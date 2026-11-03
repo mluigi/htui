@@ -9,8 +9,9 @@
 use htui_agent::event::{PlanEntryStatus, StopReason, ToolKind};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    Billing, CitationKind, CommandQueue, Gate, Isolation, OsFamily, Priority, RequirementState,
-    Resolution, RunStatus, StepStatus, Transport,
+    Activation, Billing, CitationKind, CommandQueue, Gate, GateOutcome, Isolation, LinkKind,
+    OsFamily, Priority, RequirementState, Resolution, RunKind, RunMode, RunStatus, SkillLevel,
+    StepStatus, Transport,
 };
 use htui_core::prompt::BudgetSource;
 use ratatui::style::Style;
@@ -276,6 +277,67 @@ pub const fn os_family(os: OsFamily) -> &'static str {
     }
 }
 
+/// How one item links to another, as the Graph's edge reads it (`from` *kind* `to`; MOD-115 M4
+/// D-1).
+#[must_use]
+pub const fn link_kind(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::BlockedBy => "blocked by",
+        LinkKind::Origin => "origin",
+        LinkKind::Relates => "relates",
+        LinkKind::Supersedes => "supersedes",
+    }
+}
+
+/// How a person answered a step's gate.
+#[must_use]
+pub const fn gate_outcome(outcome: GateOutcome) -> &'static str {
+    match outcome {
+        GateOutcome::Approved => "approved",
+        GateOutcome::Rejected => "rejected",
+        GateOutcome::Retried => "retried",
+        GateOutcome::Skipped => "skipped",
+    }
+}
+
+/// What a run is: a step graph against an item, or a free-standing chat.
+#[must_use]
+pub const fn run_kind(kind: RunKind) -> &'static str {
+    match kind {
+        RunKind::Graph => "graph",
+        RunKind::Chat => "chat",
+    }
+}
+
+/// Who advances a run: a person at each phase, or the orchestrator.
+#[must_use]
+pub const fn run_mode(mode: RunMode) -> &'static str {
+    match mode {
+        RunMode::Manual => "manual",
+        RunMode::Auto => "automatic",
+    }
+}
+
+/// Whether a skill's winning attachment puts it into a step's prompt.
+#[must_use]
+pub const fn activation(activation: Activation) -> &'static str {
+    match activation {
+        Activation::Always => "always",
+        Activation::Glob => "by glob",
+        Activation::Off => "off",
+    }
+}
+
+/// The level a skill is attached at.
+#[must_use]
+pub const fn skill_level(level: SkillLevel) -> &'static str {
+    match level {
+        SkillLevel::Global => "global",
+        SkillLevel::Project => "project",
+        SkillLevel::Phase => "phase",
+    }
+}
+
 /// A count with its noun: `1 option`, `0 options`, `3 options`. Never `option(s)`.
 #[must_use]
 pub fn plural(count: usize, one: &str, many: &str) -> String {
@@ -309,6 +371,30 @@ mod tests {
             BudgetSource::AppSetting => Some(BudgetSource::AppSettingDefault),
             BudgetSource::AppSettingDefault => None,
         }
+    }
+
+    /// `SkillLevel` is a plain enum without a generated `ALL`, so this list is by hand, checked
+    /// against [`skill_level_after`] as [`BUDGET_SOURCES`] is.
+    const SKILL_LEVELS: [SkillLevel; 3] =
+        [SkillLevel::Global, SkillLevel::Project, SkillLevel::Phase];
+
+    /// The level after `level`, in specificity order; a new variant needs an arm here.
+    const fn skill_level_after(level: SkillLevel) -> Option<SkillLevel> {
+        match level {
+            SkillLevel::Global => Some(SkillLevel::Project),
+            SkillLevel::Project => Some(SkillLevel::Phase),
+            SkillLevel::Phase => None,
+        }
+    }
+
+    #[test]
+    fn the_skill_level_hand_list_is_complete() {
+        let mut chain = vec![SkillLevel::Global];
+        while let Some(next) = chain.last().copied().and_then(skill_level_after) {
+            assert!(!chain.contains(&next), "the chain loops at {next:?}");
+            chain.push(next);
+        }
+        assert_eq!(SKILL_LEVELS.as_slice(), chain.as_slice());
     }
 
     /// Every word a word-only label table shows, as `(raw, label)`, in the enum's order.
@@ -373,6 +459,24 @@ mod tests {
             (
                 "OsFamily",
                 words(OsFamily::ALL, OsFamily::as_str, os_family),
+            ),
+            (
+                "LinkKind",
+                words(LinkKind::ALL, LinkKind::as_str, link_kind),
+            ),
+            (
+                "GateOutcome",
+                words(GateOutcome::ALL, GateOutcome::as_str, gate_outcome),
+            ),
+            ("RunKind", words(RunKind::ALL, RunKind::as_str, run_kind)),
+            ("RunMode", words(RunMode::ALL, RunMode::as_str, run_mode)),
+            (
+                "Activation",
+                words(Activation::ALL, Activation::as_str, activation),
+            ),
+            (
+                "SkillLevel",
+                words(&SKILL_LEVELS, SkillLevel::as_str, skill_level),
             ),
         ]
     }
@@ -671,6 +775,50 @@ mod tests {
         assert_eq!(
             labels(&words(OsFamily::ALL, OsFamily::as_str, os_family)),
             ["Windows", "Linux", "macOS"]
+        );
+    }
+
+    /// MOD-115 M4 D-1: the Graph's edges read as words, `blocked by` for `blocked_by`.
+    #[test]
+    fn a_link_kind_reads_as_the_edge_says() {
+        assert_eq!(
+            words(LinkKind::ALL, LinkKind::as_str, link_kind),
+            [
+                ("blocked_by", "blocked by"),
+                ("origin", "origin"),
+                ("relates", "relates"),
+                ("supersedes", "supersedes"),
+            ]
+        );
+    }
+
+    /// MOD-115 M4 D-18: the Runs grid's words.
+    #[test]
+    fn the_run_labels_read_as_plain_words() {
+        assert_eq!(
+            labels(&words(GateOutcome::ALL, GateOutcome::as_str, gate_outcome)),
+            ["approved", "rejected", "retried", "skipped"]
+        );
+        assert_eq!(
+            labels(&words(RunKind::ALL, RunKind::as_str, run_kind)),
+            ["graph", "chat"]
+        );
+        assert_eq!(
+            words(RunMode::ALL, RunMode::as_str, run_mode),
+            [("manual", "manual"), ("auto", "automatic")]
+        );
+    }
+
+    /// MOD-115 M4 D-18: how a skill attaches, as the Skills tab and the Prompt sub-tab show it.
+    #[test]
+    fn the_skill_labels_read_as_plain_words() {
+        assert_eq!(
+            words(Activation::ALL, Activation::as_str, activation),
+            [("always", "always"), ("glob", "by glob"), ("off", "off")]
+        );
+        assert_eq!(
+            labels(&words(&SKILL_LEVELS, SkillLevel::as_str, skill_level)),
+            ["global", "project", "phase"]
         );
     }
 

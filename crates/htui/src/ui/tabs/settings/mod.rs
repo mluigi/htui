@@ -489,12 +489,6 @@ impl Tab for SettingsTab {
             .and_then(|section| section.key_hint(ctx.keys(), ctx.theme))
     }
 
-    /// MOD-115 M3 D4: Settings draws its own kit pane, so the shell paints no focus or hints
-    /// over it.
-    fn draws_chrome(&self) -> bool {
-        true
-    }
-
     /// MOD-115 M3 D4: one kit pane, titled by the active section, with every section as a chip
     /// on its top border (the active one kept and the rest marked when they overflow, D3), the
     /// section's hints on its bottom border and the section's scrollbar on its right one. A
@@ -652,14 +646,6 @@ mod tests {
 
     fn rows(buffer: &Buffer) -> Vec<String> {
         (0..buffer.area.height).map(|y| row(buffer, y)).collect()
-    }
-
-    /// MOD-115 M3 D4: Settings draws its own frame, so the shell neither restyles it nor paints
-    /// its hint adapter over it.
-    #[test]
-    fn settings_draws_its_own_chrome() {
-        assert!(SettingsTab::new().draws_chrome());
-        assert!(tab_of(&TEN).draws_chrome());
     }
 
     /// MOD-115 M3 D4: one rounded pane titled by the active section; the `┌ Settings ─` box is

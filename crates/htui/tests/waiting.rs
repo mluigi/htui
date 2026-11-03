@@ -24,6 +24,13 @@ use htui_core::model::{
 use htui_core::store::{MemStore, ParkOutcome, ReadStore as _, StepFence, WriteStore as _};
 use uuid::Uuid;
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 /// The top bar over Graphics, which owes nothing.
 const GRAPHICS: &str = "0 working · 0 waiting · memory";
 
@@ -292,7 +299,7 @@ async fn enter_opens_the_rows_step_in_the_runs_pane() {
     assert!(harness.app().overlays.is_empty());
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
-    assert!(frame.contains("\u{250c} ANA-2 "), "{frame}");
+    assert!(on_item(&frame, "ANA-2"), "{frame}");
     // Review T1: the parked `plan`, not the run's first step `prd`.
     let line = cursor_line(&frame);
     assert!(line.contains("plan"), "{line}\n{frame}");

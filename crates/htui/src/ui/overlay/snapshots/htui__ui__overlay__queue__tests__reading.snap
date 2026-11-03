@@ -15,8 +15,7 @@ expression: rendered
 
 
 
-          ┌ Queue ────────────────────────────────────────────────────────────────────────┐
-          │  reading the queue                                                            │
-          │                                                                               │
-          │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close │
-          └───────────────────────────────────────────────────────────────────────────────┘
+          ╭ Queue ───────────────────────────────────────────────────────────────────────╮
+          │                              reading the queue                               │
+          │                   the rows appear once the store answers                     │
+          ╰ j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close ╯

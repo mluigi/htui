@@ -3,23 +3,20 @@ source: crates/htui/tests/backlog.rs
 expression: harness.render()
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││TUI scaffold                               │
-│  ANA-2    open               Orchestrator step grap…││FEAT-1  FEAT  in_progress                  │
-│  CLEAN-1  failed             Drop the legacy markdo…││rust · priority 2 · version 1              │
-│  FEAT-1   in_progress        TUI scaffold           ││                                           │
-│  FEAT-2   blocked            Agent driver and chat …││Stand up the terminal application: a       │
-│  FEAT-3   queued             Postgres store and cac…││workspace-scoped shell with a tab strip, a │
-│  FIX-1    closed             Terminal left raw afte…││top bar and a backlog tab, all reading     │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││through the store seam.                    │
-│▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││Shape                                      │
-│  FEAT-1   open               ACP transport upgrade  ││- Two crates: htui-core holds the domain   │
-│  FIX-1    open               Session leak on cancel ││  model and the store traits, htui holds   │
-│                                                     ││  the terminal application. Nothing in the │
-│                                                     ││  view layer holds a store handle.         │
-│                                                     ││- A store worker task owns the backend. The│
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────── Body  Runs ›╮
+│ ▾ htui (8)                                          ││◐ running · rust · priority 2 · version 1  │
+│  ANA-1    ● done       Data model, box registry and…││                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││Stand up the terminal application: a       │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││workspace-scoped shell with a tab strip, a │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││top bar and a backlog tab, all reading     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││through the store seam.                    │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││Shape                                      │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││- Two crates: htui-core holds the domain   │
+│ ▾ agy (3)                                           ││  model and the store traits, htui holds   │
+│  ANA-1    ● done       Prompt assembly survey       ││  the terminal application. Nothing in the │
+│  FEAT-1   ○ open       ACP transport upgrade        ││  view layer holds a store handle.         │
+│  FIX-1    ○ open       Session leak on cancel       ││- A store worker task owns the backend. The│
 │                                                     ││  UI sends a request, the worker replies,  │
 │                                                     ││  the event loop folds the reply into      │
 │                                                     ││  state. Three select arms: terminal       │
@@ -31,4 +28,7 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││Scope                                      │
 │                                                     ││- Backlog list grouped by project and key  │
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+│                                                     ││  prefix, with the five detail sub-tabs:   │
+│                                                     ││  body, runs, graph, documents, notes.     │
+│                                                     ││- A workspace switcher overlay, opened with│
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

@@ -17,21 +17,19 @@ use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear};
 
 use crate::ui::Theme;
-use crate::ui::cells::clip;
+use crate::ui::kit::rule;
 
 /// The diff width of a narrow grid cell.
 const NARROW: NonZeroU16 = NonZeroU16::MIN;
 /// The diff width of a wide grid cell (its continuation is the second column).
 const WIDE: NonZeroU16 = NonZeroU16::new(2).unwrap();
 
-/// Draws an in-pane editor over `area`: a top rule titled `title` (focused: `theme.title`, else
-/// `theme.dim`), then the VT screen cell by cell in the rest. When `focused` and the child shows
-/// its cursor, the terminal's real cursor is placed on it (`Frame::set_cursor_position`), on the
-/// grid's last column while a wrap is pending.
+/// Draws an in-pane editor over `area`: the kit's rule titled `title` on the top row
+/// (`kit::rule`; focused: `theme.title`, else `theme.dim`), then the VT screen cell by cell in
+/// the rest. When `focused` and the child shows its cursor, the terminal's real cursor is placed
+/// on it (`Frame::set_cursor_position`), on the grid's last column while a wrap is pending.
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -43,15 +41,9 @@ pub fn render(
     if area.is_empty() {
         return;
     }
-    let style = if focused { theme.title } else { theme.dim };
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .border_style(style)
-        .title(Line::styled(clip(title, usize::from(area.width)), style));
-    let inner = block.inner(area);
-    // `Block` only patches its styles over what the tab drew there: reset the rule row first.
-    frame.render_widget(Clear, Rect { height: 1, ..area });
-    frame.render_widget(block, area);
+    // The kit's titled rule (MOD-115 M4 C6, D-14): it clears its row over what the tab drew
+    // there and hands back the rows under it, the PTY's whole height.
+    let inner = rule::render(frame, area, title, focused, theme);
     draw_screen(frame.buffer_mut(), inner, screen);
     if focused && !screen.hide_cursor() {
         // A pending wrap leaves vt100's column one past the grid; a terminal shows the last one.
@@ -190,6 +182,46 @@ mod tests {
         let mut cell = Cell::EMPTY;
         cell.set_style(style);
         cell
+    }
+
+    /// MOD-115 M4 E7 (C6, D-14): the editor's frame is the kit's titled rule, cell for cell and
+    /// style for style, focused or not, at a width that clips the title and one that does not;
+    /// the screen starts on the row under it.
+    #[test]
+    fn the_frame_is_the_kit_titled_rule() {
+        let parser = parser(3, 30, b"top");
+        let theme = Theme::default();
+        for (width, title, focused) in [
+            (30, FOCUSED, true),
+            (30, UNFOCUSED, false),
+            (10, FOCUSED, true),
+        ] {
+            let area = Rect::new(0, 0, width, 4);
+            let mut editor = Terminal::new(TestBackend::new(width, 4)).expect("a test backend");
+            draw(&mut editor, area, parser.screen(), title, focused);
+            let mut kit = Terminal::new(TestBackend::new(width, 4)).expect("a test backend");
+            kit.draw(|frame| {
+                let under = rule::render(frame, area, title, focused, &theme);
+                assert_eq!(under, Rect::new(0, 1, width, 3), "the rows under the rule");
+            })
+            .expect("the rule draws");
+            for x in 0..width {
+                let (drawn, rule) = (
+                    &editor.backend().buffer()[(x, 0)],
+                    &kit.backend().buffer()[(x, 0)],
+                );
+                assert_eq!(
+                    (drawn.symbol(), drawn.fg, drawn.bg, drawn.modifier),
+                    (rule.symbol(), rule.fg, rule.bg, rule.modifier),
+                    "{width} columns, focused {focused}: column {x}"
+                );
+            }
+            assert_eq!(
+                editor.backend().buffer()[(0, 1)].symbol(),
+                "t",
+                "the screen under it"
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! `REQS_PICK`, `REQS_KIND`, `REQS_CONFIRM`): the D12 pins and the lane's rebinding test. Helpers
 //! stay in this file.
 
+use super::on_item;
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, RevealKind};
 use htui::keys::Keys;
@@ -84,7 +85,7 @@ async fn ctrl_n_does_not_cycle_the_prompt_template() {
     sub_tab(&mut harness, TO_PROMPT);
     let frame = harness.render();
     assert!(
-        frame.contains("n / p"),
+        frame.contains("8 templates"),
         "the Prompt, its preview landed:\n{frame}"
     );
     assert_eq!(harness.queued(), 0, "nothing in flight");
@@ -128,7 +129,8 @@ async fn a_chord_does_not_scroll_the_body() {
 
 /// PA-2: on a Graph node `Enter` is `backlog.graph.reroot`, which shadows the Backlog's replay
 /// miss: it re-roots the list (the detail border reads the new root) and the status line never
-/// says "select a step in the Runs pane". On the new root's own row it is consumed too.
+/// says "select a step in the Runs pane". On the new root's own row it is consumed too. The
+/// detail is focused, so the Graph's keys are on its border (MOD-115 M4 Q2).
 #[tokio::test]
 async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     let mut harness = backlog().await;
@@ -136,9 +138,13 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.app().reveal_tabs = vec![(RevealKind::Item, BacklogTab::ID)];
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, TO_GRAPH);
+    // MOD-115 M4 Q2: the Graph's keys are the detail's hints, drawn while it is focused; the pane
+    // key moves the focus among the panes the last frame drew.
+    harness.render();
+    harness.key("tab");
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1")
+        on_item(&frame, "FEAT-1")
             && frame.contains("depth 2/3")
             && frame.contains("+/- depth · Enter re-root"),
         "the Graph on FEAT-1, its keys label-built in the hint row:\n{frame}"
@@ -149,7 +155,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-1"), "re-rooted on ANA-1:\n{frame}");
+    assert!(on_item(&frame, "ANA-1"), "re-rooted on ANA-1:\n{frame}");
     assert!(
         frame.contains("depth 2/3"),
         "the Graph is still active:\n{frame}"
@@ -159,10 +165,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(
-        frame.contains("┌ ANA-1"),
-        "the root row stays put:\n{frame}"
-    );
+    assert!(on_item(&frame, "ANA-1"), "the root row stays put:\n{frame}");
     assert_eq!(
         harness.app().status,
         None,
@@ -176,7 +179,7 @@ pub(super) async fn on_feat_1_reqs(harness: &mut Harness) {
     sub_tab(harness, TO_REQS);
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("▸ R-STO-1 addresses v1"),
+        on_item(&frame, "FEAT-1") && frame.contains("\u{258c} R-STO-1 addresses v1"),
         "the Reqs on FEAT-1, its citation under the cursor:\n{frame}"
     );
 }
@@ -220,7 +223,7 @@ async fn f1_opens_help_from_the_reqs_picker_and_it_stays() {
     harness.key("j");
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-2"),
+        frame.contains("\u{258c} R-ENT-2"),
         "the picker, its cursor on R-ENT-2:\n{frame}"
     );
 
@@ -230,7 +233,7 @@ async fn f1_opens_help_from_the_reqs_picker_and_it_stays() {
     assert!(!harness.app().help_visible, "`F1` closed it");
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-2") && frame.contains("Enter pick"),
+        frame.contains("\u{258c} R-ENT-2") && frame.contains("Enter pick"),
         "the picker is still open on R-ENT-2:\n{frame}"
     );
 }
@@ -245,20 +248,20 @@ async fn the_picker_moves_on_j_and_j_capital() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-1"),
+        frame.contains("\u{258c} R-ENT-1"),
         "the picker opens on its first candidate:\n{frame}"
     );
     for (down, up) in [("J", "K"), ("j", "k"), ("down", "up")] {
         harness.key(down);
         let frame = harness.render();
         assert!(
-            frame.contains("▸ R-ENT-2"),
+            frame.contains("\u{258c} R-ENT-2"),
             "`{down}` moved the picker down:\n{frame}"
         );
         harness.key(up);
         let frame = harness.render();
         assert!(
-            frame.contains("▸ R-ENT-1"),
+            frame.contains("\u{258c} R-ENT-1"),
             "`{up}` moved it back:\n{frame}"
         );
     }
@@ -273,9 +276,14 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
         htui::keys::load_str("version = 1\n[backlog.reqs]\ncite = \"C\"\n").expect("the keys load");
     let mut harness = backlog_with(keys).await;
     on_feat_1_reqs(&mut harness).await;
+    // MOD-115 M4 Q2: the browse hint is the focused detail's. Under a version-1 key file `tab`
+    // is `next_tab`, so the pane key is `ctrl-right`.
+    harness.key("ctrl-right");
     let frame = harness.render();
+    // The detail's 41 hint cells drop the keys past the rebound one whole (D-20, T3: never half a
+    // key); the rebound one is whole.
     assert!(
-        frame.contains("J/K move · r reconfirm · C cite · u uncite"),
+        frame.contains("J/K move · r reconfirm · C cite \u{2026}"),
         "the browse hint names the rebound key:\n{frame}"
     );
 
@@ -283,7 +291,7 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("Enter pick") && !frame.contains("▸ R-ENT-1"),
+        !frame.contains("Enter pick") && !frame.contains("\u{258c} R-ENT-1"),
         "`c` opened nothing:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and said nothing");
@@ -292,7 +300,7 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-1") && frame.contains("j/k move · Enter pick · Esc back"),
+        frame.contains("\u{258c} R-ENT-1") && frame.contains("j/k move · Enter pick · Esc back"),
         "`C` opened the picker:\n{frame}"
     );
 }

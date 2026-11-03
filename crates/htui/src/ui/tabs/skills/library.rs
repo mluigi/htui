@@ -33,23 +33,31 @@ use htui_core::store::{invalid_skill_name, skill_body_refusal};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
+use super::{
+    Detail, DetailPane, framed, holder, joined, render_detail, view_chips, view_chips_if_room,
+};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::translate::FieldEvent;
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillEntry, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
-use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::{modal::modal_rest, text::wrapped};
-use crate::ui::shell::{ListSize, TabLayout};
-use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
-use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
+use crate::ui::cells;
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::list::{self, GUTTER, Row, RowKind, ellipsize, selection_band};
+use crate::ui::kit::modal::modal_rest;
+use crate::ui::kit::pane::{Focus, Pane as KitPane, capture_area};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::shell::{ListSize, PaneId, TabLayout};
+use crate::ui::{FieldOutcome, TextArea, TextField, diff};
 use crossterm::event::KeyEvent;
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
@@ -75,17 +83,36 @@ pub(super) const LAYOUT: TabLayout = TabLayout {
 /// A library row's name field, in cells: a name is fitted to it with `cells::fit`.
 const NAME_WIDTH: usize = 22;
 
-/// The rename form's label column: `description` and two spaces.
-const INFO_LABEL: usize = 13;
-
 /// The pane before the first reply.
 const NOT_READ: &str = "skills not read yet";
+
+/// [`NOT_READ`]'s next step (MOD-115 M4 E5).
+const NOT_READ_NEXT: &str = "they appear once the store answers";
 
 /// The pane after a refused read, before the message.
 const UNAVAILABLE: &str = "skills unavailable";
 
 /// The pane with no skill under the cursor (an empty library).
 const SELECT_A_SKILL: &str = "select a skill";
+
+/// [`SELECT_A_SKILL`]'s next step in an empty library, through `LIBRARY_BROWSE`.
+const EMPTY_LIBRARY_HINT: HintSpec = &[
+    Hint::One(Act::New, "creates one"),
+    Hint::One(Act::LibraryImport, "imports some"),
+];
+
+/// [`EMPTY_LIBRARY_HINT`] with every key unbound.
+const EMPTY_LIBRARY_NEXT: &str = "a new or imported skill shows here";
+
+/// [`SELECT_A_SKILL`]'s next step on a skill with no version yet, through `LIBRARY_BROWSE`.
+const NO_VERSION_HINT: HintSpec = &[Hint::One(Act::Edit, "writes its first version")];
+
+/// [`NO_VERSION_HINT`] with the key unbound.
+const NO_VERSION_NEXT: &str = "its first version shows here";
+
+/// The import form's help, under its path field.
+const IMPORT_HELP: &str = "a SKILL.md or rules file, or a directory: its */SKILL.md, and the \
+                           *.md / *.mdc of a rules directory";
 
 /// `Esc` over a modified draft, the first time.
 const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
@@ -121,9 +148,11 @@ fn binding_changed_elsewhere(save: Option<&str>) -> String {
 const DETACH_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was \
                                         detached; its row shows it as it is now";
 
-/// The hint row in Browse (96 cells with the defaults: `j/k` carries no word, and `r reload` is
+/// Every Browse key, the shell's activity pane's hint ([`key_hint`](LibraryView::key_hint), M4
+/// C8); the list and the body show their own ([`LIST_HINT`], [`DETAIL_HINT`]). 96 cells with the
+/// defaults: `j/k` carries no word, and `r reload` is
 /// left out, so the row fits 100 columns with its ` \u{b7} ` separators; MOD-67 M4). `I import`
-/// took the room `h/l view` had: the switch line right above names both views.
+/// took the room `h/l view` had: the view chips name both views (MOD-115 M4 E5).
 const BROWSE_HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, ""),
     Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
@@ -137,15 +166,42 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::LibraryAttach, "attach"),
 ];
 
-/// The pane's bottom border while its lines overflow it: the pane keys, through
-/// `LIBRARY_BROWSE` whatever the mode.
+/// The list pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the
+/// list's motion, as every list's hint leads with it, then a new skill and the import, the
+/// Browse row's keys before the port that are not the shown skill's; 22 of its 28 cells. The
+/// view switch is the chips' (L-skills repair 1: the Browse row never had the room for it).
+const LIST_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::LibraryImport, "import"),
+];
+
+/// The body pane's keys while browsing (MOD-115 M4 E5): the shown skill's, the version and the
+/// diff first; [`BROWSE_HINT`] is all of them, on the shell's activity pane.
+const DETAIL_HINT: HintSpec = &[
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::LibraryInfo, "info"),
+    Hint::One(Act::LibraryAttach, "attach"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
+];
+
+/// The pane's keys while its lines overflow it, through `LIBRARY_BROWSE` whatever the mode:
+/// they close the detail pane's hints when it is focused, after the view's own keys, so they are
+/// the first a narrow pane drops (MOD-115 M4 E5, T3; MOD-82 carried: no key literal in a title).
 const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
 
-/// The hint row while naming or describing a new skill: `Enter` and `Esc` are the field's.
-const NAMING_HINT: HintSpec = &[Hint::Text("Enter next"), Hint::Text("Esc cancel")];
+/// The hint row while naming or describing a new skill, through `LIBRARY_PROMPT`: the field's
+/// `field.submit` names its key in force (MOD-115 M4 MD-A); `Esc` is never rebound (M2 MD7).
+const NAMING_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "next"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row on the rename form (`Esc` is the field's).
 const INFO_HINT: HintSpec = &[
@@ -154,12 +210,14 @@ const INFO_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's).
+/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's). Save
+/// and the way out lead, as in the Templates editor (MOD-115 M4 RV3-L3): a narrow pane drops the
+/// keys whole from the end (`kit::pane::fit_hints`), so `Esc cancel` is the last it gives up.
 const EDIT_HINT: HintSpec = &[
     Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
     Hint::One(Act::SkillsAskAgent, "ask agent"),
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
-    Hint::Text("Esc cancel"),
 ];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
@@ -169,8 +227,12 @@ const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
 /// belongs to a project.
 const NO_PROJECT: &str = "no project in this workspace \u{2014} agent help records its run in one";
 
-/// The hint row on the import form: `Enter` and `Esc` are the field's.
-const IMPORT_HINT: HintSpec = &[Hint::Text("Enter import"), Hint::Text("Esc cancel")];
+/// The hint row on the import form, through `LIBRARY_PROMPT`: `field.submit` in force (MOD-115
+/// M4 MD-A), and the field's `Esc`.
+const IMPORT_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "import"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row on the import report.
 const REPORT_HINT: HintSpec = &[
@@ -527,7 +589,7 @@ fn outcome_row(outcome: &ImportOutcome) -> (char, String, bool) {
 /// shell switches tabs with the prompt kept; anything else is `modal_rest`'s through
 /// `views::LIBRARY_PROMPT`.
 fn prompt_rest(key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-    let chord = KeyChord::from_event(key);
+    let chord = ctx.pressed(&key);
     match ctx.keys().actions(views::LIBRARY_PROMPT, chord).first() {
         Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
         _ => modal_rest(views::LIBRARY_PROMPT, chord),
@@ -754,19 +816,22 @@ impl LibraryView {
         }
     }
 
-    /// Draws the view below the switch line: the content and the notice row. Its keys are
-    /// [`key_hint`](Self::key_hint), the shell's hint row since MOD-67 M6 T2.
+    /// Draws the view over the tab's body: the content and the notice row. Its keys are
+    /// [`key_hint`](Self::key_hint), drawn on the pane that holds the keyboard (MOD-115 M4 C4).
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // The notice wraps rather than clips (at most `NOTICE_LINES`): the stale sentence ends on
         // the version the next `Ctrl+S` writes.
-        let (notice, style) = match &self.notice {
-            Some(Notice::Info(text)) => (text.as_str(), ctx.theme.dim),
-            Some(Notice::Error(text)) => (text.as_str(), ctx.theme.error),
-            None => ("", ctx.theme.dim),
+        let (notice_text, tone) = match &self.notice {
+            Some(Notice::Info(text)) => (text.as_str(), Tone::Info),
+            Some(Notice::Error(text)) => (text.as_str(), Tone::Error),
+            None => ("", Tone::Info),
         };
-        let mut notice = wrapped(notice, usize::from(area.width.saturating_sub(1)).max(1));
-        notice.truncate(NOTICE_LINES);
-        let notice_height = u16::try_from(notice.len().max(1)).unwrap_or(1);
+        let mut rows = wrapped(
+            notice_text,
+            usize::from(area.width.saturating_sub(1)).max(1),
+        );
+        rows.truncate(NOTICE_LINES);
+        let notice_height = u16::try_from(rows.len().max(1)).unwrap_or(1);
         let [content, notice_row] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(notice_height)]).areas(area);
         match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
@@ -781,31 +846,31 @@ impl LibraryView {
         }
         frame.render_widget(
             Paragraph::new(
-                notice
-                    .into_iter()
-                    .map(|line| Line::styled(format!(" {line}"), style))
+                rows.into_iter()
+                    .map(|line| notice(&format!(" {line}"), tone, ctx.theme))
                     .collect::<Vec<_>>(),
             ),
             notice_row,
         );
     }
 
-    /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
+    /// The keys of the shown mode (MOD-67 M6 T2), drawn on the pane that holds the keyboard and,
+    /// for Browse, on the shell's activity pane (MOD-115 M4 C4, C8), through
     /// [`key_stack`](Self::key_stack): the attachments pane's while it is open, an open agent
-    /// help's, the editor's with the cursor's `L:C`, else the mode's.
+    /// help's, the editor's after the cursor's `L:C`, else the mode's.
     pub(super) fn key_hint(&self, keys: &Keys) -> String {
         match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
             (Some(pane), Some(_), _, _) => pane.hint(keys),
             (_, _, Mode::Editing(editor), _) => match &editor.help {
                 Some(help) => help.hint(keys),
                 None => {
+                    // MOD-115 M4 E5: the cursor's `L:C` leads, so a pane narrower than the row
+                    // was (the Templates draft beside its placeholders) still shows it.
                     let (line, col) = editor.area.cursor_line_col();
-                    format!(
-                        "{} \u{b7} L{}:C{}",
+                    joined(&[
+                        format!("L{}:C{}", line + 1, col + 1),
                         keys.hint(self.key_stack(), EDIT_HINT),
-                        line + 1,
-                        col + 1
-                    )
+                    ])
                 }
             },
             (_, _, Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
@@ -834,7 +899,7 @@ impl LibraryView {
     /// activity pane focused they are taken and nothing moves. Every other act acts whatever
     /// pane is focused.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(views::LIBRARY_BROWSE, chord) {
             if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
@@ -1053,7 +1118,7 @@ impl LibraryView {
     /// scroll, `common.reload` re-reads the library behind it, `common.back` returns to Browse.
     /// Every other key passes, so the tab and the shell keep theirs.
     fn on_report_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::LIBRARY_REPORT, chord) {
             let Mode::Report { outcomes, cursor } = &mut self.mode else {
                 return Handled::Pass;
@@ -1135,7 +1200,7 @@ impl LibraryView {
                 Handled::Consumed
             }
             FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 match ctx.keys().actions(views::LIBRARY_INFO, chord).first() {
                     Some(Act::FormNextField | Act::FormPrevField) => {
                         form.focus = 1 - form.focus;
@@ -1237,7 +1302,7 @@ impl LibraryView {
             // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
             // `form.save` below saves.
             FieldOutcome::Submit | FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 match ctx.keys().actions(views::LIBRARY_EDITOR, chord).first() {
                     Some(Act::FormSave) => self.save_editor(ctx),
                     Some(Act::SkillsAskAgent) => self.open_help(ctx),
@@ -1755,134 +1820,169 @@ impl LibraryView {
 
     // --- frames --------------------------------------------------------------------------------
 
-    /// Browse, the prompts and the rename form: the list on the left, the pane on the right.
+    /// Browse, the prompts and the rename form: the list on the left, the pane on the right, each
+    /// a kit pane (MOD-115 M4 E5). The list leads the view, so it carries the view chips. An open
+    /// prompt holds the keyboard, so the pane it is drawn in is the focused one (C4); otherwise
+    /// the shell's focus decides. Each pane draws its hints only while focused (Q2).
     fn render_browse(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let theme = ctx.theme;
-        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
-        // borders, the hints and the mouse; today's 32-cell list by default. A hidden pane is an
-        // empty rect, which draws nothing.
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus,
+        // the hidden-pane note and the mouse; today's 32-cell list by default. A hidden pane is
+        // an empty rect, which draws nothing.
         let areas = ctx.split(area, LAYOUT);
+        let prompt = !matches!(self.mode, Mode::Browse);
         // T7 repair: a prompt or the rename form takes every key, so with another pane zoomed
         // the pane is drawn over the zoomed one rather than into its own empty rect.
-        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
-        let list_area = list_area.unwrap_or_default();
+        let (list_area, pane_area) = capture_area(&areas, area, prompt);
+        // The shell's activity pane is on screen unless it is the zoomed pane drawn over.
+        let activity = areas.activity.is_some_and(|rect| !rect.is_empty())
+            && !(areas.list.is_none() && areas.detail.is_empty());
+        let (list_focus, pane_focus) = if prompt {
+            (Focus::Unfocused, holder(ctx, activity))
+        } else {
+            (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
+        };
+        let list_area = list_area.filter(|rect| !rect.is_empty());
+        if let Some(list_area) = list_area {
+            self.render_list(frame, list_area, list_focus, ctx);
+        }
+        if !pane_area.is_empty() {
+            // RV3-M1: with the list off screen the pane leads the view, so it names it.
+            let leads = list_area.is_none();
+            self.render_pane(frame, pane_area, pane_focus, prompt, leads, ctx);
+        }
+    }
 
-        let list = Block::new().borders(Borders::ALL).title(" Skills ");
-        let inner = list.inner(list_area);
-        frame.render_widget(list, list_area);
-        let lines: Vec<Line<'static>> = self
+    /// The library as a kit list (MOD-115 M4 E5): one row per skill after the gutter, the cursor
+    /// the gutter and band (MOD-85), kept in view; the view chips on the top border.
+    fn render_list(&self, frame: &mut Frame<'_>, area: Rect, focus: Focus, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let inner = KitPane::inner(area);
+        let rows: Vec<Row<'static>> = self
             .snapshot
             .iter()
             .flat_map(|snapshot| snapshot.skills.iter())
-            .enumerate()
-            .map(|(index, entry)| {
+            .map(|entry| {
                 let head = entry
                     .versions
                     .iter()
                     .map(|row| row.version)
                     .max()
                     .unwrap_or(0);
-                let style = if index == self.cursor {
-                    theme.selected
-                } else {
-                    theme.base
-                };
-                Line::styled(browse_row(&entry.skill.name, head), style)
+                Row {
+                    line: Line::styled(browse_row(&entry.skill.name, head), theme.base),
+                    kind: RowKind::Item,
+                }
             })
             .collect();
-        let offset = self
-            .cursor
-            .saturating_sub(usize::from(inner.height).saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-            inner,
-        );
-
-        // The body and the diff wrap; the row count is a character wrap's, a lower bound on the
-        // word wrap's (`Scroll`'s rule), so the clamp never scrolls the pane blank.
-        let width = pane_area.width.saturating_sub(2);
-        let (title, lines) = self.pane(width, ctx);
-        let rows: usize = lines
-            .iter()
-            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
-            .sum();
-        self.pane_rows.set(rows);
-        let mut block = Block::new().borders(Borders::ALL).title(title);
-        let visible = usize::from(pane_area.height.saturating_sub(2));
-        if rows > visible || self.scroll.offset() > 0 {
-            let hint = format!(" {} ", ctx.keys().hint(views::LIBRARY_BROWSE, SCROLL_HINT));
-            block = block.title_bottom(Line::styled(hint, theme.dim).right_aligned());
-        }
-        let inner = block.inner(pane_area);
-        frame.render_widget(block, pane_area);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll.offset(), 0)),
-            inner,
-        );
+        let selected = (!rows.is_empty()).then_some(self.cursor);
+        let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
+        list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
+        let hints = key_line(ctx.keys().hint(views::LIBRARY_BROWSE, LIST_HINT), ctx.theme);
+        framed(view_chips(KitPane::new(""), 0), focus, hints, ctx)
+            .scrollbar(rows.len(), offset)
+            .render(frame, area, theme);
     }
 
-    /// The right-hand pane's title and lines: a prompt, the rename form, a refusal, the empty
-    /// states, the shown body, or the diff. The caller wraps and scrolls them.
-    fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
-        let theme = ctx.theme;
-        let prompt = |prompt: String, field: &TextField| {
-            let budget =
-                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
-            let mut spans = vec![Span::styled(prompt, theme.base)];
-            spans.extend(field.line(budget, true, theme).spans);
-            (" new skill ".to_owned(), vec![Line::from(spans)])
+    /// The right-hand pane through the views' shared [`render_detail`] (MOD-115 M4 RV3-L4): the
+    /// Library's browse stack and hints, or an open prompt's keys. While the list is off screen
+    /// (`leads`: hidden or another pane zoomed) the pane leads the view, so it carries the view
+    /// chips, its title kept whole (RV3-M1).
+    fn render_pane(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focus: Focus,
+        prompt: bool,
+        leads: bool,
+        ctx: &Ctx<'_>,
+    ) {
+        let (title, detail) = self.detail(ctx);
+        let pane = DetailPane {
+            title: &title,
+            focus,
+            leads: leads.then_some(0),
+            scroll: &self.scroll,
+            rows: &self.pane_rows,
+            stack: views::LIBRARY_BROWSE,
+            detail_hint: DETAIL_HINT,
+            scroll_hint: SCROLL_HINT,
+            prompt_hint: prompt.then(|| self.key_hint(ctx.keys())),
         };
+        render_detail(frame, area, pane, detail, ctx);
+    }
+
+    /// The right-hand pane's title and what it shows: a prompt or the rename form, a refusal, the
+    /// empty states, the shown body, or the diff.
+    fn detail(&self, ctx: &Ctx<'_>) -> (String, Detail<'_>) {
+        let theme = ctx.theme;
         match &self.mode {
-            Mode::Naming { field } => return prompt("new skill: ".to_owned(), field),
-            Mode::Describing { name, field } => {
-                return prompt(format!("description of {name}: "), field);
+            Mode::Naming { field } => {
+                let form = Form::new()
+                    .field(Field::new("name", Value::Text(field)))
+                    .focus(0)
+                    .editing(true);
+                return ("new skill".to_owned(), Detail::Form(form));
             }
-            Mode::Info(form) => return self.info_pane(form, width, theme),
+            Mode::Describing { name, field } => {
+                let form = Form::new()
+                    .field(Field::new("name", Value::ReadOnly(name.as_str().into())))
+                    .field(Field::new("description", Value::Text(field)))
+                    .focus(1)
+                    .editing(true);
+                return ("new skill".to_owned(), Detail::Form(form));
+            }
+            Mode::Info(form) => {
+                let name = snapshot_name(self.snapshot.as_ref(), form.skill);
+                let fields = Form::new()
+                    .field(Field::new("name", Value::Text(&form.name)))
+                    .field(Field::new("description", Value::Text(&form.description)))
+                    .focus(form.focus)
+                    .editing(true);
+                return (format!("{name} \u{b7} rename"), Detail::Form(fields));
+            }
             Mode::ImportPath { field } => {
-                let label = "path: ";
-                let budget =
-                    width.saturating_sub(u16::try_from(cell_width(label)).unwrap_or(u16::MAX));
-                let mut spans = vec![Span::styled(label, theme.base)];
-                spans.extend(field.line(budget, true, theme).spans);
-                return (
-                    " import skills ".to_owned(),
-                    vec![
-                        Line::from(spans),
-                        Line::default(),
-                        Line::styled(
-                            "a SKILL.md or rules file, or a directory: its */SKILL.md, and the \
-                             *.md / *.mdc of a rules directory",
-                            theme.dim,
-                        ),
-                    ],
-                );
+                let form = Form::new()
+                    .field(Field::new("path", Value::Text(field)).help(IMPORT_HELP))
+                    .focus(0)
+                    .editing(true);
+                return ("import skills".to_owned(), Detail::Form(form));
             }
             Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => {}
         }
-        let dim = |text: &str| {
-            (
-                String::new(),
-                vec![Line::styled(text.to_owned(), theme.dim)],
-            )
-        };
         if let Some(why) = &self.unavailable {
             return (
                 String::new(),
-                vec![Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)],
+                Detail::Unavailable(format!("{UNAVAILABLE}: {why}")),
             );
         }
+        let keys = ctx.keys();
+        let next = |spec: HintSpec, unbound: &str| {
+            let hint = keys.hint(views::LIBRARY_BROWSE, spec);
+            if hint.is_empty() {
+                unbound.to_owned()
+            } else {
+                hint
+            }
+        };
         let Some(snapshot) = &self.snapshot else {
-            return dim(NOT_READ);
+            return (
+                String::new(),
+                Detail::Empty(NOT_READ, NOT_READ_NEXT.to_owned()),
+            );
         };
         let Some(entry) = snapshot.skills.get(self.cursor) else {
-            return dim(SELECT_A_SKILL);
+            return (
+                String::new(),
+                Detail::Empty(SELECT_A_SKILL, next(EMPTY_LIBRARY_HINT, EMPTY_LIBRARY_NEXT)),
+            );
         };
         let (skill, name) = (entry.skill.id, entry.skill.name.as_str());
         let (Some(head), Some(shown)) = (snapshot.head(skill), self.shown_row(snapshot, skill))
         else {
-            return dim(SELECT_A_SKILL);
+            return (
+                name.to_owned(),
+                Detail::Empty(SELECT_A_SKILL, next(NO_VERSION_HINT, NO_VERSION_NEXT)),
+            );
         };
         if self.pane == Pane::Body {
             let mut lines = Vec::new();
@@ -1898,22 +1998,22 @@ impl LibraryView {
             );
             return (
                 format!(
-                    " {name} v{} (head v{}) \u{b7} ~{} tokens ",
+                    "{name} v{} (head v{}) \u{b7} ~{} tokens",
                     shown.version,
                     head.version,
                     estimate(name, shown.version, &shown.body)
                 ),
-                lines,
+                Detail::Lines(lines),
             );
         }
         let base = self.base.unwrap_or(shown.version - 1);
         let Some(old) = snapshot.version(skill, base) else {
             return (
-                format!(" {name} v{} ", shown.version),
-                vec![Line::styled(
+                format!("{name} v{}", shown.version),
+                Detail::Lines(vec![Line::styled(
                     format!("v{} has no base to diff against", shown.version),
                     theme.dim,
-                )],
+                )]),
             );
         };
         let unified = diff::unified(
@@ -1923,36 +2023,15 @@ impl LibraryView {
             &format!("{name} v{}", shown.version),
         );
         (
-            format!(" diff v{base} \u{2192} v{} ", shown.version),
-            diff::lines(&unified, theme),
+            format!("diff v{base} \u{2192} v{}", shown.version),
+            Detail::Lines(diff::lines(&unified, theme)),
         )
     }
 
-    /// The rename form's pane: the name and the description, the focused one highlighted.
-    fn info_pane(
-        &self,
-        form: &InfoForm,
-        width: u16,
-        theme: &Theme,
-    ) -> (String, Vec<Line<'static>>) {
-        let name = snapshot_name(self.snapshot.as_ref(), form.skill);
-        let budget = width.saturating_sub(u16::try_from(INFO_LABEL).unwrap_or(0));
-        let line = |label: &str, field: &TextField, focused: bool| {
-            let mut spans = vec![Span::styled(format!("{label:<INFO_LABEL$}"), theme.base)];
-            spans.extend(field.line(budget, focused, theme).spans);
-            Line::from(spans)
-        };
-        (
-            format!(" {name} \u{b7} rename "),
-            vec![
-                line("name", &form.name, form.focus == 0),
-                line("description", &form.description, form.focus == 1),
-            ],
-        )
-    }
-
-    /// The import report over the whole content: one row per outcome, the cursor on one of them,
-    /// the rows that need acting on in the error style.
+    /// The import report over the whole content, a kit pane with the view chips: one block of
+    /// rows per outcome, wrapped (no message is cut), the cursor's block in the gutter and band
+    /// (MOD-115 M4 E5, MOD-85: the `>` marker is gone), the rows that need acting on in the error
+    /// style.
     fn render_report(
         &self,
         frame: &mut Frame<'_>,
@@ -1961,39 +2040,53 @@ impl LibraryView {
         cursor: usize,
         ctx: &Ctx<'_>,
     ) {
-        let block = Block::new().borders(Borders::ALL).title(" import report ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let width = usize::from(inner.width).max(1);
-        let lines: Vec<Line<'static>> = outcomes
-            .iter()
-            .enumerate()
-            .map(|(at, outcome)| {
-                let (sign, text, problem) = outcome_row(outcome);
-                let marker = if at == cursor { '>' } else { ' ' };
-                let style = if problem {
-                    ctx.theme.error
+        let theme = ctx.theme;
+        let inner = KitPane::inner(area);
+        let content = inner.width.saturating_sub(1);
+        // `{sign} ` leads a block's first row; its other rows are indented as far.
+        let text_width = usize::from(content.saturating_sub(2)).max(1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (at, outcome) in outcomes.iter().enumerate() {
+            let (sign, text, problem) = outcome_row(outcome);
+            let style = if problem { theme.error } else { theme.dim };
+            let rows = cells::wrap(&text, text_width);
+            for (index, row) in rows.into_iter().enumerate() {
+                let lead = if index == 0 {
+                    format!("{sign} ")
                 } else {
-                    ctx.theme.dim
+                    "  ".to_owned()
                 };
-                Line::from(vec![
-                    Span::styled(format!("{marker}{sign} "), ctx.theme.base),
-                    Span::styled(text, style),
-                ])
-            })
-            .collect();
-        self.pane_rows.set(
-            lines
-                .iter()
-                .map(|line| line.width().div_ceil(width).max(1))
-                .sum(),
-        );
+                let line = Line::from(vec![
+                    Span::styled(lead, theme.base),
+                    Span::styled(row, style),
+                ]);
+                let (gutter, line) = if at == cursor {
+                    (
+                        Span::styled(GUTTER, ctx.accent()),
+                        selection_band(line, content, theme),
+                    )
+                } else {
+                    (Span::raw(" "), ellipsize(line, content))
+                };
+                let mut spans = vec![gutter];
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+        let total = lines.len();
+        self.pane_rows.set(total);
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll.offset(), 0)),
+            Paragraph::new(lines).scroll((self.scroll.offset(), 0)),
             inner,
         );
+        let mut pane = view_chips(KitPane::new("import report"), 0)
+            .focus(holder(ctx, false))
+            .accent(ctx.accent())
+            .scrollbar(total, self.scroll.skip());
+        if let Some(hints) = key_line(self.key_hint(ctx.keys()), ctx.theme) {
+            pane = pane.hints(hints);
+        }
+        pane.render(frame, area, theme);
     }
 
     /// The editor over the whole content, its title carrying the draft's estimate (D82). An open
@@ -2001,7 +2094,7 @@ impl LibraryView {
     /// proposal over all of it.
     fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let draft = match &editor.help {
-            Some(help) => help.render(frame, area, ctx.theme),
+            Some(help) => help.render(frame, area, ctx, 0),
             None => Some(area),
         };
         if let Some(draft) = draft {
@@ -2009,40 +2102,52 @@ impl LibraryView {
         }
     }
 
-    /// The draft's block: the name, the versions and the estimate, and the text with its cursor
-    /// (dim under an open help, which has the keys). The text's rect is claimed for an in-pane
-    /// editor (MOD-57 P2), inside the block, so the name and versions stay visible beside it.
+    /// The draft's pane: the name, the versions and the estimate as its title, the view chips while
+    /// the whole title fits beside them (`view_chips_if_room`), and the text with its cursor (dim
+    /// under an open help, which has the keys and the focus). The text's rect is claimed for an
+    /// in-pane editor (MOD-57 P2), inside the pane, so the name and versions stay visible beside
+    /// it.
     fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let name = editor.target.name();
         let tokens = estimate(name, editor.saves(), editor.area.text());
         let title = match (&editor.target, editor.from) {
             (Target::New { .. }, _) => {
-                format!(" {name} \u{b7} new, saves v1 \u{b7} ~{tokens} tokens ")
+                format!("{name} \u{b7} new, saves v1 \u{b7} ~{tokens} tokens")
             }
             // MOD-9 D127: a skill with no version row has nothing to edit from.
             (Target::Version { .. }, None) => format!(
-                " {name} \u{b7} no version yet, saves v{} \u{b7} ~{tokens} tokens ",
+                "{name} \u{b7} no version yet, saves v{} \u{b7} ~{tokens} tokens",
                 editor.saves()
             ),
             (Target::Version { .. }, Some(from)) => format!(
-                " {name} \u{b7} editing from v{from}, saves v{} \u{b7} ~{tokens} tokens ",
+                "{name} \u{b7} editing from v{from}, saves v{} \u{b7} ~{tokens} tokens",
                 editor.saves()
             ),
         };
-        let block = Block::new().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = KitPane::inner(area);
         self.page.set(inner.height);
+        let open = editor.help.is_none();
         frame.render_widget(
-            Paragraph::new(editor.area.lines(
-                inner.width,
-                inner.height,
-                editor.help.is_none(),
-                ctx.theme,
-            )),
+            Paragraph::new(
+                editor
+                    .area
+                    .lines(inner.width, inner.height, open, ctx.theme),
+            ),
             inner,
         );
         ctx.claim_editor_area(inner);
+        let focus = if open {
+            holder(ctx, false)
+        } else {
+            Focus::Unfocused
+        };
+        let mut pane = view_chips_if_room(KitPane::new(&title), &title, 0, area.width)
+            .focus(focus)
+            .accent(ctx.accent());
+        if let Some(hints) = key_line(self.key_hint(ctx.keys()), ctx.theme) {
+            pane = pane.hints(hints);
+        }
+        pane.render(frame, area, ctx.theme);
     }
 }
 
@@ -2141,13 +2246,17 @@ mod tests {
             },
             ..LibraryView::default()
         };
-        let (_, lines) = view.pane(40, &ctx);
-        let drawn: usize = lines[0]
-            .spans
-            .iter()
-            .map(|span| cell_width(&span.content))
-            .sum();
-        assert_eq!(drawn, 40, "{lines:?}");
+        // MOD-115 M4 E5: the prompt is a `kit::form`; no row of it runs past the pane.
+        let (_, detail) = view.detail(&ctx);
+        let Detail::Form(form) = detail else {
+            panic!("the prompt is a form");
+        };
+        let lines = form.lines(40, ctx.accent(), &theme);
+        assert!(lines.iter().all(|line| line.width() <= 40), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.width() == 40),
+            "the field takes the value column: {lines:?}"
+        );
     }
 
     /// The Harness's startup scope: the Graphics workspace and its one project.
@@ -3793,5 +3902,374 @@ mod tests {
         view.cursor = 0;
         assert!(view.restore_cursor(&at));
         assert_eq!(view.cursor, 1, "the skill is gone: its row");
+    }
+
+    // ---- MOD-115 M4 L-skills: the view on the kit ----------------------------------------------
+
+    /// `view` drawn at `width` x `height` through `ctx`, as the buffer and its rows.
+    fn frame_of(
+        view: &LibraryView,
+        ctx: &Ctx<'_>,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), ctx))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
+
+    /// MOD-115 M4 MD-A: the prompts' hints name `field.submit` through `LIBRARY_PROMPT`, so a
+    /// rebound one shows its chord; `Esc` stays the field's (M2 MD7).
+    #[test]
+    fn the_prompt_hints_name_the_submit_key_in_force() {
+        let rebound = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the key file loads");
+        let naming = LibraryView {
+            mode: Mode::Naming {
+                field: TextField::new(),
+            },
+            ..LibraryView::default()
+        };
+        let import = LibraryView {
+            mode: Mode::ImportPath {
+                field: TextField::new(),
+            },
+            ..LibraryView::default()
+        };
+        assert_eq!(
+            naming.key_hint(Keys::compiled()),
+            "Enter next \u{b7} Esc cancel"
+        );
+        assert_eq!(naming.key_hint(&rebound), "Ctrl+t next \u{b7} Esc cancel");
+        assert_eq!(
+            import.key_hint(Keys::compiled()),
+            "Enter import \u{b7} Esc cancel"
+        );
+        assert_eq!(import.key_hint(&rebound), "Ctrl+t import \u{b7} Esc cancel");
+    }
+
+    /// MOD-115 M4 MD-A: what a prompt's field passes resolves from the chord pressed
+    /// (`Ctx::pressed`), not the event delivered: with `field.line_down` on `ctrl-n` the shell
+    /// delivers the canonical `Down`, which the one-line field passes; the pressed `ctrl-n` is a
+    /// chord the modal stack passes on, a pressed `Down` is swallowed.
+    #[test]
+    fn a_prompt_resolves_what_its_field_passes_from_the_chord_pressed() {
+        let bench = Bench::new();
+        let chord = |spec: &str| crate::keys::KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = key(KeyCode::Down);
+        for mode in [
+            Mode::Naming {
+                field: TextField::new(),
+            },
+            Mode::ImportPath {
+                field: TextField::new(),
+            },
+        ] {
+            let mut view = LibraryView {
+                mode,
+                ..LibraryView::default()
+            };
+            assert_eq!(
+                view.on_key(down, &mut bench.ctx().with_pressed(down, chord("ctrl-n"))),
+                Handled::Pass,
+                "a pressed `ctrl-n` delivered as `Down` passes"
+            );
+            assert_eq!(
+                view.on_key(down, &mut bench.ctx().with_pressed(down, chord("down"))),
+                Handled::Consumed,
+                "a pressed `Down` is swallowed"
+            );
+            assert!(view.captures_input(), "the prompt stays");
+        }
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the list's cursor is the kit's gutter and band, legible without
+    /// colour (the band reverses), not `selected` on the text alone; the list and the body are
+    /// rounded kit panes.
+    #[tokio::test]
+    async fn the_list_cursor_is_the_gutter_and_band() {
+        use ratatui::style::Modifier;
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench {
+                theme,
+                ..Bench::new()
+            };
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 28);
+            assert!(rows[0].starts_with('\u{256d}'), "rounded: {rows:#?}");
+            assert_eq!(buffer[(1, 1)].symbol(), GUTTER, "{rows:#?}");
+            assert_eq!(buffer[(1, 2)].symbol(), " ", "only the cursor's row");
+            let band = |y: u16| {
+                let cell = &buffer[(5, y)];
+                (cell.bg, cell.modifier.contains(Modifier::REVERSED))
+            };
+            let selected = (
+                theme.selected.bg.unwrap_or(ratatui::style::Color::Reset),
+                theme.selected.add_modifier.contains(Modifier::REVERSED),
+            );
+            assert_eq!(band(1), selected, "the cursor's row is banded");
+            assert_ne!(band(2), selected, "the next row is not");
+            // The band runs past the text, to the pane's edge.
+            assert_eq!(buffer[(30, 1)].bg, selected.0);
+        }
+    }
+
+    /// MOD-115 M4 C4: an open prompt holds the keyboard, so the pane it is drawn in is the
+    /// focused one, in the tab's accent with the prompt's keys on its bottom border, and the
+    /// list is not, whatever the shell's focus says.
+    #[test]
+    fn an_open_prompt_holds_the_focus_and_its_hints() {
+        let bench = Bench::new();
+        let view = LibraryView {
+            mode: Mode::Naming {
+                field: TextField::new(),
+            },
+            snapshot: Some(SkillsSnapshot {
+                skills: Vec::new(),
+                global: Vec::new(),
+                projects: Vec::new(),
+            }),
+            ..LibraryView::default()
+        };
+        let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 20);
+        let accent = bench.theme.tab_accent(SkillsTab::ID.0);
+        assert_eq!(
+            Some(buffer[(32, 0)].fg),
+            accent.fg,
+            "the prompt's pane: {rows:#?}"
+        );
+        assert_eq!(
+            Some(buffer[(0, 0)].fg),
+            bench.theme.border_faint.fg,
+            "not the list"
+        );
+        let bottom = &rows[18];
+        let detail: String = bottom.chars().skip(32).collect();
+        assert!(detail.contains("Enter next"), "the prompt's pane: {bottom}");
+        let list: String = bottom.chars().take(32).collect();
+        assert!(!list.contains("Enter"), "no hint on the list: {bottom}");
+        assert!(rows[0].contains("new skill"), "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.contains("name")),
+            "the prompt is a form row: {rows:#?}"
+        );
+    }
+
+    /// MOD-115 M4 E5 (MOD-82 carried), T3: the body's title names no key; while its lines
+    /// overflow it, the scroll keys close the hints of the body pane, shown when it is focused,
+    /// after the view's own keys, so a pane too narrow for them all drops those first, whole (the
+    /// scrollbar still says it scrolls). The list's hints never carry them.
+    #[tokio::test]
+    async fn the_scroll_keys_close_the_focused_body_and_no_title_names_a_key() {
+        use crate::ui::shell::PaneId;
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 6);
+        assert!(rows[0].contains("rust-style v2 (head v2)"), "{rows:#?}");
+        assert!(
+            rows.iter().all(|row| !row.contains("J/K")),
+            "list focused: {rows:#?}"
+        );
+        let focused = bench.ctx().with_focus(PaneId::Detail);
+        let (_, rows) = frame_of(&view, &focused, 100, 6);
+        assert!(!rows[0].contains("J/K"), "no key in a title: {rows:#?}");
+        let narrow: String = rows[4].chars().skip(32).collect();
+        assert!(
+            narrow.starts_with("\u{2570}\u{2500},/. version \u{b7} b base \u{b7} d diff")
+                && narrow.contains(" \u{2026}"),
+            "the view's keys lead, cut by whole keys: {rows:#?}"
+        );
+        assert!(
+            !narrow.contains("J/K"),
+            "the scroll keys drop first: {narrow}"
+        );
+        let (_, rows) = frame_of(&view, &focused, 140, 4);
+        let wide = &rows[2];
+        let (own, scroll) = (
+            wide.find("b base"),
+            wide.find("J/K scroll \u{b7} PgUp/PgDn page"),
+        );
+        assert!(
+            own.zip(scroll).is_some_and(|(own, scroll)| own < scroll),
+            "wide enough, the scroll keys close the hints: {wide}"
+        );
+    }
+
+    /// Whether `cell` is drawn in `style`: its colours where it names them, and its modifiers.
+    fn in_style(cell: &ratatui::buffer::Cell, style: ratatui::style::Style) -> bool {
+        style.fg.is_none_or(|fg| cell.fg == fg)
+            && style.bg.is_none_or(|bg| cell.bg == bg)
+            && cell.modifier.contains(style.add_modifier)
+    }
+
+    /// The buffer column `text` starts at in `row`, counted in cells.
+    fn column_of(row: &str, text: &str) -> u16 {
+        let at = row
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} is not on {row:?}"));
+        u16::try_from(row[..at].chars().count()).expect("a short row")
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the body's and the draft's titles are the kit pane's title role,
+    /// the tab's accent in bold while the pane is focused and dim while it is not, never a
+    /// style the view paints on them. In colour and in monochrome.
+    #[tokio::test]
+    async fn the_body_and_draft_titles_are_the_pane_title_role() {
+        use crate::ui::shell::PaneId;
+        use ratatui::style::Modifier;
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench {
+                theme,
+                ..Bench::new()
+            };
+            let focused = bench
+                .theme
+                .tab_accent(SkillsTab::ID.0)
+                .add_modifier(Modifier::BOLD);
+            let view = browsing(&bench).await;
+            let ctx = bench.ctx().with_focus(PaneId::Detail);
+            let (buffer, rows) = frame_of(&view, &ctx, 100, 12);
+            let x = column_of(&rows[0], "rust-style v2");
+            assert!(in_style(&buffer[(x, 0)], focused), "focused: {rows:#?}");
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let title = &buffer[(x, 0)];
+            assert!(in_style(title, bench.theme.dim), "unfocused: {rows:#?}");
+            assert!(!title.modifier.contains(Modifier::BOLD), "{rows:#?}");
+
+            let target = Target::New {
+                name: "docs-style".to_owned(),
+                description: String::new(),
+            };
+            let view = LibraryView {
+                mode: Mode::Editing(Editor::new(target, 0, None, "First line.\n")),
+                ..LibraryView::default()
+            };
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let x = column_of(&rows[0], "docs-style");
+            assert!(in_style(&buffer[(x, 0)], focused), "the draft: {rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 L-skills repair 1 (Q2): the focused list shows its own keys whole in its 28
+    /// cells: its motion first, as every list's hint does, then a new skill and the view's own
+    /// act, the keys the Browse row showed before the port; the row's keys are the body's.
+    #[tokio::test]
+    async fn the_list_hint_leads_with_its_motion() {
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2570}'))
+            .expect("the list's bottom border");
+        let list: String = rows[bottom].chars().take(32).collect();
+        assert_eq!(
+            list.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}']),
+            "j/k \u{b7} n new \u{b7} I import",
+            "{rows:#?}"
+        );
+    }
+
+    /// MOD-115 M4 L-skills repair 2: every empty state of the pane says what is missing and the
+    /// next step (`kit::empty`), and a refused read names where it is fixed: before the first
+    /// reply, on a refused read, on an empty library and on a skill with no version yet.
+    #[tokio::test]
+    async fn every_empty_pane_names_its_next_step() {
+        let bench = Bench::new();
+        let shows = |view: &LibraryView, bench: &Bench, texts: &[&str]| {
+            let (_, rows) = frame_of(view, &bench.ctx(), 100, 12);
+            for text in texts {
+                assert!(
+                    rows.iter().any(|row| row.contains(text)),
+                    "{text:?}: {rows:#?}"
+                );
+            }
+        };
+        shows(
+            &LibraryView::default(),
+            &bench,
+            &["skills not read yet", "they appear once the store answers"],
+        );
+        let refused = LibraryView {
+            unavailable: Some("store unreachable: gone".to_owned()),
+            ..LibraryView::default()
+        };
+        shows(
+            &refused,
+            &bench,
+            &[
+                "skills unavailable: store unreachable: gone",
+                "Settings \u{203a} Connection stores a DSN",
+            ],
+        );
+        let empty = LibraryView {
+            snapshot: Some(SkillsSnapshot {
+                skills: Vec::new(),
+                global: Vec::new(),
+                projects: Vec::new(),
+            }),
+            ..LibraryView::default()
+        };
+        shows(
+            &empty,
+            &bench,
+            &["select a skill", "n creates one \u{b7} I imports some"],
+        );
+        let mut unversioned = browsing(&bench).await;
+        if let Some(snapshot) = unversioned.snapshot.as_mut() {
+            snapshot.skills[0].versions.clear();
+        }
+        shows(
+            &unversioned,
+            &bench,
+            &["select a skill", "e writes its first version"],
+        );
+
+        // With every key of a next step unbound, the step is said in words, never left blank.
+        let unbound = Bench {
+            keys: crate::keys::load_str(
+                "version = 2\n[common]\nnew = []\nedit = []\n[skills.library]\nimport = []\n",
+            )
+            .expect("the key file loads"),
+            ..Bench::new()
+        };
+        shows(&empty, &unbound, &["a new or imported skill shows here"]);
+        shows(&unversioned, &unbound, &["its first version shows here"]);
+    }
+
+    /// MOD-115 M4 L-skills repair 2: the draft's title (the versions and the token estimate,
+    /// D82) stays whole in a pane just wide enough for it: the view chips, which do nothing while
+    /// the draft has the keys, are drawn only when the whole title fits beside them.
+    #[test]
+    fn the_draft_title_stays_whole_where_the_chips_would_cut_it() {
+        let bench = Bench::new();
+        let body = "First line.\n";
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let view = LibraryView {
+            mode: Mode::Editing(Editor::new(target, 0, None, body)),
+            ..LibraryView::default()
+        };
+        let title = format!(
+            "docs-style \u{b7} new, saves v1 \u{b7} ~{} tokens",
+            estimate("docs-style", 1, body)
+        );
+        let width = u16::try_from(cell_width(&title)).expect("a short title") + 6;
+        let (_, rows) = frame_of(&view, &bench.ctx(), width, 8);
+        assert!(rows[0].contains(&format!(" {title} ")), "{rows:#?}");
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 8);
+        assert!(rows[0].contains(&format!(" {title} ")), "{rows:#?}");
+        assert!(rows[0].contains(" Skills "), "the view chips: {rows:#?}");
     }
 }

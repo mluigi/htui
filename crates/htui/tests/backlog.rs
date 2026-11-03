@@ -71,6 +71,20 @@ async fn backlog() -> Harness {
     harness
 }
 
+/// [`backlog`] on a `width` x `height` terminal (MOD-81's 80-column case).
+async fn backlog_at(width: u16, height: u16) -> Harness {
+    let mut harness = Harness::demo()
+        .size(width, height)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    harness
+}
+
 /// Moves the selection down `n` rows, serving what each move asks the store for.
 async fn down(harness: &mut Harness, n: usize) {
     for _ in 0..n {
@@ -96,6 +110,13 @@ const TO_FEAT_1: usize = 3;
 /// Rows down to htui `ANA-2`, the item nothing in the fixture attaches to.
 const TO_ANA_2: usize = 1;
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 #[tokio::test]
 async fn the_list_groups_the_two_project_workspace_by_project() {
     let mut harness = backlog().await;
@@ -103,10 +124,30 @@ async fn the_list_groups_the_two_project_workspace_by_project() {
     assert!(frame.contains("htui"), "the first project header");
     assert!(frame.contains("agy"), "the second project header");
     assert!(
-        frame.contains("awaiting_approval"),
-        "every status renders in full"
+        frame.contains("\u{26a0} needs you"),
+        "every status renders as its mark and word (MOD-115 M4 E4)"
     );
     insta::assert_snapshot!("list_grouped", frame);
+}
+
+/// MOD-81, MOD-115 M4 E4: the list and the detail at 80 columns. The status column is sized for
+/// the marks, so the titles keep their room; the detail keeps `KEY · title` first, its chips
+/// windowed after it.
+#[tokio::test]
+async fn the_list_and_the_detail_at_80_columns() {
+    let mut harness = backlog_at(80, 24).await;
+    down(&mut harness, TO_FEAT_1).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{25d0} running    TUI scaffold"),
+        "{frame}"
+    );
+    assert!(frame.contains("\u{26a0} needs you"), "{frame}");
+    assert!(
+        frame.contains("\u{256d}\u{2500} FEAT-1 \u{b7} TUI scaffold "),
+        "{frame}"
+    );
+    insta::assert_snapshot!("list_80", frame);
 }
 
 #[tokio::test]
@@ -136,22 +177,22 @@ async fn enter_folds_and_unfolds_a_project_group() {
 async fn j_k_g_and_shift_g_move_the_selection() {
     let mut harness = backlog().await;
     assert!(
-        harness.render().contains("┌ ANA-1"),
+        on_item(&harness.render(), "ANA-1"),
         "the first item is selected on arrival"
     );
 
     down(&mut harness, TO_FEAT_1).await;
-    assert!(harness.render().contains("┌ FEAT-1"), "three rows down");
+    assert!(on_item(&harness.render(), "FEAT-1"), "three rows down");
 
     harness.key("k");
     harness.drive_to_end().await;
-    assert!(harness.render().contains("┌ CLEAN-1"), "one row back up");
+    assert!(on_item(&harness.render(), "CLEAN-1"), "one row back up");
 
     harness.key("G");
     harness.drive_to_end().await;
     let last = harness.render();
     assert!(
-        last.contains("┌ FIX-1"),
+        on_item(&last, "FIX-1"),
         "G lands on the last row: agy FIX-1"
     );
     insta::assert_snapshot!("list_last_row", last);
@@ -160,7 +201,7 @@ async fn j_k_g_and_shift_g_move_the_selection() {
     harness.drive_to_end().await;
     let first = harness.render();
     assert!(
-        first.contains("┌ Detail") && first.contains("No item selected"),
+        on_item(&first, "Detail") && first.contains("No item selected"),
         "g lands on the first project header, which has no detail"
     );
 }
@@ -202,7 +243,7 @@ async fn every_sub_tab_says_so_when_it_has_nothing() {
         sub_tab(&mut harness, steps);
         let frame = harness.render();
         assert!(
-            frame.contains("┌ ANA-2"),
+            on_item(&frame, "ANA-2"),
             "the empty cases all sit on htui ANA-2"
         );
         assert!(
@@ -224,7 +265,7 @@ async fn the_prompt_sub_tab_says_so_with_no_item_selected() {
     sub_tab(&mut harness, 5);
     let frame = harness.render();
     assert!(
-        frame.contains("┌ Detail") && frame.contains("No item selected"),
+        on_item(&frame, "Detail") && frame.contains("No item selected"),
         "g lands on the first project header:\n{frame}"
     );
     insta::assert_snapshot!("empty_prompt", frame);
@@ -316,7 +357,7 @@ async fn the_reqs_sub_tab_shows_ana_1_s_suspect_citation() {
     let mut harness = backlog().await;
     sub_tab(&mut harness, TO_REQS);
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-1"), "the arrival row:\n{frame}");
+    assert!(on_item(&frame, "ANA-1"), "the arrival row:\n{frame}");
     assert!(
         frame.contains("R-ENT-1 addresses v1 ! suspect"),
         "the citation, its stamp and the marker:\n{frame}"
@@ -355,11 +396,11 @@ async fn r_reconfirms_the_suspect_citation() {
 async fn c_cites_a_requirement_of_the_item_s_project() {
     let (mut harness, picker) = picking_r_ent_2().await;
     assert!(
-        picker.contains("┌ FEAT-1"),
+        on_item(&picker, "FEAT-1"),
         "the list cursor stayed:\n{picker}"
     );
     assert!(
-        picker.contains("▸ R-ENT-2 later An item may carry"),
+        picker.contains("\u{258c} R-ENT-2 later An item may carry"),
         "the picker's cursor is on R-ENT-2:\n{picker}"
     );
     assert!(
@@ -374,7 +415,7 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
     let frame = harness.render();
     assert_eq!(harness.app().status, None, "the cite applied");
     assert!(
-        frame.contains("▸ R-ENT-2 addresses v1"),
+        frame.contains("\u{258c} R-ENT-2 addresses v1"),
         "the new citation, under the cursor:\n{frame}"
     );
     assert!(
@@ -388,7 +429,7 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
 async fn u_then_y_uncites() {
     let mut harness = cited_r_ent_2().await;
     assert!(
-        harness.render().contains("▸ R-ENT-2 addresses v1"),
+        harness.render().contains("\u{258c} R-ENT-2 addresses v1"),
         "the new citation is under the cursor"
     );
     harness.key("u");
@@ -436,7 +477,7 @@ async fn the_reqs_sub_tab_says_so_when_it_has_nothing() {
     down(&mut harness, TO_CLEAN_1).await;
     sub_tab(&mut harness, TO_REQS);
     let frame = harness.render();
-    assert!(frame.contains("┌ CLEAN-1"), "the empty case:\n{frame}");
+    assert!(on_item(&frame, "CLEAN-1"), "the empty case:\n{frame}");
     assert!(
         frame.contains("No requirements cited."),
         "a message, never a blank pane:\n{frame}"
@@ -590,8 +631,10 @@ async fn parked() -> Harness {
     harness.key("R");
     harness.drive().await;
     let frame = harness.render();
+    // The Runs pane's half only: the list's `TOOL-1` row reads `⚠ needs you` in every frame.
+    let pane = detail_pane(&frame);
     assert!(
-        frame.contains("awaiting") && frame.contains("research"),
+        pane.contains("\u{26a0} needs you") && pane.contains("research"),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and nothing failed");
@@ -618,7 +661,7 @@ async fn x_note_letters_do_not_move_the_list() {
     type_text(&mut harness, "jkgGlh[]q1");
     harness.drive().await;
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-2"), "the list did not move:\n{frame}");
+    assert!(on_item(&frame, "ANA-2"), "the list did not move:\n{frame}");
     assert!(
         frame.contains("jkgGlh[]q1"),
         "every letter is in the note, and the Runs pane is still the one shown:\n{frame}"
@@ -663,7 +706,7 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     let mut harness = driving(MemStore::demo(), &adapter).await;
     sub_tab(&mut harness, 1);
     assert!(
-        harness.render().contains("┌ ANA-1"),
+        on_item(&harness.render(), "ANA-1"),
         "the arrival row is htui `ANA-1`"
     );
     harness.key("C");
@@ -676,9 +719,16 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     type_text(&mut harness, "ANA");
     harness.drive().await;
     let typed = harness.render();
-    assert!(typed.contains("type ANA-1 to close it: ANA"), "{typed}");
+    assert!(typed.contains("type ANA-1 to close it:"), "{typed}");
+    // What is typed is on its own row in the question (MOD-115 M4 L-runs, MOD-81).
     assert!(
-        typed.contains("┌ ANA-1"),
+        typed
+            .lines()
+            .any(|row| row.split('\u{2502}').any(|cell| cell.trim() == "ANA")),
+        "{typed}"
+    );
+    assert!(
+        on_item(&typed, "ANA-1"),
         "`A`, `N` and `A` are typed, not bound"
     );
     insta::assert_snapshot!("runs_closeout_typed", typed);
@@ -916,8 +966,11 @@ async fn v_draws_the_fan_out_run_as_a_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("0.1/0 done \u{2713}") && frame.contains("0.1/1 superseded"),
-        "both candidates are drawn:\n{frame}"
+        frame.contains("candidate 1")
+            && frame.contains("\u{25cf} done \u{2713}")
+            && frame.contains("candidate 2")
+            && frame.contains("\u{21b7} superseded"),
+        "both candidates are drawn, each titled by its place:\n{frame}"
     );
     assert!(!frame.contains("kind   status"), "no list header:\n{frame}");
     insta::assert_snapshot!("runs_flow_fanout", frame);
@@ -1068,12 +1121,15 @@ fn cell_of(frame: &str, needle: &str) -> (u16, u16) {
         .unwrap_or_else(|| panic!("`{needle}` is drawn:\n{frame}"))
 }
 
-/// The list row of the slot `slot` in a frame: the line that names it.
-fn listed<'a>(frame: &'a str, slot: &str) -> &'a str {
-    frame
-        .lines()
-        .find(|line| line.contains(slot))
-        .unwrap_or_else(|| panic!("`{slot}` is listed:\n{frame}"))
+/// The first list line of the step whose place is `place` (`candidate 2`) in a frame: the line
+/// above the one that names it (MOD-115 M4 E10), where the cursor's `▸` is.
+fn listed<'a>(frame: &'a str, place: &str) -> &'a str {
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(place))
+        .unwrap_or_else(|| panic!("`{place}` is listed:\n{frame}"));
+    lines[at.saturating_sub(1)]
 }
 
 /// MOD-71 D1, D6, ANA-12 invariant 2: in the flow, a click on `ANA-1`'s losing candidate moves the
@@ -1088,7 +1144,7 @@ async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
     harness.key("v");
     harness.drive_to_end().await;
     assert!(harness.app().wants_mouse(), "the flow wants the mouse");
-    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    let (column, row) = cell_of(&harness.render(), "\u{21b7} superseded");
     harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
 
@@ -1112,7 +1168,7 @@ async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
     assert!(harness.app().wants_mouse(), "still a list + detail tab");
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/1").contains('\u{25b8}'),
+        listed(&frame, "candidate 2").contains('\u{25b8}'),
         "the list's cursor is on the clicked step:\n{frame}"
     );
 }
@@ -1126,7 +1182,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.key("v");
     harness.drive_to_end().await;
     let frame = harness.render();
-    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let (column, row) = cell_of(&frame, "\u{25cf} done \u{2713}");
     let below = frame
         .lines()
         .nth(usize::from(row + 8))
@@ -1138,7 +1194,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column + 2, row + 9);
     let panned = harness.render();
     assert_eq!(
-        cell_of(&panned, "0.1/0 done"),
+        cell_of(&panned, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "the nodes moved by the drag:\n{panned}"
     );
@@ -1151,7 +1207,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        listed(&frame, "candidate 1").contains('\u{25b8}'),
         "the cursor stayed on the first candidate:\n{frame}"
     );
 }
@@ -1167,7 +1223,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     harness.drive_to_end().await;
     assert!(harness.app().mouse_capture(), "the flow takes the mouse");
     let frame = harness.render();
-    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let (column, row) = cell_of(&frame, "\u{25cf} done \u{2713}");
     let below = frame
         .lines()
         .nth(usize::from(row + 8))
@@ -1178,7 +1234,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     harness.mouse(MouseEventKind::Drag(MouseButton::Left), column + 2, row + 9);
     let panned = harness.render();
     assert_eq!(
-        cell_of(&panned, "0.1/0 done"),
+        cell_of(&panned, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "the drag pans:\n{panned}"
     );
@@ -1201,7 +1257,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     );
     let after = harness.render();
     assert_eq!(
-        cell_of(&after, "0.1/0 done"),
+        cell_of(&after, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "a bare drag pans nothing:\n{after}"
     );
@@ -1216,11 +1272,11 @@ async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
     sub_tab(&mut harness, 1);
     harness.key("v");
     harness.drive_to_end().await;
-    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    let (column, row) = cell_of(&harness.render(), "\u{21b7} superseded");
     harness.key("z");
     let zoomed = harness.render();
     assert!(
-        !zoomed.contains("0.1/1 superseded"),
+        !zoomed.contains("\u{21b7} superseded"),
         "the list is zoomed and the flow hidden:\n{zoomed}"
     );
     assert!(
@@ -1235,11 +1291,11 @@ async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        listed(&frame, "candidate 1").contains('\u{25b8}'),
         "the cursor stayed on the first candidate:\n{frame}"
     );
     assert!(
-        !listed(&frame, "0.1/1").contains('\u{25b8}'),
+        !listed(&frame, "candidate 2").contains('\u{25b8}'),
         "the click reached no hidden step:\n{frame}"
     );
 }
@@ -1274,7 +1330,7 @@ async fn enter_on_a_graph_node_re_roots_the_backlog() {
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-1"), "re-rooted on ANA-1:\n{frame}");
+    assert!(on_item(&frame, "ANA-1"), "re-rooted on ANA-1:\n{frame}");
     assert!(
         frame.contains("agy:ANA-1"),
         "only an htui root labels agy ANA-1 so:\n{frame}"
@@ -1289,7 +1345,7 @@ async fn enter_on_a_graph_node_re_roots_the_backlog() {
     harness.key("j");
     harness.drive_to_end().await;
     assert!(
-        harness.render().contains("┌ ANA-2"),
+        on_item(&harness.render(), "ANA-2"),
         "the list cursor was on htui ANA-1, not agy ANA-1"
     );
 }
@@ -1316,14 +1372,14 @@ async fn enter_reveals_a_node_of_the_other_project_and_unfolds_its_group() {
     harness.drive_to_end().await;
     // From the htui header: one row to the arrival row, then on to FEAT-2.
     down(&mut harness, 1 + TO_FEAT_2).await;
-    assert!(harness.render().contains("┌ FEAT-2"));
+    assert!(on_item(&harness.render(), "FEAT-2"));
     sub_tab(&mut harness, TO_GRAPH);
     // One `J` from FEAT-2's root row is agy FEAT-1: `agy` < `htui` breaks the key tie.
     harness.key("J");
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(frame.contains("┌ FEAT-1"), "re-rooted on FEAT-1:\n{frame}");
+    assert!(on_item(&frame, "FEAT-1"), "re-rooted on FEAT-1:\n{frame}");
     assert!(
         frame.contains("htui:FEAT-2"),
         "an agy root labels htui FEAT-2:\n{frame}"
@@ -1337,7 +1393,7 @@ async fn enter_reveals_a_node_of_the_other_project_and_unfolds_its_group() {
     harness.key("j");
     harness.drive_to_end().await;
     assert!(
-        harness.render().contains("┌ FIX-1"),
+        on_item(&harness.render(), "FIX-1"),
         "the list cursor was on agy FEAT-1"
     );
 }
@@ -1348,7 +1404,7 @@ async fn enter_on_a_node_outside_the_workspace_refuses_on_the_status_line() {
     let mut harness = revealing_backlog().await;
     harness.key("G");
     harness.drive_to_end().await;
-    assert!(harness.render().contains("┌ FIX-1"), "agy FIX-1");
+    assert!(on_item(&harness.render(), "FIX-1"), "agy FIX-1");
     sub_tab(&mut harness, TO_GRAPH);
     // Three `J` from agy FIX-1's root row is vulkan-tutorials FEAT-1 (blueprint §1.4).
     for _ in 0..3 {
@@ -1361,7 +1417,7 @@ async fn enter_on_a_node_outside_the_workspace_refuses_on_the_status_line() {
         Some("vulkan-tutorials:FEAT-1 is outside this workspace")
     );
     let frame = harness.render();
-    assert!(frame.contains("┌ FIX-1"), "the list did not move:\n{frame}");
+    assert!(on_item(&frame, "FIX-1"), "the list did not move:\n{frame}");
     insta::assert_snapshot!("graph_outside_workspace", frame);
 }
 
@@ -1381,7 +1437,7 @@ async fn enter_on_the_graph_root_row_is_consumed_under_the_real_registration() {
     harness.key("m");
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("▸ FEAT-1 in_progress"),
+        on_item(&frame, "FEAT-1") && frame.contains("\u{258c} FEAT-1 \u{25d0} running"),
         "the Graph, its cursor on the root row:\n{frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -1447,7 +1503,7 @@ async fn plus_and_minus_change_the_graph_depth() {
     harness.key("j");
     harness.drive_to_end().await;
     let feat_2 = harness.render();
-    assert!(feat_2.contains("┌ FEAT-2"), "{feat_2}");
+    assert!(on_item(&feat_2, "FEAT-2"), "{feat_2}");
     assert!(
         feat_2.contains("depth 3/3"),
         "the depth is a preference, not per item:\n{feat_2}"
@@ -1502,12 +1558,16 @@ fn detail_pane(frame: &str) -> String {
         .join("\n")
 }
 
-/// The run-grid status cell of the only `graph` run on the pane.
+/// The run-grid status cell of the only `graph` run on the pane: its mark's word (MOD-115 M4
+/// E10), the glyph before it dropped.
 fn run_status(frame: &str) -> Option<String> {
     detail_pane(frame).lines().find_map(|line| {
-        let mut cells = line.split_whitespace();
-        cells.position(|cell| cell == "graph")?;
-        cells.next().map(str::to_owned)
+        if !line.starts_with("graph ") {
+            return None;
+        }
+        let cell: String = line.chars().skip(7).take(11).collect();
+        let (_glyph, word) = cell.trim().split_once(' ')?;
+        Some(word.to_owned())
     })
 }
 
@@ -1569,7 +1629,7 @@ async fn the_runs_pane_rereads_an_active_run_every_poll() {
     let frame = harness.render();
     assert_eq!(
         run_status(&frame).as_deref(),
-        Some("awaiting"),
+        Some("needs you"),
         "the twentieth tick is the fifth refresh, and the poll shows the park:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and nothing failed");
@@ -1717,6 +1777,16 @@ fn list_title(frame: &str) -> &str {
         .expect("the list pane has a title")
 }
 
+/// The list pane's first row under its title: the summary band while a filter is applied
+/// (MOD-115 M4 E4, D-13).
+fn band(frame: &str) -> &str {
+    frame
+        .lines()
+        .skip_while(|line| !line.contains("Backlog ("))
+        .nth(1)
+        .expect("the list pane has a row under its title")
+}
+
 /// D1, D2: a status filter reads only that status.
 #[tokio::test]
 async fn filtering_by_status_done_lists_only_done_items() {
@@ -1725,7 +1795,7 @@ async fn filtering_by_status_done_lists_only_done_items() {
     keys(&mut harness, &["enter"]).await;
     let frame = harness.render();
     assert!(
-        list_title(&frame).contains("Backlog (2) · status:done "),
+        list_title(&frame).contains("Backlog (2) ") && band(&frame).contains(" / status: done "),
         "{frame}"
     );
     assert!(frame.contains("Data model, box registry"), "{frame}");
@@ -1741,7 +1811,7 @@ async fn filtering_by_one_project_lists_only_its_items() {
     keys(&mut harness, &["f", "j", "space", "enter"]).await;
     let frame = harness.render();
     assert!(
-        list_title(&frame).contains("Backlog (8) · project:htui "),
+        list_title(&frame).contains("Backlog (8) ") && band(&frame).contains(" / project: htui "),
         "{frame}"
     );
     assert!(!frame.contains("ACP transport upgrade"), "{frame}");
@@ -1756,7 +1826,7 @@ async fn filtering_by_the_rust_tag_lists_only_rust_items() {
     keys(&mut harness, &["enter"]).await;
     let frame = harness.render();
     assert!(
-        list_title(&frame).contains("Backlog (4) · tags:rust "),
+        list_title(&frame).contains("Backlog (4) ") && band(&frame).contains(" / tags: rust "),
         "htui FEAT-1/2/3 and agy FEAT-1:\n{frame}"
     );
     assert!(
@@ -1809,7 +1879,8 @@ async fn ready_here_lists_what_this_box_can_start() {
     .await;
     let frame = harness.render();
     assert!(
-        list_title(&frame).contains(&format!("Backlog ({}) · ready here ", ready.len())),
+        list_title(&frame).contains(&format!("Backlog ({}) ", ready.len()))
+            && band(&frame).contains(" / ready here "),
         "{frame}"
     );
     for item in &ready {
@@ -1829,14 +1900,14 @@ async fn shift_f_restores_the_whole_list() {
     let mut harness = backlog().await;
     keys(&mut harness, &TICK_DONE).await;
     keys(&mut harness, &["enter"]).await;
-    assert!(list_title(&harness.render()).contains("Backlog (2) · "));
+    assert!(band(&harness.render()).contains(" / status: done "));
     keys(&mut harness, &["F"]).await;
     let frame = harness.render();
     let title = list_title(&frame);
     assert!(title.contains("Backlog (11) "), "{frame}");
     assert!(
-        !title.contains('·'),
-        "no summary without a filter:\n{frame}"
+        !band(&frame).contains(" / "),
+        "no summary band without a filter:\n{frame}"
     );
     assert!(frame.contains("TUI scaffold"), "{frame}");
 }
@@ -1864,7 +1935,7 @@ async fn the_filter_form_renders_in_the_list_pane() {
     assert!(list_title(&frame).contains("Backlog (11) "), "{frame}");
     assert!(frame.contains("Filter"), "{frame}");
     assert!(frame.contains("[x] done"), "{frame}");
-    assert!(frame.contains("> tags    rust"), "{frame}");
+    assert!(frame.contains("\u{258c}tags      rust"), "{frame}");
     insta::assert_snapshot!("filter_form", frame);
 }
 
@@ -1875,8 +1946,12 @@ async fn the_filtered_list_names_its_filter() {
     keys(&mut harness, &TICK_DONE).await;
     keys(&mut harness, &["enter"]).await;
     let frame = harness.render();
-    assert!(frame.contains("┌ Backlog (2) · status:done"), "{frame}");
-    assert!(frame.contains("┌ ANA-1"), "{frame}");
+    assert!(
+        list_title(&frame).contains("\u{256d}\u{2500} Backlog (2) ")
+            && band(&frame).contains(" / status: done "),
+        "{frame}"
+    );
+    assert!(on_item(&frame, "ANA-1"), "{frame}");
     insta::assert_snapshot!("filtered_list", frame);
 }
 
@@ -1889,6 +1964,11 @@ async fn a_filter_nothing_matches_says_so() {
     keys(&mut harness, &["enter"]).await;
     let frame = harness.render();
     assert!(frame.contains("No items match the filter."), "{frame}");
+    // MOD-115 M4 RV, repair 2: no item row is there for the list's motion to choose, so the
+    // detail's no-item state names none; the list's own step clears the filter.
+    assert!(frame.contains("No item selected."), "{frame}");
+    assert!(frame.contains("a chosen item shows here"), "{frame}");
+    assert!(!frame.contains("chooses one"), "{frame}");
     insta::assert_snapshot!("filter_no_match", frame);
 }
 
@@ -2391,7 +2471,7 @@ async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
     let root = tempfile::tempdir().expect("a throwaway config root");
     let (mut harness, cache) = offline_backlog(root.path()).await;
     assert!(
-        harness.render().contains("┌ ANA-1"),
+        on_item(&harness.render(), "ANA-1"),
         "the mirror's items are listed and the first is selected"
     );
     let refused = format!("item_form: store unreachable: {DATABASE_UNREACHABLE}");
@@ -2443,8 +2523,12 @@ async fn the_new_item_form_renders_in_the_detail_pane() {
     type_text(&mut harness, "Fresh item");
     let frame = harness.render();
     assert!(frame.contains(" New item \u{b7} htui "), "{frame}");
-    assert!(frame.contains("> title"), "the focus is on Title:\n{frame}");
-    assert!(frame.contains("\u{2039}ANA "), "the hinted kind:\n{frame}");
+    // MOD-115 M4 L-forms: the focused row carries the kit gutter (and band).
+    assert!(
+        frame.contains("\u{258c}title "),
+        "the focus is on Title:\n{frame}"
+    );
+    assert!(frame.contains("\u{2039} ANA "), "the hinted kind:\n{frame}");
     assert!(frame.contains("kind default"), "{frame}");
     insta::assert_snapshot!("item_form_new", frame);
 }
@@ -2457,7 +2541,7 @@ async fn the_edit_item_form_renders_in_the_detail_pane() {
     let frame = harness.render();
     assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
     assert!(
-        !frame.contains("project  \u{2039}"),
+        !frame.contains(" project    \u{2039}"),
         "an edit has no project row:\n{frame}"
     );
     insta::assert_snapshot!("item_form_edit", frame);
@@ -3120,10 +3204,7 @@ async fn offline_a_opens_no_compose_in_either_pane() {
     let _keyring = htui_store::testkit::mock_keyring().await;
     let root = tempfile::tempdir().expect("a throwaway config root");
     let (mut harness, cache) = offline_backlog(root.path()).await;
-    assert!(
-        harness.render().contains("\u{250c} ANA-1"),
-        "ANA-1 is selected"
-    );
+    assert!(on_item(&harness.render(), "ANA-1"), "ANA-1 is selected");
     let notes = cache
         .notes(ids::HTUI_ANA_1)
         .await
@@ -3405,7 +3486,7 @@ async fn q_on_a_done_item_queues_nothing() {
     let store = MemStore::demo();
     let mut harness = backlog_over(store.clone()).await;
     assert!(
-        harness.render().contains("┌ ANA-1"),
+        on_item(&harness.render(), "ANA-1"),
         "the cursor arrives on the done ANA-1"
     );
     keys(&mut harness, &["Q"]).await;
@@ -3506,7 +3587,7 @@ async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     harness.drive_to_end().await;
     let after = harness.render();
     assert!(
-        after.contains("┌ FEAT-1"),
+        on_item(&after, "FEAT-1"),
         "the list cursor stayed:\n{after}"
     );
     assert!(
@@ -3521,11 +3602,14 @@ async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     harness.key("j");
     harness.drive_to_end().await;
     assert!(
-        !harness.render().contains("┌ FEAT-1"),
+        !on_item(&harness.render(), "FEAT-1"),
         "the list moved on:\n{}",
         harness.render()
     );
 }
+
+/// FEAT-1's Body head, its meta line (MOD-115 M4 E4): what says the Body is FEAT-1's.
+const FEAT_1_META: &str = "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1";
 
 /// MOD-115 M2 D5 (T7): a sub-tab change is a place in the history; Back returns to the sub-tab
 /// left and the item the cursor was on then, and Forward to the one it moved to since.
@@ -3537,7 +3621,7 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     harness.drive_to_end().await;
     down(&mut harness, 1).await;
     let runs = harness.render();
-    assert!(!runs.contains("┌ FEAT-1"), "the cursor moved on:\n{runs}");
+    assert!(!on_item(&runs, "FEAT-1"), "the cursor moved on:\n{runs}");
     assert!(
         runs.contains("\u{232b} back"),
         "the header offers the way back:\n{runs}"
@@ -3546,21 +3630,18 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     harness.key("backspace");
     harness.drive_to_end().await;
     let body = harness.render();
-    assert!(body.contains("┌ FEAT-1"), "back on FEAT-1:\n{body}");
-    assert!(
-        body.contains("FEAT-1  FEAT  in_progress"),
-        "on its Body:\n{body}"
-    );
+    assert!(on_item(&body, "FEAT-1"), "back on FEAT-1:\n{body}");
+    assert!(body.contains(FEAT_1_META), "on its Body:\n{body}");
 
     harness.key("alt-right");
     harness.drive_to_end().await;
     let forward = harness.render();
     assert!(
-        !forward.contains("┌ FEAT-1"),
+        !on_item(&forward, "FEAT-1"),
         "forward to the item left:\n{forward}"
     );
     assert!(
-        !forward.contains("FEAT-1  FEAT  in_progress"),
+        !forward.contains(FEAT_1_META),
         "and off the Body:\n{forward}"
     );
 }
@@ -3617,7 +3698,7 @@ async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
     press(&mut harness, &["f"]).await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} Filter "),
+        frame.contains("\u{256d}\u{2500} Filter "),
         "the form is drawn:\n{frame}"
     );
 }
@@ -3638,7 +3719,7 @@ async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
     let lines: Vec<&str> = frame.lines().collect();
     let form = lines
         .iter()
-        .position(|line| line.contains("\u{250c} Filter "))
+        .position(|line| line.contains("\u{256d}\u{2500} Filter "))
         .unwrap_or_else(|| panic!("the form is drawn:\n{frame}"));
     let list = lines
         .iter()

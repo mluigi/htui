@@ -1,8 +1,8 @@
-//! MOD-115 M3 T4, blueprint §9: the ported views (group A) draw only through `ui/kit`. No
-//! `Block::` or `Borders::` path (nor one through an alias, `use … Block as Framed`) may appear in
-//! their production code, and nothing else under `src` may frame itself unless [`GROUP_B`] lists
-//! it for M4; a new site fails with its `path:line`, and a stale `GROUP_B` entry fails too, so M4
-//! shrinks the list. The whole of `src` is read (RV1 L7), not only `ui/` and `app/`.
+//! MOD-115 M3 T4, blueprint §9, and M4 T3: every view draws only through `ui/kit`. No `Block::`
+//! or `Borders::` path (nor one through an alias, `use … Block as Framed`) may appear in the
+//! production code of any file under `src` outside the kit, save the [`OWN_BLOCK`] name
+//! collisions; a new site fails with its `path:line`. The whole of `src` is read (RV1 L7), not
+//! only `ui/` and `app/`. M3's group A and M4's group B are both ported, so neither list is left.
 //!
 //! Mirrors `tests/no_hardcoded_keys.rs`, through the same scanner (`tests/token_scan`): test
 //! items are skipped, an import, a comment or a string is no site. It reads sources only, so it
@@ -17,9 +17,9 @@ use token_scan::{aliases, relative, sites, sites_except, sources, src_root};
 /// The idents that build a frame by hand.
 const NEEDLES: &[&str] = &["Block", "Borders"];
 
-/// Files that declare a `Block` of their own, with the paths that name it: no frame, and no work
-/// for M4, so they are not in [`GROUP_B`]. Only those paths are exempt, so a ratatui frame added
-/// to such a file (`ratatui::widgets::Block::bordered()`, `Borders::ALL`) is still a site.
+/// Files that declare a `Block` of their own, with the paths that name it: no frame. Only those
+/// paths are exempt, so a ratatui frame added to such a file (`ratatui::widgets::Block::bordered()`,
+/// `Borders::ALL`) is still a site.
 const OWN_BLOCK: &[(&str, &[&str], &str)] = &[(
     "ui/markdown.rs",
     &[
@@ -32,53 +32,12 @@ const OWN_BLOCK: &[(&str, &[&str], &str)] = &[(
     "its `enum Block` is a parsed markdown block, not a ratatui frame",
 )];
 
-/// Group A (MOD-115 M3): no frame of its own anywhere in these.
-const GROUP_A: &[&str] = &[
-    "ui/tabs/settings/",
-    "ui/tabs/requirements/",
-    "ui/tabs/chat/",
-    "ui/path_picker.rs",
-];
-
-/// The kit draws the frames.
+/// The kit draws the frames: the one tree under `src` that may.
 const KIT: &str = "ui/kit/";
 
-/// Still framing themselves, each with what it frames; M4 ports each and deletes its entry. Built
-/// from a scan of the merged M3 tree (`8e4568ba`): every non-test `Block::`/`Borders::` site in
-/// `src` outside group A and the kit, less the [`OWN_BLOCK`] name collisions (all of them under
-/// `src/ui` and `src/app`, which RV1 L7 checked when it widened the scan to the whole of `src`).
-const GROUP_B: &[(&str, &str)] = &[
-    ("app/state.rs", "the `?` box and the no-tab body"),
-    ("ui/editor_pane.rs", "the in-pane editor"),
-    ("ui/overlay/abort_confirm.rs", "overlay"),
-    ("ui/overlay/concepts_search.rs", "overlay"),
-    ("ui/overlay/migration_prompt.rs", "overlay"),
-    ("ui/overlay/queue.rs", "overlay"),
-    ("ui/overlay/workspace_switcher.rs", "overlay"),
-    ("ui/tabs/backlog/detail/compose.rs", "Backlog"),
-    ("ui/tabs/backlog/detail/mod.rs", "Backlog"),
-    ("ui/tabs/backlog/detail/runs/execution_graph.rs", "Backlog"),
-    ("ui/tabs/backlog/divergence.rs", "Backlog"),
-    ("ui/tabs/backlog/filter.rs", "Backlog"),
-    ("ui/tabs/backlog/item_form.rs", "Backlog"),
-    ("ui/tabs/backlog/list.rs", "Backlog"),
-    ("ui/tabs/skills/agent_help.rs", "Skills"),
-    ("ui/tabs/skills/attach.rs", "Skills"),
-    ("ui/tabs/skills/library.rs", "Skills"),
-    ("ui/tabs/skills/templates.rs", "Skills"),
-];
-
-/// Whether `name` (relative to `src/`) is `prefix`, or under it when `prefix` ends in `/`.
-fn under(name: &str, prefix: &str) -> bool {
-    if prefix.ends_with('/') {
-        name.starts_with(prefix)
-    } else {
-        name == prefix
-    }
-}
-
-fn in_group_a(name: &str) -> bool {
-    GROUP_A.iter().any(|prefix| under(name, prefix))
+/// Whether `name` (relative to `src/`) is under the kit.
+fn in_kit(name: &str) -> bool {
+    name.starts_with(KIT)
 }
 
 /// The idents that build a frame in `src`: [`NEEDLES`] and the names `src` gives them with `as`.
@@ -140,47 +99,18 @@ fn scanned() -> Vec<(String, usize)> {
 }
 
 #[test]
-fn group_a_draws_only_through_the_kit() {
+fn nothing_outside_the_kit_frames_itself() {
     let found: Vec<String> = scanned()
         .into_iter()
-        .filter(|(name, _)| in_group_a(name))
+        .filter(|(name, _)| !in_kit(name))
         .map(|(name, line)| format!("src/{name}:{line}"))
         .collect();
     assert!(
         found.is_empty(),
-        "a ported view frames itself (MOD-115 M3): draw it through `ui/kit` (`Pane`, `Modal`, \
+        "a hand-built frame (MOD-115 M3/M4): draw it through `ui/kit` (`Pane`, `Modal`, \
          `kit::list`, `kit::form`):\n  {}",
         found.join("\n  ")
     );
-}
-
-#[test]
-fn nothing_else_frames_itself_unless_m4_lists_it() {
-    let found: Vec<String> = scanned()
-        .into_iter()
-        .filter(|(name, _)| !under(name, KIT) && !in_group_a(name))
-        .filter(|(name, _)| !GROUP_B.iter().any(|(listed, _)| listed == name))
-        .map(|(name, line)| format!("src/{name}:{line}"))
-        .collect();
-    assert!(
-        found.is_empty(),
-        "a new hand-built frame (MOD-115 M3): draw it through `ui/kit`; only M4's GROUP_B may \
-         still frame itself:\n  {}",
-        found.join("\n  ")
-    );
-}
-
-/// A stale entry fails, as `no_hardcoded_keys.rs`'s `every_allow_list_entry_is_still_needed`
-/// does: each listed file still frames itself outside its tests.
-#[test]
-fn every_m4_entry_still_frames_itself() {
-    for (name, what) in GROUP_B {
-        let src = std::fs::read_to_string(src_root().join(name)).expect("a listed file exists");
-        assert!(
-            !violations_in(name, &src).is_empty(),
-            "src/{name} ({what}) frames itself no more: drop it from GROUP_B"
-        );
-    }
 }
 
 /// A stale exemption fails too: each listed file still names its own `Block`, through a path
@@ -195,14 +125,7 @@ fn every_own_block_entry_is_still_needed() {
             blocks.len() > frames.len(),
             "src/{name} ({what}) names its own `Block` no more: drop it from OWN_BLOCK"
         );
-        assert!(
-            !in_group_a(name) && !under(name, KIT),
-            "src/{name} ({what}) is group A or the kit"
-        );
-        assert!(
-            !GROUP_B.iter().any(|(listed, _)| listed == name),
-            "src/{name} ({what}) frames nothing: it is no work for M4"
-        );
+        assert!(!in_kit(name), "src/{name} ({what}) is the kit");
     }
 }
 
@@ -219,16 +142,6 @@ fn an_own_block_path_is_no_frame_but_a_ratatui_block_still_is() {
     // The exemption is the listed file's alone.
     assert_eq!(violations_in("ui/markdown.rs", src), [4, 5]);
     assert_eq!(violations_in("ui/editor_pane.rs", src), [2, 3, 4, 5]);
-}
-
-#[test]
-fn no_group_a_file_is_listed_for_m4() {
-    for (name, what) in GROUP_B {
-        assert!(
-            !in_group_a(name) && !under(name, KIT),
-            "src/{name} ({what}) is group A or the kit: it may not be listed for M4"
-        );
-    }
 }
 
 // The scanner's own cases, on inline sources.
@@ -324,10 +237,10 @@ fn the_guard_reads_all_of_src() {
 }
 
 #[test]
-fn group_a_is_matched_by_tree_or_by_file() {
-    assert!(in_group_a("ui/tabs/settings/agents/mod.rs"));
-    assert!(in_group_a("ui/tabs/chat/composer.rs"));
-    assert!(in_group_a("ui/path_picker.rs"));
-    assert!(!in_group_a("ui/path_picker_extra.rs"));
-    assert!(!in_group_a("ui/tabs/skills/library.rs"));
+fn only_the_kit_tree_is_the_kit() {
+    assert!(in_kit("ui/kit/pane.rs"));
+    assert!(in_kit("ui/kit/form/field.rs"));
+    assert!(!in_kit("ui/kitchen.rs"));
+    assert!(!in_kit("kit/pane.rs"));
+    assert!(!in_kit("ui/tabs/skills/library.rs"));
 }

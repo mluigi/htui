@@ -5,6 +5,12 @@
 //! assembled prompt, not a `SELECT`. It still holds no store handle (`R-NF-3`, `runs.rs:5`) — the
 //! Backlog tab issues the request with the other five reads and the deferred task answers it.
 //!
+//! MOD-115 M4: the counts and the budget's, a skill's level and its activation words are the
+//! kit's (`label::plural`, `setting_source`, `skill_level`, `activation`; MOD-83); the record's
+//! own words (`head_tail`, `no_path`, a choice's reason) stay, the audit's vocabulary (D-17, Q3).
+//! The template keys are the pane's hint, not the picker row's (MOD-82), and a row wider than the
+//! pane ends in `…` (D-24): it is clipped, not wrapped, so the rows keep their numbering.
+//!
 //! **Nothing here parses the text.** The header lines are built from `trim_record`'s own fields and
 //! the body is the canonical text verbatim, so a `</section>` inside a document body is inert
 //! (blueprint H-28).
@@ -17,11 +23,17 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::preview::PromptPreview;
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::cells;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label::{self, plural};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, message, no_item, unavailable,
+};
+use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
 
 /// How wide the label gutter is: every header line is `label` then the value.
@@ -29,6 +41,20 @@ const LABEL: usize = 10;
 
 /// The separator between the audit header and the prompt text.
 const RULE: &str = "────────────────────────────────────────";
+
+/// The pane's keys (MOD-82: they left the picker row): `n/p template` with the defaults, read
+/// through `BACKLOG_PROMPT` so a rebound key shows its own label.
+const PROMPT_HINT: HintSpec = &[Hint::Pair(
+    Act::PromptNextTemplate,
+    Act::PromptPrevTemplate,
+    "template",
+)];
+
+/// What the pane says when the project has no template, and where one is made.
+const NO_TEMPLATES: &str = "No prompt templates in this project.";
+
+/// Where a prompt template is created: the Skills tab's Templates view.
+const MAKE_TEMPLATE: NextStep<'static> = NextStep("Skills \u{203a} Templates creates one");
 
 /// The prompt one item would be given, with its digest, its budget, its section table, its excerpt
 /// audit and its declared stand-ins above the canonical text.
@@ -51,6 +77,9 @@ pub struct PromptTab {
     /// The rendered rows, rebuilt on every reply. Held rather than recomputed per frame: the
     /// prompt text is up to the whole token budget, and a render runs on the UI task.
     lines: Vec<Row>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 /// One rendered row of the pane: its text, and whether it is drawn in `Theme::dim` (MOD-9 D46).
@@ -123,44 +152,27 @@ impl PromptTab {
     /// exactly one rendered row, which is what the field's doc already claimed and what makes
     /// [`Scroll`]'s clamp against `lines.len()` true rather than a lower bound.
     ///
-    /// The `picker` row names the template keys in force (MOD-67 M5 PA-1): `keys` is read here,
-    /// once per reply, not per frame.
-    fn rebuild(&mut self, keys: &Keys) {
+    /// The `picker` row counts the templates; their keys are the pane's hint since MOD-115 M4
+    /// ([`DetailTab::key_hint`]), so no key is read here.
+    fn rebuild(&mut self) {
         let rows = match self.preview.as_ref() {
-            Some(preview) => render_lines(preview, &picker_keys(keys)),
+            Some(preview) => render_lines(preview),
             None => Vec::new(),
         };
         self.lines = rows.into_iter().flat_map(Row::split).collect();
     }
 }
 
-/// The template keys as the `picker` row names them: the first chord of
-/// `backlog.prompt.next_template` and of `prev_template` through `BACKLOG_PROMPT`, joined `" / "`
-/// (`n / p` with the defaults); an unbound one drops out, and both unbound read `""`.
-fn picker_keys(keys: &Keys) -> String {
-    [Act::PromptNextTemplate, Act::PromptPrevTemplate]
-        .into_iter()
-        .filter_map(|act| keys.label(views::BACKLOG_PROMPT, act))
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-/// Every line the pane shows, top to bottom (blueprint B.16). `picker` is the template keys as
-/// [`picker_keys`] names them; empty, the row reads `N template(s)` alone.
-fn render_lines(preview: &PromptPreview, picker: &str) -> Vec<Row> {
+/// Every line the pane shows, top to bottom (blueprint B.16).
+fn render_lines(preview: &PromptPreview) -> Vec<Row> {
     let mut lines = Vec::new();
     let template = match preview.template.as_ref() {
         Some(row) => format!("{} v{}", row.name, row.version),
         None => "none".to_owned(),
     };
     lines.push(Row::plain(labelled("template", &template)));
-    let count = format!("{} template(s)", preview.available.len());
-    let picker = if picker.is_empty() {
-        count
-    } else {
-        format!("{picker} \u{b7} {count}")
-    };
-    lines.push(Row::plain(labelled("picker", &picker)));
+    let count = plural(preview.available.len(), "template", "templates");
+    lines.push(Row::plain(labelled("picker", &count)));
 
     // Bound once, and used again at the bottom for the text. The second `match` that used to read
     // `preview.outcome` there needed an `unreachable!` arm to say what this binding says by
@@ -186,7 +198,7 @@ fn render_lines(preview: &PromptPreview, picker: &str) -> Vec<Row> {
         &format!(
             "{} ({}) \u{b7} reserve {:.2} \u{b7} target {}",
             record.budget,
-            record.budget_source.as_str(),
+            label::setting_source(record.budget_source),
             record.reserve,
             record.target
         ),
@@ -230,7 +242,8 @@ fn render_lines(preview: &PromptPreview, picker: &str) -> Vec<Row> {
 
 /// One skill choice as the pane lists it: `<name> v<N|?> · <level> · <activation> → <outcome>`,
 /// where the outcome is `active` for `always`, `matched <repo:path>` for `matched` (MOD-9 D125),
-/// the reason otherwise. CR and LF in a name or a path become spaces, so one choice is one row.
+/// the reason otherwise. The level and the activation are `kit::label`'s words; the reason is the
+/// record's (D-17). CR and LF in a name or a path become spaces, so one choice is one row.
 fn choice_line(choice: &SkillChoice) -> String {
     let version = choice
         .version
@@ -245,8 +258,8 @@ fn choice_line(choice: &SkillChoice) -> String {
     format!(
         "{} v{version} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
         choice.name.replace(['\n', '\r'], " "),
-        choice.level.as_str(),
-        choice.activation.as_str(),
+        label::skill_level(choice.level),
+        label::activation(choice.activation),
     )
 }
 
@@ -380,7 +393,7 @@ impl DetailTab for PromptTab {
         self.scroll.follow(step, self.lines.len())
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
         if let StoreReply::Failed { request, message } = reply
             && *request == crate::store_worker::PROMPT_PREVIEW
         {
@@ -401,30 +414,42 @@ impl DetailTab for PromptTab {
             return;
         }
         self.preview = Some((**preview).clone());
-        self.rebuild(ctx.keys());
+        self.rebuild();
         self.scroll.reset();
+    }
+
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_PROMPT,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         let Some(preview) = self.preview.as_ref() else {
-            let text = match self.failed.as_deref() {
-                Some(why) => format!("No preview: {why}"),
-                None => "Assembling the prompt\u{2026}".to_owned(),
-            };
-            message(frame, area, &text, ctx.theme);
+            match self.failed.as_deref() {
+                Some(why) => unavailable(
+                    frame,
+                    area,
+                    &format!("No preview: {why}"),
+                    views::BACKLOG_PROMPT,
+                    self.told.list(),
+                    ctx,
+                ),
+                None => message(frame, area, "Assembling the prompt\u{2026}", ctx.theme),
+            }
             return;
         };
         if preview.available.is_empty() {
-            message(
-                frame,
-                area,
-                "No prompt templates in this project.",
-                ctx.theme,
-            );
+            empty::render(frame, area, NO_TEMPLATES, MAKE_TEMPLATE, ctx.theme);
             return;
         }
         // No wrap: a wrapped prompt would renumber every line of the audit above it, and the pane
@@ -434,21 +459,38 @@ impl DetailTab for PromptTab {
         // `Text` built before it can throw all but `area.height` rows of it away, and building it
         // meant copying and re-parsing the prompt — up to ~400 KB for a 100 k-token one — on the UI
         // task, once per frame (finding M5). Skipping the rows here instead renders the identical
-        // cells, because the pane does not wrap and one element of `lines` is one row.
+        // cells, because the pane does not wrap and one element of `lines` is one row. A row
+        // wider than the pane is cut with `…` (D-24), so a clipped row says so.
+        let width = usize::from(area.width);
         let window: Vec<Line<'_>> = self
             .lines
             .iter()
             .skip(self.scroll.skip())
             .take(usize::from(area.height))
             .map(|row| {
+                let text = cells::clip(&row.text, width);
                 if row.dim {
-                    Line::styled(row.text.as_str(), ctx.theme.dim)
+                    Line::styled(text, ctx.theme.dim)
                 } else {
-                    Line::raw(row.text.as_str())
+                    Line::raw(text)
                 }
             })
             .collect();
         frame.render_widget(Paragraph::new(Text::from(window)), area);
+    }
+
+    /// [`PROMPT_HINT`] once a preview names a template to cycle to (MOD-82: the keys left the
+    /// picker row); nothing before, or with no template.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        self.item?;
+        if self
+            .preview
+            .as_ref()
+            .is_none_or(|preview| preview.available.is_empty())
+        {
+            return None;
+        }
+        key_line(keys.hint(views::BACKLOG_PROMPT, PROMPT_HINT), theme)
     }
 }
 
@@ -512,6 +554,35 @@ mod tests {
 
             assert_eq!(whole, only, "the two disagree at offset {offset}");
         }
+    }
+
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_PROMPT`; a refused preview is one too, its next step
+    /// the re-read.
+    #[test]
+    fn no_item_and_a_refused_preview_are_empty_states_with_a_next_step() {
+        use crate::ui::tabs::backlog::detail::assert_empty_state;
+        use crate::ui::tabs::backlog::detail::compose::bench::{Shell, drawn};
+
+        let shell = Shell::new();
+        let mut tab = PromptTab::new();
+        let text = drawn(43, 6, |frame, area| tab.render(frame, area, &shell.ctx()));
+        assert_empty_state(&text, "No item selected.", "j/k chooses one");
+
+        tab.on_item_change(Some(htui_core::fixtures::ids::HTUI_FEAT_1));
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: crate::store_worker::PROMPT_PREVIEW,
+                message: "store unreachable".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        let text = drawn(43, 6, |frame, area| tab.render(frame, area, &shell.ctx()));
+        assert_empty_state(
+            &text,
+            "No preview: store unreachable",
+            "j/k away and back retries",
+        );
     }
 
     /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the prompt, a row as `J`
@@ -593,7 +664,7 @@ mod tests {
             outcome: Ok(assembled),
         };
 
-        let rows = render_lines(&preview, "n / p");
+        let rows = render_lines(&preview);
         let first = labelled(
             "skills",
             "rust-style v2 \u{b7} project \u{b7} always \u{2192} active",
@@ -632,21 +703,10 @@ mod tests {
         assert!(table < at, "the block sits below the section table");
     }
 
-    /// MOD-67 M5 PA-1: the `picker` row names the template keys in force: `n / p` with the
-    /// defaults, a rebound key's own label, and nothing but the count when both are unbound.
+    /// MOD-115 M4 (MOD-82, MOD-83): the `picker` row is the count alone, in words; the keys are
+    /// the pane's hint (`the_template_keys_are_the_panes_hint`).
     #[test]
-    fn the_picker_row_names_the_template_keys_in_force() {
-        assert_eq!(picker_keys(Keys::compiled()), "n / p");
-        let rebound =
-            crate::keys::load_str("version = 1\n[backlog.prompt]\nnext_template = \"t\"\n")
-                .expect("the keys load");
-        assert_eq!(picker_keys(&rebound), "t / p");
-        let unbound = crate::keys::load_str(
-            "version = 1\n[backlog.prompt]\nnext_template = []\nprev_template = []\n",
-        )
-        .expect("the keys load");
-        assert_eq!(picker_keys(&unbound), "");
-
+    fn the_picker_row_counts_the_templates() {
         let preview = PromptPreview {
             item: htui_core::fixtures::ids::HTUI_FEAT_1,
             available: vec!["implement".to_owned(), "review".to_owned()],
@@ -654,12 +714,8 @@ mod tests {
             outcome: Err("no template".to_owned()),
         };
         assert_eq!(
-            render_lines(&preview, "n / p")[1].text,
-            labelled("picker", "n / p \u{b7} 2 template(s)")
-        );
-        assert_eq!(
-            render_lines(&preview, "")[1].text,
-            labelled("picker", "2 template(s)")
+            render_lines(&preview)[1].text,
+            labelled("picker", "2 templates")
         );
     }
 
@@ -678,7 +734,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "rust-glob v1 \u{b7} project \u{b7} glob \u{2192} matched htui:src/lib x.rs"
+            "rust-glob v1 \u{b7} project \u{b7} by glob \u{2192} matched htui:src/lib x.rs"
         );
     }
 
@@ -710,7 +766,7 @@ mod tests {
             outcome: Ok(assembled),
         };
 
-        let rows = render_lines(&preview, "n / p");
+        let rows = render_lines(&preview);
         let row = rows
             .iter()
             .find(|row| row.text.contains("rust-glob"))
@@ -720,5 +776,134 @@ mod tests {
             "the reason is spelled out: {row:?}"
         );
         assert!(row.dim, "an inactive choice is dim: {row:?}");
+    }
+
+    /// The fixture's assembled prompt for FEAT-1, its budget from the app setting's default, one
+    /// glob-attached skill matched, under `available` templates.
+    fn previewed(available: &[&str]) -> PromptPreview {
+        let mut assembled = htui_core::prompt::assemble(
+            &htui_core::prompt::fixtures::phase_implement_attempt2(),
+            &htui_core::scrub::MinimalScrubber::new([]),
+        )
+        .expect("the fixture assembles");
+        assembled.trim.budget_source = htui_core::prompt::BudgetSource::AppSettingDefault;
+        assembled.trim.skill_choices.push(SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "rust-glob".to_owned(),
+            version: Some(1),
+            level: SkillLevel::Phase,
+            activation: Activation::Glob,
+            active: true,
+            reason: ChoiceReason::Matched,
+            path: Some("htui:src/lib.rs".to_owned()),
+        });
+        PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: available.iter().map(|name| (*name).to_owned()).collect(),
+            template: Some(htui_core::prompt::TemplateRef {
+                name: "implement".to_owned(),
+                version: 1,
+            }),
+            outcome: Ok(assembled),
+        }
+    }
+
+    /// A pane on FEAT-1 that has landed `preview`, drawn at `width` x 40, one string per row.
+    fn landed(preview: PromptPreview, width: u16) -> (PromptTab, Vec<String>) {
+        use crate::ui::tabs::backlog::detail::compose::bench::{Shell, drawn};
+
+        let shell = Shell::new();
+        let mut tab = PromptTab::new();
+        tab.on_item_change(Some(htui_core::fixtures::ids::HTUI_FEAT_1));
+        tab.on_reply(
+            &StoreReply::PromptPreview(Box::new(preview)),
+            &mut shell.ctx(),
+        );
+        let rows = drawn(width, 40, |frame, area| {
+            tab.render(frame, area, &shell.ctx())
+        })
+        .lines()
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+        (tab, rows)
+    }
+
+    /// MOD-83: the picker row counts the templates in words and names no key (MOD-82: the keys are
+    /// the pane's hint); the budget's rung, a skill's level and its activation read as
+    /// `kit::label`'s words. The audit's record words stay (D-17, Q3).
+    #[test]
+    fn the_header_reads_as_words() {
+        let (_, rows) = landed(previewed(&["implement", "review"]), 120);
+        assert_eq!(rows[1], labelled("picker", "2 templates"), "{rows:#?}");
+        let (_, one) = landed(previewed(&["implement"]), 120);
+        assert_eq!(one[1], labelled("picker", "1 template"), "{one:#?}");
+        assert!(
+            rows[3].starts_with("budget    ") && rows[3].contains(" (default) \u{b7} reserve "),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.ends_with(
+                "rust-glob v1 \u{b7} phase \u{b7} by glob \u{2192} matched htui:src/lib.rs"
+            )),
+            "{rows:#?}"
+        );
+        let text = rows.join("\n");
+        assert!(!text.contains("(s)") && !text.contains("n / p"), "{text}");
+        assert!(!text.contains("app_setting"), "{text}");
+    }
+
+    /// MOD-82: the template keys are the pane's hint, through `BACKLOG_PROMPT`, once there is a
+    /// template to cycle to; nothing before the preview lands.
+    #[test]
+    fn the_template_keys_are_the_panes_hint() {
+        let theme = Theme::default();
+        assert!(
+            PromptTab::new()
+                .key_hint(Keys::compiled(), &theme)
+                .is_none(),
+            "no preview, nothing to cycle"
+        );
+        let (tab, _) = landed(previewed(&["implement", "review"]), 120);
+        let hint = tab
+            .key_hint(Keys::compiled(), &theme)
+            .map(|line| line.to_string());
+        assert_eq!(hint.as_deref(), Some("n/p template"));
+        let rebound =
+            crate::keys::load_str("version = 1\n[backlog.prompt]\nnext_template = \"t\"\n")
+                .expect("the keys load");
+        let hint = tab.key_hint(&rebound, &theme).map(|line| line.to_string());
+        assert_eq!(hint.as_deref(), Some("t/p template"));
+    }
+
+    /// Plan DoD 2: a project with no template is `kit::empty`, naming where one is made, and the
+    /// pane hints no template key, there being none to cycle to.
+    #[test]
+    fn no_templates_names_where_one_is_made() {
+        let (tab, rows) = landed(previewed(&[]), 120);
+        let text = rows.join("\n");
+        assert!(text.contains(NO_TEMPLATES), "{rows:#?}");
+        assert!(
+            text.contains("Skills \u{203a} Templates creates one"),
+            "{rows:#?}"
+        );
+        assert!(
+            tab.key_hint(Keys::compiled(), &Theme::default()).is_none(),
+            "no template, nothing to cycle"
+        );
+    }
+
+    /// MOD-81, D-24: a row wider than the pane is cut with `…`; one that fits is drawn whole.
+    #[test]
+    fn a_clipped_row_ends_in_an_ellipsis() {
+        let (_, rows) = landed(previewed(&["implement", "review"]), 30);
+        let digest = &rows[2];
+        assert!(digest.starts_with("digest    "), "{rows:#?}");
+        assert!(digest.ends_with('\u{2026}'), "{digest:?}");
+        assert_eq!(cell_width(digest), 30, "{digest:?}");
+        assert_eq!(
+            rows[0],
+            labelled("template", "implement v1"),
+            "a row that fits"
+        );
     }
 }

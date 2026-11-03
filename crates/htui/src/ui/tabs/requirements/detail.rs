@@ -16,9 +16,8 @@ use ratatui::text::{Line, Span};
 use crate::requirements::{ProjectRequirements, RequirementDetail, RevisionRow};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::text::wrapped;
+use crate::ui::kit::text::{STAMP, wrapped};
 use crate::ui::kit::{label, status};
-use crate::ui::tabs::backlog::detail::STAMP;
 
 /// What the Revisions heading says over a detail read from the mirror, and where to fix it.
 pub(super) const REVISIONS_NEED_THE_DATABASE: &str =

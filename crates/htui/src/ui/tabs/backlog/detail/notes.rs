@@ -47,15 +47,26 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
-use crate::ui::kit::{chips::key_line, text::wrapped};
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::text::STAMP;
+use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, empty_state, no_item, writes_one,
+};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
 const HINT: HintSpec = &[Hint::One(Act::NotesAdd, "add note")];
+
+/// An item with no notes (plan D11).
+const NO_NOTES: &str = "No notes for this item.";
+
+/// [`NO_NOTES`]' next step while `backlog.notes.add` is unbound.
+const WRITE_UNBOUND: &str = "a note written by hand lists here";
 
 /// `StoreRequest::Notes`' name: the `Failed` of the re-read that checks a hedge (review M1).
 const NOTES_READ: &str = "notes";
@@ -118,6 +129,10 @@ pub struct NotesTab {
     hedged: Option<Hedged>,
     /// Review M1: the hedge settled as written, under the thread until the next key.
     notice: Option<String>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read, and what
+    /// the compose rule is drawn as.
+    told: Told,
 }
 
 impl NotesTab {
@@ -181,7 +196,8 @@ impl NotesTab {
     /// A key while the area is open: its outcome, mapped for the Backlog.
     fn on_compose_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Option<Handled> {
         let compose = self.compose.as_mut()?;
-        Some(match compose.on_key(key, ctx.keys()) {
+        let pressed = ctx.pressed(&key);
+        Some(match compose.on_pressed(key, pressed, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -329,7 +345,7 @@ impl DetailTab for NotesTab {
 
     /// MOD-115 M2 §7: the list's motion scrolls the thread while the detail is focused, over
     /// the rows as wrapped at the last render (review L1, as `J`/`K`).
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         let (width, _) = self.drawn.get();
         self.scroll.follow(step, self.row_count(width))
     }
@@ -434,33 +450,57 @@ impl DetailTab for NotesTab {
         key_line(hint, theme)
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                " New note ",
+                None,
+                self.told.focus(),
+                ctx,
+            );
             ctx.claim_editor_area(body);
             return;
         }
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_NOTES,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
-        // Review M1's sentence under the thread; D11's browse hint is the shell's hint row since
-        // MOD-67 M6 T2 (`key_hint`).
-        let notice = self.notice_rows(area.width);
-        let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
+        // Review M1's sentence under the thread, the kit's notice row (MOD-115 M4 L-docs); D11's
+        // browse hint is the detail pane's, on its border (`key_hint`).
+        let rows = self.notice_rows(area.width);
+        let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
         let [list, below] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
         frame.render_widget(
             Paragraph::new(
-                notice
-                    .into_iter()
-                    .map(|line| Line::styled(line, ctx.theme.base))
+                rows.iter()
+                    .map(|row| notice(row, Tone::Info, ctx.theme))
                     .collect::<Vec<_>>(),
             ),
             below,
         );
         if self.notes.is_empty() {
-            message(frame, list, "No notes for this item.", ctx.theme);
+            let next = writes_one(
+                views::BACKLOG_NOTES,
+                Act::NotesAdd,
+                WRITE_UNBOUND,
+                ctx.keys(),
+            );
+            empty_state(frame, list, NO_NOTES, &next, ctx);
             return;
         }
         self.drawn
@@ -487,7 +527,7 @@ mod tests {
     use crate::editor::{ExternalEdit, ExternalEditOutcome, edited};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
-    use crate::ui::tabs::backlog::detail::Step;
+    use crate::ui::kit::scroll::Step;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         could_not_check, may_have_landed, not_written,
@@ -1207,5 +1247,66 @@ mod tests {
             Some(compose(&composing).key_hint(Keys::compiled())),
             "the area's own keys"
         );
+    }
+
+    /// MOD-115 M4 L-docs: an empty thread is `kit::empty`'s, its next step the key that writes a
+    /// note through `BACKLOG_NOTES` (a rebound key named, a sentence without it unbound); no item
+    /// is `kit::empty`'s too, its next step the list's motion.
+    #[tokio::test]
+    async fn the_empty_states_name_their_next_step() {
+        let mut shell = Shell::new();
+        let mut empty = NotesTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
+        let text = drawn(43, 9, |frame, area| empty.render(frame, area, &shell.ctx()));
+        assert!(text.contains(NO_NOTES), "{text}");
+        assert!(text.contains("a writes one"), "{text}");
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.notes]\nadd = \"W\"\n").expect("loads");
+        let text = drawn(43, 9, |frame, area| empty.render(frame, area, &shell.ctx()));
+        assert!(text.contains("W writes one"), "{text}");
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.notes]\nadd = []\n").expect("loads");
+        let text = drawn(43, 9, |frame, area| empty.render(frame, area, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+
+        let shell = Shell::new();
+        let mut none = NotesTab::new();
+        none.on_item_change(None);
+        let text = drawn(43, 9, |frame, area| none.render(frame, area, &shell.ctx()));
+        assert!(text.contains("No item selected."), "{text}");
+        assert!(text.contains("j/k chooses one"), "{text}");
+    }
+
+    /// MOD-115 M4 L-docs: `kit::empty` cuts a line to the pane, so the sentence standing in for an
+    /// unbound `backlog.notes.add` fits whole in the detail pane at 80 columns (34 cells inside).
+    #[tokio::test]
+    async fn the_unbound_next_step_fits_the_detail_pane_at_80_columns() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.notes]\nadd = []\n").expect("loads");
+        let mut empty = NotesTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
+        let text = drawn(34, 9, |frame, area| empty.render(frame, area, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+    }
+
+    /// MOD-115 M4 L-docs: review M1's sentence under the thread is the kit's notice row in the
+    /// info role.
+    #[tokio::test]
+    async fn the_written_sentence_is_the_kit_notice() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.notice = Some(NOTE_WRITTEN.to_owned());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let last: String = (0..60).map(|x| buffer[(x, 7)].symbol()).collect();
+        assert_eq!(last.trim_end(), NOTE_WRITTEN);
+        assert_eq!(buffer[(0, 7)].fg, shell.theme.dim.fg.unwrap_or_default());
     }
 }

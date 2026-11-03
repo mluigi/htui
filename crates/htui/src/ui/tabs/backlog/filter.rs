@@ -13,22 +13,27 @@
 //! `backlog.filter_form.next_row`/`prev_row` and `form.next_field`/`prev_field`, `x` clears
 //! (`backlog.filter_form.clear`); an option row's value keys are the `[choice]` rows (MOD-115 M2
 //! D7) and its `Enter`/`Esc` the canonical field events.
+//!
+//! MOD-115 M4 E4: the form is a kit pane titled `Filter` whose rows are a kit form (the gutter
+//! and the band on the focused row, legible without colour), its keys the pane's own hints.
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::Line;
 
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::store_worker::StoreRequest;
-use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::pane::Pane;
+use crate::ui::kit::status as kit_status;
+use crate::ui::tabs::backlog::Chrome;
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// Rows the form takes at the bottom of the list pane: two borders and four rows (its keys are
-/// the shell's hint row since MOD-67 M6 T2).
+/// its pane's hints, MOD-115 M4 Q2).
 pub const FORM_HEIGHT: u16 = 6;
 
 /// The hint under every row but Tags, through [`views::BACKLOG_FILTER`]: `choice.toggle` and
@@ -49,8 +54,8 @@ pub const HINT_TAGS: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// Width of a row's label column, after the two-cell focus marker.
-const LABEL: usize = 8;
+/// Width of a row's label column, after the kit form's gutter.
+const LABEL: u16 = 8;
 
 /// `declared_tags_from_text`'s refusal, worded for this form (MOD-13 review N2). The rule is the
 /// declared-tag rule (D3), but these are the tags an item *requires*, so the sentence names a
@@ -110,8 +115,9 @@ impl BacklogFilter {
         }
     }
 
-    /// What the list title appends while a filter is set (D5), e.g.
-    /// `status:open,done · project:htui · tags:gpu,rust · ready here`; `None` without one.
+    /// What the list's summary band reads while a filter is set (D5, MOD-115 M4 E4), e.g.
+    /// `status: open, done · project: htui · tags: gpu, rust · ready here`, each status by its
+    /// `kit::status` word (`running`, never `in_progress`); `None` without one.
     ///
     /// Project names come from `projects` (`ctx.projects`); an id it lacks is skipped, and so is
     /// the whole `project:` part when it names none (MOD-13 review N3). A filter with nothing to
@@ -123,8 +129,12 @@ impl BacklogFilter {
         }
         let mut parts = Vec::with_capacity(4);
         if !self.statuses.is_empty() {
-            let names: Vec<&str> = self.statuses.iter().map(|status| status.as_str()).collect();
-            parts.push(format!("status:{}", names.join(",")));
+            let names: Vec<&str> = self
+                .statuses
+                .iter()
+                .map(|status| kit_status::mark(*status).word)
+                .collect();
+            parts.push(format!("status: {}", names.join(", ")));
         }
         if !self.projects.is_empty() {
             let names: Vec<&str> = self
@@ -134,11 +144,11 @@ impl BacklogFilter {
                 .map(|project| project.name.as_str())
                 .collect();
             if !names.is_empty() {
-                parts.push(format!("project:{}", names.join(",")));
+                parts.push(format!("project: {}", names.join(", ")));
             }
         }
         if !self.tags.is_empty() {
-            parts.push(format!("tags:{}", self.tags.join(",")));
+            parts.push(format!("tags: {}", self.tags.join(", ")));
         }
         if self.ready_here {
             parts.push("ready here".to_owned());
@@ -364,34 +374,22 @@ impl FilterForm {
         }
     }
 
-    /// One row as a line of at most `width` cells: the focus marker, the label, the value.
-    fn line(&self, row: FilterRow, width: usize, theme: &Theme) -> Line<'static> {
-        let focused = row == self.row;
-        let label = match row {
-            FilterRow::Status => "status",
-            FilterRow::Project => "project",
-            FilterRow::Tags => "tags",
-            FilterRow::Ready => "ready",
-        };
-        let head = format!("{} {label:<LABEL$}", if focused { '>' } else { ' ' });
-        let head_style = if focused { theme.title } else { theme.dim };
-        let room = width.saturating_sub(cell_width(&head));
-        let value = match row {
-            FilterRow::Tags => {
-                let field = self
-                    .tags
-                    .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme);
-                let mut spans = vec![Span::styled(cells::clip(&head, width), head_style)];
-                spans.extend(field.spans);
-                return Line::from(spans);
-            }
+    /// An option row's value as text: `‹[x] word›  chosen` for Status and Project, each status
+    /// by its `kit::status` word (MOD-115 M4 E4), and the tick box for Ready.
+    fn value(&self, row: FilterRow) -> String {
+        match row {
             FilterRow::Status => {
                 let option = Status::ALL[self.status_at];
-                let chosen: Vec<&str> = self.draft.statuses.iter().map(|s| s.as_str()).collect();
+                let chosen: Vec<&str> = self
+                    .draft
+                    .statuses
+                    .iter()
+                    .map(|status| kit_status::mark(*status).word)
+                    .collect();
                 format!(
                     "‹{} {}›  {}",
                     check(self.draft.statuses.contains(&option)),
-                    option.as_str(),
+                    kit_status::mark(option).word,
                     any(&chosen)
                 )
             }
@@ -416,11 +414,23 @@ impl FilterForm {
                 "{} only what this box can start",
                 check(self.draft.ready_here)
             ),
-        };
-        Line::from(vec![
-            Span::styled(cells::clip(&head, width), head_style),
-            Span::styled(cells::clip(&value, room), theme.base),
-        ])
+            FilterRow::Tags => self.tags.text().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// The form as a kit form (MOD-115 M4 E4): one field per row under an 8-cell label column,
+    /// the focused row behind the gutter, Tags a text field typed into while it is focused.
+    fn form(&self, theme: &Theme) -> Form<'_> {
+        let option = |row: FilterRow| Value::Lines(vec![Line::styled(self.value(row), theme.base)]);
+        let focus = ROWS.iter().position(|row| *row == self.row).unwrap_or(0);
+        Form::new()
+            .field(Field::new("status", option(FilterRow::Status)))
+            .field(Field::new("project", option(FilterRow::Project)))
+            .field(Field::new("tags", Value::Text(&self.tags)))
+            .field(Field::new("ready", option(FilterRow::Ready)))
+            .label_width(LABEL)
+            .focus(focus)
+            .editing(self.row == FilterRow::Tags)
     }
 }
 
@@ -447,18 +457,20 @@ fn any(chosen: &[&str]) -> String {
     }
 }
 
-/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane. Its keys are
-/// [`FilterForm::key_hint`], the shell's hint row since MOD-67 M6 T2.
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, theme: &Theme) {
-    let block = Block::new().borders(Borders::ALL).title(" Filter ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let width = usize::from(inner.width);
-    let lines: Vec<Line<'static>> = ROWS
-        .iter()
-        .map(|row| form.line(*row, width, theme))
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane, as a kit pane
+/// titled `Filter` (MOD-115 M4 E4) whose rows are a kit form. Its keys are
+/// [`FilterForm::key_hint`], the pane's hints while it holds the keyboard (C4, Q2).
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &FilterForm,
+    chrome: Chrome<'_>,
+    theme: &Theme,
+) {
+    let inner = Pane::inner(area);
+    form.form(theme)
+        .render(frame, inner, 0, chrome.accent, theme);
+    chrome.frame(Pane::new("Filter")).render(frame, area, theme);
 }
 
 impl FilterForm {
@@ -479,13 +491,13 @@ impl FilterForm {
 mod tests {
     use super::*;
     use crate::testkit::DEFAULT_SIZE;
+    use crate::ui::cells::cell_width;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::WorkspaceId;
     use ratatui::layout::Rect;
-    use ratatui::widgets::{Block, Borders};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
@@ -705,7 +717,7 @@ mod tests {
         assert_eq!(BacklogFilter::default().summary(&projects()), None);
     }
 
-    /// MOD-13 D5: the title's summary, facet by facet, in a fixed order.
+    /// MOD-13 D5, MOD-115 M4 E4: the summary band's words, facet by facet, in a fixed order.
     #[test]
     fn summary_names_statuses_projects_tags_and_readiness() {
         let filter = BacklogFilter {
@@ -716,13 +728,26 @@ mod tests {
         };
         assert_eq!(
             filter.summary(&projects()).as_deref(),
-            Some("status:open,done · project:htui · tags:gpu,rust · ready here")
+            Some("status: open, done · project: htui · tags: gpu, rust · ready here")
         );
         let ready = BacklogFilter {
             ready_here: true,
             ..BacklogFilter::default()
         };
         assert_eq!(ready.summary(&projects()).as_deref(), Some("ready here"));
+    }
+
+    /// MOD-115 M4 E4: a status reads as `kit::status`'s word, never its internal name.
+    #[test]
+    fn summary_names_each_status_by_its_word() {
+        let filter = BacklogFilter {
+            statuses: vec![Status::InProgress, Status::AwaitingApproval],
+            ..BacklogFilter::default()
+        };
+        assert_eq!(
+            filter.summary(&projects()).as_deref(),
+            Some("status: running, needs you")
+        );
     }
 
     /// MOD-13 D6: a project the new scope lacks leaves the filter; the rest stays.
@@ -1065,7 +1090,10 @@ mod tests {
             projects: vec![ProjectId::new()],
             ..BacklogFilter::default()
         };
-        assert_eq!(unknown.summary(&projects()).as_deref(), Some("status:done"));
+        assert_eq!(
+            unknown.summary(&projects()).as_deref(),
+            Some("status: done")
+        );
         let only = BacklogFilter {
             projects: vec![ProjectId::new()],
             ..BacklogFilter::default()
@@ -1095,13 +1123,16 @@ mod tests {
             position: 0,
         }];
         let form = FilterForm::open(&BacklogFilter::default(), &projects);
-        let line = form.line(FilterRow::Project, 30, &Theme::default());
-        let used: usize = line
-            .spans
-            .iter()
-            .map(|span| cell_width(&span.content))
-            .sum();
-        assert!(used <= 30, "{line:?} against 30");
+        let theme = Theme::default();
+        let lines = form.form(&theme).lines(30, theme.accent, &theme);
+        for line in &lines {
+            assert!(line.width() <= 30, "{line:?} against 30");
+        }
+        let project = lines[1].to_string();
+        assert!(
+            project.contains('\u{2026}'),
+            "cut with an ellipsis: {project:?}"
+        );
     }
 
     /// Both hints fit the form's inner width inside the list pane at the harness's pinned size, so
@@ -1111,8 +1142,8 @@ mod tests {
         let (width, height) = DEFAULT_SIZE;
         let body = chrome(Rect::new(0, 0, width, height)).body;
         let [left, _] = panes(body);
-        let list = Block::new().borders(Borders::ALL).inner(left);
-        let room = usize::from(list.width) - 2;
+        // MOD-115 M4 Q2: the hints go on the Filter pane's own bottom border, two cells in.
+        let room = usize::from(left.width) - 4;
         for spec in [HINT_CHOICES, HINT_TAGS] {
             let hint = Keys::compiled().hint(views::BACKLOG_FILTER, spec);
             let hint = hint.as_str();

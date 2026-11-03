@@ -81,15 +81,38 @@ fn type_text(harness: &mut Harness, text: &str) {
     }
 }
 
+/// Whether one line of `frame` holds every word of `words`, in order: a `kit::form` row, its
+/// label and its value (MOD-115 M4 E5).
+fn line_has(frame: &str, words: &[&str]) -> bool {
+    frame.lines().any(|line| {
+        let mut rest = line;
+        words.iter().all(|word| match rest.find(word) {
+            Some(at) => {
+                rest = &rest[at + word.len()..];
+                true
+            }
+            None => false,
+        })
+    })
+}
+
+/// Whether `frame` shows a pane titled `title`: a self-drawn `┌ title`, or a kit pane's
+/// `╭─ title` (MOD-115 M4 L-skills, D-11: the body pane's title is a kit title; the
+/// `tests/reveal.rs` pattern, the corner included so a rule elsewhere does not pass for one).
+fn titled(frame: &str, title: &str) -> bool {
+    frame.contains(&format!("\u{250c} {title}"))
+        || frame.contains(&format!("\u{256d}\u{2500} {title}"))
+}
+
 /// Moves the list's cursor onto `name`: to the top, then down until the body pane is titled with
 /// it.
 fn select(harness: &mut Harness, name: &str) {
     for _ in 0..20 {
         harness.key("k");
     }
-    let title = format!("\u{250c} {name} v");
+    let title = format!("{name} v");
     for _ in 0..20 {
-        if harness.render().contains(&title) {
+        if titled(&harness.render(), &title) {
             return;
         }
         harness.key("j");
@@ -131,7 +154,12 @@ fn line_with(frame: &str, needle: &str) -> String {
     frame
         .lines()
         .find(|line| line.contains(needle))
-        .map(|line| line.trim_matches(['\u{2502}', ' ']).to_owned())
+        // MOD-115 M4 E5: a kit row opens with its gutter, and a scrollbar's thumb may stand
+        // for the right border.
+        .map(|line| {
+            line.trim_matches(['\u{2502}', '\u{2503}', '\u{258c}', ' '])
+                .to_owned()
+        })
         .unwrap_or_else(|| panic!("no line holds `{needle}`:\n{frame}"))
 }
 
@@ -277,6 +305,20 @@ async fn the_library_lists_the_skills_with_body_and_estimate() {
         "the head's body: {frame}"
     );
     insta::assert_snapshot!("library", frame);
+    // MOD-115 M4 Q2: the list shows its own keys; the shown skill's are the body's, on its
+    // bottom border once it is focused.
+    harness.key("tab");
+    let body = hint(&harness.render());
+    for keys in [
+        ",/. version",
+        "b base",
+        "d diff",
+        "e edit",
+        "i info",
+        "a attach",
+    ] {
+        assert!(body.contains(keys), "`{keys}` on the body: {body}");
+    }
 }
 
 #[tokio::test]
@@ -361,7 +403,7 @@ async fn the_form_shows_the_effective_globs_before_save() {
         "the form's title: {frame}"
     );
     assert!(
-        frame.contains("activation  glob"),
+        frame.contains("activation  \u{2039} by glob"),
         "`space` cycled the activation: {frame}"
     );
     assert!(
@@ -545,7 +587,7 @@ async fn a_new_skill_needs_a_valid_name_and_a_body() {
         "{frame}"
     );
     assert!(
-        frame.contains("\u{250c} docs-style v1 (head v1)"),
+        titled(&frame, "docs-style v1 (head v1)"),
         "the cursor is on the new skill: {frame}"
     );
     assert!(
@@ -633,7 +675,7 @@ async fn the_info_form_renames_under_compare_and_set() {
     let frame = harness.render();
     assert!(notice(&frame).contains("saved `test-rules`"), "{frame}");
     assert!(
-        frame.contains("\u{250c} test-rules v1 (head v1)"),
+        titled(&frame, "test-rules v1 (head v1)"),
         "the pane follows the renamed row: {frame}"
     );
 }
@@ -705,7 +747,7 @@ async fn a_glob_row_names_repos_with_no_path_here() {
     let frame = harness.render();
     assert!(
         line_with(&frame, " htui ").contains(
-            "glob \u{b7} latest \u{b7} pos 0 \u{b7} 2 globs \u{b7} no path here: htui, web"
+            "by glob \u{b7} latest \u{b7} pos 0 \u{b7} 2 globs \u{b7} no path here: htui, web"
         ),
         "{frame}"
     );
@@ -746,7 +788,7 @@ async fn a_qualified_glob_warns_only_for_its_own_repo() {
     let frame = harness.render();
     let line = line_with(&frame, " htui ");
     assert!(
-        line.contains("glob \u{b7} latest \u{b7} pos 0 \u{b7} 1 globs \u{b7} no path here: web"),
+        line.contains("by glob \u{b7} latest \u{b7} pos 0 \u{b7} 1 glob \u{b7} no path here: web"),
         "{frame}"
     );
     assert!(!line.contains("no path here: htui"), "{frame}");
@@ -830,7 +872,7 @@ async fn an_attachment_saved_in_the_form_lands_and_the_form_closes() {
     let frame = harness.render();
     assert!(notice(&frame).contains("attached to htui"), "{frame}");
     assert!(
-        line_with(&frame, " htui ").contains("glob \u{b7} v1 \u{b7} pos 3 \u{b7} 2 globs"),
+        line_with(&frame, " htui ").contains("by glob \u{b7} v1 \u{b7} pos 3 \u{b7} 2 globs"),
         "the row shows what landed: {frame}"
     );
     assert!(
@@ -846,10 +888,11 @@ async fn an_attachment_saved_in_the_form_lands_and_the_form_closes() {
         frame.contains("effective:  **/*.rs, **/Cargo.toml"),
         "{frame}"
     );
-    // The form's field sits at the panel's left border; the `htui` row's `2 globs` now ends its
-    // line too (MOD-9 D126 dropped `fires from milestone 5`), so the needle carries the border.
+    // The form's field sits at the panel's left border, behind the form's gutter (MOD-115 M4);
+    // the `htui` row's `2 globs` now ends its line too (MOD-9 D126 dropped `fires from milestone
+    // 5`), so the needle carries the border.
     assert!(
-        line_with(&frame, "\u{2502}globs       ") == "globs",
+        line_with(&frame, "\u{2502} globs       ") == "globs",
         "the stored globs minus the language's are empty: {frame}"
     );
 }
@@ -1314,7 +1357,11 @@ async fn the_import_report_lists_every_outcome() {
 
     let frame = harness.render();
     assert!(frame.contains(" import report "), "{frame}");
-    assert!(frame.contains(">! "), "the refused file leads: {frame}");
+    // MOD-115 M4 E5, MOD-85: the cursor is the kit's gutter, no `>` marker.
+    assert!(
+        frame.contains("\u{258c}! "),
+        "the refused file leads: {frame}"
+    );
     assert_eq!(
         hint(&frame).trim(),
         "j/k move \u{b7} r reload \u{b7} Esc back"
@@ -1376,7 +1423,7 @@ async fn a_new_attachment_is_prefilled_from_the_imported_source() {
         "a new attachment: {frame}"
     );
     assert!(
-        frame.contains("activation  glob"),
+        frame.contains("activation  \u{2039} by glob"),
         "the file's activation: {frame}"
     );
     assert!(
@@ -1406,7 +1453,7 @@ async fn an_existing_attachment_is_never_reseeded_from_a_source() {
         frame.contains("edit rust-style \u{b7} htui"),
         "the stored row: {frame}"
     );
-    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(frame.contains("activation  \u{2039} always"), "{frame}");
     assert!(
         line_with(&frame, "globs       ") == "globs",
         "no glob seeded into a stored row: {frame}"
@@ -1423,7 +1470,7 @@ async fn a_skill_with_no_source_prefills_nothing() {
 
     let frame = harness.render();
     assert!(frame.contains("attach tests \u{b7} global"), "{frame}");
-    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(frame.contains("activation  \u{2039} always"), "{frame}");
     assert!(line_with(&frame, "globs       ") == "globs", "{frame}");
     assert!(
         !notice(&frame).contains("prefills"),
@@ -1448,7 +1495,7 @@ async fn a_file_with_no_activation_rule_prefills_always_and_says_so() {
     harness.key("enter");
 
     let frame = harness.render();
-    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(frame.contains("activation  \u{2039} always"), "{frame}");
     assert!(
         notice(&frame).contains("names no activation rule; htui prefills `always`"),
         "{}",
@@ -1631,7 +1678,8 @@ async fn a_proposal_accepted_saves_as_the_next_version() {
     );
     assert!(
         hint(&frame).contains(
-            "Ctrl+s save \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR \u{b7} Esc cancel"
+            // MOD-115 M4 RV3-L3: save and the way out lead, as in the Templates editor.
+            "Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR"
         ),
         "the editor is back: {frame}"
     );
@@ -1869,7 +1917,7 @@ async fn down_and_up_move_the_rename_and_attach_form_fields() {
     harness.key("space");
     let frame = harness.render();
     assert!(
-        frame.contains("activation  glob"),
+        frame.contains("activation  \u{2039} by glob"),
         "`up` went back to the activation: {frame}"
     );
 }
@@ -2000,17 +2048,14 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
     harness.key("g");
     harness.settle().await;
     let frame = harness.render();
-    assert!(
-        frame.contains("\u{250c} tests v"),
-        "the cursor stayed:\n{frame}"
-    );
+    assert!(titled(&frame, "tests v"), "the cursor stayed:\n{frame}");
 
     harness.key("tab");
     harness.key("l");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} tests v"),
+        !titled(&frame, "tests v"),
         "on the Templates view:\n{frame}"
     );
     // RV3 (review M1): back on the library, its cursor moves off `tests`, so the Back that
@@ -2020,23 +2065,20 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} tests v"),
+        !titled(&frame, "tests v"),
         "the cursor left `tests`:\n{frame}"
     );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} tests v"),
+        !titled(&frame, "tests v"),
         "back on the Templates view:\n{frame}"
     );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
-    assert!(
-        frame.contains("\u{250c} tests v"),
-        "back on `tests`:\n{frame}"
-    );
+    assert!(titled(&frame, "tests v"), "back on `tests`:\n{frame}");
 }
 
 /// MOD-115 M2 §7 (T7 repair): the name prompt takes every key, so with the list zoomed `n`
@@ -2052,7 +2094,7 @@ async fn the_name_prompt_opened_with_the_list_zoomed_is_on_screen() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} new skill ") && frame.contains("new skill: qwe"),
+        titled(&frame, "new skill ") && line_has(&frame, &["name", "qwe"]),
         "the prompt is drawn:\n{frame}"
     );
 }
@@ -2078,7 +2120,7 @@ async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} aaa-docs v1 (head v1)"),
+        titled(&frame, "aaa-docs v1 (head v1)"),
         "the new skill, first in the library, is under the cursor:\n{frame}"
     );
     harness.key("backspace");
@@ -2087,8 +2129,37 @@ async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
+    assert!(titled(&frame, "tests v"), "back on `tests`:\n{frame}");
+}
+
+// ---- MOD-115 M4 L-skills: the view on the kit --------------------------------------------------
+
+/// MOD-81, MOD-115 M4 E5: the Library at 80 columns: the list with the view chips on its top
+/// border and its own keys on its bottom one, the body beside it with its title and estimate.
+#[tokio::test]
+async fn the_library_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo()).size(80, 24);
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("2");
+    harness.settle().await;
+    select(&mut harness, "rust-style");
+    let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} tests v"),
-        "back on `tests`:\n{frame}"
+        frame.contains(" Skills  Templates "),
+        "the view chips: {frame}"
     );
+    assert!(
+        !frame.contains("Skills \u{2502} Templates"),
+        "no switch line: {frame}"
+    );
+    assert!(
+        frame.contains("rust-style v2 (head v2) \u{b7} ~42 tokens"),
+        "{frame}"
+    );
+    assert!(
+        hint(&frame).contains("I import"),
+        "the list's keys: {frame}"
+    );
+    insta::assert_snapshot!("library_80", frame);
 }

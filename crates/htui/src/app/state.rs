@@ -8,8 +8,7 @@ use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
 use std::cell::{Cell, RefCell};
 use tokio::sync::mpsc;
 
@@ -21,14 +20,14 @@ use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::translate::translate;
 use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
-use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash, ShellChips};
-use crate::ui::kit::empty::{NextStep, placeholder};
-use crate::ui::kit::pane::{Focus, paint_bottom_hints, paint_bottom_note, paint_focus};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::modal;
+use crate::ui::kit::pane::{Focus, Pane, paint_bottom_note};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::shell::history::{History, Loc};
 use crate::ui::shell::layout::{self as pane_layout, NoteLabels, Seam};
-use crate::ui::shell::{PaneAreas, PaneId, Panes, TabLayout};
+use crate::ui::shell::{HiddenBy, PaneAreas, PaneId, Panes, TabLayout};
 use crate::ui::state_file::{UiState, UiStore};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, about, layout};
@@ -280,6 +279,21 @@ impl<'a> Ctx<'a> {
             cell.set(Some((region, areas)));
         }
         areas
+    }
+
+    /// Why the list of a list + detail tab is off screen this frame, or `None` while it is drawn:
+    /// what [`split`](Self::split) reports as `list_hidden` under the same layout and focus
+    /// (it depends on no region), without recording a claim. A pane drawn beside the list reads
+    /// it to name a step that moves the list only while the list is there (MOD-115 M4 RV,
+    /// repair 1).
+    #[must_use]
+    pub fn list_hidden(&self, default: TabLayout) -> Option<HiddenBy> {
+        crate::ui::shell::layout::areas(
+            Rect::default(),
+            &self.layout.unwrap_or(default),
+            self.focus(),
+        )
+        .list_hidden
     }
 
     /// This context with the tab's focused pane (MOD-115 M2 D3). Only the shell calls it.
@@ -741,14 +755,12 @@ impl App {
         Some(result)
     }
 
-    /// The shell's paint over the panes the active tab claimed (MOD-115 M2 §6.4): the activity
-    /// placeholder, then each visible pane's border restyled for focus (the tab accent on the
-    /// focused one, the faint border on the others).
-    ///
-    /// MOD-115 M3 D1, C2: for a tab that draws its own kit panes (`chrome`), only the activity
-    /// placeholder, a shell pane, is drawn and restyled; while it is the focused pane and nothing
-    /// covers it, the tab's hints go on its bottom border, since no tab can put them there.
-    fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas, chrome: bool) {
+    /// The shell's own pane among those the active tab claimed (MOD-115 M2 §6.4, M3 C2): the
+    /// activity pane, a kit pane holding an empty state until MOD-122 fills it. It is drawn as
+    /// every tab draws its panes (MOD-115 M4 E8): focused through [`Ctx::pane_focus`], so not
+    /// under an overlay or the in-pane editor, in the tab's [`Ctx::accent`], and carrying the
+    /// tab's [`Tab::key_hint`] while it is the focused pane, since no tab can put them there.
+    fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
         let Some(tab) = self.tabs.active() else {
             return;
         };
@@ -757,54 +769,32 @@ impl App {
         // open form) draws what captures them over the zoomed pane; no placeholder covers it.
         let modal = stack.global().is_some_and(|(_, layer)| layer.is_modal());
         let zoomed = areas.list.is_none() && areas.detail.is_empty();
-        if let Some(activity) = areas.activity.filter(|rect| !rect.is_empty())
-            && !(modal && zoomed)
-        {
-            let next = self
-                .keys
-                .reachable_chord(stack, Act::LayoutToggleActivity)
-                .map(|chord| chord.label())
-                .map_or_else(
-                    || ACTIVITY_NEXT_UNBOUND.to_owned(),
-                    |key| format!("{key} {ACTIVITY_NEXT}"),
-                );
-            placeholder(
-                frame,
-                activity,
-                ACTIVITY_TITLE,
-                ACTIVITY_WHAT,
-                NextStep(&next),
-                &self.theme,
+        let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) else {
+            return;
+        };
+        if modal && zoomed {
+            return;
+        }
+        let next = self
+            .keys
+            .reachable_chord(stack, Act::LayoutToggleActivity)
+            .map(|chord| chord.label())
+            .map_or_else(
+                || ACTIVITY_NEXT_UNBOUND.to_owned(),
+                |key| format!("{key} {ACTIVITY_NEXT}"),
             );
-        }
-        let focus = self.focus_of(tab);
-        let accent = self.theme.tab_accent(tab.id().0);
-        for pane in pane_layout::visible(areas) {
-            if chrome && pane != PaneId::Activity {
-                continue;
-            }
-            if let Some(rect) = focused_rect(areas, pane) {
-                let state = if pane == focus {
-                    Focus::Focused
-                } else {
-                    Focus::Unfocused
-                };
-                paint_focus(frame.buffer_mut(), rect, state, accent, &self.theme);
-            }
-        }
-        if chrome
-            && focus == PaneId::Activity
-            && self.overlays.is_empty()
-            && !self.editor_visible()
-            && let Some(activity) = focused_rect(areas, PaneId::Activity)
-            && activity.height >= 2
+        let ctx = self
+            .tab_ctx(tab)
+            .with_covered(!self.overlays.is_empty() || self.editor_visible());
+        let focus = ctx.pane_focus(PaneId::Activity);
+        let mut pane = Pane::new(ACTIVITY_TITLE).focus(focus).accent(ctx.accent());
+        if focus == Focus::Focused
+            && let Some(hints) = tab.key_hint(activity.width.saturating_sub(4), &ctx)
         {
-            let width = activity.width.saturating_sub(4);
-            if let Some(line) = tab.key_hint(width, &self.tab_ctx(tab)) {
-                let row = Rect::new(activity.x, activity.bottom() - 1, activity.width, 1);
-                paint_bottom_hints(frame.buffer_mut(), row, line, self.theme.base);
-            }
+            pane = pane.hints(hints);
         }
+        let inner = pane.render(frame, activity, &self.theme);
+        empty::render(frame, inner, ACTIVITY_WHAT, NextStep(&next), &self.theme);
     }
 
     /// R-TUI-12: what a hidden pane says about bringing it back, right-aligned on the bottom
@@ -1571,13 +1561,14 @@ impl App {
     }
 
     /// Draws one frame: the one-row header, the about panel when it is up, the active tab, the
-    /// in-pane editor over it (MOD-57 P1), the active tab's key hints on the body's bottom border
-    /// (MOD-115 M1 adapter), then the overlays bottom-up and the help box on top.
+    /// shell's activity pane ([`paint_panes`](Self::paint_panes)), the in-pane editor over it
+    /// (MOD-57 P1), the hidden pane's note, then the overlays bottom-up and the help box on top.
     ///
-    /// The hints are the active tab's [`Tab::key_hint`]; they are left off under any overlay (the
-    /// overlay's box has its own hint, plan Q1 (a)) and while the in-pane editor's tab is on
-    /// screen (focused, the editor has the keys; unfocused, the tab refuses its own,
-    /// [`Stack::EDITOR_OPEN`]). The `?` box leaves them alone: the box is centred over the body.
+    /// Every pane carries its own hints and is focused through [`Ctx::pane_focus`] (MOD-115 M4
+    /// E8), so none shows under any overlay (the overlay's box has its own hint, plan Q1 (a)) nor
+    /// while the in-pane editor's tab is on screen (focused, the editor has the keys; unfocused,
+    /// the tab refuses its own, [`Stack::EDITOR_OPEN`]). The `?` box leaves them alone: the box
+    /// is centred over the body.
     ///
     /// Rendering is read-only by contract: a view that emits here is not applied until the next
     /// key or reply drains the queue.
@@ -1628,10 +1619,15 @@ impl App {
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
-                frame.render_widget(
-                    Paragraph::new(Line::styled("No tab is registered.", self.theme.dim))
-                        .block(Block::new().borders(Borders::ALL)),
-                    chrome.body,
+                // MOD-115 M4 E7: a kit pane holding an empty state, what is missing and what
+                // brings it.
+                let inner = Pane::new("").render(frame, chrome.body, &self.theme);
+                empty::render(
+                    frame,
+                    inner,
+                    "No tab is registered.",
+                    NextStep("a tab registered at start shows here"),
+                    &self.theme,
                 );
             }
         }
@@ -1643,39 +1639,12 @@ impl App {
             .active_id()
             .zip(claim)
             .map(|(id, (region, areas))| (id, region, areas));
-        // MOD-115 M3 D1: a tab that draws its own kit panes is not painted over.
-        let draws_chrome = self.tabs.active().is_some_and(|tab| tab.draws_chrome());
         if let Some((_, areas)) = claim {
-            self.paint_panes(frame, &areas, draws_chrome);
+            self.paint_panes(frame, &areas);
         }
 
         self.draw_editor(frame, chrome.body);
 
-        // The M1 hint adapter: tabs still frame their own bodies, so the hints are painted onto
-        // the last row's border glyphs once the tab is drawn. Deleted as tabs move to `Pane::hints`.
-        // MOD-115 M2 §6.4: on a tab that claimed panes they go on the focused pane's border,
-        // from its left edge to the body's right one (with the list focused, the M1 rect).
-        if let Some(tab) = self.tabs.active()
-            && !draws_chrome
-            && self.overlays.is_empty()
-            && !self.editor_visible()
-            && chrome.body.height > 0
-        {
-            let target = claim.map_or(chrome.body, |(_, areas)| {
-                let pane = focused_rect(&areas, self.focus_of(tab)).unwrap_or(chrome.body);
-                Rect {
-                    x: pane.x,
-                    width: chrome.body.right().saturating_sub(pane.x),
-                    height: pane.bottom().saturating_sub(chrome.body.y),
-                    ..chrome.body
-                }
-            });
-            let width = target.width.saturating_sub(4);
-            let hint = tab.key_hint(width, &self.tab_ctx(tab));
-            if let Some(line) = hint {
-                paint_shell_hints(frame.buffer_mut(), target, line, self.theme.base);
-            }
-        }
         // R-TUI-12: the hidden pane's note, after the hints (it keeps one rule cell before them),
         // on the detail's bottom border, or the zoomed pane's.
         if let Some((_, areas)) = claim
@@ -1712,8 +1681,10 @@ impl App {
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
     /// exactly as tall as what it shows and no row is clipped.
     fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let box_width = area.width.saturating_sub(10).max(20);
-        let inner = usize::from(box_width.saturating_sub(2));
+        // Today's packing width (the old box less its two borders), handed to the kit as the
+        // content width: the kit's box is one column wider, so no line re-wraps (blueprint §3.3).
+        let content_w = area.width.saturating_sub(10).max(20).saturating_sub(2);
+        let inner = usize::from(content_w);
         let offered = |act| self.offers(act);
         // MOD-57 M2 E7 (PD-M2-2): the editor keys that act where the user is.
         let uncovered = self.editor.is_some() && !self.editor_covered();
@@ -1752,17 +1723,7 @@ impl App {
         if let Some(closer) = closer {
             rows.push(Line::styled(closer, self.theme.dim));
         }
-        let height = u16::try_from(rows.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height);
-        let box_area = layout::centered(area, box_width, height);
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(rows))
-                .block(Block::new().borders(Borders::ALL).title(" Keys ")),
-            box_area,
-        );
+        modal::help(frame, area, "Keys", &rows, content_w, &self.theme);
     }
 }
 
@@ -1797,75 +1758,6 @@ fn shifted(at: u16, by: i32) -> u16 {
     u16::try_from((i32::from(at) + by).max(0)).unwrap_or(u16::MAX)
 }
 
-/// The rect `pane` is drawn in, if it has a cell (a zoomed-away detail is 0x0).
-fn focused_rect(areas: &PaneAreas, pane: PaneId) -> Option<Rect> {
-    match pane {
-        PaneId::List => areas.list,
-        PaneId::Detail => Some(areas.detail),
-        PaneId::Activity => areas.activity,
-    }
-    .filter(|rect| !rect.is_empty())
-}
-
-/// How many of the body's last rows [`hint_row`] looks through for the tab's bottom border.
-const HINT_SEARCH_ROWS: u16 = 4;
-
-/// The row of `body` the M1 hint adapter paints on: the lowest of its last [`HINT_SEARCH_ROWS`]
-/// rows that starts with a bottom-left corner, i.e. the bottom border of the tab's content. A tab
-/// that puts a notice or a filter row under its frame still gets the hints on the frame; one with
-/// no such border in its last rows loses them until it moves to `Pane::hints` (M3, M4).
-fn hint_row(buf: &ratatui::buffer::Buffer, body: Rect) -> Option<Rect> {
-    let body = body.intersection(buf.area);
-    if body.is_empty() {
-        // A body with no columns (a 0-wide frame) has no cell to look at.
-        return None;
-    }
-    (0..HINT_SEARCH_ROWS.min(body.height))
-        .map(|up| body.bottom() - 1 - up)
-        .find(|y| matches!(buf[(body.x, *y)].symbol(), "\u{2514}" | "\u{2570}"))
-        .map(|y| Rect::new(body.x, y, body.width, 1))
-}
-
-/// The M1 hint adapter's whole job: finds the bottom border of the tab's content in `body`
-/// ([`hint_row`]), joins the seams under the hint ([`join_panes_under`]) and paints the hint on
-/// the rule ([`paint_bottom_hints`]), which ends it in an ellipsis where the tab drew text of its
-/// own on that border. Deleted with the rest of the adapter as tabs move to `Pane::hints`
-/// (M3, M4).
-fn paint_shell_hints(
-    buf: &mut ratatui::buffer::Buffer,
-    body: Rect,
-    hint: Line<'static>,
-    style: Style,
-) {
-    let Some(row) = hint_row(buf, body) else {
-        return;
-    };
-    let line = clip_line(hint, body.width.saturating_sub(4));
-    join_panes_under(buf, row, line.width());
-    paint_bottom_hints(buf, row, line, style);
-}
-
-/// Turns the corners where two side-by-side panes meet on `row` into plain rule, across the
-/// `width` cells the hints will cover from two cells in, so a hint longer than the first pane
-/// reads on across the seam instead of being cut by `┘└`. The join stops at the first cell that
-/// is text on the border (a title the tab drew there), where [`paint_bottom_hints`] ends the hint.
-fn join_panes_under(buf: &mut ratatui::buffer::Buffer, row: Rect, width: usize) {
-    let end = row
-        .x
-        .saturating_add(2)
-        .saturating_add(u16::try_from(width).unwrap_or(u16::MAX))
-        .min(row.right().saturating_sub(1));
-    for x in row.x.saturating_add(2)..end {
-        match buf[(x, row.y)].symbol() {
-            "\u{2518}" | "\u{2514}" | "\u{256f}" | "\u{2570}" => {
-                buf[(x, row.y)].set_symbol("\u{2500}");
-            }
-            "\u{2500}" | "\u{2501}" => {}
-            _ => break,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
@@ -1873,7 +1765,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
-    use super::{App, hint_row, join_panes_under};
+    use super::App;
     use crate::keys::{CATALOGUE, Context};
 
     /// MOD-115 M2 B7: a view sees the list focused and no open edit unless the shell says so;
@@ -2023,139 +1915,6 @@ mod tests {
         assert!(!bare.restore(&TabLoc::default(), &mut ctx));
     }
 
-    /// MOD-115 M1 adapter: the hints go on the lowest bottom border among the body's last four
-    /// rows, so a tab with a notice under its frame still shows them; none there, none shown.
-    #[test]
-    fn the_hint_row_is_the_lowest_bottom_border_in_the_last_rows() {
-        let body = Rect::new(0, 1, 20, 10);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 11));
-        assert_eq!(hint_row(&buf, body), None);
-        buf[(0, 5)].set_symbol("\u{2514}");
-        assert_eq!(hint_row(&buf, body), None, "five rows up is too far");
-        buf[(0, 8)].set_symbol("\u{2514}");
-        assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 8, 20, 1)));
-        buf[(0, 10)].set_symbol("\u{2570}");
-        assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 10, 20, 1)));
-    }
-
-    /// A frame with no columns has no border to paint the hints on: the adapter finds no row
-    /// instead of reading a cell the buffer does not have (T6 repair 2, finding 5).
-    #[test]
-    fn a_body_with_no_columns_has_no_hint_row() {
-        let buf = Buffer::empty(Rect::new(0, 0, 0, 6));
-        for height in 0..=6 {
-            assert_eq!(hint_row(&buf, Rect::new(0, 0, 0, height)), None, "{height}");
-        }
-    }
-
-    /// A hint longer than the first pane reads on across the seam where two panes meet.
-    #[test]
-    fn a_long_hint_joins_the_panes_it_runs_across() {
-        let row = Rect::new(0, 0, 14, 1);
-        let mut buf = Buffer::empty(row);
-        buf.set_string(0, 0, "\u{2514}\u{2500}\u{2500}\u{2500}\u{2518}\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}", ratatui::style::Style::default());
-        join_panes_under(&mut buf, row, 2);
-        assert_eq!(
-            buf[(4, 0)].symbol(),
-            "\u{2518}",
-            "the hint stops before the seam"
-        );
-        join_panes_under(&mut buf, row, 8);
-        assert_eq!(buf[(4, 0)].symbol(), "\u{2500}");
-        assert_eq!(buf[(5, 0)].symbol(), "\u{2500}");
-        assert_eq!(buf[(0, 0)].symbol(), "\u{2514}", "the outer corners stay");
-        assert_eq!(buf[(13, 0)].symbol(), "\u{2518}");
-    }
-
-    /// Two rounded panes side by side over `width` x 8 cells, the right one carrying a scroll hint
-    /// on its bottom border as the Skills library and templates views do.
-    fn two_panes(width: u16) -> Buffer {
-        use ratatui::text::Line;
-        use ratatui::widgets::{Block, BorderType, Widget};
-
-        let area = Rect::new(0, 0, width, 8);
-        let mut buf = Buffer::empty(area);
-        let left = Rect::new(0, 0, width / 3, 8);
-        let right = Rect::new(left.right(), 0, width - left.width, 8);
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .render(left, &mut buf);
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .title_bottom(Line::from(" 12/40 ").right_aligned())
-            .render(right, &mut buf);
-        buf
-    }
-
-    fn bottom_row(buf: &Buffer) -> String {
-        let y = buf.area.bottom() - 1;
-        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
-    }
-
-    /// MOD-115 review (hint adapter): where a tab drew its own text on the bottom border, the
-    /// shell hint ends with an ellipsis just before it instead of skipping cells one by one; the
-    /// seam between the panes is still joined under the part of the hint that is drawn.
-    #[test]
-    fn a_hint_running_into_a_title_on_the_bottom_border_ends_in_an_ellipsis_before_it() {
-        use ratatui::style::Style;
-        use ratatui::text::Line;
-
-        use super::paint_shell_hints;
-
-        let hint = "j/k move \u{b7} enter open \u{b7} f filter \u{b7} N new \u{b7} e edit \u{b7} / search \u{b7} ? keys \u{b7} q quit \u{b7} Tab next tab \u{b7} Ctrl+f find";
-        for width in [100_u16, 80] {
-            let mut buf = two_panes(width);
-            let body = Rect::new(0, 0, width, 8);
-            paint_shell_hints(&mut buf, body, Line::from(hint), Style::new());
-            let row = bottom_row(&buf);
-            let cells: Vec<char> = row.chars().collect();
-            assert_eq!(cells.len(), usize::from(width), "{width}: {row}");
-            assert!(
-                row.starts_with("\u{2570}\u{2500}j/k move"),
-                "{width}: {row}"
-            );
-            assert!(
-                row.ends_with("\u{2026} 12/40 \u{256f}"),
-                "{width}: the hint ends in an ellipsis right before the title: {row}"
-            );
-            let inner = &cells[1..cells.len() - 1];
-            assert!(
-                !inner
-                    .iter()
-                    .any(|c| "\u{2514}\u{2518}\u{2570}\u{256f}".contains(*c)),
-                "{width}: the seam is joined under the hint: {row}"
-            );
-        }
-        // A hint that fits before the title is drawn whole, with no ellipsis.
-        let mut buf = two_panes(100);
-        paint_shell_hints(
-            &mut buf,
-            Rect::new(0, 0, 100, 8),
-            Line::from("j/k move"),
-            Style::new(),
-        );
-        let row = bottom_row(&buf);
-        assert!(row.starts_with("\u{2570}\u{2500}j/k move"), "{row}");
-        assert!(!row.contains('\u{2026}'), "{row}");
-        assert!(row.ends_with(" 12/40 \u{256f}"), "{row}");
-    }
-
-    /// The seam is not joined past text on the border: a corner after the title stays.
-    #[test]
-    fn the_seam_join_stops_at_text_on_the_border() {
-        let row = Rect::new(0, 0, 14, 1);
-        let mut buf = Buffer::empty(row);
-        buf.set_string(
-            0,
-            0,
-            "\u{2570}\u{2500}\u{2500}ab\u{2500}\u{256f}\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
-            ratatui::style::Style::default(),
-        );
-        join_panes_under(&mut buf, row, 12);
-        assert_eq!(buf[(6, 0)].symbol(), "\u{256f}", "text ends the join");
-        assert_eq!(buf[(7, 0)].symbol(), "\u{2570}");
-    }
-
     /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is
     /// either fixed-mapped by the shell or offerable (and so dispatched once `register_all`
     /// offers it). A new global act that is neither would be silently inert.
@@ -2176,6 +1935,170 @@ mod tests {
             );
         }
     }
+
+    /// A shell with no tab registered, about off, the `?` box up when `help`.
+    fn bare_app(help: bool) -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.help_visible = help;
+        app
+    }
+
+    /// The rows the `?` box of a bare shell holds at `width` columns: the global keys packed
+    /// to today's content width (`width - 12`, at least 18), then the closer.
+    fn help_rows(app: &App, width: u16) -> Vec<String> {
+        packed_help_rows(
+            app,
+            usize::from(width.saturating_sub(10).max(20).saturating_sub(2)),
+        )
+    }
+
+    /// The rows the `?` box of a bare shell holds packed to `inner` columns, then the closer.
+    fn packed_help_rows(app: &App, inner: usize) -> Vec<String> {
+        let mut rows: Vec<String> = app
+            .keys
+            .help_line(Context::Global, |act| app.offers(act))
+            .iter()
+            .flat_map(|line| line.rows(inner))
+            .collect();
+        rows.extend(app.keys.help_closer(crate::keys::Stack::BASE));
+        rows
+    }
+
+    /// The top-left corner of the box titled `title` in `buf`: the `╭` a ` {title} ` follows.
+    fn box_corner(buf: &Buffer, title: &str) -> Option<(u16, u16)> {
+        let title = format!(" {title} ");
+        (0..buf.area.height).find_map(|y| {
+            let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            (0..row.len()).find_map(|x| {
+                let follows: String = row[x + 1..].concat();
+                (row[x] == "\u{256d}" && follows.starts_with(&title))
+                    .then(|| (u16::try_from(x).expect("x fits"), y))
+            })
+        })
+    }
+
+    /// The text of `buf` from `(x, y)`, `len` cells.
+    fn cells_at(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
+        (x..x + len).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// MOD-115 M4 E7 (blueprint §3.3): the `?` box is the kit's help box, rounded and titled
+    /// `Keys`, and packs its rows as before: the content is `width - 12` wide (the box one
+    /// column wider than the old one, for the kit's padding), so a line that fitted still fits,
+    /// no row re-wraps and none is clipped, at every width.
+    #[test]
+    fn the_help_box_is_the_kit_help_box_and_packs_as_before() {
+        for width in [40_u16, 60, 80, 100, 140] {
+            let mut app = bare_app(true);
+            let buf = super::shell_tests::draw(&mut app, width, 30);
+            let (x, y) = box_corner(&buf, "Keys").expect("a rounded box titled Keys");
+            let content = width.saturating_sub(10).max(20).saturating_sub(2);
+            let right = x + content + 2;
+            assert_eq!(
+                buf[(right, y)].symbol(),
+                "\u{256e}",
+                "{width}: the box is the content and the kit's chrome wide"
+            );
+            let rows = help_rows(&app, width);
+            for (i, expected) in rows.iter().enumerate() {
+                let at = y + 1 + u16::try_from(i).expect("rows fit");
+                let drawn = cells_at(&buf, x + 1, at, content);
+                assert_eq!(drawn.trim_end(), expected, "{width}: row {i} as packed");
+                assert_eq!(buf[(right, at)].symbol(), "\u{2502}", "{width}: row {i}");
+            }
+            let bottom = y + 1 + u16::try_from(rows.len()).expect("rows fit");
+            assert_eq!(
+                buf[(x, bottom)].symbol(),
+                "\u{2570}",
+                "{width}: the box is exactly as tall as its rows"
+            );
+        }
+    }
+
+    /// A screen of 20 columns or fewer clamps the box below the width its rows are packed to
+    /// (the kit box is one column wider than the old one). Each row there holds one entry, so
+    /// it reads as that width's packing cut at the box's edge: no row breaks somewhere else.
+    #[test]
+    fn a_narrow_screen_cuts_each_help_row_at_the_box_edge() {
+        for width in [14_u16, 16, 18, 20] {
+            let mut app = bare_app(true);
+            let buf = super::shell_tests::draw(&mut app, width, 80);
+            let (x, y) = box_corner(&buf, "Keys").expect("a rounded box titled Keys");
+            let content = width - crate::ui::kit::modal::CHROME;
+            let rows = packed_help_rows(&app, usize::from(content));
+            let keys = &rows[..rows.len() - 1];
+            for (i, expected) in keys.iter().enumerate() {
+                let at = y + 1 + u16::try_from(i).expect("rows fit");
+                let drawn = cells_at(&buf, x + 1, at, content);
+                let fits: String = expected.chars().take(usize::from(content)).collect();
+                assert_eq!(drawn.trim_end(), fits.trim_end(), "{width}: row {i}");
+            }
+        }
+    }
+
+    /// The `?` box's closer stays dim, its key rows the base role (MOD-67 D8).
+    #[test]
+    fn the_help_box_closer_is_dim() {
+        let theme = crate::ui::Theme::default();
+        let mut app = bare_app(true);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let (x, y) = box_corner(&buf, "Keys").expect("the box");
+        let rows = help_rows(&app, 80);
+        let closer = y + u16::try_from(rows.len()).expect("rows fit");
+        let mut dim = ratatui::buffer::Cell::EMPTY;
+        dim.set_style(theme.dim);
+        let cell = &buf[(x + 1, closer)];
+        assert_eq!(
+            (cell.fg, cell.modifier),
+            (dim.fg, dim.modifier),
+            "the closer"
+        );
+        let mut base = ratatui::buffer::Cell::EMPTY;
+        base.set_style(theme.base);
+        let cell = &buf[(x + 1, y + 1)];
+        assert_eq!(
+            (cell.fg, cell.modifier),
+            (base.fg, base.modifier),
+            "a key row"
+        );
+    }
+
+    /// MOD-115 M4 E7: the `?` box over a bare shell at 80 columns.
+    #[test]
+    fn the_help_box_at_80_columns() {
+        let mut app = bare_app(true);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let frame: String = (0..buf.area.height)
+            .map(|y| super::shell_tests::row(&buf, y).trim_end().to_owned() + "\n")
+            .collect();
+        insta::assert_snapshot!("the_help_box_80", frame);
+    }
+
+    /// MOD-115 M4 E7: with no tab registered the body is a kit pane holding an empty state
+    /// that says what is missing and what brings it.
+    #[test]
+    fn the_no_tab_body_is_an_empty_state_with_a_next_step() {
+        let mut app = bare_app(false);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| super::shell_tests::row(&buf, y))
+            .collect();
+        let corner = rows
+            .iter()
+            .position(|row| row.starts_with('\u{256d}'))
+            .expect("the body is a rounded kit pane");
+        let what = rows
+            .iter()
+            .position(|row| row.contains("No tab is registered."))
+            .expect("what is missing");
+        assert!(what > corner, "inside the pane");
+        assert!(
+            rows[what + 1].contains("a tab registered at start shows here"),
+            "the next step under it: {rows:#?}"
+        );
+    }
 }
 
 /// MOD-115 M2 T6: the shell's panes (render), focus, layout, history and mouse, over a list +
@@ -2189,7 +2112,6 @@ pub(crate) mod shell_tests {
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Style};
     use ratatui::text::Line;
-    use ratatui::widgets::{Block, BorderType};
     use ratatui::{Frame, Terminal};
     use tokio::sync::mpsc;
 
@@ -2212,8 +2134,9 @@ pub(crate) mod shell_tests {
         ..TabLayout::DEFAULT
     };
 
-    /// A list + detail tab that splits its body with `ctx.split` and frames each pane, as the
-    /// list + detail tabs do once they adopt the layout (Task 7).
+    /// A list + detail tab that splits its body with `ctx.split` and draws each pane as a kit
+    /// pane, as every list + detail tab does (MOD-115 M4 E8): focused through `ctx.pane_focus`,
+    /// in `ctx.accent()`, and its [`key_hint`](Tab::key_hint) as the focused pane's hints.
     pub(crate) struct SplitTab {
         pub(crate) id: TabId,
         pub(crate) title: &'static str,
@@ -2222,6 +2145,13 @@ pub(crate) mod shell_tests {
         pub(crate) restored: Vec<TabLoc>,
         /// The stack it resolves through: Backlog's body sub-tab unless a test names another.
         pub(crate) stack: Stack<'static>,
+        /// Its focused border's style instead of `ctx.accent()`: [`SENTINEL`], so a border the
+        /// shell repainted cannot pass for one the tab drew.
+        pub(crate) accent: Option<Style>,
+        /// Whether its own panes draw its hints (MOD-115 M4 RV1-M2). Its
+        /// [`key_hint`](Tab::key_hint) is `j/k move` either way, so a tab that draws none still
+        /// has a hint the shell could paint, and a shell that painted it would show.
+        pub(crate) pane_hints: bool,
     }
 
     impl SplitTab {
@@ -2233,6 +2163,8 @@ pub(crate) mod shell_tests {
                 cursor: 0,
                 restored: Vec::new(),
                 stack: views::BACKLOG_BODY,
+                accent: None,
+                pane_hints: true,
             }
         }
     }
@@ -2274,12 +2206,19 @@ pub(crate) mod shell_tests {
         fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
         fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
             let areas = ctx.split(area, SPLIT_LAYOUT);
-            let block = || Block::bordered().border_type(BorderType::Rounded);
+            let accent = self.accent.unwrap_or_else(|| ctx.accent());
+            let pane = |title, id| {
+                let pane = Pane::new(title).focus(ctx.pane_focus(id)).accent(accent);
+                match self.key_hint(0, ctx).filter(|_| self.pane_hints) {
+                    Some(hints) => pane.hints(hints),
+                    None => pane,
+                }
+            };
             if let Some(list) = areas.list {
-                frame.render_widget(block(), list);
+                pane("List", PaneId::List).render(frame, list, ctx.theme);
             }
             if !areas.detail.is_empty() {
-                frame.render_widget(block(), areas.detail);
+                pane("Detail", PaneId::Detail).render(frame, areas.detail, ctx.theme);
             }
         }
         fn key_stack(&self) -> Option<Stack<'static>> {
@@ -2518,65 +2457,20 @@ pub(crate) mod shell_tests {
         assert!(inside.contains("Activity appears here"), "{inside}");
     }
 
-    /// What [`ChromeTab`] draws its focused border in: a colour no border role or tab accent
-    /// uses, so a border the shell repainted cannot pass for one the tab drew.
+    /// What [`SplitTab::accent`] names for a test: a colour no border role or tab accent uses.
     const SENTINEL: Style = Style::new().fg(Color::Red);
 
-    /// MOD-115 M3 D1: a list + detail tab that draws its own kit panes (`draws_chrome`): each
-    /// pane focused through `ctx.pane_focus`, in [`SENTINEL`], and no hints of its own; its
-    /// `key_hint` is what the adapter would paint.
-    struct ChromeTab;
-
-    impl Tab for ChromeTab {
-        fn id(&self) -> TabId {
-            SPLIT
-        }
-        fn title(&self) -> &str {
-            "Backlog"
-        }
-        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
-            Vec::new()
-        }
-        fn on_scope_change(&mut self, _scope: &Scope) {}
-        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
-            Handled::Pass
-        }
-        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
-        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-            let areas = ctx.split(area, SPLIT_LAYOUT);
-            if let Some(list) = areas.list {
-                Pane::new("List")
-                    .focus(ctx.pane_focus(PaneId::List))
-                    .accent(SENTINEL)
-                    .render(frame, list, ctx.theme);
-            }
-            if !areas.detail.is_empty() {
-                Pane::new("Detail")
-                    .focus(ctx.pane_focus(PaneId::Detail))
-                    .accent(SENTINEL)
-                    .render(frame, areas.detail, ctx.theme);
-            }
-        }
-        fn key_stack(&self) -> Option<Stack<'static>> {
-            Some(views::BACKLOG_BODY)
-        }
-        fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
-            Some(Line::from("j/k move"))
-        }
-        fn panes(&self) -> Panes {
-            Panes::ListDetail(SPLIT_LAYOUT)
-        }
-        fn draws_chrome(&self) -> bool {
-            true
-        }
-    }
-
-    /// A shell with [`ChromeTab`] registered, about off.
-    fn chrome_app() -> App {
+    /// A shell with a [`SplitTab`] that draws its focused border in [`SENTINEL`] and no hints on
+    /// its panes though it has keys to hint (`key_hint` is `j/k move`, RV1-M2), about off: what the
+    /// shell paints over its panes, its hint included, shows.
+    fn sentinel_app() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.about_visible = false;
-        app.register_tab(Box::new(ChromeTab));
+        let mut tab = SplitTab::new(SPLIT, "Backlog");
+        tab.accent = Some(SENTINEL);
+        tab.pane_hints = false;
+        app.register_tab(Box::new(tab));
         app
     }
 
@@ -2587,17 +2481,25 @@ pub(crate) mod shell_tests {
             .collect()
     }
 
-    /// M3 D1: the shell does not restyle a chrome tab's borders: the focused pane keeps the
+    /// The bottom border of the pane drawn in `rect`, its own cells only.
+    fn pane_bottom(buf: &Buffer, rect: Rect) -> String {
+        let y = rect.bottom() - 1;
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
+    /// M3 D1, M4 E8: the shell does not restyle a tab's borders: the focused pane keeps the
     /// tab's own accent, the other the faint role the kit gave it.
     #[test]
-    fn a_chrome_tab_keeps_its_own_borders() {
+    fn the_shell_keeps_a_tabs_own_borders() {
         let theme = Theme::default();
         assert_ne!(
             theme.tab_accent(SPLIT.0),
             SENTINEL,
             "the sentinel is not the accent"
         );
-        let mut app = chrome_app();
+        let mut app = sentinel_app();
         let buf = draw(&mut app, 100, 30);
         let (_, areas) = claim(&app);
         let list = areas.list.expect("the list is shown");
@@ -2612,26 +2514,64 @@ pub(crate) mod shell_tests {
         assert_eq!(buf[(list.x, list.y)].fg, faint);
     }
 
-    /// M3 D1: no adapter hint lands on a chrome tab, whichever pane is focused.
+    /// M3 D1, M4 E8: the shell paints no hint of its own over a tab's panes, whichever pane is
+    /// focused: a tab whose panes draw no hints shows none though it has keys to hint (RV1-M2),
+    /// and one whose panes draw them shows them once, on its focused pane. The activity pane is
+    /// the shell's, so the shell hints there, and there only.
     #[test]
-    fn a_chrome_tab_gets_no_adapter_hint() {
-        let mut app = chrome_app();
-        let buf = draw(&mut app, 100, 30);
-        assert!(rows_with(&buf, "j/k move").is_empty());
+    fn the_shell_paints_no_hint_over_a_tabs_panes() {
+        let mut app = sentinel_app();
+        for focus in [PaneId::List, PaneId::Detail] {
+            app.focus.insert(SPLIT, focus);
+            let buf = draw(&mut app, 100, 30);
+            assert!(rows_with(&buf, "j/k move").is_empty(), "{focus:?}");
+        }
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
         app.focus.insert(SPLIT, PaneId::Detail);
         let buf = draw(&mut app, 100, 30);
-        assert!(rows_with(&buf, "j/k move").is_empty());
+        assert!(
+            rows_with(&buf, "j/k move").is_empty(),
+            "detail, activity shown"
+        );
+        app.focus.insert(SPLIT, PaneId::Activity);
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("the preset shows the activity pane");
+        assert_eq!(
+            rows_with(&buf, "j/k move"),
+            [activity.bottom() - 1],
+            "the shell's own pane"
+        );
+
+        let mut app = split_app();
+        for focus in [PaneId::List, PaneId::Detail] {
+            app.focus.insert(SPLIT, focus);
+            let buf = draw(&mut app, 100, 30);
+            let rows = rows_with(&buf, "j/k move");
+            assert_eq!(rows.len(), 1, "{focus:?}");
+            assert_eq!(
+                row(&buf, rows[0]).matches("j/k move").count(),
+                1,
+                "{focus:?}"
+            );
+        }
     }
 
-    /// M3 D1 (T3 repair 1): an overlay holds the keys, so a chrome tab under it is handed no
-    /// focused pane (and a kit pane draws no hints unfocused), as the M2 adapter painted no hint
-    /// under one; closing it gives the focus back.
+    /// M3 D1 (T3 repair 1): an overlay holds the keys, so a tab under it is handed no focused
+    /// pane (and a kit pane draws no hints unfocused), as the M2 adapter painted no hint under
+    /// one; closing it gives the focus back.
     #[test]
-    fn under_an_overlay_a_chrome_tab_draws_no_focused_pane() {
+    fn under_an_overlay_a_tab_draws_no_focused_pane() {
         use crate::ui::overlay::WorkspaceSwitcher;
 
         let theme = Theme::default();
-        let mut app = chrome_app();
+        let mut app = sentinel_app();
         let _ = draw(&mut app, 100, 30);
         let (_, areas) = claim(&app);
         let list = areas.list.expect("the list is shown");
@@ -2648,12 +2588,28 @@ pub(crate) mod shell_tests {
         app.overlays.clear();
         let buf = draw(&mut app, 100, 30);
         assert_eq!(buf[(list.x, list.y)].fg, red, "focused again");
+
+        let mut app = split_app();
+        let buf = draw(&mut app, 100, 30);
+        assert!(
+            pane_bottom(&buf, list).contains("j/k move"),
+            "the focused list's"
+        );
+        app.push_overlay(Box::new(WorkspaceSwitcher::new()));
+        let buf = draw(&mut app, 100, 30);
+        for pane in [list, areas.detail] {
+            assert!(
+                !pane_bottom(&buf, pane).contains("j/k move"),
+                "no hint under it"
+            );
+        }
     }
 
-    /// M3 D1: the hidden-pane note stays the shell's, on the kit pane's rounded bottom border.
+    /// M3 D1: the hidden-pane note stays the shell's, on the kit pane's rounded bottom border,
+    /// on a pane with no hints too.
     #[test]
-    fn the_hidden_pane_note_is_still_painted_on_a_chrome_tab() {
-        let mut app = chrome_app();
+    fn the_hidden_pane_note_is_painted_on_a_pane_without_hints() {
+        let mut app = sentinel_app();
         app.ui.layouts.insert(
             SPLIT.0.to_owned(),
             TabLayout {
@@ -2674,12 +2630,13 @@ pub(crate) mod shell_tests {
         assert!(!text.contains("j/k move"), "{text}");
     }
 
-    /// M3 C2: the activity placeholder is a shell pane on a chrome tab too: drawn, restyled for
-    /// focus, and carrying the tab's hints when it is the focused pane.
+    /// M3 C2, M4 E8: the activity pane is the shell's kit pane: drawn unfocused in the faint
+    /// role, focused in the tab's accent through `Ctx::pane_focus`, and carrying the tab's hints
+    /// when it is the focused pane.
     #[test]
     fn the_activity_placeholder_is_still_the_shells() {
         let theme = Theme::default();
-        let mut app = chrome_app();
+        let mut app = split_app();
         app.ui.layouts.insert(
             SPLIT.0.to_owned(),
             TabLayout {
@@ -2695,7 +2652,10 @@ pub(crate) mod shell_tests {
             buf[(activity.x, activity.y)].fg,
             theme.border_faint.fg.unwrap_or_default()
         );
-        assert!(rows_with(&buf, "j/k move").is_empty());
+        assert!(
+            !pane_bottom(&buf, activity).contains("j/k move"),
+            "no hint on the unfocused activity pane"
+        );
 
         app.focus.insert(SPLIT, PaneId::Activity);
         let buf = draw(&mut app, 100, 30);
@@ -2712,6 +2672,15 @@ pub(crate) mod shell_tests {
         let at = usize::from(activity.x);
         assert_eq!(cells[at + 2..at + 10].concat(), "j/k move");
         assert!(!cells[..at].concat().contains("j/k"));
+
+        // Under an overlay the activity pane is not focused either, so it draws no hints.
+        app.push_overlay(Box::new(crate::ui::overlay::WorkspaceSwitcher::new()));
+        let buf = draw(&mut app, 100, 30);
+        assert_eq!(
+            buf[(activity.x, activity.y)].fg,
+            theme.border_faint.fg.unwrap_or_default()
+        );
+        assert!(!pane_bottom(&buf, activity).contains("j/k move"));
     }
 
     /// A bench context addressed to `origin`, focused on `focus` when one is given.
@@ -2755,7 +2724,7 @@ pub(crate) mod shell_tests {
         });
         assert_eq!((list, detail), (Focus::Unfocused, Focus::Focused));
 
-        let mut app = chrome_app();
+        let mut app = split_app();
         let _ = draw(&mut app, 100, 30);
         let both = |app: &App| {
             let ctx = app.tab_ctx(app.tabs.active().expect("a tab"));
@@ -2770,7 +2739,7 @@ pub(crate) mod shell_tests {
     #[test]
     fn accent_is_the_addressed_tabs() {
         let theme = Theme::default();
-        let app = chrome_app();
+        let app = split_app();
         let shell = app.tab_ctx(app.tabs.active().expect("a tab")).accent();
         assert_eq!(shell, theme.tab_accent(SPLIT.0));
         let settings = bench_check(Origin::Tab(SettingsTab::ID), None, |ctx| ctx.accent());
@@ -3687,14 +3656,25 @@ pub(crate) mod shell_tests {
             Handled::Consumed
         }
         fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        /// Kit panes, the focused one carrying [`key_hint`](Tab::key_hint) built with the
+        /// render's `Ctx`, as every list + detail tab does (MOD-115 M4 E8).
         fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
             let areas = ctx.split(area, SPLIT_LAYOUT);
-            let block = || Block::bordered().border_type(BorderType::Rounded);
-            if let Some(list) = areas.list {
-                frame.render_widget(block(), list);
-            }
-            if !areas.detail.is_empty() {
-                frame.render_widget(block(), areas.detail);
+            for (id, rect) in [
+                (PaneId::List, areas.list),
+                (PaneId::Detail, Some(areas.detail)),
+            ] {
+                let Some(rect) = rect.filter(|rect| !rect.is_empty()) else {
+                    continue;
+                };
+                let focus = ctx.pane_focus(id);
+                let mut pane = Pane::new("").focus(focus).accent(ctx.accent());
+                if focus == Focus::Focused
+                    && let Some(hints) = self.key_hint(rect.width, ctx)
+                {
+                    pane = pane.hints(hints);
+                }
+                pane.render(frame, rect, ctx.theme);
             }
         }
         fn key_stack(&self) -> Option<Stack<'static>> {
@@ -3740,8 +3720,8 @@ pub(crate) mod shell_tests {
     }
 
     /// T6R finding 1 (D3): every `Ctx` the shell builds for a tab carries the tab's focused
-    /// pane, not only the render's: `on_key`, `key_hint`, `on_mouse` and `restore` see the
-    /// focus `Tab` moved.
+    /// pane: `on_key`, `on_mouse` and `restore` see the focus `Tab` moved, and so does the
+    /// render's, which the focused pane's `key_hint` is built with (MOD-115 M4 E8).
     #[test]
     fn every_ctx_the_shell_builds_for_a_tab_carries_its_focus() {
         use crossterm::event::{MouseEvent, MouseEventKind};

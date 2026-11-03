@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/backlog_forms.rs
+expression: frame
+---
+Platform   ¹Backlog       1 working · 1 waiting · memory ·  F9  about   F1  keys
+╭─ ANA-1  v1 → theirs v2 ──────────────────────────────────────────────────────╮
+│field     state     ancestor v1        theirs v2          mine                │
+│title     conflict  Data model, box    Theirs             Data model, box     │
+│                    registry and sync                     registry and sync   │
+│                    topology                              topology mine       │
+│body      conflict  8 lines            1 line             8 lines             │
+│body  ancestor → theirs                 body  ancestor → mine                 │
+│--- ancestor v1                        │--- ancestor v1                       │
+│+++ theirs v2                          │+++ mine                              │
+│@@ -1,8 +1 @@                          │@@ -1,4 +1,4 @@                       │
+│-The store seam is the one interface   │-The store seam is the one interface  │
+│every other module reaches through, so │every other module reaches through, so│
+│it is settled first.                   │it is settled first.                  │
+│-                                      │+Mine first. The store seam is the one│
+│-Postgres holds the truth; every box   │interface every other module reaches  │
+│keeps a read-only cache it refreshes on│through, so it is settled first.      │
+│connect. Writes are                    │                                      │
+│-compare-and-set on a version column,  │ Postgres holds the truth; every box  │
+│so a losing edit is shown against its  │keeps a read-only cache it refreshes  │
+│common ancestor rather                 │on connect. Writes are                │
+│-than silently dropped.                │ compare-and-set on a version column, │
+│-                                      │so a losing edit is shown against its │
+╰─t theirs wins · m mine wins · Esc back───────────────────────────────────────╯

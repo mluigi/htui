@@ -34,9 +34,10 @@ use htui_core::model::{
     StepGraphId,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{
@@ -47,8 +48,8 @@ use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
-use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::text::wrapped;
+use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::text::{self, Tone, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
@@ -82,9 +83,6 @@ pub const HINT_AREA: HintSpec = &[
 /// The refusal of a save in a project without item kinds: an item needs one.
 pub const NO_KINDS: &str = "this project has no item kinds; Settings \u{2192} Kinds adds one";
 
-/// Width of a row's label column, after the two-cell focus marker.
-const LABEL: usize = 9;
-
 /// Rows the paths area takes.
 const PATHS_HEIGHT: u16 = 3;
 
@@ -92,9 +90,6 @@ const PATHS_HEIGHT: u16 = 3;
 /// detail pane's width. A longer notice (a D11 hedge after a long store message) grows into the
 /// body's rows.
 const NOTICE_HEIGHT: u16 = 2;
-
-/// Rows the body keeps when a long notice grows.
-const BODY_MIN: u16 = 3;
 
 /// One focusable part of the form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,7 +617,7 @@ impl ItemForm {
     /// never picks on a picker.
     pub fn on_pressed(&mut self, key: KeyEvent, pressed: KeyChord, keys: &Keys) -> ItemFormOutcome {
         if self.resolving.is_some() {
-            return self.on_view_key(key, keys);
+            return self.on_view_key(pressed, keys);
         }
         let stack = views::ITEM_FORM;
         let chord = pressed;
@@ -714,15 +709,16 @@ impl ItemForm {
         }
     }
 
-    /// A key while the view is open (D5). `Esc` closes it and keeps the text, focus, token and
-    /// reason; `m`/`t` rebase the form on the head with the resolved spec. `Ctrl+E` is no act in
+    /// A key while the view is open (D5), `pressed` the chord the user pressed (`Ctx::pressed`,
+    /// MOD-115 M4 MD-A). `Esc` closes it and keeps the text, focus, token and reason; `m`/`t`
+    /// rebase the form on the head with the resolved spec. `Ctrl+E` is no act in
     /// [`views::ITEM_DIVERGENCE`], so it passes like any CONTROL chord (MOD-67 M5): no editor
     /// opens over the view.
-    fn on_view_key(&mut self, key: KeyEvent, keys: &Keys) -> ItemFormOutcome {
+    fn on_view_key(&mut self, pressed: KeyChord, keys: &Keys) -> ItemFormOutcome {
         let Some(view) = self.resolving.as_mut() else {
             return ItemFormOutcome::Stay;
         };
-        match view.on_key(key, keys) {
+        match view.on_pressed(pressed, keys) {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
             ViewOutcome::Back => {
@@ -998,47 +994,32 @@ impl ItemForm {
         }
     }
 
-    /// One focused row as a line of at most `width` cells: the marker, the label, the value.
-    fn row_line(&self, field: Field, width: u16, theme: &Theme) -> Line<'static> {
-        let focused = self.focus == field;
-        let label = match field {
-            Field::Project => "project",
-            Field::Kind => "kind",
-            Field::Title => "title",
-            Field::Priority => "priority",
-            Field::Tags => "tags",
-            Field::Graph => "graph",
-            Field::Paths => "paths",
-            Field::Body => "body",
+    /// `field` as a `kit::form` row (MOD-115 M4 L-forms): a picker its `‹ word ›` (`choice`, the
+    /// [`picker_label`](Self::picker_label)), a one-line field its widget, and Paths or Body their
+    /// label over `rows` rows of their text, `width` cells wide (stacked).
+    fn form_row<'a>(
+        &'a self,
+        field: Field,
+        choice: &'a str,
+        (width, rows): (u16, u16),
+        theme: &Theme,
+    ) -> form::Field<'a> {
+        let area = |area: &TextArea| {
+            let mut lines = area.lines(width, rows, self.focus == field, theme);
+            lines.resize(usize::from(rows), Line::default());
+            Value::Lines(lines)
         };
-        let head = format!("{}{label:<LABEL$}", marker(focused));
-        let head_style = if focused { theme.title } else { theme.dim };
-        let all = usize::from(width);
-        let room = all.saturating_sub(cell_width(&head));
-        let mut spans = vec![Span::styled(cells::clip(&head, all), head_style)];
-        let text = match field {
-            Field::Title => Some(&self.title),
-            Field::Priority => Some(&self.priority),
-            Field::Tags => Some(&self.tags),
-            Field::Project | Field::Kind | Field::Graph | Field::Paths | Field::Body => None,
-        };
-        match text {
-            Some(text) => {
-                let room = u16::try_from(room).unwrap_or(u16::MAX);
-                spans.extend(text.line(room, focused, theme).spans);
-            }
-            None => {
-                let value = format!("\u{2039}{}\u{203a}", self.picker_label(field));
-                spans.push(Span::styled(cells::clip(&value, room), theme.base));
-            }
+        match field {
+            Field::Project => form::Field::new("project", Value::Choice(choice)),
+            Field::Kind => form::Field::new("kind", Value::Choice(choice)),
+            Field::Title => form::Field::new("title", Value::Text(&self.title)),
+            Field::Priority => form::Field::new("priority", Value::Text(&self.priority)),
+            Field::Tags => form::Field::new("tags", Value::Text(&self.tags)),
+            Field::Graph => form::Field::new("graph", Value::Choice(choice)),
+            Field::Paths => form::Field::new("paths (one per line)", area(&self.paths)).stacked(),
+            Field::Body => form::Field::new("body", area(&self.body)).stacked(),
         }
-        Line::from(spans)
     }
-}
-
-/// The two-cell focus marker, so focus shows in a text snapshot.
-pub(super) const fn marker(focused: bool) -> &'static str {
-    if focused { "> " } else { "  " }
 }
 
 impl ItemForm {
@@ -1055,100 +1036,122 @@ impl ItemForm {
     }
 }
 
-/// Draws the form into the detail pane's `area` (D8).
+/// The item form's pane title (MOD-115 M4 D-9): `Edit ANA-1 (v1)` for an edit, `New item ·
+/// {slug}` for a new item. The Backlog draws the pane it titles, in the detail's place.
+#[must_use]
+pub fn title(form: &ItemForm) -> String {
+    match &form.context.item {
+        Some(item) => format!("Edit {} (v{})", item.key, item.version),
+        None => format!("New item \u{b7} {}", form.slug(form.context.project)),
+    }
+}
+
+/// Draws the form's rows into `inner`, the inner rect of the pane the Backlog draws in the
+/// detail pane's place (D8; MOD-115 M4 D-9: the frame is a kit pane titled [`title`]).
+///
+/// The rows are `kit::form` rows (MOD-115 M4 L-forms): the one-line fields, then Paths and Body
+/// as their labels over their text, the focused field marked by the gutter in `accent`
+/// (`ctx.accent()`) and the band; a picker is banded whole, a field typed into only on its label,
+/// so its cursor shows. The notice is the form's last rows, after the gutter. A pane too short
+/// for every row scrolls the focused field into view.
 ///
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
-/// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
-/// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
-    let title = match &form.context.item {
-        Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
-        None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
-    };
-    let block = Block::new().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let rows: Vec<Field> = form
-        .fields()
-        .iter()
-        .copied()
-        .filter(|field| !matches!(field, Field::Paths | Field::Body))
-        .collect();
-    // The notice in rows of at most the pane's width in cells: broken at spaces, and inside a word
-    // only when the word alone is wider (a long path in a refusal). Wrapped here rather than by
-    // `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
-    // (the `kit::text::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
+/// `$EDITOR`, else the focused one when it is Paths, else the body, each the text under its
+/// label, after the gutter. The paths rect is `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths
+/// edit gets the whole tab body (R0 F1).
+pub fn render(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    form: &ItemForm,
+    accent: Style,
+    theme: &Theme,
+) -> Rect {
+    let fields = form.fields();
+    let one_line = u16::try_from(fields.len().saturating_sub(2)).unwrap_or(u16::MAX);
+    let width = Form::new().content_width(inner.width);
+    // The notice in rows of at most the content's width in cells: broken at spaces, and inside a
+    // word only when the word alone is wider (a long path in a refusal). Wrapped here, because
+    // the layout sizes the notice from this count before drawing it (the `kit::text::wrapped`
+    // precedent), and a count that disagreed would cut off the D11 hedge.
     let mut notice_lines = form
         .notice
         .as_deref()
-        .map(|sentence| wrapped(sentence, usize::from(inner.width)))
+        .map(|sentence| wrapped(sentence, usize::from(width)))
         .unwrap_or_default();
     // Every row but the body and the notice: the one-line rows, the paths and their label, and
-    // the body label (the keys are the shell's hint row since MOD-67 M6 T2).
-    let fixed = u16::try_from(rows.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(PATHS_HEIGHT + 2);
+    // the body label (the keys are the pane's hints since MOD-67 M6 T2).
+    let fixed = one_line.saturating_add(PATHS_HEIGHT + 2);
     // The notice grows into the body's rows when it has to (a small terminal), and a notice
     // longer than all of them loses its first rows: the D11 hedge ends the sentence, and it is
     // what stops a second Ctrl+S from minting a duplicate.
     let room = inner.height.saturating_sub(fixed);
     let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
     let notice_height = wanted.min(room).max(NOTICE_HEIGHT);
-    let body_min = BODY_MIN.min(room.saturating_sub(notice_height));
     if wanted > notice_height {
         notice_lines.drain(..usize::from(wanted - notice_height));
     }
-    let mut constraints: Vec<Constraint> = rows.iter().map(|_| Constraint::Length(1)).collect();
-    constraints.extend([
-        Constraint::Length(1),
-        Constraint::Length(PATHS_HEIGHT),
-        Constraint::Length(1),
-        Constraint::Min(body_min),
-        Constraint::Length(notice_height),
-    ]);
-    let areas = Layout::vertical(constraints).split(inner);
-    let width = inner.width;
-    for (field, at) in rows.iter().zip(areas.iter()) {
-        frame.render_widget(Paragraph::new(form.row_line(*field, width, theme)), *at);
-    }
-    let rest = &areas[rows.len()..];
-    let [paths_label, paths, body_label, body, notice] =
-        [rest[0], rest[1], rest[2], rest[3], rest[4]];
-    let label = |field: Field, text: &str| {
-        let focused = form.focus == field;
-        let style = if focused { theme.title } else { theme.dim };
-        Line::styled(
-            cells::clip(&format!("{}{text}", marker(focused)), usize::from(width)),
-            style,
-        )
+    let body_height = room.saturating_sub(notice_height);
+    let choices: Vec<String> = fields
+        .iter()
+        .map(|field| form.picker_label(*field))
+        .collect();
+    let rows = |field: Field| match field {
+        Field::Paths => PATHS_HEIGHT,
+        Field::Body => body_height,
+        Field::Project
+        | Field::Kind
+        | Field::Title
+        | Field::Priority
+        | Field::Tags
+        | Field::Graph => 1,
     };
-    frame.render_widget(
-        Paragraph::new(label(Field::Paths, "paths (one per line)")),
-        paths_label,
-    );
-    frame.render_widget(
-        Paragraph::new(form.paths.lines(
-            paths.width,
-            paths.height,
-            form.focus == Field::Paths,
-            theme,
-        )),
-        paths,
-    );
-    frame.render_widget(Paragraph::new(label(Field::Body, "body")), body_label);
-    frame.render_widget(
-        Paragraph::new(
-            form.body
-                .lines(body.width, body.height, form.focus == Field::Body, theme),
-        ),
-        body,
-    );
+    let mut kit = Form::new();
+    for (field, choice) in fields.iter().zip(&choices) {
+        kit = kit.field(form.form_row(*field, choice, (width, rows(*field)), theme));
+    }
+    let focus = fields
+        .iter()
+        .position(|field| *field == form.focus)
+        .unwrap_or(0);
+    let editing = !matches!(form.focus, Field::Project | Field::Kind | Field::Graph);
+    let laid = kit
+        .focus(focus)
+        .editing(editing)
+        .layout(inner.width, accent, theme);
+    let above = Rect {
+        height: inner.height.saturating_sub(notice_height),
+        ..inner
+    };
+    // A pane too short for every row scrolls the focused field into view (the kit's
+    // `FormLines::offset`), down to Paths and Body.
+    let offset = u16::try_from(laid.offset(above.height)).unwrap_or(u16::MAX);
+    laid.render(frame, above, usize::from(offset));
+    // The text rows under a label, after the gutter, inside the pane: the form's lines `line`
+    // to `line + height`, less those scrolled off its top.
+    let text_at = |line: u16, height: u16| {
+        let shown = line.max(offset);
+        Rect {
+            x: inner.x.saturating_add(1),
+            y: above.y.saturating_add(shown - offset),
+            width,
+            height: line.saturating_add(height).saturating_sub(shown),
+        }
+        .intersection(above)
+    };
+    let paths_line = one_line + 1;
+    let paths = text_at(paths_line, PATHS_HEIGHT);
+    let body = text_at(paths_line + PATHS_HEIGHT + 1, body_height);
+    let notice = Rect {
+        x: inner.x.saturating_add(1),
+        y: above.bottom(),
+        width,
+        height: inner.bottom().saturating_sub(above.bottom()),
+    };
     frame.render_widget(
         Paragraph::new(
             notice_lines
-                .into_iter()
-                .map(|line| Line::styled(line, theme.error))
+                .iter()
+                .map(|line| text::notice(line, Tone::Error, theme))
                 .collect::<Vec<_>>(),
         ),
         notice,
@@ -1187,6 +1190,9 @@ mod tests {
     use crate::item_writes;
     use crate::store_worker::StoreReply;
     use crate::testkit::DEFAULT_SIZE;
+    use crate::ui::cells::cell_width;
+    use crate::ui::kit::list::GUTTER;
+    use crate::ui::kit::pane::Pane;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1194,6 +1200,8 @@ mod tests {
     use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Style};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
@@ -1808,6 +1816,279 @@ mod tests {
         assert!(printed.contains("notice_len"), "{printed}");
     }
 
+    /// The accent the tests draw the form's gutter in: not a theme role, so a cell in it is the
+    /// gutter's and nothing else's.
+    const ACCENT: Style = Style::new().fg(Color::Magenta);
+
+    /// The form drawn as the Backlog draws it (MOD-115 M4 D-9): its rows inside a kit pane titled
+    /// [`title`] over `area`; the rect it claims.
+    fn framed(frame: &mut Frame<'_>, area: Rect, form: &ItemForm) -> Rect {
+        framed_in(frame, area, form, &Theme::default())
+    }
+
+    /// [`framed`] in `theme`.
+    fn framed_in(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
+        let inner = Pane::new(&title(form)).render(frame, area, theme);
+        render(frame, inner, form, ACCENT, theme)
+    }
+
+    /// The form drawn into the detail pane at the default size in `theme`: the buffer, the pane's
+    /// inner rect and the rect the form claims.
+    fn painted(form: &ItemForm, theme: &Theme) -> (Buffer, Rect, Rect) {
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            right.width,
+            right.height,
+        ))
+        .expect("a test terminal");
+        let mut claim = None;
+        terminal
+            .draw(|frame| claim = Some(framed_in(frame, frame.area(), form, theme)))
+            .expect("the frame draws");
+        let area = Rect::new(0, 0, right.width, right.height);
+        (
+            terminal.backend().buffer().clone(),
+            Pane::inner(area),
+            claim.expect("the frame drew"),
+        )
+    }
+
+    /// The text of row `y` of `buffer` inside `inner`.
+    fn inner_row(buffer: &Buffer, inner: Rect, y: u16) -> String {
+        (inner.x..inner.right())
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The first row inside `inner` whose text after the gutter starts with `label`.
+    fn row_of(buffer: &Buffer, inner: Rect, label: &str) -> u16 {
+        (inner.y..inner.bottom())
+            .find(|y| {
+                inner_row(buffer, inner, *y)
+                    .chars()
+                    .skip(1)
+                    .collect::<String>()
+                    .starts_with(label)
+            })
+            .unwrap_or_else(|| panic!("a {label:?} row"))
+    }
+
+    /// Whether `cell` is drawn in the selection band (`theme.selected`).
+    fn banded(cell: &ratatui::buffer::Cell, theme: &Theme) -> bool {
+        theme.selected.bg.is_none_or(|bg| cell.bg == bg)
+            && cell.modifier.contains(theme.selected.add_modifier)
+    }
+
+    /// MOD-115 M4 L-forms: the rows are `kit::form` rows. The gutter marks the focused one, the
+    /// pickers read `‹ word ›`, paths and body are labels over their text, and no `> ` marker is
+    /// left.
+    #[tokio::test]
+    async fn the_rows_are_kit_form_rows_with_the_gutter_on_the_focus() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        let rows = drawn(&form);
+        let text = rows.join("\n");
+        for wanted in [
+            "\u{2502}\u{258c}title      Fresh item",
+            "\u{2502} project    \u{2039} htui \u{203a}",
+            "\u{2502} kind       \u{2039} ANA analysis \u{203a}",
+            "\u{2502} priority   0",
+            "\u{2502} graph      \u{2039} kind default \u{203a}",
+            "\u{2502} paths (one per line)",
+            "\u{2502} body ",
+        ] {
+            assert!(text.contains(wanted), "{wanted:?} in\n{text}");
+        }
+        assert!(
+            !rows.iter().any(|row| row.contains("\u{2502}> ")),
+            "no `> ` marker:\n{text}"
+        );
+        let order = [
+            "project", "kind", "title", "priority", "tags", "graph", "paths", "body",
+        ];
+        let at: Vec<usize> = order
+            .iter()
+            .map(|label| {
+                rows.iter()
+                    .position(|row| row.chars().skip(2).collect::<String>().starts_with(label))
+                    .unwrap_or_else(|| panic!("a {label:?} row in\n{text}"))
+            })
+            .collect();
+        assert!(at.is_sorted(), "{order:?} at {at:?} in\n{text}");
+        assert_eq!(at[6] + 1 + usize::from(PATHS_HEIGHT), at[7], "{text}");
+    }
+
+    /// MOD-115 M4 L-forms (MOD-85): the focused text row's gutter is the accent and only its
+    /// label is banded, so the field's reversed cursor still shows in monochrome; a focused
+    /// picker is banded whole. Both themes.
+    #[tokio::test]
+    async fn the_focus_is_the_accent_gutter_and_the_band_in_both_themes() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh");
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let (buffer, inner, _) = painted(&form, &theme);
+            let y = row_of(&buffer, inner, "title");
+            assert_eq!(buffer[(inner.x, y)].symbol(), GUTTER);
+            assert_eq!(buffer[(inner.x, y)].fg, Color::Magenta, "the accent");
+            assert!(banded(&buffer[(inner.x + 1, y)], &theme), "the label");
+            let value = inner.x + 1 + 9 + 2;
+            assert_eq!(buffer[(value, y)].symbol(), "F");
+            assert!(
+                !banded(&buffer[(value, y)], &theme),
+                "the value is typed into"
+            );
+            let kind = row_of(&buffer, inner, "kind");
+            assert_eq!(
+                buffer[(inner.x, kind)].symbol(),
+                " ",
+                "no gutter off the focus"
+            );
+            assert!(!banded(&buffer[(inner.x + 1, kind)], &theme));
+        }
+
+        focus_on(&mut form, Field::Kind);
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let (buffer, inner, _) = painted(&form, &theme);
+            let y = row_of(&buffer, inner, "kind");
+            assert_eq!(buffer[(inner.x, y)].symbol(), GUTTER);
+            let word = inner_row(&buffer, inner, y)
+                .chars()
+                .position(|c| c == 'A')
+                .expect("the kind's word");
+            let word = inner.x + u16::try_from(word).expect("on screen");
+            assert!(
+                banded(&buffer[(word, y)], &theme),
+                "a picker is banded whole"
+            );
+        }
+    }
+
+    /// MOD-115 M4 L-forms (repair 1): a pane too short for every row scrolls the focused
+    /// field into view, and the rect it claims for an editor is the scrolled text's.
+    #[tokio::test]
+    async fn a_short_pane_scrolls_and_the_claim_follows() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Paths);
+        form.on_paste("src/**");
+        let (width, height) = (60, 8);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        let mut claim = None;
+        terminal
+            .draw(|frame| claim = Some(framed(frame, frame.area(), &form)))
+            .expect("the frame draws");
+        let claim = claim.expect("the form claims a rect");
+        let buffer = terminal.backend().buffer().clone();
+        let inner = Pane::inner(Rect::new(0, 0, width, height));
+        let label = row_of(&buffer, inner, "paths (one per line)");
+        assert_eq!(buffer[(inner.x, label)].symbol(), GUTTER, "paths in view");
+        assert_eq!(claim.y, label + 1, "the claim is the scrolled text");
+        assert!(
+            inner_row(&buffer, inner, claim.y)
+                .chars()
+                .skip(1)
+                .collect::<String>()
+                .starts_with("src/**")
+        );
+    }
+
+    /// MOD-115 M4 L-forms: paths and body are their labels over their text across the form's
+    /// width after the gutter, the gutter on the label of the focused one.
+    #[tokio::test]
+    async fn paths_and_body_are_labels_over_their_text() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Paths);
+        form.on_paste("src/**");
+        focus_on(&mut form, Field::Body);
+        form.on_paste("First line.");
+        let (buffer, inner, claim) = painted(&form, &Theme::default());
+        let label = row_of(&buffer, inner, "body");
+        assert_eq!(
+            buffer[(inner.x, label)].symbol(),
+            GUTTER,
+            "the body is focused"
+        );
+        assert_eq!(claim.y, label + 1, "the text is under its label");
+        assert_eq!((claim.x, claim.right()), (inner.x + 1, inner.right()));
+        assert!(
+            inner_row(&buffer, inner, claim.y)
+                .chars()
+                .skip(1)
+                .collect::<String>()
+                .starts_with("First line.")
+        );
+        let paths = row_of(&buffer, inner, "paths (one per line)");
+        assert_eq!(buffer[(inner.x, paths)].symbol(), " ");
+        assert!(
+            inner_row(&buffer, inner, paths + 1)
+                .chars()
+                .skip(1)
+                .collect::<String>()
+                .starts_with("src/**")
+        );
+    }
+
+    /// MOD-115 M4 L-forms: the notice is the form's last rows, after the gutter, in the error
+    /// role.
+    #[tokio::test]
+    async fn the_notice_is_the_last_rows_in_the_error_role() {
+        let mut form = new_form().await;
+        form.settle(Some(NO_KINDS.to_owned()));
+        let theme = Theme::default();
+        let (buffer, inner, _) = painted(&form, &theme);
+        let rows: Vec<String> = (inner.y..inner.bottom())
+            .map(|y| inner_row(&buffer, inner, y))
+            .collect();
+        let flowed = rows[rows.len() - usize::from(NOTICE_HEIGHT)..]
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(flowed, NO_KINDS, "{}", rows.join("\n"));
+        let y = inner.bottom() - NOTICE_HEIGHT;
+        assert_eq!(buffer[(inner.x, y)].symbol(), " ", "after the gutter");
+        assert_eq!(
+            buffer[(inner.x + 1, y)].fg,
+            theme.error.fg.expect("a colour")
+        );
+    }
+
+    /// MOD-115 M4 L-forms (MD-A): every hint the form shows names its keys through `Keys`, so a
+    /// rebound key is the one named; only `Esc` (never configurable, M2 MD7) is written out.
+    #[tokio::test]
+    async fn the_hints_name_the_keys_in_force() {
+        let keys = crate::keys::load_str(
+            "version = 1\n[form]\nnext_field = \"f3\"\nsave = \"f2\"\nexternal_editor = \"f4\"\n\
+             [choice]\nprev = \"f5\"\nnext = \"f6\"\n",
+        )
+        .expect("loads");
+        let mut form = new_form().await;
+        assert_eq!(
+            form.key_hint(&keys),
+            "F3 field \u{b7} F2 save \u{b7} Esc cancel"
+        );
+        focus_on(&mut form, Field::Kind);
+        assert!(
+            form.key_hint(&keys)
+                .starts_with("F5/F6 choose \u{b7} F3 field"),
+            "{}",
+            form.key_hint(&keys)
+        );
+        focus_on(&mut form, Field::Body);
+        assert_eq!(
+            form.key_hint(&keys),
+            "F4 $EDITOR \u{b7} F2 save \u{b7} Esc cancel"
+        );
+        for spec in [HINT_TEXT, HINT_PICK, HINT_AREA] {
+            for hint in spec {
+                if let Hint::Text(text) = hint {
+                    assert!(text.starts_with("Esc "), "{text:?} names a key");
+                }
+            }
+        }
+    }
+
     /// The form drawn into the detail pane at the default size, one string per row.
     fn drawn(form: &ItemForm) -> Vec<String> {
         drawn_at(form, DEFAULT_SIZE)
@@ -1823,7 +2104,7 @@ mod tests {
         .expect("a test terminal");
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), form, &Theme::default());
+                framed(frame, frame.area(), form);
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1853,7 +2134,7 @@ mod tests {
         let mut body = None;
         terminal
             .draw(|frame| {
-                body = Some(render(frame, frame.area(), &form, &Theme::default()));
+                body = Some(framed(frame, frame.area(), &form));
             })
             .expect("the frame draws");
         let body = body.expect("the frame drew");
@@ -1863,13 +2144,11 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        assert_eq!((body.x, body.width), (1, right.width - 2), "{body:?}");
+        // MOD-115 M4 L-forms: after the form's one-cell gutter, across the rest of the pane.
+        assert_eq!((body.x, body.width), (2, right.width - 3), "{body:?}");
         assert!(row(body.y).starts_with("First line."), "{:?}", row(body.y));
-        assert!(
-            row(body.y - 1).starts_with("> body"),
-            "{:?}",
-            row(body.y - 1)
-        );
+        assert!(row(body.y - 1).starts_with("body"), "{:?}", row(body.y - 1));
+        assert_eq!(buffer[(body.x - 1, body.y - 1)].symbol(), GUTTER, "focused");
         // The notice's two rows and the frame's bottom border are below it (the keys are the
         // shell's hint row since MOD-67 M6 T2).
         assert_eq!(body.bottom() + NOTICE_HEIGHT + 1, right.height, "{body:?}");
@@ -1893,7 +2172,7 @@ mod tests {
             let mut rect = None;
             terminal
                 .draw(|frame| {
-                    rect = Some(render(frame, frame.area(), form, &Theme::default()));
+                    rect = Some(framed(frame, frame.area(), form));
                 })
                 .expect("the frame draws");
             let rect = rect.expect("the frame drew");
@@ -1911,10 +2190,10 @@ mod tests {
         assert_eq!(form.external, Some(Field::Paths));
         let (paths, label, first) = drawn(&form);
         assert_eq!(paths, focused, "focused or handed off, the same rect");
-        assert_eq!((paths.x, paths.width), (1, right.width - 2), "{paths:?}");
+        assert_eq!((paths.x, paths.width), (2, right.width - 3), "{paths:?}");
         assert_eq!(paths.height, PATHS_HEIGHT, "{paths:?}");
         assert!(paths.height < crate::app::MIN_PANE.height);
-        assert!(label.starts_with("> paths"), "{label:?}");
+        assert!(label.starts_with("paths"), "{label:?}");
         assert!(first.starts_with("src/**"), "{first:?}");
     }
 
@@ -1926,10 +2205,10 @@ mod tests {
         let text = drawn(&form).join("\n");
         for wanted in [
             " New item \u{b7} htui ",
-            "> title    Fresh item",
-            "  project  \u{2039}htui\u{203a}",
-            "\u{2039}ANA ",
-            "\u{2039}kind default\u{203a}",
+            "\u{258c}title      Fresh item",
+            " project    \u{2039} htui \u{203a}",
+            "\u{2039} ANA ",
+            "\u{2039} kind default \u{203a}",
             "paths (one per line)",
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
@@ -2031,13 +2310,27 @@ mod tests {
         let id = htui.graphs[0].id;
         let mut form = ItemForm::open_new(htui, &projects(), None);
         form.graph = Some(id);
-        let line = form.row_line(Field::Graph, 30, &Theme::default());
-        let used: usize = line
-            .spans
+        // A 32-column pane: 30 cells inside its borders.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20)).expect("a terminal");
+        terminal
+            .draw(|frame| {
+                framed(frame, frame.area(), &form);
+            })
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..20)
+            .map(|y| (0..32).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let row = rows
             .iter()
-            .map(|span| cell_width(&span.content))
-            .sum();
-        assert!(used <= 30, "{line:?} against 30");
+            .find(|row| row.contains(" graph "))
+            .unwrap_or_else(|| panic!("a graph row in\n{}", rows.join("\n")));
+        assert!(
+            row.contains('\u{6f22}') && row.contains('\u{2026}'),
+            "{row:?}"
+        );
+        assert!(row.ends_with('\u{2502}'), "the border is intact: {row:?}");
     }
 
     /// MOD-60 D5: a CJK notice wraps by cells, so its last character is on screen, not past the
@@ -2061,7 +2354,8 @@ mod tests {
     async fn a_combining_notice_fills_its_row_by_clusters() {
         let mut form = new_form().await;
         let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
-        let inner = usize::from(right.width - 2);
+        // The pane's inner width less the form's one-cell gutter (MOD-115 M4 L-forms).
+        let inner = usize::from(right.width - 3);
         let accented = "e\u{301}".repeat(inner);
         form.settle(Some(accented.clone()));
         let rows = drawn(&form);

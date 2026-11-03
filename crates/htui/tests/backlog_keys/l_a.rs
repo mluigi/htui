@@ -2,6 +2,7 @@
 //! Each case drives the real shell (`register_all`) over the demo fixture, scoped to `Platform`,
 //! so a key reaches the tab, the pane and the shell's stack exactly as at run time (D12).
 
+use super::on_item;
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
 use htui::keys::{Keys, load_str};
@@ -68,7 +69,7 @@ async fn press(harness: &mut Harness, chord: &str) {
 async fn ctrl_l_alt_l_and_alt_j_do_not_move_the_backlog() {
     let mut harness = shell(None).await;
     let before = harness.render();
-    assert!(before.contains("┌ ANA-1"), "ANA-1 on arrival:\n{before}");
+    assert!(on_item(&before, "ANA-1"), "ANA-1 on arrival:\n{before}");
     for chord in ["ctrl-l", "alt-l", "alt-]", "alt-j", "ctrl-j"] {
         press(&mut harness, chord).await;
         assert_eq!(harness.render(), before, "`{chord}` changed nothing");
@@ -78,11 +79,11 @@ async fn ctrl_l_alt_l_and_alt_j_do_not_move_the_backlog() {
     press(&mut harness, "l").await;
     let runs = harness.render();
     assert_ne!(runs, before, "`l` cycles the strip");
-    assert!(runs.contains("┌ ANA-1"), "and keeps the row:\n{runs}");
+    assert!(on_item(&runs, "ANA-1"), "and keeps the row:\n{runs}");
     press(&mut harness, "h").await;
     press(&mut harness, "j").await;
     assert!(
-        harness.render().contains("┌ ANA-2"),
+        on_item(&harness.render(), "ANA-2"),
         "`j` moves the row:\n{}",
         harness.render()
     );
@@ -113,7 +114,7 @@ async fn enter_on_a_header_still_folds_and_on_body_misses() {
 
     press(&mut harness, "enter").await;
     press(&mut harness, "j").await;
-    assert!(harness.render().contains("┌ ANA-1"));
+    assert!(on_item(&harness.render(), "ANA-1"));
     press(&mut harness, "enter").await;
     assert_eq!(harness.app().status.as_deref(), Some(DEFAULT_MISS));
 }
@@ -181,7 +182,7 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
         harness.key(c);
     }
     assert!(
-        harness.render().contains("> title    Fresh"),
+        harness.render().contains("\u{258c}title      Fresh"),
         "{}",
         harness.render()
     );
@@ -196,7 +197,7 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
     assert!(!frame.contains("F1 closes this box"), "closed:\n{frame}");
     assert!(frame.contains(" New item "), "the form stays:\n{frame}");
     assert!(
-        frame.contains("> title    Fresh"),
+        frame.contains("\u{258c}title      Fresh"),
         "with its text:\n{frame}"
     );
 }
@@ -420,13 +421,13 @@ fn hint_row(frame: &str) -> String {
         .to_owned()
 }
 
-/// The filter form's four rows, as drawn in the list pane: borders and padding off (its keys are
-/// the shell's hint row since MOD-67 M6 T2).
+/// The filter form's four rows, as drawn in its kit pane under the list: borders and padding off,
+/// the gutter kept (its keys are the pane's own hints since MOD-115 M4 Q2).
 fn filter_rows(frame: &str) -> Vec<String> {
     let lines: Vec<&str> = frame.lines().collect();
     let title = lines
         .iter()
-        .position(|line| line.contains("┌ Filter "))
+        .position(|line| line.contains("\u{256d}\u{2500} Filter "))
         .unwrap_or_else(|| panic!("the filter form is open:\n{frame}"));
     lines[title + 1..=title + 4]
         .iter()
@@ -439,11 +440,11 @@ fn filter_rows(frame: &str) -> Vec<String> {
         .collect()
 }
 
-/// The focused row's label (the row drawn with `>`).
+/// The focused row's label (the row behind the kit's gutter, MOD-115 M4 E4).
 fn focused(harness: &mut Harness) -> String {
     let rows = filter_rows(&harness.render());
     rows.iter()
-        .find_map(|row| row.strip_prefix("> "))
+        .find_map(|row| row.strip_prefix('\u{258c}'))
         .and_then(|row| row.split_whitespace().next())
         .unwrap_or_else(|| panic!("a focused row in {rows:#?}"))
         .to_owned()
@@ -457,12 +458,12 @@ async fn the_filter_form_keeps_its_value_keys_and_x_clears() {
     let mut harness = shell(None).await;
     press(&mut harness, "f").await;
     let status = |harness: &mut Harness| filter_rows(&harness.render())[0].clone();
-    assert_eq!(status(&mut harness), "> status  ‹[ ] open›  any");
+    assert_eq!(status(&mut harness), "\u{258c}status    ‹[ ] open›  any");
 
     press(&mut harness, "l").await;
     let queued = status(&mut harness);
     assert_eq!(
-        queued, "> status  ‹[ ] queued›  any",
+        queued, "\u{258c}status    ‹[ ] queued›  any",
         "`l` moves the option"
     );
     press(&mut harness, "right").await;
@@ -496,7 +497,10 @@ async fn the_filter_form_keeps_its_value_keys_and_x_clears() {
     press(&mut harness, "x").await;
     let frame = harness.render();
     let rows = filter_rows(&frame);
-    assert_eq!(rows[2], "> tags    jx", "typed, not moved or cleared");
+    assert_eq!(
+        rows[2], "\u{258c}tags      jx",
+        "typed, not moved or cleared"
+    );
     assert_eq!(
         hint_row(&frame),
         "comma list · Tab row · Enter apply · Esc cancel"
@@ -521,6 +525,10 @@ async fn a_rebound_new_version_key_opens_the_form_and_v_is_inert() {
     for _ in 0..TO_DOCS {
         press(&mut harness, "l").await;
     }
+    // MOD-115 M4 Q2: the Docs keys are the detail's hints, drawn while it is focused. The pane
+    // key moves the focus among the panes the last frame drew, so a frame is drawn first.
+    harness.render();
+    press(&mut harness, "ctrl-right").await;
     let frame = harness.render();
     assert!(
         frame.contains("J/K move · a new · V new version"),

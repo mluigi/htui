@@ -3,8 +3,7 @@ source: crates/htui/tests/templates.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ implement · editing from v1, saves v2 ─────────────────────┐┌ phase placeholders ────────────────┐
+╭─ implement · editing from v1, saves v2 ─ Skills  Templates ╮╭─ phase placeholders ───────────────╮
 │You are running the `implement` phase for {{item_key}}, atte││{{item_key}} scalar                 │
 │                                                            ││{{item_title}} scalar               │
 │{{item}}                                                    ││{{item_kind}} scalar                │
@@ -26,8 +25,9 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 wait
 │                                                            ││                                    │
 │                                                            ││                                    │
 │                                                            ││                                    │
-└────────────────────────────────────────────────────────────┘│                                    │
-┌ ask an agent ──────────────────────────────────────────────┐│                                    │
-│ask: shorter                                                ││                                    │
-│agent: scripted                                             ││                                    │
-└─Enter ask · Up/Down agent · Esc back───────────────────────┘└────────────────────────────────────┘
+│                                                            ││                                    │
+╰────────────────────────────────────────────────────────────╯│                                    │
+╭─ ask an agent ─────────────────────────────────────────────╮│                                    │
+│▌ask     shorter                                            ││                                    │
+│ agent   scripted                                           ││                                    │
+╰─Enter ask · Up/Down agent · Esc back───────────────────────╯╰────────────────────────────────────╯

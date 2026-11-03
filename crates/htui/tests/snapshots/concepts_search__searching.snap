@@ -3,17 +3,18 @@ source: crates/htui/tests/concepts_search.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 waiting · memory ·  F1  keys
-┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
-│  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
-│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
-│ ┌ Search concepts ─────────────────────────────────────────────────────────────────────────────┐ │
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
+│ ▾ htui (8)                                          ││Data model, box registry and sync topology │
+│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
+│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
+│ ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮ │
 │ │scope all projects · decisions off                                                            │ │
-│ │query postgres store cache                                                                    │ │
+│ │query postgres store cache                                                                    │a│
 │ │                                                                                              │ │
 │ │                                                                                              │ │
-│▾│                                                                                              │a│
+│ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
@@ -24,11 +25,10 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 w
 │ │                                                                                              │ │
 │ │loading the embedding model…                                                                  │ │
 │ │                                                                                              │ │
-│ │Enter search/open · Up/Down move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close │ │
-│ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│ ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close ───╯ │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯

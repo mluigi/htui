@@ -109,8 +109,10 @@ async fn revealing_a_loaded_item_focuses_the_backlog_and_selects_it() {
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
     assert!(titled(&frame, "TOOL-1"), "{frame}");
+    // MOD-115 M4 E4: the detail's title is `KEY · title`, Body's head its meta line.
     assert!(
-        frame.contains("\u{2502}CI matrix for the three OSes"),
+        frame.contains("\u{2500} TOOL-1 \u{b7} CI matrix")
+            && frame.contains("\u{2502}\u{26a0} needs you \u{b7} "),
         "the Body pane shows TOOL-1: {frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -284,7 +286,7 @@ fn cursor_line(frame: &str) -> String {
 
 /// The Runs pane is the one drawn: its run grid's header.
 fn shows_runs(frame: &str) -> bool {
-    frame.contains("\u{2502}kind   status    box")
+    frame.contains("\u{2502}kind   status      box")
 }
 
 #[tokio::test]

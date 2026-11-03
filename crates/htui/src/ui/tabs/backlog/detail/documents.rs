@@ -1,7 +1,8 @@
 //! The Documents sub-tab: the item's documents, without their bodies, and `a`/`v` to write one
 //! by hand (MOD-13 milestone 5 D9).
 //!
-//! - **Keys**: `J`/`K` move a cursor over the rows, drawn by style only; `PgUp`/`PgDn` scroll.
+//! - **Keys**: `J`/`K` move a cursor over the rows, its row drawn as the kit list's gutter and
+//!   band (MOD-115 M4 L-docs); `PgUp`/`PgDn` scroll.
 //!   `a` sends `DocumentForm` with no kind (a new document: kind, title and body typed); `v`
 //!   sends it with the kind under the cursor (a new version: the kind fixed, title and body from
 //!   the version of that kind the next step reads, never a fan-out loser's (MOD-73 review M1), the
@@ -46,8 +47,8 @@ use htui_core::model::hand_written::SUMMARY_KIND;
 use htui_core::model::{Document, DocumentHead, ItemId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
@@ -55,11 +56,17 @@ use crate::hand_written::{DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME, wri
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::kit::{chips::key_line, text::wrapped};
+use crate::ui::cells;
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, empty_state, no_item, writes_one,
+};
 use crossterm::event::KeyEvent;
 
 /// Written by a run step.
@@ -67,6 +74,21 @@ const BY_STEP: &str = "step";
 
 /// Written by a human.
 const BY_HAND: &str = "hand";
+
+/// The kind column's cells at the most (MOD-81): as wide as the widest kind listed, never
+/// narrower than its header, never wider than this, so the titles keep their room; a longer kind
+/// is cut with `…`.
+const KIND_MAX: usize = 8;
+/// The version column's cells at the least (`ver`, `v12`); it grows to the widest version.
+const VERSION_MIN: usize = 3;
+/// The provenance column's cells: `step` or `hand`.
+const BY_WIDTH: usize = 4;
+
+/// An item with no documents (plan D11).
+const NO_DOCUMENTS: &str = "No documents for this item.";
+
+/// [`NO_DOCUMENTS`]' next step while `backlog.docs.add` is unbound.
+const WRITE_UNBOUND: &str = "hand-written documents list here";
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_DOCS`].
 const HINT: HintSpec = &[
@@ -123,7 +145,8 @@ pub struct DocumentsTab {
     item: Option<ItemId>,
     /// The selected item's key, from `StoreReply::Item` (E2): the temp-file stem.
     key: Option<String>,
-    /// Index of the row under the cursor (D9; drawn by style only).
+    /// Index of the row under the cursor (D9; drawn as the kit list's gutter and band, MOD-115
+    /// M4 L-docs).
     cursor: usize,
     /// First visible document.
     scroll: Scroll,
@@ -141,6 +164,10 @@ pub struct DocumentsTab {
     compose: Option<Compose>,
     /// D5: the last save's sentence, under the table until the next key.
     notice: Option<String>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read, and what
+    /// the compose rule is drawn as.
+    told: Told,
 }
 
 impl DocumentsTab {
@@ -195,7 +222,8 @@ impl DocumentsTab {
         let compose = self.compose.as_mut()?;
         // The maintainer answer to blueprint §6 Q1 (a `v` form saved untouched writes nothing) is
         // the area's own `form.save` rule now (MOD-67 M5).
-        Some(match compose.on_key(key, ctx.keys()) {
+        let pressed = ctx.pressed(&key);
+        Some(match compose.on_pressed(key, pressed, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -309,72 +337,81 @@ impl DocumentsTab {
         }
     }
 
-    /// The table, the cursor's row selected, scrolled so the cursor stays in view.
+    /// The kind and version columns' cells: the widest kind listed between its header's width and
+    /// [`KIND_MAX`], the widest `v{n}` and at least [`VERSION_MIN`] (MOD-81: the title takes the
+    /// rest).
+    fn widths(&self) -> (usize, usize) {
+        let widest = |cells: fn(&DocumentHead) -> usize| self.documents.iter().map(cells).max();
+        let kind = widest(|document| cells::cell_width(&document.kind))
+            .unwrap_or(0)
+            .clamp(cells::cell_width("kind"), KIND_MAX);
+        let version = widest(|document| cells::cell_width(&format!("v{}", document.version)))
+            .unwrap_or(0)
+            .max(VERSION_MIN);
+        (kind, version)
+    }
+
+    /// The table, scrolled so the cursor stays in view (MOD-115 M4 L-docs): a header line in the
+    /// title role over `kit::list` rows, the cursor's row behind the gutter in the tab's accent
+    /// and in the band. The kind is a category word in the base role, not focus (MOD-85, E9); the
+    /// provenance is dim.
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        // The header takes one row.
-        let visible = usize::from(area.height).saturating_sub(1);
+        let theme = ctx.theme;
+        let [head, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         let skip = self
             .scroll
             .skip()
-            .max((self.cursor + 1).saturating_sub(visible));
-        let rows = self
+            .max((self.cursor + 1).saturating_sub(usize::from(body.height)));
+        let (kind_width, version_width) = self.widths();
+        let header = format!(
+            " {} {} {} title",
+            cells::fit("kind", kind_width),
+            cells::fit("ver", version_width),
+            cells::fit("by", BY_WIDTH),
+        );
+        frame.render_widget(
+            Paragraph::new(list::ellipsize(
+                Line::styled(header, theme.title),
+                head.width,
+            )),
+            head,
+        );
+        let rows: Vec<Row<'static>> = self
             .documents
             .iter()
-            .enumerate()
-            .skip(skip)
-            .map(|(at, document)| {
+            .map(|document| {
                 let by = if document.produced_by_step_id.is_some() {
                     BY_STEP
                 } else {
                     BY_HAND
                 };
-                // MOD-80 D2: a row style does not override a cell's own colour, so the cursor
-                // row's cells are selected one by one; the row style paints the column gaps.
-                let on_cursor = at == self.cursor;
-                let cell = |line: Line<'static>| {
-                    Cell::from(if on_cursor {
-                        ctx.theme.select(line)
-                    } else {
-                        line
-                    })
-                };
-                let row = Row::new(vec![
-                    cell(Line::styled(document.kind.clone(), ctx.theme.accent)),
-                    cell(Line::styled(
-                        format!("v{}", document.version),
-                        ctx.theme.base,
-                    )),
-                    cell(Line::styled(by, ctx.theme.dim)),
-                    cell(Line::styled(document.title.clone(), ctx.theme.base)),
-                ]);
-                if on_cursor {
-                    row.style(ctx.theme.selected)
-                } else {
-                    row
+                Row {
+                    line: Line::from(vec![
+                        Span::styled(cells::fit(&document.kind, kind_width), theme.base),
+                        Span::raw(" "),
+                        Span::styled(
+                            cells::fit(&format!("v{}", document.version), version_width),
+                            theme.base,
+                        ),
+                        Span::raw(" "),
+                        Span::styled(cells::fit(by, BY_WIDTH), theme.dim),
+                        Span::raw(" "),
+                        Span::styled(document.title.clone(), theme.base),
+                    ]),
+                    kind: RowKind::Item,
                 }
             })
-            .collect::<Vec<_>>();
-
-        let header = Row::new(vec![
-            Cell::from("kind"),
-            Cell::from("ver"),
-            Cell::from("by"),
-            Cell::from("title"),
-        ])
-        .style(ctx.theme.title);
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(8),
-                Constraint::Length(3),
-                Constraint::Length(4),
-                Constraint::Min(0),
-            ],
-        )
-        .header(header)
-        .column_spacing(1);
-        frame.render_widget(table, area);
+            .collect();
+        list::render(
+            frame,
+            body,
+            &rows,
+            Some(self.cursor),
+            skip,
+            ctx.accent(),
+            theme,
+        );
     }
 }
 
@@ -490,7 +527,7 @@ impl DetailTab for DocumentsTab {
 
     /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
     /// its own `J`/`K` (`Act::DocsNextRow`/`DocsPrevRow`) do.
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         Handled::Consumed
     }
@@ -619,42 +656,58 @@ impl DetailTab for DocumentsTab {
         key_line(hint, theme)
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                &title,
+                Some(&kinds),
+                self.told.focus(),
+                ctx,
+            );
             ctx.claim_editor_area(body);
             return;
         }
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_DOCS,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
-        // D5's sentence under the table; with none the table keeps the whole rect (E5).
-        let notice = self
+        // D5's sentence under the table, the kit's notice row; with none the table keeps the
+        // whole rect (E5).
+        let notice_rows: Vec<Line<'static>> = self
             .notice
             .as_deref()
             .map(|sentence| wrapped(sentence, usize::from(area.width)))
-            .unwrap_or_default();
-        let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
-        // D11's browse hint is the shell's hint row since MOD-67 M6 T2 (`key_hint`).
+            .unwrap_or_default()
+            .iter()
+            .map(|row| notice(row, Tone::Info, ctx.theme))
+            .collect();
+        let height = u16::try_from(notice_rows.len()).unwrap_or(u16::MAX);
+        // D11's browse hint is the detail pane's, on its border (`key_hint`).
         let [table, below] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
         if self.documents.is_empty() {
-            message(frame, table, "No documents for this item.", ctx.theme);
+            let next = writes_one(views::BACKLOG_DOCS, Act::DocsAdd, WRITE_UNBOUND, ctx.keys());
+            empty_state(frame, table, NO_DOCUMENTS, &next, ctx);
         } else {
             self.render_table(frame, table, ctx);
         }
-        frame.render_widget(
-            Paragraph::new(
-                notice
-                    .into_iter()
-                    .map(|line| Line::styled(line, ctx.theme.base))
-                    .collect::<Vec<_>>(),
-            ),
-            below,
-        );
+        frame.render_widget(Paragraph::new(notice_rows), below);
     }
 }
 
@@ -665,13 +718,15 @@ mod tests {
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::store::{MemStore, ReadStore as _, StoreError};
     use htui_store::Backend;
-    use ratatui::style::Color;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::app::Action;
     use crate::hand_written::{self, DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::Theme;
+    use crate::ui::kit::list::GUTTER;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         Part, could_not_check, may_have_landed, not_written,
@@ -833,7 +888,7 @@ mod tests {
     /// `J` and `K` do, or to either end; nothing is asked of the store.
     #[tokio::test]
     async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::new();
         let (store, _) = demo();
@@ -927,7 +982,7 @@ mod tests {
         assert_eq!(pane.opened, Some(2));
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
         assert!(text.contains(" New version of plan (from v2) "), "{text}");
-        assert!(!text.contains("kinds:"), "{text}");
+        assert!(!text.contains("kinds "), "{text}");
     }
 
     /// MOD-57 P2 (PD-3): the open form claims its body for an in-pane editor, the rect under its
@@ -941,10 +996,7 @@ mod tests {
         let text = drawn(43, 23, |frame, rect| {
             pane.render(frame, rect, &shell.ctx().with_editor_area(&cell));
         });
-        assert!(
-            text.contains("kind     ver by"),
-            "the table is drawn:\n{text}"
-        );
+        assert!(text.contains("kind ver by"), "the table is drawn:\n{text}");
         assert_eq!(cell.get(), None, "the table claims nothing");
 
         open(&shell, &backend, &mut pane, 'v').await;
@@ -1539,7 +1591,7 @@ mod tests {
         assert_eq!(pane.kinds(), "plan, prd, summary");
         open(&shell, &backend, &mut pane, 'a').await;
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
-        assert!(text.contains("kinds: plan, prd, summary"), "{text}");
+        assert!(text.contains("kinds   plan, prd, summary"), "{text}");
 
         let empty = pane_on(&shell, &store, ids::HTUI_ANA_2).await;
         assert_eq!(empty.kinds(), "summary");
@@ -1645,41 +1697,198 @@ mod tests {
         assert_eq!(saved_as("summary", 1, 1, None), "saved as summary v1");
     }
 
+    /// `pane` drawn through `shell`'s `Ctx` into a `width` x `height` buffer.
+    fn painted(pane: &DocumentsTab, shell: &Shell, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the frame draws");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Row `y` of `buffer` as text.
+    fn row_of(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// MOD-115 M4 L-docs: the table is a header line over `kit::list` rows; the cursor's row is
+    /// the gutter in the tab's accent, then one band across the rest, the kind's and the gaps'
+    /// cells included (MOD-80 D2); no other row is banded.
     #[tokio::test]
-    async fn the_cursor_row_is_drawn_selected() {
+    async fn the_cursor_row_is_the_gutter_and_the_band() {
         let shell = Shell::new();
         let (store, _) = demo();
         let mut pane = pane(&shell, &store).await;
         let _ = press(&mut pane, &shell, KeyCode::Char('J'));
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 10)).expect("terminal");
-        terminal
-            .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
-            .expect("the frame draws");
-        let buffer = terminal.backend().buffer();
-        // MOD-80 D2: every cell of the cursor row, the kind column's and the gaps included.
-        let selected = Theme::default().selected;
-        for x in 0..43 {
+        let buffer = painted(&pane, &shell, 43, 10);
+        assert!(
+            row_of(&buffer, 0).starts_with(" kind ver by   title"),
+            "{buffer:?}"
+        );
+        assert!(
+            row_of(&buffer, 2).starts_with("\u{258c}plan v2  step Plan: TUI scaffold (revised)"),
+            "{buffer:?}"
+        );
+        let accent = shell.ctx().accent();
+        assert_eq!(buffer[(0, 2)].symbol(), GUTTER);
+        assert_eq!(buffer[(0, 2)].fg, accent.fg.unwrap_or_default());
+        let selected = shell.theme.selected;
+        for x in 1..43 {
             let cell = &buffer[(x, 2)];
             assert_eq!(
-                cell.fg,
-                selected.fg.expect("selected has a foreground"),
-                "plan v2, under the cursor, x = {x}"
-            );
-            assert_eq!(
-                cell.bg,
-                selected.bg.expect("selected has a background"),
+                (cell.fg, cell.bg),
+                (
+                    selected.fg.expect("selected has a foreground"),
+                    selected.bg.expect("selected has a background")
+                ),
                 "plan v2, under the cursor, x = {x}"
             );
         }
         for (y, row) in [(0, "the header"), (1, "plan v1"), (3, "prd v1")] {
-            assert_ne!(buffer[(0, y)].bg, Color::Cyan, "{row}");
+            assert_eq!(buffer[(0, y)].symbol(), " ", "{row}");
+            assert_ne!(buffer[(1, y)].bg, Color::Cyan, "{row}");
         }
+    }
+
+    /// MOD-81, MOD-115 M4 L-docs: the kind column is as wide as the widest kind listed, at least
+    /// its header's four cells and at most eight (a longer kind cut with `…`), and the version
+    /// column grows past three cells for a long version, so the title takes the rest.
+    #[tokio::test]
+    async fn the_kind_column_fits_the_widest_kind_up_to_eight_cells() {
+        let shell = Shell::new();
+        let (store, _) = demo();
+        let mut pane = pane(&shell, &store).await;
+        assert_eq!(pane.widths(), (4, 3), "plan and prd, v1 and v2");
+        let mut rows = pane.documents.clone();
+        rows[0].kind = "review".to_owned();
+        rows[1].kind = "decision_record".to_owned();
+        rows[2].version = 1234;
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert_eq!(pane.widths(), (8, 5));
+        let buffer = painted(&pane, &shell, 43, 6);
+        assert!(
+            row_of(&buffer, 0).starts_with(" kind     ver   by   title"),
+            "{buffer:?}"
+        );
+        assert!(
+            row_of(&buffer, 2).starts_with(" decisio\u{2026} v2    step"),
+            "{buffer:?}"
+        );
+        assert!(
+            row_of(&buffer, 3).starts_with(" prd      v1234 hand"),
+            "{buffer:?}"
+        );
+    }
+
+    /// MOD-115 M4 L-docs (MOD-85, E9): the kind is a category word, not focus: base, never the
+    /// accent; under monochrome the cursor's row is reversed and no other row is.
+    #[tokio::test]
+    async fn the_kind_column_is_base_and_the_band_reads_without_colour() {
+        let shell = Shell::new();
+        let (store, _) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let _ = press(&mut pane, &shell, KeyCode::Char('J'));
+        let buffer = painted(&pane, &shell, 43, 10);
+        for x in 1..5 {
+            let cell = &buffer[(x, 1)];
+            assert_eq!(cell.fg, Color::Reset, "plan v1's kind, x = {x}: {cell:?}");
+            assert_ne!(Some(cell.fg), shell.theme.accent.fg, "x = {x}");
+        }
+
+        let mut mono = Shell::new();
+        mono.theme = Theme::monochrome();
+        let buffer = painted(&pane, &mono, 43, 10);
+        for x in 1..43 {
+            assert!(
+                buffer[(x, 2)].modifier.contains(Modifier::REVERSED),
+                "x = {x}: {:?}",
+                buffer[(x, 2)]
+            );
+            for y in [1, 3] {
+                assert!(
+                    !buffer[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "({x},{y})"
+                );
+            }
+        }
+        for cell in &buffer.content {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+        }
+    }
+
+    /// MOD-115 M4 L-docs: an item with no documents is `kit::empty`'s, its next step the key that
+    /// writes one through `BACKLOG_DOCS` (a rebound key named, a sentence without it unbound);
+    /// no item is `kit::empty`'s too, its next step the list's motion.
+    #[tokio::test]
+    async fn the_empty_states_name_their_next_step() {
+        let mut shell = Shell::new();
+        let mut empty = DocumentsTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Documents(Vec::new()), &mut shell.ctx());
+        let text = drawn(43, 9, |frame, rect| empty.render(frame, rect, &shell.ctx()));
+        assert!(text.contains("No documents for this item."), "{text}");
+        assert!(text.contains("a writes one"), "{text}");
+
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.docs]\nadd = \"W\"\n").expect("loads");
+        let text = drawn(43, 9, |frame, rect| empty.render(frame, rect, &shell.ctx()));
+        assert!(text.contains("W writes one"), "{text}");
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.docs]\nadd = []\n").expect("loads");
+        let text = drawn(43, 9, |frame, rect| empty.render(frame, rect, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+
+        let shell = Shell::new();
+        let mut none = DocumentsTab::new();
+        none.on_item_change(None);
+        let text = drawn(43, 9, |frame, rect| none.render(frame, rect, &shell.ctx()));
+        assert!(text.contains("No item selected."), "{text}");
+        assert!(text.contains("j/k chooses one"), "{text}");
+    }
+
+    /// MOD-115 M4 L-docs: `kit::empty` cuts a line to the pane, so each sentence standing in for
+    /// an unbound key fits whole in the detail pane at 80 columns (34 cells inside).
+    #[tokio::test]
+    async fn the_unbound_next_steps_fit_the_detail_pane_at_80_columns() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.docs]\nadd = []\n").expect("loads");
+        let mut empty = DocumentsTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Documents(Vec::new()), &mut shell.ctx());
+        let text = drawn(34, 9, |frame, rect| empty.render(frame, rect, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+
+        shell.keys =
+            crate::keys::load_str("version = 1\n[list]\ndown = []\nup = []\n").expect("loads");
+        let mut none = DocumentsTab::new();
+        none.on_item_change(None);
+        let text = drawn(34, 9, |frame, rect| none.render(frame, rect, &shell.ctx()));
+        assert!(text.contains(CHOOSE_UNBOUND), "{text}");
+    }
+
+    /// MOD-115 M4 L-docs: D5's sentence under the table is the kit's notice row, wrapped to the
+    /// pane, in the info role.
+    #[tokio::test]
+    async fn the_saved_sentence_is_the_kit_notice() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let request = saving_v(&shell, &backend, &mut pane).await;
+        let reply = served(&backend, &request).await;
+        pane.on_reply(&reply, &mut shell.ctx());
+        let buffer = painted(&pane, &shell, 43, 10);
+        assert_eq!(row_of(&buffer, 9).trim_end(), "saved as plan v3");
+        assert_eq!(buffer[(0, 9)].fg, shell.theme.dim.fg.unwrap_or_default());
     }
 
     #[test]
     fn the_hint_fits_the_detail_pane() {
-        assert!(crate::ui::cells::cell_width(HINT) <= 43, "{HINT}");
+        assert!(cells::cell_width(HINT) <= 43, "{HINT}");
     }
 
     /// D11, MOD-67 M6 T2: with an item and no form the keys are [`HINT`], the shell's hint row,

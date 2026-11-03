@@ -3,23 +3,7 @@ source: crates/htui/src/testkit.rs
 expression: harness.render()
 ---
 no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting · memory ·  ?  keys
-┌ Backlog (0) ────────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
-│No items in this workspace.                          ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│                                                     ││No item selected.                          │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                   ┌ Workspaces ──────────────────────────────────────────────┐                   │
-│                   │  no workspaces — `N` in Settings > Hierarchy creates one │                   │
-│                   │                                                          │                   │
-│                   │  j/k move · Enter switch · Esc close                     │                   │
-│                   └──────────────────────────────────────────────────────────┘                   │
+╭─ Backlog (0) ───────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -31,4 +15,20 @@ no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+│                            ╭ Workspaces ────────────────────────────╮                            │
+│                            │             no workspaces              │                            │
+│             No items in thi│`N` in Settings › Hierarchy creates one │ item selected.             │
+│         Settings › Hierarch╰ j/k move · Enter switch · Esc close ───╯en item shows here          │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯

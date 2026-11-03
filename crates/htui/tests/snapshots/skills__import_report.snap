@@ -3,10 +3,9 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
- Skills │ Templates
-┌ import report ───────────────────────────────────────────────────────────────────────────────────┐
-│>! /nonexistent/htui-import-report — could not read `/nonexistent/htui-import-report` (No such    │
-│file or directory (os error 2))                                                                   │
+╭─ import report ─────────────────────────────────────────────────────────────── Skills  Templates ╮
+│▌! /nonexistent/htui-import-report — could not read `/nonexistent/htui-import-report` (No such    │
+│▌  file or directory (os error 2))                                                                │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 wai
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─j/k move · r reload · Esc back───────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰─j/k move · r reload · Esc back───────────────────────────────────────────────────────────────────╯

@@ -3,32 +3,32 @@ source: crates/htui/tests/backlog.rs
 expression: harness.render()
 ---
 Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
-┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││template  prd v1                           │
-│  ANA-2    open               Orchestrator step grap…││picker    n / p · 8 template(s)            │
-│  CLEAN-1  failed             Drop the legacy markdo…││digest    a3cad86a286f7e936fb4b1457f8c92b71│
-│  FEAT-1   in_progress        TUI scaffold           ││budget    120000 (project) · reserve 0.10 ·│
-│  FEAT-2   blocked            Agent driver and chat …││tokens    1067 → 1067 · chars-v2           │
-│  FEAT-3   queued             Postgres store and cac…││excerpts  builtin@1 · considered 0 · select│
-│  FIX-1    closed             Terminal left raw afte…││roots     none · this project has no repo  │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
-│▾ agy (3)                                            ││section                   before   after  s│
-│  ANA-1    done               Prompt assembly survey ││template                     149     149  n│
-│  FEAT-1   open               ACP transport upgrade  ││item                         570     570  n│
-│  FIX-1    open               Session leak on cancel ││documents:plan                57      57  n│
-│                                                     ││documents:prd                 52      52  n│
-│                                                     ││upstream                      71      71  n│
-│                                                     ││box                           80      80  n│
-│                                                     ││skills                        88      88  n│
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Prompt  Reqs ╮
+│ ▾ htui (8)                                          ││template  prd v1                           │
+│  ANA-1    ● done       Data model, box registry and…││picker    8 templates                      │
+│  ANA-2    ○ open       Orchestrator step graphs and…││digest    a3cad86a286f7e936fb4b1457f8c92b7…│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││budget    120000 (project) · reserve 0.10 …│
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││tokens    1067 → 1067 · chars-v2           │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││excerpts  builtin@1 · considered 0 · selec…│
+│  FEAT-3   ◌ queued     Postgres store and cache     ││roots     none · this project has no repo  │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││section                   before   after  …│
+│ ▾ agy (3)                                           ││template                     149     149  …│
+│  ANA-1    ● done       Prompt assembly survey       ││item                         570     570  …│
+│  FEAT-1   ○ open       ACP transport upgrade        ││documents:plan                57      57  …│
+│  FIX-1    ○ open       Session leak on cancel       ││documents:prd                 52      52  …│
+│                                                     ││upstream                      71      71  …│
+│                                                     ││box                           80      80  …│
+│                                                     ││skills                        88      88  …│
 │                                                     ││                                           │
-│                                                     ││skills    tests v1 · project · always → act│
-│                                                     ││          rust-style v2 · project · always │
+│                                                     ││skills    tests v1 · project · always → ac…│
+│                                                     ││          rust-style v2 · project · always…│
 │                                                     ││                                           │
-│                                                     ││notes     preview: the template is chosen b│
-│                                                     ││          preview: documents are latest-per│
-│                                                     ││          preview: the `summary` kind is ex│
-│                                                     ││          preview: phase-level skills come │
-│                                                     ││          preview: output_kind defaults to │
-│                                                     ││          preview: command_queue exposure i│
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+│                                                     ││notes     preview: the template is chosen …│
+│                                                     ││          preview: documents are latest-pe…│
+│                                                     ││          preview: the `summary` kind is e…│
+│                                                     ││          preview: phase-level skills come…│
+│                                                     ││          preview: output_kind defaults to…│
+│                                                     ││          preview: command_queue exposure …│
+│                                                     ││          preview: attempt 1, so verify_fa…│
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

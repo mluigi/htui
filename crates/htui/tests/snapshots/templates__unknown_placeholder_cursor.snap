@@ -3,8 +3,7 @@ source: crates/htui/tests/templates.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ implement · editing from v1, saves v2 ─────────────────────┐┌ phase placeholders ────────────────┐
+╭─ implement · editing from v1, saves v2 ─ Skills  Templates ╮╭─ phase placeholders ───────────────╮
 │You are running the `implement` phase for {{item_key}}, atte││{{item_key}} scalar                 │
 │                                                            ││{{item_title}} scalar               │
 │{{itme}}{{item}}                                            ││{{item_kind}} scalar                │
@@ -30,5 +29,6 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 wait
 │                                                            ││                                    │
 │                                                            ││                                    │
 │                                                            ││                                    │
-└─Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L3:C1─────────────────────────────┘
+│                                                            ││                                    │
+╰─L3:C1 · Ctrl+s save · Esc cancel · Ctrl+g ask agent …──────╯╰────────────────────────────────────╯
  unknown prompt placeholder `{{itme}}` at byte 78

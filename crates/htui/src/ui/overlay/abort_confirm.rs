@@ -18,27 +18,23 @@ use crossterm::event::{KeyEvent, KeyEventKind};
 use htui_core::model::Scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::Theme;
-use crate::ui::layout::centered;
+use crate::ui::kit::modal::Ask;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 
 /// What the box asks.
 const QUESTION: &str = "Abort the edit and lose it?";
 
-/// The line under the question: the abort key, generated, then the fixed rest.
+/// The keys on the box's bottom border: the abort key, generated, then the fixed rest (prose, not
+/// a key: every other key keeps editing).
 const HINT: HintSpec = &[
     Hint::One(Act::EditorAbort, "again aborts"),
     Hint::Text("any other key keeps editing"),
 ];
-
-/// Left border, right border and one column of right padding.
-const CHROME: u16 = 3;
 
 /// Asks before `editor.abort` drops an open edit.
 #[derive(Debug, Default)]
@@ -53,15 +49,6 @@ impl AbortConfirm {
     #[must_use]
     pub fn new() -> Self {
         Self
-    }
-
-    /// The box's contents: the question, a blank line, then `hint` (the rendered [`HINT`]).
-    fn lines(hint: String, theme: &Theme) -> Vec<Line<'static>> {
-        vec![
-            Line::styled(QUESTION, theme.base),
-            Line::raw(""),
-            Line::styled(hint, theme.dim),
-        ]
     }
 }
 
@@ -108,25 +95,13 @@ impl Overlay for AbortConfirm {
 
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
+    /// A kit question (MOD-115 M4 E7, C7): the question in the box, [`HINT`] on its bottom
+    /// border.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = Self::lines(ctx.keys().hint(views::ABORT_CONFIRM, HINT), ctx.theme);
-        let widest = lines.iter().map(Line::width).max().unwrap_or(0);
-        let width = u16::try_from(widest)
-            .unwrap_or(u16::MAX)
-            .saturating_add(CHROME);
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2);
-        let box_area = centered(area, width, height);
-
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title()), ctx.theme.title)),
-            ),
-            box_area,
-        );
+        let hint = ctx.keys().hint(views::ABORT_CONFIRM, HINT);
+        Ask::new(self.title())
+            .line(Line::styled(QUESTION, ctx.theme.base))
+            .hint(&hint)
+            .render(frame, area, ctx.theme);
     }
 }

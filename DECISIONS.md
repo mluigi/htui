@@ -2,6 +2,11 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-115](docs/decisions/mod/mod-115.md)** - TUI shell: header, panes, layouts, history, widget kit (done, 2026-11-03)
+- **[MOD-85](docs/decisions/mod/mod-85.md)** - Remaining accent (cyan) uses that do not mean focus or selection (done, 2026-11-03)
+- **[MOD-83](docs/decisions/mod/mod-83.md)** - Display labels and actionable errors (done, 2026-11-03)
+- **[MOD-82](docs/decisions/mod/mod-82.md)** - Shared pane chrome: sub-tabs, detail header, overlays, Settings layouts (done, 2026-11-03)
+- **[MOD-81](docs/decisions/mod/mod-81.md)** - Narrow and wide terminal widths (done, 2026-11-03)
 - **[MOD-137](docs/decisions/mod/mod-137.md)** - Step graph v2 storage: edges, owner scope, revision, atomic edits (done, 2026-10-21)
 - **[MOD-146](docs/decisions/mod/mod-146.md)** - Project type table (done, 2026-10-21)
 - **[ANA-38](docs/decisions/ana/ana-38.md)** - Project and workspace memory (concluded, 2026-10-20)

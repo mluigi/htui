@@ -8,37 +8,43 @@
 //! `REFRESHES_PER_RETRY`th after a failed one.
 //!
 //! Its keys resolve through `views::QUEUE_OVERLAY` (MOD-67 M6).
+//!
+//! Drawn on the MOD-115 kit (M4 E6): [`Modal`] is the frame, `kit::list` the rows (the `▌` gutter
+//! and the selection band mark the cursor, MOD-85), `kit::empty` the reading and empty states, and
+//! the keys sit on the modal's bottom border.
 
 use htui_core::model::{
-    BatchClose, EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd,
+    BatchClose, BatchStop, CapError, EntryState, Escalation, Hold, ItemId, PER_TOKEN_CAP_BATCH,
+    PER_TOKEN_CAP_RUN, QueueMove, QueueOverview, QueueRow, RunStatus, Scope, Wait, format_usd,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::layout::centered;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::modal::{Modal, ModalSize};
+use crate::ui::kit::status;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crate::ui::tabs::backlog::queue_sentence;
+use crate::ui::queue_status::{DEMO_NOTHING_ADMITTED, queue_sentence};
 use crossterm::event::KeyEvent;
 
-/// Marker in front of the row the cursor is on (the waiting list's): a snapshot records symbols
-/// and not styles.
-const CURSOR: &str = "> ";
+/// The margin in front of every row, after the list's gutter, so the columns stay put whether or
+/// not a row is selected (the waiting list's).
+const LEAD: &str = " ";
 
-/// The marker's width, in front of every other line, so the columns stay put.
-const NO_CURSOR: &str = "  ";
+/// What the header and the unavailable line lead with, to line up with the rows' keys: the
+/// gutter's column, then [`LEAD`].
+const NOTE_LEAD: &str = "  ";
 
 /// Gap between two columns.
 const GAP: &str = "  ";
-
-/// Left border, right border and one column of right padding.
-const CHROME: u16 = 3;
 
 /// The widest the title column grows, in cells; a longer title is cut with an ellipsis.
 const TITLE_MAX: usize = 32;
@@ -58,15 +64,18 @@ const HINT: HintSpec = &[
 /// What the list says before the first `QueueOverview` reply.
 const READING: &str = "reading the queue";
 
+/// The reading state's next step.
+const READING_NEXT: &str = "the rows appear once the store answers";
+
 /// What a reply with no entry says.
 const EMPTY: &str = "the queue is empty";
 
 /// In front of a failed read's message, on the row line.
 const UNAVAILABLE: &str = "the queue is unavailable: ";
 
-/// The memory backend's header tail: its runtime never admits (M1 review L3). The text of the
-/// Backlog's own `DEMO_NOTHING_ADMITTED`, copied so the two views stay independent.
-const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
+/// Under the unavailable line (MOD-115 M4 E6, MOD-83): where the store's connection is fixed.
+/// A row of its own, so a message cut at the box's edge never takes it along.
+const UNAVAILABLE_NEXT: &str = "Settings \u{203a} Connection shows the store's connection";
 
 /// [`StoreRequest::name`] of [`StoreRequest::QueueOverview`]: its `Failed` is shown, not re-read.
 const OVERVIEW: &str = QUEUE_REQUEST_NAMES[5];
@@ -162,7 +171,7 @@ impl QueueOverlay {
         self.sentences = overview
             .rows
             .iter()
-            .map(|(_, state)| state.to_string())
+            .map(|(_, state)| sentence(state))
             .collect();
         self.columns = Columns::of(&overview.rows, &self.sentences);
         self.overview = Some(overview.clone());
@@ -228,88 +237,24 @@ impl QueueOverlay {
         ctx.emit(Action::Reveal(target));
     }
 
-    /// The box's contents: the header and the visible rows (or the reading, empty or unavailable
-    /// line), a blank line, then `hint` (the rendered [`HINT`]).
-    ///
-    /// `room` is the box's inner width and `text_width` the room the sentence column gets;
-    /// `None` is the natural size, nothing clipped. The header, the unavailable line and the hint
-    /// are clipped to `room` with an ellipsis too (the whole failure is on the status line as
-    /// well).
-    /// `visible` is how many rows fit: the window always holds the cursor.
-    fn lines(
-        &self,
-        room: Option<usize>,
-        text_width: Option<usize>,
-        visible: usize,
-        hint: &str,
-        theme: &Theme,
-    ) -> Vec<Line<'static>> {
-        let clipped = |text: &str| {
-            let text = match room {
-                Some(room) => cells::clip(text, room.saturating_sub(cell_width(NO_CURSOR))),
-                None => text.to_owned(),
-            };
-            format!("{NO_CURSOR}{text}")
-        };
-        let mut lines = match (&self.failure, &self.overview) {
-            (Some(message), _) => vec![Line::styled(
-                clipped(&format!("{UNAVAILABLE}{message}")),
-                theme.dim,
-            )],
-            (None, None) => vec![Line::styled(format!("{NO_CURSOR}{READING}"), theme.dim)],
-            (None, Some(overview)) => {
-                let mut lines = vec![
-                    Line::styled(clipped(&header(overview)), theme.base),
-                    Line::raw(""),
-                ];
-                if overview.rows.is_empty() {
-                    lines.push(Line::styled(format!("{NO_CURSOR}{EMPTY}"), theme.dim));
-                } else {
-                    let columns = &self.columns;
-                    let text_width = text_width.unwrap_or(columns.text);
-                    let at = self.cursor.min(overview.rows.len() - 1);
-                    let first = if visible > 0 && at >= visible {
-                        at + 1 - visible
-                    } else {
-                        0
-                    };
-                    lines.extend(
-                        overview
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .skip(first)
-                            .take(visible)
-                            .map(|(index, (row, state))| {
-                                let sentence = self.sentences.get(index).map_or("", String::as_str);
-                                row_line(
-                                    row,
-                                    state,
-                                    sentence,
-                                    index == at,
-                                    columns,
-                                    text_width,
-                                    theme,
-                                )
-                            }),
-                    );
-                }
-                lines
-            }
-        };
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(clipped(hint), theme.dim));
-        lines
+    /// One kit row per entry, in queue order: the sentences said on reply, each row whole (the
+    /// list cuts it at the box's edge with an ellipsis).
+    fn list_rows(&self, theme: &Theme) -> Vec<Row<'static>> {
+        self.rows()
+            .iter()
+            .zip(&self.sentences)
+            .map(|((row, state), sentence)| row_line(row, state, sentence, &self.columns, theme))
+            .collect()
     }
+}
 
-    /// The lines around the rows: header and blank over them, blank and hint under them.
-    const fn fixed(&self) -> usize {
-        if self.failure.is_none() && self.overview.is_some() {
-            4
-        } else {
-            2
-        }
-    }
+/// The empty queue's next step: the Backlog's queue key in force, else the place alone.
+fn empty_next(keys: &Keys) -> String {
+    keys.label(views::BACKLOG_BODY, Act::BacklogQueue)
+        .map_or_else(
+            || "queue an item from the Backlog".to_owned(),
+            |queue| format!("{queue} on a Backlog item queues it"),
+        )
 }
 
 /// The header (M3 D8): running or paused, then the batch's figures and the slots, or the demo's
@@ -341,6 +286,112 @@ fn header(overview: &QueueOverview) -> String {
         }
         None => format!("queue: {state} · {slots}"),
     }
+}
+
+/// What one entry is doing, as the overlay says it (MOD-115 M4 E10, finding F1). htui-core's
+/// [`EntryState`] `Display` is the CLI's (`htui state`) and prints internal values: an item's
+/// status as its stored name and money in USD micros. Here a status reads through
+/// [`kit::status`](status) (glyph and word) and money through [`format_usd`], every figure kept.
+fn sentence(state: &EntryState) -> String {
+    match state {
+        EntryState::Running { status, .. } => if *status == RunStatus::Queued {
+            "admitted, waiting to be claimed"
+        } else {
+            "running here"
+        }
+        .to_owned(),
+        EntryState::Elsewhere {
+            hostname, status, ..
+        } => {
+            let host = hostname.as_deref().unwrap_or("another box");
+            if *status == RunStatus::Queued {
+                format!("queued for {host}")
+            } else {
+                format!("running on {host}")
+            }
+        }
+        EntryState::Next => "next to run".to_owned(),
+        EntryState::Held(hold) => format!("held: {}", hold_sentence(hold)),
+        EntryState::Waiting(wait) => wait_sentence(wait),
+        EntryState::Escalated(escalation) => escalation_sentence(escalation),
+    }
+}
+
+/// Why a ready entry is held, money in dollars.
+fn hold_sentence(hold: &Hold) -> String {
+    match hold {
+        Hold::Budget(BatchStop::CapReached { spent, cap }) => format!(
+            "batch cap reached ({} spent of {})",
+            format_usd(*spent),
+            format_usd(*cap)
+        ),
+        Hold::Budget(BatchStop::Budget { remaining, min }) => format!(
+            "batch budget has {} left, {} required",
+            format_usd(*remaining),
+            format_usd(*min)
+        ),
+        Hold::BadCap(error) => cap_sentence(error),
+        Hold::ProjectGone => "its project is gone".to_owned(),
+    }
+}
+
+/// A cap the project's settings hold that does not parse: the cap named as Settings names it,
+/// with what the operator wrote.
+fn cap_sentence(error: &CapError) -> String {
+    if error.is_document() {
+        return format!("the project's settings are unreadable: {}", error.found);
+    }
+    let cap = match error.key {
+        PER_TOKEN_CAP_RUN => "run cap",
+        PER_TOKEN_CAP_BATCH => "batch cap",
+        other => other,
+    };
+    format!("the project's {cap} is not a valid amount: {}", error.found)
+}
+
+/// Why an entry waits without needing a person; an item's status through `kit::status`.
+fn wait_sentence(wait: &Wait) -> String {
+    match wait {
+        Wait::BlockedBy(keys) => format!("waiting on {}", keys.join(", ")),
+        Wait::CancelledInBatch => "cancelled in this batch; the next batch runs it".to_owned(),
+        Wait::Paused => "queue paused".to_owned(),
+        Wait::NotReady(item) => {
+            let mark = status::mark(*item);
+            format!("not ready: item is {} {}", mark.glyph, mark.word)
+        }
+    }
+}
+
+/// Why an entry needs a person; a note or a failure shows its first line only (the Runs pane
+/// holds the whole text).
+fn escalation_sentence(escalation: &Escalation) -> String {
+    match escalation {
+        Escalation::HardGateParked { .. } => "hard gate parked".to_owned(),
+        Escalation::JudgeUndecided { note, .. } => with_note("judge undecided", note.as_deref()),
+        Escalation::ReviewLoopExhausted { note, .. } => {
+            with_note("review loop exhausted", note.as_deref())
+        }
+        Escalation::Blocked { note, .. } => with_note("blocked", note.as_deref()),
+        Escalation::Failed {
+            failure: Some(failure),
+            ..
+        } => format!("failed: {}", first_line(failure)),
+        Escalation::Failed { failure: None, .. } => "failed".to_owned(),
+        Escalation::MissingTags(tags) => format!("missing tags: {}", tags.join(", ")),
+    }
+}
+
+/// `head`, then ` (last note: …)` when there is a note.
+fn with_note(head: &str, note: Option<&str>) -> String {
+    note.map_or_else(
+        || head.to_owned(),
+        |note| format!("{head} (last note: {})", first_line(note)),
+    )
+}
+
+/// The first line of a note or a failure: the overlay draws one row per entry.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
 }
 
 /// The widths of a row's columns, in cells.
@@ -378,55 +429,63 @@ impl Columns {
         }
     }
 
-    /// Everything in front of the sentence: the marker, two padded columns and their gaps.
-    fn prefix(&self) -> usize {
-        cell_width(CURSOR) + self.key + self.title + 2 * cell_width(GAP)
+    /// A whole row, its sentence unclipped: the gutter, the lead, two padded columns, their gaps
+    /// and the sentence.
+    fn row_width(&self) -> usize {
+        1 + cell_width(LEAD) + self.key + self.title + 2 * cell_width(GAP) + self.text
     }
 }
 
-/// One row: `{marker}{key}{GAP}{title}{GAP}{sentence}`, the key and title fit to their column and
-/// `sentence` (`state`'s, said on reply) clipped to `text_width` with an ellipsis, never wrapped.
-/// The selected row is in the accent style, an escalated one in the warning style.
+/// One row: `{LEAD}{key}{GAP}{title}{GAP}{sentence}`, the key and title fit to their column and
+/// `sentence` (`state`'s, said on reply) whole: the list cuts it at the box's edge with an
+/// ellipsis, never wrapped. An escalated row is in the warning style; the cursor row is the
+/// list's band whatever its style (MOD-85).
 fn row_line(
     row: &QueueRow,
     state: &EntryState,
     sentence: &str,
-    selected: bool,
     columns: &Columns,
-    text_width: usize,
     theme: &Theme,
-) -> Line<'static> {
-    let marker = if selected { CURSOR } else { NO_CURSOR };
-    let style = if selected {
-        theme.accent
-    } else if state.is_escalated() {
+) -> Row<'static> {
+    let style = if state.is_escalated() {
         theme.warning
     } else {
         theme.base
     };
-    Line::styled(
-        format!(
-            "{marker}{}{GAP}{}{GAP}{}",
-            cells::fit(&row.key, columns.key),
-            cells::fit(&row.title, columns.title),
-            cells::clip(sentence, text_width),
+    Row {
+        line: Line::styled(
+            format!(
+                "{LEAD}{}{GAP}{}{GAP}{sentence}",
+                cells::fit(&row.key, columns.key),
+                cells::fit(&row.title, columns.title),
+            ),
+            style,
         ),
-        style,
-    )
+        kind: RowKind::Item,
+    }
 }
 
-/// The widest of `lines`, in cells (the switcher's MOD-60 B3 measure).
-fn widest(lines: &[Line<'_>]) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| cell_width(&span.content))
-                .sum::<usize>()
-        })
-        .max()
-        .unwrap_or(0)
+/// What fills the box.
+enum Body<'a> {
+    /// A failed read: its message.
+    Unavailable(&'a str),
+    /// No reply yet.
+    Reading,
+    /// A reply: its header, then its rows (or the empty state).
+    Overview(&'a QueueOverview),
+}
+
+impl Body<'_> {
+    /// The rows the body takes when nothing is cut.
+    fn height(&self) -> usize {
+        match self {
+            Self::Unavailable(_) | Self::Reading => 2,
+            // The header and a blank, then the rows or the two-line empty state (RV1-L1: one
+            // row is one row, not the empty state's two).
+            Self::Overview(overview) if overview.rows.is_empty() => 2 + 2,
+            Self::Overview(overview) => 2 + overview.rows.len(),
+        }
+    }
 }
 
 impl Overlay for QueueOverlay {
@@ -565,34 +624,91 @@ impl Overlay for QueueOverlay {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        // The natural size: every row, every sentence whole.
+        let theme = ctx.theme;
+        let body = match (&self.failure, &self.overview) {
+            (Some(message), _) => Body::Unavailable(message),
+            (None, None) => Body::Reading,
+            (None, Some(overview)) => Body::Overview(overview),
+        };
+        let empty_next = empty_next(ctx.keys());
         let hint = ctx.keys().hint(views::QUEUE_OVERLAY, HINT);
-        let natural = self.lines(None, None, usize::MAX, &hint, ctx.theme);
-        let width = u16::try_from(widest(&natural))
-            .unwrap_or(u16::MAX)
-            .saturating_add(CHROME)
-            .min(area.width.saturating_sub(4));
-        let height = u16::try_from(natural.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(2));
 
-        let room = usize::from(width.saturating_sub(CHROME));
-        let text_width = room.saturating_sub(self.columns.prefix());
-        let visible = usize::from(height.saturating_sub(2)).saturating_sub(self.fixed());
-        let lines = self.lines(Some(room), Some(text_width), visible, &hint, ctx.theme);
+        // The natural size: every row, every sentence and message whole, the hint whole on the
+        // border.
+        let widest = match &body {
+            Body::Unavailable(message) => {
+                (cell_width(NOTE_LEAD) + cell_width(UNAVAILABLE) + cell_width(message))
+                    .max(cell_width(NOTE_LEAD) + cell_width(UNAVAILABLE_NEXT))
+            }
+            Body::Reading => cell_width(READING).max(cell_width(READING_NEXT)),
+            Body::Overview(overview) if overview.rows.is_empty() => (cell_width(NOTE_LEAD)
+                + cell_width(&header(overview)))
+            .max(cell_width(EMPTY))
+            .max(cell_width(&empty_next)),
+            Body::Overview(overview) => (cell_width(NOTE_LEAD) + cell_width(&header(overview)))
+                .max(self.columns.row_width()),
+        }
+        .max(cell_width(&hint) + 1);
+        let content_w = u16::try_from(widest).unwrap_or(u16::MAX);
+        let content = Modal::new(self.title())
+            .size(ModalSize::Fit {
+                content_w,
+                content_h: u16::try_from(body.height()).unwrap_or(u16::MAX),
+            })
+            .hint(&hint)
+            .render(frame, area, theme);
 
-        let box_area = centered(area, width, height);
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title()), ctx.theme.title)),
-            ),
-            box_area,
-        );
+        match body {
+            Body::Unavailable(message) => {
+                let lines = [
+                    Line::styled(format!("{NOTE_LEAD}{UNAVAILABLE}{message}"), theme.error),
+                    // The focus role, kit::empty's next-step role (MOD-115 M4 E9, RV1-L3): the
+                    // line says what to do, as an empty state's second line does.
+                    Line::styled(format!("{NOTE_LEAD}{UNAVAILABLE_NEXT}"), theme.accent),
+                ];
+                cut_lines(frame, content, lines);
+            }
+            Body::Reading => {
+                empty::render(frame, content, READING, NextStep(READING_NEXT), theme);
+            }
+            Body::Overview(overview) => {
+                let head = Line::styled(format!("{NOTE_LEAD}{}", header(overview)), theme.base);
+                cut_lines(frame, content, [head]);
+                // The header and a blank row, then the rows.
+                let rows_area = Rect {
+                    y: content.y.saturating_add(2).min(content.bottom()),
+                    height: content.height.saturating_sub(2),
+                    ..content
+                };
+                if overview.rows.is_empty() {
+                    empty::render(frame, rows_area, EMPTY, NextStep(&empty_next), theme);
+                } else {
+                    let rows = self.list_rows(theme);
+                    let at = self.cursor.min(rows.len() - 1);
+                    let offset =
+                        list::scroll_into_view(at, 0, usize::from(rows_area.height), rows.len());
+                    list::render(
+                        frame,
+                        rows_area,
+                        &rows,
+                        Some(at),
+                        offset,
+                        theme.accent,
+                        theme,
+                    );
+                }
+            }
+        }
     }
+}
+
+/// `lines` drawn one per row from the top of `area`, each cut at its edge with an ellipsis.
+fn cut_lines<const N: usize>(frame: &mut Frame<'_>, area: Rect, lines: [Line<'static>; N]) {
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| list::ellipsize(line, area.width))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]
@@ -606,13 +722,16 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{
         BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
-        ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId, Wait, WorkspaceId,
+        PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
+        Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
+
+    use crate::ui::kit::list::GUTTER;
 
     /// Everything a `Ctx` borrows; the overlay holds its own rows.
     struct Bench {
@@ -643,6 +762,12 @@ mod tests {
         /// rebinds.
         fn with_keys(mut self, keys: Keys) -> Self {
             self.keys = keys;
+            self
+        }
+
+        /// The bench with this palette (MOD-115 M4 RV1-L3: the monochrome one).
+        fn with_theme(mut self, theme: Theme) -> Self {
+            self.theme = theme;
             self
         }
 
@@ -765,11 +890,11 @@ mod tests {
             .collect()
     }
 
-    fn texts(lines: &[Line<'_>]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
+    fn texts(rows: &[Row<'_>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.line
+                    .spans
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect()
@@ -871,18 +996,96 @@ mod tests {
         let bench = Bench::new();
         let mut overlay = QueueOverlay::new();
         bench.feed(&mut overlay, overview(every_state()));
-        let lines = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
-        let texts = texts(&lines);
-        for (row, state) in every_state() {
-            let sentence = state.to_string();
+        let texts = texts(&overlay.list_rows(&Theme::default()));
+        // Finding F1: the overlay says each state itself, in words, money in dollars and an
+        // item's status through `kit::status`; htui-core's `Display` (the CLI's) is not shown.
+        let expected = [
+            "running here",
+            "admitted, waiting to be claimed",
+            "running on LAPTOP-B",
+            "queued for another box",
+            "next to run",
+            "held: batch cap reached ($0.0006 spent of $0.0005)",
+            "held: batch budget has $0.0001 left, $0.0002 required",
+            "held: the project's batch cap is not a valid amount: \"x\"",
+            "held: its project is gone",
+            "waiting on FEAT-1, FEAT-2",
+            "cancelled in this batch; the next batch runs it",
+            "queue paused",
+            "not ready: item is \u{25d0} running",
+            "hard gate parked",
+            "judge undecided (last note: pick a branch)",
+            "review loop exhausted",
+            "blocked (last note: pick a branch)",
+            "failed: exit 1",
+            "missing tags: gpu",
+        ];
+        let states = every_state();
+        assert_eq!(states.len(), expected.len());
+        for ((row, state), want) in states.iter().zip(expected) {
+            assert_eq!(sentence(state), want, "{state:?}");
             assert!(
                 texts
                     .iter()
-                    .any(|line| line.contains(&row.key) && line.ends_with(&sentence)),
-                "{sentence}: {texts:?}"
+                    .any(|line| line.contains(&row.key) && line.ends_with(want)),
+                "{want}: {texts:?}"
+            );
+        }
+        for raw in ["micros", "in_progress", "per_token_cap", "project.settings"] {
+            assert!(
+                texts.iter().all(|line| !line.contains(raw)),
+                "{raw} on screen: {texts:?}"
             );
         }
         insta::assert_snapshot!("states", bench.render(&overlay));
+    }
+
+    /// Finding F1: the cap refusals the fixture leaves out read in words too, and a note or a
+    /// failure shows only its first line.
+    #[test]
+    fn the_other_refusals_read_in_words() {
+        let run = RunId::new();
+        let cases = [
+            (
+                EntryState::Held(Hold::BadCap(CapError::at_key(
+                    PER_TOKEN_CAP_RUN,
+                    "-1".to_owned(),
+                ))),
+                "held: the project's run cap is not a valid amount: -1",
+            ),
+            (
+                EntryState::Held(Hold::BadCap(CapError::document("[]".to_owned()))),
+                "held: the project's settings are unreadable: []",
+            ),
+            (
+                EntryState::Escalated(Escalation::Failed {
+                    run: Some(run),
+                    failure: None,
+                }),
+                "failed",
+            ),
+            (
+                EntryState::Escalated(Escalation::Failed {
+                    run: None,
+                    failure: Some("exit 2\nstack".to_owned()),
+                }),
+                "failed: exit 2",
+            ),
+            (
+                EntryState::Escalated(Escalation::ReviewLoopExhausted {
+                    run,
+                    note: Some("round 3\nmore".to_owned()),
+                }),
+                "review loop exhausted (last note: round 3)",
+            ),
+            (
+                EntryState::Waiting(Wait::NotReady(Status::AwaitingApproval)),
+                "not ready: item is \u{26a0} needs you",
+            ),
+        ];
+        for (state, want) in cases {
+            assert_eq!(sentence(&state), want, "{state:?}");
+        }
     }
 
     /// M3 review R1 N1: each row's sentence is worked out once per reply that changed the queue,
@@ -896,7 +1099,7 @@ mod tests {
         let said: Vec<String> = first
             .rows
             .iter()
-            .map(|(_, state)| state.to_string())
+            .map(|(_, state)| sentence(state))
             .collect();
         assert_eq!(overlay.sentences, said);
 
@@ -1057,16 +1260,19 @@ mod tests {
             },
         );
         assert!(bench.drained().is_empty(), "a failed read is not re-read");
-        let natural = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
-        assert_eq!(
-            texts(&natural)[0],
-            format!("{NO_CURSOR}{UNAVAILABLE}{message}")
-        );
         let rendered = bench.render(&overlay);
-        let line = rendered
-            .lines()
-            .find(|line| line.contains(UNAVAILABLE))
+        let lines: Vec<&str> = rendered.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains(UNAVAILABLE))
             .expect("the unavailable line is drawn");
+        let line = lines[at];
+        // MOD-115 M4 E6 (MOD-83): the next row names where to fix it, whatever the message's
+        // length.
+        assert!(
+            lines[at + 1].contains(UNAVAILABLE_NEXT),
+            "the next step: {rendered}"
+        );
         assert!(
             line.contains("the queue is unavailable: store unreachable: this box browses"),
             "{rendered}"
@@ -1123,7 +1329,12 @@ mod tests {
             .find(|line| line.contains("j/k move"))
             .expect("the hint is drawn");
         assert!(
-            hint.trim_end_matches('│').trim_end().ends_with('…'),
+            hint.trim_start().starts_with('\u{2570}'),
+            "the hint rides the bottom border: {rendered}"
+        );
+        assert!(
+            hint.trim_end_matches(['\u{256f}', '\u{2500}', ' '])
+                .ends_with('…'),
             "a hint wider than the box is cut with an ellipsis: {rendered}"
         );
         insta::assert_snapshot!("narrow", rendered);
@@ -1138,22 +1349,23 @@ mod tests {
             .collect();
         bench.feed(&mut overlay, overview(rows));
 
-        // A 12-line frame holds a 10-line box: header, blank, four rows, blank, hint.
+        // A 12-line frame holds a 10-line box: header, blank, six rows (the keys are on the
+        // border).
         let top = bench.render_at(&overlay, 100, 12);
-        assert!(top.contains("> W-01"), "{top}");
-        assert!(top.contains("W-04"), "{top}");
-        assert!(!top.contains("W-05"), "{top}");
+        assert!(top.contains(&format!("{GUTTER} W-01")), "{top}");
+        assert!(top.contains("W-06"), "{top}");
+        assert!(!top.contains("W-07"), "{top}");
 
         for _ in 0..19 {
             bench.code(&mut overlay, KeyCode::Char('j'));
         }
         let bottom = bench.render_at(&overlay, 100, 12);
         assert!(
-            bottom.contains("> W-20"),
+            bottom.contains(&format!("{GUTTER} W-20")),
             "the cursor row is drawn: {bottom}"
         );
-        assert!(bottom.contains("W-17"), "{bottom}");
-        assert!(!bottom.contains("W-16"), "{bottom}");
+        assert!(bottom.contains("W-15"), "{bottom}");
+        assert!(!bottom.contains("W-14"), "{bottom}");
         assert!(
             !bottom.contains("W-01"),
             "the first row scrolled off: {bottom}"
@@ -1169,11 +1381,10 @@ mod tests {
             &mut overlay,
             overview(vec![(row("FIX-1", title), EntryState::Next)]),
         );
-        let lines = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
-        let row_text = &texts(&lines)[2];
+        let row_text = &texts(&overlay.list_rows(&Theme::default()))[0];
         assert_eq!(
             row_text,
-            &format!("> FIX-1  {}  next to run", cells::fit(title, TITLE_MAX)),
+            &format!("{LEAD}FIX-1  {}  next to run", cells::fit(title, TITLE_MAX)),
         );
         assert!(row_text.contains('…'));
     }
@@ -1197,29 +1408,35 @@ mod tests {
         term.draw(|frame| overlay.render(frame, frame.area(), &bench.ctx()))
             .expect("the overlay draws");
         let buffer = term.backend().buffer();
-        let fg_of = |key: &str| {
+        let cell_of = |key: &str| {
             for y in 0..buffer.area.height {
                 let line: String = (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect();
                 if let Some(x) = line.find(key) {
                     let x = u16::try_from(line[..x].chars().count()).expect("narrow");
-                    return buffer[(x, y)].fg;
+                    return buffer[(x, y)].clone();
                 }
             }
             panic!("{key} is not drawn");
         };
+        let theme = Theme::default();
         assert_eq!(
-            fg_of("SEL-1"),
-            Color::Cyan,
-            "the selected row is the accent"
+            cell_of("SEL-1").bg,
+            theme.selected.bg.unwrap_or_default(),
+            "the selected row is the band (MOD-85)"
         );
         assert_eq!(
-            fg_of("ESC-2"),
+            cell_of("ESC-2").fg,
             Color::Yellow,
             "the escalated row is the warning"
         );
-        assert_eq!(fg_of("CAL-3"), Color::Reset, "an ordinary row is the base");
+        assert_eq!(cell_of("ESC-2").bg, Color::Reset);
+        assert_eq!(
+            cell_of("CAL-3").fg,
+            Color::Reset,
+            "an ordinary row is the base"
+        );
 
         // Selected wins over escalated.
         bench.code(&mut overlay, KeyCode::Char('j'));
@@ -1233,10 +1450,10 @@ mod tests {
                 .collect();
             line.find("ESC-2").is_some_and(|x| {
                 let x = u16::try_from(line[..x].chars().count()).expect("narrow");
-                buffer[(x, y)].fg == Color::Cyan
+                buffer[(x, y)].bg == theme.selected.bg.unwrap_or_default()
             })
         });
-        assert!(found, "the selected escalated row is the accent");
+        assert!(found, "the selected escalated row is the band");
     }
 
     #[test]
@@ -1255,7 +1472,7 @@ mod tests {
         let reordered = vec![rows[1].clone(), rows[0].clone(), rows[2].clone()];
         bench.feed(&mut overlay, overview(reordered));
         assert_eq!((overlay.cursor, overlay.anchor), (0, Some(b)));
-        assert!(bench.render(&overlay).contains("> B-2 "));
+        assert!(bench.render(&overlay).contains(&format!("{GUTTER} B-2 ")));
 
         // Its row gone: the index clamped, the anchor on the row now there.
         bench.code(&mut overlay, KeyCode::Char('j'));
@@ -1810,5 +2027,158 @@ mod tests {
     #[test]
     fn the_overview_request_name_is_the_one_the_worker_uses() {
         assert_eq!(StoreRequest::QueueOverview.name(), OVERVIEW);
+    }
+
+    /// MOD-115 M4 E6 (MOD-85): the cursor row is the kit's gutter and band, legible under
+    /// `NO_COLOR`: the band is reversed, and no cell names a colour.
+    #[test]
+    fn the_cursor_row_is_the_band_and_reads_without_colour() {
+        let mut bench = Bench::new();
+        bench.theme = Theme::monochrome();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        bench.code(&mut overlay, KeyCode::Char('j'));
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
+        term.draw(|frame| overlay.render(frame, frame.area(), &bench.ctx()))
+            .expect("the overlay draws");
+        let buffer = term.backend().buffer();
+        let at = |key: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let line: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect();
+                    line.find(key).map(|byte| {
+                        let x = u16::try_from(line[..byte].chars().count()).expect("narrow");
+                        (x, y, line)
+                    })
+                })
+                .unwrap_or_else(|| panic!("{key} is not drawn"))
+        };
+        let (x, y, line) = at("B-2");
+        assert!(line.contains(GUTTER), "{line}");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        let (x, y, line) = at("A-1");
+        assert!(!line.contains(GUTTER), "{line}");
+        assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        for cell in &buffer.content {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+        }
+    }
+
+    /// MOD-115 M4 E6: the keys ride the modal's bottom border, not a row of the box.
+    #[test]
+    fn the_keys_ride_the_bottom_border() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        let rendered = bench.render(&overlay);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains("\u{256d} Queue "))
+            .expect("a rounded box titled Queue");
+        assert!(lines[top + 1].contains("queue: running"), "{rendered}");
+        assert!(lines[top + 3].contains("A-1"), "{rendered}");
+        assert!(lines[top + 5].contains("C-3"), "{rendered}");
+        assert!(
+            lines[top + 6].contains('\u{2570}') && lines[top + 6].contains(&hint()),
+            "the border under the last row carries the keys: {rendered}"
+        );
+    }
+
+    /// MOD-115 M4 E6: an empty queue says so and how to fill it, naming the Backlog's queue key
+    /// in force; before the first reply the box says it is reading and what comes next.
+    #[test]
+    fn the_empty_and_reading_states_name_a_next_step() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let rendered = bench.render(&overlay);
+        assert!(rendered.contains(READING), "{rendered}");
+        assert!(rendered.contains(READING_NEXT), "{rendered}");
+
+        bench.feed(&mut overlay, overview(Vec::new()));
+        let rendered = bench.render(&overlay);
+        assert!(rendered.contains(EMPTY), "{rendered}");
+        assert!(
+            rendered.contains("Q on a Backlog item queues it"),
+            "{rendered}"
+        );
+
+        let keys = load_str("[backlog]\nqueue = \"ctrl-u\"\n").expect("the keys load");
+        let bench = Bench::new().with_keys(keys);
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(Vec::new()));
+        let rendered = bench.render(&overlay);
+        assert!(
+            rendered.contains("Ctrl+u on a Backlog item queues it"),
+            "{rendered}"
+        );
+    }
+
+    /// MOD-115 M4 RV1-L1: a one-entry queue's box ends under its row; the two rows kept for the
+    /// empty state are the empty state's alone.
+    #[test]
+    fn a_one_entry_queue_has_no_blank_row() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(
+            &mut overlay,
+            overview(vec![(row("A-1", "t"), EntryState::Next)]),
+        );
+        let rendered = bench.render(&overlay);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains("A-1"))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            lines[at + 1].contains('\u{2570}'),
+            "the bottom border follows the row: {rendered}"
+        );
+    }
+
+    /// The unavailable line is the error role, and its next step is drawn with it, in the focus
+    /// role, kit::empty's next-step role (MOD-115 M4 RV1-L3, E9): under the monochrome theme too,
+    /// where the role is its modifier.
+    #[test]
+    fn the_unavailable_line_is_an_error_with_a_next_step() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench::new().with_theme(theme);
+            let mut overlay = QueueOverlay::new();
+            bench.reply(
+                &mut overlay,
+                &StoreReply::Failed {
+                    request: OVERVIEW,
+                    message: "boom".to_owned(),
+                },
+            );
+            let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
+            term.draw(|frame| overlay.render(frame, frame.area(), &bench.ctx()))
+                .expect("the overlay draws");
+            let buffer = term.backend().buffer();
+            let find = |y: u16, text: &str| {
+                let line: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect();
+                line.find(text)
+                    .map(|byte| u16::try_from(line[..byte].chars().count()).expect("narrow"))
+            };
+            let (x, y) = (0..buffer.area.height)
+                .find_map(|y| find(y, UNAVAILABLE).map(|x| (x, y)))
+                .expect("the unavailable line is drawn");
+            assert_eq!(buffer[(x, y)].fg, theme.error.fg.unwrap_or_default());
+            let next = find(y + 1, UNAVAILABLE_NEXT).expect("the next step under it");
+            let cell = &buffer[(next, y + 1)];
+            assert_eq!(
+                cell.fg,
+                theme.accent.fg.unwrap_or_default(),
+                "the focus role"
+            );
+            assert!(
+                cell.modifier.contains(theme.accent.add_modifier),
+                "the focus role's modifier"
+            );
+        }
     }
 }

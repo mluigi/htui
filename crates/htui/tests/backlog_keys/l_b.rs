@@ -2,6 +2,7 @@
 //! through their stacks, `alt-y` no longer answers a question (D7), and browsing draws a hint row
 //! built from the keys in force (ANA-26 §8). Helpers stay in this file.
 
+use super::on_item;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -159,8 +160,14 @@ pub(super) async fn parked(store: MemStore) -> Harness {
     harness.key("R");
     harness.drive().await;
     let frame = harness.render();
+    // The Runs pane's half only: the list's `TOOL-1` row reads `⚠ needs you` in every frame.
+    let pane: Vec<&str> = frame
+        .lines()
+        .filter_map(|row| row.rsplit_once("\u{2502}\u{2502}").map(|(_, pane)| pane))
+        .collect();
     assert!(
-        frame.contains("awaiting") && frame.contains("research"),
+        pane.iter().any(|row| row.contains("\u{26a0} needs you"))
+            && pane.iter().any(|row| row.contains("research")),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     harness
@@ -288,7 +295,7 @@ async fn the_resolution_keys_stay_fixed_and_plain() {
         "`Right` cycles it too"
     );
     assert!(
-        harness.render().contains("┌ ANA-1"),
+        on_item(&harness.render(), "ANA-1"),
         "and the Backlog stays on ANA-1's Runs pane"
     );
 }
@@ -331,14 +338,14 @@ async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
     let frame = harness.render();
     assert_eq!(note(&frame), "no", "`Tab` is swallowed");
     assert!(
-        frame.contains("┌ ANA-2"),
+        on_item(&frame, "ANA-2"),
         "still on ANA-2's Runs pane:\n{frame}"
     );
     harness.key("2");
     let frame = harness.render();
     assert_eq!(note(&frame), "no2", "`2` is typed, not a tab select");
     assert!(
-        frame.contains("┌ ANA-2"),
+        on_item(&frame, "ANA-2"),
         "still on ANA-2's Runs pane:\n{frame}"
     );
     assert_eq!(harness.queued(), 0, "and nothing was sent");
@@ -357,40 +364,49 @@ fn hint_row(frame: &str) -> String {
         .to_owned()
 }
 
-/// The list's own keys, after a pane's in the shell's hint row when both fit (MOD-67 M6 T2).
+/// The list's own keys, after a pane's when both fit the pane (MOD-67 M6 T2, MOD-115 M4 Q2).
 const LIST_KEYS: &str = "j/k move · h/l sub-tab · f filter · N new · e edit";
 
-/// ANA-26 §8: browsing the Runs pane, the shell's hint row (MOD-67 M6 T2) leads with the pane's
-/// keys, built from the keys in force, one per view: the run list, the flow, and an item with no
-/// run; the list's own follow at 100 columns.
+/// ANA-26 §8: browsing the Runs pane, its hints lead with the pane's keys, built from the keys in
+/// force, one per view: the run list, the flow, and an item with no run. MOD-115 M4 Q2: they are
+/// the focused detail's own, so the pane key focuses it first; at 100 columns the list's keys do
+/// not fit beside them.
 #[tokio::test]
 async fn the_runs_browse_hint_row() {
     let adapter = FakeAdapter::new();
     let mut harness = driving(MemStore::demo(), &adapter).await;
     harness.key("l");
     harness.drive().await;
+    // The pane key moves the focus among the panes the last frame drew.
+    harness.render();
+    harness.key("tab");
+    harness.drive().await;
     let frame = harness.render();
     assert!(frame.contains("▸"), "ANA-1's runs are listed:\n{frame}");
     assert_eq!(
         hint_row(&frame),
-        format!("J/K step · Enter replay · v flow · ? keys · {LIST_KEYS}"),
+        "J/K step · Enter replay · v flow · ? keys",
         "the list's row:\n{frame}"
     );
+    assert!(!frame.contains(LIST_KEYS), "the list draws none:\n{frame}");
 
     harness.key("v");
     harness.drive().await;
     let frame = harness.render();
     assert_eq!(
         hint_row(&frame),
-        format!("J/K step · +/- zoom · v list · ? keys · {LIST_KEYS}"),
+        "J/K step · +/- zoom · v list · ? keys",
         "the flow's row:\n{frame}"
     );
     harness.key("v");
 
+    // The list's `j` moves the cursor while the list is focused.
+    harness.key("tab");
     for _ in 0..TO_ANA_2 {
         harness.key("j");
         harness.drive().await;
     }
+    harness.key("tab");
     let frame = harness.render();
     assert!(
         frame.contains("No runs for this item."),
@@ -398,7 +414,7 @@ async fn the_runs_browse_hint_row() {
     );
     assert_eq!(
         hint_row(&frame),
-        format!("R start run · ? keys · {LIST_KEYS}"),
+        "R start run · ? keys",
         "an item with no run:\n{frame}"
     );
 }
@@ -483,6 +499,12 @@ async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
     }
     harness.key("l");
     harness.drive().await;
+    // MOD-115 M4 Q2: the browse row is the focused detail's hints. Under a version-1 key file
+    // `tab` is `next_tab`, so the pane key is `ctrl-right`; it moves the focus among the panes
+    // the last frame drew.
+    harness.render();
+    harness.key("ctrl-right");
+    harness.drive().await;
     let frame = harness.render();
     assert!(
         cursor_row(&frame).contains("prd"),
@@ -508,5 +530,5 @@ async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
         cursor_row(&frame).contains("plan"),
         "`n` moves it to the next step:\n{frame}"
     );
-    assert!(frame.contains("┌ FEAT-1"), "on FEAT-1 still:\n{frame}");
+    assert!(on_item(&frame, "FEAT-1"), "on FEAT-1 still:\n{frame}");
 }

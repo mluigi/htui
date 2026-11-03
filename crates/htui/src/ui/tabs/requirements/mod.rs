@@ -49,11 +49,10 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::filter::{self, Filter};
 use crate::ui::kit::list;
 use crate::ui::kit::modal::modal_rest;
-use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::kit::pane::{Focus, Pane, capture_area};
+use crate::ui::kit::scroll::{Scroll, Step, window};
 use crate::ui::kit::text::{self as kit_text, Tone, wrapped};
 use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
-use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
-use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -1435,11 +1434,6 @@ impl Tab for RequirementsTab {
 
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         self.keys_line(ctx.keys(), ctx.theme)
-    }
-
-    /// MOD-115 M3 D1, D6: the tree and the detail as kit panes, their hints on the focused one.
-    fn draws_chrome(&self) -> bool {
-        true
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -2837,12 +2831,6 @@ mod tests {
     fn style_of(buffer: &ratatui::buffer::Buffer, rows: &[String], text: &str) -> Style {
         let (x, y) = find(rows, text).unwrap_or_else(|| panic!("`{text}` is drawn: {rows:#?}"));
         buffer[(x, y)].style()
-    }
-
-    /// MOD-115 M3 D1: the tab draws its own kit panes, so the shell paints nothing over them.
-    #[test]
-    fn the_tab_draws_its_own_chrome() {
-        assert!(RequirementsTab::new().draws_chrome());
     }
 
     /// MOD-115 M3 D6: the tree and the detail are rounded kit panes titled on their top border,

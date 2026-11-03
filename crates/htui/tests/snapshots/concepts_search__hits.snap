@@ -3,32 +3,32 @@ source: crates/htui/tests/concepts_search.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 waiting · memory ·  F1  keys
-┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
-│  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
-│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
-│ ┌ Search concepts ─────────────────────────────────────────────────────────────────────────────┐ │
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
+│ ▾ htui (8)                                          ││Data model, box registry and sync topology │
+│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
+│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
+│ ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮ │
 │ │scope all projects · decisions off                                                            │ │
-│ │query postgres store cache                                                                    │ │
+│ │query postgres store cache                                                                    │a│
 │ │                                                                                              │ │
-│ │> ANA-1      item                       3.000  ANA-1 Data model, box registry and sync topolog│ │
-│▾│  FEAT-3     item                       3.000  FEAT-3 Postgres store and cache                │a│
-│ │  R-STO-1    requirement                2.000  R-STO-1 Postgres is the source of truth; the ca│ │
-│ │  ANA-1      verdict document           2.000  ANA-1 Verdict: Postgres with a per-box cache (v│ │
-│ │  FEAT-1     item                       1.000  FEAT-1 TUI scaffold Stand up the terminal appli│ │
-│ │  ANA-1      research document          1.000  ANA-1 Research: store topology (agy) (research)│ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
+│ │▌ANA-1      item                       best   ANA-1 Data model, box registry and sync topolo… │ │
+│ │ FEAT-3     item                       best   FEAT-3 Postgres store and cache                 │ │
+│ │ R-STO-1    requirement                strong R-STO-1 Postgres is the source of truth; the c… │ │
+│ │ ANA-1      verdict document           strong ANA-1 Verdict: Postgres with a per-box cache (… │ │
+│ │ FEAT-1     item                       fair   FEAT-1 TUI scaffold Stand up the terminal appl… │ │
+│ │ ANA-1      research document          fair   ANA-1 Research: store topology (agy) (research… │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
-│ │6 hit(s)                                                                                      │ │
 │ │                                                                                              │ │
-│ │Enter search/open · Up/Down move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close │ │
-│ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│ │                                                                                              │ │
+│ │6 hits                                                                                        │ │
+│ │                                                                                              │ │
+│ ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close ───╯ │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯

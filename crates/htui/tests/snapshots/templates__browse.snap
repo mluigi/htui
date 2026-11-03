@@ -3,19 +3,18 @@ source: crates/htui/tests/templates.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
- Skills │ Templates
-┌ Templates ───────────────────┐┌ implement v1 (head v1) ──────────────────────────────────────────┐
-│vulkan-tutorials              ││You are running the `implement` phase for {{item_key}}, attempt   │
-│  fix           v1   phase    ││{{attempt}}.                                                      │
-│  handoff       v1   handoff  ││                                                                  │
-│  implement     v1   phase    ││{{item}}                                                          │
-│  judge         v1   judge    ││{{documents}}                                                     │
-│  plan          v1   phase    ││{{verify_failure}}                                                │
-│  prd           v1   phase    ││{{previous_diff}}                                                 │
-│  reproduce     v1   phase    ││{{upstream}}                                                      │
-│  research      v1   phase    ││{{box}}                                                           │
-│  review        v1   phase    ││{{skills}}                                                        │
-│  verdict       v1   phase    ││{{excerpts}}                                                      │
+╭─────────── Skills  Templates ╮╭─ implement v1 (head v1) ─────────────────────────────────────────╮
+│ vulkan-tutorials             ││You are running the `implement` phase for {{item_key}}, attempt   │
+│   fix           v1   phase   ││{{attempt}}.                                                      │
+│   handoff       v1   handoff ││                                                                  │
+│▌  implement     v1   phase   ││{{item}}                                                          │
+│   judge         v1   judge   ││{{documents}}                                                     │
+│   plan          v1   phase   ││{{verify_failure}}                                                │
+│   prd           v1   phase   ││{{previous_diff}}                                                 │
+│   reproduce     v1   phase   ││{{upstream}}                                                      │
+│   research      v1   phase   ││{{box}}                                                           │
+│   review        v1   phase   ││{{skills}}                                                        │
+│   verdict       v1   phase   ││{{excerpts}}                                                      │
 │                              ││{{command_queue}}                                                 │
 │                              ││                                                                  │
 │                              ││Make the change the plan describes, in this working tree. Keep the│
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 wai
 │                              ││                                                                  │
 │                              ││                                                                  │
 │                              ││                                                                  │
-└─j/k · ,/. version · b base · d diff · D default · e edit · E $EDITOR · n new · r reload · h/l v…─┘
+│                              ││                                                                  │
+╰─j/k · n new · r reload───────╯╰──────────────────────────────────────────────────────────────────╯

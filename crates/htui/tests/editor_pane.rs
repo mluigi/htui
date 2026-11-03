@@ -25,6 +25,13 @@ use htui_core::store::MemStore;
 use tempfile::TempDir;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 /// The event loop's bound on the pane's channel (`event_loop::PANE_QUEUE`, R1 M-1).
 const QUEUE: usize = 256;
 
@@ -42,15 +49,23 @@ async fn open() -> Harness {
     harness
 }
 
+/// Whether `frame` shows a pane titled `title`: a self-drawn `┌ title`, or a kit pane's
+/// `╭─ title` (MOD-115 M4 L-skills, D-11: the body pane's title is a kit title; the
+/// `tests/reveal.rs` pattern, the corner included so a rule elsewhere does not pass for one).
+fn titled(frame: &str, title: &str) -> bool {
+    frame.contains(&format!("\u{250c} {title}"))
+        || frame.contains(&format!("\u{256d}\u{2500} {title}"))
+}
+
 /// Moves the tree's cursor onto `name`: to the top, then down until the body pane is titled with
 /// it.
 fn select(harness: &mut Harness, name: &str) {
     for _ in 0..20 {
         harness.key("k");
     }
-    let title = format!("\u{250c} {name} v");
+    let title = format!("{name} v");
     for _ in 0..20 {
-        if harness.render().contains(&title) {
+        if titled(&harness.render(), &title) {
             return;
         }
         harness.key("j");
@@ -521,17 +536,14 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
         header.ends_with("editing in Skills \u{b7} Ctrl+4 back"),
         "the header names the edit: {frame}"
     );
-    assert!(
-        frame.contains("\u{250c} FEAT-1 "),
-        "FEAT-1 selected: {frame}"
-    );
+    assert!(on_item(&frame, "FEAT-1"), "FEAT-1 selected: {frame}");
 
     // M2 R1 M-3: a key reaches the other tab while the editor waits.
     harness.key("j");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} TOOL-1 "),
+        on_item(&frame, "TOOL-1"),
         "`j` moved Backlog's selection: {frame}"
     );
     assert!(harness.app().editor_open(), "the editor still waits");

@@ -1,5 +1,7 @@
 //! Plain text for panes (MOD-115 M3 D2, D4): [`wrapped`], the one word-wrap every tab's
 //! measured layout uses, and [`notice`], the one-line notice a section shows under its content.
+//! [`STAMP`] is the one timestamp format the Backlog's detail pane and Requirements render
+//! with (MOD-115 M4 T0).
 //!
 //! [`wrapped`] is here rather than relying on `Paragraph`'s own `Wrap`, because the layout needs
 //! the height *before* the pane is drawn and a count that disagreed with the widget's wrapping
@@ -16,6 +18,11 @@
 use ratatui::text::Line;
 
 use crate::ui::{Theme, cells};
+
+/// `strftime` format every timestamp in the Backlog's detail pane and in Requirements is rendered
+/// with: the detail pane is 43 columns wide at 100x30 and the year is the same on every row that
+/// would fit next to it.
+pub const STAMP: &str = "%m-%d %H:%M";
 
 /// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
 /// a word wider than `width` broken by grapheme (MOD-60 D5, OQ-1) and the next word joining its

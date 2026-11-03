@@ -1,5 +1,5 @@
-//! The empty state: what is missing and always a next step (MOD-115), and the placeholder pane
-//! that frames one where a pane has nothing to show yet (M2's activity pane).
+//! The empty state: what is missing and always a next step (MOD-115). A pane with nothing to
+//! show yet (the shell's activity pane, the no-tab body) is a kit pane holding one.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::ui::Theme;
 use crate::ui::cells::clip_line;
-use crate::ui::kit::pane::Pane;
+use crate::ui::kit::text::wrapped;
 use crate::ui::layout::centered;
 
 /// The next step an empty state points at. Required, so no empty state is a dead end.
@@ -25,10 +25,44 @@ pub fn lines(what: &str, next: NextStep<'_>, theme: &Theme) -> Vec<Line<'static>
     ]
 }
 
+/// The lines of a failed read (MOD-115 M4 RV2-M1): the failure wrapped at `width` in the error
+/// role, so no part of its sentence is lost, then the next step in the focus role.
+#[must_use]
+pub fn failed_lines(
+    what: &str,
+    width: u16,
+    next: NextStep<'_>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = wrapped(what, usize::from(width.max(1)))
+        .into_iter()
+        .map(|row| Line::styled(row, theme.error))
+        .collect();
+    lines.push(Line::styled(next.0.to_owned(), theme.accent));
+    lines
+}
+
 /// Draws an empty state centred in `area`. Each line is clipped to the width first, so a long
 /// sentence loses its tail and not its alignment.
 pub fn render(frame: &mut Frame<'_>, area: Rect, what: &str, next: NextStep<'_>, theme: &Theme) {
-    let lines: Vec<Line<'static>> = lines(what, next, theme)
+    centred(frame, area, lines(what, next, theme));
+}
+
+/// Draws a failed read centred in `area` as [`failed_lines`]: a pane whose read was refused is an
+/// empty state too, and its next step is never optional either.
+pub fn render_failed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    what: &str,
+    next: NextStep<'_>,
+    theme: &Theme,
+) {
+    centred(frame, area, failed_lines(what, area.width, next, theme));
+}
+
+/// `lines`, each clipped to the width and centred, the block centred in `area`.
+fn centred(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
+    let lines: Vec<Line<'static>> = lines
         .into_iter()
         .map(|line| clip_line(line, area.width).alignment(Alignment::Center))
         .collect();
@@ -37,29 +71,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, what: &str, next: NextStep<'_>,
     frame.render_widget(Paragraph::new(lines), target);
 }
 
-/// Draws the empty state of a pane nothing fills yet into `area` (MOD-115 M2 D2: the activity
-/// pane until MOD-122): a rounded block in the faint border role titled ` {title} `, with the
-/// empty state for `what` and `next` centred inside. The shell restyles its border for focus
-/// afterwards, like any pane's.
-pub fn placeholder(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    what: &str,
-    next: NextStep<'_>,
-    theme: &Theme,
-) {
-    let inner = Pane::new(title).render(frame, area, theme);
-    render(frame, inner, what, next, theme);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
 
     fn draw(width: u16, height: u16, what: &str, next: &str, theme: &Theme) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -151,6 +168,23 @@ mod tests {
         );
     }
 
+    /// RV2-M1: a failed read keeps its whole sentence, wrapped in the error role, and its next
+    /// step under it in the focus role.
+    #[test]
+    fn a_failed_read_wraps_its_sentence_and_keeps_the_next_step() {
+        let theme = Theme::default();
+        let lines = failed_lines(
+            "Links unavailable: connection refused",
+            20,
+            NextStep("retry"),
+            &theme,
+        );
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text, ["Links unavailable:", "connection refused", "retry"]);
+        assert_eq!(lines[0].style, theme.error);
+        assert_eq!(lines[2].style, theme.accent);
+    }
+
     #[test]
     fn a_zero_sized_area_draws_nothing_and_does_not_panic() {
         let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("terminal");
@@ -159,96 +193,6 @@ mod tests {
                 render(
                     frame,
                     Rect::new(0, 0, 0, 0),
-                    "x",
-                    NextStep("y"),
-                    &Theme::default(),
-                );
-            })
-            .expect("draw");
-    }
-
-    fn draw_placeholder(width: u16, height: u16, theme: &Theme) -> Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                placeholder(
-                    frame,
-                    frame.area(),
-                    "Activity",
-                    "no activity yet",
-                    NextStep("it lands with MOD-122"),
-                    theme,
-                );
-            })
-            .expect("draw");
-        terminal.backend().buffer().clone()
-    }
-
-    fn text(buffer: &Buffer, y: u16) -> String {
-        (0..buffer.area.width)
-            .map(|x| buffer[(x, y)].symbol())
-            .collect()
-    }
-
-    #[test]
-    fn the_placeholder_is_a_rounded_faint_pane_titled_with_the_state_inside() {
-        let theme = Theme::default();
-        let buffer = draw_placeholder(30, 6, &theme);
-        let top = text(&buffer, 0);
-        assert!(top.starts_with("╭─ Activity ─"), "{top}");
-        assert!(top.ends_with('╮'), "{top}");
-        assert!(text(&buffer, 5).starts_with('╰') && text(&buffer, 5).ends_with('╯'));
-        for (x, y) in [(0, 0), (29, 0), (0, 3), (29, 5)] {
-            assert_eq!(buffer[(x, y)].fg, Color::Indexed(240), "({x},{y})");
-        }
-        let inner: Vec<String> = (1..5).map(|y| text(&buffer, y)).collect();
-        assert!(
-            inner
-                .iter()
-                .any(|row| row.trim_matches(['│', ' ']) == "no activity yet"),
-            "{inner:?}"
-        );
-        assert!(
-            inner
-                .iter()
-                .any(|row| row.trim_matches(['│', ' ']) == "it lands with MOD-122"),
-            "{inner:?}"
-        );
-        let what = inner
-            .iter()
-            .position(|row| row.contains("no activity yet"))
-            .unwrap();
-        assert_eq!(what, 1, "centred in the four inner rows: {inner:?}");
-    }
-
-    #[test]
-    fn the_placeholder_border_is_dim_in_monochrome() {
-        let theme = Theme::monochrome();
-        let buffer = draw_placeholder(30, 6, &theme);
-        for (x, y) in [(0, 0), (29, 0), (0, 3), (29, 5)] {
-            let cell = &buffer[(x, y)];
-            assert!(cell.modifier.contains(Modifier::DIM), "({x},{y})");
-            assert_eq!(
-                (cell.fg, cell.bg),
-                (Color::Reset, Color::Reset),
-                "({x},{y})"
-            );
-        }
-    }
-
-    #[test]
-    fn a_tiny_placeholder_does_not_panic() {
-        for (width, height) in [(1, 1), (2, 2), (5, 2), (12, 3)] {
-            let buffer = draw_placeholder(width, height, &Theme::default());
-            assert_eq!(buffer.area.width, width);
-        }
-        let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                placeholder(
-                    frame,
-                    Rect::default(),
-                    "Activity",
                     "x",
                     NextStep("y"),
                     &Theme::default(),

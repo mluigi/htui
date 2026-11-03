@@ -6,11 +6,14 @@
 //! reaches it, and every other edge a `(*)` leaf (D3), its arrow read from the row it hangs under
 //! (D4). `Enter` re-roots by emitting `Action::Reveal` for the item under the cursor (D6), so the
 //! sub-tab never names the list it re-roots.
+//!
+//! MOD-115 M4: the rows are a `kit::list`, the cursor its gutter and band (MOD-85); an edge's kind
+//! reads as `label::link_kind`'s words and a node's status as its `kit::status` mark (MOD-83).
 
 use core::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use htui_core::model::{ItemId, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef};
+use htui_core::model::{ItemId, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -23,8 +26,14 @@ use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::kit::chips::key_line;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
-use crate::ui::tabs::backlog::list;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::scroll::{PAGE, Step, window};
+use crate::ui::kit::status;
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, message, no_item, unavailable,
+};
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
@@ -40,17 +49,17 @@ const OUT: &str = "\u{2192}";
 /// An edge that arrives at the parent row's item (D4).
 const IN: &str = "\u{2190}";
 
-/// Marks the row under the cursor (the `runs.rs` / `requirements.rs` glyph).
-const CURSOR: &str = "\u{25b8}";
-
 /// Default view depth (D2).
 const DEFAULT_DEPTH: u8 = 2;
 
 /// Columns one tree level indents by.
 const INDENT: usize = 2;
 
-/// Width the kind column is padded to: `blocked_by` / `supersedes`, the old table's `Length(10)`.
-const KIND_WIDTH: usize = 10;
+/// What the pane says when the item has no link, and where links come from.
+const NO_LINKS: (&str, NextStep<'static>) = (
+    "No links for this item.",
+    NextStep("a run step proposes the links shown here"),
+);
 
 /// Narrowest title worth drawing: below it a clipped title is an ellipsis and a letter or two.
 const TITLE_MIN: usize = 8;
@@ -149,6 +158,9 @@ pub struct GraphTab {
     cursor: usize,
     /// View depth, `1..=MAX_HOPS`. A preference: survives `on_item_change` (D2).
     depth: u8,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 impl GraphTab {
@@ -168,6 +180,7 @@ impl GraphTab {
             failed: None,
             cursor: 0,
             depth: DEFAULT_DEPTH,
+            told: Told::new(),
         }
     }
 
@@ -474,13 +487,29 @@ fn in_workspace(node: &LinkNode, projects: &[ProjectRef]) -> bool {
         .any(|project| project.project_id == node.project_id)
 }
 
-/// Every row as a line at most `width` cells wide, the cursor on row `cursor`.
+/// The cells the kind column is padded to: the widest of `label::link_kind`'s words (`blocked
+/// by`, `supersedes`), so the column is as wide as its longest word and no wider.
+fn kind_width() -> usize {
+    LinkKind::ALL
+        .iter()
+        .map(|kind| cell_width(label::link_kind(*kind)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// A node's status as the pane shows it: its `kit::status` glyph and word, one span.
+fn status_text(status: Status) -> String {
+    let mark = status::mark(status);
+    format!("{} {}", mark.glyph, mark.word)
+}
+
+/// Every row as a line at most `width` cells wide: the content of a `kit::list` row, which draws
+/// the gutter (and the cursor's band) in the cell before it.
 ///
-/// The kind column is padded to [`KIND_WIDTH`] for every row or for none (L6): padded when every
+/// The kind column is padded to [`kind_width`] for every row or for none (L6): padded when every
 /// row still fits with it, so a narrow pane drops the padding uniformly rather than row by row.
 fn lines(
     rows: &[GraphRow<'_>],
-    cursor: usize,
     projects: &[ProjectRef],
     width: usize,
     theme: &Theme,
@@ -489,22 +518,21 @@ fn lines(
         return Vec::new();
     };
     let root_project = root.node.project_id;
+    let kind_width = kind_width();
     let pad_kind = rows.iter().all(|row| match row.link {
         None => true,
         Some(link) => {
-            let kind = cell_width(link.kind.as_str()).max(KIND_WIDTH);
+            let kind = cell_width(label::link_kind(link.kind)).max(kind_width);
             fixed_cells(row, link) + kind + label_cells(row.node, root_project) <= width
         }
     });
     rows.iter()
-        .enumerate()
-        .map(|(at, row)| {
+        .map(|row| {
             line(
                 row,
-                at == cursor,
                 root_project,
                 in_workspace(row.node, projects),
-                pad_kind,
+                pad_kind.then_some(kind_width),
                 width,
                 theme,
             )
@@ -522,17 +550,17 @@ fn slug(node: &LinkNode, root_project: ProjectId) -> Option<&str> {
     (node.project_id != root_project).then_some(node.project_slug.as_str())
 }
 
-/// Cells of a non-root row before its label, but the kind: cursor, space, indent, arrow and the
-/// separators either side of the kind. Everything the key never gives way to.
+/// Cells of a non-root row before its label, but the kind: the space after the gutter, indent,
+/// arrow and the separators either side of the kind. Everything the key never gives way to.
 fn lead_cells(row: &GraphRow<'_>, link: Link) -> usize {
-    2 + indent(row.level) + cell_width(link.arrow.glyph()) + 2
+    1 + indent(row.level) + cell_width(link.arrow.glyph()) + 2
 }
 
 /// Cells of a non-root row but its kind, label and title: [`lead_cells`], the separator before
 /// the status, the status and the repeat mark.
 fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
     let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
-    lead_cells(row, link) + 1 + cell_width(row.node.status.as_str()) + repeat
+    lead_cells(row, link) + 1 + cell_width(&status_text(row.node.status)) + repeat
 }
 
 /// Cells of `node`'s whole `[slug:]KEY` label.
@@ -541,13 +569,12 @@ fn label_cells(node: &LinkNode, root_project: ProjectId) -> usize {
 }
 
 /// One row as a line at most `width` cells wide (§1.5 of the blueprint), its kind padded to
-/// [`KIND_WIDTH`] when `pad_kind` says the whole column is.
+/// `pad_kind` cells when the whole column is.
 fn line(
     row: &GraphRow<'_>,
-    on_cursor: bool,
     root_project: ProjectId,
     in_workspace: bool,
-    pad_kind: bool,
+    pad_kind: Option<usize>,
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
@@ -558,11 +585,8 @@ fn line(
     } else {
         (theme.dim, theme.dim, theme.dim)
     };
-    let status = node.status.as_str();
-    let mut spans = vec![
-        Span::styled(if on_cursor { CURSOR } else { " " }, theme.accent),
-        Span::raw(" "),
-    ];
+    let status = status_text(node.status);
+    let mut spans = vec![Span::raw(" ")];
 
     let Some(link) = row.link else {
         // Clipped to its own width, so never cut, only flattened (D3): `cut` measures a control
@@ -575,11 +599,10 @@ fn line(
         return Line::from(cut(spans, width));
     };
 
-    let kind = link.kind.as_str();
-    let kind = if pad_kind {
-        format!("{kind:<KIND_WIDTH$}")
-    } else {
-        kind.to_owned()
+    let kind = label::link_kind(link.kind);
+    let kind = match pad_kind {
+        Some(cells) => format!("{kind:<cells$}"),
+        None => kind.to_owned(),
     };
     // The label's room with the status kept, and the key's once the status gives way: the status
     // is cut at the pane edge by `cut`, the key only when nothing else is left (L5).
@@ -693,7 +716,7 @@ impl DetailTab for GraphTab {
 
     /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
     /// its own `J`/`K` (`Act::GraphNextRow`/`GraphPrevRow`) do.
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         Handled::Consumed
     }
@@ -747,40 +770,65 @@ impl DetailTab for GraphTab {
         }
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(
+                frame,
+                area,
+                self.key_stack(),
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         if self.graph.is_none() {
-            let text = match self.failed.as_deref() {
-                Some(why) => format!("Links unavailable: {why}"),
-                None => "Loading links\u{2026}".to_owned(),
-            };
-            message(frame, area, &text, ctx.theme);
+            match self.failed.as_deref() {
+                Some(why) => unavailable(
+                    frame,
+                    area,
+                    &format!("Links unavailable: {why}"),
+                    self.key_stack(),
+                    self.told.list(),
+                    ctx,
+                ),
+                None => message(frame, area, "Loading links\u{2026}", ctx.theme),
+            }
             return;
         }
         let rows = self.visible();
         if rows.len() <= 1 {
-            message(frame, area, "No links for this item.", ctx.theme);
+            let (what, next) = NO_LINKS;
+            empty::render(frame, area, what, next, ctx.theme);
             return;
         }
 
         let [tree, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
         let cursor = self.cursor.min(rows.len() - 1);
-        let mut lines = lines(
-            &rows,
-            cursor,
-            ctx.projects,
-            usize::from(tree.width),
-            ctx.theme,
-        );
-        let offset = list::window(cursor, lines.len(), usize::from(tree.height));
-        // No `Wrap`: a wrapped row would break the row-to-cursor mapping.
-        frame.render_widget(
-            Paragraph::new(lines.split_off(offset.min(lines.len()))),
+        // The gutter takes the tree's first cell; the rows are fitted to the rest.
+        let width = usize::from(tree.width.saturating_sub(1));
+        let rows: Vec<Row<'static>> = lines(&rows, ctx.projects, width, ctx.theme)
+            .into_iter()
+            .map(|line| Row {
+                line,
+                kind: RowKind::Item,
+            })
+            .collect();
+        let offset = window(cursor, rows.len(), usize::from(tree.height));
+        // One row per line, never wrapped: a wrapped row would break the row-to-cursor mapping.
+        list::render(
+            frame,
             tree,
+            &rows,
+            Some(cursor),
+            offset,
+            ctx.accent(),
+            ctx.theme,
         );
         // The keys are the shell's hint row (MOD-67 M6 T2, `key_hint`); the depth stays here.
         let text = format!("depth {}/{}", self.depth, Self::MAX_HOPS);
@@ -813,9 +861,13 @@ mod tests {
     use crate::ui::tabs::BacklogTab;
     use htui_core::model::LinkEdge;
 
-    /// The detail pane's inner width at `DEFAULT_SIZE`, pinned by the Backlog tab's
-    /// `the_detail_strip_fits_the_detail_pane`.
+    /// The detail pane's inner width at `DEFAULT_SIZE` (100x30): the 45-column detail pane less
+    /// its border, as `backlog::tests::render`'s
+    /// `the_detail_chips_window_around_the_active_one_at_100_columns` draws it.
     const PANE: usize = 43;
+
+    /// What a row's content has of [`PANE`]: the `kit::list` gutter takes the first cell.
+    const ROW: usize = PANE - 1;
 
     /// Everything a `Ctx` borrows, kept alive for the length of a test (the Runs pane's `Shell`).
     struct Shell {
@@ -1244,8 +1296,8 @@ mod tests {
             node: &node,
             ..root
         };
-        let drawn = line(&row, false, node.project_id, true, false, 43, &shell.theme);
-        assert_eq!(text(&drawn), "  FEAT 1 in_progress TUI scaffold");
+        let drawn = line(&row, node.project_id, true, None, ROW, &shell.theme);
+        assert_eq!(text(&drawn), " FEAT 1 \u{25d0} running TUI scaffold");
     }
 
     #[tokio::test]
@@ -1322,7 +1374,7 @@ mod tests {
     /// `J` and `K` do, or to either end.
     #[tokio::test]
     async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::platform().await;
         let ctx = shell.ctx();
@@ -1453,9 +1505,9 @@ mod tests {
             let graph = demo(root).await;
             for depth in 1..=GraphTab::MAX_HOPS {
                 let rows = rows(&graph, depth);
-                for drawn in lines(&rows, 0, &shell.projects, PANE, &shell.theme) {
+                for drawn in lines(&rows, &shell.projects, ROW, &shell.theme) {
                     assert!(
-                        drawn.width() <= PANE,
+                        drawn.width() <= ROW,
                         "{:?} is {} columns",
                         text(&drawn),
                         drawn.width()
@@ -1465,19 +1517,19 @@ mod tests {
         }
 
         let graph = demo(ids::AGY_FIX_1).await;
-        let drawn: Vec<String> = lines(&rows(&graph, 2), 0, &shell.projects, PANE, &shell.theme)
+        let drawn: Vec<String> = lines(&rows(&graph, 2), &shell.projects, ROW, &shell.theme)
             .iter()
             .map(text)
             .collect();
         assert_eq!(
             drawn,
             [
-                "▸ FIX-1 open Session leak on cancel",
-                "  → blocked_by ANA-1 done Prompt assembly …",
-                "    → blocked_by htui:ANA-1 done Data mode…",
-                "  → origin vulkan-tutor…:FEAT-1 in_progress",
-                "  → origin htui:TOOL-1 awaiting_approval",
-                "    → blocked_by htui:ANA-1 done (*)",
+                " FIX-1 \u{25cb} open Session leak on cancel",
+                " \u{2192} blocked by ANA-1 \u{25cf} done Prompt assembl\u{2026}",
+                "   \u{2192} blocked by htui:ANA-1 \u{25cf} done Data mo\u{2026}",
+                " \u{2192} origin vulkan-tutoria\u{2026}:FEAT-1 \u{25d0} running",
+                " \u{2192} origin htui:TOOL-1 \u{26a0} needs you CI matr\u{2026}",
+                "   \u{2192} blocked by htui:ANA-1 \u{25cf} done (*)",
             ]
         );
     }
@@ -1486,21 +1538,21 @@ mod tests {
     async fn feat_1_draws_the_worked_rows() {
         let shell = Shell::platform().await;
         let graph = demo(ids::HTUI_FEAT_1).await;
-        let drawn: Vec<String> = lines(&rows(&graph, 2), 0, &shell.projects, PANE, &shell.theme)
+        let drawn: Vec<String> = lines(&rows(&graph, 2), &shell.projects, ROW, &shell.theme)
             .iter()
             .map(text)
             .collect();
         assert_eq!(
             drawn,
             [
-                "▸ FEAT-1 in_progress TUI scaffold",
-                "  → origin     ANA-1 done Data model, box …",
-                "    ← blocked_by agy:ANA-1 done Prompt ass…",
-                "    ← origin     FEAT-3 queued (*)",
-                "    ← blocked_by TOOL-1 awaiting_approval",
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
-                "    ← relates    agy:FEAT-1 open ACP trans…",
-                "  ← relates    FEAT-3 queued Postgres stor…",
+                " FEAT-1 \u{25d0} running TUI scaffold",
+                " \u{2192} origin     ANA-1 \u{25cf} done Data model, bo\u{2026}",
+                "   \u{2190} blocked by agy:ANA-1 \u{25cf} done Prompt a\u{2026}",
+                "   \u{2190} origin     FEAT-3 \u{25cc} queued (*)",
+                "   \u{2190} blocked by TOOL-1 \u{26a0} needs you",
+                " \u{2190} blocked by FEAT-2 \u{2298} blocked Agent driv\u{2026}",
+                "   \u{2190} relates    agy:FEAT-1 \u{25cb} open ACP tra\u{2026}",
+                " \u{2190} relates    FEAT-3 \u{25cc} queued Postgres st\u{2026}",
             ]
         );
     }
@@ -1569,43 +1621,42 @@ mod tests {
         let at = |width| {
             let drawn = line(
                 vulkan,
-                false,
                 fix_1[0].node.project_id,
                 false,
-                false,
+                None,
                 width,
                 &shell.theme,
             );
             assert!(drawn.width() <= width, "{:?} at {width}", text(&drawn));
             text(&drawn)
         };
-        // 17 fixed cells and `origin` leave 8 for the label: one for the slug, so it goes whole.
-        assert_eq!(at(31), "  → origin FEAT-1 in_progress");
+        // 14 fixed cells and `origin` leave 8 of 28 for the label: one for the slug, so it goes
+        // whole.
+        assert_eq!(at(28), " \u{2192} origin FEAT-1 \u{25d0} running");
         // Then the status gives way, cut at the pane edge, and the key goes last.
-        assert_eq!(at(25), "  → origin FEAT-1 in_prog");
-        assert_eq!(at(23), "  → origin FEAT-1 in_pr");
-        assert_eq!(at(17), "  → origin FEAT-1");
-        assert_eq!(at(16), "  → origin FEAT…");
+        assert_eq!(at(24), " \u{2192} origin FEAT-1 \u{25d0} runni");
+        assert_eq!(at(22), " \u{2192} origin FEAT-1 \u{25d0} run");
+        assert_eq!(at(16), " \u{2192} origin FEAT-1");
+        assert_eq!(at(15), " \u{2192} origin FEAT\u{2026}");
 
         // A label with no slug keeps its key over its status too.
         let graph = demo(ids::HTUI_FEAT_1).await;
         let feat_1 = rows(&graph, 2);
         let drawn = line(
             &feat_1[1],
-            false,
             feat_1[0].node.project_id,
             true,
-            false,
-            18,
+            None,
+            17,
             &shell.theme,
         );
-        assert_eq!(text(&drawn), "  → origin ANA-1 d");
+        assert_eq!(text(&drawn), " \u{2192} origin ANA-1 \u{25cf}");
 
         // An 80-column terminal's pane: the widest status gives way before the key does.
-        let tool_1 = |width| text(&lines(&feat_1, 0, &shell.projects, width, &shell.theme)[4]);
-        assert_eq!(tool_1(34), "    ← blocked_by TOOL-1 awaiting_a");
-        assert_eq!(tool_1(23), "    ← blocked_by TOOL-1");
-        assert_eq!(tool_1(22), "    ← blocked_by TOOL…");
+        let tool_1 = |width| text(&lines(&feat_1, &shell.projects, width, &shell.theme)[4]);
+        assert_eq!(tool_1(30), "   \u{2190} blocked by TOOL-1 \u{26a0} needs");
+        assert_eq!(tool_1(22), "   \u{2190} blocked by TOOL-1");
+        assert_eq!(tool_1(21), "   \u{2190} blocked by TOOL\u{2026}");
     }
 
     /// L8: no graph yet is a pending read, not an item without links.
@@ -1619,7 +1670,19 @@ mod tests {
         tab.on_reply(&StoreReply::Links(demo(ids::HTUI_FEAT_1).await), &mut ctx);
         assert_eq!(
             draw(&tab, &shell, 43, 6)[0],
-            "▸ FEAT-1 in_progress TUI scaffold"
+            "\u{258c} FEAT-1 \u{25d0} running TUI scaffold"
+        );
+    }
+
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_GRAPH`.
+    #[tokio::test]
+    async fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::platform().await;
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &draw(&GraphTab::new(), &shell, 43, 6).join("\n"),
+            "No item selected.",
+            "j/k chooses one",
         );
     }
 
@@ -1645,9 +1708,11 @@ mod tests {
             },
             &mut ctx,
         );
-        assert_eq!(
-            draw(&tab, &shell, 43, 6)[0],
-            "Links unavailable: connection refused"
+        // MOD-115 M4 RV2-M1: the failure is the kit's empty state, and its next step re-reads.
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &draw(&tab, &shell, 43, 6).join("\n"),
+            "Links unavailable: connection refused",
+            "j/k away and back retries",
         );
         tab.on_item_change(Some(ids::HTUI_FEAT_2));
         assert_eq!(draw(&tab, &shell, 43, 6)[0], "Loading links\u{2026}");
@@ -1685,8 +1750,8 @@ mod tests {
             nodes: vec![r, x],
         };
         let rows = rows(&graph, 3);
-        for width in 0..=PANE {
-            for drawn in lines(&rows, 0, &shell.projects, width, &shell.theme) {
+        for width in 0..=ROW {
+            for drawn in lines(&rows, &shell.projects, width, &shell.theme) {
                 assert!(
                     cell_width(&text(&drawn)) <= width,
                     "{:?} is {} cells at {width}",
@@ -1695,15 +1760,15 @@ mod tests {
                 );
             }
         }
-        let drawn: Vec<String> = lines(&rows, 0, &shell.projects, PANE, &shell.theme)
+        let drawn: Vec<String> = lines(&rows, &shell.projects, ROW, &shell.theme)
             .iter()
             .map(text)
             .collect();
         assert_eq!(
             drawn,
             [
-                "▸ R open 图形视图图形视图图形视图图形视图…",
-                "  → relates    项目:键-1 open 宽字符标题宽…",
+                " R \u{25cb} open 图形视图图形视图图形视图图形视\u{2026}",
+                " \u{2192} relates    项目:键-1 \u{25cb} open 宽字符标题\u{2026}",
             ]
         );
     }
@@ -1716,8 +1781,8 @@ mod tests {
             let graph = demo(root).await;
             for depth in 1..=GraphTab::MAX_HOPS {
                 let rows = rows(&graph, depth);
-                for width in 0..=PANE {
-                    let drawn = lines(&rows, 1, &shell.projects, width, &shell.theme);
+                for width in 0..=ROW {
+                    let drawn = lines(&rows, &shell.projects, width, &shell.theme);
                     for (row, drawn) in rows.iter().zip(&drawn) {
                         let drawn = text(drawn);
                         assert!(cell_width(&drawn) <= width, "{drawn:?} at {width}");
@@ -1725,10 +1790,10 @@ mod tests {
                         // unpadded kind and the key itself fit.
                         let Some(link) = row.link else { continue };
                         let key = row.node.key.as_str();
-                        let needs = 2
+                        let needs = 1
                             + indent(row.level)
                             + 2
-                            + cell_width(link.kind.as_str())
+                            + cell_width(label::link_kind(link.kind))
                             + 1
                             + cell_width(key);
                         assert!(
@@ -1771,25 +1836,25 @@ mod tests {
         };
         let rows = rows(&graph, 3);
         let at = |width| -> Vec<String> {
-            lines(&rows, 0, &shell.projects, width, &shell.theme)
+            lines(&rows, &shell.projects, width, &shell.theme)
                 .iter()
                 .map(text)
                 .collect()
         };
-        // `long-project:Y` fits 34 columns padded, so both rows are.
+        // `long-project:Y` fits 35 columns padded, so both rows are.
+        assert_eq!(
+            at(35)[1..],
+            [
+                " \u{2192} relates    X \u{25cb} open X title",
+                " \u{2192} origin     long-project:Y \u{25cb} open",
+            ]
+        );
+        // At 34 it fits only unpadded, so neither row is, though `X` alone would be.
         assert_eq!(
             at(34)[1..],
             [
-                "  → relates    X open X title",
-                "  → origin     long-project:Y open",
-            ]
-        );
-        // At 32 it fits only unpadded, so neither row is, though `X` alone would be.
-        assert_eq!(
-            at(32)[1..],
-            [
-                "  → relates X open X title",
-                "  → origin long-project:Y open",
+                " \u{2192} relates X \u{25cb} open X title",
+                " \u{2192} origin long-project:Y \u{25cb} open",
             ]
         );
     }
@@ -1808,9 +1873,9 @@ mod tests {
         assert_eq!(
             draw(&tab, &shell, 43, 4),
             [
-                "    ← origin     FEAT-3 queued (*)",
-                "▸   ← blocked_by TOOL-1 awaiting_approval",
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
+                "    \u{2190} origin     FEAT-3 \u{25cc} queued (*)",
+                "\u{258c}   \u{2190} blocked by TOOL-1 \u{26a0} needs you",
+                "  \u{2190} blocked by FEAT-2 \u{2298} blocked Agent driv\u{2026}",
                 "depth 2/3",
             ]
         );
@@ -1820,9 +1885,9 @@ mod tests {
         assert_eq!(
             draw(&tab, &shell, 43, 4),
             [
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
-                "    ← relates    agy:FEAT-1 open ACP trans…",
-                "▸ ← relates    FEAT-3 queued Postgres stor…",
+                "  \u{2190} blocked by FEAT-2 \u{2298} blocked Agent driv\u{2026}",
+                "    \u{2190} relates    agy:FEAT-1 \u{25cb} open ACP tra\u{2026}",
+                "\u{258c} \u{2190} relates    FEAT-3 \u{25cc} queued Postgres st\u{2026}",
                 "depth 2/3",
             ],
             "the last row is the window's last"
@@ -1841,11 +1906,10 @@ mod tests {
         assert!(!in_workspace(vulkan.node, &shell.projects));
         let drawn = line(
             vulkan,
-            false,
             rows[0].node.project_id,
             false,
-            false,
-            PANE,
+            None,
+            ROW,
             &shell.theme,
         );
         let label = drawn
@@ -1854,5 +1918,93 @@ mod tests {
             .find(|span| span.content.contains("FEAT-1"))
             .expect("the label span");
         assert_eq!(label.style, shell.theme.dim);
+    }
+
+    /// The pane drawn into a `width` x `height` test terminal, its buffer.
+    fn buffer(tab: &GraphTab, shell: &Shell, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("the test backend is constructible");
+        term.draw(|frame| tab.render(frame, frame.area(), &shell.ctx()))
+            .expect("the pane draws");
+        term.backend().buffer().clone()
+    }
+
+    /// MOD-83, MOD-115 M4 D-1: an edge's kind reads as `label::link_kind`'s words and a node's
+    /// status as its `kit::status` mark; no raw value reaches the pane.
+    #[tokio::test]
+    async fn kinds_and_statuses_read_as_words() {
+        let shell = Shell::platform().await;
+        let tab = pane(demo(ids::HTUI_FEAT_1).await);
+        let rows = draw(&tab, &shell, 43, 10);
+        assert_eq!(rows[0], "\u{258c} FEAT-1 \u{25d0} running TUI scaffold");
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("  \u{2190} blocked by FEAT-2 \u{2298} blocked ")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.contains(&"    \u{2190} blocked by TOOL-1 \u{26a0} needs you".to_owned()),
+            "{rows:#?}"
+        );
+        let text = rows.join("\n");
+        for raw in ["blocked_by", "in_progress", "awaiting"] {
+            assert!(!text.contains(raw), "{raw}: {text}");
+        }
+    }
+
+    /// MOD-85: the cursor row is the kit's: the gutter in the pane's accent, the row in the
+    /// selection band to the pane's edge; legible under monochrome, where the band is reversed.
+    #[tokio::test]
+    async fn the_cursor_row_is_the_kit_band_behind_the_gutter() {
+        let mut shell = Shell::platform().await;
+        let mut tab = pane(demo(ids::HTUI_FEAT_1).await);
+        tab.cursor = 1;
+        let accent = shell.ctx().accent();
+        let buf = buffer(&tab, &shell, 43, 10);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            " ",
+            "the root row is not the cursor's"
+        );
+        assert_eq!(buf[(0, 1)].symbol(), "\u{258c}");
+        assert_eq!(
+            buf[(0, 1)].fg,
+            accent.fg.unwrap_or_default(),
+            "the gutter's accent"
+        );
+        let band = shell.theme.selected.bg.unwrap_or_default();
+        for x in 1..43 {
+            assert_eq!(buf[(x, 1)].bg, band, "column {x} of the cursor row");
+        }
+        assert_ne!(buf[(5, 0)].bg, band, "the root row is not banded");
+
+        shell.theme = Theme::monochrome();
+        let buf = buffer(&tab, &shell, 43, 10);
+        for x in 1..43 {
+            assert!(
+                buf[(x, 1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                "column {x} of the cursor row under monochrome"
+            );
+        }
+        assert!(
+            !buf[(5, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    /// The kind column is as wide as the widest of `label::link_kind`'s words, and no raw kind is
+    /// wider than its word's column (D-1).
+    #[test]
+    fn the_kind_column_is_the_widest_label() {
+        assert_eq!(kind_width(), 10, "`blocked by` and `supersedes`");
+        for kind in LinkKind::ALL {
+            assert!(
+                cell_width(label::link_kind(*kind)) <= kind_width(),
+                "{kind:?}"
+            );
+        }
     }
 }

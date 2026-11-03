@@ -87,7 +87,7 @@ async fn the_switcher_opens_on_the_workspace_the_shell_is_already_inside() {
         "startup entered the first workspace"
     );
     assert!(
-        frame.contains("> Graphics") && !frame.contains("> Platform"),
+        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
         "the cursor starts on the scope's own workspace: {frame}"
     );
 }
@@ -99,7 +99,7 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
     harness.key("j");
     let down = harness.render();
     assert!(
-        down.contains("> Platform") && !down.contains("> Graphics"),
+        down.contains("▌Platform") && !down.contains("▌Graphics"),
         "`j` moves onto the second workspace: {down}"
     );
 
@@ -111,7 +111,7 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
     harness.key("k");
     let up = harness.render();
     assert!(
-        up.contains("> Graphics") && !up.contains("> Platform"),
+        up.contains("▌Graphics") && !up.contains("▌Platform"),
         "`k` walks back to the first workspace and stops there: {up}"
     );
 }
@@ -270,7 +270,7 @@ async fn answering_y_asks_the_store_to_apply_them() {
     );
     assert_eq!(
         harness.app().status.as_deref(),
-        Some("applied 0 migration(s)"),
+        Some("applied 0 migrations"),
         "the reply to `StoreRequest::ApplyMigrations` landed"
     );
 }
@@ -338,7 +338,7 @@ async fn ctrl_y_and_alt_n_do_not_answer_the_migration_prompt() {
     assert_eq!(
         harness.app().status,
         None,
-        "nothing was applied: no `applied 0 migration(s)`"
+        "nothing was applied: no `applied 0 migrations`"
     );
 }
 
@@ -351,7 +351,7 @@ async fn capital_y_applies_and_capital_n_declines() {
     assert!(harness.app().overlays.is_empty(), "`Y` closes the prompt");
     assert_eq!(
         harness.app().status.as_deref(),
-        Some("applied 0 migration(s)"),
+        Some("applied 0 migrations"),
         "`Y` applies"
     );
 
@@ -392,7 +392,7 @@ async fn a_migration_override_rebinds_yes() {
     assert!(harness.app().overlays.is_empty(), "`a` closes the prompt");
     assert_eq!(
         harness.app().status.as_deref(),
-        Some("applied 0 migration(s)"),
+        Some("applied 0 migrations"),
         "`a` applies"
     );
 }
@@ -419,11 +419,11 @@ async fn ctrl_j_does_not_move_the_switcher() {
     harness.key("ctrl-j");
     let frame = harness.render();
     assert!(
-        frame.contains("> Graphics") && !frame.contains("> Platform"),
+        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
         "`ctrl-j` left the cursor alone: {frame}"
     );
     harness.key("j");
-    assert!(harness.render().contains("> Platform"), "`j` still moves");
+    assert!(harness.render().contains("▌Platform"), "`j` still moves");
 }
 
 /// MOD-67 M3 (D7, D8): over the switcher the status line and the `?` box render the switcher's

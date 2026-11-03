@@ -1,5 +1,6 @@
-//! The detail pane: the [`DetailTab`] contract, the registry that holds the seven sub-tabs, and
-//! the scroll state they share.
+//! The detail pane: the [`DetailTab`] contract and the registry that holds the seven sub-tabs.
+//! The scroll state they share is the kit's ([`Scroll`](crate::ui::kit::scroll::Scroll), MOD-115
+//! M4 T0).
 //!
 //! Sub-tabs are a registry for the same reason tabs are (plan D5): MOD-4's approve/reject and
 //! MOD-2's "promote to chat" are `DetailTab::on_key` bodies inside their own file plus one
@@ -9,6 +10,9 @@
 //!
 //! MOD-13 milestone 5: Notes and Docs write, each through a [`compose`] area of its own (D6), and
 //! an `$EDITOR` outcome comes back to the active sub-tab (D7).
+//!
+//! MOD-115 M4 E4: the pane is a kit pane titled `KEY · title`, the sub-tabs its chips (MOD-81: no
+//! strip row clipping `Notes Prompt Reqs`); a sub-tab draws into the whole inner rect.
 
 pub mod body;
 pub mod compose;
@@ -19,19 +23,24 @@ pub mod prompt;
 pub mod requirements;
 pub mod runs;
 
-use htui_core::model::{ItemId, RunId, StepId};
+use std::cell::Cell;
+
+use htui_core::model::{ItemId, ItemSummary, RunId, StepId};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::{Act, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
-use crate::ui::shell::{PaneAreas, PaneId};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::kit::scroll::Step;
+use crate::ui::shell::{HiddenBy, PaneId};
+use crate::ui::tabs::backlog::Chrome;
 use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
@@ -41,13 +50,6 @@ pub use notes::NotesTab;
 pub use prompt::PromptTab;
 pub use requirements::ReqsTab;
 pub use runs::RunsTab;
-
-/// How many rows `PageDown` / `PageUp` move.
-const PAGE: isize = 10;
-
-/// `strftime` format every timestamp in the detail pane is rendered with: the pane is 43 columns
-/// wide at 100x30 and the year is the same on every row that would fit next to it.
-pub const STAMP: &str = "%m-%d %H:%M";
 
 /// Stable identity of a detail sub-tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,8 +99,14 @@ pub trait DetailTab {
     }
     /// A reply addressed to the Backlog tab. Sub-tabs that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
-    /// Draws into the detail pane, below the sub-tab strip.
+    /// Draws into the detail pane's inner rect (the chips are on its border, MOD-115 M4 E4).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// How the detail pane and the list beside it are drawn this frame, told just before
+    /// [`render`](DetailTab::render) (MOD-115 M4 RV2-L1; RV, repair 2): the pane's focus, which a
+    /// part drawn as the pane (a compose area's rule) takes, so it never looks focused while its
+    /// pane does not (C4); and the [`ListCue`] the no-item and failed-read steps read. A sub-tab
+    /// keeps it in a [`Told`]; the default ignores it.
+    fn framing(&self, _framing: Framing) {}
     /// Whether this sub-tab shows a run that is still active (MOD-41 plan D16): what the Backlog
     /// tab's `Runs` poll asks before it re-reads. Only [`RunsTab`] shows runs.
     fn has_active_run(&self) -> bool {
@@ -204,6 +212,12 @@ impl DetailRegistry {
     #[must_use]
     pub fn active(&self) -> Option<&dyn DetailTab> {
         self.tabs.get(self.active).map(AsRef::as_ref)
+    }
+
+    /// Index of the active sub-tab in strip order: the active chip (MOD-115 M4 E4).
+    #[must_use]
+    pub const fn active_index(&self) -> usize {
+        self.active
     }
 
     /// Id of the active sub-tab, or `None` while the registry is empty.
@@ -382,69 +396,115 @@ impl DetailRegistry {
     }
 }
 
-/// Draws the detail pane: a border titled with the selected item's key, the sub-tab strip, and
-/// the active sub-tab below it.
+/// What the list beside the detail is doing this frame (MOD-115 M4 RV, repair 2): the list's
+/// motion chooses an item only while the list takes it and draws an item to choose, so the
+/// detail's no-item and failed-read steps ([`no_item`], [`unavailable`]) read this beside
+/// where the list is and which pane holds the focus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCue {
+    /// The filter form, at the foot of the list pane, holds the keyboard (C4): `j`/`k` move its
+    /// rows.
+    pub filter_open: bool,
+    /// The list draws no item row (an empty scope, a filter nothing matches, every group
+    /// folded): its motion has nothing to choose.
+    pub no_items: bool,
+}
+
+/// How the detail pane and the list beside it are drawn this frame ([`DetailTab::framing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framing {
+    /// The detail pane's focus.
+    pub focus: Focus,
+    /// The list's [`ListCue`].
+    pub list: ListCue,
+}
+
+/// The last [`Framing`] a sub-tab was told; nothing on a bench that renders a sub-tab alone.
+#[derive(Debug, Default)]
+pub struct Told(Cell<Option<Framing>>);
+
+impl Told {
+    /// Nothing told yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Cell::new(None))
+    }
+
+    /// Keeps this frame's framing.
+    pub fn set(&self, framing: Framing) {
+        self.0.set(Some(framing));
+    }
+
+    /// The detail pane's focus, `None` until told.
+    #[must_use]
+    pub fn focus(&self) -> Option<Focus> {
+        self.0.get().map(|framing| framing.focus)
+    }
+
+    /// The list's cue; the default (the list takes its keys and has items) until told.
+    #[must_use]
+    pub fn list(&self) -> ListCue {
+        self.0.get().map(|framing| framing.list).unwrap_or_default()
+    }
+}
+
+/// The sub-tabs' chips, in registration order (`BacklogTab::new`): what a sub-tab measures the
+/// detail pane's top border against (MOD-115 M4 RV2-L7, `kit::pane::Pane::title_fits`).
+pub(super) const CHIPS: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
+
+/// The detail pane's title (MOD-115 M4 E4, MOD-82): `KEY · title` of the selected item, or
+/// `Detail` while a project header is selected.
+#[must_use]
+pub fn title(item: Option<&ItemSummary>) -> String {
+    item.map_or_else(
+        || "Detail".to_owned(),
+        |item| format!("{} \u{b7} {}", item.key, item.title),
+    )
+}
+
+/// Draws the detail pane as a kit pane (MOD-115 M4 E4): titled [`title`], kept first (C5, Q1),
+/// the sub-tabs as chips on its top border windowed around the active one with `‹`/`›`, and the
+/// active sub-tab in the whole inner rect, told the pane's focus and the list's `cue` first
+/// ([`DetailTab::framing`]). The content is drawn before the frame, which touches border cells
+/// only (M3 C3).
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     registry: &DetailRegistry,
-    key: Option<&str>,
+    item: Option<&ItemSummary>,
+    chrome: Chrome<'_>,
+    cue: ListCue,
     ctx: &Ctx<'_>,
 ) {
-    let block = frame_block(key);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let [strip, content] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-    render_strip(frame, strip, registry, ctx.theme);
+    let inner = Pane::inner(area);
     match registry.active() {
-        Some(tab) => tab.render(frame, content, ctx),
-        None => message(
-            frame,
-            content,
-            "No detail sub-tab is registered.",
-            ctx.theme,
-        ),
+        Some(tab) => {
+            tab.framing(Framing {
+                focus: chrome.focus,
+                list: cue,
+            });
+            tab.render(frame, inner, ctx);
+        }
+        None => message(frame, inner, "No detail sub-tab is registered.", ctx.theme),
     }
+    let title = title(item);
+    let titles: Vec<&str> = registry
+        .titles()
+        .into_iter()
+        .map(|(_, title)| title)
+        .collect();
+    chrome
+        .frame(
+            Pane::new(&title)
+                .title_first()
+                .sub_tabs(&titles, registry.active_index()),
+        )
+        .render(frame, area, ctx.theme);
 }
 
-/// The detail pane's border, titled with the selected item's key. Shared with the strip-width pin
-/// in the Backlog tab's tests, so the pin measures the inner area [`render`] actually draws into.
-pub(crate) fn frame_block(key: Option<&str>) -> Block<'static> {
-    Block::new()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", key.unwrap_or("Detail")))
-}
-
-/// Draws the sub-tab strip, the active one accented.
-pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry, theme: &Theme) {
-    frame.render_widget(Paragraph::new(strip_line(registry, theme)), area);
-}
-
-/// The sub-tab strip as one line, so its width can be checked against the pane (MOD-30).
-///
-/// One leading space, one space between titles and one trailing space — a single space, not the
-/// two the Settings and top-level strips use, because the detail pane is the narrow one (MOD-30
-/// D1). `active_tab` covers the title only, never a separator. The Backlog tab's
-/// `the_detail_strip_fits_the_detail_pane` pins the width.
-#[must_use]
-pub(crate) fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Line<'a> {
-    let active = registry.active_id();
-    let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
-    for (id, title) in registry.titles() {
-        let style: Style = if Some(id) == active {
-            theme.active_tab
-        } else {
-            theme.dim
-        };
-        spans.push(Span::styled(title, style));
-        spans.push(Span::raw(" "));
-    }
-    Line::from(spans)
-}
-
-/// The one line a sub-tab renders instead of a blank pane (plan D11).
+/// The one line a sub-tab renders while a read is in flight (plan D11): `Loading links…`. An
+/// empty pane or a failed read is not one: it is [`empty_state`] or [`unavailable`], with a next
+/// step (MOD-115 M4 RV2-M1).
 pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(Line::styled(text.to_owned(), theme.dim)).wrap(Wrap { trim: true }),
@@ -452,135 +512,162 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
     );
 }
 
-/// One list motion, as a focused detail pane takes it (MOD-115 M2 §7): `list.down`, `list.up`,
-/// `list.top` or `list.bottom`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Step {
-    /// A row down.
-    Down,
-    /// A row up.
-    Up,
-    /// To the first row.
-    Top,
-    /// To the last row.
-    Bottom,
+/// No item under the list's cursor (a project header): what every sub-tab says then.
+const NO_ITEM: &str = "No item selected.";
+
+/// [`NO_ITEM`]'s next step while the list holds the focus: its motion, through the pane's stack.
+const CHOOSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
+
+/// [`NO_ITEM`]'s next step while the list's motion is unbound, for a pane with no sentence of its
+/// own.
+const CHOOSE_UNBOUND: &str = "a chosen item shows here";
+
+/// A failed read's next step while the list holds the focus: its motion away and back issues the
+/// item's reads again.
+const RETRY: HintSpec = &[Hint::Pair(
+    Act::ListDown,
+    Act::ListUp,
+    "away and back retries",
+)];
+
+/// [`CHOOSE`] or [`RETRY`] while the detail holds the focus beside the list (MOD-115 M4 RV,
+/// repair 1): the list's motion scrolls the detail there (`Step::by_focus`), so the step is the
+/// key that focuses the list.
+const FOCUS_FROM_DETAIL: HintSpec = &[Hint::One(Act::PrevPane, "focuses the list")];
+
+/// [`FOCUS_FROM_DETAIL`] while the shell's activity pane holds the focus: the next pane after it
+/// is the list.
+const FOCUS_FROM_ACTIVITY: HintSpec = &[Hint::One(Act::NextPane, "focuses the list")];
+
+/// The list's step while `layout.toggle_list` hides it.
+const SHOW_LIST: HintSpec = &[Hint::One(Act::LayoutToggleList, "shows the list")];
+
+/// The list's step while another pane is zoomed.
+const UNZOOM: HintSpec = &[Hint::One(Act::LayoutZoom, "shows the list")];
+
+/// The list's step while the layout preset has no list.
+const NEXT_PRESET: HintSpec = &[Hint::One(Act::LayoutNextPreset, "changes the layout")];
+
+/// The list's step while the filter form holds the keyboard (MOD-115 M4 RV, repair 2): `j`/`k`
+/// move the form's rows there, so the step is the form's way out, through its own stack.
+const CLOSE_FILTER: HintSpec = &[Hint::One(Act::FieldCancel, "closes the filter")];
+
+/// A step that moves the list's cursor, `on_list` through `stack`, for what the list is doing,
+/// where it is and which pane holds the focus (MOD-115 M4 RV, repairs 1 and 2, as the Templates
+/// select step, RV3-M1): while the filter form holds the keyboard, its way out; off screen, the
+/// key that brings the list back; `None` while it draws no item row, so there is nothing to
+/// choose; `on_list` only while it holds the focus; beside it, the key that focuses it.
+fn list_step<'s>(
+    on_list: HintSpec,
+    stack: Stack<'s>,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) -> Option<(Stack<'s>, HintSpec)> {
+    if list.filter_open {
+        return Some((views::BACKLOG_FILTER, CLOSE_FILTER));
+    }
+    let spec = match ctx.list_hidden(super::BACKLOG_LAYOUT) {
+        Some(HiddenBy::Zoom) => UNZOOM,
+        Some(HiddenBy::Preset) => NEXT_PRESET,
+        Some(HiddenBy::Toggle) => SHOW_LIST,
+        None if list.no_items => return None,
+        None => match ctx.focus() {
+            PaneId::List => on_list,
+            PaneId::Activity => FOCUS_FROM_ACTIVITY,
+            PaneId::Detail => FOCUS_FROM_DETAIL,
+        },
+    };
+    Some((stack, spec))
 }
 
-impl Step {
-    /// The step `act` is, if it is a list motion.
-    #[must_use]
-    pub const fn of(act: Act) -> Option<Self> {
-        match act {
-            Act::ListDown => Some(Self::Down),
-            Act::ListUp => Some(Self::Up),
-            Act::ListTop => Some(Self::Top),
-            Act::ListBottom => Some(Self::Bottom),
-            _ => None,
-        }
-    }
-
-    /// The step as rows to move a clamped cursor by: one either way, or as far as it goes.
-    #[must_use]
-    pub const fn delta(self) -> isize {
-        match self {
-            Self::Down => 1,
-            Self::Up => -1,
-            Self::Top => isize::MIN,
-            Self::Bottom => isize::MAX,
-        }
-    }
-
-    /// MOD-115 M2 §7, the one rule every list + detail tab routes motion by: only motion
-    /// follows the focus. Whether the motion was taken away from the list: `false` when `act`
-    /// is no list motion or the list is focused, so the tab's own arms take it; with the detail
-    /// focused `detail` takes the step, and whatever it answers the motion is taken (a pane at
-    /// its end does not hand the key back); with the activity pane focused nothing moves.
-    pub fn by_focus(act: Act, focus: PaneId, detail: impl FnOnce(Self) -> Handled) -> bool {
-        let Some(step) = Self::of(act).filter(|_| focus != PaneId::List) else {
-            return false;
-        };
-        if focus == PaneId::Detail {
-            let _ = detail(step);
-        }
-        true
-    }
+/// [`list_step`] for `on_list` through `stack`, as words: `unbound` while there is no step or
+/// none of its keys is bound.
+fn list_step_text(
+    on_list: HintSpec,
+    stack: Stack<'_>,
+    unbound: &str,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) -> String {
+    list_step(on_list, stack, list, ctx).map_or_else(
+        || unbound.to_owned(),
+        |(stack, spec)| hint_or(stack, spec, unbound, ctx.keys()),
+    )
 }
 
-/// MOD-115 M2 §7 (T7 repair): where a list + detail tab draws its list and its detail. While
-/// what the detail shows takes every key (`capturing`: a form, a prompt, a compose area) and
-/// another pane is zoomed, so the detail's rect is empty, the detail takes the whole `area` and
-/// the list nothing: what is typed is on screen. Otherwise the panes the layout gave.
-#[must_use]
-pub fn capture_area(areas: &PaneAreas, area: Rect, capturing: bool) -> (Option<Rect>, Rect) {
-    if areas.detail.is_empty() && capturing {
-        (None, area)
+/// [`RETRY`]'s sentence while the list's motion is unbound.
+const RETRY_UNBOUND: &str = "choosing the item again retries";
+
+/// An empty pane: `what` and its next step through `kit::empty`, centred in `area`.
+fn empty_state(frame: &mut Frame<'_>, area: Rect, what: &str, next: &str, ctx: &Ctx<'_>) {
+    empty::render(frame, area, what, NextStep(next), ctx.theme);
+}
+
+/// `spec` through `stack` under `keys`, or `unbound` while none of its keys is bound.
+fn hint_or(stack: Stack<'_>, spec: HintSpec, unbound: &str, keys: &Keys) -> String {
+    let hint = keys.hint(stack, spec);
+    if hint.is_empty() {
+        unbound.to_owned()
     } else {
-        (areas.list, areas.detail)
+        hint
     }
 }
 
-/// Vertical scroll shared by every sub-tab.
-///
-/// The clamp is against the number of *unwrapped* rows, which is a lower bound on the number of
-/// rendered ones, so the last page can never be scrolled off the top even though the wrapped
-/// height is only known at render time.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Scroll {
-    /// First rendered row.
-    offset: u16,
+/// No item selected (MOD-115 M4 RV2-M1, RV2-L5), the one state every sub-tab draws alike:
+/// [`NO_ITEM`] as the kit's empty state, its next step [`CHOOSE`] through `stack` where the list
+/// is and takes its keys, else the key that gets it there ([`list_step`]), or `unbound` while
+/// that key is unbound or the list draws no item to choose ([`CHOOSE_UNBOUND`] for a pane with
+/// nothing more to say). `list` is the sub-tab's [`Told::list`].
+fn no_item(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stack: Stack<'_>,
+    unbound: &str,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) {
+    let next = list_step_text(CHOOSE, stack, unbound, list, ctx);
+    empty_state(frame, area, NO_ITEM, &next, ctx);
 }
 
-impl Scroll {
-    /// The current offset, for `Paragraph::scroll` or for skipping table rows.
-    #[must_use]
-    pub const fn offset(self) -> u16 {
-        self.offset
-    }
+/// The next step of an empty list: `{key} writes one` with `act`'s label through `stack`, else
+/// `unbound`.
+fn writes_one(stack: Stack<'_>, act: Act, unbound: &str, keys: &Keys) -> String {
+    keys.label(stack, act)
+        .map_or_else(|| unbound.to_owned(), |key| format!("{key} writes one"))
+}
 
-    /// The offset as a row index.
-    #[must_use]
-    pub const fn skip(self) -> usize {
-        self.offset as usize
-    }
+/// A refused read (MOD-115 M4 RV2-M1): `what`, its whole sentence, as the kit's failed state,
+/// its next step [`RETRY`] through `stack`, the list's motion away and back, which reads the
+/// item again, where the list is and takes its keys, else the key that gets it there
+/// ([`list_step`]). `list` is the sub-tab's [`Told::list`].
+fn unavailable(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    what: &str,
+    stack: Stack<'_>,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) {
+    let next = list_step_text(RETRY, stack, RETRY_UNBOUND, list, ctx);
+    empty::render_failed(frame, area, what, NextStep(&next), ctx.theme);
+}
 
-    /// A scroll whose first rendered row is `offset`: the Notes pane's bottom after the user's
-    /// own note lands (MOD-13 review L1). The next key clamps it as any other.
-    #[must_use]
-    pub const fn at(offset: u16) -> Self {
-        Self { offset }
-    }
-
-    /// Back to the top: what a new item or a new reply does.
-    pub const fn reset(&mut self) {
-        self.offset = 0;
-    }
-
-    /// One pane-scroll act (MOD-67 M4): `pane.scroll_down`/`scroll_up` one row,
-    /// `pane.page_down`/`page_up` ten, clamped to the last row; `Pass` for any other act.
-    pub fn apply(&mut self, act: Act, len: usize) -> Handled {
-        let step: isize = match act {
-            Act::PaneScrollDown => 1,
-            Act::PaneScrollUp => -1,
-            Act::PanePageDown => PAGE,
-            Act::PanePageUp => -PAGE,
-            _ => return Handled::Pass,
-        };
-        self.step(step, len)
-    }
-
-    /// A list motion over `len` rows while the pane is focused (MOD-115 M2 §7): a row, as
-    /// `pane.scroll_down`/`scroll_up`, or to either end, clamped to the last row.
-    pub fn follow(&mut self, step: Step, len: usize) -> Handled {
-        self.step(step.delta(), len)
-    }
-
-    /// Moves `step` rows, clamped to the last of `len` rows.
-    fn step(&mut self, step: isize, len: usize) -> Handled {
-        let max = u16::try_from(len.saturating_sub(1)).unwrap_or(u16::MAX);
-        let next = usize::from(self.offset).saturating_add_signed(step);
-        self.offset = u16::try_from(next).unwrap_or(u16::MAX).min(max);
-        Handled::Consumed
-    }
+/// MOD-115 M4 RV2-M1: `text`, a drawn pane, shows `what` as the kit's empty state, off the top
+/// row (centred), with `next` on the row under it.
+#[cfg(test)]
+pub(super) fn assert_empty_state(text: &str, what: &str, next: &str) {
+    let rows: Vec<&str> = text.lines().collect();
+    let at = rows
+        .iter()
+        .position(|row| row.trim() == what)
+        .unwrap_or_else(|| panic!("no {what:?} row:\n{text}"));
+    assert!(at > 0, "{what:?} is centred, not on the top row:\n{text}");
+    assert_eq!(
+        rows.get(at + 1).map(|row| row.trim()),
+        Some(next),
+        "{what:?}'s next step:\n{text}"
+    );
 }
 
 #[cfg(test)]
@@ -590,92 +677,11 @@ mod tests {
     use ratatui::Frame;
     use ratatui::layout::Rect;
 
-    use super::{DetailId, DetailRegistry, DetailTab, Scroll, Step};
+    use super::{DetailId, DetailRegistry, DetailTab};
     use crate::app::{Ctx, Handled};
-    use crate::keys::{Act, Stack, views};
+    use crate::keys::{Stack, views};
     use crate::store_worker::StoreReply;
-    use crate::ui::shell::{PaneAreas, PaneId};
-
-    /// MOD-115 M2 §7 (RV3): only motion follows the focus. A list motion with the list focused,
-    /// or any other act, is the tab's own; with the detail focused the detail takes the step,
-    /// and the motion is taken even when the detail declines it; with the activity pane focused
-    /// it is taken and nothing moves.
-    #[test]
-    fn by_focus_routes_only_motion_away_from_the_list() {
-        let never = |_: Step| -> Handled { panic!("the detail is not asked") };
-        assert!(!Step::by_focus(Act::ListDown, PaneId::List, never));
-        assert!(!Step::by_focus(Act::Edit, PaneId::Detail, never));
-        assert!(!Step::by_focus(Act::ListFold, PaneId::Activity, never));
-        let mut seen = None;
-        let taken = Step::by_focus(Act::ListBottom, PaneId::Detail, |step| {
-            seen = Some(step);
-            Handled::Pass
-        });
-        assert_eq!((taken, seen), (true, Some(Step::Bottom)));
-        assert!(Step::by_focus(Act::ListUp, PaneId::Activity, never));
-    }
-
-    /// MOD-115 M2 §7 (RV3): a detail that takes every key gets the whole area only while another
-    /// pane is zoomed; otherwise each pane keeps the rect the layout gave it.
-    #[test]
-    fn capture_area_gives_a_capturing_detail_the_area_only_when_zoomed_away() {
-        let area = Rect::new(0, 0, 100, 30);
-        let list = Rect::new(0, 0, 55, 30);
-        let detail = Rect::new(55, 0, 45, 30);
-        let shown = PaneAreas {
-            list: Some(list),
-            detail,
-            activity: None,
-            list_hidden: None,
-            activity_hidden: None,
-        };
-        assert_eq!(
-            super::capture_area(&shown, area, true),
-            (Some(list), detail)
-        );
-        assert_eq!(
-            super::capture_area(&shown, area, false),
-            (Some(list), detail)
-        );
-        let zoomed = PaneAreas {
-            list: Some(area),
-            detail: Rect::default(),
-            ..shown
-        };
-        assert_eq!(
-            super::capture_area(&zoomed, area, false),
-            (Some(area), Rect::default())
-        );
-        assert_eq!(super::capture_area(&zoomed, area, true), (None, area));
-    }
-
-    /// `Scroll::apply`, the pane scroll's one entry (MOD-67 M5 dropped the key-matching
-    /// `on_key`): a row or a page per act, clamped to the last row; any other act passes.
-    #[test]
-    fn apply_steps_and_clamps() {
-        for len in [0, 1] {
-            let mut scroll = Scroll::at(3);
-            assert_eq!(scroll.apply(Act::PanePageDown, len), Handled::Consumed);
-            assert_eq!(scroll.offset(), 0, "nothing to scroll over {len} rows");
-        }
-
-        let mut scroll = Scroll::default();
-        assert_eq!(scroll.apply(Act::PaneScrollDown, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 1);
-        assert_eq!(scroll.apply(Act::PanePageDown, 25), Handled::Consumed);
-        assert_eq!(scroll.offset(), 11);
-        assert_eq!(scroll.apply(Act::PanePageDown, 15), Handled::Consumed);
-        assert_eq!(scroll.offset(), 14, "the page clamps at len - 1");
-        assert_eq!(scroll.apply(Act::PanePageUp, 15), Handled::Consumed);
-        assert_eq!(scroll.offset(), 4);
-        assert_eq!(scroll.apply(Act::PanePageUp, 15), Handled::Consumed);
-        assert_eq!(scroll.offset(), 0);
-
-        let mut scroll = Scroll::at(2);
-        assert_eq!(scroll.apply(Act::Edit, 5), Handled::Pass);
-        assert_eq!(scroll.apply(Act::ListDown, 5), Handled::Pass);
-        assert_eq!(scroll, Scroll::at(2), "a passed act moves nothing");
-    }
+    use crate::ui::kit::scroll::Step;
 
     /// A sub-tab that keeps every default, `key_stack` included.
     struct Plain;
@@ -744,42 +750,17 @@ mod tests {
         );
     }
 
-    /// MOD-115 M2 §7: the four list motions are the steps a focused detail pane takes; every
-    /// other act is none.
+    /// RV2-L7: [`super::CHIPS`] are the Backlog's registered sub-tabs, in order.
     #[test]
-    fn the_list_motions_are_the_detail_steps() {
-        assert_eq!(Step::of(Act::ListDown), Some(Step::Down));
-        assert_eq!(Step::of(Act::ListUp), Some(Step::Up));
-        assert_eq!(Step::of(Act::ListTop), Some(Step::Top));
-        assert_eq!(Step::of(Act::ListBottom), Some(Step::Bottom));
-        for act in [
-            Act::ListFold,
-            Act::PaneScrollDown,
-            Act::PanePageDown,
-            Act::Edit,
-        ] {
-            assert_eq!(Step::of(act), None, "{act:?}");
-        }
-    }
-
-    /// MOD-115 M2 §7: a step scrolls a row, or to either end, clamped to the last row.
-    #[test]
-    fn a_step_scrolls_a_row_or_to_an_end() {
-        let mut scroll = Scroll::default();
-        assert_eq!(scroll.follow(Step::Down, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 1);
-        assert_eq!(scroll.follow(Step::Bottom, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 4, "the last of five rows");
-        assert_eq!(scroll.follow(Step::Down, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 4, "clamped");
-        assert_eq!(scroll.follow(Step::Up, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 3);
-        assert_eq!(scroll.follow(Step::Top, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 0);
-        assert_eq!(scroll.follow(Step::Up, 5), Handled::Consumed);
-        assert_eq!(scroll.offset(), 0, "clamped at the top");
-        assert_eq!(scroll.follow(Step::Bottom, 0), Handled::Consumed);
-        assert_eq!(scroll.offset(), 0, "nothing to scroll over");
+    fn the_chips_are_the_registered_sub_tabs() {
+        let tab = crate::ui::tabs::BacklogTab::new();
+        let titles: Vec<&str> = tab
+            .detail
+            .titles()
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect();
+        assert_eq!(titles, super::CHIPS);
     }
 
     /// A sub-tab that records the steps it is handed.
@@ -826,5 +807,233 @@ mod tests {
         registry.cycle_next();
         assert_eq!(registry.step(Step::Bottom, &ctx), Handled::Consumed);
         assert_eq!(*seen.borrow(), [Step::Bottom]);
+    }
+
+    /// MOD-115 M4 RV repair 1: the no-item and failed-read steps name the list's motion only
+    /// while the list holds the focus (`Step::by_focus` hands it to the detail otherwise); with
+    /// another pane focused they name the key that focuses the list, and with the list off
+    /// screen the key that brings it back, as the Templates select step does (RV3-M1).
+    #[test]
+    fn the_list_steps_follow_the_focus_and_where_the_list_is() {
+        use crate::ui::shell::{PaneId, Preset, TabLayout};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let shell = super::compose::bench::Shell::new();
+        let hidden = TabLayout {
+            list_on: false,
+            ..BACKLOG_LAYOUT
+        };
+        let zoomed = TabLayout {
+            zoom: true,
+            ..BACKLOG_LAYOUT
+        };
+        let alone = TabLayout {
+            preset: Preset::Focus,
+            ..BACKLOG_LAYOUT
+        };
+        let cases = [
+            (
+                PaneId::List,
+                None,
+                "j/k chooses one",
+                "j/k away and back retries",
+            ),
+            (
+                PaneId::Detail,
+                None,
+                "Shift+Tab focuses the list",
+                "Shift+Tab focuses the list",
+            ),
+            (
+                PaneId::Activity,
+                None,
+                "Tab focuses the list",
+                "Tab focuses the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+            (
+                PaneId::List,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(zoomed),
+                "z shows the list",
+                "z shows the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(alone),
+                "p changes the layout",
+                "p changes the layout",
+            ),
+        ];
+        for (focus, layout, choose, retry) in cases {
+            let ctx = shell.ctx().with_focus(focus);
+            let ctx = match layout {
+                Some(layout) => ctx.with_layout(layout),
+                None => ctx,
+            };
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::no_item(
+                    frame,
+                    area,
+                    views::BACKLOG_BODY,
+                    super::CHOOSE_UNBOUND,
+                    super::ListCue::default(),
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, super::NO_ITEM, choose);
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::unavailable(
+                    frame,
+                    area,
+                    "Links unavailable: boom",
+                    views::BACKLOG_GRAPH,
+                    super::ListCue::default(),
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, "Links unavailable: boom", retry);
+        }
+    }
+
+    /// MOD-115 M4 RV, repair 2: while the filter form holds the keyboard, `j`/`k` move its rows,
+    /// so both steps name the form's way out, wherever the list is and whichever pane the shell
+    /// focuses; while the list draws no item row, the no-item step names no motion with nothing
+    /// to choose (the pane's own sentence), unless the list is off screen, where the key that
+    /// brings it back shows the list's own step.
+    #[test]
+    fn the_list_steps_close_the_filter_first_and_choose_nothing_from_an_empty_list() {
+        use crate::ui::shell::{PaneId, TabLayout};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let shell = super::compose::bench::Shell::new();
+        let hidden = TabLayout {
+            list_on: false,
+            ..BACKLOG_LAYOUT
+        };
+        let filter = super::ListCue {
+            filter_open: true,
+            no_items: false,
+        };
+        let empty = super::ListCue {
+            filter_open: false,
+            no_items: true,
+        };
+        let both = super::ListCue {
+            filter_open: true,
+            no_items: true,
+        };
+        let cases = [
+            (
+                filter,
+                PaneId::List,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                filter,
+                PaneId::Detail,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                filter,
+                PaneId::Detail,
+                Some(hidden),
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                both,
+                PaneId::List,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                empty,
+                PaneId::List,
+                None,
+                super::CHOOSE_UNBOUND,
+                super::RETRY_UNBOUND,
+            ),
+            (
+                empty,
+                PaneId::Detail,
+                None,
+                super::CHOOSE_UNBOUND,
+                super::RETRY_UNBOUND,
+            ),
+            (
+                empty,
+                PaneId::Detail,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+        ];
+        for (cue, focus, layout, choose, retry) in cases {
+            let ctx = shell.ctx().with_focus(focus);
+            let ctx = match layout {
+                Some(layout) => ctx.with_layout(layout),
+                None => ctx,
+            };
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::no_item(
+                    frame,
+                    area,
+                    views::BACKLOG_BODY,
+                    super::CHOOSE_UNBOUND,
+                    cue,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, super::NO_ITEM, choose);
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::unavailable(
+                    frame,
+                    area,
+                    "Links unavailable: boom",
+                    views::BACKLOG_GRAPH,
+                    cue,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, "Links unavailable: boom", retry);
+        }
+    }
+
+    /// MOD-115 M4 RV, repair 2: a sub-tab keeps what it was told, and reads the default (the list
+    /// takes its keys and has items) before it is told anything.
+    #[test]
+    fn told_keeps_the_last_framing() {
+        use super::{Framing, ListCue, Told};
+        use crate::ui::kit::pane::Focus;
+
+        let told = Told::new();
+        assert_eq!(told.focus(), None);
+        assert_eq!(told.list(), ListCue::default());
+        let list = ListCue {
+            filter_open: true,
+            no_items: false,
+        };
+        told.set(Framing {
+            focus: Focus::Unfocused,
+            list,
+        });
+        assert_eq!(told.focus(), Some(Focus::Unfocused));
+        assert_eq!(told.list(), list);
     }
 }

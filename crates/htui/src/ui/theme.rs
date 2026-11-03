@@ -101,6 +101,10 @@ pub struct Theme {
     /// The text drawn on a block filled with a tab's accent colour (the header's active tab
     /// chip): black on the default theme, plain without colour, where no block is filled.
     pub on_accent: Style,
+    /// What a modal leaves visible around itself (MOD-115 M4 C3): DIM, and not BOLD, over each
+    /// cell's own colours, so the page under an overlay recedes without losing its colours and
+    /// reads without colour too. The same in both themes.
+    pub backdrop: Style,
     /// Per-tab accents; read them through [`Theme::tab_accent`].
     pub tab_accents: TabAccents,
     /// Per-kind key colours; read them through [`Theme::kind_style`].
@@ -126,6 +130,7 @@ impl Default for Theme {
             cursor: Style::new().add_modifier(Modifier::REVERSED),
             border_faint: Style::new().fg(Color::Indexed(240)),
             on_accent: Style::new().fg(Color::Black),
+            backdrop: backdrop(),
             tab_accents: TabAccents {
                 backlog: accent,
                 chat: Style::new().fg(Color::Green),
@@ -147,6 +152,13 @@ impl Default for Theme {
             },
         }
     }
+}
+
+/// The backdrop role both themes share: a fade names no colour.
+fn backdrop() -> Style {
+    Style::new()
+        .add_modifier(Modifier::DIM)
+        .remove_modifier(Modifier::BOLD)
 }
 
 impl Theme {
@@ -175,6 +187,7 @@ impl Theme {
             cursor: reversed,
             border_faint: plain.add_modifier(Modifier::DIM),
             on_accent: plain,
+            backdrop: backdrop(),
             tab_accents: TabAccents {
                 backlog: bold,
                 chat: bold,
@@ -395,6 +408,27 @@ mod tests {
             Theme::from_no_color(Some(OsStr::new("0"))),
             Theme::monochrome()
         );
+    }
+
+    /// MOD-115 M4 C3: a backdrop fades what a modal leaves visible and keeps each cell's own
+    /// colours, so the role names none, in either theme; it drops bold so a bold border is never
+    /// bold and dim at once.
+    #[test]
+    fn the_backdrop_role_names_no_colour() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let backdrop = theme.backdrop;
+            assert_eq!(backdrop.fg, None, "{backdrop:?}");
+            assert_eq!(backdrop.bg, None, "{backdrop:?}");
+            assert_eq!(backdrop.underline_color, None, "{backdrop:?}");
+            assert!(
+                backdrop.add_modifier.contains(Modifier::DIM),
+                "{backdrop:?}"
+            );
+            assert!(
+                backdrop.sub_modifier.contains(Modifier::BOLD),
+                "{backdrop:?}"
+            );
+        }
     }
 
     #[test]
