@@ -20,7 +20,7 @@
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope};
-use htui_store::vector::{Hit, Owner, PointType, SearchQuery};
+use htui_store::vector::{Hit, Owner, PointType, QUERY_EMBED_FAILED, SearchQuery};
 use htui_store::vector_sync::SyncReport;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -109,6 +109,13 @@ pub fn changed(submit: Option<&str>) -> String {
 
 /// Where a missing or unreachable index is fixed (MOD-115 M4 E6, MOD-83).
 const QDRANT_PLACE: &str = "Settings \u{203a} Qdrant";
+
+/// Where a store read the index sync made is fixed (MOD-115 M4 RV1-M1).
+const CONNECTION_PLACE: &str = "Settings \u{203a} Connection";
+
+/// What to do about an embedding model that could not be fetched: no Settings section fetches it
+/// (MOD-115 M4 RV1-M1).
+const NETWORK_STEP: &str = "check the network";
 
 /// The keys, on the bottom border (MOD-67 D9). `Enter` is the field's own submit (D13), named
 /// through `Keys` (MOD-115 M4 MD-A); the short `scope` and `index` labels and the arrows as the
@@ -583,14 +590,44 @@ pub fn index_report(report: &SyncReport) -> String {
     )
 }
 
-/// `error` with where it is fixed (MOD-115 M4 E6, MOD-83): `… — Settings › Qdrant`, unless it
-/// already names a Settings place (`set one in Settings > Qdrant`).
+/// `error` with where it is fixed (MOD-115 M4 E6, MOD-83), [`place`]'s, unless it already names a
+/// Settings place (`set one in Settings > Qdrant`) or no place fixes it.
 #[must_use]
 pub fn with_place(error: &str) -> String {
+    match place(error) {
+        Some(place) => format!("{error} \u{2014} {place}"),
+        None => error.to_owned(),
+    }
+}
+
+/// Where `error` is fixed, by its origin (MOD-115 M4 RV1-M1): the index's errors come from the
+/// embedding model, from the Postgres reads its sync makes, and from Qdrant with its keyring
+/// settings, and only the last two have a Settings section.
+///
+/// - The embedding model (`htui_store::model`'s and `embed`'s `embedding model: …`, the query's
+///   embedding): nothing in Settings fetches or loads it, so a failed download says
+///   [`NETWORK_STEP`] and any other failure names no place.
+/// - Qdrant (`qdrant: …`, the URL check), or the keyring that holds its URL and key:
+///   [`QDRANT_PLACE`].
+/// - The store (`store unreachable: …`, another `store backend error: …`): a read of the index
+///   sync, so [`CONNECTION_PLACE`].
+/// - Anything else came from the Qdrant connection (`concepts::qdrant_refusal`): [`QDRANT_PLACE`].
+fn place(error: &str) -> Option<&'static str> {
+    let lower = error.to_lowercase();
     if error.contains("Settings") {
-        error.to_owned()
+        None
+    } else if lower.contains("embedding model")
+        || lower.contains("embedding failed")
+        || lower.contains("embedding task failed")
+        || error.contains(QUERY_EMBED_FAILED)
+    {
+        lower.contains("cannot download").then_some(NETWORK_STEP)
+    } else if lower.contains("qdrant") || lower.contains("keyring") {
+        Some(QDRANT_PLACE)
+    } else if error.starts_with("store unreachable") || error.starts_with("store backend error") {
+        Some(CONNECTION_PLACE)
     } else {
-        format!("{error} \u{2014} {QDRANT_PLACE}")
+        Some(QDRANT_PLACE)
     }
 }
 
@@ -1334,6 +1371,54 @@ mod tests {
             "indexed: 1 item rebuilt, 2 unchanged; 3 requirements rebuilt, 4 unchanged; \
              5 points written, 6 removed"
         );
+    }
+
+    /// MOD-115 M4 RV1-M1: the place is the error's origin's. Nothing in Settings fetches the
+    /// embedding model, so a failed download says to check the network and a model that will not
+    /// load names no place; a Postgres read the index sync made is fixed in Settings › Connection;
+    /// Qdrant's own errors, the keyring's and the URL's stay on Settings › Qdrant.
+    #[test]
+    fn an_error_names_the_place_of_its_origin() {
+        let download = "store backend error: embedding model: cannot download model.onnx from \
+                        https://huggingface.co/x: dns error";
+        assert_eq!(
+            with_place(download),
+            format!("{download} \u{2014} check the network")
+        );
+        let load = "store backend error: embedding model: cannot load /m/model.onnx: bad header";
+        assert_eq!(with_place(load), load, "no place fixes a broken model file");
+        assert_eq!(
+            with_place("the embedding model's loader stopped"),
+            "the embedding model's loader stopped"
+        );
+        let query = format!("store backend error: {QUERY_EMBED_FAILED}: the session failed");
+        assert_eq!(
+            with_place(&query),
+            query,
+            "the model's failure, not Qdrant's"
+        );
+
+        assert_eq!(
+            with_place("store unreachable: connection refused"),
+            "store unreachable: connection refused \u{2014} Settings \u{203a} Connection"
+        );
+        assert_eq!(
+            with_place("store backend error: read.items: pool timed out"),
+            "store backend error: read.items: pool timed out \u{2014} Settings \u{203a} Connection"
+        );
+
+        for qdrant in [
+            "store backend error: qdrant: upsert: refused",
+            "store backend error: Qdrant URL must start with http:// or https://",
+            "store backend error: cannot read the keyring entry (qdrant_url): locked",
+            "the keyring read stopped: cancelled",
+        ] {
+            assert_eq!(
+                with_place(qdrant),
+                format!("{qdrant} \u{2014} Settings \u{203a} Qdrant"),
+                "{qdrant}"
+            );
+        }
     }
 
     /// MOD-115 M4 E6 (MOD-83): an error names where it is fixed, once.
