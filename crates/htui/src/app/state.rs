@@ -2133,8 +2133,10 @@ pub(crate) mod shell_tests {
         /// Its focused border's style instead of `ctx.accent()`: [`SENTINEL`], so a border the
         /// shell repainted cannot pass for one the tab drew.
         pub(crate) accent: Option<Style>,
-        /// Whether it has keys to hint (`j/k move`); without, no pane carries a hint.
-        pub(crate) hints: bool,
+        /// Whether its own panes draw its hints (MOD-115 M4 RV1-M2). Its
+        /// [`key_hint`](Tab::key_hint) is `j/k move` either way, so a tab that draws none still
+        /// has a hint the shell could paint, and a shell that painted it would show.
+        pub(crate) pane_hints: bool,
     }
 
     impl SplitTab {
@@ -2147,7 +2149,7 @@ pub(crate) mod shell_tests {
                 restored: Vec::new(),
                 stack: views::BACKLOG_BODY,
                 accent: None,
-                hints: true,
+                pane_hints: true,
             }
         }
     }
@@ -2192,7 +2194,7 @@ pub(crate) mod shell_tests {
             let accent = self.accent.unwrap_or_else(|| ctx.accent());
             let pane = |title, id| {
                 let pane = Pane::new(title).focus(ctx.pane_focus(id)).accent(accent);
-                match self.key_hint(0, ctx) {
+                match self.key_hint(0, ctx).filter(|_| self.pane_hints) {
                     Some(hints) => pane.hints(hints),
                     None => pane,
                 }
@@ -2208,7 +2210,7 @@ pub(crate) mod shell_tests {
             Some(self.stack)
         }
         fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
-            self.hints.then(|| Line::from("j/k move"))
+            Some(Line::from("j/k move"))
         }
         fn panes(&self) -> Panes {
             Panes::ListDetail(SPLIT_LAYOUT)
@@ -2443,15 +2445,16 @@ pub(crate) mod shell_tests {
     /// What [`SplitTab::accent`] names for a test: a colour no border role or tab accent uses.
     const SENTINEL: Style = Style::new().fg(Color::Red);
 
-    /// A shell with a [`SplitTab`] that draws its focused border in [`SENTINEL`] and has no keys
-    /// to hint, about off: what the shell paints over its panes, if anything, shows.
+    /// A shell with a [`SplitTab`] that draws its focused border in [`SENTINEL`] and no hints on
+    /// its panes though it has keys to hint (`key_hint` is `j/k move`, RV1-M2), about off: what the
+    /// shell paints over its panes, its hint included, shows.
     fn sentinel_app() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.about_visible = false;
         let mut tab = SplitTab::new(SPLIT, "Backlog");
         tab.accent = Some(SENTINEL);
-        tab.hints = false;
+        tab.pane_hints = false;
         app.register_tab(Box::new(tab));
         app
     }
@@ -2497,16 +2500,39 @@ pub(crate) mod shell_tests {
     }
 
     /// M3 D1, M4 E8: the shell paints no hint of its own over a tab's panes, whichever pane is
-    /// focused: a tab with no keys to hint shows none, and one with keys shows them once, on its
-    /// focused pane.
+    /// focused: a tab whose panes draw no hints shows none though it has keys to hint (RV1-M2),
+    /// and one whose panes draw them shows them once, on its focused pane. The activity pane is
+    /// the shell's, so the shell hints there, and there only.
     #[test]
     fn the_shell_paints_no_hint_over_a_tabs_panes() {
         let mut app = sentinel_app();
-        let buf = draw(&mut app, 100, 30);
-        assert!(rows_with(&buf, "j/k move").is_empty());
+        for focus in [PaneId::List, PaneId::Detail] {
+            app.focus.insert(SPLIT, focus);
+            let buf = draw(&mut app, 100, 30);
+            assert!(rows_with(&buf, "j/k move").is_empty(), "{focus:?}");
+        }
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
         app.focus.insert(SPLIT, PaneId::Detail);
         let buf = draw(&mut app, 100, 30);
-        assert!(rows_with(&buf, "j/k move").is_empty());
+        assert!(
+            rows_with(&buf, "j/k move").is_empty(),
+            "detail, activity shown"
+        );
+        app.focus.insert(SPLIT, PaneId::Activity);
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("the preset shows the activity pane");
+        assert_eq!(
+            rows_with(&buf, "j/k move"),
+            [activity.bottom() - 1],
+            "the shell's own pane"
+        );
 
         let mut app = split_app();
         for focus in [PaneId::List, PaneId::Detail] {
