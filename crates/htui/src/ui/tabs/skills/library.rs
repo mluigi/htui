@@ -187,8 +187,8 @@ const DETAIL_HINT: HintSpec = &[
 ];
 
 /// The pane's keys while its lines overflow it, through `LIBRARY_BROWSE` whatever the mode:
-/// they lead the detail pane's hints when it is focused (MOD-115 M4 E5; MOD-82 carried: no key
-/// literal in a title).
+/// they close the detail pane's hints when it is focused, after the view's own keys, so they are
+/// the first a narrow pane drops (MOD-115 M4 E5, T3; MOD-82 carried: no key literal in a title).
 const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
@@ -1925,7 +1925,7 @@ impl LibraryView {
             } else {
                 String::new()
             };
-            joined(&[scroll, keys.hint(views::LIBRARY_BROWSE, DETAIL_HINT)])
+            joined(&[keys.hint(views::LIBRARY_BROWSE, DETAIL_HINT), scroll])
         };
         if let Some(hints) = hint_line(hint, ctx) {
             pane = pane.hints(hints);
@@ -4098,11 +4098,12 @@ mod tests {
         );
     }
 
-    /// MOD-115 M4 E5 (MOD-82 carried): the body's title names no key; while its lines overflow
-    /// it, the scroll keys lead the hints of the body pane, shown when it is focused, and the
-    /// list's hints never carry them.
+    /// MOD-115 M4 E5 (MOD-82 carried), T3: the body's title names no key; while its lines
+    /// overflow it, the scroll keys close the hints of the body pane, shown when it is focused,
+    /// after the view's own keys, so a pane too narrow for them all drops those first, whole (the
+    /// scrollbar still says it scrolls). The list's hints never carry them.
     #[tokio::test]
-    async fn the_scroll_keys_lead_the_focused_body_and_no_title_names_a_key() {
+    async fn the_scroll_keys_close_the_focused_body_and_no_title_names_a_key() {
         use crate::ui::shell::PaneId;
         let bench = Bench::new();
         let view = browsing(&bench).await;
@@ -4112,12 +4113,28 @@ mod tests {
             rows.iter().all(|row| !row.contains("J/K")),
             "list focused: {rows:#?}"
         );
-        let (_, rows) = frame_of(&view, &bench.ctx().with_focus(PaneId::Detail), 100, 6);
+        let focused = bench.ctx().with_focus(PaneId::Detail);
+        let (_, rows) = frame_of(&view, &focused, 100, 6);
         assert!(!rows[0].contains("J/K"), "no key in a title: {rows:#?}");
-        let detail: String = rows[4].chars().skip(32).collect();
+        let narrow: String = rows[4].chars().skip(32).collect();
         assert!(
-            detail.starts_with("\u{2570}\u{2500}J/K scroll \u{b7} PgUp/PgDn page"),
-            "the body's bottom border: {rows:#?}"
+            narrow.starts_with("\u{2570}\u{2500},/. version \u{b7} b base \u{b7} d diff")
+                && narrow.contains(" \u{2026}"),
+            "the view's keys lead, cut by whole keys: {rows:#?}"
+        );
+        assert!(
+            !narrow.contains("J/K"),
+            "the scroll keys drop first: {narrow}"
+        );
+        let (_, rows) = frame_of(&view, &focused, 140, 4);
+        let wide = &rows[2];
+        let (own, scroll) = (
+            wide.find("b base"),
+            wide.find("J/K scroll \u{b7} PgUp/PgDn page"),
+        );
+        assert!(
+            own.zip(scroll).is_some_and(|(own, scroll)| own < scroll),
+            "wide enough, the scroll keys close the hints: {wide}"
         );
     }
 
