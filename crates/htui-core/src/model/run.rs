@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BatchId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId,
-    UserId, WorkspaceId,
+    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId,
+    StepGraphId, StepId, UserId, WorkspaceId,
 };
-use crate::model::kind::{CommandQueue, Gate, Isolation};
+use crate::model::kind::{
+    CommandQueue, EdgeKind, EdgePredicate, Gate, GraphScope, Isolation, PlanScope, Split,
+};
 
 str_enum!(
     /// `run.kind` (§5.8).
@@ -518,12 +520,22 @@ pub struct GraphSnapshot {
     pub v: u32,
     /// The graph row this snapshot was taken from.
     pub graph: SnapshotGraph,
-    /// `sha256:…` over the canonical `phases[]`; milestone 2 computes it, milestone 1 stores it.
+    /// MOD-138 D1: how the run's graph was chosen; `None` on a v1 blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SnapshotSource>,
+    /// `sha256:…` digest of the topology. v1: `graph::topology` over the canonical `phases[]`;
+    /// v2: `graph::topology_v2` over `phases[]` and `edges[]` (MOD-138 D3). The envelope (`v`,
+    /// `graph`, `source`, `mode`, `settings`, `scope`, `personas`) is outside both.
     pub topology: String,
     /// `run.mode`, repeated so the snapshot is self-contained.
     pub mode: RunMode,
-    /// The phases in `position` order.
+    /// The phases in `position` order: the graph's nodes (ANA-33 §7.2's `nodes`; the JSON key
+    /// stays `phases`, MOD-138 D1).
     pub phases: Vec<SnapshotPhase>,
+    /// MOD-138 D2: the graph's edges by node key, in [`sort_snapshot_edges`] order. Empty in a
+    /// v1 blob; [`GraphSnapshot::lift_v1`] fills them (D4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<SnapshotEdge>,
     /// The project settings the resolution used.
     pub settings: SnapshotSettings,
     /// Plan D79: §4.7's resolved scope, written by `graph::resolve` at `StartRun`. **Not** hashed
@@ -540,8 +552,21 @@ pub struct GraphSnapshot {
 }
 
 impl GraphSnapshot {
-    /// The `v` this crate writes and the only one it reads.
-    pub const V: u32 = 1;
+    /// The `v` this crate writes (MOD-138 D1): nodes, edges, bounds, the graph's scope and
+    /// revision, digested over nodes *and* edges.
+    pub const V: u32 = 2;
+
+    /// The oldest `v` this crate reads, lifted by [`Self::lift_v1`] (MOD-138 D4).
+    pub const V1: u32 = 1;
+
+    /// MOD-138 D4: a v1 snapshot's edges are `seed::default_edges`' rule over its own phases
+    /// ([`default_snapshot_edges`]). Keeps `v == 1`, so resume can tell a v1 run from a v2 one;
+    /// a no-op on a v2 snapshot, whose edges are whatever it froze.
+    pub fn lift_v1(&mut self) {
+        if self.v == Self::V1 && self.edges.is_empty() {
+            self.edges = default_snapshot_edges(&self.phases);
+        }
+    }
 
     /// MOD-26 D12, I-4: the frozen persona `phase` names. `Ok(None)` for a persona-less phase;
     /// `Err` is [`PersonaNotInSnapshot`](crate::model::persona::PersonaNotInSnapshot) when the
@@ -579,6 +604,13 @@ pub struct SnapshotGraph {
     /// `step_graph.is_override` (ANA-2 §4.1).
     #[serde(default)]
     pub is_override: bool,
+    /// MOD-138 D1: the graph's owner (`{"owner":"project","id":…}`, `workspace` or
+    /// `{"owner":"library"}`); `None` on a v1 blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<GraphScope>,
+    /// MOD-138 D1: `step_graph.revision` at resolve; `None` on a v1 blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
 }
 
 /// One resolved phase of a [`GraphSnapshot`] (ANA-2 §5.1).
@@ -627,6 +659,38 @@ pub struct SnapshotPhase {
     /// so from the digest, when `None` (I-7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
+    // MOD-138 D1: the four node fields come **after** `persona` and are skipped at their
+    // defaults, so a linear phase serialises byte-identically to v1 and its v1 digest holds.
+    /// MOD-138 D1: what the node is; absent from the JSON, and so from both digests, for `step`.
+    #[serde(default, skip_serializing_if = "NodeRole::is_step")]
+    pub role: NodeRole,
+    /// `step_graph_phase.palette`; absent when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub palette: bool,
+    /// `step_graph_phase.plan_scope`; absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_scope: Option<PlanScope>,
+    /// MOD-138 D11: `Some` exactly on a node whose stored `split` is `divide`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divide: Option<SnapshotDivide>,
+}
+
+impl SnapshotPhase {
+    /// MOD-138 amendment A1 (F1): [`Split::Divide`] when the node carries a divide block, else
+    /// what `fan_out` implies (`ck_phase_split_fan_out`). Derived, never serialised.
+    #[must_use]
+    pub const fn split(&self) -> Split {
+        if self.divide.is_some() {
+            Split::Divide
+        } else {
+            Split::for_fan_out(self.fan_out)
+        }
+    }
+}
+
+/// `skip_serializing_if` for a `bool` that is absent when `false`.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The prompt template of a [`SnapshotPhase`].
@@ -681,6 +745,277 @@ pub struct SnapshotSettings {
     pub max_fan_out: u32,
     /// `app_setting.max_agents_per_run`.
     pub max_agents_per_run: u32,
+    /// MOD-138 D1, D13: `app_setting.max_parallel_sessions`, frozen for M3's walker. Always
+    /// written; never hashed.
+    #[serde(default = "SnapshotSettings::default_max_parallel_sessions")]
+    pub max_parallel_sessions: u32,
+    /// `app_setting.max_plan_revisions`, frozen for MOD-139 and MOD-140.
+    #[serde(default = "SnapshotSettings::default_max_plan_revisions")]
+    pub max_plan_revisions: u32,
+    /// `app_setting.max_child_runs`, frozen for MOD-143.
+    #[serde(default = "SnapshotSettings::default_max_child_runs")]
+    pub max_child_runs: u32,
+    /// `app_setting.runtime_changes`, frozen for MOD-140.
+    #[serde(default)]
+    pub runtime_changes: RuntimeChanges,
+}
+
+impl SnapshotSettings {
+    /// `max_parallel_sessions` when `app_setting` names none (MOD-138 D13).
+    pub const DEFAULT_MAX_PARALLEL_SESSIONS: u32 = 4;
+    /// `max_plan_revisions` when `app_setting` names none (MOD-138 D13).
+    pub const DEFAULT_MAX_PLAN_REVISIONS: u32 = 3;
+    /// `max_child_runs` when `app_setting` names none (MOD-138 D13).
+    pub const DEFAULT_MAX_CHILD_RUNS: u32 = 8;
+
+    const fn default_max_parallel_sessions() -> u32 {
+        Self::DEFAULT_MAX_PARALLEL_SESSIONS
+    }
+
+    const fn default_max_plan_revisions() -> u32 {
+        Self::DEFAULT_MAX_PLAN_REVISIONS
+    }
+
+    const fn default_max_child_runs() -> u32 {
+        Self::DEFAULT_MAX_CHILD_RUNS
+    }
+}
+
+str_enum!(
+    /// MOD-138 D1 (ANA-33 §7.2): what a frozen node is. `subgraph` is MOD-143's, added there.
+    #[derive(Default)]
+    NodeRole {
+        /// An ordinary step; every v1 node.
+        #[default]
+        Step => "step",
+        /// `<name>:plan` of an expanded `divide` node (D11).
+        Planner => "planner",
+        /// `<name>` of an expanded `divide` node (D11).
+        Integrate => "integrate",
+    }
+);
+
+impl NodeRole {
+    /// D1's skip predicate: a `step` node serialises without `role`.
+    #[must_use]
+    pub const fn is_step(&self) -> bool {
+        matches!(self, Self::Step)
+    }
+}
+
+str_enum!(
+    /// MOD-138 D1: how the run's graph was chosen. `pick` is MOD-126's, added there.
+    SourceHow {
+        /// `item.step_graph_id` named the graph (an override included).
+        Pin => "pin",
+        /// The item named none: its kind's `default_graph_id`.
+        KindDefault => "kind_default",
+    }
+);
+
+str_enum!(
+    /// MOD-138 D1, D13 (ANA-33 §7.8): whether a run may change its own graph, frozen here and
+    /// read by MOD-140.
+    #[derive(Default)]
+    RuntimeChanges {
+        /// Never.
+        Off => "off",
+        /// A person approves each change.
+        #[default]
+        Ask => "ask",
+        /// Applied without asking.
+        Automatic => "automatic",
+    }
+);
+
+/// [`GraphSnapshot::source`] (MOD-138 D1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSource {
+    /// How the graph was chosen.
+    pub how: SourceHow,
+}
+
+/// One edge of a v2 snapshot, by node key (MOD-138 D2): the phase `name` (`<name>:plan` for an
+/// expanded planner), never a phase id or position. `predicate` stays MOD-137's opaque JSON,
+/// serialised with sorted keys so neither digest depends on `serde_json`'s `preserve_order`
+/// (F5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotEdge {
+    /// Key of the source node.
+    pub from: String,
+    /// Key of the target node.
+    pub to: String,
+    /// `step_graph_edge.kind`.
+    pub kind: EdgeKind,
+    /// `step_graph_edge.predicate`; `Some` iff `kind` is `if`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "sorted_predicate"
+    )]
+    pub predicate: Option<EdgePredicate>,
+    /// `step_graph_edge.loop_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_limit: Option<i32>,
+}
+
+/// MOD-138 D1, D11: a `divide` node's frozen block. **M1 never stores one** (resolve refuses a
+/// divide node after expanding it, D6(a)), so MOD-139 may reshape it without a compatibility
+/// concern.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotDivide {
+    /// The `planner_*` columns.
+    #[serde(default)]
+    pub planner: SnapshotSeat,
+    /// The `integrate_*` columns.
+    #[serde(default)]
+    pub integrate: SnapshotSeat,
+    /// `step_graph_phase.max_parts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parts: Option<i32>,
+    /// The `phase_part` rows, by `position` (D11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_parts: Vec<SnapshotPart>,
+}
+
+/// The planner or integrate columns of a divide row, as stored: ids, not frozen names (see
+/// [`SnapshotDivide`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSeat {
+    /// `*_agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    /// `*_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `*_persona_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_id: Option<PersonaId>,
+}
+
+/// One `phase_part` row minus `phase_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPart {
+    /// `phase_part.position`.
+    pub position: i32,
+    /// `phase_part.key`.
+    pub key: String,
+    /// `phase_part.title`.
+    pub title: String,
+    /// `phase_part.brief`.
+    #[serde(default)]
+    pub brief: String,
+    /// `phase_part.owned_paths`.
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
+    /// `phase_part.acceptance`.
+    #[serde(default)]
+    pub acceptance: Option<String>,
+    /// `phase_part.agent_id`.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    /// `phase_part.model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `phase_part.persona_id`.
+    #[serde(default)]
+    pub persona_id: Option<PersonaId>,
+}
+
+/// `serialize_with` for [`SnapshotEdge::predicate`] (F5): the JSON with object keys sorted by
+/// bytes at every depth. Only reached on `Some`; the field is skipped on `None`.
+fn sorted_predicate<S: serde::Serializer>(
+    predicate: &Option<EdgePredicate>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match predicate {
+        Some(EdgePredicate(value)) => SortedJson(value).serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// `Serialize` over a `&Value`: objects as maps in key-byte order, arrays element by element,
+/// everything else as itself. Never re-enters `serde_json::Map`'s own order (finding 4).
+#[derive(Debug)]
+struct SortedJson<'a>(&'a Value);
+
+impl Serialize for SortedJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap as _, SerializeSeq as _};
+        match self.0 {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    out.serialize_entry(key, &SortedJson(value))?;
+                }
+                out.end()
+            }
+            Value::Array(items) => {
+                let mut out = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    out.serialize_element(&SortedJson(item))?;
+                }
+                out.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
+}
+
+/// F13's one edge order, as a sort key: (position of `from`, position of `to`, `kind` bytes,
+/// `from` bytes, `to` bytes), positions looked up by key in `phases` and an unknown key at
+/// `i32::MAX`. Public so `htui_orch::graph::topology_v2` sorts its borrowed view by the same
+/// key and the two orders cannot drift.
+#[must_use]
+pub fn edge_sort_key<'a>(
+    edge: &'a SnapshotEdge,
+    phases: &[SnapshotPhase],
+) -> (i32, i32, &'static str, &'a [u8], &'a [u8]) {
+    let position = |key: &str| {
+        phases
+            .iter()
+            .find(|phase| phase.name == key)
+            .map_or(i32::MAX, |phase| phase.position)
+    };
+    (
+        position(&edge.from),
+        position(&edge.to),
+        edge.kind.as_str(),
+        edge.from.as_bytes(),
+        edge.to.as_bytes(),
+    )
+}
+
+/// F13: sorts `edges` into the one snapshot edge order ([`edge_sort_key`]), so resolve, the lift
+/// and the v2 digest cannot make two equal graphs differ by order.
+pub fn sort_snapshot_edges(edges: &mut [SnapshotEdge], phases: &[SnapshotPhase]) {
+    edges.sort_by(|a, b| edge_sort_key(a, phases).cmp(&edge_sort_key(b, phases)));
+}
+
+/// MOD-138 D4: [`crate::seed::default_edge_plan`] over `(position, name, retry_limit)` of
+/// `phases`, by key, in [`sort_snapshot_edges`] order. The v1 lift reads it. D6(c)
+/// (`htui_orch::graph::not_yet_runnable`) applies the same `default_edge_plan` rule through
+/// [`crate::seed::default_edges`] over the non-palette rows (A5).
+#[must_use]
+pub fn default_snapshot_edges(phases: &[SnapshotPhase]) -> Vec<SnapshotEdge> {
+    let projection: Vec<(i32, &str, i32)> = phases
+        .iter()
+        .map(|phase| (phase.position, phase.name.as_str(), phase.retry_limit))
+        .collect();
+    let mut edges: Vec<SnapshotEdge> = crate::seed::default_edge_plan(&projection)
+        .into_iter()
+        .map(|edge| SnapshotEdge {
+            from: phases[edge.from].name.clone(),
+            to: phases[edge.to].name.clone(),
+            kind: edge.kind,
+            predicate: None,
+            loop_limit: edge.loop_limit,
+        })
+        .collect();
+    sort_snapshot_edges(&mut edges, phases);
+    edges
 }
 
 /// A row of `run_step_commit` (§5.8): the before/after commit of one repository for one step.
@@ -1226,6 +1561,10 @@ mod tests {
             candidates: Vec::new(),
             judge: None,
             persona: persona.map(str::to_owned),
+            role: super::NodeRole::Step,
+            palette: false,
+            plan_scope: None,
+            divide: None,
         }
     }
 
@@ -1241,16 +1580,24 @@ mod tests {
                 id: StepGraphId::new(),
                 name: "feature".to_owned(),
                 is_override: false,
+                scope: None,
+                revision: None,
             },
+            source: None,
             topology: "sha256:00".to_owned(),
             mode: super::RunMode::Auto,
             phases,
+            edges: Vec::new(),
             settings: super::SnapshotSettings {
                 default_isolation: Isolation::Local,
                 per_token_cap_run: None,
                 per_token_cap_batch: None,
                 max_fan_out: 1,
                 max_agents_per_run: 1,
+                max_parallel_sessions: super::SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: super::SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: super::SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: super::RuntimeChanges::Ask,
             },
             scope: None,
             personas,
@@ -1408,6 +1755,406 @@ mod tests {
             },
             chat,
             "for_edit_help keeps every other field"
+        );
+    }
+
+    // ---- MOD-138 T1: snapshot v2 (D1, D2, D4) ----
+
+    /// `snapshot_phase(None)` at `name`, `position` and `retry_limit`.
+    fn phase_at(name: &str, position: i32, retry_limit: i32) -> super::SnapshotPhase {
+        super::SnapshotPhase {
+            name: name.to_owned(),
+            position,
+            retry_limit,
+            ..snapshot_phase(None)
+        }
+    }
+
+    fn edge(
+        from: &str,
+        to: &str,
+        kind: crate::model::kind::EdgeKind,
+        loop_limit: Option<i32>,
+    ) -> super::SnapshotEdge {
+        super::SnapshotEdge {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind,
+            predicate: None,
+            loop_limit,
+        }
+    }
+
+    fn divide_block() -> super::SnapshotDivide {
+        use crate::model::ids::{AgentId, PersonaId};
+        super::SnapshotDivide {
+            planner: super::SnapshotSeat {
+                agent_id: Some(AgentId::from_uuid(Uuid::from_u128(7))),
+                model: Some("opus".to_owned()),
+                persona_id: None,
+            },
+            integrate: super::SnapshotSeat {
+                agent_id: None,
+                model: None,
+                persona_id: Some(PersonaId::from_uuid(Uuid::from_u128(8))),
+            },
+            max_parts: Some(4),
+            default_parts: vec![super::SnapshotPart {
+                position: 0,
+                key: "api".to_owned(),
+                title: "The API".to_owned(),
+                brief: "Build the API".to_owned(),
+                owned_paths: vec!["src/api".to_owned()],
+                acceptance: Some("its tests pass".to_owned()),
+                agent_id: None,
+                model: None,
+                persona_id: None,
+            }],
+        }
+    }
+
+    /// D1 (plan risk 1): a linear phase carries none of the v2 keys, so it serialises exactly as
+    /// v1 did and its v1 digest does not move. `split` is derived and never written (A1).
+    #[test]
+    fn a_step_phase_serialises_without_the_v2_keys() {
+        let text = serde_json::to_string(&snapshot_phase(None)).expect("encodes");
+        for key in [
+            "\"role\"",
+            "\"palette\"",
+            "\"plan_scope\"",
+            "\"divide\"",
+            "\"split\"",
+        ] {
+            assert!(!text.contains(key), "{key} in {text}");
+        }
+        assert!(text.ends_with("\"judge\":null}"), "{text}");
+    }
+
+    #[test]
+    fn a_planner_phase_carries_its_role_and_divide() {
+        use crate::model::kind::PlanScope;
+        let phase = super::SnapshotPhase {
+            role: super::NodeRole::Planner,
+            palette: true,
+            plan_scope: Some(PlanScope::Parts),
+            divide: Some(divide_block()),
+            ..snapshot_phase(Some("planner"))
+        };
+        let value = serde_json::to_value(&phase).expect("encodes");
+        assert_eq!(value["role"], json!("planner"));
+        assert_eq!(value["palette"], json!(true));
+        assert_eq!(value["plan_scope"], json!("parts"));
+        assert_eq!(value["divide"]["max_parts"], json!(4));
+        assert_eq!(value["divide"]["planner"]["model"], json!("opus"));
+        assert_eq!(value["divide"]["default_parts"][0]["key"], json!("api"));
+        assert!(value.get("split").is_none(), "split is never written (A1)");
+
+        let back: super::SnapshotPhase = serde_json::from_value(value).expect("decodes");
+        assert_eq!(back, phase, "encode then decode is the identity");
+    }
+
+    /// A1 (F1): `split()` is `divide` exactly when a divide block is frozen, else what `fan_out`
+    /// implies (`ck_phase_split_fan_out`).
+    #[test]
+    fn split_is_divide_then_fan_out() {
+        use crate::model::kind::Split;
+        let divide = super::SnapshotPhase {
+            divide: Some(divide_block()),
+            ..snapshot_phase(None)
+        };
+        assert_eq!(divide.split(), Split::Divide);
+        let compete = super::SnapshotPhase {
+            fan_out: 2,
+            ..snapshot_phase(None)
+        };
+        assert_eq!(compete.split(), Split::Compete);
+        assert_eq!(snapshot_phase(None).split(), Split::None);
+    }
+
+    #[test]
+    fn a_v2_snapshot_round_trips_edges_source_scope_revision_and_bounds() {
+        use crate::model::kind::{EdgeKind, EdgePredicate, GraphScope};
+        let mut snapshot = graph_snapshot(
+            vec![phase_at("plan", 0, 1), phase_at("review", 1, 2)],
+            Vec::new(),
+        );
+        assert_eq!(snapshot.v, 2, "the version this crate writes (D1)");
+        snapshot.graph.scope = Some(GraphScope::Library);
+        snapshot.graph.revision = Some(7);
+        snapshot.source = Some(super::SnapshotSource {
+            how: super::SourceHow::KindDefault,
+        });
+        snapshot.edges = vec![
+            super::SnapshotEdge {
+                predicate: Some(EdgePredicate(json!({ "verdict": "approve" }))),
+                ..edge("plan", "review", EdgeKind::If, None)
+            },
+            edge("review", "plan", EdgeKind::ChangesRequested, Some(2)),
+        ];
+        snapshot.settings.max_parallel_sessions = 2;
+        snapshot.settings.max_plan_revisions = 5;
+        snapshot.settings.max_child_runs = 1;
+        snapshot.settings.runtime_changes = super::RuntimeChanges::Off;
+
+        let text = serde_json::to_string(&snapshot).expect("encodes");
+        assert!(text.contains("\"edges\":[{\"from\":\"plan\""), "{text}");
+        assert!(
+            text.contains("\"source\":{\"how\":\"kind_default\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"scope\":{\"owner\":\"library\"},\"revision\":7"),
+            "{text}"
+        );
+        assert!(text.contains("\"max_parallel_sessions\":2"), "{text}");
+        assert!(text.contains("\"runtime_changes\":\"off\""), "{text}");
+
+        let back: super::GraphSnapshot = serde_json::from_str(&text).expect("decodes");
+        assert_eq!(back, snapshot, "encode then decode is the identity");
+    }
+
+    /// D1: a blob written before MOD-138 (no `edges`, `source`, bounds or graph scope) decodes,
+    /// every new field at its default.
+    #[test]
+    fn a_v1_blob_decodes_with_v2_defaults() {
+        let v1 = json!({
+            "v": 1,
+            "graph": {
+                "id": "01a06490-c789-7000-8000-000000000501",
+                "name": "feature",
+                "is_override": false,
+            },
+            "topology": "sha256:00",
+            "mode": "auto",
+            "phases": [serde_json::to_value(snapshot_phase(None)).expect("encodes")],
+            "settings": {
+                "default_isolation": "local",
+                "per_token_cap_run": null,
+                "per_token_cap_batch": null,
+                "max_fan_out": 1,
+                "max_agents_per_run": 1,
+            },
+            "scope": null,
+        });
+        let back: super::GraphSnapshot = serde_json::from_value(v1).expect("a v1 blob decodes");
+        assert_eq!(back.v, super::GraphSnapshot::V1);
+        assert!(back.edges.is_empty(), "the lift fills them, not serde");
+        assert_eq!(back.source, None);
+        assert_eq!((back.graph.scope, back.graph.revision), (None, None));
+        assert_eq!(
+            (
+                back.settings.max_parallel_sessions,
+                back.settings.max_plan_revisions,
+                back.settings.max_child_runs,
+                back.settings.runtime_changes,
+            ),
+            (4, 3, 8, super::RuntimeChanges::Ask),
+            "the code defaults (D13)"
+        );
+        assert_eq!(
+            (
+                super::SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                super::SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                super::SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+            ),
+            (4, 3, 8)
+        );
+        let phase = &back.phases[0];
+        assert_eq!(phase.role, super::NodeRole::Step);
+        assert!(!phase.palette);
+        assert_eq!((phase.plan_scope, phase.divide.as_ref()), (None, None));
+        assert_eq!(phase, &snapshot_phase(None));
+    }
+
+    /// F5: a predicate's bytes never depend on `serde_json`'s `preserve_order` (finding 4): its
+    /// object keys sort by bytes at every depth, arrays included.
+    #[test]
+    fn a_predicate_serialises_with_sorted_keys() {
+        use crate::model::kind::{EdgeKind, EdgePredicate};
+        use serde_json::{Map, Value};
+        let mut inner = Map::new();
+        inner.insert("y".to_owned(), json!(2));
+        inner.insert("b".to_owned(), json!(3));
+        let mut listed = Map::new();
+        listed.insert("q".to_owned(), json!(1));
+        listed.insert("c".to_owned(), json!(null));
+        let mut outer = Map::new();
+        outer.insert("z".to_owned(), Value::Array(vec![Value::Object(listed)]));
+        outer.insert("a".to_owned(), Value::Object(inner));
+        let edge = super::SnapshotEdge {
+            predicate: Some(EdgePredicate(Value::Object(outer))),
+            ..edge("a", "b", EdgeKind::If, None)
+        };
+        assert_eq!(
+            serde_json::to_string(&edge).expect("encodes"),
+            r#"{"from":"a","to":"b","kind":"if","predicate":{"a":{"b":3,"y":2},"z":[{"c":null,"q":1}]}}"#
+        );
+        let bare = super::SnapshotEdge {
+            predicate: None,
+            ..edge.clone()
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).expect("encodes"),
+            r#"{"from":"a","to":"b","kind":"if"}"#,
+            "no predicate, no loop limit: neither key is written"
+        );
+        let back: super::SnapshotEdge =
+            serde_json::from_str(&serde_json::to_string(&edge).expect("encodes")).expect("decodes");
+        assert_eq!(back, edge);
+    }
+
+    /// F13: one edge order, (position of `from`, position of `to`, kind bytes), an unknown key
+    /// last, ties by key bytes.
+    #[test]
+    fn edges_sort_by_position_then_kind() {
+        use crate::model::kind::EdgeKind;
+        let phases = vec![
+            phase_at("implement", 1, 1),
+            phase_at("plan", 0, 1),
+            phase_at("review", 2, 1),
+        ];
+        let mut edges = vec![
+            edge("review", "implement", EdgeKind::ChangesRequested, Some(1)),
+            edge("ghost", "plan", EdgeKind::Next, None),
+            edge("implement", "review", EdgeKind::Next, None),
+            edge("plan", "implement", EdgeKind::Next, None),
+            edge("plan", "review", EdgeKind::If, None),
+            edge("plan", "implement", EdgeKind::AsksYou, None),
+            edge("plan", "ghost", EdgeKind::Next, None),
+        ];
+        super::sort_snapshot_edges(&mut edges, &phases);
+        let order: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .map(|edge| (edge.from.as_str(), edge.to.as_str(), edge.kind.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("plan", "implement", "asks_you"),
+                ("plan", "implement", "next"),
+                ("plan", "review", "if"),
+                ("plan", "ghost", "next"),
+                ("implement", "review", "next"),
+                ("review", "implement", "changes_requested"),
+                ("ghost", "plan", "next"),
+            ]
+        );
+    }
+
+    /// D4's "one rule, pinned equal": over every seeded graph and the awkward shapes (gaps, a
+    /// leading `review`, two `review`s, slice order unlike position order), the key-based edges
+    /// are exactly `seed::default_edges` mapped to names.
+    #[test]
+    fn default_snapshot_edges_is_seed_default_edges() {
+        use crate::model::ids::{EdgeId, PhaseId, StepGraphId};
+        use crate::seed::{KINDS, PhaseSeed, default_edges, phase_row};
+
+        type Shape = (String, String, &'static str, Option<i32>);
+        let mut shapes: Vec<Vec<(&'static str, i32, i32)>> = KINDS
+            .iter()
+            .map(|kind| {
+                kind.phases
+                    .iter()
+                    .zip(0..)
+                    .map(|(phase, position)| (phase.name, position, 1))
+                    .collect()
+            })
+            .collect();
+        shapes.push(vec![("implement", 0, 3), ("docs", 5, 1), ("review", 9, 2)]);
+        shapes.push(vec![("review", 0, 1), ("implement", 1, 2), ("check", 2, 1)]);
+        shapes.push(vec![
+            ("plan", 0, 2),
+            ("review", 1, 1),
+            ("implement", 2, 4),
+            ("review", 3, 1),
+        ]);
+        shapes.push(vec![("draft", 4, 2), ("review", 2, 1), ("spec", 0, 5)]);
+        for rows in shapes {
+            let graph = StepGraphId::new();
+            let stored: Vec<_> = rows
+                .iter()
+                .map(|&(name, position, retry_limit)| {
+                    let seed = PhaseSeed {
+                        name,
+                        input_kinds: &[],
+                        gate_hard: false,
+                    };
+                    let mut row =
+                        phase_row(PhaseId::new(), graph, position, &seed, chrono::Utc::now());
+                    row.retry_limit = retry_limit;
+                    row
+                })
+                .collect();
+            let name_of = |id| {
+                stored
+                    .iter()
+                    .find(|phase| phase.id == id)
+                    .map(|phase| phase.name.clone())
+                    .expect("an endpoint of the graph")
+            };
+            let mut seeded: Vec<Shape> = default_edges(&stored, EdgeId::new)
+                .iter()
+                .map(|e| {
+                    (
+                        name_of(e.from),
+                        name_of(e.to),
+                        e.kind.as_str(),
+                        e.loop_limit,
+                    )
+                })
+                .collect();
+            let phases: Vec<_> = rows
+                .iter()
+                .map(|&(name, position, retry_limit)| phase_at(name, position, retry_limit))
+                .collect();
+            let keyed = super::default_snapshot_edges(&phases);
+            assert!(keyed.iter().all(|e| e.predicate.is_none()));
+            let mut keyed: Vec<Shape> = keyed
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone(), e.kind.as_str(), e.loop_limit))
+                .collect();
+            seeded.sort();
+            keyed.sort();
+            assert_eq!(keyed, seeded, "{rows:?}");
+        }
+    }
+
+    /// D4: the lift fills a v1 snapshot's edges and keeps `v == 1`; a v2 snapshot is untouched,
+    /// edges or none.
+    #[test]
+    fn lift_v1_fills_default_edges_and_keeps_v1() {
+        use crate::model::kind::EdgeKind;
+        let phases = vec![
+            phase_at("prd", 0, 1),
+            phase_at("plan", 1, 1),
+            phase_at("implement", 2, 3),
+            phase_at("review", 3, 1),
+        ];
+        let mut v1 = super::GraphSnapshot {
+            v: super::GraphSnapshot::V1,
+            ..graph_snapshot(phases.clone(), Vec::new())
+        };
+        v1.lift_v1();
+        assert_eq!(v1.v, 1, "resume tells a v1 run from a v2 one by `v`");
+        assert_eq!(
+            v1.edges,
+            [
+                edge("prd", "plan", EdgeKind::Next, None),
+                edge("plan", "implement", EdgeKind::Next, None),
+                edge("implement", "review", EdgeKind::Next, None),
+                edge("review", "implement", EdgeKind::ChangesRequested, Some(3)),
+            ]
+        );
+        let lifted = v1.clone();
+        v1.lift_v1();
+        assert_eq!(v1, lifted, "lifting twice changes nothing");
+
+        let mut v2 = graph_snapshot(phases, Vec::new());
+        let before = v2.clone();
+        v2.lift_v1();
+        assert_eq!(
+            v2, before,
+            "a v2 snapshot keeps the edges it froze, none included"
         );
     }
 }

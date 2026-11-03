@@ -34,9 +34,10 @@ use htui_agent::record::{Control, Signal};
 use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item,
-    ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph,
-    Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
+    Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
+    Isolation, Item, ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId,
+    ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId,
+    VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -2494,6 +2495,57 @@ impl FakeOrchestrator {
             .expect("MemStore never fails a read")
             .expect("the case names a run the walk created")
     }
+}
+
+/// The `settings` keys a v1 snapshot never carried: MOD-138 D1's bounds.
+const V2_BOUND_KEYS: [&str; 4] = [
+    "max_parallel_sessions",
+    "max_plan_revisions",
+    "max_child_runs",
+    "runtime_changes",
+];
+
+/// MOD-138 T5: rewrites `run`'s stored snapshot as the v1 blob a pre-MOD-138 binary wrote: `v: 1`,
+/// no `edges`, `source`, `graph.scope`/`revision`, the four bound keys removed from `settings`, and
+/// `topology = graph::topology(&phases)` (the v1 digest). Through `MemStore::set_run_snapshot`.
+///
+/// `async` where the blueprint has it sync: `MemStore` reads a run only through `ReadStore::run`.
+///
+/// # Panics
+/// When the run has no decodable snapshot, or a node that is not a linear `step` (v1 had none).
+pub async fn rewrite_as_v1(store: &MemStore, run: RunId) {
+    let blob = store
+        .run(run)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the run exists")
+        .graph_snapshot
+        .expect("the run carries a snapshot");
+    let mut snapshot: GraphSnapshot =
+        serde_json::from_value(blob).expect("the run's snapshot decodes");
+    assert!(
+        snapshot.phases.iter().all(|phase| phase.role.is_step()
+            && !phase.palette
+            && phase.plan_scope.is_none()
+            && phase.divide.is_none()),
+        "a v1 snapshot holds linear `step` nodes only: {:?}",
+        snapshot.phases
+    );
+    snapshot.v = GraphSnapshot::V1;
+    snapshot.edges.clear();
+    snapshot.source = None;
+    snapshot.graph.scope = None;
+    snapshot.graph.revision = None;
+    snapshot.topology = crate::graph::topology(&snapshot.phases).expect("the phases serialise");
+    let mut blob = serde_json::to_value(&snapshot).expect("a snapshot serialises");
+    let settings = blob
+        .get_mut("settings")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("a snapshot's settings are an object");
+    for key in V2_BOUND_KEYS {
+        settings.remove(key);
+    }
+    assert!(store.set_run_snapshot(run, blob), "the run exists");
 }
 
 #[cfg(test)]

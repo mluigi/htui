@@ -44,7 +44,7 @@ use htui_core::model::{
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{
-    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES,
+    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, graph_label,
 };
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
@@ -115,7 +115,7 @@ const HINT_CONFIRM_PREFIX: HintSpec = &[
 const PROJECTS_ELSEWHERE: &str = "projects are edited in Hierarchy";
 
 /// What the kind editor says when its `graph` field names nothing (B-7).
-const NO_GRAPH_NAMED: &str = "`graph` names no graph in this project";
+const NO_GRAPH_NAMED: &str = "`graph` names no graph this project can use";
 
 /// What an editor says when a `position` field is not a number (B-8).
 const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
@@ -699,7 +699,16 @@ impl KindsSection {
                 };
                 let id = kind.default_graph_id;
                 if self.locate_graph(id).is_none() {
-                    self.refuse(GRAPH_MISSING.to_owned());
+                    // MOD-138 D12: a workspace or library graph is the kind's to name, not this
+                    // section's to edit; say which, rather than calling it missing.
+                    let shared = self
+                        .project(p)
+                        .and_then(|project| project.graph_name(id))
+                        .map(|(name, scope)| graph_label(name, scope));
+                    self.refuse(shared.map_or_else(
+                        || GRAPH_MISSING.to_owned(),
+                        |label| format!("graph {label} is not edited here"),
+                    ));
                     return;
                 }
                 id
@@ -950,7 +959,7 @@ impl KindsSection {
                         prefix: editor.text(0),
                         name: editor.text(1),
                         description: editor.text(2),
-                        graph: graph_named(owner, &editor.text(3))?,
+                        graph: graph_named(owner, &editor.text(3), None)?,
                         position: position(&editor.text(4))?,
                     },
                     None,
@@ -960,7 +969,7 @@ impl KindsSection {
                 let expected = editor
                     .expected
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                let (owner, _) = self
+                let (owner, kind) = self
                     .locate_kind(id)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
                 Ok((
@@ -972,7 +981,11 @@ impl KindsSection {
                             prefix: Some(editor.text(0)),
                             name: Some(editor.text(1)),
                             description: Some(editor.text(2)),
-                            default_graph_id: Some(graph_named(owner, &editor.text(3))?),
+                            default_graph_id: Some(graph_named(
+                                owner,
+                                &editor.text(3),
+                                Some(kind.default_graph_id),
+                            )?),
                             position: Some(position(&editor.text(4))?),
                         },
                     },
@@ -1307,8 +1320,12 @@ impl KindsSection {
         let head = format!("  {}  {} \u{b7} ", kind.prefix, kind.name);
         // The tail is the one thing on this line the user has to act on, so it is
         // the one thing in `theme.error` (the band covers it on the cursor row).
-        let tail = match project.graph(kind.default_graph_id) {
-            Some(entry) => Span::styled(format!("graph {}", entry.graph.name), theme.base),
+        // MOD-138 D12: a workspace or library graph is named with its scope, and has no phase
+        // rows under it (`rows` expands the project's own graphs only).
+        let tail = match project.graph_name(kind.default_graph_id) {
+            Some((name, scope)) => {
+                Span::styled(format!("graph {}", graph_label(name, scope)), theme.base)
+            }
             None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
         };
         Some(Line::from(vec![Span::styled(head, theme.base), tail]))
@@ -1756,16 +1773,18 @@ fn new_kind_fields(project: &ProjectCatalogue) -> Vec<Field> {
     ]
 }
 
-/// The same five fields, prefilled from the row (B-5's whole patch goes out from them).
+/// The same five fields, prefilled from the row (B-5's whole patch goes out from them). The
+/// graph reads as its [`graph_label`] (MOD-138 D12), so a workspace or library graph keeps its
+/// scope on screen and [`graph_named`] does not mistake it for a project graph of that name.
 fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
     let graph = project
-        .graph(kind.default_graph_id)
-        .map_or("", |entry| entry.graph.name.as_str());
+        .graph_name(kind.default_graph_id)
+        .map_or_else(String::new, |(name, scope)| graph_label(name, scope));
     vec![
         Field::required("prefix", &kind.prefix),
         Field::required("name", &kind.name),
         Field::optional("description", &kind.description),
-        Field::required("graph", graph),
+        Field::required("graph", &graph),
         Field::required("position", &kind.position.to_string()),
     ]
 }
@@ -1848,16 +1867,36 @@ fn next_position(positions: impl Iterator<Item = i32>) -> String {
         .to_string()
 }
 
-/// The graph of this project that carries the typed name (B-7).
+/// The graph the typed text names (B-7). A graph name is unique within one scope only (MOD-138
+/// D12), so the text is matched as a [`graph_label`]: the project's own graph by its bare name
+/// first, then a workspace or library graph the project may use as `name · workspace` /
+/// `name · library`, in [`ProjectCatalogue::shared`]'s order; a bare name no project graph has
+/// still finds a shared graph of that name. `current` is the edited kind's graph: text that still
+/// reads as its label keeps it, so an untouched field never moves the kind, not even between two
+/// workspaces' graphs that share a name and so a label.
 ///
-/// A name rather than an id because that is what is on screen; the store checks the project again
+/// A name rather than an id because that is what is on screen; the store checks the rule again
 /// on the write, so this resolution is a convenience and not the guard.
-fn graph_named(project: &ProjectCatalogue, name: &str) -> Result<StepGraphId, String> {
+fn graph_named(
+    project: &ProjectCatalogue,
+    text: &str,
+    current: Option<StepGraphId>,
+) -> Result<StepGraphId, String> {
+    if let Some(id) = current.filter(|&id| {
+        project
+            .graph_name(id)
+            .is_some_and(|(name, scope)| graph_label(name, scope) == text)
+    }) {
+        return Ok(id);
+    }
     project
         .graphs
         .iter()
-        .find(|entry| entry.graph.name == name)
-        .map(|entry| entry.graph.id)
+        .map(|entry| &entry.graph)
+        .chain(&project.shared)
+        .find(|graph| graph_label(&graph.name, graph.scope) == text)
+        .or_else(|| project.shared.iter().find(|graph| graph.name == text))
+        .map(|graph| graph.id)
         .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
 }
 

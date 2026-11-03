@@ -43,18 +43,19 @@ TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-d
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-163 M1 (checked against the tree 2026-10-25): migrations run through `0022_memory`
+Live coordinates after MOD-138 M1 (checked against the tree 2026-11-03): migrations run through
+`0023_default_edges_repair` (MOD-138 M1: re-derives default edges once; no table, not mirrored), before it `0022_memory`
 (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0023`** (cache: through `0007_project_type`, next `0008`;
+`workspace_stop`), so **the next migration is `0024`** (cache: through `0007_project_type`, next `0008`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
 `htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143, MOD-144,
-MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 109 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
+MOD-147 and MOD-159. Pins: store conformance `CASES` 218 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 115 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
@@ -1090,6 +1091,15 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   rule the v1 lift reuses, and `replace_graph` calls the shared validator once it exists. Owed here from
   MOD-137 D4: items and kinds may name a workspace or library graph (`check_graph`, the kind's same-project
   rule), with `template_name` resolved in the run's project. Not blocked.
+  **Phase M1 landed (`hr/MOD-138` `d114f91f`, 2026-11-03):** snapshot v2 (edges by node key, bounds, source,
+  scope and revision; v2 `topology` over typed phases and edges), the v1 lift in `snapshot_of`, pinned resume
+  (`Resume::SnapshotTampered`; a v1 run on a refused live graph compares phases only, A6), the shared walk
+  validator in `replace_graph`, the override clone and resolve, per-row phase writers keeping default edges (palette
+  phases outside, A5) and migration `0023`, resolve refusing divide, palette and non-default edges until M2, and
+  workspace and library graphs for kinds and items (`usable_graphs`; `delete_workspace` refuses a held graph; a
+  kind's graph checked only when changed, A7). The walk is still the position cursor. Record:
+  `docs/decisions/mod/mod-138-decisions.md`. Next, per `.claude/prds/mod-138-snapshot-v2-graph-walker.prd.md`: M2
+  the readiness walker (lifts the non-default-edge refusal), M3 concurrent nodes.
 - [ ] **MOD-139 - Divided fan-out runtime: planner, parts, integrate** (from ANA-33, `docs/ANA-33.md` §7.4, §7.5,
   §7.7, §7.8, §7.11, §10). `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`. Migration: `run_step.role`,
   `parent_step_id` and `node_key`; `run_plan` (append-only); a cache mirror migration for both (the next free
@@ -1100,7 +1110,9 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   exhausted part. Integrate: `Isolator::premerge`, the copy-mode fetch, the ancestry post-check
   (`integrate_incomplete`), only the integrate branch landing through §4.6. §4.9 recovery per role; caps at every
   admission (`max_agents_per_run` counts planned sessions); `fan_out_only` meaning live siblings; the `role = 'stage'`
-  rows at -3..-1 that MOD-126 and MOD-132 need. Blocked on MOD-138.
+  rows at -3..-1 that MOD-126 and MOD-132 need. From MOD-138 M1: lift resolve's `NotYetRunnable` divide refusal
+  (the expansion is already frozen) and reserve the `:plan` suffix in phase names at save time (resolve refuses a
+  collision today). Blocked on MOD-138.
 - [ ] **MOD-140 - The planner's MCP tools and run-time changes** (from ANA-33, `docs/ANA-33.md` §7.6, §10). `R-MCP-2`,
   `R-MCP-1`, `R-ID-6`, `R-ORCH-1`. `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced
   `run_plan` proposal writer in the `write_step_document` style; the `ToolScope` role and plan scope set in
@@ -1117,8 +1129,10 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   save-time validator; in-memory undo and redo over the revision CAS; catalogue key actions only, collisions resolved
   per context. `Settings > Kinds` opens it on the project's graphs, the Toolbox on the library and the workspace's.
   Amends MOD-124 (its workflow editor is this component) and MOD-123 (the `runtime_changes` default). Saves
-  through `StoreRequest::ReplaceGraph` with a body from `GraphEntry` (MOD-137). Blocked on MOD-138 (validator);
-  MOD-115 is done (`docs/decisions/mod/mod-115.md`).
+  through `StoreRequest::ReplaceGraph` with a body from `GraphEntry` (MOD-137). The shared validator is in (MOD-138
+  M1, `graph_body_walk_refusal`); MOD-115 is done (`docs/decisions/mod/mod-115.md`). Owed from MOD-138 M1's review:
+  two workspaces holding one project may each own a graph of one name, and the item and kind pickers then show two
+  identical `name · workspace` entries and take the first typed match; qualify the label or refuse the ambiguity.
 - [ ] **MOD-142 - Runs pane for divided and planned runs** (from ANA-33, `docs/ANA-33.md` §7.10, §10). `R-TUI-4`,
   `R-ORCH-11`. `RunSummary` carries the decoded v2 graph and `run_plan` rows; the step list groups planner, parts and
   integrate as a tree with each part's key, agent and state, offline from the mirrored `role`, `parent_step_id` and

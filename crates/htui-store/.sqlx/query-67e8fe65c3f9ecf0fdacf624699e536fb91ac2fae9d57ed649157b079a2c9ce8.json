@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id,\n                                   position)\n            SELECT $1, $2, $3, $4, $5, $6, $7\n             WHERE EXISTS (SELECT 1 FROM step_graph g WHERE g.id = $6 AND g.project_id = $2)\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id,\n                                   position)\n            SELECT $1, $2, $3, $4, $5, $6, $7\n             WHERE EXISTS (SELECT 1 FROM step_graph g\n                            WHERE g.id = $6\n                              AND (g.project_id = $2\n                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                                   OR g.workspace_id IN (SELECT wp.workspace_id\n                                                           FROM workspace_project wp\n                                                          WHERE wp.project_id = $2)))\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -114,5 +114,5 @@
       false
     ]
   },
-  "hash": "c2445cfa0b4b9db8f97ee5ab4cf19bd7e3358940568fd7b150771aca38a450fa"
+  "hash": "67e8fe65c3f9ecf0fdacf624699e536fb91ac2fae9d57ed649157b079a2c9ce8"
 }

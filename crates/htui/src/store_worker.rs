@@ -670,7 +670,8 @@ pub enum StoreRequest {
         name: String,
         /// `item_kind.description`.
         description: String,
-        /// `item_kind.default_graph_id`, which must belong to `project`.
+        /// `item_kind.default_graph_id`: a graph `project` may use (its own, a workspace's that holds
+        /// it, or the library's; MOD-138 D12).
         graph: StepGraphId,
         /// `item_kind.position`.
         position: i32,

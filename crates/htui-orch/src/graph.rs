@@ -22,10 +22,15 @@ use htui_core::model::{
     SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona, SnapshotPhase,
     SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
-use htui_core::model::{GraphScope, ItemFilter, Scope, WorkspaceId};
+use htui_core::model::{
+    EdgeKind, GraphScope, ItemFilter, NodeRole, Scope, SnapshotDivide, SnapshotEdge, SnapshotPart,
+    SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
+    sort_snapshot_edges,
+};
 use htui_core::store::{
-    BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
-    graph_body_shape_refusal, graph_body_topology_refusal, references_no_row,
+    BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
+    check_attachment, edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
+    graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
 
@@ -257,9 +262,44 @@ pub enum ResolveError {
         /// The qualifier, as written before the `:`.
         name: String,
     },
+    /// MOD-138 D9: the shared validator refused the live graph, or its frozen expansion. The
+    /// reason is the sentence `replace_graph` would give for the same body.
+    #[error("graph `{graph}` is not a valid step graph: {reason}")]
+    InvalidGraph {
+        /// `step_graph.name`.
+        graph: String,
+        /// The validator's sentence.
+        reason: String,
+    },
+    /// MOD-138 D6: a graph M1 freezes but cannot walk yet; lifted by MOD-139, MOD-140 and M2.
+    #[error("phase `{node}` cannot run yet: {reason}")]
+    NotYetRunnable {
+        /// The node refused: the divide phase, the palette phase, or the source of the first
+        /// edge that is not a default one.
+        node: String,
+        /// Why.
+        reason: NotRunnable,
+    },
     /// The store said no.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// MOD-138 D6: why a graph this version cannot walk is refused before its run exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotRunnable {
+    /// (a) A `divide` node, after its expansion is frozen (PRD Q1).
+    #[error("a `divide` node runs once divided fan-out lands (MOD-139)")]
+    Divide,
+    /// (b) A palette node.
+    #[error("a palette node is placed by a planner, which runs from MOD-140 on")]
+    Palette,
+    /// (c) Stored edges other than the default ones of the phases.
+    #[error(
+        "its edges are not the default ones its phases imply (`next` in position order and the \
+         review loop); other edges run once the readiness walker lands (MOD-138 M2)"
+    )]
+    NonDefaultEdges,
 }
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the **typed** phase slice (plan D9).
@@ -310,6 +350,10 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// under the run's own mode (`engine.rs:3036-3044`), so the topology an auto run is compared
 /// against is downgraded the same way (H-3).
 ///
+/// The graph may be a workspace or library graph (MOD-138 D12): its scope is frozen in
+/// `graph.scope`, and its phases' templates and personas still resolve in the **item's** project
+/// (`prompt_template(project.id, ..)`), so one shared graph runs with each project's templates.
+///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
 pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
@@ -321,8 +365,57 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
 ) -> std::result::Result<Resolved, ResolveError> {
-    let resolved = source
-        .resolve_graph(item.id)
+    match Box::pin(resolve_or_refused(
+        store,
+        source,
+        item,
+        mode,
+        app,
+        requested_scope,
+        box_id,
+    ))
+    .await?
+    {
+        Resolution::Resolved(resolved) => Ok(*resolved),
+        Resolution::Refused { refusal, .. } => Err(refusal),
+    }
+}
+
+/// What [`resolve_or_refused`] found (MOD-138 blueprint A6).
+pub(crate) enum Resolution {
+    /// The graph resolved: what [`resolve`] returns.
+    Resolved(Box<Resolved>),
+    /// A D6 or D9 refusal raised once the phases were built: a [`ResolveError::NotYetRunnable`]
+    /// or a [`ResolveError::InvalidGraph`]. `phases` are the live phases in position order,
+    /// before any `divide` expansion (MOD-138 D11), which is the shape a v1 run is compared on.
+    Refused {
+        /// The live phases, as built.
+        phases: Vec<SnapshotPhase>,
+        /// The refusal [`resolve`] raises.
+        refusal: ResolveError,
+    },
+}
+
+/// [`resolve`], with its D6 and D9 refusals (blueprint A6) handed back beside the live phases
+/// built before them, so a v1 run's resume can compare those phases on the v1 digest. Every other
+/// error is [`resolve`]'s, in its order. The shared validator's refusal of the stored body comes
+/// before the phases are built, so it is held while they are; a phase that then fails to build
+/// raises the validator's refusal, as [`resolve`] always has, with no phases to compare.
+///
+/// # Errors
+/// As [`resolve`], less the refusals carried by [`Resolution::Refused`].
+pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: GraphSource>(
+    store: &S,
+    source: &G,
+    item: &Item,
+    mode: RunMode,
+    app: &BTreeMap<String, Value>,
+    requested_scope: Option<&[RepoId]>,
+    box_id: BoxId,
+) -> std::result::Result<Resolution, ResolveError> {
+    // Boxed: PgStore's read now holds a transaction, and the engine awaits this inside its own
+    // futures (MOD-138 blueprint §4, the 2 MiB debug stack).
+    let resolved = Box::pin(source.resolve_graph(item.id))
         .await?
         .ok_or(ResolveError::NoGraph(item.id))?;
     let project = store
@@ -343,38 +436,98 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     })?;
     let settings = project_settings(&project);
 
+    let ResolvedGraph {
+        graph,
+        phases: mut rows,
+        edges: stored,
+    } = resolved;
+    // MOD-138 D10, D9: the body the store would hold, judged by the shared validator before a
+    // phase is resolved. Blueprint A6: its refusal is held until the phases are built.
+    let invalid = match live_graph_refusal(&graph, &rows, &stored) {
+        Ok(()) => None,
+        Err(refusal @ ResolveError::InvalidGraph { .. }) => Some(refusal),
+        Err(err) => return Err(err),
+    };
+
     // `UNIQUE (graph_id, position)` permits gaps, so the snapshot builder is what makes positions
     // dense `0..n-1` (`docs/ANA-2.md:269-272`). Sorting first means a gapped or out-of-order table
     // still yields the graph's own order rather than the store's.
-    let mut rows = resolved.phases;
     rows.sort_by_key(|row| row.phase.position);
 
-    let mut phases = Vec::with_capacity(rows.len());
-    // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
-    let mut personas: Vec<SnapshotPersona> = Vec::new();
-    for (dense, row) in rows.iter().enumerate() {
-        let position = i32::try_from(dense).map_err(|_| {
-            StoreError::Constraint(format!(
-                "graph {} has more phases than i32",
-                resolved.graph.id
-            ))
-        })?;
-        let mut phase = snapshot_phase(
-            source,
-            &row.phase,
-            &row.agents,
-            position,
-            project.id,
-            &settings,
-            app,
-            box_id,
-            mode,
-        )
-        .await?;
-        phase.persona = frozen_persona(row, &mut personas)?;
-        phases.push(phase);
+    let built = async {
+        let mut phases = Vec::with_capacity(rows.len());
+        // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
+        let mut personas: Vec<SnapshotPersona> = Vec::new();
+        for (dense, row) in rows.iter().enumerate() {
+            let position = i32::try_from(dense).map_err(|_| {
+                StoreError::Constraint(format!("graph {} has more phases than i32", graph.id))
+            })?;
+            let mut phase = snapshot_phase(
+                source, row, position, project.id, &settings, app, box_id, mode,
+            )
+            .await?;
+            phase.persona = frozen_persona(row, &mut personas)?;
+            phases.push(phase);
+        }
+        personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Ok::<_, ResolveError>((phases, personas))
     }
-    personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    .await;
+    let (phases, personas) = match (built, invalid) {
+        (Ok(built), None) => built,
+        (Ok((phases, _)), Some(refusal)) => return Ok(Resolution::Refused { phases, refusal }),
+        // `resolve`'s order: the validator's refusal is raised before any phase's.
+        (Err(_), Some(refusal)) | (Err(refusal), None) => return Err(refusal),
+    };
+
+    // MOD-138 D2: the stored edges by node key, in the one snapshot order (F13). Every end names
+    // a row of this read: `live_graph_refusal` refused the rest as a graph that moved.
+    let key = |id: PhaseId| {
+        rows.iter()
+            .find(|row| row.phase.id == id)
+            .map(|row| row.phase.name.clone())
+            .unwrap_or_default()
+    };
+    let mut edges: Vec<SnapshotEdge> = stored
+        .iter()
+        .map(|edge| SnapshotEdge {
+            from: key(edge.from),
+            to: key(edge.to),
+            kind: edge.kind,
+            predicate: edge_predicate(edge).cloned(),
+            loop_limit: edge.loop_limit,
+        })
+        .collect();
+    sort_snapshot_edges(&mut edges, &phases);
+
+    // MOD-138 D11, then PRD Q1: the expansion is frozen and the validator checks it, before D6
+    // refuses what this version cannot walk. Each refusal carries the unexpanded phases (A6).
+    let unexpanded = phases.clone();
+    let (phases, edges) = match expand_divide(&graph.name, phases, edges) {
+        Ok(expanded) => expanded,
+        Err(refusal @ ResolveError::InvalidGraph { .. }) => {
+            return Ok(Resolution::Refused {
+                phases: unexpanded,
+                refusal,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    if let Some(reason) = snapshot_walk_refusal(graph.id, &phases, &edges) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal: ResolveError::InvalidGraph {
+                graph: graph.name,
+                reason,
+            },
+        });
+    }
+    if let Err(refusal) = not_yet_runnable(&phases, &rows, &stored) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal,
+        });
+    }
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
@@ -383,6 +536,18 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
         max_agents_per_run: app_u32(app, "max_agents_per_run")
             .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        // MOD-138 D13: the bounds, frozen over their code defaults like the caps above.
+        max_parallel_sessions: app_u32(app, "max_parallel_sessions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS),
+        max_plan_revisions: app_u32(app, "max_plan_revisions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS),
+        max_child_runs: app_u32(app, "max_child_runs")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_CHILD_RUNS),
+        runtime_changes: app
+            .get("runtime_changes")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
     };
     check_fan_out_caps(&phases, &settings)?;
 
@@ -394,22 +559,290 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     let snapshot = GraphSnapshot {
         v: GraphSnapshot::V,
         graph: SnapshotGraph {
-            id: resolved.graph.id,
-            name: resolved.graph.name,
-            is_override: resolved.graph.is_override,
+            id: graph.id,
+            name: graph.name,
+            is_override: graph.is_override,
+            scope: Some(graph.scope),
+            revision: Some(graph.revision),
         },
-        topology: topology(&phases)?,
+        // MOD-138 D1: `item.step_graph_id` (an override included) pins the graph.
+        source: Some(SnapshotSource {
+            how: if item.step_graph_id.is_some() {
+                SourceHow::Pin
+            } else {
+                SourceHow::KindDefault
+            },
+        }),
+        topology: topology_v2(&phases, &edges)?,
         mode,
         phases,
+        edges,
         settings,
         scope: Some(scope),
         personas,
     };
 
-    Ok(Resolved {
+    Ok(Resolution::Resolved(Box::new(Resolved {
         snapshot,
         repo_scope,
+    })))
+}
+
+/// MOD-138 D10, D9: the live graph `resolve` read, judged before a phase is resolved.
+///
+/// An edge whose end is not a phase of the read is a graph that moved while it was being read
+/// (the `override_graph` precedent): a `Constraint` saying so, so the caller starts again. Then
+/// the shared validator's topology and walk rules over the same body `replace_graph` judges, so a
+/// body the store would refuse at save is refused here with the same sentence.
+fn live_graph_refusal(
+    graph: &StepGraph,
+    rows: &[ResolvedPhase],
+    edges: &[StepGraphEdge],
+) -> std::result::Result<(), ResolveError> {
+    let read = |id: PhaseId| rows.iter().any(|row| row.phase.id == id);
+    if edges.iter().any(|edge| !read(edge.from) || !read(edge.to)) {
+        return Err(ResolveError::Store(StoreError::Constraint(format!(
+            "graph `{}` moved while it was being resolved; start the run again",
+            graph.name
+        ))));
+    }
+    let body = GraphBody {
+        graph: graph.clone(),
+        nodes: rows
+            .iter()
+            .map(|row| NodeBody {
+                phase: row.phase.clone(),
+                agents: row.agents.clone(),
+                parts: row.parts.clone(),
+            })
+            .collect(),
+        edges: edges.to_vec(),
+    };
+    match graph_body_topology_refusal(graph.id, &body)
+        .or_else(|| graph_body_walk_refusal(graph.id, &body))
+    {
+        Some(reason) => Err(ResolveError::InvalidGraph {
+            graph: graph.name.clone(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// MOD-138 D6: what M1 freezes but cannot walk, first refusal wins: (a) the first node, in
+/// position order, that is not a `step` (an expanded `divide` node, named by the divide phase);
+/// (b) the first palette node; (c) stored edges other than `seed::default_edges` of the
+/// non-palette rows (blueprint A5), compared as multisets of `(from, to, kind, loop_limit,
+/// predicate is none)`.
+fn not_yet_runnable(
+    phases: &[SnapshotPhase],
+    rows: &[ResolvedPhase],
+    stored: &[StepGraphEdge],
+) -> std::result::Result<(), ResolveError> {
+    let refuse = |node: &str, reason| {
+        Err(ResolveError::NotYetRunnable {
+            node: node.to_owned(),
+            reason,
+        })
+    };
+    if let Some(phase) = phases.iter().find(|phase| !phase.role.is_step()) {
+        let node = match phase.role {
+            NodeRole::Planner => phase.name.strip_suffix(PLAN_SUFFIX).unwrap_or(&phase.name),
+            _ => &phase.name,
+        };
+        return refuse(node, NotRunnable::Divide);
+    }
+    if let Some(phase) = phases.iter().find(|phase| phase.palette) {
+        return refuse(&phase.name, NotRunnable::Palette);
+    }
+
+    let linear: Vec<StepGraphPhase> = rows
+        .iter()
+        .filter(|row| !row.phase.palette)
+        .map(|row| row.phase.clone())
+        .collect();
+    let defaults = htui_core::seed::default_edges(&linear, EdgeId::new);
+    let shape = |edge: &StepGraphEdge| {
+        (
+            edge.from,
+            edge.to,
+            edge.kind,
+            edge.loop_limit,
+            edge_predicate(edge).is_none(),
+        )
+    };
+    // The first edge of `left`, in its order, that `right` does not match one for one.
+    let unmatched = |left: &[StepGraphEdge], right: &[StepGraphEdge]| {
+        let mut counts: HashMap<_, usize> = HashMap::new();
+        for edge in right {
+            *counts.entry(shape(edge)).or_default() += 1;
+        }
+        left.iter()
+            .find(|edge| match counts.get_mut(&shape(edge)) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .map(|edge| edge.from)
+    };
+    if let Some(from) = unmatched(stored, &defaults).or_else(|| unmatched(&defaults, stored)) {
+        let node = rows
+            .iter()
+            .find(|row| row.phase.id == from)
+            .map_or_else(|| from.to_string(), |row| row.phase.name.clone());
+        return refuse(&node, NotRunnable::NonDefaultEdges);
+    }
+    Ok(())
+}
+
+/// The suffix an expanded `divide` node's planner key carries (MOD-138 D11).
+const PLAN_SUFFIX: &str = ":plan";
+
+/// `"sha256:"` + hex over `serde_json::to_string` of the typed, borrowed `{ phases, edges }`
+/// (MOD-138 D3): the digest a v2 snapshot's `topology` carries. The edges are read in the one
+/// snapshot order ([`htui_core::model::edge_sort_key`]) whatever order they are handed in, so the
+/// order cannot make two equal graphs differ (F13).
+///
+/// The rules of [`topology`] hold: never through `serde_json::Value` (finding 4; a predicate is
+/// key-sorted by its own serialiser, F5), and the envelope (`v`, `graph`, `source`, `mode`,
+/// `settings`, `scope`, `personas`) is outside it.
+///
+/// # Errors
+/// [`ResolveError::Store`] carrying the serialiser's own sentence, as [`topology`].
+pub fn topology_v2(
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> std::result::Result<String, ResolveError> {
+    /// The digested shape; field order is the JSON's.
+    #[derive(serde::Serialize)]
+    struct TopologyV2<'a> {
+        phases: &'a [SnapshotPhase],
+        edges: Vec<&'a SnapshotEdge>,
+    }
+    let mut sorted: Vec<&SnapshotEdge> = edges.iter().collect();
+    sorted.sort_by(|a, b| edge_sort_key(a, phases).cmp(&edge_sort_key(b, phases)));
+    let json = serde_json::to_string(&TopologyV2 {
+        phases,
+        edges: sorted,
     })
+    .map_err(|err| {
+        ResolveError::Store(StoreError::Constraint(format!(
+            "the graph's nodes and edges do not serialise: {err}"
+        )))
+    })?;
+    Ok(format!(
+        "sha256:{}",
+        htui_core::prompt::digest::sha256_hex(&json)
+    ))
+}
+
+/// MOD-138 D11: each `divide` node `N` at position `p` becomes `N:plan` (role `planner`, position
+/// `p`, `N`'s `plan_scope`) and `N` (role `integrate`, `p + 1`, `plan_scope: None`), both
+/// carrying `N`'s `divide` block; every later position shifts by one; edges into `N` move to
+/// `N:plan`, edges out of `N` stay on `N`, and a synthetic `N:plan → N` `next` joins them. The
+/// edges come back in snapshot order. A graph with no `divide` node comes back as it went in.
+///
+/// `graph` names the graph in the refusal.
+///
+/// # Errors
+/// [`ResolveError::InvalidGraph`] when `N:plan` is already a node's key.
+pub fn expand_divide(
+    graph: &str,
+    phases: Vec<SnapshotPhase>,
+    edges: Vec<SnapshotEdge>,
+) -> std::result::Result<(Vec<SnapshotPhase>, Vec<SnapshotEdge>), ResolveError> {
+    if phases.iter().all(|phase| phase.divide.is_none()) {
+        return Ok((phases, edges));
+    }
+    let mut divided = Vec::new();
+    for phase in phases.iter().filter(|phase| phase.divide.is_some()) {
+        let planner = format!("{}{PLAN_SUFFIX}", phase.name);
+        if phases.iter().any(|other| other.name == planner) {
+            return Err(ResolveError::InvalidGraph {
+                graph: graph.to_owned(),
+                reason: format!(
+                    "phase name `{planner}` is taken by the expansion of divide phase `{}`",
+                    phase.name
+                ),
+            });
+        }
+        divided.push((phase.name.clone(), planner));
+    }
+
+    let mut out = Vec::with_capacity(phases.len() + divided.len());
+    for phase in phases {
+        let at = i32::try_from(out.len()).map_err(|_| {
+            StoreError::Constraint(format!("graph `{graph}` has more nodes than i32"))
+        })?;
+        if phase.divide.is_some() {
+            out.push(SnapshotPhase {
+                position: at,
+                name: format!("{}{PLAN_SUFFIX}", phase.name),
+                role: NodeRole::Planner,
+                ..phase.clone()
+            });
+            out.push(SnapshotPhase {
+                position: at.saturating_add(1),
+                role: NodeRole::Integrate,
+                plan_scope: None,
+                ..phase
+            });
+        } else {
+            out.push(SnapshotPhase {
+                position: at,
+                ..phase
+            });
+        }
+    }
+
+    let mut edges: Vec<SnapshotEdge> = edges
+        .into_iter()
+        .map(|mut edge| {
+            if let Some((_, planner)) = divided.iter().find(|(name, _)| *name == edge.to) {
+                edge.to.clone_from(planner);
+            }
+            edge
+        })
+        .collect();
+    edges.extend(divided.into_iter().map(|(name, planner)| SnapshotEdge {
+        from: planner,
+        to: name,
+        kind: EdgeKind::Next,
+        predicate: None,
+        loop_limit: None,
+    }));
+    sort_snapshot_edges(&mut edges, &out);
+    Ok((out, edges))
+}
+
+/// MOD-138 D9 over a snapshot, by node key: [`walk_refusal`] with `palette` from the node. An
+/// edge naming a key no node holds is skipped, as [`graph_body_walk_refusal`] skips one.
+fn snapshot_walk_refusal(
+    graph: StepGraphId,
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> Option<String> {
+    let nodes: Vec<WalkNode<'_>> = phases
+        .iter()
+        .map(|phase| WalkNode {
+            name: &phase.name,
+            palette: phase.palette,
+        })
+        .collect();
+    let index = |key: &str| phases.iter().position(|phase| phase.name == key);
+    let edges: Vec<WalkEdge> = edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: index(&edge.from)?,
+                to: index(&edge.to)?,
+                kind: edge.kind,
+            })
+        })
+        .collect();
+    walk_refusal(graph, &nodes, &edges)
 }
 
 /// MOD-26 D9: the name of the persona `row` binds, frozen once into `personas`. A `persona_id`
@@ -455,10 +888,13 @@ fn frozen_persona(
 /// Each source phase's `phase_agent` and `phase_part` rows are re-keyed to the cloned phase
 /// (MOD-37 R-6), and the source graph's edges are copied, remapped onto the cloned phases with
 /// fresh edge ids (MOD-137 D13), so the clone is deep over `step_graph_phase`, `phase_agent`,
-/// `phase_part`, `step_graph_edge` and the phase attachments alike. All of it but the attachments
+/// `phase_part`, `step_graph_edge` and the phase attachments alike. The source may be a graph of
+/// any scope the item may use (MOD-138 D12); the clone is always created in the item's project
+/// (an override stays project-only), and a workspace or library phase carries no phase
+/// attachment to copy. All of it but the attachments
 /// is written by one [`WriteStore::replace_graph`] (revision 0 → 1 on a first override), whose
-/// pure refusals ([`graph_body_shape_refusal`], [`graph_body_topology_refusal`]) are decided before
-/// the graph row is created.
+/// pure refusals ([`graph_body_shape_refusal`], [`graph_body_topology_refusal`],
+/// [`graph_body_walk_refusal`]) are decided before the graph row is created.
 ///
 /// What a failure after that leaves: the `<key>-override` graph row, which no item names yet —
 /// empty when `replace_graph` refused it (a stale revision, a persona or agent row gone),
@@ -688,11 +1124,12 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     };
     body.graph.name.clone_from(&name);
     body.graph.description.clone_from(&description);
-    // `replace_graph`'s pure refusals (shape, then topology), decided on the body before the graph
-    // row is created, as D96 decides the attachments: a body the store would refuse leaves no
-    // orphan behind (review C-M1).
+    // `replace_graph`'s pure refusals (shape, then topology, then MOD-138 D9's walk), decided on
+    // the body before the graph row is created, as D96 decides the attachments: a body the store
+    // would refuse leaves no orphan behind (review C-M1).
     if let Some(sentence) = graph_body_shape_refusal(target_id, &body)
         .or_else(|| graph_body_topology_refusal(target_id, &body))
+        .or_else(|| graph_body_walk_refusal(target_id, &body))
     {
         return Err(ResolveError::Store(StoreError::Constraint(sentence)));
     }
@@ -815,7 +1252,8 @@ async fn orphaned_override<S: WriteStore>(
             "graph `{name}` already exists and is not an override; rename it and override again"
         ))));
     }
-    // Only an item of the graph's own project can name it (`check_graph`, MOD-137 D4), and
+    // Only an item of the graph's own project can name it: an override is always a project graph
+    // and `check_graph` never offers one (MOD-137 D4; MOD-138 D12 kept overrides so), and
     // `items` narrows by `project_ids` alone; no store reads the workspace, so the nil id stands
     // in for the one the project may not even have.
     let scope = Scope {
@@ -980,8 +1418,7 @@ pub(crate) const fn effective_gate(mode: RunMode, gate: Gate, gate_hard: bool) -
 )]
 async fn snapshot_phase<G: GraphSource>(
     source: &G,
-    phase: &StepGraphPhase,
-    rung_one: &[PhaseAgent],
+    row: &ResolvedPhase,
     position: i32,
     project: ProjectId,
     settings: &ProjectSettings,
@@ -989,6 +1426,7 @@ async fn snapshot_phase<G: GraphSource>(
     box_id: BoxId,
     mode: RunMode,
 ) -> std::result::Result<SnapshotPhase, ResolveError> {
+    let (phase, rung_one) = (&row.phase, row.agents.as_slice());
     let isolation = phase.isolation.unwrap_or(settings.default_isolation);
     if isolation == Isolation::Local && phase.fan_out > 1 {
         return Err(ResolveError::LocalFanOut {
@@ -1064,7 +1502,46 @@ async fn snapshot_phase<G: GraphSource>(
         // MOD-26 D9 (B-18): `resolve` binds the persona after this call, where the snapshot's
         // persona list is built.
         persona: None,
+        // MOD-138 D1: a live row is a `step`; `expand_divide` assigns `planner` and `integrate`.
+        role: NodeRole::Step,
+        palette: phase.palette,
+        plan_scope: phase.plan_scope,
+        divide: (phase.split == Split::Divide).then(|| divide_block(phase, &row.parts)),
     })
+}
+
+/// MOD-138 D1, D11: a `divide` row's frozen block, its seven columns as stored and its
+/// `phase_part` rows by `position`.
+fn divide_block(phase: &StepGraphPhase, parts: &[PhasePart]) -> SnapshotDivide {
+    let mut parts: Vec<&PhasePart> = parts.iter().collect();
+    parts.sort_by_key(|part| part.position);
+    SnapshotDivide {
+        planner: SnapshotSeat {
+            agent_id: phase.planner_agent_id,
+            model: phase.planner_model.clone(),
+            persona_id: phase.planner_persona_id,
+        },
+        integrate: SnapshotSeat {
+            agent_id: phase.integrate_agent_id,
+            model: phase.integrate_model.clone(),
+            persona_id: phase.integrate_persona_id,
+        },
+        max_parts: phase.max_parts,
+        default_parts: parts
+            .into_iter()
+            .map(|part| SnapshotPart {
+                position: part.position,
+                key: part.key.clone(),
+                title: part.title.clone(),
+                brief: part.brief.clone(),
+                owned_paths: part.owned_paths.clone(),
+                acceptance: part.acceptance.clone(),
+                agent_id: part.agent_id,
+                model: part.model.clone(),
+                persona_id: part.persona_id,
+            })
+            .collect(),
+    }
 }
 
 /// ANA-2 §4.1's candidate chain (`docs/ANA-2.md:288`), all four rungs.
@@ -1210,18 +1687,24 @@ mod tests {
         RepoScope, RunScope, Scope, SkillBinding, SkillBindingId, SnapshotPersona, Split,
         StepGraphEdge,
     };
+    use htui_core::model::{
+        EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
+        SnapshotSource, SourceHow, default_snapshot_edges,
+    };
     use htui_core::store::{
-        MemStore, ReadStore, StoreError, UpdateOutcome, glob_names_unknown_repo, negative_position,
-        references_no_row, split_fan_out_mismatch,
+        MemStore, ReadStore, StoreError, UpdateOutcome, forward_edges_form_a_cycle,
+        glob_names_unknown_repo, graph_body_walk_refusal, negative_position, references_no_row,
+        split_fan_out_mismatch,
     };
     use serde_json::json;
 
     use super::{
-        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSource, Isolation,
-        Item, ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
-        ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
-        Value, WriteStore, effective_gate, first_decode_failure, override_graph, project_settings,
-        resolve,
+        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSnapshot,
+        GraphSource, Isolation, Item, ItemId, NotRunnable, PhaseAgent, PhaseId, PhasePart,
+        ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunMode,
+        SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
+        effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
+        resolve, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -1317,10 +1800,18 @@ mod tests {
     const FEATURE_TOPOLOGY: &str =
         "sha256:ce0b489ff772a6a1c84c7590dcf6ba60b68121716f6897decf628115bd7c959b";
 
-    /// What a change to [`FEATURE_TOPOLOGY`] means, said where it will be read.
+    /// MOD-138 D3 (F14): the v2 digest of the same resolve, over its phases **and** its default
+    /// edges, which `snapshot.topology` carries since `GraphSnapshot::V = 2`. Computed once and
+    /// pasted, as [`FEATURE_TOPOLOGY`] is.
+    const FEATURE_TOPOLOGY_V2: &str =
+        "sha256:bdbf786844046bcf4101e4499f27230c2914ec8baa3611117af9cd2c1e076a5e";
+
+    /// What a change to [`FEATURE_TOPOLOGY`] or [`FEATURE_TOPOLOGY_V2`] means, said where it will
+    /// be read.
     const TOPOLOGY_MOVED: &str = "\
-the `topology` digest of the seeded `feature` graph moved. It is sha256 over \
-`serde_json::to_string` of the **typed** `&[SnapshotPhase]` in declaration order (plan D9), so it \
+a `topology` digest of the seeded `feature` graph moved. The v1 one is sha256 over \
+`serde_json::to_string` of the **typed** `&[SnapshotPhase]` in declaration order (plan D9); the \
+v2 one (MOD-138 D3) is the same over the typed `{ phases, edges }`, edges in snapshot order. Either \
 moves only when the phase struct gains or loses a field, when the seeded graph changes, or when a \
 resolved value does — the template versions, the `7200` deadline default, the denormalised \
 `agent_name`, the project's `token_budget`. Every one of those also changes the digest a *stored* \
@@ -1346,6 +1837,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
         /// `revision` moves) right after it answers `resolve_graph` — an edit landing between the
         /// read and the clone's write.
         race: Option<StepGraphId>,
+        /// MOD-138 D10: a phase (by name) this source leaves out of its `resolve_graph` answer
+        /// while keeping the edges that name it — a read that raced a delete.
+        dropped: Option<&'static str>,
     }
 
     impl<'a> TestSource<'a> {
@@ -1356,6 +1850,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 candidates: vec![(ids::AGENT_CLAUDE, "sonnet")],
                 unbacked: None,
                 race: None,
+                dropped: None,
             }
         }
 
@@ -1366,6 +1861,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 candidates: Vec::new(),
                 unbacked: None,
                 race: None,
+                dropped: None,
             }
         }
     }
@@ -1373,6 +1869,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
     impl GraphSource for TestSource<'_> {
         async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
             let mut graph = self.store.resolve_graph(item).await?;
+            if let (Some(name), Some(graph)) = (self.dropped, graph.as_mut()) {
+                graph.phases.retain(|row| row.phase.name != name);
+            }
             if let (Some(id), Some(graph)) = (self.unbacked, graph.as_mut()) {
                 let first = graph
                     .phases
@@ -1504,16 +2003,24 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let resolved = resolve_feat(&store, &TestSource::claude(&store))
             .await
             .expect("the seeded feature graph resolves");
+        // MOD-138 F14: the v1 digest of the same phases is unchanged, because the v2 node fields
+        // are skipped at their defaults; that is D1's cross-build byte-identity proof.
         assert_eq!(
-            resolved.snapshot.topology, FEATURE_TOPOLOGY,
+            super::topology(&resolved.snapshot.phases).expect("`SnapshotPhase` serialises"),
+            FEATURE_TOPOLOGY,
+            "{TOPOLOGY_MOVED}"
+        );
+        assert_eq!(
+            resolved.snapshot.topology, FEATURE_TOPOLOGY_V2,
             "{TOPOLOGY_MOVED}"
         );
         assert_eq!(
             resolved.snapshot.topology,
-            super::topology(&resolved.snapshot.phases).expect("`SnapshotPhase` serialises"),
-            "the snapshot carries the digest of its own phases"
+            topology_v2(&resolved.snapshot.phases, &resolved.snapshot.edges)
+                .expect("the snapshot serialises"),
+            "the snapshot carries the v2 digest of its own phases and edges"
         );
-        assert_eq!(resolved.snapshot.v, 1, "{TOPOLOGY_MOVED}");
+        assert_eq!(resolved.snapshot.v, 2, "{TOPOLOGY_MOVED}");
     }
 
     /// `UNIQUE (graph_id, position)` permits gaps; the snapshot builder is what closes them
@@ -1728,7 +2235,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(snapshot.settings.per_token_cap_run, Some(7));
         assert_eq!(snapshot.settings.per_token_cap_batch, Some(9));
         assert_ne!(
-            snapshot.topology, FEATURE_TOPOLOGY,
+            snapshot.topology, FEATURE_TOPOLOGY_V2,
             "a resolved value moving is a different topology, which is the point of the digest"
         );
     }
@@ -1986,6 +2493,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 if phase.graph_id == ids::GRAPH_HTUI_FEAT && phase.name == "implement" {
                     phase.isolation = Some(Isolation::Local);
                     phase.fan_out = 3;
+                    // MOD-138 T4: resolve validates the row (`ck_phase_split_fan_out`).
+                    phase.split = Split::Compete;
                 }
             }
         });
@@ -2303,7 +2812,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .await
         .expect("the override resolves");
         assert_eq!(resolved.snapshot.graph.id, clone.id);
-        assert_eq!(resolved.snapshot.topology, FEATURE_TOPOLOGY);
+        // MOD-138 F14: the clone has the same keys and edges, so the same v2 digest too.
+        assert_eq!(resolved.snapshot.topology, FEATURE_TOPOLOGY_V2);
     }
 
     /// MOD-37 R-6: the clone carries `phase_agent` too. Each source phase's candidate rows are
@@ -3553,12 +4063,203 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(error, ResolveError::NoGraph(ids::HTUI_FEAT_1));
     }
 
+    /// MOD-138 D12: a library graph `libflow` holding a copy of `feature`'s `implement` and
+    /// `review` rows (built row by row, so D7 gives it default edges), made `FEAT`'s kind default
+    /// through `update_item_kind`, which takes a library graph since D12. Returns its id.
+    async fn feat_on_a_library_graph(store: &MemStore) -> StepGraphId {
+        let library = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Library,
+                name: "libflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a library graph");
+        let feature = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        for (position, name) in [(0, "implement"), (1, "review")] {
+            let row = feature
+                .iter()
+                .find(|row| row.name == name)
+                .expect("the feature graph has the phase");
+            store
+                .create_phase(&StepGraphPhase {
+                    id: PhaseId::new(),
+                    graph_id: library.id,
+                    position,
+                    ..row.clone()
+                })
+                .await
+                .expect("the phase lands");
+        }
+        let kind = store
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|kind| kind.id == ids::KIND_HTUI_FEAT)
+            .expect("the fixture's FEAT kind");
+        let outcome = store
+            .update_item_kind(
+                kind.id,
+                kind.updated_at,
+                htui_core::model::ItemKindPatch {
+                    default_graph_id: Some(library.id),
+                    ..htui_core::model::ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect("a kind takes a library graph (D12)");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        library.id
+    }
+
+    /// MOD-138 D12: an item whose kind defaults to a library graph runs it, frozen with the
+    /// library scope, and its templates resolve in the **item's** project: `htui`'s own newer
+    /// `review` template is the one pinned.
+    #[tokio::test]
+    async fn an_items_run_resolves_a_library_graph_with_the_projects_templates() {
+        let store = store_with(|data| {
+            let latest = data
+                .templates
+                .iter()
+                .filter(|row| row.project_id == ids::PROJECT_HTUI && row.name == "review")
+                .max_by_key(|row| row.version)
+                .cloned()
+                .expect("the fixture seeds a `review` template");
+            data.templates.push(PromptTemplate {
+                id: PromptTemplateId::new(),
+                version: latest.version + 1,
+                ..latest
+            });
+        });
+        let library = feat_on_a_library_graph(&store).await;
+        let newest = store
+            .prompt_template(ids::PROJECT_HTUI, "review", None)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("htui's review template")
+            .version;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a library graph resolves")
+            .snapshot;
+
+        assert_eq!(snapshot.graph.id, library);
+        assert_eq!(snapshot.graph.scope, Some(GraphScope::Library));
+        assert_eq!(
+            snapshot.source,
+            Some(SnapshotSource {
+                how: SourceHow::KindDefault
+            })
+        );
+        assert_eq!(
+            snapshot
+                .phases
+                .iter()
+                .map(|phase| phase.name.as_str())
+                .collect::<Vec<_>>(),
+            ["implement", "review"]
+        );
+        assert_eq!(
+            snapshot.phases[1].template,
+            SnapshotTemplate {
+                name: "review".to_owned(),
+                version: newest,
+            },
+            "the template is the item's project's latest"
+        );
+        assert_eq!(
+            snapshot.edges,
+            default_snapshot_edges(&snapshot.phases),
+            "built row by row, the library graph is default-edged"
+        );
+    }
+
+    /// MOD-138 D12: overriding an item whose graph is a library graph clones it into the item's
+    /// project, edges copied; a re-override re-clones from the library graph (the kind default).
+    #[tokio::test]
+    async fn an_override_of_a_library_graph_clones_into_the_project() {
+        let store = MemStore::demo();
+        let library = feat_on_a_library_graph(&store).await;
+        let source = TestSource::claude(&store);
+        let library_phases = store
+            .phases(library)
+            .await
+            .expect("MemStore never fails a read");
+        let library_edges = store
+            .graph_edges(library)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(!library_edges.is_empty(), "the library graph has edges");
+
+        let clone = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override of the library graph");
+        assert_eq!(clone.scope, GraphScope::Project(ids::PROJECT_HTUI));
+        assert!(clone.is_override);
+        let phases = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        let edges = store
+            .graph_edges(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            named_edges(&phases, &edges),
+            named_edges(&library_phases, &library_edges),
+            "the library graph's edges, remapped onto the clone"
+        );
+        assert_edges_are_the_clones(&store, clone.id, &library_edges).await;
+
+        let pointed = feat_1(&store).await;
+        assert_eq!(pointed.step_graph_id, Some(clone.id));
+        let again = override_graph(&store, &source, &pointed)
+            .await
+            .expect("a second override re-clones");
+        assert_eq!(again.id, clone.id, "the same override graph");
+        assert_eq!(again.scope, GraphScope::Project(ids::PROJECT_HTUI));
+        let recloned = store
+            .phases(again.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            recloned.iter().map(|row| &row.name).collect::<Vec<_>>(),
+            library_phases
+                .iter()
+                .map(|row| &row.name)
+                .collect::<Vec<_>>(),
+            "re-cloned from the library graph, the kind's default"
+        );
+        assert!(
+            recloned
+                .iter()
+                .all(|row| !phases.iter().any(|first| first.id == row.id)),
+            "with fresh phase ids"
+        );
+        let graph = store
+            .graph_body(library)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the library graph is untouched");
+        assert_eq!(graph.graph.scope, GraphScope::Library);
+    }
+
     /// `feature`'s `phase` with `fan_out` set, and `htui`'s settings naming `agy` as the judge.
     fn store_fanned(graph: StepGraphId, phase: &str, fan_out: i32) -> MemStore {
         let store = store_with(|data| {
             for row in &mut data.phases {
                 if row.graph_id == graph && row.name == phase {
                     row.fan_out = fan_out;
+                    // MOD-138 T4: resolve validates the row, and `ck_phase_split_fan_out` holds
+                    // `compete` to exactly `fan_out > 1`.
+                    row.split = Split::for_fan_out(fan_out);
                 }
             }
         });
@@ -3613,6 +4314,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
             for row in &mut data.phases {
                 if row.graph_id == ids::GRAPH_HTUI_FEAT && row.name == "implement" {
                     row.fan_out = 2;
+                    // MOD-138 T4: resolve validates the row (`ck_phase_split_fan_out`).
+                    row.split = Split::Compete;
                 }
             }
         });
@@ -3745,6 +4448,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
                         "implement" => row.fan_out = 3,
                         _ => {}
                     }
+                    // MOD-138 T4: resolve validates the row (`ck_phase_split_fan_out`).
+                    row.split = Split::for_fan_out(row.fan_out);
                 }
             }
         });
@@ -3884,14 +4589,18 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
-    /// MOD-26 D9, I-7: a persona-less graph keeps [`FEATURE_TOPOLOGY`]; binding one phase moves it.
+    /// MOD-26 D9, I-7: a persona-less graph keeps [`FEATURE_TOPOLOGY_V2`]; binding one phase moves
+    /// it.
     #[tokio::test]
     async fn only_a_bound_phase_moves_the_topology() {
         let store = MemStore::demo();
         let bare = resolve_feat(&store, &TestSource::claude(&store))
             .await
             .expect("the seeded feature graph resolves");
-        assert_eq!(bare.snapshot.topology, FEATURE_TOPOLOGY, "{TOPOLOGY_MOVED}");
+        assert_eq!(
+            bare.snapshot.topology, FEATURE_TOPOLOGY_V2,
+            "{TOPOLOGY_MOVED}"
+        );
         assert!(
             bare.snapshot.personas.is_empty(),
             "no bound phase, no frozen persona"
@@ -3902,7 +4611,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("the bound feature graph resolves");
         assert_ne!(
-            bound.snapshot.topology, FEATURE_TOPOLOGY,
+            bound.snapshot.topology, FEATURE_TOPOLOGY_V2,
             "a bound phase's digest names its persona (MOD-26 D9)"
         );
     }
@@ -3928,5 +4637,530 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 "persona",
             )))
         );
+    }
+
+    // ---- MOD-138 T4: resolve builds snapshot v2 ----
+
+    /// `FEAT-1` re-pointed by `edit`, the rest of the demo fixture as it is.
+    fn store_with_feat_1(edit: impl Fn(&mut Item)) -> MemStore {
+        store_with(|data| {
+            for item in &mut data.items {
+                if item.id == ids::HTUI_FEAT_1 {
+                    edit(item);
+                }
+            }
+        })
+    }
+
+    /// The `feature` graph's phase called `name` in the demo fixture.
+    fn feature_phase(data: &DemoData, name: &str) -> PhaseId {
+        data.phases
+            .iter()
+            .find(|phase| phase.graph_id == ids::GRAPH_HTUI_FEAT && phase.name == name)
+            .map(|phase| phase.id)
+            .expect("the seeded feature graph has the phase")
+    }
+
+    /// The seeded `feature` graph, rewritten through `replace_graph` after `edit`.
+    async fn replace_feature(store: &MemStore, edit: impl FnOnce(&mut GraphBody)) {
+        let mut body = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the seeded feature graph is there");
+        edit(&mut body);
+        let outcome = store
+            .replace_graph(ids::GRAPH_HTUI_FEAT, body.graph.revision, body)
+            .await
+            .expect("the store takes the edited graph");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// MOD-138 D10, D1 (plan acceptance): every seeded kind's default graph resolves to a v2
+    /// snapshot whose edges are its default edges, carrying the graph's scope and revision and
+    /// the kind-default source.
+    #[tokio::test]
+    async fn every_seeded_kind_resolves_to_its_default_edges() {
+        let kinds: Vec<_> = demo_data()
+            .kinds
+            .into_iter()
+            .filter(|kind| kind.project_id == ids::PROJECT_HTUI)
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            htui_core::seed::KINDS.len(),
+            "one per seed kind"
+        );
+        for kind in kinds {
+            let store = store_with_feat_1(|item| {
+                item.kind_id = kind.id;
+                item.step_graph_id = None;
+            });
+            let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+                .await
+                .unwrap_or_else(|err| panic!("kind `{}` resolves: {err}", kind.name))
+                .snapshot;
+            assert_eq!(snapshot.v, GraphSnapshot::V, "{}", kind.name);
+            assert_eq!(snapshot.graph.id, kind.default_graph_id, "{}", kind.name);
+            assert_eq!(
+                snapshot.edges,
+                default_snapshot_edges(&snapshot.phases),
+                "kind `{}` freezes its default edges",
+                kind.name
+            );
+            assert_eq!(
+                snapshot.source,
+                Some(SnapshotSource {
+                    how: SourceHow::KindDefault
+                }),
+                "{}",
+                kind.name
+            );
+            assert_eq!(
+                snapshot.graph.scope,
+                Some(GraphScope::Project(ids::PROJECT_HTUI)),
+                "{}",
+                kind.name
+            );
+            assert_eq!(snapshot.graph.revision, Some(0), "{}", kind.name);
+            assert!(
+                snapshot
+                    .phases
+                    .iter()
+                    .all(|phase| phase.role == NodeRole::Step && !phase.palette),
+                "kind `{}`: every seeded node is a plain step",
+                kind.name
+            );
+            assert_eq!(
+                snapshot.topology,
+                topology_v2(&snapshot.phases, &snapshot.edges).expect("the snapshot serialises"),
+                "{}",
+                kind.name
+            );
+        }
+    }
+
+    /// MOD-138 D13, D1: the bounds are frozen from `app_setting` over their code defaults, and
+    /// the source says whether the item pinned its graph. Neither is in the digest (D3).
+    #[tokio::test]
+    async fn a_snapshot_freezes_the_bounds_and_the_source() {
+        let store = MemStore::demo();
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        let bounds = |snapshot: &GraphSnapshot| {
+            (
+                snapshot.settings.max_parallel_sessions,
+                snapshot.settings.max_plan_revisions,
+                snapshot.settings.max_child_runs,
+                snapshot.settings.runtime_changes,
+            )
+        };
+        assert_eq!(
+            bounds(&snapshot),
+            (4, 3, 8, RuntimeChanges::Ask),
+            "defaults"
+        );
+        assert_eq!(
+            snapshot.source,
+            Some(SnapshotSource {
+                how: SourceHow::KindDefault
+            })
+        );
+
+        let app: BTreeMap<String, Value> = [
+            ("max_parallel_sessions".to_owned(), json!(7)),
+            ("max_plan_revisions".to_owned(), json!(2)),
+            ("max_child_runs".to_owned(), json!(3)),
+            ("runtime_changes".to_owned(), json!("off")),
+        ]
+        .into_iter()
+        .collect();
+        let item = feat_1(&store).await;
+        let set = resolve(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &app,
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the seeded feature graph resolves")
+        .snapshot;
+        assert_eq!(bounds(&set), (7, 2, 3, RuntimeChanges::Off), "frozen");
+        assert_eq!(set.topology, snapshot.topology, "the bounds are not hashed");
+
+        let pinned = store_with_feat_1(|item| item.step_graph_id = Some(ids::GRAPH_HTUI_FEAT));
+        let pin = resolve_feat(&pinned, &TestSource::claude(&pinned))
+            .await
+            .expect("the pinned graph resolves")
+            .snapshot;
+        assert_eq!(
+            pin.source,
+            Some(SnapshotSource {
+                how: SourceHow::Pin
+            })
+        );
+        assert_eq!(pin.topology, snapshot.topology, "the source is not hashed");
+    }
+
+    /// MOD-138 D11, D6(a): a `divide` node is expanded (so the validator checks the expansion),
+    /// then refused until MOD-139 lands divided fan-out.
+    #[tokio::test]
+    async fn a_divide_node_is_expanded_then_refused() {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let node = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has `implement`");
+            node.phase.split = Split::Divide;
+            node.phase.fan_out = 1;
+            node.phase.max_parts = Some(2);
+            node.parts = vec![PhasePart {
+                phase_id: node.phase.id,
+                position: 0,
+                key: "api".to_owned(),
+                title: "The API".to_owned(),
+                brief: String::new(),
+                owned_paths: vec!["src/api".to_owned()],
+                acceptance: None,
+                agent_id: None,
+                model: None,
+                persona_id: None,
+            }];
+        })
+        .await;
+        let error = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect_err("a divide node cannot run yet");
+        assert_eq!(
+            error,
+            ResolveError::NotYetRunnable {
+                node: "implement".to_owned(),
+                reason: NotRunnable::Divide,
+            }
+        );
+        assert!(error.to_string().contains("MOD-139"), "{error}");
+    }
+
+    /// The seeded `feature` resolve's phases and edges, for the pure tests below.
+    async fn feature_phases_and_edges() -> (Vec<super::SnapshotPhase>, Vec<SnapshotEdge>) {
+        let store = MemStore::demo();
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        (snapshot.phases, snapshot.edges)
+    }
+
+    /// MOD-138 D11: `implement` becomes `implement:plan` (planner) then `implement` (integrate),
+    /// later nodes shift by one, edges into it move to the planner and a synthetic `next` joins
+    /// the two.
+    #[tokio::test]
+    async fn expand_divide_splits_reroutes_and_shifts() {
+        let (mut phases, edges) = feature_phases_and_edges().await;
+        let block = SnapshotDivide {
+            max_parts: Some(2),
+            ..SnapshotDivide::default()
+        };
+        phases[2].divide = Some(block.clone());
+        phases[2].plan_scope = Some(PlanScope::Parts);
+        let (phases, edges) = expand_divide("feature", phases, edges).expect("no key is taken");
+
+        let nodes: Vec<(i32, &str, NodeRole)> = phases
+            .iter()
+            .map(|phase| (phase.position, phase.name.as_str(), phase.role))
+            .collect();
+        assert_eq!(
+            nodes,
+            [
+                (0, "prd", NodeRole::Step),
+                (1, "plan", NodeRole::Step),
+                (2, "implement:plan", NodeRole::Planner),
+                (3, "implement", NodeRole::Integrate),
+                (4, "review", NodeRole::Step),
+            ]
+        );
+        assert_eq!(
+            phases[2].plan_scope,
+            Some(PlanScope::Parts),
+            "the planner's"
+        );
+        assert_eq!(
+            phases[3].plan_scope, None,
+            "the integrate node plans nothing"
+        );
+        assert_eq!(phases[2].divide.as_ref(), Some(&block));
+        assert_eq!(phases[3].divide.as_ref(), Some(&block));
+
+        let shape: Vec<(&str, &str, EdgeKind)> = edges
+            .iter()
+            .map(|edge| (edge.from.as_str(), edge.to.as_str(), edge.kind))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("prd", "plan", EdgeKind::Next),
+                ("plan", "implement:plan", EdgeKind::Next),
+                ("implement:plan", "implement", EdgeKind::Next),
+                ("implement", "review", EdgeKind::Next),
+                ("review", "implement:plan", EdgeKind::ChangesRequested),
+            ],
+            "the review loop is re-pointed at the planner"
+        );
+    }
+
+    /// MOD-138 D11: a node already keyed `<name>:plan` refuses the expansion.
+    #[tokio::test]
+    async fn expand_divide_refuses_a_taken_plan_key() {
+        let (mut phases, _) = feature_phases_and_edges().await;
+        phases[1].name = "implement:plan".to_owned();
+        phases[2].divide = Some(SnapshotDivide::default());
+        let error = expand_divide("feature", phases, Vec::new()).expect_err("the key is taken");
+        assert_eq!(
+            error,
+            ResolveError::InvalidGraph {
+                graph: "feature".to_owned(),
+                reason: "phase name `implement:plan` is taken by the expansion of divide phase \
+                         `implement`"
+                    .to_owned(),
+            }
+        );
+    }
+
+    /// MOD-138 D6(b): a palette node is placed by a planner, which runs from MOD-140 on.
+    #[tokio::test]
+    async fn a_palette_node_is_refused() {
+        let store = store_with(|data| {
+            let prd = feature_phase(data, "prd");
+            for phase in &mut data.phases {
+                if phase.id == prd {
+                    phase.palette = true;
+                }
+            }
+            // A palette node has no edges (MOD-137 rule e).
+            data.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        });
+        let error = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect_err("a palette node cannot run yet");
+        assert_eq!(
+            error,
+            ResolveError::NotYetRunnable {
+                node: "prd".to_owned(),
+                reason: NotRunnable::Palette,
+            }
+        );
+    }
+
+    /// MOD-138 blueprint A6: `resolve_or_refused` hands D6's refusal back beside the live phases
+    /// it built first, in position order, which a v1 run's resume compares on its v1 digest.
+    #[tokio::test]
+    async fn a_refusal_carries_the_live_phases() {
+        let store = store_with(|data| {
+            let prd = feature_phase(data, "prd");
+            for phase in &mut data.phases {
+                if phase.id == prd {
+                    phase.palette = true;
+                }
+            }
+            data.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        });
+        let item = feat_1(&store).await;
+        let resolution = super::resolve_or_refused(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("only D6 refuses the graph");
+        let super::Resolution::Refused { phases, refusal } = resolution else {
+            panic!("a palette node is refused");
+        };
+        assert_eq!(
+            refusal,
+            ResolveError::NotYetRunnable {
+                node: "prd".to_owned(),
+                reason: NotRunnable::Palette,
+            }
+        );
+        let names: Vec<(i32, &str, bool)> = phases
+            .iter()
+            .map(|phase| (phase.position, phase.name.as_str(), phase.palette))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (0, "prd", true),
+                (1, "plan", false),
+                (2, "implement", false),
+                (3, "review", false),
+            ]
+        );
+    }
+
+    /// MOD-138 D6(c): edges other than the default ones run once M2's readiness walker lands.
+    #[tokio::test]
+    async fn non_default_edges_are_refused() {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let id = |name: &str| {
+                body.nodes
+                    .iter()
+                    .find(|node| node.phase.name == name)
+                    .map(|node| node.phase.id)
+                    .expect("the feature graph has the phase")
+            };
+            let (review, plan) = (id("review"), id("plan"));
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from: review,
+                to: plan,
+                kind: EdgeKind::AsksYou,
+                predicate: None,
+                loop_limit: None,
+            });
+        })
+        .await;
+        let error = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect_err("a non-default edge cannot run yet");
+        assert_eq!(
+            error,
+            ResolveError::NotYetRunnable {
+                node: "review".to_owned(),
+                reason: NotRunnable::NonDefaultEdges,
+            }
+        );
+    }
+
+    /// MOD-138 D9: a live graph the validator refuses (a forward cycle, planted under
+    /// `replace_graph`) is refused at resolve with the very sentence the store gives at save.
+    #[tokio::test]
+    async fn an_invalid_live_graph_is_refused_with_the_validators_sentence() {
+        let store = store_with(|data| {
+            let (implement, plan) = (
+                feature_phase(data, "implement"),
+                feature_phase(data, "plan"),
+            );
+            data.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from: implement,
+                to: plan,
+                kind: EdgeKind::Next,
+                predicate: None,
+                loop_limit: None,
+            });
+        });
+        let body = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the seeded feature graph is there");
+        let sentence =
+            graph_body_walk_refusal(ids::GRAPH_HTUI_FEAT, &body).expect("the store refuses it");
+        assert_eq!(
+            sentence,
+            forward_edges_form_a_cycle(&["plan", "implement", "plan"], ids::GRAPH_HTUI_FEAT)
+        );
+        let error = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect_err("an invalid graph is refused");
+        assert_eq!(
+            error,
+            ResolveError::InvalidGraph {
+                graph: "feature".to_owned(),
+                reason: sentence,
+            }
+        );
+    }
+
+    /// MOD-138 D10: an edge naming a phase the read did not return is a graph that moved while
+    /// it was being resolved (the `override_graph` precedent).
+    #[tokio::test]
+    async fn an_edge_outside_the_read_is_refused_as_moved() {
+        let store = MemStore::demo();
+        let source = TestSource {
+            dropped: Some("plan"),
+            ..TestSource::claude(&store)
+        };
+        let error = resolve_feat(&store, &source)
+            .await
+            .expect_err("a torn read is refused");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(
+                "graph `feature` moved while it was being resolved; start the run again".to_owned()
+            ))
+        );
+    }
+
+    /// MOD-138 D3: the v2 digest reads the edges in snapshot order whatever order it is handed,
+    /// moves with any node or edge field, and does not depend on a predicate's key order (F5).
+    #[tokio::test]
+    async fn topology_v2_ignores_edge_order() {
+        let (phases, edges) = feature_phases_and_edges().await;
+        let digest = topology_v2(&phases, &edges).expect("the snapshot serialises");
+        let mut reversed = edges.clone();
+        reversed.reverse();
+        assert_ne!(reversed, edges, "the reversal moves something");
+        assert_eq!(topology_v2(&phases, &reversed).expect("serialises"), digest);
+
+        let mut limited = edges.clone();
+        let review_loop = limited
+            .iter_mut()
+            .find(|edge| edge.kind == EdgeKind::ChangesRequested)
+            .expect("the seeded loop");
+        review_loop.loop_limit = Some(9);
+        assert_ne!(
+            topology_v2(&phases, &limited).expect("serialises"),
+            digest,
+            "a loop limit"
+        );
+        let mut kinded = edges.clone();
+        kinded[0].kind = EdgeKind::AsksYou;
+        assert_ne!(
+            topology_v2(&phases, &kinded).expect("serialises"),
+            digest,
+            "an edge kind"
+        );
+        let mut retried = phases.clone();
+        retried[0].retry_limit += 1;
+        assert_ne!(
+            topology_v2(&retried, &edges).expect("serialises"),
+            digest,
+            "a node field"
+        );
+
+        let with_predicate = |pairs: &[(&str, Value)]| {
+            let mut map = serde_json::Map::new();
+            for (key, value) in pairs {
+                map.insert((*key).to_owned(), value.clone());
+            }
+            let mut edges = edges.clone();
+            edges.push(SnapshotEdge {
+                from: "plan".to_owned(),
+                to: "review".to_owned(),
+                kind: EdgeKind::If,
+                predicate: Some(EdgePredicate(Value::Object(map))),
+                loop_limit: None,
+            });
+            topology_v2(&phases, &edges).expect("serialises")
+        };
+        let one = with_predicate(&[("verdict", json!("approve")), ("min", json!(2))]);
+        let other = with_predicate(&[("min", json!(2)), ("verdict", json!("approve"))]);
+        assert_eq!(one, other, "a predicate's key order is not hashed");
+        assert_ne!(one, digest, "a predicate is");
     }
 }

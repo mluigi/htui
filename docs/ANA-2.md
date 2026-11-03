@@ -114,7 +114,10 @@ enforcement point in this design.
    *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.2, `docs/decisions/ana/ana-33.md`):* a v2 run is
    pinned to its snapshot. Resume checks that the snapshot's `topology` and each admitted plan's `digest`
    recompute from their own content and no longer compares against the live graph; the topology-hash
-   refusal above holds for v1 runs only.
+   refusal above holds for v1 runs only. *Landed in MOD-138 M1 (2026-11-03, `docs/decisions/mod/mod-138-decisions.md`):*
+   a v2 run whose own phases and edges no longer hash to its `topology` parks as "snapshot tampered"; a
+   v1 run compares its lifted snapshot with the live graph, and a live graph M1 refuses to start is
+   compared on the phases alone, as before MOD-138 (plan amendment A6).
 3. **No agent in a bookkeeping path.** Gate resolution, status moves, overlap admission, isolation
    setup, commit capture, selection bookkeeping and close-out are deterministic code (`R-ID-6`).
    The judge is the single exception `R-ORCH-7` grants, and it decides one thing only: which

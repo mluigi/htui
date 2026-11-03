@@ -724,6 +724,9 @@ impl WriteStore for SpyStore {
     async fn step_graphs(&self, project: ProjectId) -> StoreResult<Vec<StepGraph>> {
         self.inner.step_graphs(project).await
     }
+    async fn usable_graphs(&self, project: ProjectId) -> StoreResult<Vec<StepGraph>> {
+        self.inner.usable_graphs(project).await
+    }
     async fn create_phase(&self, phase: &StepGraphPhase) -> StoreResult<StepGraphPhase> {
         self.inner.create_phase(phase).await
     }

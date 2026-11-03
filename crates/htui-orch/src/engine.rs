@@ -545,21 +545,59 @@ where
 /// go looking for. The note is still written — it is what an operator reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
-    /// The snapshot was walked. Either the live graph still hashes to the run's own `topology`,
-    /// or the live graph no longer resolves under a start-time rule (a fan-out or agent cap, a
-    /// review or local fan-out, no candidate) and so was not compared at all: the item's
-    /// `live graph not comparable` note says which rule refused it.
+    /// The snapshot was walked: a v2 run whose snapshot recomputes to its own `topology`
+    /// (MOD-138 D5), or a v1 run whose live graph still hashes to the lifted snapshot's v2
+    /// digest, or whose live graph M1 refuses (D6, D9) but whose live phases still hash to the
+    /// run's own v1 phase-only digest (blueprint A6). A v1 run whose live graph no longer
+    /// resolves under a start-time rule (a fan-out or agent cap, a review or local fan-out, no
+    /// candidate) was not compared at all: the item's `live graph not comparable` note says
+    /// which rule refused it.
     Walked(Rest),
-    /// The live graph moved. **Nothing was advanced**: invariant 2 says a run walks its snapshot,
-    /// and §4.9's resume says a mismatch is a human's decision, not the engine's.
+    /// A v1 run's live graph moved (MOD-138 D5). **Nothing was advanced**: invariant 2 says a run
+    /// walks its snapshot, and §4.9's resume says a mismatch is a human's decision, not the
+    /// engine's.
     TopologyChanged {
-        /// `run.graph_snapshot.topology`, the digest this run walks.
+        /// The lifted snapshot's v2 digest ([`graph::topology_v2`] over its phases and its
+        /// lifted edges), the graph this run walks. When M1 refuses the live graph (D6, D9) once
+        /// its phases are built, the run's v1 phase-only digest ([`graph::topology`]) instead
+        /// (blueprint A6).
         snapshot: String,
-        /// What the live graph hashes to now.
+        /// The live graph's v2 digest; when M1 refuses the live graph once its phases are built,
+        /// the live phases' v1 digest (A6); when it refuses it before (D9's validator, with a
+        /// phase that then fails to build), `not runnable: <refusal>`.
         live: String,
         /// Where the run is, unchanged.
         rest: Rest,
     },
+    /// MOD-138 D5: a v2 run whose snapshot no longer hashes to its own `topology`. Nothing
+    /// advanced; parked like [`Resume::TopologyChanged`], and the live graph was never read.
+    SnapshotTampered {
+        /// `run.graph_snapshot.topology`, as stored.
+        stored: String,
+        /// [`graph::topology_v2`] over the snapshot's own phases and edges.
+        recomputed: String,
+        /// Where the run is, unchanged.
+        rest: Rest,
+    },
+}
+
+/// MOD-138 blueprint A6: the v1 phase-only digest ([`graph::topology`]) of `phases` as a
+/// pre-MOD-138 binary froze them, without D1's four node fields (`role`, `palette`, `plan_scope`,
+/// `divide`), which it never recorded. So a v1 run frozen on a phase since marked palette, or
+/// given a plan scope, still hashes to the live graph's phases. A v1 snapshot's own phases carry
+/// those fields at their defaults already, so its digest is the one it stored.
+fn v1_topology(phases: &[SnapshotPhase]) -> Result<String, ResolveError> {
+    let phases: Vec<SnapshotPhase> = phases
+        .iter()
+        .map(|phase| SnapshotPhase {
+            role: htui_core::model::NodeRole::default(),
+            palette: false,
+            plan_scope: None,
+            divide: None,
+            ..phase.clone()
+        })
+        .collect();
+    graph::topology(&phases)
 }
 
 /// One run [`Engine::sweep`] adopted, and what it left the run owing (plan D98, D117).
@@ -1781,7 +1819,9 @@ where
                     .await?;
                 Some(match self.parts.tails {
                     Tails::Walk => match self.resume(run).await? {
-                        Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                        Resume::Walked(rest)
+                        | Resume::TopologyChanged { rest, .. }
+                        | Resume::SnapshotTampered { rest, .. } => rest,
                     },
                     Tails::HandBack => self.hand_back_resume(run).await?,
                 })
@@ -3111,12 +3151,19 @@ where
     /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): what §4.9's sweep does before it advances a
     /// run it did not start.
     ///
-    /// Re-resolves the item's **live** graph and compares its [`graph::topology`] with the digest
-    /// the run's own snapshot carries. On a mismatch the walk is not advanced and an `item_note`
-    /// records both digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9
-    /// says the divergence is a human's decision rather than the engine's.
+    /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its [`graph::topology_v2`]
+    /// is recomputed from the snapshot's own phases and edges, and the live graph is never read;
+    /// a recomputed digest that differs from the stored one is [`Resume::SnapshotTampered`].
     ///
-    /// A live graph that **refuses to resolve** for a reason that is a rule about starting a run —
+    /// A **v1** run re-resolves the item's **live** graph and compares its v2 digest with the
+    /// lifted snapshot's. On a mismatch the walk is not advanced and an `item_note` records both
+    /// digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the
+    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses (D6, D9)
+    /// once its phases are built is compared on the v1 phase-only digest (blueprint A6): equal
+    /// walks on, different is such a mismatch. One refused before any phase could be built is a
+    /// mismatch.
+    ///
+    /// A v1 run's live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
     /// ANA-2 §4.6), a phase left with no candidate (§4.1 rung 4), a `touched_paths` entry naming a
     /// repo the project does not carry (plan D81) — has no topology to compare.
@@ -3156,13 +3203,43 @@ where
         Ok(Resume::Walked(rest))
     }
 
-    /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and
-    /// `Some(Resume::TopologyChanged)` is the mismatch, with its note written.
+    /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and `Some` is
+    /// a [`Resume::TopologyChanged`] or [`Resume::SnapshotTampered`] park, with its note written.
+    ///
+    /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its digest is recomputed
+    /// from its own phases and edges ([`graph::topology_v2`]) and the live graph is never read.
+    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare, edge-aware: the
+    /// live graph's v2 digest against the lifted snapshot's. Blueprint A6: a live graph M1
+    /// refuses as not yet runnable or invalid (D6, D9) is compared as before MOD-138, on the v1
+    /// phase-only digest of its live phases against the run's own ([`v1_topology`]), since a v1
+    /// run always walked by position: equal walks on, different parks with the topology note. A
+    /// refusal raised before any phase could be built has nothing to compare, and is a mismatch.
     async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
-        let live = match graph::resolve(
+        if snapshot.v >= GraphSnapshot::V {
+            // D5 v2: pinned; the live graph is never read.
+            let recomputed = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
+            if recomputed == snapshot.topology {
+                return Ok(None);
+            }
+            let body = format!(
+                "snapshot tampered: run {run} carries topology `{}`, but its own phases and edges \
+                 hash to `{recomputed}`; the walk is not advanced (ANA-33 §7.2, invariant 2)",
+                snapshot.topology
+            );
+            let rest = Box::pin(self.park_on_resume(row, item.id, body)).await?;
+            return Ok(Some(Resume::SnapshotTampered {
+                stored: snapshot.topology,
+                recomputed,
+                rest,
+            }));
+        }
+
+        // D5 v1: the live compare, edge-aware.
+        let lifted = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
+        let (walks, live) = match Box::pin(graph::resolve_or_refused(
             self.parts.store,
             self.parts.graphs,
             &item,
@@ -3170,10 +3247,19 @@ where
             &self.parts.app,
             Some(&row.repo_scope),
             self.parts.box_id,
-        )
+        ))
         .await
         {
-            Ok(live) => live,
+            Ok(graph::Resolution::Resolved(live)) => (lifted.clone(), live.snapshot.topology),
+            // Blueprint A6: a live graph M1 refuses (D6, D9) is compared on the v1 phase-only
+            // digest, as before MOD-138; its edges never moved a v1 walk.
+            Ok(graph::Resolution::Refused { phases, .. }) => {
+                (v1_topology(&snapshot.phases)?, v1_topology(&phases)?)
+            }
+            // A6: refused before a phase could be built, so nothing compares; it did change.
+            Err(
+                err @ (ResolveError::NotYetRunnable { .. } | ResolveError::InvalidGraph { .. }),
+            ) => (lifted.clone(), format!("not runnable: {err}")),
             Err(err @ ResolveError::ProjectCaps { .. }) => {
                 // A malformed cap would otherwise add an item note on every resume; the run keeps
                 // walking its snapshot, and the cause is logged instead.
@@ -3194,9 +3280,8 @@ where
                 | ResolveError::UnknownTouchedRepo { .. }),
             ) => {
                 let body = format!(
-                    "live graph not comparable: run {run} walks its snapshot `{}` \
-                     (invariant 2); the live graph does not resolve: {err}",
-                    snapshot.topology
+                    "live graph not comparable: run {run} walks its snapshot `{lifted}` \
+                     (invariant 2); the live graph does not resolve: {err}"
                 );
                 self.note(item.id, body, None, self.now()).await?;
                 return Ok(None);
@@ -3204,46 +3289,57 @@ where
             Err(err) => return Err(err.into()),
         };
 
-        if live.snapshot.topology != snapshot.topology {
-            let now = self.now();
-            self.parts
-                .store
-                .add_note(NewNote {
-                    id: NoteId::new(),
-                    item_id: item.id,
-                    body: format!(
-                        "topology mismatch: run {run} walks `{}`, the live graph is `{}`; \
-                         the walk is not advanced (ANA-2 §4.9, invariant 2)",
-                        snapshot.topology, live.snapshot.topology
-                    ),
-                    created_by: self.parts.user,
-                    box_id: Some(self.parts.box_id),
-                    via_step_id: None,
-                    created_at: now,
-                })
-                .await?;
-            // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the
-            // mismatch is addressed to — run, then item — rather than being handed back to every
-            // sweep as a `running` run. A run already parked is left as it is.
-            let row = if row.status == RunStatus::Running {
-                self.move_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
-                    .await?;
-                self.parts
-                    .store
-                    .transition(item.id, Status::InProgress, Status::AwaitingApproval)
-                    .await?;
-                self.run(run).await?
-            } else {
-                row
-            };
-            let rest = self.resting(&row).await?;
+        if live != walks {
+            let body = format!(
+                "topology mismatch: run {run} walks `{walks}`, the live graph is `{live}`; \
+                 the walk is not advanced (ANA-2 §4.9, invariant 2)"
+            );
+            let rest = Box::pin(self.park_on_resume(row, item.id, body)).await?;
             return Ok(Some(Resume::TopologyChanged {
-                snapshot: snapshot.topology,
-                live: live.snapshot.topology,
+                snapshot: walks,
+                live,
                 rest,
             }));
         }
         Ok(None)
+    }
+
+    /// [`Self::resume_window`]'s park: the item note `body` first, then a `running` run moves to
+    /// `awaiting_approval`, run then item (MOD-4 plan D159); the rest is the run's as it now is.
+    async fn park_on_resume(
+        &self,
+        row: Run,
+        item: ItemId,
+        body: String,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body,
+                created_by: self.parts.user,
+                box_id: Some(self.parts.box_id),
+                via_step_id: None,
+                created_at: now,
+            })
+            .await?;
+        // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the mismatch
+        // is addressed to — run, then item — rather than being handed back to every sweep as a
+        // `running` run. A run already parked is left as it is.
+        let row = if row.status == RunStatus::Running {
+            self.move_run(row.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                .await?;
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            self.run(row.id).await?
+        } else {
+            row
+        };
+        self.resting(&row).await
     }
 
     /// [`Self::resume`]'s walk. Plan D132 (review H3): an `awaiting_approval` run whose cursor
@@ -8034,6 +8130,10 @@ mod tests {
             candidates: Vec::new(),
             judge: None,
             persona: None,
+            role: htui_core::model::NodeRole::Step,
+            palette: false,
+            plan_scope: None,
+            divide: None,
         };
         let candidates = vec![
             SnapshotCandidate {
@@ -8962,6 +9062,10 @@ mod tests {
             candidates: Vec::new(),
             judge: None,
             persona: None,
+            role: htui_core::model::NodeRole::Step,
+            palette: false,
+            plan_scope: None,
+            divide: None,
         }
     }
 
@@ -12219,11 +12323,13 @@ mod tests {
 
     /// Plan D81 on the resume path: `touched_paths` edited after `StartRun` to name a repo the
     /// project does not carry is a rule about starting a run, so the live graph is not
-    /// comparable and the run walks its snapshot, with the note that says so.
+    /// comparable and the **v1** run walks its snapshot, with the note that says so (MOD-138 D5:
+    /// only a v1 run resolves the live graph).
     #[tokio::test]
     async fn resume_walks_a_run_whose_touched_paths_name_an_unknown_repo() {
         let harness = Harness::new().await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         let item = harness.orch.item(ids::HTUI_FEAT_3).await;
         harness
             .orch
@@ -12844,10 +12950,18 @@ mod tests {
     }
 
     /// `FEAT-3` started and parked at `prd`, then `prd`'s `input_kinds` edited, so the live
-    /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3).
+    /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3). The
+    /// run is rewritten as **v1** first (MOD-138 D5): a v2 run never reads the live graph.
     async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
         let harness = Harness::new().await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        move_prd_input_kinds(&harness).await;
+        (harness, run)
+    }
+
+    /// Edits `FEAT-3`'s live `prd` phase's `input_kinds`, which moves both topology digests.
+    async fn move_prd_input_kinds(harness: &Harness) {
         // `input_kinds` is one of `PhasePatch`'s six, and it is a `SnapshotPhase` field, so
         // editing it moves the topology digest — which is the whole content of criterion 3.
         let graph = harness
@@ -12871,7 +12985,6 @@ mod tests {
             )
             .await
             .expect("the phase exists");
-        (harness, run)
     }
 
     /// ANA-2 §12 criterion 3 (`:2090`): the graph moved under a parked run.
@@ -12908,7 +13021,7 @@ mod tests {
             "{notes:?}"
         );
 
-        // An unedited run resumes into the walk instead.
+        // An unedited v1 run resumes into the walk instead.
         let harness = Harness::new().await;
         harness.free_feat_3().await;
         let CommandOutcome::Started { run, .. } = harness
@@ -12923,10 +13036,292 @@ mod tests {
         else {
             panic!("`StartRun` answers `Started`");
         };
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         assert!(matches!(
             harness.resume(run).await.expect("the run is readable"),
             Resume::Walked(_)
         ));
+    }
+
+    /// MOD-138 D5, the v2 twin of `a_topology_mismatch_parks_on_resume`: a v2 run is pinned, so
+    /// the same live edit is never read. `resume` walks, and no `topology mismatch` note is
+    /// written.
+    #[tokio::test]
+    async fn a_v2_run_on_a_moved_graph_walks_on() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        assert_eq!(snapshot_of(&harness, run).await.v, GraphSnapshot::V);
+        move_prd_input_kinds(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("topology mismatch")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 D5, the v2 twin of `rebinding_a_phase_persona_parks_a_resumed_run`'s first half:
+    /// a phase's persona rebound under a v2 run does not reach it, and it walks on.
+    #[tokio::test]
+    async fn rebinding_a_phase_persona_under_a_v2_run_walks_on() {
+        let harness = Harness::new().await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let (run, _) = started(&harness).await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_ARCHITECT,
+        )
+        .await;
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(resumed, Resume::Walked(_)),
+            "a v2 run walks its own snapshot: {resumed:?}"
+        );
+        assert_eq!(
+            snapshot_of(&harness, run).await.phases[1]
+                .persona
+                .as_deref(),
+            Some("reviewer"),
+            "the frozen binding is the one the run walks"
+        );
+    }
+
+    /// MOD-138 D5, the v2 twin of `resume_walks_a_run_whose_touched_paths_name_an_unknown_repo`:
+    /// a v2 run never resolves the live graph, so the start-time rule is not met at all and no
+    /// `live graph not comparable` note is written.
+    #[tokio::test]
+    async fn a_v2_run_whose_touched_paths_name_an_unknown_repo_walks_without_a_note() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        harness
+            .orch
+            .store
+            .update_item(
+                item.id,
+                item.version,
+                ItemPatch {
+                    touched_paths: Some(vec!["web:src/**".to_owned()]),
+                    author_id: item.created_by,
+                    reason: "a qualifier no repo carries".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect("the item's version is current");
+
+        let resumed = harness.resume(run).await.expect("the run walks");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("live graph not comparable")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 D4, D5 (plan risk row 1): an unedited v1 run's lifted snapshot hashes to the live
+    /// graph's v2 digest, so it resumes `Walked`, is driven through its next gate, and resumes
+    /// `Walked` again, with no topology note anywhere.
+    #[tokio::test]
+    async fn a_v1_run_on_an_unchanged_graph_walks() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        let lifted = crate::command::snapshot_of(&harness.orch.run(run).await)
+            .expect("a v1 snapshot decodes, lifted");
+        assert_eq!(lifted.v, GraphSnapshot::V1);
+        assert!(!lifted.edges.is_empty(), "the lift gave it default edges");
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "{resumed:?}"
+        );
+        harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect("the artefact is there");
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    ..
+                })
+            ),
+            "the v1 run walked its snapshot to `plan`'s gate: {resumed:?}"
+        );
+        assert_eq!(snapshot_of(&harness, run).await.v, GraphSnapshot::V1);
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("topology mismatch")),
+            "{notes:?}"
+        );
+    }
+
+    /// Turns `FEAT-3`'s live `prd` phase into a palette phase through `replace_graph`, dropping
+    /// its edges (a palette node has none, MOD-137 rule e): a graph the store takes and M1's
+    /// resolve refuses as not yet runnable (MOD-138 D6(b)).
+    async fn plant_palette_prd(harness: &Harness) {
+        let graph = harness
+            .orch
+            .store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3 resolves")
+            .graph
+            .id;
+        let mut body = harness
+            .orch
+            .store
+            .graph_body(graph)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3's graph is there");
+        let prd = body
+            .nodes
+            .iter()
+            .find(|node| node.phase.name == "prd")
+            .map(|node| node.phase.id)
+            .expect("the graph has a `prd` phase");
+        for node in &mut body.nodes {
+            if node.phase.id == prd {
+                node.phase.palette = true;
+            }
+        }
+        body.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        let revision = body.graph.revision;
+        let outcome = harness
+            .orch
+            .store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect("the store takes a palette node with no edges");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// MOD-138 blueprint A6: a v1 run frozen before the upgrade on a graph that already had a
+    /// palette phase. A pre-MOD-138 snapshot never recorded `palette`, so the run's phases are
+    /// the live ones without it; the live graph M1 refuses (D6(b)) is compared on the v1
+    /// phase-only digest, which matches, and the run walks on twice with no topology note.
+    #[tokio::test]
+    async fn a_v1_run_on_a_graph_that_already_had_a_palette_phase_walks_on() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        plant_palette_prd(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "a v1 run is not stranded by a palette phase it always walked by position: \
+             {resumed:?}"
+        );
+        harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect("the artefact is there");
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    ..
+                })
+            ),
+            "the v1 run walked its snapshot to `plan`'s gate: {resumed:?}"
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes.iter().any(|note| {
+                note.body.contains("topology mismatch")
+                    || note.body.contains("live graph not comparable")
+            }),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 blueprint A6, the other half: the same refused live graph with a phase field
+    /// edited too parks, and both digests are v1 phase-only ones.
+    #[tokio::test]
+    async fn a_v1_run_on_a_palette_graph_whose_phases_moved_parks() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        let stored = snapshot_of(&harness, run).await.topology;
+        plant_palette_prd(&harness).await;
+        move_prd_input_kinds(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        let Resume::TopologyChanged { snapshot, live, .. } = resumed else {
+            panic!("the live phases moved: {resumed:?}");
+        };
+        assert_eq!(snapshot, stored, "the run's own v1 digest");
+        assert!(live.starts_with("sha256:"), "{live}");
+        assert_ne!(snapshot, live);
     }
 
     /// MOD-26 I-4 at stage 3 (B-4): a snapshot whose phase names a persona it does not carry is
@@ -13174,8 +13569,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no driver was built");
     }
 
-    /// MOD-26 D9, I-3: rebinding a phase's persona under a parked run moves the topology, so a
-    /// resume parks on it; editing the bound persona's body does not.
+    /// MOD-26 D9, I-3: rebinding a phase's persona under a parked **v1** run moves the topology,
+    /// so a resume parks on it (MOD-138 D5: only a v1 run compares); editing the bound persona's
+    /// body under a parked v1 run does not.
     #[tokio::test]
     async fn rebinding_a_phase_persona_parks_a_resumed_run() {
         let harness = Harness::new().await;
@@ -13187,6 +13583,7 @@ mod tests {
         )
         .await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         bind_persona(
             &harness.orch,
             ids::HTUI_FEAT_3,
@@ -13209,6 +13606,8 @@ mod tests {
         )
         .await;
         let (run, _) = started(&harness).await;
+        // Only a v1 run reads the live graph (MOD-138 D5), so I-3 is checked on one.
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         let reviewer = harness
             .orch
             .store
@@ -13242,7 +13641,8 @@ mod tests {
     /// MOD-12 review M3, blueprint H-3: a resume re-resolves the live graph under the run's own
     /// `mode` (the one read of `run.mode` after its insert), so a parked auto run whose snapshot
     /// downgraded its soft gates resumes `Walked`, not `TopologyChanged`; a parked manual run of
-    /// the same graph, which kept them, resumes `Walked` too.
+    /// the same graph, which kept them, resumes `Walked` too. Only a **v1** run re-resolves
+    /// (MOD-138 D5), so the runs are rewritten as v1 before the resume.
     #[tokio::test]
     async fn a_parked_run_resumes_under_its_own_mode() {
         for mode in [RunMode::Auto, RunMode::Manual] {
@@ -13289,6 +13689,7 @@ mod tests {
                 assert!(parked.gate_hard, "an auto run parks at its hard gate");
             }
 
+            crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
             let resumed = Box::pin(harness.resume(run))
                 .await
                 .expect("the run is readable");

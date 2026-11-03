@@ -218,8 +218,9 @@ pub struct ItemKindPatch {
 
 /// Who owns a `step_graph` row (MOD-137 D3): a project, a workspace, or neither — the global
 /// workflow library. `ck_step_graph_owner` keeps at most one of the two columns set. Who may *use*
-/// a non-project graph is MOD-138's (plan D4): today a kind or item still names only its own
-/// project's graphs.
+/// a graph is MOD-138 D12's rule ([`graph_usable_by`](crate::store::graph_rules::graph_usable_by)):
+/// a kind or item names its project's graph, one of a workspace holding its project, or a library
+/// graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "owner", content = "id", rename_all = "snake_case")]
 pub enum GraphScope {
@@ -665,14 +666,20 @@ impl Default for ProjectSettings {
     }
 }
 
-/// What `Backend::resolve_graph` answers in one round trip (ANA-2 §8): the graph an item runs
-/// under and its phases with their candidate agents.
+/// What `Backend::resolve_graph` answers as one consistent read (ANA-2 §8): the graph an item
+/// runs under, its phases with their candidate agents and parts, and its edges. One
+/// `REPEATABLE READ` transaction on Postgres and one lock in `MemStore` (MOD-138 F7), so the
+/// edges always name phases of the same read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedGraph {
     /// The `step_graph` row: the item's override, else its kind's default.
     pub graph: StepGraph,
     /// In `position` order.
     pub phases: Vec<ResolvedPhase>,
+    /// MOD-138 D10: the `step_graph_edge` rows, by (from position, to position, kind bytes), the
+    /// order [`GraphBody::edges`] reads in.
+    #[serde(default)]
+    pub edges: Vec<StepGraphEdge>,
 }
 
 /// One phase of a [`ResolvedGraph`] with the candidates the snapshot builder picks from.
@@ -686,6 +693,9 @@ pub struct ResolvedPhase {
     /// The `persona` row `phase.persona_id` names (MOD-26 D6); `None` when it names none.
     #[serde(default)]
     pub persona: Option<Persona>,
+    /// MOD-138 D10: the `phase_part` rows in `position` order; empty off a `divide` node.
+    #[serde(default)]
+    pub parts: Vec<PhasePart>,
 }
 
 /// A row of `prompt_template` (§5.4).

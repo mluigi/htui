@@ -64,7 +64,10 @@ pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
 };
-pub use graph::{GraphSource, ResolveError, Resolved, override_graph, resolve, topology};
+pub use graph::{
+    GraphSource, NotRunnable, ResolveError, Resolved, override_graph, resolve, topology,
+    topology_v2,
+};
 pub use isolate::{
     ChangedPaths, Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
     IsolatorFuture, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,

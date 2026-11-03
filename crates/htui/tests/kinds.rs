@@ -1573,8 +1573,305 @@ async fn an_unknown_graph_name_is_refused() {
     assert!(bench.drained().is_empty());
     assert!(
         error_text(&bench, &section, 100)
-            .contains(&"`graph` names no graph in this project".to_owned()),
+            .contains(&"`graph` names no graph this project can use".to_owned()),
         "the refusal says what could not be resolved"
+    );
+}
+
+/// MOD-138 D12: the kind editor's `graph` field resolves a library graph's name too (after the
+/// project's own), the store takes it, and the kind's line names it with its scope.
+#[tokio::test]
+async fn a_kind_can_take_a_library_graph() {
+    let store = MemStore::demo();
+    let library = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Library,
+            name: "libflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a library graph");
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+    assert_eq!(
+        snapshot.projects[0]
+            .shared
+            .iter()
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![library.id],
+        "the catalogue carries the graphs the project may use beside its own"
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "DOC");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "docs");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    for _ in 0.."analysis".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "libflow");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [request @ Action::Store(StoreRequest::CreateKind { graph, .. })] = asked.as_slice() else {
+        panic!("`Enter` creates once: {asked:?}");
+    };
+    assert_eq!(*graph, library.id, "the library graph, by name");
+    let Action::Store(request) = request else {
+        unreachable!("matched above")
+    };
+    let reread = catalogue(serve(&backend, request).await);
+    let created = reread.projects[0]
+        .kinds
+        .iter()
+        .find(|kind| kind.prefix == "DOC")
+        .expect("the kind landed");
+    assert_eq!(created.default_graph_id, library.id);
+
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(reread)));
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame
+            .lines()
+            .any(|line| line.trim() == "DOC  docs \u{b7} graph libflow \u{b7} library"),
+        "the kind's line names the library graph: {frame}"
+    );
+
+    // `g` on that kind: the library graph is not this section's to edit, and is not "missing".
+    let row = frame
+        .lines()
+        .position(|line| line.trim().starts_with("DOC  docs"))
+        .expect("the kind's row");
+    for _ in 0..row {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "g");
+    assert!(bench.drained().is_empty(), "no editor, no request");
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"graph libflow \u{b7} library is not edited here".to_owned()),
+        "the refusal names the shared graph: {}",
+        bench.render_section(&section, 100)
+    );
+}
+
+/// MOD-138 D12: a graph name is unique within one scope only, so the project may own a graph
+/// named like the library graph its kind is on. The `graph` field then reads `libflow · library`,
+/// an untouched `e` + `Enter` keeps the library graph rather than switching the kind to the
+/// project's own, and the bare name still picks the project's graph first.
+#[tokio::test]
+async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name() {
+    let store = MemStore::demo();
+    let library = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Library,
+            name: "libflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a library graph");
+    store
+        .create_item_kind(htui_core::model::NewItemKind {
+            id: ItemKindId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            prefix: "DOC".to_owned(),
+            name: "docs".to_owned(),
+            description: String::new(),
+            default_graph_id: library.id,
+            position: 99,
+        })
+        .await
+        .expect("a kind on the library graph");
+    let own = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Project(ids::PROJECT_VULKAN),
+            name: "libflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("the project's own graph of the same name");
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    let row = frame
+        .lines()
+        .position(|line| line.trim() == "DOC  docs \u{b7} graph libflow \u{b7} library")
+        .unwrap_or_else(|| panic!("the kind's row names the library graph: {frame}"));
+    let edit = |section: &mut KindsSection| {
+        for _ in 0..row {
+            bench.key(section, "j");
+        }
+        bench.key(section, "e");
+    };
+
+    edit(&mut section);
+    let open = bench.render_section(&section, 100);
+    assert!(
+        open.lines()
+            .any(|line| line.trim() == "graph         libflow \u{b7} library"),
+        "the graph field names the scope: {open}"
+    );
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`Enter` updates once: {asked:?}");
+    };
+    assert_eq!(
+        patch.default_graph_id,
+        Some(library.id),
+        "an untouched field keeps the library graph"
+    );
+
+    // Typing the bare name over the field picks the project's own graph.
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(demo_catalogue(&backend).await)),
+    );
+    let _ = bench.drained();
+    edit(&mut section);
+    for _ in 0..3 {
+        bench.key(&mut section, "tab");
+    }
+    for _ in 0.."libflow \u{b7} library".chars().count() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "libflow");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`Enter` updates once: {asked:?}");
+    };
+    assert_eq!(
+        patch.default_graph_id,
+        Some(own.id),
+        "the bare name is the project's own graph"
+    );
+}
+
+/// MOD-138 D12: a kind keeps its workspace graph after the project leaves that workspace, and the
+/// kind still resolves. `usable_graphs` no longer lists the graph, yet the catalogue carries its row
+/// in `kept`, so the kind's line names it with its scope rather than `graph missing`, and the edit
+/// form opens on that label. A rename sends the kept graph untouched, and it lands: a kind's graph
+/// is checked against the usable-graphs rule only when an update changes it (A7).
+#[tokio::test]
+async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
+    let store = MemStore::demo();
+    let shared = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            name: "wsflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a workspace graph");
+    store
+        .create_item_kind(htui_core::model::NewItemKind {
+            id: ItemKindId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            prefix: "DOC".to_owned(),
+            name: "docs".to_owned(),
+            description: String::new(),
+            default_graph_id: shared.id,
+            position: 99,
+        })
+        .await
+        .expect("a kind on the workspace graph");
+    store
+        .remove_workspace_project(ids::WORKSPACE_GRAPHICS, ids::PROJECT_VULKAN)
+        .await
+        .expect("the project leaves the workspace");
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+    let project = &snapshot.projects[0];
+    assert!(
+        !project.shared.iter().any(|graph| graph.id == shared.id),
+        "the project may no longer pick it"
+    );
+    assert_eq!(
+        project
+            .kept
+            .iter()
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![shared.id],
+        "the catalogue carries the graph its kind kept"
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    let row = frame
+        .lines()
+        .position(|line| line.trim() == "DOC  docs \u{b7} graph wsflow \u{b7} workspace")
+        .unwrap_or_else(|| panic!("the kind's line names the kept graph: {frame}"));
+    assert!(
+        !error_text(&bench, &section, 100).contains(&"graph missing".to_owned()),
+        "a kept graph is not missing: {frame}"
+    );
+
+    for _ in 0..row {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "e");
+    let open = bench.render_section(&section, 100);
+    assert!(
+        open.lines()
+            .any(|line| line.trim() == "graph         wsflow \u{b7} workspace"),
+        "the graph field names the kept graph: {open}"
+    );
+    bench.key(&mut section, "tab");
+    for _ in 0.."docs".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "guides");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(request @ StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`Enter` updates once: {asked:?}");
+    };
+    assert_eq!(
+        patch.default_graph_id,
+        Some(shared.id),
+        "an untouched field keeps the kept graph"
+    );
+    assert_eq!(patch.name.as_deref(), Some("guides"), "the rename");
+    let reread = catalogue(serve(&backend, request).await);
+    let renamed = reread.projects[0]
+        .kinds
+        .iter()
+        .find(|kind| kind.prefix == "DOC")
+        .expect("the kind is still there");
+    assert_eq!(renamed.name, "guides", "the rename lands");
+    assert_eq!(
+        renamed.default_graph_id, shared.id,
+        "an unchanged graph is not re-checked, so the kind keeps it"
     );
 }
 

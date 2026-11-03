@@ -874,20 +874,25 @@ pub trait WriteStore: ReadStore {
     // item_kind
 
     /// Inserts a kind. The prefix is checked by [`ItemKind::prefix_is_valid`] before the statement
-    /// and `default_graph_id` must belong to the same project (D11).
+    /// and `default_graph_id` must be a graph the kind's project may use (D11, widened by MOD-138
+    /// D12): its own, a workspace's that holds it, or the library's.
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a bad prefix, a taken
-    /// `(project_id, prefix)` or `(project_id, name)`, or a graph from another project.
+    /// `(project_id, prefix)` or `(project_id, name)`, or a graph the project may not use
+    /// ([`graph_not_usable`]).
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind>;
 
-    /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind).
+    /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind),
+    /// except that `default_graph_id` is checked against the usable-graphs rule only when the patch
+    /// changes it (A7), as an item's graph is: a kind keeps a workspace graph its project has left.
     /// Renaming the prefix leaves existing keys (`ANA-2`) and counters alone; the next mint under
     /// the kind starts a counter for the new prefix (PRD D12).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create, the graph
+    /// only when the patch changes it.
     async fn update_item_kind(
         &self,
         id: ItemKindId,
@@ -943,11 +948,24 @@ pub trait WriteStore: ReadStore {
     /// The backend's own failures only.
     async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>>;
 
+    /// MOD-138 D12 (blueprint A4): every graph a kind or item of `project` may name
+    /// ([`graph_usable_by`](crate::store::graph_rules::graph_usable_by)): the project's, then each
+    /// workspace's that holds it, then the library's; by `name` bytes within each scope, then id.
+    /// Overrides included (callers filter `is_override`, as for [`step_graphs`](Self::step_graphs)).
+    /// An unknown project answers the library's graphs alone.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn usable_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>>;
+
     /// Inserts a whole phase row (D10); `phase.updated_at` is ignored and the store's clock is
     /// returned. `judge` and `handoff` are template roles, not phase names
     /// ([`TemplateRole::of_name`](crate::prompt::template::TemplateRole::of_name)).
     ///
-    /// A successful insert bumps the graph's `revision` (MOD-137 D5).
+    /// A successful insert bumps the graph's `revision` (MOD-137 D5). MOD-138 D7: on a
+    /// default-edged graph the edges are re-derived in the same write; authored edges are left
+    /// alone ([`default_edges_follow`](crate::store::default_edges_follow)). A `palette` phase is
+    /// left unlinked, so creating one moves no edge (a palette node has no edges).
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in MOD-137 blueprint
@@ -975,7 +993,9 @@ pub trait WriteStore: ReadStore {
     async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()>;
 
     /// Edits the six columns of [`PhasePatch`] under CAS; `token_budget` is
-    /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
+    /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8). MOD-138
+    /// D7: on a default-edged graph the edges are re-derived in the same write; authored edges
+    /// are left alone. Only a patch setting `name` or `position` can move them.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
@@ -1010,8 +1030,7 @@ pub trait WriteStore: ReadStore {
     /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
     /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
     /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
-    /// new one. Store-level checks only: acyclicity, back-edge kinds and reachability are
-    /// MOD-138's shared validator, which this writer will call once it exists.
+    /// new one.
     ///
     /// # Errors
     /// In this order, and nothing is written on any of them:
@@ -1030,7 +1049,10 @@ pub trait WriteStore: ReadStore {
     /// 7. `Constraint` with
     ///    [`graph_body_topology_refusal`](crate::store::graph_body_topology_refusal)'s sentence
     ///    (edge endpoints, edge CHECKs, duplicate edges, node CHECKs, palette edges, parts on a
-    ///    non-divide node).
+    ///    non-divide node);
+    /// 8. `Constraint` with
+    ///    [`graph_body_walk_refusal`](crate::store::graph_body_walk_refusal)'s sentence (MOD-138
+    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back).
     async fn replace_graph(
         &self,
         graph: StepGraphId,
@@ -1039,7 +1061,8 @@ pub trait WriteStore: ReadStore {
     ) -> Result<CasOutcome<GraphBody>>;
 
     /// Deletes a phase with its candidates, parts, edges and phase bindings (MOD-137 D11); the
-    /// graph's last phase may go. `revision` + 1.
+    /// graph's last phase may go. `revision` + 1. MOD-138 D7: on a default-edged graph the edges
+    /// are re-derived in the same write; authored edges are left alone.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
@@ -1360,10 +1383,14 @@ pub trait WriteStore: ReadStore {
     async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>>;
 
     /// Removes a workspace, its links and its box paths; projects survive
-    /// (`0001_init.sql:162,174`).
+    /// (`0001_init.sql:162,174`). Its graphs go with it (MOD-137 D3).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`workspace_graph_is_held`], MOD-138 A3) while a kind's `default_graph_id` or an item's
+    /// `step_graph_id` names one of its graphs, naming the first holder in (graph name bytes,
+    /// holder bytes, project slug bytes) order; nothing is deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
     /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts
@@ -2553,11 +2580,16 @@ pub fn invalid_prefix(prefix: &str) -> String {
     format!("item_kind.prefix `{prefix}` is not `^[A-Z][A-Z0-9]{{1,15}}$`")
 }
 
-/// D11: `default_graph_id` must be one of the kind's own project's graphs. The FK is to
-/// `step_graph(id)` alone (`0001_init.sql:288`), so nothing below the seam checks this.
+/// D11, widened by MOD-138 D12: `default_graph_id` must be a graph the kind's project may use
+/// ([`graph_usable_by`](crate::store::graph_rules::graph_usable_by)): its own, a workspace's that
+/// holds it, or the library's. The FK is to `step_graph(id)` alone (`0001_init.sql:288`), so
+/// nothing below the seam checks this. Replaces `graph_not_in_project`.
 #[must_use]
-pub fn graph_not_in_project(graph: StepGraphId, project: ProjectId) -> String {
-    format!("step_graph {graph} is not in project {project}")
+pub fn graph_not_usable(graph: StepGraphId, project: ProjectId) -> String {
+    format!(
+        "step_graph {graph} is not usable in project {project}: a kind or item takes a graph of \
+         its project, of a workspace holding its project, or of the library"
+    )
 }
 
 /// §5.1: a run is filed under `run.project_id`, which `delete_project` counts by — so the item it
@@ -2720,7 +2752,8 @@ pub fn phase_attachment_needs_a_project(phase: PhaseId) -> String {
     format!("a phase attachment needs its project: step_graph_phase {phase} was given none")
 }
 
-/// D78: the phase's graph belongs to another project ([`graph_not_in_project`]'s shape).
+/// D78: the phase's graph belongs to another project (the shape `graph_not_in_project` had,
+/// before MOD-138 D12 widened that rule into [`graph_not_usable`]).
 #[must_use]
 pub fn phase_not_in_project(phase: PhaseId, project: ProjectId) -> String {
     format!("step_graph_phase {phase} is not in project {project}")
@@ -3109,6 +3142,44 @@ pub fn phase_token_budget_refusal(budget: i32) -> Option<String> {
 #[must_use]
 pub fn parts_off_divide(phase: &str, split: Split) -> String {
     format!("phase `{phase}` is split `{split}`; only a `divide` phase has parts")
+}
+
+// ---- MOD-138: the snapshot v2 walk refusals (plan D9; blueprint §1.6) ----
+
+/// MOD-138 D9 (W1/W2): the forward edges (`next`, `if` and every `asks_you` that is not a back
+/// edge) hold a cycle; `path` is the cycle by phase name, its first name repeated at the end.
+#[must_use]
+pub fn forward_edges_form_a_cycle(path: &[&str], graph: StepGraphId) -> String {
+    let path = path
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" → ");
+    format!(
+        "phases {path} form a cycle of forward edges in graph `{graph}`; only a \
+         `changes_requested`, `fails` or back `asks_you` edge may close a loop"
+    )
+}
+
+/// MOD-138 D9 (W3): a `changes_requested` or `fails` edge whose target does not reach its
+/// source over the forward edges.
+#[must_use]
+pub fn loop_edge_runs_forward(kind: EdgeKind, from: &str, to: &str, graph: StepGraphId) -> String {
+    format!(
+        "the `{kind}` edge from `{from}` to `{to}` in graph `{graph}` runs forward: `{to}` does \
+         not reach `{from}` over forward edges, and a `{kind}` edge always loops back"
+    )
+}
+
+/// MOD-138 A3 (D12): `delete_workspace` would cascade a graph that a kind (`holder` =
+/// `item_kind PREFIX`) or an item (`item KEY`) of project `project` (its slug) names; neither
+/// reference cascades, so the delete is refused before it writes anything.
+#[must_use]
+pub fn workspace_graph_is_held(graph: &str, holder: &str, project: &str) -> String {
+    format!(
+        "step_graph `{graph}` of this workspace is held by {holder} of project `{project}`; point \
+         it at another graph before deleting the workspace"
+    )
 }
 
 // ---- MOD-38: ANA-11's refusals ----

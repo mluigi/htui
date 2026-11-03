@@ -278,48 +278,83 @@ pub fn default_edges(
     phases: &[StepGraphPhase],
     mut mint: impl FnMut() -> EdgeId,
 ) -> Vec<StepGraphEdge> {
-    let mut sorted: Vec<&StepGraphPhase> = phases.iter().collect();
-    sorted.sort_by_key(|phase| phase.position);
     debug_assert!(
-        sorted
+        phases
             .windows(2)
             .all(|pair| pair[0].graph_id == pair[1].graph_id),
         "default_edges takes the phases of one graph"
     );
-    let edge = |from: &StepGraphPhase, to: &StepGraphPhase, kind, loop_limit, id| StepGraphEdge {
-        id,
-        graph_id: from.graph_id,
-        from: from.id,
-        to: to.id,
-        kind,
-        predicate: None,
-        loop_limit,
-    };
-    let mut edges: Vec<StepGraphEdge> = sorted
-        .windows(2)
-        .map(|pair| edge(pair[0], pair[1], EdgeKind::Next, None, mint()))
+    let projection: Vec<(i32, &str, i32)> = phases
+        .iter()
+        .map(|phase| (phase.position, phase.name.as_str(), phase.retry_limit))
         .collect();
-    for (index, review) in sorted.iter().enumerate() {
-        if review.name != REVIEW {
+    default_edge_plan(&projection)
+        .into_iter()
+        .map(|edge| StepGraphEdge {
+            id: mint(),
+            graph_id: phases[edge.from].graph_id,
+            from: phases[edge.from].id,
+            to: phases[edge.to].id,
+            kind: edge.kind,
+            predicate: None,
+            loop_limit: edge.loop_limit,
+        })
+        .collect()
+}
+
+/// One edge [`default_edges`]' rule derives, by index into the projection it was given
+/// (MOD-138 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultEdge {
+    /// Index of the source phase in the projection.
+    pub from: usize,
+    /// Index of the target phase in the projection.
+    pub to: usize,
+    /// `next` or `changes_requested`.
+    pub kind: EdgeKind,
+    /// The target's `retry_limit` on a loop edge; `None` on `next`.
+    pub loop_limit: Option<i32>,
+}
+
+/// MOD-138 D4: MOD-137 D9's rule (see [`default_edges`]) over any projection
+/// `(position, name, retry_limit)`, so the stored graph and a run's frozen snapshot share one
+/// rule. The output order is `default_edges`' (every `next` in position order, then the loops in
+/// review-position order); indices are into `phases` as given, not sorted. Equal positions keep
+/// their slice order (a stable sort), as `default_edges` always did.
+#[must_use]
+pub fn default_edge_plan(phases: &[(i32, &str, i32)]) -> Vec<DefaultEdge> {
+    let mut sorted: Vec<usize> = (0..phases.len()).collect();
+    sorted.sort_by_key(|&index| phases[index].0);
+    let mut edges: Vec<DefaultEdge> = sorted
+        .windows(2)
+        .map(|pair| DefaultEdge {
+            from: pair[0],
+            to: pair[1],
+            kind: EdgeKind::Next,
+            loop_limit: None,
+        })
+        .collect();
+    for (rank, &review) in sorted.iter().enumerate() {
+        if phases[review].1 != REVIEW {
             continue;
         }
         // The phases before this review; a review first in order has none and gets no loop.
-        let earlier = &sorted[..index];
-        let Some(previous) = earlier.last() else {
+        let earlier = &sorted[..rank];
+        let Some(&previous) = earlier.last() else {
             continue;
         };
         let target = earlier
             .iter()
             .rev()
-            .find(|phase| phase.name == IMPLEMENT)
+            .copied()
+            .find(|&index| phases[index].1 == IMPLEMENT)
             .unwrap_or(previous);
-        edges.push(edge(
-            review,
-            target,
-            EdgeKind::ChangesRequested,
-            Some(target.retry_limit),
-            mint(),
-        ));
+        edges.push(DefaultEdge {
+            from: review,
+            to: target,
+            kind: EdgeKind::ChangesRequested,
+            loop_limit: Some(phases[target].2),
+        });
     }
     edges
 }
@@ -895,6 +930,79 @@ mod tests {
             (10, 4),
             "fifteen phases in five graphs, four reviews"
         );
+    }
+
+    /// MOD-138 D4: the projection rule and `default_edges` give the same edges in the same order
+    /// (every `next` in position order, then the loops), indices into the slice as given.
+    #[test]
+    fn default_edge_plan_matches_default_edges_order() {
+        use super::{DefaultEdge, default_edge_plan};
+
+        let mut shapes: Vec<Vec<StepGraphPhase>> = KINDS
+            .iter()
+            .map(|kind| {
+                let graph = StepGraphId::new();
+                kind.phases
+                    .iter()
+                    .zip(0..)
+                    .map(|(seed, position)| {
+                        phase_row(PhaseId::new(), graph, position, seed, Utc::now())
+                    })
+                    .collect()
+            })
+            .collect();
+        shapes.push(graph_of(&[("draft", 0, 2), ("review", 4, 1)]));
+        shapes.push(graph_of(&[
+            ("docs", 9, 1),
+            ("review", 7, 1),
+            ("implement", 3, 3),
+            ("plan", 0, 1),
+        ]));
+        for phases in shapes {
+            let projection: Vec<(i32, &str, i32)> = phases
+                .iter()
+                .map(|phase| (phase.position, phase.name.as_str(), phase.retry_limit))
+                .collect();
+            let plan: Vec<(PhaseId, PhaseId, EdgeKind, Option<i32>)> =
+                default_edge_plan(&projection)
+                    .iter()
+                    .map(|edge| {
+                        (
+                            phases[edge.from].id,
+                            phases[edge.to].id,
+                            edge.kind,
+                            edge.loop_limit,
+                        )
+                    })
+                    .collect();
+            let edges: Vec<(PhaseId, PhaseId, EdgeKind, Option<i32>)> =
+                default_edges(&phases, EdgeId::new)
+                    .iter()
+                    .map(|edge| (edge.from, edge.to, edge.kind, edge.loop_limit))
+                    .collect();
+            assert_eq!(plan, edges, "{projection:?}");
+        }
+
+        let gap = default_edge_plan(&[(4, "review", 1), (0, "draft", 2)]);
+        assert_eq!(
+            gap,
+            [
+                DefaultEdge {
+                    from: 1,
+                    to: 0,
+                    kind: EdgeKind::Next,
+                    loop_limit: None,
+                },
+                DefaultEdge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::ChangesRequested,
+                    loop_limit: Some(2),
+                },
+            ],
+            "indices are into the slice as given, not the sorted order"
+        );
+        assert_eq!(default_edge_plan(&[]), []);
     }
 
     /// MOD-146 D3: ANA-35 §7.4's six, unique and in the order the stores answer, each slug

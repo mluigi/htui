@@ -71,6 +71,9 @@ use crate::store::traits::{
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
+use crate::store::traits::{
+    forward_edges_form_a_cycle, graph_not_usable, loop_edge_runs_forward, workspace_graph_is_held,
+};
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -270,6 +273,23 @@ pub const CASES: &[&str] = &[
     "create_phase_keeps_split_in_step_with_fan_out",
     // MOD-137 review round 1 (B-L4)
     "replace_graph_replaces_candidates_and_parts_by_position",
+    // MOD-138 M1: the walk validator (plan D9, blueprint §T2)
+    "replace_graph_refuses_a_forward_cycle",
+    "replace_graph_refuses_a_forward_changes_requested",
+    "replace_graph_refuses_a_forward_fails",
+    "replace_graph_accepts_an_asks_you_back_edge",
+    // MOD-138 M1: the per-row writers keep default edges (plan D7, blueprint §T3)
+    "create_phase_keeps_a_default_graph_default_edged",
+    "update_phase_keeps_a_default_graph_default_edged",
+    "delete_phase_keeps_a_default_graph_default_edged",
+    "per_row_writers_leave_authored_edges_alone",
+    "create_phase_leaves_a_palette_phase_unlinked",
+    // MOD-138 M1: workspace and library graphs for kinds and items (plan D12, blueprint §T6)
+    "item_kind_takes_usable_graphs_only",
+    "usable_graphs_lists_project_workspace_library",
+    "delete_workspace_refuses_a_held_graph",
+    // MOD-138 M1 review R1 (A7): a kind's graph is checked only when an update changes it
+    "item_kind_keeps_a_graph_its_project_left",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -878,6 +898,45 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
                 store,
             ))
             .await;
+        }
+        "replace_graph_refuses_a_forward_cycle" => {
+            Box::pin(replace_graph_refuses_a_forward_cycle(store)).await;
+        }
+        "replace_graph_refuses_a_forward_changes_requested" => {
+            Box::pin(replace_graph_refuses_a_forward_changes_requested(store)).await;
+        }
+        "replace_graph_refuses_a_forward_fails" => {
+            Box::pin(replace_graph_refuses_a_forward_fails(store)).await;
+        }
+        "replace_graph_accepts_an_asks_you_back_edge" => {
+            Box::pin(replace_graph_accepts_an_asks_you_back_edge(store)).await;
+        }
+        "create_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(create_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "update_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(update_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "delete_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(delete_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "per_row_writers_leave_authored_edges_alone" => {
+            Box::pin(per_row_writers_leave_authored_edges_alone(store)).await;
+        }
+        "create_phase_leaves_a_palette_phase_unlinked" => {
+            Box::pin(create_phase_leaves_a_palette_phase_unlinked(store)).await;
+        }
+        "item_kind_takes_usable_graphs_only" => {
+            Box::pin(item_kind_takes_usable_graphs_only(store)).await;
+        }
+        "usable_graphs_lists_project_workspace_library" => {
+            Box::pin(usable_graphs_lists_project_workspace_library(store)).await;
+        }
+        "delete_workspace_refuses_a_held_graph" => {
+            Box::pin(delete_workspace_refuses_a_held_graph(store)).await;
+        }
+        "item_kind_keeps_a_graph_its_project_left" => {
+            Box::pin(item_kind_keeps_a_graph_its_project_left(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -5176,6 +5235,8 @@ fn run_snapshot() -> GraphSnapshot {
             id: ids::GRAPH_HTUI_FEAT,
             name: "feature".to_owned(),
             is_override: false,
+            scope: None,
+            revision: None,
         },
         topology: "sha256:conformance".to_owned(),
         mode: RunMode::Manual,
@@ -5186,9 +5247,15 @@ fn run_snapshot() -> GraphSnapshot {
             per_token_cap_batch: None,
             max_fan_out: 4,
             max_agents_per_run: 8,
+            max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+            max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+            max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+            runtime_changes: crate::model::RuntimeChanges::Ask,
         },
         scope: None,
         personas: Vec::new(),
+        source: None,
+        edges: Vec::new(),
     }
 }
 
@@ -15360,7 +15427,11 @@ async fn run_and_steps_round_trip<S: ReadStore>(store: &S) {
             .unwrap_or_else(|| panic!("{CASE}: a graph run carries its snapshot")),
     )
     .unwrap_or_else(|error| panic!("{CASE}: the snapshot decodes as §5.1's type, got {error}"));
-    assert_eq!(snapshot.v, 1, "{CASE}: at the version this crate writes");
+    assert_eq!(
+        snapshot.v,
+        GraphSnapshot::V1,
+        "{CASE}: the fixture's runs predate MOD-138 (F4), so their snapshots are v1"
+    );
     assert_eq!(
         snapshot.phases.len(),
         4,
@@ -22150,6 +22221,9 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
     let mut written = body_now(CASE, store, graph).await;
     written.nodes.retain(|node| node.phase.id == kept);
     written.nodes[0].phase.name = "kept".to_owned();
+    // MOD-138 D7 (blueprint F17): the scratch graph is default-edged now, and its `next` edge
+    // names the dropped phase; the body drops it with the node.
+    written.edges.clear();
     applied(
         CASE,
         store
@@ -22336,9 +22410,9 @@ async fn replace_graph_refuses_parts_on_a_non_divide_node<S: WriteStore>(store: 
 
 /// MOD-137 D10: the refusal order, both stores, one sentence each (blueprint §T3.1, §T3.2). One
 /// body breaks every rule, the graph name and a foreign phase and edge id among them, so shape <
-/// name < foreign id < persona < agent < topology is pinned; each call mends one and expects
-/// exactly the next sentence. Then the node CHECKs a kept node trips alone. The revision never
-/// moves until the mended body is applied.
+/// name < foreign id < persona < agent < topology < walk (MOD-138 D9, blueprint §T2) is pinned;
+/// each call mends one and expects exactly the next sentence. Then the node CHECKs a kept node
+/// trips alone. The revision never moves until the mended body is applied.
 async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_refusal_order";
     let (graph, phases) = scratch_graph(CASE, store, "ordered", &["plan", "build", "review"]).await;
@@ -22360,8 +22434,9 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     let taken = GraphScope::Project(ids::PROJECT_HTUI);
 
     // Review R1 B-M1: the body breaks every step at once, D10's steps 3 (shape), 4 (the graph's
-    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents) and
-    // 7 (topology), so each mend proves the next sentence outranks everything after it.
+    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents),
+    // 7 (topology) and 8 (MOD-138 D9's walk), so each mend proves the next sentence outranks
+    // everything after it.
     let mut body = before.clone();
     body.graph.name = "analysis".to_owned();
     body.nodes.push(bare_node(StepGraphPhase {
@@ -22380,6 +22455,12 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
             ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
         },
     ];
+    // MOD-138 D9: a forward cycle (W1) and a forward `fails` (W3), after `into_palette` in body
+    // order, so the palette rule (topology e) still names `into_palette` first.
+    let cycle = graph_edge(graph, build, plan, EdgeKind::Next);
+    let forward_fails = graph_edge(graph, plan, phases[2].id, EdgeKind::Fails);
+    let (cycle_id, forward_fails_id) = (cycle.id, forward_fails.id);
+    body.edges.extend([cycle, forward_fails]);
     body.nodes[2].phase.fan_out = 2;
     body.nodes[2].phase.retry_limit = -1;
     body.nodes[1].phase.palette = true;
@@ -22440,6 +22521,14 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
             parts_off_divide("plan", Split::None),
             Box::new(|b: &mut GraphBody| b.nodes[0].parts.clear()),
         ),
+        (
+            forward_edges_form_a_cycle(&["plan", "build", "plan"], graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != cycle_id)),
+        ),
+        (
+            loop_edge_runs_forward(EdgeKind::Fails, "plan", "review", graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != forward_fails_id)),
+        ),
     ];
     for (sentence, mend) in steps {
         constraint_exactly(
@@ -22485,6 +22574,471 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         answer.graph.revision,
         revision + 1,
         "{CASE}: the mended body was the last refusal"
+    );
+}
+
+/// MOD-138 D9 (W1): `next` edges closing `plan → build → review` back to `plan` are a forward
+/// cycle; nothing is written and the revision does not move.
+async fn replace_graph_refuses_a_forward_cycle<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_a_forward_cycle";
+    let (graph, phases) = scratch_graph(CASE, store, "cyclic", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut written = before.clone();
+    written.edges = vec![
+        graph_edge(graph, plan, build, EdgeKind::Next),
+        graph_edge(graph, build, review, EdgeKind::Next),
+        graph_edge(graph, review, plan, EdgeKind::Next),
+    ];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &forward_edges_form_a_cycle(&["plan", "build", "review", "plan"], graph),
+        "a cycle of `next` edges",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written, the revision unchanged"
+    );
+}
+
+/// MOD-138 D9 (W3): a `kind` edge `plan → review` with no forward path from `review` back to
+/// `plan` runs forward; nothing is written.
+async fn refuse_a_forward_loop_edge<S: WriteStore>(case: &str, store: &S, kind: EdgeKind) {
+    let (graph, phases) = scratch_graph(case, store, "forward", &["plan", "build", "review"]).await;
+    let before = body_now(case, store, graph).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut written = before.clone();
+    written.edges = vec![
+        graph_edge(graph, plan, build, EdgeKind::Next),
+        graph_edge(graph, build, review, EdgeKind::Next),
+        graph_edge(graph, plan, review, kind),
+    ];
+    constraint_exactly(
+        case,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &loop_edge_runs_forward(kind, "plan", "review", graph),
+        "a loop edge that runs forward",
+    );
+    assert_eq!(
+        body_now(case, store, graph).await,
+        before,
+        "{case}: nothing written, the revision unchanged"
+    );
+}
+
+/// MOD-138 D9 (W3): a forward `changes_requested` edge.
+async fn replace_graph_refuses_a_forward_changes_requested<S: WriteStore>(store: &S) {
+    Box::pin(refuse_a_forward_loop_edge(
+        "replace_graph_refuses_a_forward_changes_requested",
+        store,
+        EdgeKind::ChangesRequested,
+    ))
+    .await;
+}
+
+/// MOD-138 D9 (W3): a forward `fails` edge.
+async fn replace_graph_refuses_a_forward_fails<S: WriteStore>(store: &S) {
+    Box::pin(refuse_a_forward_loop_edge(
+        "replace_graph_refuses_a_forward_fails",
+        store,
+        EdgeKind::Fails,
+    ))
+    .await;
+}
+
+/// MOD-138 D9 (W2, blueprint F18): `review → plan` `asks_you` is a back edge over the `next`
+/// chain, so the default edges plus it are applied and stored as given.
+async fn replace_graph_accepts_an_asks_you_back_edge<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_accepts_an_asks_you_back_edge";
+    let (graph, phases) = scratch_graph(CASE, store, "asked", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let mut written = before.clone();
+    written.edges = seed::default_edges(&phases, EdgeId::new);
+    written.edges.push(graph_edge(
+        graph,
+        phases[2].id,
+        phases[0].id,
+        EdgeKind::AsksYou,
+    ));
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        before.graph.revision + 1,
+        "{CASE}: applied"
+    );
+    assert_eq!(
+        answer.edges.len(),
+        written.edges.len(),
+        "{CASE}: every edge stored"
+    );
+    for edge in &written.edges {
+        assert!(
+            answer.edges.contains(edge),
+            "{CASE}: {edge:?} is stored as given"
+        );
+    }
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        answer.edges,
+        "{CASE}: the read agrees with the answer"
+    );
+}
+
+// ---- MOD-138 M1: the per-row writers keep default edges (plan D7, blueprint §T3.1) ----------
+
+/// Edges without their ids, as an order-free multiset (D7 mints fresh ids, blueprint §4.5).
+fn edge_set(edges: &[StepGraphEdge]) -> Vec<EdgeShape> {
+    let mut shapes = edge_shape(edges);
+    shapes.sort_by_key(|shape| (shape.0, shape.1, shape.2.as_str(), shape.4));
+    shapes
+}
+
+/// `graph`'s revision now.
+async fn revision_now<S: WriteStore>(case: &str, store: &S, graph: StepGraphId) -> i64 {
+    body_now(case, store, graph).await.graph.revision
+}
+
+/// MOD-138 D7: `graph`'s stored edges are exactly `seed::default_edges` of its stored phases,
+/// palette phases left out (a palette node has no edges); the edges, for the caller's further
+/// checks.
+async fn assert_default_edged<S: WriteStore>(
+    case: &str,
+    store: &S,
+    graph: StepGraphId,
+    after: &str,
+) -> Vec<StepGraphEdge> {
+    let mut phases = store.phases(graph).await.expect(case);
+    phases.retain(|phase| !phase.palette);
+    let edges = store.graph_edges(graph).await.expect(case);
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&seed::default_edges(&phases, EdgeId::new)),
+        "{case}: after {after}, the graph is default-edged"
+    );
+    edges
+}
+
+/// MOD-138 D7: a graph built row by row is default-edged (the empty graph is, and each
+/// `create_phase` re-derives); appending a phase re-chains it in the same write, one bump each.
+async fn create_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "created", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let edges = assert_default_edged(CASE, store, graph, "three creates").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, plan, implement, EdgeKind::Next),
+            graph_edge(graph, implement, review, EdgeKind::Next),
+            StepGraphEdge {
+                loop_limit: Some(phases[1].retry_limit),
+                ..graph_edge(graph, review, implement, EdgeKind::ChangesRequested)
+            },
+        ]),
+        "{CASE}: the chain and the review loop, by phase id"
+    );
+    let revision = revision_now(CASE, store, graph).await;
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "appending `docs`").await;
+    assert!(
+        edges
+            .iter()
+            .any(|edge| (edge.from, edge.to, edge.kind) == (review, docs.id, EdgeKind::Next)),
+        "{CASE}: `review → docs` is chained in"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: the create and its edges are one write, one bump"
+    );
+}
+
+/// MOD-138 D7: moves and renames re-derive the edges in the same write; a rename the rule does
+/// not see (the loop keeps its target) leaves the edges as they are. One bump each.
+async fn update_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "update_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "updated", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (&phases[0], &phases[1], &phases[2]);
+    let patch_of = |name: Option<&str>, position: Option<i32>| PhasePatch {
+        name: name.map(str::to_owned),
+        position,
+        ..PhasePatch::default()
+    };
+
+    // `review` to 9: the order is unchanged, and so are the edges.
+    let before = store.graph_edges(graph).await.expect(CASE);
+    let revision = revision_now(CASE, store, graph).await;
+    let review = applied(
+        CASE,
+        store
+            .update_phase(review.id, review.updated_at, patch_of(None, Some(9)))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "moving `review` to 9").await;
+    assert_eq!(edges, before, "{CASE}: nothing moved, the edges are kept");
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `implement` → `build`: the loop now targets the phase before `review`, the same id.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(
+                implement.id,
+                implement.updated_at,
+                patch_of(Some("build"), None),
+            )
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "renaming `implement`").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&before),
+        "{CASE}: the loop's target is the same phase, so the shape is unchanged"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `review` → `check`: no review, no loop.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(review.id, review.updated_at, patch_of(Some("check"), None))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "renaming `review`").await;
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.kind != EdgeKind::ChangesRequested),
+        "{CASE}: the loop edge went with the name"
+    );
+    assert_eq!(edges.len(), 2, "{CASE}: the `next` chain alone");
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `plan` to 5: the order is now build, plan, check, and the chain follows it.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(plan.id, plan.updated_at, patch_of(None, Some(5)))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "moving `plan` to 5").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, implement.id, plan.id, EdgeKind::Next),
+            graph_edge(graph, plan.id, review.id, EdgeKind::Next),
+        ]),
+        "{CASE}: `build → plan → check`"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+}
+
+/// MOD-138 D7: deleting the middle phase re-chains `next` around it and re-targets the loop, in
+/// the same write.
+async fn delete_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "deleted", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (&phases[0], phases[1].id, phases[2].id);
+    let revision = revision_now(CASE, store, graph).await;
+    store.delete_phase(implement).await.expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "deleting `implement`").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, plan.id, review, EdgeKind::Next),
+            StepGraphEdge {
+                loop_limit: Some(plan.retry_limit),
+                ..graph_edge(graph, review, plan.id, EdgeKind::ChangesRequested)
+            },
+        ]),
+        "{CASE}: `plan → review`, and the loop falls back to the phase before `review`"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: the delete and its edges are one write, one bump"
+    );
+}
+
+/// MOD-138 D7: a graph whose edges were authored keeps them through every per-row write; a new
+/// phase is an unlinked root, and a delete takes only its own edges (the cascade).
+async fn per_row_writers_leave_authored_edges_alone<S: WriteStore>(store: &S) {
+    const CASE: &str = "per_row_writers_leave_authored_edges_alone";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "authored", &["plan", "implement", "review"]).await;
+    let (plan, review) = (phases[0].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.edges = seed::default_edges(&phases, EdgeId::new);
+    body.edges
+        .push(graph_edge(graph, review, plan, EdgeKind::AsksYou));
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    // The replace restamps every kept row, so the rename's token is the answer's.
+    let implement = &answer.nodes[1].phase;
+    assert_eq!(
+        implement.id, phases[1].id,
+        "{CASE}: nodes in position order"
+    );
+    let authored = answer.edges.clone();
+    let by_id = |mut edges: Vec<StepGraphEdge>| {
+        edges.sort_by_key(|edge| edge.id);
+        edges
+    };
+    let stored = || async { by_id(store.graph_edges(graph).await.expect(CASE)) };
+
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a create leaves authored edges alone"
+    );
+    let docs = applied(
+        CASE,
+        store
+            .update_phase(
+                docs.id,
+                docs.updated_at,
+                PhasePatch {
+                    position: Some(10),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a move leaves authored edges alone"
+    );
+    applied(
+        CASE,
+        store
+            .update_phase(
+                implement.id,
+                implement.updated_at,
+                PhasePatch {
+                    name: Some("build".to_owned()),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a rename leaves authored edges alone"
+    );
+    store.delete_phase(docs.id).await.expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: deleting an unlinked phase leaves authored edges alone"
+    );
+    store.delete_phase(implement.id).await.expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(
+            authored
+                .into_iter()
+                .filter(|edge| edge.from != implement.id && edge.to != implement.id)
+                .collect()
+        ),
+        "{CASE}: a delete takes its own edges and re-derives nothing"
+    );
+}
+
+/// MOD-138 D7: a palette node has no edges (MOD-137 rule e), so the default-edge rule leaves it
+/// out. Creating one on a default-edged graph links nothing to it, a phase created after it
+/// chains past it, and the read-back body saves unchanged.
+async fn create_phase_leaves_a_palette_phase_unlinked<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_leaves_a_palette_phase_unlinked";
+    let (graph, phases) = scratch_graph(CASE, store, "palette-row", &["plan", "implement"]).await;
+    let implement = phases[1].id;
+    let chained = assert_default_edged(CASE, store, graph, "two creates").await;
+    let mut row = new_phase(graph, 2, "spare");
+    row.palette = true;
+    let spare = store.create_phase(&row).await.expect(CASE);
+    assert!(spare.palette, "{CASE}: the palette flag is stored");
+    assert_eq!(
+        edge_set(&store.graph_edges(graph).await.expect(CASE)),
+        edge_set(&chained),
+        "{CASE}: creating a palette phase moves no edge"
+    );
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "appending `docs` past `spare`").await;
+    assert!(
+        edges
+            .iter()
+            .any(|edge| (edge.from, edge.to, edge.kind) == (implement, docs.id, EdgeKind::Next)),
+        "{CASE}: `implement → docs` chains past the palette phase"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.from != spare.id && edge.to != spare.id),
+        "{CASE}: no edge on the palette phase"
+    );
+    let body = body_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
     );
 }
 
@@ -23012,6 +23566,510 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
         store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE),
         project_graphs,
         "{CASE}: project graphs untouched"
+    );
+}
+
+/// MOD-138 D12: a fresh workspace linked to `project`, so its graphs are the project's to use.
+async fn linked_workspace<S: WriteStore>(
+    case: &str,
+    store: &S,
+    slug: &str,
+    project: ProjectId,
+) -> WorkspaceId {
+    let workspace = store
+        .create_workspace(new_workspace(slug))
+        .await
+        .expect(case);
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace.id,
+            project_id: project,
+            position: 0,
+        })
+        .await
+        .expect(case);
+    workspace.id
+}
+
+/// MOD-138 D12: a kind takes its project's graph, a library graph, or a graph of a workspace that
+/// holds its project, on create and on update; another workspace's graph is refused with
+/// [`graph_not_usable`], and the refused update leaves the row as it was.
+async fn item_kind_takes_usable_graphs_only<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_takes_usable_graphs_only";
+    let ours = linked_workspace(CASE, store, "kinds-ours", ids::PROJECT_HTUI).await;
+    let theirs = linked_workspace(CASE, store, "kinds-theirs", ids::PROJECT_AGY).await;
+    let library = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "libflow", false))
+        .await
+        .expect(CASE);
+    let shared = store
+        .create_step_graph(scoped_graph(GraphScope::Workspace(ours), "wsflow", false))
+        .await
+        .expect(CASE);
+    let foreign = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(theirs),
+            "otherws",
+            false,
+        ))
+        .await
+        .expect(CASE);
+
+    for (prefix, graph) in [("LIBK", library.id), ("WSK", shared.id)] {
+        let kind = store
+            .create_item_kind(new_item_kind(
+                ids::PROJECT_HTUI,
+                prefix,
+                &format!("kind {prefix}"),
+                graph,
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: a kind on {graph} is created: {err:?}"));
+        assert_eq!(kind.default_graph_id, graph, "{CASE}: {prefix}'s graph");
+    }
+    let refused = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "OTHK",
+            "other workspace",
+            foreign.id,
+        ))
+        .await;
+    assert_eq!(
+        refused,
+        Err(StoreError::Constraint(graph_not_usable(
+            foreign.id,
+            ids::PROJECT_HTUI
+        ))),
+        "{CASE}: another workspace's graph is not the project's to use"
+    );
+
+    let mut kind = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "MOVK",
+            "moving",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    for graph in [library.id, shared.id, ids::GRAPH_HTUI_ANA] {
+        kind = applied(
+            CASE,
+            store
+                .update_item_kind(
+                    kind.id,
+                    kind.updated_at,
+                    ItemKindPatch {
+                        default_graph_id: Some(graph),
+                        ..ItemKindPatch::default()
+                    },
+                )
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            kind.default_graph_id, graph,
+            "{CASE}: the update to {graph}"
+        );
+    }
+    let refused = store
+        .update_item_kind(
+            kind.id,
+            kind.updated_at,
+            ItemKindPatch {
+                default_graph_id: Some(foreign.id),
+                ..ItemKindPatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(StoreError::Constraint(text))
+                if *text == graph_not_usable(foreign.id, ids::PROJECT_HTUI)
+        ),
+        "{CASE}: an update to another workspace's graph is refused, got {refused:?}"
+    );
+    let kept = store
+        .item_kinds(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == kind.id)
+        .unwrap_or_else(|| panic!("{CASE}: the kind is there"));
+    assert_eq!(kept, kind, "{CASE}: the refused update wrote nothing");
+}
+
+/// MOD-138 A7 (review R1): a kind's graph is checked against the usable-graphs rule only when an
+/// update changes it, as an item's is. A kind kept on a workspace graph after its project left the
+/// workspace takes a rename that resends the graph unchanged, and one that leaves it out; an
+/// update that changes the graph to one the project may not use is still refused with
+/// [`graph_not_usable`], whether that graph is another workspace's or the one the project left.
+async fn item_kind_keeps_a_graph_its_project_left<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_keeps_a_graph_its_project_left";
+    let ours = linked_workspace(CASE, store, "kept-ours", ids::PROJECT_HTUI).await;
+    let theirs = linked_workspace(CASE, store, "kept-theirs", ids::PROJECT_AGY).await;
+    let shared = store
+        .create_step_graph(scoped_graph(GraphScope::Workspace(ours), "keptflow", false))
+        .await
+        .expect(CASE);
+    let foreign = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(theirs),
+            "keptother",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let mut kind = store
+        .create_item_kind(new_item_kind(ids::PROJECT_HTUI, "KEPK", "kept", shared.id))
+        .await
+        .expect(CASE);
+    let mut moved = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "MOVEK",
+            "moved",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    store
+        .remove_workspace_project(ours, ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+
+    for (graph, name) in [(Some(shared.id), "kept again"), (None, "kept once more")] {
+        kind = applied(
+            CASE,
+            store
+                .update_item_kind(
+                    kind.id,
+                    kind.updated_at,
+                    ItemKindPatch {
+                        name: Some(name.to_owned()),
+                        default_graph_id: graph,
+                        ..ItemKindPatch::default()
+                    },
+                )
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            kind.name, name,
+            "{CASE}: the rename with graph {graph:?} lands"
+        );
+        assert_eq!(
+            kind.default_graph_id, shared.id,
+            "{CASE}: an unchanged graph is not re-checked, so the kind keeps it"
+        );
+    }
+
+    for (row, graph) in [(&kind, foreign.id), (&moved, shared.id)] {
+        let refused = store
+            .update_item_kind(
+                row.id,
+                row.updated_at,
+                ItemKindPatch {
+                    name: Some("renamed too".to_owned()),
+                    default_graph_id: Some(graph),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::Constraint(text))
+                    if *text == graph_not_usable(graph, ids::PROJECT_HTUI)
+            ),
+            "{CASE}: a change to {graph}, which the project may not use, is refused, got \
+             {refused:?}"
+        );
+    }
+    let rows = store.item_kinds(ids::PROJECT_HTUI).await.expect(CASE);
+    let reread = |id| {
+        rows.iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{CASE}: the kind is there"))
+    };
+    assert_eq!(
+        reread(kind.id),
+        kind,
+        "{CASE}: the refused change wrote nothing"
+    );
+    moved = reread(moved.id);
+    assert_eq!(
+        moved.default_graph_id,
+        ids::GRAPH_HTUI_ANA,
+        "{CASE}: the refused move wrote nothing"
+    );
+    assert_eq!(moved.name, "moved", "{CASE}: nor the rename beside it");
+}
+
+/// MOD-138 D12 (A4): `usable_graphs` lists the project's graphs (an override included), then the
+/// graphs of every workspace holding the project, then the library's, by name within each scope;
+/// a workspace that does not hold the project lends nothing, and unlinking it takes its graphs off
+/// the list.
+async fn usable_graphs_lists_project_workspace_library<S: WriteStore>(store: &S) {
+    const CASE: &str = "usable_graphs_lists_project_workspace_library";
+    let extra = linked_workspace(CASE, store, "usable-extra", ids::PROJECT_HTUI).await;
+    let graph = |scope: GraphScope, name: &'static str, is_override: bool| {
+        store.create_step_graph(scoped_graph(scope, name, is_override))
+    };
+    let clone = graph(
+        GraphScope::Project(ids::PROJECT_HTUI),
+        "HTUI-9-override",
+        true,
+    )
+    .await
+    .expect(CASE);
+    let b_flow = graph(
+        GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+        "b-flow",
+        false,
+    )
+    .await
+    .expect(CASE);
+    let a_flow = graph(GraphScope::Workspace(extra), "a-flow", false)
+        .await
+        .expect(CASE);
+    let elsewhere = graph(
+        GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+        "c-flow",
+        false,
+    )
+    .await
+    .expect(CASE);
+    let lib_b = graph(GraphScope::Library, "lib-b", false)
+        .await
+        .expect(CASE);
+    let lib_a = graph(GraphScope::Library, "lib-a", false)
+        .await
+        .expect(CASE);
+
+    let project: Vec<StepGraphId> = store
+        .step_graphs(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    assert!(
+        project.contains(&clone.id) && project.contains(&ids::GRAPH_HTUI_FEAT),
+        "{CASE}: the project's own graphs, the override among them"
+    );
+    let mut expected = project.clone();
+    expected.extend([a_flow.id, b_flow.id, lib_a.id, lib_b.id]);
+    let listed = store.usable_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        listed.iter().map(|row| row.id).collect::<Vec<_>>(),
+        expected,
+        "{CASE}: project, then workspace, then library, by name within each"
+    );
+    assert!(
+        !listed.iter().any(|row| row.id == elsewhere.id),
+        "{CASE}: a workspace that does not hold the project lends nothing"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|row| row.scope == GraphScope::Project(ids::PROJECT_AGY)),
+        "{CASE}: nor does another project"
+    );
+    let a_row = listed
+        .iter()
+        .find(|row| row.id == a_flow.id)
+        .unwrap_or_else(|| panic!("{CASE}: a-flow is listed"));
+    assert_eq!(a_row, &a_flow, "{CASE}: the row as created");
+
+    store
+        .remove_workspace_project(extra, ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+    let mut expected = project;
+    expected.extend([b_flow.id, lib_a.id, lib_b.id]);
+    assert_eq!(
+        store
+            .usable_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        expected,
+        "{CASE}: unlinked, the workspace's graphs leave the list"
+    );
+}
+
+/// MOD-138 A3: `delete_workspace` refuses while a kind or an item names one of its graphs (neither
+/// reference cascades), naming the first holder in (graph, holder, project slug) order, and
+/// deletes nothing; once nothing holds the graph the delete applies.
+async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_refuses_a_held_graph";
+    let workspace = linked_workspace(CASE, store, "held-ws", ids::PROJECT_HTUI).await;
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(workspace),
+            "held-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    let slug = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project"))
+        .slug;
+    let kind = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "WSK",
+            "workspace kind",
+            graph.id,
+        ))
+        .await
+        .expect(CASE);
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace))
+        .await
+        .expect(CASE);
+
+    let refused = store.delete_workspace(workspace).await;
+    assert_eq!(
+        refused,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind WSK",
+            &slug
+        ))),
+        "{CASE}: a kind holds the graph"
+    );
+    assert_eq!(
+        store
+            .delete_reach(DeleteTarget::Workspace(workspace))
+            .await
+            .expect(CASE),
+        reach,
+        "{CASE}: nothing was deleted"
+    );
+    assert!(
+        store.graph_body(graph.id).await.expect(CASE).is_some(),
+        "{CASE}: the graph is still there"
+    );
+
+    // Prefixes are unique per project only, so a second project in the workspace can hold the
+    // graph under the same holder text; the project slug breaks that tie (`agy` before `htui`).
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace,
+            project_id: ids::PROJECT_AGY,
+            position: 1,
+        })
+        .await
+        .expect(CASE);
+    let agy = store
+        .project(ids::PROJECT_AGY)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the second fixture project"))
+        .slug;
+    let twin = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_AGY,
+            "WSK",
+            "workspace kind",
+            graph.id,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind WSK",
+            core::cmp::min(&agy, &slug)
+        ))),
+        "{CASE}: the project slug breaks a tie"
+    );
+
+    // An item on the graph holds it too, and `item KEY` sorts before `item_kind PREFIX`.
+    let mut item = new_item(
+        ids::PROJECT_HTUI,
+        ids::KIND_HTUI_ANA,
+        "on the workspace graph",
+    );
+    item.step_graph_id = Some(graph.id);
+    let item = store.mint_item(item).await.expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            &format!("item {}", item.key),
+            &slug
+        ))),
+        "{CASE}: the item is named first"
+    );
+
+    applied(
+        CASE,
+        store
+            .update_item_kind(
+                kind.id,
+                kind.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ids::GRAPH_HTUI_ANA),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .update_item_kind(
+                twin.id,
+                twin.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ids::GRAPH_AGY_ANA),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    let repointed = store
+        .update_item(
+            item.id,
+            item.version,
+            ItemPatch {
+                step_graph_id: Some(None),
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: "off the workspace graph".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(repointed, UpdateOutcome::Updated(_)),
+        "{CASE}: the item lets go, got {repointed:?}"
+    );
+    let done = store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(done.step_graphs, 1, "{CASE}: the delete takes the graph");
+    assert_eq!(
+        store.graph_body(graph.id).await.expect(CASE),
+        None,
+        "{CASE}: the graph went with its workspace"
     );
 }
 

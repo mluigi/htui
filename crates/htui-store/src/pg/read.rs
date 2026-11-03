@@ -1914,22 +1914,7 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
-        sqlx::query_as!(
-            PhaseAgent,
-            r#"
-            SELECT phase_id AS "phase_id: PhaseId",
-                   position,
-                   agent_id AS "agent_id: htui_core::model::AgentId",
-                   model
-              FROM phase_agent
-             WHERE phase_id = $1
-             ORDER BY position
-            "#,
-            phase.as_uuid(),
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)
+        phase_agents_on(&self.pool, phase).await
     }
 
     /// One `prompt_template` by `(project, name)`: the pinned `version` when `version` is `Some`,
@@ -1975,65 +1960,31 @@ impl PgStore {
     }
 
     /// The graph an item runs under - its own `step_graph_id`, else its kind's default - with the
-    /// phases in `position` order and each phase's candidate agents (ANA-2 §8).
+    /// phases in `position` order, each phase's candidate agents and parts, and the graph's edges
+    /// (ANA-2 §8, MOD-138 D10).
     ///
-    /// Three round trips plus one per phase rather than one join, because [`ResolvedGraph`] is a
-    /// tree and `query_as!` builds rows: the alternative is a `jsonb_agg` the two backends would
-    /// then have to decode alike. `None` when the item, its kind or the graph is gone, which is
-    /// `MemStore`'s `?`-chain in SQL - the `COALESCE` resolves the graph id and the row read after
-    /// it decides whether such a graph exists.
+    /// Several statements rather than one join, because [`ResolvedGraph`] is a tree and
+    /// `query_as!` builds rows: the alternative is a `jsonb_agg` the two backends would then have
+    /// to decode alike. They run in one `REPEATABLE READ, READ ONLY` transaction (MOD-138 F7, the
+    /// `graph_body` precedent), so a Settings edit committed between the phase read and the edge
+    /// read cannot hand resolve edges of one revision and phases of another. `None` when the
+    /// item, its kind or the graph is gone, which is `MemStore`'s `?`-chain in SQL - the
+    /// `COALESCE` resolves the graph id and the row read after it decides whether such a graph
+    /// exists.
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
-        let Some(graph_id) = sqlx::query_scalar!(
-            r#"
-            SELECT COALESCE(i.step_graph_id, k.default_graph_id)
-                       AS "graph_id?: htui_core::model::StepGraphId"
-              FROM item i JOIN item_kind k ON k.id = i.kind_id
-             WHERE i.id = $1
-            "#,
-            item.as_uuid(),
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?
-        .flatten() else {
-            return Ok(None);
-        };
-
-        let Some(graph) = self.step_graph_row(graph_id).await? else {
-            return Ok(None);
-        };
-
-        let mut phases = Vec::new();
-        for phase in self.phase_rows(graph_id).await? {
-            let agents = self.phase_agents(phase.id).await?;
-            phases.push(ResolvedPhase {
-                phase,
-                agents,
-                persona: None,
-            });
-        }
-        // MOD-26 D6: one read over the distinct bound personas.
-        let mut ids: Vec<Uuid> = phases
-            .iter()
-            .filter_map(|row| row.phase.persona_id)
-            .map(PersonaId::as_uuid)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        if !ids.is_empty() {
-            let personas = self.persona_rows_by_id(&ids).await?;
-            for row in &mut phases {
-                row.persona = row
-                    .phase
-                    .persona_id
-                    .and_then(|id| personas.iter().find(|persona| persona.id == id).cloned());
-            }
-        }
-        Ok(Some(ResolvedGraph { graph, phases }))
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        // Boxed: the engine awaits this future inside its own (MOD-138 blueprint §4).
+        let resolved = Box::pin(resolve_graph_on(&mut tx, item)).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(resolved)
     }
 
     /// Every `agent_box` row of one box, in `agent_id` byte order.
@@ -3019,6 +2970,49 @@ impl PgStore {
         .collect()
     }
 
+    /// MOD-138 D12 (A4): every graph `project` may use: its own, each workspace's that holds it
+    /// (`workspace_project`), and the library's (neither owner column set); ordered by scope in
+    /// that order, then `name` bytes, then id, as `MemStore` orders them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn usable_graph_rows(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        sqlx::query_as!(
+            StepGraphRow,
+            r#"
+            SELECT g.id           AS "id: StepGraphId",
+                   g.project_id   AS "project_id: ProjectId",
+                   g.workspace_id AS "workspace_id: WorkspaceId",
+                   g.name,
+                   g.description,
+                   -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).
+                   g.is_override,
+                   g.revision,
+                   g.created_at,
+                   g.updated_at
+              FROM step_graph g
+             WHERE g.project_id = $1
+                OR (g.project_id IS NULL AND g.workspace_id IS NULL)
+                OR g.workspace_id IN (SELECT wp.workspace_id
+                                        FROM workspace_project wp
+                                       WHERE wp.project_id = $1)
+             ORDER BY CASE WHEN g.project_id IS NOT NULL THEN 0
+                           WHEN g.workspace_id IS NOT NULL THEN 1
+                           ELSE 2 END,
+                      g.name COLLATE "C",
+                      g.id
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(StepGraph::try_from)
+        .collect()
+    }
+
     /// A graph's phases, ordered by `position`, which is unique per graph.
     ///
     /// # Errors
@@ -3086,35 +3080,6 @@ impl PgStore {
         .await
         .map_err(map_sqlx)?;
         Ok(row.map(Persona::from))
-    }
-
-    /// The personas `ids` name, in `name` byte order; an id that names no row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the driver reports, through [`map_sqlx`].
-    pub(crate) async fn persona_rows_by_id(&self, ids: &[Uuid]) -> Result<Vec<Persona>> {
-        let rows = sqlx::query_as!(
-            PersonaRow,
-            r#"
-            SELECT id          AS "id: PersonaId",
-                   name,
-                   description,
-                   body,
-                   tools       AS "tools: Json<PersonaTools>",
-                   permission  AS "permission: Json<PersonaPermission>",
-                   created_at,
-                   updated_at
-              FROM persona
-             WHERE id = ANY($1)
-             ORDER BY name COLLATE "C"
-            "#,
-            ids,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(rows.into_iter().map(Persona::from).collect())
     }
 
     // ---- MOD-9 milestone 3: the skill readers (plan D75, blueprint D91, D92) -----------------
@@ -3511,6 +3476,137 @@ pub(crate) async fn phase_parts_on<'e, E: PgExecutor<'e>>(
     .fetch_all(executor)
     .await
     .map_err(map_sqlx)
+}
+
+/// [`PgStore::phase_agents`] on any executor.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn phase_agents_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    phase: PhaseId,
+) -> Result<Vec<PhaseAgent>> {
+    // The literal is byte-identical to the one `phase_agents` held, so `.sqlx` is unchanged.
+    sqlx::query_as!(
+        PhaseAgent,
+        r#"
+            SELECT phase_id AS "phase_id: PhaseId",
+                   position,
+                   agent_id AS "agent_id: htui_core::model::AgentId",
+                   model
+              FROM phase_agent
+             WHERE phase_id = $1
+             ORDER BY position
+            "#,
+        phase.as_uuid(),
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// The personas `ids` name, in `name` byte order; an id that names no row is absent. On any
+/// executor, because [`resolve_graph_on`] reads them inside its transaction.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn persona_rows_by_id_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[Uuid],
+) -> Result<Vec<Persona>> {
+    // Byte-identical to the literal `PgStore::persona_rows_by_id` held, so `.sqlx` is unchanged.
+    let rows = sqlx::query_as!(
+        PersonaRow,
+        r#"
+            SELECT id          AS "id: PersonaId",
+                   name,
+                   description,
+                   body,
+                   tools       AS "tools: Json<PersonaTools>",
+                   permission  AS "permission: Json<PersonaPermission>",
+                   created_at,
+                   updated_at
+              FROM persona
+             WHERE id = ANY($1)
+             ORDER BY name COLLATE "C"
+            "#,
+        ids,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(rows.into_iter().map(Persona::from).collect())
+}
+
+/// [`PgStore::resolve_graph`]'s reads on one connection, which the caller holds in a
+/// `REPEATABLE READ` transaction (MOD-138 F7).
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn resolve_graph_on(
+    conn: &mut PgConnection,
+    item: ItemId,
+) -> Result<Option<ResolvedGraph>> {
+    // Byte-identical to the literal `resolve_graph` held, so `.sqlx` is unchanged.
+    let Some(graph_id) = sqlx::query_scalar!(
+        r#"
+            SELECT COALESCE(i.step_graph_id, k.default_graph_id)
+                       AS "graph_id?: htui_core::model::StepGraphId"
+              FROM item i JOIN item_kind k ON k.id = i.kind_id
+             WHERE i.id = $1
+            "#,
+        item.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    .flatten() else {
+        return Ok(None);
+    };
+
+    let Some(graph) = step_graph_row_on(&mut *conn, graph_id).await? else {
+        return Ok(None);
+    };
+
+    let mut phases = Vec::new();
+    for phase in phase_rows_on(&mut *conn, graph_id).await? {
+        let agents = phase_agents_on(&mut *conn, phase.id).await?;
+        // MOD-138 D10: the node's default parts.
+        let parts = phase_parts_on(&mut *conn, phase.id).await?;
+        phases.push(ResolvedPhase {
+            phase,
+            agents,
+            persona: None,
+            parts,
+        });
+    }
+    // MOD-26 D6: one read over the distinct bound personas.
+    let mut ids: Vec<Uuid> = phases
+        .iter()
+        .filter_map(|row| row.phase.persona_id)
+        .map(PersonaId::as_uuid)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if !ids.is_empty() {
+        let personas = persona_rows_by_id_on(&mut *conn, &ids).await?;
+        for row in &mut phases {
+            row.persona = row
+                .phase
+                .persona_id
+                .and_then(|id| personas.iter().find(|persona| persona.id == id).cloned());
+        }
+    }
+    // MOD-138 D10: the edges, in the same snapshot as the phases they name.
+    let edges = graph_edges_on(&mut *conn, graph_id).await?;
+    Ok(Some(ResolvedGraph {
+        graph,
+        phases,
+        edges,
+    }))
 }
 
 /// The whole body `replace_graph` writes, as stored (blueprint F10, §T3.4): the graph row, its

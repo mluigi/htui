@@ -112,7 +112,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -123,8 +123,8 @@ async fn migrations_apply_on_a_clean_database() {
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
-         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql and MOD-163's 0022_memory.sql, \
-         in ordinal order"
+         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql \
+         and MOD-138's 0023_default_edges_repair.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -2371,6 +2371,350 @@ async fn migration_0020_backfill_equals_default_edges() {
     db.drop_db().await;
 }
 
+/// MOD-138's ten probe graphs (blueprint §T3.2), raw-seeded at v22 under `project`; answers
+/// the graph ids by name. `feature` is already default-edged; `appended` gained `docs` with no
+/// edge; `renamed` loops `review → plan` where the rule says `review → implement`; `gappy` has
+/// positions 0/5/9 and no edges; `authored` carries an odd `next`, an `if` and a `fails`; `asks`
+/// an `asks_you`; `solo` is one `review`; `empty` has no phases; `palette` has a palette phase
+/// between `plan` and `review`, and `palette-review`'s `review` is a palette phase. Both palette
+/// graphs carry the drifted edges a pre-A5 writer left on them (into, out of and looping onto the
+/// palette phase), which 0023 must delete and link past.
+async fn seed_0023_probe_graphs(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+) -> std::collections::BTreeMap<&'static str, uuid::Uuid> {
+    let edge = |graph: uuid::Uuid,
+                from: uuid::Uuid,
+                to: uuid::Uuid,
+                kind: &'static str,
+                predicate: Option<serde_json::Value>,
+                limit: Option<i32>| async move {
+        try_edge(pool, graph, from, to, kind, predicate, limit)
+            .await
+            .unwrap_or_else(|err| panic!("insert a `{kind}` edge: {err}"));
+    };
+    let mut graphs = std::collections::BTreeMap::new();
+
+    let feature = insert_graph(pool, project, "feature").await;
+    let prd = insert_phase(pool, feature, 0, "prd", 1, 1).await;
+    let plan = insert_phase(pool, feature, 1, "plan", 1, 1).await;
+    let implement = insert_phase(pool, feature, 2, "implement", 1, 3).await;
+    let review = insert_phase(pool, feature, 3, "review", 1, 1).await;
+    edge(feature, prd, plan, "next", None, None).await;
+    edge(feature, plan, implement, "next", None, None).await;
+    edge(feature, implement, review, "next", None, None).await;
+    edge(
+        feature,
+        review,
+        implement,
+        "changes_requested",
+        None,
+        Some(3),
+    )
+    .await;
+    graphs.insert("feature", feature);
+
+    let appended = insert_graph(pool, project, "appended").await;
+    let implement = insert_phase(pool, appended, 0, "implement", 1, 2).await;
+    let review = insert_phase(pool, appended, 1, "review", 1, 1).await;
+    insert_phase(pool, appended, 2, "docs", 1, 1).await;
+    edge(appended, implement, review, "next", None, None).await;
+    edge(
+        appended,
+        review,
+        implement,
+        "changes_requested",
+        None,
+        Some(2),
+    )
+    .await;
+    graphs.insert("appended", appended);
+
+    let renamed = insert_graph(pool, project, "renamed").await;
+    let plan = insert_phase(pool, renamed, 0, "plan", 1, 1).await;
+    let implement = insert_phase(pool, renamed, 1, "implement", 1, 2).await;
+    let review = insert_phase(pool, renamed, 2, "review", 1, 1).await;
+    edge(renamed, plan, implement, "next", None, None).await;
+    edge(renamed, implement, review, "next", None, None).await;
+    edge(renamed, review, plan, "changes_requested", None, Some(1)).await;
+    graphs.insert("renamed", renamed);
+
+    let gappy = insert_graph(pool, project, "gappy").await;
+    insert_phase(pool, gappy, 0, "implement", 1, 4).await;
+    insert_phase(pool, gappy, 5, "docs", 1, 1).await;
+    insert_phase(pool, gappy, 9, "review", 1, 1).await;
+    graphs.insert("gappy", gappy);
+
+    let authored = insert_graph(pool, project, "authored").await;
+    let x = insert_phase(pool, authored, 0, "x", 1, 1).await;
+    let y = insert_phase(pool, authored, 1, "y", 1, 1).await;
+    let z = insert_phase(pool, authored, 2, "z", 1, 1).await;
+    edge(authored, x, z, "next", None, None).await;
+    edge(
+        authored,
+        y,
+        z,
+        "if",
+        Some(serde_json::json!({"verify": "passed"})),
+        None,
+    )
+    .await;
+    edge(authored, z, x, "fails", None, Some(1)).await;
+    graphs.insert("authored", authored);
+
+    let asks = insert_graph(pool, project, "asks").await;
+    let p = insert_phase(pool, asks, 0, "p", 1, 1).await;
+    let q = insert_phase(pool, asks, 1, "q", 1, 1).await;
+    edge(asks, p, q, "next", None, None).await;
+    edge(asks, q, p, "asks_you", None, None).await;
+    graphs.insert("asks", asks);
+
+    let solo = insert_graph(pool, project, "solo").await;
+    insert_phase(pool, solo, 0, "review", 1, 1).await;
+    graphs.insert("solo", solo);
+
+    // A palette node has no edges (MOD-137 rule e): the chain runs past `spare`, and `review`'s
+    // fallback loop skips it for `plan`. In `palette-review` the palette node is the review.
+    // Before A5 a phase flipped to palette kept its edges, so both graphs start drifted: edges
+    // into, out of and looping onto the palette phase, all of which 0023 deletes.
+    let palette = insert_graph(pool, project, "palette").await;
+    let plan = insert_phase(pool, palette, 0, "plan", 1, 2).await;
+    let spare = insert_phase(pool, palette, 1, "spare", 1, 1).await;
+    let review = insert_phase(pool, palette, 2, "review", 1, 1).await;
+    edge(palette, plan, spare, "next", None, None).await;
+    edge(palette, spare, review, "next", None, None).await;
+    edge(palette, review, spare, "changes_requested", None, Some(1)).await;
+    graphs.insert("palette", palette);
+    let palette_review = insert_graph(pool, project, "palette-review").await;
+    let implement = insert_phase(pool, palette_review, 0, "implement", 1, 1).await;
+    let parked = insert_phase(pool, palette_review, 1, "review", 1, 1).await;
+    edge(palette_review, implement, parked, "next", None, None).await;
+    graphs.insert("palette-review", palette_review);
+    sqlx::query("UPDATE step_graph_phase SET palette = true WHERE id = ANY($1)")
+        .bind(vec![spare, parked])
+        .execute(pool)
+        .await
+        .expect("mark the palette phases");
+
+    graphs.insert("empty", insert_graph(pool, project, "empty").await);
+    graphs
+}
+
+/// A graph's edges by id, as `(id, from, to, kind, loop_limit)`.
+async fn edge_rows(
+    pool: &sqlx::PgPool,
+    graph: uuid::Uuid,
+) -> Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid, String, Option<i32>)> {
+    sqlx::query_as(
+        "SELECT id, from_phase_id, to_phase_id, kind, loop_limit FROM step_graph_edge \
+         WHERE graph_id = $1 ORDER BY id",
+    )
+    .bind(graph)
+    .fetch_all(pool)
+    .await
+    .expect("read the graph's edges")
+}
+
+/// MOD-138 plan D8 (blueprint §T3.2): `0023_default_edges_repair.sql` re-derives every graph
+/// without an `if`, `asks_you` or `fails` edge and leaves an authored graph exactly as it is,
+/// edge ids included; no revision moves. Staged at v22 with the ten probe graphs; the plain
+/// `run` then applies 0023. The expected rows are the blueprint's probe, verbatim, plus the two
+/// palette graphs (a palette node has no edges, MOD-137 rule e).
+#[tokio::test]
+async fn migration_0023_repairs_drifted_graphs_and_leaves_authored_ones() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(22, &db.pool)
+        .await
+        .expect("apply 0001 through 0022");
+    let pool = &db.pool;
+    let user = insert_user(pool, "repair").await;
+    let project = insert_project(pool, user, "repairs").await;
+    let graphs = seed_0023_probe_graphs(pool, project).await;
+    let authored_before = edge_rows(pool, graphs["authored"]).await;
+    let asks_before = edge_rows(pool, graphs["asks"]).await;
+
+    MIGRATOR.run(pool).await.expect("apply 0023");
+
+    let edge = |graph: &str, from: &str, to: &str, kind: &str, limit: Option<i32>| {
+        (
+            graph.to_owned(),
+            from.to_owned(),
+            to.to_owned(),
+            kind.to_owned(),
+            limit,
+        )
+    };
+    let (next, loops) = ("next", "changes_requested");
+    assert_eq!(
+        edge_names(pool).await,
+        vec![
+            edge("appended", "implement", "review", next, None),
+            edge("appended", "review", "implement", loops, Some(2)),
+            edge("appended", "review", "docs", next, None),
+            edge("asks", "p", "q", next, None),
+            edge("asks", "q", "p", "asks_you", None),
+            edge("authored", "x", "z", next, None),
+            edge("authored", "y", "z", "if", None),
+            edge("authored", "z", "x", "fails", Some(1)),
+            edge("feature", "prd", "plan", next, None),
+            edge("feature", "plan", "implement", next, None),
+            edge("feature", "implement", "review", next, None),
+            edge("feature", "review", "implement", loops, Some(3)),
+            edge("gappy", "implement", "docs", next, None),
+            edge("gappy", "docs", "review", next, None),
+            edge("gappy", "review", "implement", loops, Some(4)),
+            edge("palette", "plan", "review", next, None),
+            edge("palette", "review", "plan", loops, Some(2)),
+            edge("renamed", "plan", "implement", next, None),
+            edge("renamed", "implement", "review", next, None),
+            edge("renamed", "review", "implement", loops, Some(2)),
+        ],
+        "the probe's 20 rows: drifted graphs re-derived, authored ones untouched, no edge on a \
+         palette node, solo, palette-review and empty without edges"
+    );
+    assert_eq!(
+        edge_rows(pool, graphs["authored"]).await,
+        authored_before,
+        "`authored` keeps its edges, ids included"
+    );
+    assert_eq!(
+        edge_rows(pool, graphs["asks"]).await,
+        asks_before,
+        "`asks` keeps its edges, ids included"
+    );
+    let predicate: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT predicate FROM step_graph_edge WHERE graph_id = $1 AND kind = 'if'",
+    )
+    .bind(graphs["authored"])
+    .fetch_one(pool)
+    .await
+    .expect("read the `if` predicate");
+    assert_eq!(
+        predicate,
+        Some(serde_json::json!({"verify": "passed"})),
+        "the authored predicate is kept"
+    );
+    let revisions: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT revision FROM step_graph")
+        .fetch_all(pool)
+        .await
+        .expect("read revisions");
+    assert_eq!(revisions, vec![0], "0023 bumps no revision");
+
+    db.drop_db().await;
+}
+
+/// MOD-138 plan D8 (blueprint §T3.2): the 0023 repair and [`htui_core::seed::default_edges`] are
+/// one rule in two places, pinned equal, the `migration_0020_backfill_equals_default_edges`
+/// shape. Per repaired probe graph, the stored `(from, to, kind, loop_limit)` set equals what
+/// `default_edges` derives from the same phase rows, palette phases left out (as
+/// `default_edges_follow` leaves them out). Then the file runs a second time, raw in
+/// one transaction as sqlx runs it: the same rows (idempotent).
+#[tokio::test]
+async fn migration_0023_equals_default_edges() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(22, &db.pool)
+        .await
+        .expect("apply 0001 through 0022");
+    let pool = &db.pool;
+    let user = insert_user(pool, "repair").await;
+    let project = insert_project(pool, user, "repairs").await;
+    let graphs = seed_0023_probe_graphs(pool, project).await;
+
+    MIGRATOR.run(pool).await.expect("apply 0023");
+
+    let mut total = 0;
+    for name in [
+        "feature",
+        "appended",
+        "renamed",
+        "gappy",
+        "solo",
+        "empty",
+        "palette",
+        "palette-review",
+    ] {
+        let graph = graphs[name];
+        let rows: Vec<(uuid::Uuid, i32, String, i32)> = sqlx::query_as(
+            "SELECT id, position, name, retry_limit FROM step_graph_phase \
+             WHERE graph_id = $1 AND NOT palette",
+        )
+        .bind(graph)
+        .fetch_all(pool)
+        .await
+        .expect("read the graph's phases");
+        let phases: Vec<htui_core::model::StepGraphPhase> = rows
+            .into_iter()
+            .map(|(id, position, name, retry_limit)| {
+                let seed = htui_core::seed::PhaseSeed {
+                    name: "unused",
+                    input_kinds: &[],
+                    gate_hard: false,
+                };
+                let mut row = htui_core::seed::phase_row(
+                    htui_core::model::PhaseId::from_uuid(id),
+                    htui_core::model::StepGraphId::from_uuid(graph),
+                    position,
+                    &seed,
+                    at_2026(),
+                );
+                row.name = name;
+                row.retry_limit = retry_limit;
+                row
+            })
+            .collect();
+        let mut derived: Vec<(uuid::Uuid, uuid::Uuid, String, Option<i32>)> =
+            htui_core::seed::default_edges(&phases, htui_core::model::EdgeId::new)
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge.from.as_uuid(),
+                        edge.to.as_uuid(),
+                        edge.kind.as_str().to_owned(),
+                        edge.loop_limit,
+                    )
+                })
+                .collect();
+        derived.sort();
+        let mut repaired: Vec<(uuid::Uuid, uuid::Uuid, String, Option<i32>)> =
+            edge_rows(pool, graph)
+                .await
+                .into_iter()
+                .map(|(_, from, to, kind, limit)| (from, to, kind, limit))
+                .collect();
+        repaired.sort();
+        assert_eq!(
+            repaired, derived,
+            "graph `{name}`: the 0023 repair is seed::default_edges"
+        );
+        total += derived.len();
+    }
+    assert_eq!(
+        total, 15,
+        "4 feature + 3 appended + 3 renamed + 3 gappy + 2 palette"
+    );
+
+    let once = edge_names(pool).await;
+    let mut tx = pool.begin().await.expect("begin the second application");
+    sqlx::raw_sql(include_str!("../migrations/0023_default_edges_repair.sql"))
+        .execute(&mut *tx)
+        .await
+        .expect("apply 0023 again");
+    tx.commit().await.expect("commit the second application");
+    assert_eq!(
+        edge_names(pool).await,
+        once,
+        "a second application writes the same rows"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-137 plan D7: `0020_step_graph_v2.sql` marks a v19 phase with `fan_out > 1` `compete` and
 /// every other `none`; `palette` is false and `plan_scope` plus the seven divide columns are
 /// `NULL` on every existing row.
@@ -3558,8 +3902,9 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(22),
-        "twenty-two embedded migrations, none applied (through MOD-163's 0022_memory.sql)"
+        MigrationState::Pending(23),
+        "twenty-three embedded migrations, none applied (through MOD-138's \
+         0023_default_edges_repair.sql)"
     );
 
     db.drop_db().await;
@@ -3659,8 +4004,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(22),
-        "twenty-two embedded migrations, through MOD-163's 0022_memory.sql"
+        MigrationState::Pending(23),
+        "twenty-three embedded migrations, through MOD-138's 0023_default_edges_repair.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -3668,8 +4013,9 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(22),
-        "every one of the twenty-two, through MOD-163's 0022_memory.sql, is pending"
+        HeadlessError::MigrationsPending(23),
+        "every one of the twenty-three, through MOD-138's 0023_default_edges_repair.sql, is \
+         pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -3691,8 +4037,9 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(22),
-        "every one of the twenty-two, through MOD-163's 0022_memory.sql, is pending"
+        HeadlessError::MigrationsPending(23),
+        "every one of the twenty-three, through MOD-138's 0023_default_edges_repair.sql, is \
+         pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -3843,9 +4190,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        22,
-        "the later applies migrate nothing: the twenty-two embedded migrations (through MOD-163's \
-         0022_memory.sql) are applied once"
+        23,
+        "the later applies migrate nothing: the twenty-three embedded migrations (through \
+         MOD-138's 0023_default_edges_repair.sql) are applied once"
     );
 
     db.drop_db().await;

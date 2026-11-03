@@ -60,8 +60,9 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
-    body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-    graph_body_topology_refusal, phase_row_refusal,
+    body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
+    graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
+    graph_usable_by, phase_row_refusal,
 };
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -71,7 +72,7 @@ use crate::store::traits::{
     batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
     command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
     expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
     link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
@@ -86,6 +87,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
+    workspace_graph_is_held,
 };
 use uuid::Uuid;
 
@@ -1487,6 +1489,20 @@ impl MemStore {
                 .boxes
                 .get_mut(&id)
                 .map(|row| row.settings[key] = value)
+                .is_some()
+        })
+    }
+
+    /// MOD-138 T5: replaces `run.graph_snapshot` as no writer does (a run's snapshot is frozen,
+    /// `R-ORCH-11`), on this store and every clone of it; `updated_at` does not move. The v1
+    /// resume fixtures rewrite a run's snapshot through it. Whether the run exists.
+    #[cfg(feature = "test-support")]
+    pub fn set_run_snapshot(&self, run: RunId, snapshot: Value) -> bool {
+        self.write(|state| {
+            state
+                .runs
+                .get_mut(&run)
+                .map(|row| row.graph_snapshot = Some(snapshot))
                 .is_some()
         })
     }
@@ -3345,14 +3361,17 @@ impl State {
     }
 
     /// The three `item_kind` rules the schema cannot express on its own (D11): the prefix CHECK in
-    /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` that
-    /// belongs to the kind's own project.
+    /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` the
+    /// kind's project may use (MOD-138 D12, [`graph_usable_by`]): its own, a workspace's that
+    /// holds it, or the library's. `graph` is `None` when an update leaves the graph as it is: an
+    /// unchanged graph is not re-checked, so a kind keeps a workspace graph its project has left
+    /// (A7), as an item does.
     fn check_item_kind(
         &self,
         project: ProjectId,
         prefix: &str,
         name: &str,
-        graph: StepGraphId,
+        graph: Option<StepGraphId>,
         except: Option<ItemKindId>,
     ) -> Result<()> {
         if !ItemKind::prefix_is_valid(prefix) {
@@ -3363,12 +3382,15 @@ impl State {
                 "item_kind.project_id `{project}` references no project"
             )));
         }
-        if self
-            .graphs
-            .get(&graph)
-            .is_none_or(|row| row.scope != GraphScope::Project(project))
-        {
-            return Err(StoreError::Constraint(graph_not_in_project(graph, project)));
+        if let Some(graph) = graph {
+            let workspaces = self.workspaces_of(project);
+            if self
+                .graphs
+                .get(&graph)
+                .is_none_or(|row| !graph_usable_by(row.scope, project, &workspaces))
+            {
+                return Err(StoreError::Constraint(graph_not_usable(graph, project)));
+            }
         }
         let clashes = |taken: &dyn Fn(&ItemKind) -> bool| {
             self.kinds
@@ -3393,7 +3415,7 @@ impl State {
             new.project_id,
             &new.prefix,
             &new.name,
-            new.default_graph_id,
+            Some(new.default_graph_id),
             None,
         )?;
         if self.kinds.contains_key(&new.id) {
@@ -3441,7 +3463,9 @@ impl State {
             current.project_id,
             patch.prefix.as_deref().unwrap_or(&current.prefix),
             patch.name.as_deref().unwrap_or(&current.name),
-            patch.default_graph_id.unwrap_or(current.default_graph_id),
+            patch
+                .default_graph_id
+                .filter(|graph| *graph != current.default_graph_id),
             Some(id),
         )?;
         let row = self
@@ -3613,6 +3637,39 @@ impl State {
         rows
     }
 
+    /// MOD-138 D12: the `workspace_id` of every `workspace_project` row of `project`.
+    fn workspaces_of(&self, project: ProjectId) -> Vec<WorkspaceId> {
+        self.workspace_projects
+            .iter()
+            .filter(|row| row.project_id == project)
+            .map(|row| row.workspace_id)
+            .collect()
+    }
+
+    /// MOD-138 D12 (A4): every graph `project` may use ([`graph_usable_by`]), ordered by scope
+    /// (project, workspace, library), then `name` bytes, then id: `PgStore`'s `ORDER BY`.
+    fn usable_graph_rows(&self, project: ProjectId) -> Vec<StepGraph> {
+        let workspaces = self.workspaces_of(project);
+        let rank = |scope: GraphScope| match scope {
+            GraphScope::Project(_) => 0_u8,
+            GraphScope::Workspace(_) => 1,
+            GraphScope::Library => 2,
+        };
+        let mut rows: Vec<StepGraph> = self
+            .graphs
+            .values()
+            .filter(|row| graph_usable_by(row.scope, project, &workspaces))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            rank(left.scope)
+                .cmp(&rank(right.scope))
+                .then_with(|| left.name.as_bytes().cmp(right.name.as_bytes()))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        rows
+    }
+
     /// The graph reference and the two uniqueness rules of `step_graph_phase` (D11); each caller
     /// checks the reserved-name rule first, where its own order puts it.
     fn check_phase(
@@ -3703,11 +3760,35 @@ impl State {
                 )));
             }
         }
+        let before = self.phase_rows(phase.graph_id);
+        let before_edges = self.graph_edge_rows(phase.graph_id);
         let mut row = phase.clone();
         row.updated_at = now;
         self.phases.push(row.clone());
         self.bump_graph(row.graph_id, now);
+        let mut after = before.clone();
+        after.push(row.clone());
+        after.sort_by_key(|phase| phase.position);
+        self.follow_default_edges(row.graph_id, &before, &before_edges, &after);
         Ok(row)
+    }
+
+    /// MOD-138 D7: [`default_edges_follow`] applied in place. `write()` has no rollback, so the
+    /// writers call it after their last refusal; it cannot fail.
+    fn follow_default_edges(
+        &mut self,
+        graph: StepGraphId,
+        before_phases: &[StepGraphPhase],
+        before_edges: &[StepGraphEdge],
+        after_phases: &[StepGraphPhase],
+    ) {
+        if let Some(edges) =
+            default_edges_follow(before_phases, before_edges, after_phases, EdgeId::new)
+        {
+            self.edges.retain(|_, edge| edge.graph_id != graph);
+            self.edges
+                .extend(edges.into_iter().map(|edge| (edge.id, edge)));
+        }
     }
 
     /// Inserts a phase's candidate rows, all or nothing (MOD-37 R-6): every refusal is decided
@@ -3805,6 +3886,14 @@ impl State {
         if let Some(Some(persona)) = patch.persona {
             self.require_persona(persona)?;
         }
+        // MOD-138 D7: only `name` and `position` are columns of `default_edges` a patch can set
+        // (`retry_limit` is `replace_graph`'s alone, blueprint F12).
+        let shape = (patch.name.is_some() || patch.position.is_some()).then(|| {
+            (
+                self.phase_rows(current.graph_id),
+                self.graph_edge_rows(current.graph_id),
+            )
+        });
         let row = self
             .phase_mut(id)
             .expect("the row was read a statement ago under the same lock");
@@ -3829,6 +3918,20 @@ impl State {
         row.updated_at = now;
         let row = row.clone();
         self.bump_graph(row.graph_id, now);
+        if let Some((before, before_edges)) = shape {
+            let mut after: Vec<StepGraphPhase> = before
+                .iter()
+                .map(|phase| {
+                    if phase.id == id {
+                        row.clone()
+                    } else {
+                        phase.clone()
+                    }
+                })
+                .collect();
+            after.sort_by_key(|phase| phase.position);
+            self.follow_default_edges(row.graph_id, &before, &before_edges, &after);
+        }
         Ok(CasOutcome::Applied(row))
     }
 
@@ -3966,6 +4069,10 @@ impl State {
         if let Some(refusal) = graph_body_topology_refusal(graph, &body) {
             return Err(StoreError::Constraint(refusal));
         }
+        // MOD-138 D9: the shared walk validator, straight after the topology rules.
+        if let Some(refusal) = graph_body_walk_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
 
         // Mutate: nothing below can fail.
         let kept: HashSet<PhaseId> = body.nodes.iter().map(|node| node.phase.id).collect();
@@ -4028,6 +4135,8 @@ impl State {
                 entity: "step_graph_phase",
                 id: id.to_string(),
             })?;
+        let before = self.phase_rows(graph);
+        let before_edges = self.graph_edge_rows(graph);
         self.phases.retain(|row| row.id != id);
         self.phase_agents.retain(|(phase, _), _| *phase != id);
         self.phase_parts.retain(|(phase, _), _| *phase != id);
@@ -4035,6 +4144,12 @@ impl State {
             .retain(|_, edge| edge.from != id && edge.to != id);
         self.skill_bindings.retain(|row| row.phase_id != Some(id));
         self.bump_graph(graph, now);
+        let after: Vec<StepGraphPhase> = before
+            .iter()
+            .filter(|phase| phase.id != id)
+            .cloned()
+            .collect();
+        self.follow_default_edges(graph, &before, &before_edges, &after);
         Ok(())
     }
 
@@ -5032,6 +5147,46 @@ impl State {
         (graphs, phases)
     }
 
+    /// MOD-138 A3: the first kind or item naming one of `graphs`, in (graph name bytes, holder
+    /// bytes, project slug bytes) order (holder `item_kind PREFIX` or `item KEY`; the slug breaks
+    /// a tie between two projects of the workspace), as [`workspace_graph_is_held`]'s sentence;
+    /// `None` while nothing holds them. `PgStore`'s holder query has the same order.
+    fn workspace_graph_holder(&self, graphs: &HashSet<StepGraphId>) -> Option<String> {
+        let slug = |project: ProjectId| {
+            self.projects
+                .get(&project)
+                .map_or_else(|| project.to_string(), |row| row.slug.clone())
+        };
+        let name = |graph: StepGraphId| self.graphs.get(&graph).map(|row| row.name.clone());
+        let kinds = self.kinds.values().filter_map(|kind| {
+            graphs
+                .contains(&kind.default_graph_id)
+                .then(|| name(kind.default_graph_id))
+                .flatten()
+                .map(|graph| {
+                    (
+                        graph,
+                        format!("item_kind {}", kind.prefix),
+                        slug(kind.project_id),
+                    )
+                })
+        });
+        let items = self.items.values().filter_map(|item| {
+            let graph = item.step_graph_id.filter(|graph| graphs.contains(graph))?;
+            name(graph).map(|graph| (graph, format!("item {}", item.key), slug(item.project_id)))
+        });
+        kinds
+            .chain(items)
+            .min_by(|left, right| {
+                left.0
+                    .as_bytes()
+                    .cmp(right.0.as_bytes())
+                    .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+                    .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+            })
+            .map(|(graph, holder, project)| workspace_graph_is_held(&graph, &holder, &project))
+    }
+
     /// What a workspace delete reaches: its links and its box paths, and no project (D4); since
     /// MOD-137 D3 also its graphs, their phases and their candidates (no new `DeleteReach` field:
     /// blueprint §4 item 9).
@@ -5312,6 +5467,11 @@ impl State {
         }
         // MOD-137 D3: its graphs go, with everything that cascades from them.
         let (graphs, phases) = self.workspace_graphs(id);
+        // MOD-138 A3: but neither `item_kind.default_graph_id` nor `item.step_graph_id` cascades
+        // (Postgres answers `23503`), so a held graph refuses the delete before anything goes.
+        if let Some(held) = self.workspace_graph_holder(&graphs) {
+            return Err(StoreError::Constraint(held));
+        }
         let reach = self.workspace_reach_of(id, &graphs, &phases);
         self.phase_agents
             .retain(|(phase, _), _| !phases.contains(phase));
@@ -7287,7 +7447,8 @@ impl State {
         self.add_note(note)
     }
 
-    /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`).
+    /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`), with
+    /// its phases, candidates, parts and edges read under one lock (MOD-138 D10).
     fn resolve_graph(&self, item: ItemId) -> Option<ResolvedGraph> {
         let row = self.items.get(&item)?;
         let graph_id = row.step_graph_id.or_else(|| {
@@ -7313,8 +7474,11 @@ impl State {
                     persona: phase
                         .persona_id
                         .and_then(|id| self.personas.get(&id).cloned()),
+                    // MOD-138 D10: the node's default parts, under the same lock.
+                    parts: self.phase_parts_of(phase.id),
                 })
                 .collect(),
+            edges: self.graph_edge_rows(graph_id),
         })
     }
 
@@ -9448,6 +9612,10 @@ impl WriteStore for MemStore {
 
     async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
         Ok(self.read(|state| state.step_graph_rows(project)))
+    }
+
+    async fn usable_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        Ok(self.read(|state| state.usable_graph_rows(project)))
     }
 
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
@@ -13431,7 +13599,7 @@ mod tests {
     // refusal and — for the five transactions of plan D6 — that a refusal leaves no half-written
     // row behind.
 
-    /// A snapshot with no phases: enough to prove the column is written and decodes at `v = 1`.
+    /// A snapshot with no phases: enough to prove the column is written and decodes at `GraphSnapshot::V`.
     fn test_snapshot() -> GraphSnapshot {
         GraphSnapshot {
             v: GraphSnapshot::V,
@@ -13439,6 +13607,8 @@ mod tests {
                 id: ids::GRAPH_HTUI_FEAT,
                 name: "FEAT".to_owned(),
                 is_override: false,
+                scope: None,
+                revision: None,
             },
             topology: "sha256:test".to_owned(),
             mode: RunMode::Manual,
@@ -13449,9 +13619,15 @@ mod tests {
                 per_token_cap_batch: None,
                 max_fan_out: 4,
                 max_agents_per_run: 6,
+                max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: crate::model::RuntimeChanges::Ask,
             },
             scope: None,
             personas: Vec::new(),
+            source: None,
+            edges: Vec::new(),
         }
     }
 
@@ -13526,6 +13702,37 @@ mod tests {
             .await
             .expect("running -> awaiting_approval is legal");
         id
+    }
+
+    /// MOD-138 T5's seam: the frozen blob is replaced on every clone, nothing else on the row
+    /// moves, and an unknown run answers `false`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn set_run_snapshot_replaces_the_frozen_blob_and_nothing_else() {
+        let store = MemStore::demo();
+        let clone = store.clone();
+        let before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("reads")
+            .expect("RUN_1 exists");
+        let blob = serde_json::json!({ "v": 1, "rewritten": true });
+        assert!(store.set_run_snapshot(ids::RUN_1, blob.clone()));
+        let after = clone
+            .run(ids::RUN_1)
+            .await
+            .expect("reads")
+            .expect("RUN_1 exists");
+        assert_eq!(after.graph_snapshot, Some(blob));
+        assert_eq!(
+            crate::model::Run {
+                graph_snapshot: before.graph_snapshot.clone(),
+                ..after
+            },
+            before,
+            "only the snapshot moved"
+        );
+        assert!(!store.set_run_snapshot(RunId::new(), serde_json::json!({})));
     }
 
     /// `create_run` is one transaction (plan D6): the `run` row and the item's move to `queued`
@@ -15679,6 +15886,62 @@ mod tests {
         );
         assert!(
             resolved.phases[1..].iter().all(|row| row.persona.is_none()),
+            "every other phase carries none"
+        );
+    }
+
+    /// MOD-138 D10: `resolve_graph` carries the graph's edges in `graph_edges` order and each
+    /// phase's `phase_part` rows, read under the same lock as the phases.
+    #[tokio::test]
+    async fn resolve_graph_carries_edges_and_parts() {
+        let store = MemStore::demo();
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        let body = store
+            .graph_body(resolved.graph.id)
+            .await
+            .expect("the body reads")
+            .expect("the graph exists");
+        assert!(!resolved.edges.is_empty(), "the seeded graph has edges");
+        assert_eq!(
+            resolved.edges, body.edges,
+            "the edges as `graph_edges` reads them"
+        );
+        assert!(
+            resolved.phases.iter().all(|row| row.parts.is_empty()),
+            "no seeded phase divides"
+        );
+
+        // A part planted on a phase is carried on that phase alone.
+        let phase = resolved.phases[1].phase.id;
+        let part = PhasePart {
+            phase_id: phase,
+            position: 0,
+            key: "api".to_owned(),
+            title: "The API".to_owned(),
+            brief: String::new(),
+            owned_paths: vec!["src/api".to_owned()],
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        };
+        store.write(|state| state.phase_parts.insert((phase, 0), part.clone()));
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert_eq!(resolved.phases[1].parts, vec![part], "the planted part");
+        assert!(
+            resolved
+                .phases
+                .iter()
+                .enumerate()
+                .all(|(at, row)| at == 1 || row.parts.is_empty()),
             "every other phase carries none"
         );
     }

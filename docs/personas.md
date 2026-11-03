@@ -451,14 +451,16 @@ permission}`). From then on the run reads personas only from its snapshot.
 
 - **Editing a persona row does not change a started run.** Its steps keep the body, tools and
   permissions frozen at `StartRun`. The next run picks up the edit.
-- **Rebinding a phase does change the graph.** The phase's persona name is part of the graph's
-  topology digest, so a run resumed after its phase was bound, unbound or rebound sees a topology
-  mismatch and is parked, like any other graph change made under a run.
+- **Rebinding a phase changes the graph, not a started run.** The phase's persona name is part of
+  the graph's topology digest. A run started since MOD-138 is pinned to its snapshot, so it walks
+  on after its phase is bound, unbound or rebound. A run started before MOD-138 still compares
+  itself with the live graph when it resumes: it sees a topology mismatch and is parked, like any
+  other graph change made under it.
 - **Renaming a persona changes the graph too.** The topology digest hashes the persona's name, not
   its id, so renaming a persona that is bound to a phase moves the topology of every graph bound
-  to it: a run on such a graph that is resumed afterwards sees a topology mismatch and is parked.
-  Rename only when no run on those graphs is waiting to resume. (Renaming a seed also brings the
-  seed back on the next connect; see [The two seeds](#the-two-seeds).)
+  to it. Pinned runs are unaffected; a run started before MOD-138 that is resumed afterwards sees
+  a topology mismatch and is parked. (Renaming a seed also brings the seed back on the next
+  connect; see [The two seeds](#the-two-seeds).)
 
 A snapshot without a persona key and a phase without a persona serialise exactly as before, so
 persona-less runs keep their topology digests.
