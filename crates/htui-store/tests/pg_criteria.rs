@@ -12037,6 +12037,402 @@ async fn graph_writers_lock_the_graph_row_before_the_phase_row() {
     db.drop_db().await;
 }
 
+/// Waits, polling from `pool` (outside any racer transaction, whose `pg_stat_activity` view would
+/// be frozen at its first read), until another backend of this database waits on a lock in a
+/// statement containing `statement`.
+async fn a_backend_waits_on_a_lock_in(pool: &PgPool, statement: &str) {
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                AND wait_event_type = 'Lock' AND strpos(query, $1) > 0",
+        )
+        .bind(statement)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("no backend came to wait on a lock in `{statement}`");
+}
+
+/// On `racer`, a new phase `id` of `from`'s graph at `position` named `name`, every other column
+/// copied from `from`, and never a palette node.
+async fn racer_copies_phase(
+    racer: &mut PgConnection,
+    from: htui_core::model::PhaseId,
+    id: htui_core::model::PhaseId,
+    position: i32,
+    name: &str,
+) {
+    sqlx::query(
+        "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard, \
+                retry_limit, input_kinds, output_kind, isolation, command_queue, verify_command, \
+                template_name, template_version, token_budget, persona_id, split, palette, \
+                plan_scope, planner_persona_id, planner_agent_id, planner_model, \
+                integrate_persona_id, integrate_agent_id, integrate_model, max_parts) \
+         SELECT $1, graph_id, $2, $3, fan_out, gate, gate_hard, retry_limit, input_kinds, \
+                output_kind, isolation, command_queue, verify_command, template_name, \
+                template_version, token_budget, persona_id, split, false, plan_scope, \
+                planner_persona_id, planner_agent_id, planner_model, integrate_persona_id, \
+                integrate_agent_id, integrate_model, max_parts \
+           FROM step_graph_phase WHERE id = $4",
+    )
+    .bind(id.as_uuid())
+    .bind(position)
+    .bind(name)
+    .bind(from.as_uuid())
+    .execute(racer)
+    .await
+    .expect("the racing phase insert");
+}
+
+/// On `racer`, one `step_graph_edge` row as `edge` carries it (a default edge: no predicate).
+async fn racer_inserts_edge(racer: &mut PgConnection, edge: &htui_core::model::StepGraphEdge) {
+    assert!(edge.predicate.is_none(), "the racer writes default edges");
+    sqlx::query(
+        "INSERT INTO step_graph_edge (id, graph_id, from_phase_id, to_phase_id, kind, loop_limit) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(edge.id.as_uuid())
+    .bind(edge.graph_id.as_uuid())
+    .bind(edge.from.as_uuid())
+    .bind(edge.to.as_uuid())
+    .bind(edge.kind.as_str())
+    .bind(edge.loop_limit)
+    .execute(racer)
+    .await
+    .expect("the racing edge insert");
+}
+
+/// MOD-138 D7's edge shape, `(from, to, kind, loop_limit, predicate is none)`, as a sorted
+/// multiset so two edge lists compare without their ids.
+fn edge_shapes(
+    edges: &[htui_core::model::StepGraphEdge],
+) -> Vec<(String, String, &'static str, Option<i32>, bool)> {
+    let mut shapes: Vec<_> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.from.to_string(),
+                edge.to.to_string(),
+                edge.kind.as_str(),
+                edge.loop_limit,
+                edge.predicate.is_none(),
+            )
+        })
+        .collect();
+    shapes.sort();
+    shapes
+}
+
+/// MOD-138 D7: the default edges of `phases`' non-palette nodes, the rule `create_phase` follows.
+fn default_edges_of(
+    phases: &[htui_core::model::StepGraphPhase],
+) -> Vec<htui_core::model::StepGraphEdge> {
+    let mut linear: Vec<_> = phases
+        .iter()
+        .filter(|phase| !phase.palette)
+        .cloned()
+        .collect();
+    linear.sort_by_key(|phase| phase.position);
+    htui_core::seed::default_edges(&linear, htui_core::model::EdgeId::new)
+}
+
+/// MOD-138 M1 review R1 P3, F7: `resolve_graph` reads phases and edges in one `REPEATABLE READ`
+/// snapshot. A racer holds `step_graph_edge` `ACCESS EXCLUSIVE`, so `resolve_graph` takes its
+/// snapshot (the item, graph and phase reads) and then blocks at the edge read; the racer then
+/// moves a phase (a copy under a new id and position, the original deleted) and re-points its
+/// edges to the copy, consistently, and commits. The resolve answers the graph as it stood
+/// before that commit, phases and edges of one read, never edges naming a phase the read lacks
+/// (what `htui_orch::graph::live_graph_refusal` refuses as "moved while it was being resolved").
+/// At `READ COMMITTED` the edge read would see the racer's edges, which name the copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_graph_reads_phases_and_edges_in_one_snapshot() {
+    use htui_core::model::{PhaseId, StepGraphEdge};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let item = ids::HTUI_FEAT_3;
+    let start = db
+        .store
+        .resolve_graph(item)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    let like = start
+        .phases
+        .iter()
+        .map(|row| &row.phase)
+        .find(|phase| !phase.palette)
+        .cloned()
+        .expect("the graph has a linear phase");
+    // A fresh phase, so nothing outside the graph references the one the racer deletes; D7 links
+    // it into the default chain.
+    let moving = scratch_phase(&db.store, &like, 131).await;
+    let before = db
+        .store
+        .resolve_graph(item)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    let graph = before.graph.id;
+    let moving_edges: Vec<StepGraphEdge> = before
+        .edges
+        .iter()
+        .filter(|edge| edge.from == moving.id || edge.to == moving.id)
+        .cloned()
+        .collect();
+    assert!(
+        !moving_edges.is_empty(),
+        "the scratch phase is linked by the default edges"
+    );
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::raw_sql("LOCK TABLE step_graph_edge IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut racer)
+        .await
+        .expect("hold step_graph_edge on the racing connection");
+    let store = db.store.clone();
+    let resolving = tokio::spawn(async move { store.resolve_graph(item).await });
+    a_backend_waits_on_a_lock_in(&db.pool, "step_graph_edge").await;
+    assert!(
+        !resolving.is_finished(),
+        "resolve_graph waits at the edge read, its snapshot already taken"
+    );
+
+    // The move, as a graph writer would make it: graph row first, then the phase, then the edges.
+    sqlx::query("UPDATE step_graph SET revision = revision + 1 WHERE id = $1")
+        .bind(graph.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing bump");
+    let moved = PhaseId::new();
+    racer_copies_phase(&mut racer, moving.id, moved, 132, "race-moved").await;
+    sqlx::query("DELETE FROM step_graph_phase WHERE id = $1")
+        .bind(moving.id.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing delete, its edges cascading");
+    let re_point = |id: PhaseId| if id == moving.id { moved } else { id };
+    for edge in &moving_edges {
+        racer_inserts_edge(
+            &mut racer,
+            &StepGraphEdge {
+                id: htui_core::model::EdgeId::new(),
+                from: re_point(edge.from),
+                to: re_point(edge.to),
+                ..edge.clone()
+            },
+        )
+        .await;
+    }
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), resolving)
+        .await
+        .expect("resolve_graph finishes once the racer commits")
+        .expect("the resolve task")
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    let read = |id: PhaseId| answer.phases.iter().any(|row| row.phase.id == id);
+    assert!(
+        answer
+            .edges
+            .iter()
+            .all(|edge| read(edge.from) && read(edge.to)),
+        "every edge names a phase of the same read (never `moved while it was being resolved`), \
+         got {answer:?}"
+    );
+    assert_eq!(
+        answer, before,
+        "resolve_graph answers the graph as its snapshot saw it, before the racer's commit"
+    );
+
+    // The racer's move did land: a fresh resolve sees the copy, not the original.
+    let after = db
+        .store
+        .resolve_graph(item)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    assert!(
+        after.phases.iter().any(|row| row.phase.id == moved)
+            && after.phases.iter().all(|row| row.phase.id != moving.id),
+        "the racer moved the phase"
+    );
+    assert!(
+        after
+            .edges
+            .iter()
+            .any(|edge| edge.from == moved || edge.to == moved),
+        "the racer re-pointed the edges to the moved phase"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-138 M1 review R1 P3, D7: `create_phase` keeps F7's lock order (graph row first, no phase
+/// row touched before its bump) and derives the default edges from the phases as they stand once
+/// it holds the graph row. A racer bumps the graph (holding its row), and while `create_phase`
+/// waits on it inserts a phase of its own and re-derives the default edges over it, then commits:
+/// the waiting `create_phase` re-reads that shape, so the graph ends default-edged over both new
+/// phases, never over a shape read before the wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_phase_behind_a_racing_phase_insert_derives_edges_from_the_final_phases() {
+    use htui_core::model::{PhaseId, StepGraphPhase};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let graph = ids::GRAPH_HTUI_FEAT;
+    let phases = db
+        .store
+        .phases(graph)
+        .await
+        .expect("read the feature graph's phases");
+    let like = phases
+        .iter()
+        .find(|phase| !phase.palette)
+        .cloned()
+        .expect("the feature graph has a linear phase");
+    assert_eq!(
+        edge_shapes(
+            &db.store
+                .graph_edges(graph)
+                .await
+                .expect("read the feature graph's edges")
+        ),
+        edge_shapes(&default_edges_of(&phases)),
+        "the feature graph starts default-edged"
+    );
+    let racing = StepGraphPhase {
+        id: PhaseId::new(),
+        position: 121,
+        name: "race-121".to_owned(),
+        palette: false,
+        ..like.clone()
+    };
+    let waiting = StepGraphPhase {
+        id: PhaseId::new(),
+        position: 122,
+        name: "race-122".to_owned(),
+        palette: false,
+        ..like.clone()
+    };
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query("UPDATE step_graph SET revision = revision + 1 WHERE id = $1")
+        .bind(graph.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing bump, graph row first");
+    let store = db.store.clone();
+    let creating = {
+        let waiting = waiting.clone();
+        tokio::spawn(async move { store.create_phase(&waiting).await })
+    };
+    a_backend_waits_on_a_lock_in(&db.pool, "UPDATE step_graph SET revision").await;
+    assert!(
+        !creating.is_finished(),
+        "create_phase waits on the graph row the racer holds"
+    );
+    sqlx::raw_sql("SET LOCAL lock_timeout = '200ms'")
+        .execute(&mut racer)
+        .await
+        .expect("a short lock_timeout");
+    let locked = sqlx::query("SELECT 1 FROM step_graph_phase WHERE id = $1 FOR UPDATE")
+        .bind(like.id.as_uuid())
+        .fetch_optional(&mut racer)
+        .await;
+    assert!(
+        matches!(locked, Ok(Some(_))),
+        "no phase row is held while create_phase waits on the graph row, got {locked:?}"
+    );
+
+    racer_copies_phase(
+        &mut racer,
+        like.id,
+        racing.id,
+        racing.position,
+        &racing.name,
+    )
+    .await;
+    let mut raced = phases.clone();
+    raced.push(racing.clone());
+    sqlx::query("DELETE FROM step_graph_edge WHERE graph_id = $1")
+        .bind(graph.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racer clears the edges");
+    for edge in default_edges_of(&raced) {
+        racer_inserts_edge(&mut racer, &edge).await;
+    }
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), creating)
+        .await
+        .expect("create_phase finishes once the racer commits")
+        .expect("the create task");
+    assert!(
+        answer.is_ok(),
+        "create_phase lands after the wait, got {answer:?}"
+    );
+
+    let after = db
+        .store
+        .phases(graph)
+        .await
+        .expect("read the feature graph's phases");
+    assert!(
+        after.iter().any(|phase| phase.id == racing.id)
+            && after.iter().any(|phase| phase.id == waiting.id),
+        "both new phases are stored"
+    );
+    let edges = db
+        .store
+        .graph_edges(graph)
+        .await
+        .expect("read the feature graph's edges");
+    assert_eq!(
+        edge_shapes(&edges),
+        edge_shapes(&default_edges_of(&after)),
+        "create_phase re-derived the default edges from the final phases, the racer's included"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge.from == racing.id && edge.to == waiting.id),
+        "the chain runs through the racer's phase into the waiting writer's"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-137 review R1 A-L3: a graph name committed after `replace_graph`'s name pre-read (step 3)
 /// reaches step 7's `UPDATE` as the scope unique's `23505`, and is worded as the pre-read words
 /// it, never as raw driver text.
