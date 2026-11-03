@@ -372,6 +372,7 @@ if the known empty dir appeared.
 - [ ] Content parity reviewed per snapshot
 - [ ] MOD-81, 82, 83, 85 and MOD-115 closed with their write-ups
 
-**Status**: CONFIRMED by the maintainer 2026-10-27 as written: all seven open points as proposed
+**Status**: COMPLETE 2026-11-03 on hr/MOD-115 (T0-T3, waves 1 and 2, B1, review round RV; record
+`docs/decisions/mod/mod-115.md` "Milestone 4"). CONFIRMED by the maintainer 2026-10-27 as written: all seven open points as proposed
 (order; no `runs.rs` split; the `KEY · title` header; the 160-column cap carried to MOD-119; one
 modal-margin rule picked by the architect; ultracode per task or lane; M4 closes MOD-115).
