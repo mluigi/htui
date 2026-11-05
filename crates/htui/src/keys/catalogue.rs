@@ -571,6 +571,8 @@ pub enum Act {
     ConceptsUp,
     /// `concepts.down`: the next hit.
     ConceptsDown,
+    /// `concepts.why`: show why knowledge search is unavailable.
+    ConceptsWhy,
     /// `switcher.switch`: switch to the selected workspace.
     SwitcherSwitch,
     /// `waiting.open`: open the selected waiting step.
@@ -1464,6 +1466,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
     capture_row(Act::ConceptsUp, Concepts, "up", &["up"], "previous hit"),
     // concepts_search.rs:319.
     capture_row(Act::ConceptsDown, Concepts, "down", &["down"], "next hit"),
+    // concepts_search.rs: on_key, the cause row of a failed search (MOD-160 D7).
+    capture_row(
+        Act::ConceptsWhy,
+        Concepts,
+        "why",
+        &["ctrl-e"],
+        "why search is unavailable",
+    ),
     // [switcher]
     // workspace_switcher.rs:171.
     row(
@@ -2684,6 +2694,7 @@ mod tests {
         Act::LogsLevel,
         Act::LogsFollow,
         Act::LogsBottom,
+        Act::ConceptsWhy,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2906,6 +2917,7 @@ mod tests {
             Act::LogsLevel => 213,
             Act::LogsFollow => 214,
             Act::LogsBottom => 215,
+            Act::ConceptsWhy => 216,
         }
     }
 
@@ -2939,7 +2951,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 216);
+        assert_eq!(CATALOGUE.len(), 217);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3409,6 +3421,7 @@ mod tests {
                 Act::ConceptsReindex,
                 Act::ConceptsUp,
                 Act::ConceptsDown,
+                Act::ConceptsWhy,
                 Act::SkillsAskAgent,
                 Act::AttachRepo,
                 Act::SkillsHelpPrevAgent,

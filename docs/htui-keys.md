@@ -163,6 +163,7 @@ project   = ["ctrl-p"]  # cycle project scope
 reindex   = ["ctrl-r"]  # re-index scope
 up        = ["up"]      # previous hit
 down      = ["down"]    # next hit
+why       = ["ctrl-e"]  # why search is unavailable
 
 [switcher]
 switch = ["enter"]  # switch workspace
