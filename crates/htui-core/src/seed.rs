@@ -254,11 +254,14 @@ pub fn phase_row(
     }
 }
 
-/// The phase a review loop prefers to send work back to (D9; `htui_orch::gate`'s
-/// `IMPLEMENT_PHASE`).
+/// The phase the default rule's review loop prefers to send work back to (D9). Only the rule
+/// reads this name: since MOD-138 M2 a run follows the edge it writes
+/// (`htui_orch::gate::edge_loop`).
 const IMPLEMENT: &str = "implement";
 
-/// The phase whose `changes_requested` loops back (D9; `htui_orch::engine`'s review rule).
+/// The phase the default rule gives a `changes_requested` loop (D9). At run time a node reads its
+/// verdict because it has such an edge (`GraphSnapshot::reads_verdict`, MOD-138 Q-D), not because
+/// of its name.
 const REVIEW: &str = "review";
 
 /// MOD-137 D9: today's implied topology as edges, the rule `0020_step_graph_v2.sql`'s backfill
@@ -270,9 +273,9 @@ const REVIEW: &str = "review";
 /// `mint` names each edge (UUIDv7 in the stores, `demo_uuid` in the fixture).
 ///
 /// The output lists every `next` edge in position order, then the loop edges in review-position
-/// order. The run-time twins are `htui_orch::gate::loop_target` and the review rule of
-/// `htui_orch::engine` (this crate cannot depend on `htui-orch`); MOD-138's edge walker retires
-/// the name rule and lifts v1 graphs through this function.
+/// order. Nothing at run time reads a name any more: MOD-138's edge walker retired the name rule
+/// and follows these edges (`htui_orch::gate::edge_loop`, `GraphSnapshot::reads_verdict`), and a
+/// v1 snapshot is lifted through [`default_edge_plan`], this function's rule.
 #[must_use]
 pub fn default_edges(
     phases: &[StepGraphPhase],
