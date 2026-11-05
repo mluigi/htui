@@ -162,8 +162,9 @@ What that gives each kind of session:
 URL is configured: `HTUI_QDRANT_URL`, or a usable URL stored in Settings › Qdrant (or with
 `htui --set-qdrant-url`). Whether one is configured is read in the background and cached, so
 opening a session never waits on it: a URL set or cleared in this process applies to the next
-session at once, one set from another box within about 30 seconds, with no restart. A session keeps
-what it was offered when it opened. While Qdrant is down a configured workspace keeps the tool, and
+session at once. One set or cleared on another box is read again, in the background, when a session
+opens more than 30 seconds after the last read, and applies from the session after that, with no
+restart. A session keeps what it was offered when it opened. While Qdrant is down a configured workspace keeps the tool, and
 every call answers `knowledge search unavailable: <cause>`. See
 [`docs/htui-worker.md`](htui-worker.md#the-concepts-index) for the worker.
 
