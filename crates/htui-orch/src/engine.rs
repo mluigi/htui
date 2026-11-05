@@ -538,9 +538,9 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
     /// The snapshot was walked: a v2 run whose snapshot recomputes to its own `topology`
-    /// (MOD-138 D5), or a v1 run whose live graph still hashes to the lifted snapshot's v2
-    /// digest, or whose live graph M1 refuses (D6, D9) but whose live phases still hash to the
-    /// run's own v1 phase-only digest (blueprint A6). A v1 run whose live graph no longer
+    /// (MOD-138 D5), or a v1 run whose live phases, resolved or refused once built (blueprint
+    /// A6), still hash to the run's own v1 phase-only digest (MOD-138 M2 D11: a v1 run walks its
+    /// lift, which its phases alone decide). A v1 run whose live graph no longer
     /// resolves under a start-time rule (a fan-out or agent cap, a review or local fan-out, no
     /// candidate) was not compared at all: the item's `live graph not comparable` note says
     /// which rule refused it.
@@ -549,14 +549,12 @@ pub enum Resume {
     /// walks its snapshot, and §4.9's resume says a mismatch is a human's decision, not the
     /// engine's.
     TopologyChanged {
-        /// The lifted snapshot's v2 digest ([`graph::topology_v2`] over its phases and its
-        /// lifted edges), the graph this run walks. When M1 refuses the live graph (D6, D9) once
-        /// its phases are built, the run's v1 phase-only digest ([`graph::topology`]) instead
-        /// (blueprint A6).
+        /// The run's v1 phase-only digest ([`graph::topology`] over its phases as a pre-MOD-138
+        /// binary froze them), the graph this run walks (MOD-138 M2 D11, blueprint A6).
         snapshot: String,
-        /// The live graph's v2 digest; when M1 refuses the live graph once its phases are built,
-        /// the live phases' v1 digest (A6); when it refuses it before (D9's validator, with a
-        /// phase that then fails to build), `not runnable: <refusal>`.
+        /// The live phases' v1 digest, whether the live graph resolves or is refused once its
+        /// phases are built (D11, A6); when it is refused before (D9's validator, with a phase
+        /// that then fails to build), `not runnable: <refusal>`.
         live: String,
         /// Where the run is, unchanged.
         rest: Rest,
@@ -3177,13 +3175,14 @@ where
     /// is recomputed from the snapshot's own phases and edges, and the live graph is never read;
     /// a recomputed digest that differs from the stored one is [`Resume::SnapshotTampered`].
     ///
-    /// A **v1** run re-resolves the item's **live** graph and compares its v2 digest with the
-    /// lifted snapshot's. On a mismatch the walk is not advanced and an `item_note` records both
-    /// digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the
-    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses (D6, D9)
-    /// once its phases are built is compared on the v1 phase-only digest (blueprint A6): equal
-    /// walks on, different is such a mismatch. One refused before any phase could be built is a
-    /// mismatch.
+    /// A **v1** run re-resolves the item's **live** graph and compares its phases on the v1
+    /// phase-only digest with the run's own (MOD-138 M2 D11, blueprint A6): a v1 run walks its
+    /// lift, which its phases alone decide, so the live graph's edges are not compared, whether
+    /// it resolves or is refused once its phases are built (D9's validator, a divide or palette
+    /// node). On a mismatch the walk is not advanced and an `item_note` records both digests;
+    /// invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the divergence
+    /// is a human's decision rather than the engine's. One refused before any phase could be built
+    /// is a mismatch.
     ///
     /// A v1 run's live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
@@ -3230,12 +3229,12 @@ where
     ///
     /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its digest is recomputed
     /// from its own phases and edges ([`graph::topology_v2`]) and the live graph is never read.
-    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare, edge-aware: the
-    /// live graph's v2 digest against the lifted snapshot's. Blueprint A6: a live graph M1
-    /// refuses as not yet runnable or invalid (D6, D9) is compared as before MOD-138, on the v1
-    /// phase-only digest of its live phases against the run's own ([`v1_topology`]), since a v1
-    /// run always walked by position: equal walks on, different parks with the topology note. A
-    /// refusal raised before any phase could be built has nothing to compare, and is a mismatch.
+    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare on phases alone
+    /// (MOD-138 M2 D11): the v1 phase-only digest of the live phases against the run's own
+    /// ([`v1_topology`]), whether the live graph resolves or is refused as not yet runnable or
+    /// invalid once its phases are built (blueprint A6), since a v1 run always walks the lift of
+    /// its phases: equal walks on, different parks with the topology note. A refusal raised
+    /// before any phase could be built has nothing to compare, and is a mismatch.
     async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
@@ -3259,7 +3258,8 @@ where
             }));
         }
 
-        // D5 v1: the live compare, edge-aware.
+        // D5 v1: the live compare, on phases alone (M2 D11). `lifted` names the snapshot this run
+        // walks in the `live graph not comparable` note.
         let lifted = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
         let (walks, live) = match Box::pin(graph::resolve_or_refused(
             self.parts.store,
@@ -3272,16 +3272,25 @@ where
         ))
         .await
         {
-            Ok(graph::Resolution::Resolved(live)) => (lifted.clone(), live.snapshot.topology),
-            // Blueprint A6: a live graph M1 refuses (D6, D9) is compared on the v1 phase-only
-            // digest, as before MOD-138; its edges never moved a v1 walk.
+            // MOD-138 M2 D11: a v1 run always walks its lift, which is derived from its phases,
+            // so it is compared on the v1 phase-only digest whether the live graph resolves or
+            // is refused once its phases are built (blueprint A6). For every graph M1 could
+            // resolve this is M1's answer: its edges were the default edges of its phases. With
+            // D6(c) lifted, an edge-aware compare would park runs M1 walked on.
+            Ok(graph::Resolution::Resolved(live)) => (
+                v1_topology(&snapshot.phases)?,
+                v1_topology(&live.snapshot.phases)?,
+            ),
             Ok(graph::Resolution::Refused { phases, .. }) => {
                 (v1_topology(&snapshot.phases)?, v1_topology(&phases)?)
             }
             // A6: refused before a phase could be built, so nothing compares; it did change.
             Err(
                 err @ (ResolveError::NotYetRunnable { .. } | ResolveError::InvalidGraph { .. }),
-            ) => (lifted.clone(), format!("not runnable: {err}")),
+            ) => (
+                v1_topology(&snapshot.phases)?,
+                format!("not runnable: {err}"),
+            ),
             Err(err @ ResolveError::ProjectCaps { .. }) => {
                 // A malformed cap would otherwise add an item note on every resume; the run keeps
                 // walking its snapshot, and the cause is logged instead.

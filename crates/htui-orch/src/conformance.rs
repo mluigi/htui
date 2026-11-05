@@ -8621,7 +8621,7 @@ async fn stored_v<O: Orchestrate>(orch: &O, run: RunId) -> u32 {
 }
 
 /// Adds an `asks_you` edge `from → to` to `item`'s live graph through `replace_graph`: a back
-/// edge the validator accepts (MOD-138 D9) and resolve refuses as not yet runnable (D6(c)).
+/// edge the validator accepts (MOD-138 D9). M1's resolve refused it (D6(c)); M2's resolves it (D10).
 ///
 /// # Panics
 /// When the item resolves to no graph, a phase is missing, or `replace_graph` refuses the body.
@@ -8865,10 +8865,10 @@ async fn a_tampered_v2_snapshot_parks_with_both_digests<H: CaseHarness>(harness:
     );
 }
 
-/// MOD-138 D5 as amended by blueprint A6: a v1 run whose live graph gained a non-default edge has
-/// a live graph M1 refuses (D6(c)). A v1 run always walked by position, so it is compared on the
-/// v1 phase-only digest instead; its phases did not change, so `resume` walks on to `plan`'s
-/// gate and writes no topology note.
+/// MOD-138 D5 as amended by blueprint A6 and M2 D11: a v1 run whose live graph gained a
+/// non-default edge. M1 refused that live graph (D6(c)); M2 resolves it (D10), and a v1 run walks
+/// the lift of its phases either way, so it is compared on the v1 phase-only digest; its phases
+/// did not change, so `resume` walks on to `plan`'s gate and writes no topology note.
 async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
@@ -8905,10 +8905,11 @@ async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on<H: CaseHar
     );
 }
 
-/// MOD-138 D5 as amended by blueprint A6: a v1 run on a live graph M1 refuses (an added
-/// `asks_you` edge) whose phases also moved (`prd`'s `input_kinds`) parks with the topology
-/// note. Both digests are v1 phase-only ones: `snapshot` is the run's stored v1 `topology`, and
-/// `live` the live phases' digest, never a `not runnable` sentence.
+/// MOD-138 D5 as amended by blueprint A6 and M2 D11: a v1 run on a live graph with an added
+/// `asks_you` edge (refused by M1, resolved since M2) whose phases also moved (`prd`'s
+/// `input_kinds`) parks with the topology note. Both digests are v1 phase-only ones: `snapshot`
+/// is the run's stored v1 `topology`, and `live` the live phases' digest, never a `not runnable`
+/// sentence.
 async fn a_v1_run_on_a_refused_graph_whose_phases_changed_parks<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
