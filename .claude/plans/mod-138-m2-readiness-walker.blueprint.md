@@ -519,8 +519,10 @@ ALTER TABLE run_step ADD COLUMN branch JSONB
   CONSTRAINT chk_run_step_branch
   CHECK (branch IS NULL
          OR (jsonb_typeof(branch) = 'object'
-             AND NOT jsonb_path_exists(branch, '$.* ? (@.type() != "boolean")')));
+             AND NOT jsonb_path_exists(branch, 'strict $.* ? (@.type() != "boolean")')));
 ```
+
+*T1 verify (as landed, `8f9f49fa`):* the path must be `strict`. In lax mode an array member is unwrapped before the filter runs, so `{"a":[true]}` and `{"a":[]}` got through. MemStore's `record_branch` check (T2) must refuse array members too, so that it matches.
 
 `crates/htui-store/cache_migrations/0008_run_step_branch.sql` (T1):
 
