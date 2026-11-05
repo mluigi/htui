@@ -1,0 +1,7 @@
+---
+source: crates/htui/src/ui/tabs/settings/logging.rs
+expression: frame
+---
+ filter      debug · set by `HTUI_LOG_FILTER`
+▌log file    [TMP]/htui.log · set by `--log`
+             set by `--log` for this session: start htui without it to change the log file here

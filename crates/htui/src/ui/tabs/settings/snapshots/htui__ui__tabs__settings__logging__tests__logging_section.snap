@@ -1,0 +1,8 @@
+---
+source: crates/htui/src/ui/tabs/settings/logging.rs
+expression: frame
+---
+▌filter      info
+             which lines htui keeps, as an EnvFilter directive such as info or htui=debug,sqlx=warn; applied at once and
+             kept in ui-state.toml
+ log file    none
