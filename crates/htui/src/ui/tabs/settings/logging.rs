@@ -441,7 +441,7 @@ impl SettingsSection for LoggingSection {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::LoggingSection;
     use crate::app::{Action, Handled, LoggingAction};
@@ -619,21 +619,23 @@ mod tests {
         assert_eq!(emitted(&bench), [LoggingAction::Filter("info".to_owned())]);
     }
 
+    /// An absolute path is emitted trimmed and otherwise unchanged. The path is built from the
+    /// current directory, so it is absolute on every platform (a root-relative `/var/log/...`
+    /// is not absolute on Windows and would gain a drive).
     #[tokio::test]
-    async fn a_file_path_is_emitted_as_typed_and_clearing_it_emits_no_file() {
+    async fn an_absolute_file_path_is_emitted_trimmed_and_clearing_it_emits_no_file() {
         let bench = SectionBench::new().await;
         let (_logging, mut section) = detached();
+        let path = std::env::current_dir()
+            .expect("the current directory")
+            .join("htui.log");
+        assert!(path.is_absolute(), "{}", path.display());
 
         bench.key(&mut section, "j");
         bench.key(&mut section, "e");
-        retype(&bench, &mut section, 0, "  /var/log/htui.log  ");
+        retype(&bench, &mut section, 0, &format!("  {}  ", path.display()));
         bench.key(&mut section, "enter");
-        assert_eq!(
-            emitted(&bench),
-            [LoggingAction::File(Some(PathBuf::from(
-                "/var/log/htui.log"
-            )))]
-        );
+        assert_eq!(emitted(&bench), [LoggingAction::File(Some(path))]);
 
         bench.key(&mut section, "e");
         retype(&bench, &mut section, 0, "   ");
