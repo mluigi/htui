@@ -59,9 +59,11 @@ const HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
 ];
 
-/// The empty buffer's next step (MOD-83: an empty state always names one).
+/// The empty buffer's next step (MOD-83: an empty state always names one). The blueprint's
+/// "htui's own log appears here as it runs; …" is 76 cells and the lines pane holds 68 at 100
+/// columns, so "as it runs" goes: 64 cells, drawn whole.
 const NO_LINES_NEXT: &str =
-    "lines appear as htui runs; Settings \u{203a} Logging sets what is kept";
+    "htui's own log appears here; Settings \u{203a} Logging sets what is kept";
 
 /// The level filter's next step when `logs.level` has no key.
 const LOWER_THE_LEVEL: &str = "lower the minimum level";
@@ -686,6 +688,12 @@ mod tests {
         let mut harness = logs(&LogBuffer::new()).await;
         let frame = harness.render();
         assert!(frame.contains("No log lines yet."), "{frame}");
+        assert!(
+            frame.contains(
+                "htui's own log appears here; Settings \u{203a} Logging sets what is kept"
+            ),
+            "the whole next step fits the lines pane at 100 columns: {frame}"
+        );
         assert!(frame.contains(&source_row("all", 0, 0)), "{frame}");
         insta::assert_snapshot!("logs_empty", frame);
     }
