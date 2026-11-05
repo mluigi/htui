@@ -1235,6 +1235,16 @@ impl StoreRequest {
         crate::qdrant_settings_info::REQUEST_NAMES.contains(&self.name())
     }
 
+    /// MOD-160 D5: whether this request writes or clears the database-wide `qdrant_url` row, after
+    /// which the loop tells the concepts index to read its `search_concepts` offer again.
+    #[must_use]
+    pub const fn changes_qdrant_url(&self) -> bool {
+        matches!(
+            self,
+            Self::SetQdrantUrl { .. } | Self::ClearQdrantUrl { .. } | Self::AdoptOldQdrantUrl
+        )
+    }
+
     /// Stable name of the request, used in [`StoreReply::Failed`] and in logs.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -3311,6 +3321,12 @@ pub(crate) fn spawn_with_concepts(
                             if let Some(err) = lost_the_store(&served) {
                                 let _ = go_offline(&mut backend, &mut refresher, &mut health, err);
                             }
+                            // MOD-160 D5 (blueprint P-2): a URL write or clear, whatever it
+                            // answered (a stale or refused one says the row may have moved), has
+                            // the index re-read its offer: one cheap read, spawned, never awaited.
+                            if other.changes_qdrant_url() {
+                                concepts.url_changed();
+                            }
                             match served {
                                 Ok(reply) => reply,
                                 Err(err) => failed(other.name(), &err),
@@ -3781,6 +3797,116 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// An index that counts the URL changes the loop tells it (MOD-160 D5).
+    #[derive(Default)]
+    struct UrlChanges(std::sync::atomic::AtomicUsize);
+
+    impl UrlChanges {
+        fn seen(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl concepts_worker::ConceptIndex for UrlChanges {
+        fn search(
+            &self,
+            _: SearchQuery,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(
+            &self,
+            _: Backend,
+            _: Scope,
+        ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn url_changed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// MOD-160 D5 (blueprint P-2): every URL write or clear the loop serves tells the concepts
+    /// index to read its offer again, whatever the write answered (here `--demo` refuses each);
+    /// any other request does not.
+    #[tokio::test]
+    async fn a_qdrant_url_write_tells_the_index_to_reread() {
+        let index = Arc::new(UrlChanges::default());
+        let (tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rx) = mpsc::unbounded_channel();
+        let _worker = spawn_with_concepts(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(index.clone()),
+            None,
+        );
+        let url = htui_core::qdrant::QdrantUrl::parse("http://qdrant:6334").expect("a URL");
+
+        let reply = round_trip(
+            &tx,
+            &mut rx,
+            StoreRequest::SetQdrantUrl {
+                url,
+                expected: None,
+            },
+        )
+        .await;
+        let StoreReply::Failed { message, .. } = &reply else {
+            panic!("`--demo` refuses the write: {reply:?}")
+        };
+        assert_eq!(message, secrets_settings::DEMO_SESSION);
+        assert_eq!(index.seen(), 1);
+        for request in [
+            StoreRequest::QdrantInfo,
+            StoreRequest::BoxInfo,
+            StoreRequest::ClearQdrantApiKey,
+        ] {
+            round_trip(&tx, &mut rx, request).await;
+        }
+        assert_eq!(index.seen(), 1, "only a URL write re-reads");
+        round_trip(
+            &tx,
+            &mut rx,
+            StoreRequest::ClearQdrantUrl {
+                expected: Utc::now(),
+            },
+        )
+        .await;
+        round_trip(&tx, &mut rx, StoreRequest::AdoptOldQdrantUrl).await;
+        assert_eq!(index.seen(), 3);
+    }
+
+    /// MOD-160 D5: the requests that move the `qdrant_url` row, and only those.
+    #[test]
+    fn exactly_the_url_writes_change_the_qdrant_url() {
+        let url = htui_core::qdrant::QdrantUrl::parse("http://qdrant:6334").expect("a URL");
+        for request in [
+            StoreRequest::SetQdrantUrl {
+                url,
+                expected: None,
+            },
+            StoreRequest::ClearQdrantUrl {
+                expected: Utc::now(),
+            },
+            StoreRequest::AdoptOldQdrantUrl,
+        ] {
+            assert!(request.changes_qdrant_url(), "{request:?}");
+        }
+        for request in [
+            StoreRequest::QdrantInfo,
+            StoreRequest::ClearQdrantApiKey,
+            StoreRequest::DiscardOldQdrantUrl,
+            StoreRequest::QdrantOldUrlCheck,
+            StoreRequest::BoxInfo,
+        ] {
+            assert!(!request.changes_qdrant_url(), "{request:?}");
+        }
     }
 
     /// An index that records whether each publish handed it a store (MOD-158 D6).

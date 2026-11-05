@@ -4,10 +4,12 @@
 //! The project is the scope's and never an argument (I-1): `projects` is always
 //! `[scope.project_id]`. `types` are parsed here with [`ConceptType::parse`] (`htui-store`'s
 //! `PointType::parse` is private, B-3); `limit` is 1..=20, ten when omitted. Advertised only when
-//! the host has a concept index (D12); an index that cannot answer is `isError` with its cause
-//! (R-STO-8). A hit is what the index carries, with no title or status lookups.
+//! the host has a concept index (D12) that offered itself when the session opened (MOD-160 D5); an
+//! index that cannot answer is `isError` with `knowledge search unavailable: <cause>` (R-STO-8,
+//! MOD-160 D6). A hit is what the index carries, with no title or status lookups.
 
 use htui_core::model::Status;
+use htui_core::qdrant::unavailable;
 use serde_json::{Value, json};
 
 use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of};
@@ -60,7 +62,7 @@ fn statuses_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
-/// Advertised when the host has a concept index (D12).
+/// Advertised when the host has a concept index (D12) offered at `open` (MOD-160 D5).
 pub(crate) const DEF: ToolDef = ToolDef {
     name: "search_concepts",
     description: "Searches this project's items, documents and requirements by meaning.",
@@ -94,9 +96,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let Some(index) = ctx.session.search.as_ref() else {
-        return Err(ToolError(
-            "search unavailable: no concept index is attached".to_owned(),
-        ));
+        return Err(ToolError(unavailable("no concept index is attached")));
     };
     let hits = index
         .search(ConceptQuery {
@@ -107,6 +107,6 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
             limit,
         })
         .await
-        .map_err(|cause| ToolError(format!("search unavailable: {cause}")))?;
+        .map_err(|cause| ToolError(unavailable(&cause)))?;
     Ok(json!({ "hits": hits }))
 }

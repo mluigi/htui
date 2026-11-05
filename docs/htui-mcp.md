@@ -121,9 +121,10 @@ the link is in force after the call.
 A hit carries `point_type`, `owner_kind` (`item` or `requirement`), `key`, `score`, `snippet`, and
 when they apply `document_kind`, `resolution` (a closed item's) and `state` (a requirement's). The
 `snippet` is the start of the indexed text as stored (whitespace folded, control characters
-dropped, at most 280 characters), not scrubbed. It looks nothing else up. An index that cannot
-answer (no Qdrant URL stored, Qdrant down, the model not loaded) answers
-`search unavailable: <cause>`.
+dropped, at most 280 characters), not scrubbed. It looks nothing else up. A search that cannot
+answer (Qdrant down or refusing the key, an index written by another embedding model, the model
+failing to load) answers `knowledge search unavailable: <cause>`. A project that was never indexed
+answers no hits, and the search creates nothing in Qdrant.
 
 **`command_run`**: see [below](#command_run-and-the-command-queue).
 
@@ -140,7 +141,7 @@ JSON-RPC error (`-32602`, `unknown tool: <name>`).
 | `box_profile` | always |
 | `document_write` | the session has an item **and** an output kind |
 | `note_add`, `item_status`, `item_link` | the session has an item |
-| `search_concepts` | the host has a concepts index (below) |
+| `search_concepts` | a Qdrant URL is configured (below) |
 | `command_run` | the step's command queue is exposed ([below](#when-command_run-is-offered)) |
 | `permission_prompt` | the agent uses the CLI transport (`claude-cli`) |
 
@@ -157,11 +158,14 @@ What that gives each kind of session:
   snapshot (a snapshot that does not decode withholds that one tool, never the chat). A chat never
   gets `command_run`.
 
-`search_concepts` is offered by the TUI always; a call answers `search unavailable: …` while no
-Qdrant URL is stored (Settings › Qdrant). `htui worker` offers it only when the keyring held a
-Qdrant URL at start, the same condition under which it keeps the index current (see
-[`docs/htui-worker.md`](htui-worker.md#the-concepts-index)); a provisioned worker has no keyring,
-so it never does.
+`search_concepts` is offered per session, by the TUI and by `htui worker` alike, while a Qdrant
+URL is configured: `HTUI_QDRANT_URL`, or a usable URL stored in Settings › Qdrant (or with
+`htui --set-qdrant-url`). Whether one is configured is read in the background and cached, so
+opening a session never waits on it: a URL set or cleared in this process applies to the next
+session at once, one set from another box within about 30 seconds, with no restart. A session keeps
+what it was offered when it opened. While Qdrant is down a configured workspace keeps the tool, and
+every call answers `knowledge search unavailable: <cause>`. See
+[`docs/htui-worker.md`](htui-worker.md#the-concepts-index) for the worker.
 
 ## Scope: what a session can touch
 
@@ -634,9 +638,11 @@ session has exited or crashed, or its socket directory was deleted while it ran.
 **`HTUI_MCP_ADDR is not set` (exit 2).** `htui mcp` was run by hand, or by an agent that does not
 pass the server's environment.
 
-**`search unavailable: <cause>`.** The concepts index cannot answer. Store a Qdrant URL in
-Settings › Qdrant and build the index (`htui --index-items`); see the README's
-[Search](../README.md#search).
+**`knowledge search unavailable: <cause>`.** The concepts index cannot answer: the cause says
+whether Qdrant is unreachable, refuses this box's API key, or holds an index written by another
+embedding model. Check Settings › Qdrant, then build the index (`htui --index-items`); see the
+README's [Search](../README.md#search). **`search_concepts` is missing from `tools/list`**: no
+Qdrant URL is configured; store one in Settings › Qdrant.
 
 **A long `command_run` call is abandoned by the agent.** Its MCP client timed out before the
 command finished: see [Long calls](#liveness-crashes-and-cancellation). The queue cancels the row

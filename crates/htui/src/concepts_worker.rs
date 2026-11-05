@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::mem::Discriminant;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -64,6 +65,14 @@ pub trait ConceptIndex: Send + Sync {
     /// MOD-158 D6: the store the `qdrant_url` row is read through from now on (`None`: offline,
     /// `--demo`, or not connected yet). An index that reads no settings ignores it.
     fn publish(&self, _store: Option<Arc<dyn UrlRow>>) {}
+    /// MOD-160 D5: whether `search_concepts` is offered to a session opened now. Read once per
+    /// session at `McpHost::open`, on whatever thread opens it (the store loop for a chat), so it
+    /// awaits nothing. An index that reads no settings is always offered.
+    fn offered(&self) -> bool {
+        true
+    }
+    /// MOD-160 D5: this process wrote or cleared the `qdrant_url` row; the offer is read again.
+    fn url_changed(&self) {}
 }
 
 /// "Postgres is not connected" for the Qdrant URL (MOD-158 D6): no store is published (offline,
@@ -239,9 +248,68 @@ pub(crate) async fn resolve_settings(
     Ok(QdrantSettings { url, api_key })
 }
 
+/// MOD-160 D5: how old a known offer may be before [`QdrantSource::offered`] asks again.
+pub(crate) const OFFER_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// MOD-160 D5: whether a Qdrant URL resolves, as last read. Shared with the spawned reads (`Arc`),
+/// so a read needs no `&QdrantSource`.
+#[derive(Debug, Default)]
+struct Configured {
+    /// `None` until first known; `tokio::time::Instant`, so a paused clock ages it.
+    known: Mutex<Option<(bool, tokio::time::Instant)>>,
+    /// One staleness re-read at a time (`offered()`'s single flight). A drop guard in the task
+    /// clears it, so an aborted task cannot leave it set.
+    reading: AtomicBool,
+    /// Bumped by `publish` and `reread`. A read records only if no bump happened since it began,
+    /// so a read of the old store never overwrites the new store's answer.
+    generation: AtomicU64,
+}
+
+impl Configured {
+    /// Known at once, with no read.
+    fn known(configured: bool) -> Self {
+        Self {
+            known: Mutex::new(Some((configured, tokio::time::Instant::now()))),
+            ..Self::default()
+        }
+    }
+
+    /// The generation a read starting now belongs to.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// A new store or a new row: every read begun before is out of date. Under the `known` lock,
+    /// so no read can check the old generation and then record after the bump.
+    fn bump(&self) -> u64 {
+        let _known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Records `configured` for a read begun under `generation`, unless a bump came since.
+    fn record(&self, generation: u64, configured: bool) {
+        let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.generation.load(Ordering::SeqCst) == generation {
+            *known = Some((configured, tokio::time::Instant::now()));
+        }
+    }
+}
+
+/// Clears [`Configured::reading`] when the staleness read ends, however it ends.
+struct Reading(Arc<Configured>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.reading.store(false, Ordering::SeqCst);
+    }
+}
+
 /// MOD-158 D6: one process's source of Qdrant settings. The slot holds the current store (`None`
 /// offline, under `--demo`, or before a connect); every read takes an `Arc` clone and drops the
 /// lock before any `.await`, and a publish is a pointer swap with no `.await` (`R-NF-3`).
+///
+/// MOD-160 D5: it also caches whether a URL resolves ([`Self::offered`]), refreshed by spawned
+/// reads and by every resolution already in flight, never awaited by a reader.
 pub struct QdrantSource {
     /// `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY`, as this process read them.
     env: QdrantEnv,
@@ -251,6 +319,8 @@ pub struct QdrantSource {
     key: RwLock<KeySource>,
     /// The keyring read of the key.
     keyring: KeyringRead,
+    /// Whether a URL resolves, as last read (D5).
+    configured: Arc<Configured>,
 }
 
 impl core::fmt::Debug for QdrantSource {
@@ -286,11 +356,16 @@ impl QdrantSource {
                 Err(why) => tracing::warn!("{}", env_url_unusable(why)),
             }
         }
+        // D5: the override wins over every row, so its verdict is known without a read.
+        let configured = env.url.as_deref().map_or_else(Configured::default, |text| {
+            Configured::known(QdrantUrl::parse(text).is_ok())
+        });
         Self {
             env,
             store: RwLock::new(None),
             key: RwLock::new(key),
             keyring: secret::get_qdrant_api_key,
+            configured: Arc::new(configured),
         }
     }
 
@@ -313,9 +388,90 @@ impl QdrantSource {
         &self.env
     }
 
-    /// The store the row is read through from now on.
+    /// The store the row is read through from now on, then the offer (MOD-160 D5): `None` records
+    /// at once with no task (the override's verdict, else `false`: offline, `--demo`); `Some`
+    /// starts one read of the new store.
     pub fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
+        let read = store.is_some();
         *self.store.write().unwrap_or_else(PoisonError::into_inner) = store;
+        let generation = self.configured.bump();
+        if read {
+            self.spawn_read(true);
+        } else {
+            let verdict = self
+                .env
+                .url
+                .as_deref()
+                .is_some_and(|text| QdrantUrl::parse(text).is_ok());
+            self.configured.record(generation, verdict);
+        }
+    }
+
+    /// MOD-160 D5: this process wrote or cleared the URL row: the offer is read again, now.
+    pub fn reread(&self) {
+        self.configured.bump();
+        self.spawn_read(true);
+    }
+
+    /// MOD-160 D5: whether a Qdrant URL resolves, as last read; never awaited. Unknown answers
+    /// `false` and starts a read. Older than [`OFFER_STALE_AFTER`], it answers the old value and
+    /// starts at most one read.
+    #[must_use]
+    pub fn offered(&self) -> bool {
+        let known = *self
+            .configured
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match known {
+            None => {
+                self.spawn_read(false);
+                false
+            }
+            Some((offered, at)) => {
+                if at.elapsed() >= OFFER_STALE_AFTER {
+                    self.spawn_read(false);
+                }
+                offered
+            }
+        }
+    }
+
+    /// The read behind `publish`, `reread` and `offered`, on a task of its own: the URL alone
+    /// (never the key), over the current store, recorded under the generation it began in. With
+    /// no runtime it starts nothing and the flag stays as it was. Unforced, it is the single
+    /// flight's: none starts while another runs.
+    fn spawn_read(&self, forced: bool) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let guard = if forced {
+            None
+        } else if self
+            .configured
+            .reading
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(Reading(Arc::clone(&self.configured)))
+        } else {
+            return;
+        };
+        let generation = self.configured.generation();
+        let env = QdrantEnv {
+            url: self.env.url.clone(),
+            api_key: None,
+        };
+        let store = self.current();
+        let configured = Arc::clone(&self.configured);
+        runtime.spawn(async move {
+            let _guard = guard;
+            let resolved = resolve_url(&env, store.as_deref()).await;
+            if let Err(why) = &resolved {
+                tracing::debug!(%why, "search_concepts is not offered");
+            }
+            configured.record(generation, resolved.is_ok());
+        });
     }
 
     /// Where the key comes from from now on (`htui worker`: [`KeySource::Headless`]).
@@ -336,22 +492,29 @@ impl QdrantSource {
     /// # Errors
     /// [`Unresolved`]: no URL, offline, an unusable override or row, or an unreadable row.
     pub async fn url(&self) -> Result<QdrantUrl, Unresolved> {
+        let generation = self.configured.generation();
         let store = self.current();
-        resolve_url(&self.env, store.as_deref()).await
+        let url = resolve_url(&self.env, store.as_deref()).await;
+        self.configured.record(generation, url.is_ok());
+        url
     }
 
     /// D3 and D4, read now: a URL or key changed since the last call applies to this one.
     ///
     /// # Errors
     /// [`Unresolved`].
+    ///
+    /// MOD-160 D5: the URL's verdict is recorded as soon as it is known, before the key: a URL
+    /// that resolves is configured even when the key cannot be read.
     pub async fn settings(&self) -> Result<QdrantSettings, Unresolved> {
-        let store = self.current();
         let key = self
             .key
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        resolve_settings(&self.env, store.as_deref(), &key, self.keyring).await
+        let url = self.url().await?;
+        let api_key = resolve_key(&self.env, &key, self.keyring).await?;
+        Ok(QdrantSettings { url, api_key })
     }
 }
 
@@ -689,6 +852,14 @@ impl ConceptIndex for QdrantIndex {
     fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
         self.source.publish(store);
     }
+
+    fn offered(&self) -> bool {
+        self.source.offered()
+    }
+
+    fn url_changed(&self) {
+        self.source.reread();
+    }
 }
 
 /// The process's one production index (MOD-11 T7, H-26): [`ConceptsRuntime::production`] and
@@ -899,6 +1070,12 @@ impl ConceptsRuntime {
         self.published = now;
         self.index
             .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
+    }
+
+    /// MOD-160 D5: the loop wrote or cleared the `qdrant_url` row (or tried): the index reads its
+    /// offer again. Awaits nothing.
+    pub fn url_changed(&self) {
+        self.index.url_changed();
     }
 
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
@@ -1552,9 +1729,273 @@ mod tests {
         assert!(!shown.contains("line-key"), "{shown}");
     }
 
-    /// An index that records what is published to it.
+    /// A `qdrant_url` row that counts its reads, waits `delay` (paused clock) before each answer,
+    /// and answers a stored URL while `present`, else no row.
+    struct CountingRow {
+        /// The row behind it, set to a usable URL.
+        store: MemStore,
+        /// Whether the row is there.
+        present: AtomicBool,
+        /// How many reads began.
+        reads: AtomicUsize,
+        /// How long each read waits.
+        delay: Duration,
+    }
+
+    impl CountingRow {
+        async fn new(present: bool, delay: Duration) -> Arc<Self> {
+            let store = MemStore::new();
+            set_row(&store, "http://row:6334").await;
+            Arc::new(Self {
+                store,
+                present: AtomicBool::new(present),
+                reads: AtomicUsize::new(0),
+                delay,
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn set_present(&self, present: bool) {
+            self.present.store(present, Ordering::SeqCst);
+        }
+    }
+
+    impl UrlRow for CountingRow {
+        fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                if self.present.load(Ordering::SeqCst) {
+                    UrlRow::qdrant_url(&self.store).await
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+    }
+
+    /// Lets every spawned read that is due finish (a paused clock advances on its own).
+    async fn settle_reads() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// The flag as last recorded, without starting a read.
+    fn known(source: &QdrantSource) -> Option<bool> {
+        source
+            .configured
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|(offered, _)| offered)
+    }
+
+    /// A current-thread runtime on a paused clock: what is published before `block_on` is
+    /// published with no runtime, so it starts no read.
+    fn paused_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a runtime")
+    }
+
+    /// MOD-160 D5: unknown is "not offered", and asks once however often it is asked.
+    #[test]
+    fn an_unknown_offer_is_false_and_starts_one_read() {
+        let runtime = paused_runtime();
+        let row = runtime.block_on(CountingRow::new(true, Duration::from_secs(1)));
+        let source = source(None, None, no_key);
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        assert_eq!(known(&source), None, "no runtime, no read");
+        runtime.block_on(async {
+            for _ in 0..3 {
+                assert!(!source.offered(), "unknown is not offered");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(row.reads(), 1, "one read for every unknown answer");
+            assert!(source.offered(), "the row resolves");
+            assert_eq!(row.reads(), 1, "a fresh answer starts nothing");
+        });
+    }
+
+    /// MOD-160 D5: a publish starts the read, so the first session after it knows.
+    #[tokio::test(start_paused = true)]
+    async fn a_url_row_is_offered_after_the_read() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert_eq!(known(&source), Some(true));
+        assert!(source.offered());
+        assert_eq!(row.reads(), 1);
+    }
+
+    /// MOD-160 D5: offline and no row are not offered; a `None` publish needs no read.
+    #[tokio::test(start_paused = true)]
+    async fn no_url_and_offline_are_not_offered() {
+        let source = source(None, None, no_key);
+        source.publish(None);
+        assert_eq!(
+            known(&source),
+            Some(false),
+            "recorded at once, with no task"
+        );
+        assert!(!source.offered());
+
+        let row = CountingRow::new(false, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        for _ in 0..3 {
+            assert!(!source.offered(), "no row is not offered");
+        }
+        settle_reads().await;
+        assert_eq!(row.reads(), 1, "the publish's read, and no other");
+    }
+
+    /// MOD-160 D5: `HTUI_QDRANT_URL` wins over every row, so its verdict is known at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_override_is_known_without_a_read() {
+        let usable = source(Some("http://env:6334"), None, no_key);
+        assert_eq!(known(&usable), Some(true), "known before any read");
+        assert!(usable.offered());
+        let row = CountingRow::new(false, Duration::ZERO).await;
+        usable.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert!(usable.offered(), "the row is never read over the override");
+        assert_eq!(row.reads(), 0);
+
+        let unusable = source(Some("http://u:SENTINEL@env:6334"), None, no_key);
+        assert_eq!(known(&unusable), Some(false));
+        unusable.publish(None);
+        assert!(
+            !unusable.offered(),
+            "offline changes nothing for an override"
+        );
+    }
+
+    /// MOD-160 D5: an answer older than 30 s is still answered, and read again once, however many
+    /// sessions open meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_answer_is_used_and_read_again_once() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::from_secs(1)).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(source.offered());
+        assert_eq!(row.reads(), 1);
+
+        row.set_present(false);
+        tokio::time::sleep(OFFER_STALE_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            assert!(source.offered(), "the old answer, while the read runs");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(row.reads(), 2, "one re-read");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!source.offered(), "the re-read's answer");
+        assert_eq!(row.reads(), 2, "a fresh answer starts nothing");
+    }
+
+    /// MOD-160 D5: a slow read of the old store lands after the new store's answer, and is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_the_old_store_never_overwrites_the_new_one() {
+        let source = source(None, None, no_key);
+        let old = CountingRow::new(true, Duration::from_secs(5)).await;
+        let new = CountingRow::new(false, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&old) as Arc<dyn UrlRow>));
+        tokio::task::yield_now().await;
+        source.publish(Some(Arc::clone(&new) as Arc<dyn UrlRow>));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!((old.reads(), new.reads()), (1, 1));
+        assert_eq!(known(&source), Some(false), "the new store's answer stands");
+    }
+
+    /// MOD-160 D5: an in-process URL write or clear re-reads at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_reread_after_a_write_picks_up_a_cleared_row() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert!(source.offered());
+
+        row.set_present(false);
+        source.reread();
+        settle_reads().await;
+        assert_eq!(row.reads(), 2);
+        assert!(!source.offered(), "the cleared row");
+    }
+
+    /// MOD-160 D5: every settings resolution records the flag, a search's included, before the
+    /// key and whatever Qdrant answers.
+    #[test]
+    fn a_search_records_the_offer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let row = runtime.block_on(async {
+            let row = CountingRow::new(true, Duration::ZERO).await;
+            set_row(&row.store, "http://127.0.0.1:1").await;
+            row
+        });
+        fn broken() -> htui_core::store::Result<Option<String>> {
+            Err(StoreError::Backend("no Secret Service".into()))
+        }
+        let source = Arc::new(source(None, None, no_key));
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::clone(&source));
+        runtime.block_on(async {
+            let why = index.search(any_query()).await.expect_err("port 1");
+            assert!(why.starts_with("cannot reach Qdrant"), "{why}");
+        });
+        assert_eq!(known(&source), Some(true), "recorded by the search itself");
+        assert_eq!(row.reads(), 1);
+
+        // A URL that resolves is configured even when the key cannot be read.
+        let keyless = Arc::new(
+            QdrantSource::new(QdrantEnv::default(), KeySource::Interactive).with_keyring(broken),
+        );
+        keyless.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        runtime.block_on(async {
+            assert!(keyless.settings().await.is_err(), "the key cannot be read");
+        });
+        assert_eq!(known(&keyless), Some(true));
+    }
+
+    /// MOD-160 D5: the runtime hands a URL write to its index.
+    #[test]
+    fn the_runtime_forwards_a_url_change() {
+        let index = Arc::new(Recording::default());
+        let runtime = ConceptsRuntime::new(index.clone());
+        runtime.url_changed();
+        runtime.url_changed();
+        assert_eq!(index.1.load(Ordering::SeqCst), 2);
+    }
+
+    /// MOD-160 D5: the production index answers the offer from its source.
+    #[tokio::test(start_paused = true)]
+    async fn the_qdrant_index_offers_from_its_source() {
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::new(source(None, None, no_key)));
+        ConceptIndex::publish(&index, None);
+        assert!(!ConceptIndex::offered(&index));
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::new(source(Some("http://env:6334"), None, no_key)));
+        assert!(ConceptIndex::offered(&index));
+        assert!(
+            ConceptIndex::offered(&MemIndex::new()),
+            "an index without settings is offered"
+        );
+    }
+
+    /// An index that records what is published to it, and counts the URL changes it is told.
     #[derive(Default)]
-    struct Recording(Mutex<Vec<bool>>);
+    struct Recording(Mutex<Vec<bool>>, AtomicUsize);
 
     impl ConceptIndex for Recording {
         fn search(&self, _: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
@@ -1568,6 +2009,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(store.is_some());
+        }
+        fn url_changed(&self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
         }
     }
 

@@ -3,7 +3,8 @@
 //!
 //! `htui-mcp` has no `htui-store` dependency (D1), so it cannot name `SearchQuery`, `Hit` or
 //! `PointType`; the `htui` binary implements [`ConceptSearch`] over its index and maps those types
-//! by hand. `None` for the host's search handle leaves the tool unadvertised.
+//! by hand. `None` for the host's search handle leaves the tool unadvertised, and so does a handle
+//! whose [`ConceptSearch::offered`] says no when a session opens (MOD-160 D5).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -17,11 +18,18 @@ pub trait ConceptSearch: Send + Sync + core::fmt::Debug {
     /// # Errors
     ///
     /// A one-line cause (the index or the embedding model is unavailable); the tool answers
-    /// `search unavailable: <cause>` (R-STO-8).
+    /// `knowledge search unavailable: <cause>` (`htui_core::qdrant::unavailable`, R-STO-8,
+    /// MOD-160 D6).
     fn search(
         &self,
         query: ConceptQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ConceptHit>, String>> + Send + '_>>;
+
+    /// MOD-160 D5: whether the tool is offered to a session opened now; read once at `open`,
+    /// never awaited (`open` runs on the store loop for a chat, `R-NF-3`). Offered by default.
+    fn offered(&self) -> bool {
+        true
+    }
 }
 
 /// One search, scoped to the session's project by the tool (never by its arguments, I-1).
