@@ -226,7 +226,24 @@ pub enum Cursor {
         /// `run_step.attempt` of the slot.
         attempt: i32,
     },
-    /// Every position of the snapshot has a `done` step at its latest attempt.
+    /// MOD-138 M2 D6: `step`, a node's winner, is `done` and its node's `if` edges are not
+    /// decided yet (`run_step.branch` is NULL). A write the engine owes, so it sorts before every
+    /// node cursor (blueprint A6).
+    Decide {
+        /// The winner whose `branch` is owed.
+        step: StepId,
+    },
+    /// MOD-138 M2 D7: `step` is `done` + `approved` and its back `asks_you` edge to `to` still
+    /// has budget, so the loop over that edge is owed. Sorts before every node cursor (A6).
+    Loop {
+        /// The approved source's winner.
+        step: StepId,
+        /// The edge's target key; the edge is `(step's node, to, asks_you)`, unique by MOD-137
+        /// rule (c).
+        to: String,
+    },
+    /// Every walked node of the snapshot is done at its latest attempt, or skipped (MOD-138 M2
+    /// D2), and nothing is owed.
     Finished,
 }
 
@@ -299,7 +316,32 @@ pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunS
         .copied()
 }
 
-/// Walks `snapshot.phases` in position order; the first position whose latest step is not `done`
+/// Where the walk is: the first of [`crate::walk::ready`] (MOD-138 M2 D2).
+///
+/// `ready` orders the owed writes ([`Cursor::Decide`], [`Cursor::Loop`]) first, then every reached
+/// node's cursor in position order, so on a lifted linear graph this is exactly the pre-M2 scan
+/// (blueprint §2.1): the first position whose latest step is not `done` decides.
+///
+/// `superseded` and `cancelled` at the latest attempt count as "no live step here" and yield
+/// [`Cursor::Create`] at [`next_attempt`]: the lazy re-insertion plan D5's review loop relies on,
+/// which supersedes the chain and leaves the creating to the walk.
+///
+/// A phase with `fan_out > 1` is read as a slot (plan D59, `group_cursor`); a `fan_out = 1`
+/// phase is read exactly as it was before fan-out, at `fanout_index 0`.
+///
+/// Every status a row can hold is matched, including the ones §4.3 would not have produced: MOD-2
+/// inserts `run_step` rows outside the status law on purpose, so the walk must never assume a row
+/// passed through `can_move_to` (plan D17).
+#[must_use]
+pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
+    crate::walk::ready(snapshot, steps)
+        .into_iter()
+        .next()
+        .unwrap_or(Cursor::Finished)
+}
+
+/// The pre-M2 cursor, verbatim, kept for the parity oracle (MOD-138 M2 D2, `walk.rs`'s tests):
+/// walks `snapshot.phases` in position order; the first position whose latest step is not `done`
 /// decides.
 ///
 /// `superseded` and `cancelled` at the latest attempt count as "no live step here" and yield
@@ -312,8 +354,9 @@ pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunS
 /// Every status a row can hold is matched, including the ones §4.3 would not have produced: MOD-2
 /// inserts `run_step` rows outside the status law on purpose, so the walk must never assume a row
 /// passed through `can_move_to` (plan D17).
+#[cfg(test)]
 #[must_use]
-pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
+pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
     for phase in &snapshot.phases {
         let position = phase.position;
         if phase.fan_out > 1 {
@@ -355,14 +398,19 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
 ///
 /// `Create`, `Run` and `Finished` under an `awaiting_approval` run are a command that crashed
 /// between its first write and its unpark: every step the run is parked over is `done`,
-/// `superseded` or `selected`, and no gate is waiting on a human. `Rest`, `Fan` and `Select` are
-/// real parks a human has to answer. `Engine::resume`'s own walk and `Unblock`'s third case
+/// `superseded` or `selected`, and no gate is waiting on a human. `Decide` and `Loop` (MOD-138 M2
+/// D2) are writes the engine still owes, which a crash, or a decision the isolator could not
+/// read (D6), cut off. `Rest`, `Fan` and `Select` are real parks a human has to answer. `Engine::resume`'s own walk and `Unblock`'s third case
 /// (plan D161) both read this one predicate, so the two cannot drift.
 #[must_use]
 pub fn resumable_park(cursor: &Cursor) -> bool {
     matches!(
         cursor,
-        Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
+        Cursor::Create { .. }
+            | Cursor::Run(_)
+            | Cursor::Decide { .. }
+            | Cursor::Loop { .. }
+            | Cursor::Finished
     )
 }
 
@@ -415,7 +463,7 @@ pub fn resumable(cursor: &Cursor, steps: &[RunStep]) -> bool {
 /// The slot's attempt is the highest over its candidates (every `fanout_index >= 0` row) rather
 /// than [`latest_at`]'s index-0 reading, which agrees whenever a group was created whole (plan
 /// D71, blueprint F-K) and cannot split a slot when one was not.
-fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Option<Cursor> {
+pub(crate) fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Option<Cursor> {
     let Some(attempt) = steps
         .iter()
         .filter(|step| step.position == position && step.fanout_index >= 0)
@@ -744,6 +792,22 @@ mod tests {
             },
         ] {
             assert!(!resumable_park(&cursor), "{cursor:?} waits on a human");
+        }
+    }
+
+    /// MOD-138 M2 D2: the two owed writes are a crashed command's, so a resume walks on.
+    #[test]
+    fn decide_and_loop_are_resumable_parks() {
+        let step = ids::STEP_R2_PRD;
+        for cursor in [
+            Cursor::Decide { step },
+            Cursor::Loop {
+                step,
+                to: "plan".to_owned(),
+            },
+        ] {
+            assert!(resumable_park(&cursor), "{cursor:?} is owed by the engine");
+            assert!(resumable(&cursor, &[]), "{cursor:?} resumes");
         }
     }
 

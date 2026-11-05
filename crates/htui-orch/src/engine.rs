@@ -3121,6 +3121,20 @@ where
                         return Ok(rest);
                     }
                 }
+                // MOD-138 M2 T3: placeholders T5 fills (`decide`, `loop_back`). No lifted graph
+                // yields either (the parity oracle in `walk.rs`), and a refusal writes nothing.
+                Cursor::Decide { .. } => {
+                    return Err(EngineError::Snapshot {
+                        run,
+                        reason: "cursor `decide` is not walked yet (MOD-138 M2 T5)".to_owned(),
+                    });
+                }
+                Cursor::Loop { .. } => {
+                    return Err(EngineError::Snapshot {
+                        run,
+                        reason: "cursor `loop` is not walked yet (MOD-138 M2 T5)".to_owned(),
+                    });
+                }
             }
         }
         Err(EngineError::Stalled {
@@ -6025,7 +6039,7 @@ where
             .store
             .resolve_inputs(item, run.id, &phase.input_kinds)
             .await?;
-        let required = required_inputs(phase, &snapshot.phases);
+        let required = crate::walk::required_inputs(phase, snapshot);
         let mut documents = Vec::with_capacity(resolved.len());
         let mut notes = Vec::new();
         for input in resolved {
@@ -6966,7 +6980,10 @@ where
             Cursor::Create { position, .. }
             | Cursor::Fan { position, .. }
             | Cursor::Select { position, .. } => Some(position),
-            Cursor::Run(step) | Cursor::Rest { step, .. } => steps
+            Cursor::Run(step)
+            | Cursor::Rest { step, .. }
+            | Cursor::Decide { step }
+            | Cursor::Loop { step, .. } => steps
                 .iter()
                 .find(|row| row.id == step)
                 .map(|row| row.position),
@@ -7488,32 +7505,6 @@ struct VerifyStage<'a> {
     deadline_cut: bool,
 }
 
-/// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
-///
-/// A kind is required unless a **later** position of the same snapshot produces it. The seeded
-/// `implement` phase lists `review` in `input_kinds` (`crates/htui-core/src/seed.rs:87-90`) —
-/// ANA-2 §4.1's own seed amendment, so the review loop can feed a review back — while §4.2 makes a
-/// missing input a hard failure before a token is spent (`:412-414`). On attempt 1 no review
-/// exists, so a literal reading fails validation criterion 1 at position 2, and the seed and the
-/// contract cannot both be right as written.
-///
-/// This is the one reading under which both hold: a forward input is still mandatory, and the
-/// loop's back-edge is absent exactly when it has not run yet. Its absence is recorded in the trim
-/// record's notes rather than being silent.
-#[must_use]
-pub fn required_inputs(phase: &SnapshotPhase, phases: &[SnapshotPhase]) -> Vec<String> {
-    phase
-        .input_kinds
-        .iter()
-        .filter(|kind| {
-            !phases
-                .iter()
-                .any(|later| later.position > phase.position && later.output_kind == **kind)
-        })
-        .cloned()
-        .collect()
-}
-
 /// MOD-12 M2 D6: what one session may spend, and the batch when the batch's remainder was the
 /// binding term (so a breach can name it, D6's last bullet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7877,13 +7868,12 @@ mod tests {
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 
-    use super::{
-        AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
-    };
+    use super::{AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey};
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::{Clock as _, IsolateError};
     use crate::status::RunFailure;
+    use crate::walk::required_inputs;
 
     /// MOD-26 I-4's refusal as milestone 1 persisted it in `RunFailure::PromptRefused.reason`,
     /// written out literally so the stored reason's bytes are pinned independently of
@@ -8069,7 +8059,7 @@ mod tests {
             .expect("the seeded `feature` graph has one");
         assert_eq!(implement.input_kinds, ["plan", "review"]);
         assert_eq!(
-            required_inputs(implement, &snapshot.phases),
+            required_inputs(implement, &snapshot),
             ["plan"],
             "`review` is the loop's back edge and cannot exist on attempt 1 (plan D21)"
         );
@@ -8080,7 +8070,7 @@ mod tests {
             .find(|phase| phase.name == "review")
             .expect("the seeded `feature` graph has one");
         assert_eq!(
-            required_inputs(review, &snapshot.phases),
+            required_inputs(review, &snapshot),
             ["implement"],
             "nothing later produces `implement`, so it is required"
         );
