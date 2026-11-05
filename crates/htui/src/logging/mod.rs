@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tracing::Dispatch;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Layer as _, Layered, SubscriberExt as _};
 use tracing_subscriber::{EnvFilter, Registry, filter, reload};
 
@@ -125,9 +124,6 @@ impl Logging {
             .is_some()
             .then(|| parse_filter(initial))
             .transpose()?;
-        let sentry_level = sentry_filter
-            .as_ref()
-            .map_or(LevelFilter::OFF, |filter| widest(filter.max_level_hint()));
         let sentry = sentry_filter.map(|filter| sentry().with_filter(filter).boxed());
         let on = Arc::clone(&switch.on);
         // MOD-122 R1: with no file the `fmt` layer is filtered out, so no line is formatted for
@@ -145,7 +141,7 @@ impl Logging {
         let subscriber = tracing_subscriber::registry().with(sentry).with(local);
         Ok(Self {
             buffer,
-            control: LoggingControl::new(Some(handle), switch, sentry_level, &startup),
+            control: LoggingControl::new(Some(handle), switch, &startup),
             dispatch: Some(Dispatch::new(subscriber)),
             sentry: with_sentry,
         })
@@ -157,12 +153,7 @@ impl Logging {
     pub fn detached() -> Self {
         Self {
             buffer: LogBuffer::new(),
-            control: LoggingControl::new(
-                None,
-                FileSwitch::default(),
-                LevelFilter::OFF,
-                &Startup::default(),
-            ),
+            control: LoggingControl::new(None, FileSwitch::default(), &Startup::default()),
             dispatch: None,
             sentry: false,
         }
@@ -207,7 +198,12 @@ impl fmt::Debug for Logging {
 }
 
 /// [`Logging::build`], then installed process-wide (the same call as before MOD-122, which also
-/// installs the `log` bridge). `run` calls it once; nothing else may.
+/// installs the `log` bridge at the startup level). `run` calls it once; nothing else may.
+///
+/// Every reload after it moves the `log` crate's max level too: `tracing-subscriber`'s reload
+/// sets it from `LevelFilter::current()` (its `tracing-log` feature), the widest level of the
+/// run-time filter and the Sentry layer's, so a filter set in Settings reaches `log` records
+/// (sqlx's) with nothing of htui's own (MOD-122 R1).
 ///
 /// # Errors
 ///
@@ -220,8 +216,6 @@ pub(crate) fn init(startup: Startup) -> anyhow::Result<Logging> {
         dispatch
             .try_init()
             .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))?;
-        logging.control.0.installed.store(true, Ordering::Relaxed);
-        logging.control.bridge_log();
     }
     Ok(logging)
 }
@@ -234,11 +228,6 @@ struct ControlInner {
     /// `None` when detached: the filter is recorded, nothing reloads.
     reload: Option<reload::Handle<EnvFilter, Base>>,
     file: FileSwitch,
-    /// The widest level the Sentry layer's fixed filter lets through; `OFF` without the layer.
-    sentry: LevelFilter,
-    /// `init` installed this subscriber process-wide, so the `log` crate's max level is its to
-    /// keep (MOD-122 R1). Never set in a test: nothing process-global moves there.
-    installed: AtomicBool,
     state: Mutex<LoggingState>,
 }
 
@@ -261,7 +250,6 @@ impl LoggingControl {
     fn new(
         reload: Option<reload::Handle<EnvFilter, Base>>,
         file: FileSwitch,
-        sentry: LevelFilter,
         startup: &Startup,
     ) -> Self {
         let state = LoggingState {
@@ -277,8 +265,6 @@ impl LoggingControl {
         Self(Arc::new(ControlInner {
             reload,
             file,
-            sentry,
-            installed: AtomicBool::new(false),
             state: Mutex::new(state),
         }))
     }
@@ -318,8 +304,6 @@ impl LoggingControl {
             })?;
         }
         state.filter = directive.to_owned();
-        drop(state);
-        self.bridge_log();
         Ok(())
     }
 
@@ -353,26 +337,6 @@ impl LoggingControl {
         state.file = path.map(Path::to_path_buf);
         state.file_error = None;
         Ok(())
-    }
-
-    /// The `log` crate's max level this subscriber wants (MOD-122 R1): the widest of the run-time
-    /// filter and the Sentry layer's. `log` drops a record above its max level before the bridge
-    /// sees it, and `init` sets it once, from the startup filter.
-    fn log_level(&self) -> log::LevelFilter {
-        let local = self.0.reload.as_ref().map_or(LevelFilter::OFF, |handle| {
-            handle
-                .with_current(|filter| widest(filter.max_level_hint()))
-                .unwrap_or(LevelFilter::OFF)
-        });
-        as_log(local.max(self.0.sentry))
-    }
-
-    /// Raises or lowers the `log` crate's max level to [`log_level`](Self::log_level), only for
-    /// the subscriber `init` installed.
-    fn bridge_log(&self) {
-        if self.0.installed.load(Ordering::Relaxed) {
-            log::set_max_level(self.log_level());
-        }
     }
 
     /// D5 at startup: each saved field `HTUI_LOG_FILTER` or `--log` does not override is applied.
@@ -486,23 +450,6 @@ pub fn parse_filter(directive: &str) -> Result<EnvFilter, LoggingError> {
         return Err(refuse("it is empty".to_owned()));
     }
     EnvFilter::try_new(directive).map_err(|err| refuse(one_line(&err.to_string())))
-}
-
-/// A filter's max level hint, `None` (no hint) read as the widest.
-fn widest(hint: Option<LevelFilter>) -> LevelFilter {
-    hint.unwrap_or(LevelFilter::TRACE)
-}
-
-/// `level` as the `log` crate's.
-fn as_log(level: LevelFilter) -> log::LevelFilter {
-    match level.into_level() {
-        None => log::LevelFilter::Off,
-        Some(tracing::Level::ERROR) => log::LevelFilter::Error,
-        Some(tracing::Level::WARN) => log::LevelFilter::Warn,
-        Some(tracing::Level::INFO) => log::LevelFilter::Info,
-        Some(tracing::Level::DEBUG) => log::LevelFilter::Debug,
-        Some(_) => log::LevelFilter::Trace,
-    }
 }
 
 /// `text` with every run of whitespace, line breaks included, as one space.

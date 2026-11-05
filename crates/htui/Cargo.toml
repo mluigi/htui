@@ -70,10 +70,6 @@ zeroize            = { workspace = true }
 sentry = { workspace = true }
 sentry-anyhow = { workspace = true }
 sentry-tracing = { workspace = true }
-# MOD-122 R1: the `log` crate's max level follows the run-time filter (`logging::LoggingControl`),
-# so a record from a crate that logs through `log` (sqlx) reaches the bridge. 0.4.34 is already in
-# the lock through sqlx and tracing-log, so nothing new is compiled.
-log = "0.4"
 # MOD-9 D9: the $EDITOR temp file (removed on drop); already in the lock (was dev-only). The store
 # worker's swap tests also open a throwaway `cache.sqlite` with it, never the user's.
 tempfile = "3"
@@ -123,6 +119,11 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # and the point of that suite is what Postgres actually holds. Runtime-checked queries only, so
 # `.sqlx/` stays a `htui-store` concern.
 sqlx     = { workspace = true }
+# MOD-122 R1: `logging`'s pin that a filter reload moves the `log` crate's max level, which
+# tracing-subscriber's reload does through its default `tracing-log` feature, so a record from a
+# crate that logs through `log` (sqlx) follows the run-time filter. 0.4.34 is already in the lock
+# through sqlx and tracing-log, so nothing new is compiled.
+log      = "0.4"
 # `net` for the loopback fixture servers the MOD-20 install cases answer from (blueprint P-5).
 tokio    = { workspace = true, features = ["test-util", "net"] }
 

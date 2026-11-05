@@ -773,11 +773,16 @@ Changed by the rust-reviewer's findings; D1-D7 otherwise stand.
   `--log`) sits on the registry behind its own copy of the startup filter (`HTUI_LOG_FILTER` or
   `info`), which nothing reloads, so Settings › Logging never mutes or widens Sentry. The `fmt`
   layer has a second, dynamic per-layer filter: off while the `FileSwitch` holds no file.
-- **`log` bridge.** After every successful reload, the `log` crate's max level is set to the
-  widest of the run-time filter's and Sentry's level hints, only for the subscriber `init`
-  installed (`installed` flag), so tests move no process-global state. `log` is a direct
-  dependency; rustix gains `fs` (`O_NONBLOCK` open of the log file; a path that is not a regular
-  file is refused).
+- **`log` bridge.** Nothing of htui's own: `tracing-subscriber`'s `reload::Handle::modify` sets
+  the `log` crate's max level from `LevelFilter::current()` after every reload (its default
+  `tracing-log` feature), the widest of the run-time filter's and Sentry's hints, so the
+  reviewer's premise did not hold (repair 1 checked 0.3.23's source and dropped the R1 bridge).
+  Every reload moves that process-global level, in a test too; `a_reload_raises_the_log_crates_level`
+  pins the library behaviour, with `log` a dev-dependency only.
+- **Log file kinds.** rustix gains `fs`: on Unix the log file opens `O_NONBLOCK` (cleared once
+  open), so no open blocks, and a FIFO no one reads is refused at once. The startup `--log`
+  opens a device as before (`/dev/null`, `/dev/stderr`); a file set at run time (Settings,
+  `ui-state.toml`) must be a regular file, refused before and after the open otherwise.
 - **Startup apply (D5, lib.rs §wiring).** `ui-state.toml` is read and its `[logging]` applied
   after `--print-keys` (the last verb or flag that exits) and before `connect::start`, not after
   the store worker's spawn: the saved settings see every line the TUI logs and stay the TUI's
