@@ -866,6 +866,38 @@ mod tests {
         );
     }
 
+    /// A6: the owed writes sort by kind before position. `y`'s `Decide` at position 4 comes
+    /// before `s`'s `Loop` at position 2, and both come before root `x`'s `Create` at position 0.
+    #[test]
+    fn decide_then_loop_then_node_cursors_regardless_of_position() {
+        let snapshot = graph(
+            &[("x", 0), ("t", 1), ("s", 2), ("u", 3), ("y", 4), ("z", 5)],
+            &[
+                ("t", "s", NEXT),
+                ("s", "u", NEXT),
+                ("s", "t", ASKS),
+                ("y", "z", IF),
+            ],
+        );
+        let t = done(&snapshot, "t");
+        let mut s = done(&snapshot, "s");
+        s.gate_outcome = Some(GateOutcome::Approved);
+        let y = done(&snapshot, "y");
+        assert_eq!(
+            ready(&snapshot, &[t, s.clone(), y.clone()]),
+            [
+                Cursor::Decide { step: y.id },
+                Cursor::Loop {
+                    step: s.id,
+                    to: "t".to_owned()
+                },
+                create(0),
+                create(3)
+            ],
+            "every `Decide`, then every `Loop`, then node cursors, each group by position"
+        );
+    }
+
     /// D7: once the target's attempts reach the edge's budget, the approved source owes no loop.
     #[test]
     fn a_spent_back_asks_you_yields_no_loop() {

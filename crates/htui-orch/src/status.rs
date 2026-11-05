@@ -400,8 +400,9 @@ pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) ->
 /// between its first write and its unpark: every step the run is parked over is `done`,
 /// `superseded` or `selected`, and no gate is waiting on a human. `Decide` and `Loop` (MOD-138 M2
 /// D2) are writes the engine still owes, which a crash, or a decision the isolator could not
-/// read (D6), cut off. `Rest`, `Fan` and `Select` are real parks a human has to answer. `Engine::resume`'s own walk and `Unblock`'s third case
-/// (plan D161) both read this one predicate, so the two cannot drift.
+/// read (D6), cut off. `Rest`, `Fan` and `Select` are real parks a human has to answer.
+/// `Engine::resume`'s own walk and `Unblock`'s third case (plan D161) both read this one
+/// predicate, so the two cannot drift.
 #[must_use]
 pub fn resumable_park(cursor: &Cursor) -> bool {
     matches!(
@@ -445,7 +446,7 @@ pub fn crashed_rejection<'s>(cursor: &Cursor, steps: &'s [RunStep]) -> Option<&'
 
 /// Blueprint D196, widened by MOD-37 R-31: the one predicate every resume reader reads.
 ///
-/// [`resumable_park`]'s three cursors, or a [`crashed_rejection`]. `Unblock`'s third case
+/// [`resumable_park`]'s five cursors, or a [`crashed_rejection`]. `Unblock`'s third case
 /// (through [`crate::command::unblock_enabled`]'s callers), `Engine::resume`'s walk and the
 /// worker box's hand-back resume all read this, and none open-codes it.
 #[must_use]
@@ -762,8 +763,9 @@ mod tests {
         }
     }
 
-    /// Blueprint D196: exactly the three cursors a crashed command leaves under a parked run are
-    /// resumable, and the three a human has to answer are not.
+    /// Blueprint D196: the three cursors a crashed command leaves under a parked run are
+    /// resumable, and the three a human has to answer are not. MOD-138 M2 adds the two owed
+    /// writes, `Decide` and `Loop` (next test).
     #[test]
     fn only_a_crashed_command_s_park_is_resumable() {
         let step = ids::STEP_R2_PRD;
