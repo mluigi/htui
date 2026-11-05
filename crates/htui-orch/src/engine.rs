@@ -33,14 +33,15 @@ use htui_agent::record::{
     drive,
 };
 use htui_core::model::{
-    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
-    Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED,
-    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo,
-    RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SessionEvent, SnapshotCandidate, SnapshotEdge, SnapshotPersona, SnapshotPhase,
-    SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    Transport, UserId, VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
+    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, BranchFacts, Claim, CommandRunId,
+    CommandRunStatus, Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Isolation, Item,
+    ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId,
+    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
+    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
+    min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -93,6 +94,14 @@ const HANDOFF_TEMPLATE: &str = "handoff";
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
 const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
+
+/// MOD-138 M2 D8, blueprint A3: whether a human's reject of `node` declines its `asks_you`
+/// edges (`answer_gate(Skipped)`, the work lands) rather than failing the step. A reject's
+/// precedence is `changes_requested` (the loop) > `asks_you` (this decline) > `fails` (the loop)
+/// > the end of the run, so a node that also reads its verdict still loops.
+fn declines_on_reject(snapshot: &GraphSnapshot, node: &str) -> bool {
+    gate::asks_you(snapshot, node) && !snapshot.reads_verdict(node)
+}
 
 /// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
 const JUDGE_FANOUT_INDEX: i32 = -1;
@@ -959,6 +968,12 @@ where
         let (outcome, note, to) = match &answer {
             GateAnswer::Approved => (GateOutcome::Approved, None, StepStatus::Done),
             GateAnswer::Skipped => (GateOutcome::Skipped, None, StepStatus::Done),
+            // MOD-138 M2 D8 (plan Q-B), blueprint A3: a human's reject of a node with an
+            // `asks_you` edge declines it: `skipped`, `done`, the note kept, and the work lands
+            // below as for any done step. A `changes_requested` edge still wins (the loop).
+            GateAnswer::Rejected { note } if declines_on_reject(snapshot, &phase.name) => {
+                (GateOutcome::Skipped, Some(note.clone()), StepStatus::Done)
+            }
             GateAnswer::Rejected { note } => (
                 GateOutcome::Rejected,
                 Some(note.clone()),
@@ -998,7 +1013,8 @@ where
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
         let tail = async {
-            if matches!(answer, GateAnswer::Rejected { .. }) {
+            // The mapped outcome, not the human's verb: a declined `asks_you` reject is `done`.
+            if outcome == GateOutcome::Rejected {
                 return self.after_rejection(run, snapshot, step, phase, now).await;
             }
             // `answer_gate` moved the step `awaiting_approval -> done`
@@ -1035,8 +1051,9 @@ where
     ///
     /// MOD-138 M2 D7, blueprint A3: the node's edges decide, never its name. A
     /// `changes_requested` edge loops over it (the review loop); else a `fails` edge loops over
-    /// it; else the run ends `rejected: <phase>` (ANA-2 `:577-578`, blueprint A-8). An `asks_you`
-    /// node never reaches here with a human's reject, which declines its edges instead (D8).
+    /// it; else the run ends `rejected: <phase>` (ANA-2 `:577-578`, blueprint A-8). A human's
+    /// reject reaches here from an `asks_you` node only when it also reads its verdict; any other
+    /// `asks_you` node's reject declines its edges instead (D8, `answer_guarded`).
     async fn rejection(
         &self,
         run: &Run,
@@ -1109,6 +1126,134 @@ where
                 }))
             }
         }
+    }
+
+    /// MOD-138 M2 D6 (plan Q-A), blueprint §2.2: the walk's `Decide` cursor. `winner` is `done`
+    /// and its node's `if` edges are undecided, so every one is evaluated now, once, and the
+    /// answer written to `run_step.branch` as `{"<to>": bool}` under the walk's lease. Every
+    /// later reader, a restarted process or an offline view, reads the row and never decides
+    /// again; `record_branch`'s `Ok(false)` (a replay, or the step moved) writes nothing and the
+    /// walk re-derives from the rows either way.
+    ///
+    /// The facts (D3): the winner's changed paths over its recorded ranges (the ranges `diff`
+    /// reads), by scope name, with the primary repo's name for a bare glob (blueprint F12); its
+    /// `verify_outcome`; the item's `key_prefix` and `required_tags`. The isolator is asked only
+    /// when some predicate needs paths (F13). A decision is never guessed: an isolator error
+    /// writes no `branch` and parks the run (`park_on_resume`: the note ``branch undecided:
+    /// `<node>`: changed paths unavailable: <err>``, run `running -> awaiting_approval`, the item
+    /// unwritten). `Decide` is a resumable park, so `Unblock` resumes the run and this runs again.
+    ///
+    /// A predicate outside the closed set, or an `if` edge with none, is a snapshot no resolve
+    /// wrote (W4 refuses both at save and at resolve), so it is [`EngineError::Snapshot`].
+    async fn decide(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        winner: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let phase = Self::phase_at(run.id, snapshot, winner.position)?;
+        let mut edges = Vec::new();
+        for edge in crate::walk::Graph::of(snapshot).if_edges(&phase.name) {
+            let refused = |reason: String| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "the `if` edge from `{}` to `{}` has no predicate of the closed set: {reason}",
+                    edge.from, edge.to
+                ),
+            };
+            let predicate = edge
+                .predicate
+                .as_ref()
+                .ok_or_else(|| refused("it has none".to_owned()))?;
+            let predicate =
+                IfPredicate::parse(&predicate.0).map_err(|err| refused(err.to_string()))?;
+            edges.push((edge.to.clone(), predicate));
+        }
+        let item = self.item(Self::item_of(run)?).await?;
+        let mut facts = BranchFacts {
+            verify: winner.verify_outcome,
+            item_prefix: item.key_prefix.clone(),
+            item_tags: item.required_tags.clone(),
+            ..BranchFacts::default()
+        };
+        if edges.iter().any(|(_, predicate)| predicate.needs_paths()) {
+            let repos = self.parts.store.repos(run.project_id).await?;
+            let trees = self.parts.store.step_trees(winner.id).await?;
+            let commits = self.parts.store.step_commits(winner.id).await?;
+            let changed = match self.parts.isolator.changed_paths(&trees, &commits).await {
+                Ok(changed) => changed,
+                Err(err) => {
+                    let body = format!(
+                        "branch undecided: `{}`: changed paths unavailable: {err}",
+                        phase.name
+                    );
+                    return Box::pin(self.park_on_resume(run.clone(), item.id, body))
+                        .await
+                        .map(Some);
+                }
+            };
+            // By scope name, as `Self::changed_paths` maps them: a path in a repo outside the
+            // run's scope is dropped.
+            let scoped = |id: &RepoId| {
+                repos
+                    .iter()
+                    .find(|repo| repo.id == *id && run.repo_scope.contains(id))
+            };
+            facts.paths = changed
+                .paths
+                .into_iter()
+                .filter_map(|(id, path)| scoped(&id).map(|repo| (repo.name.clone(), path)))
+                .collect();
+            facts.truncated = changed.truncated;
+            facts.primary = run
+                .repo_scope
+                .iter()
+                .filter_map(scoped)
+                .find(|repo| repo.is_primary)
+                .map(|repo| repo.name.clone());
+        }
+        let branch: serde_json::Map<String, Value> = edges
+            .iter()
+            .map(|(to, predicate)| (to.clone(), Value::Bool(predicate.evaluate(&facts))))
+            .collect();
+        self.parts
+            .store
+            .record_branch(
+                StepFence::Lease(self.parts.owner),
+                winner.id,
+                &Value::Object(branch),
+            )
+            .await?;
+        Ok(None)
+    }
+
+    /// MOD-138 M2 D7, blueprint §2.4: the walk's `Loop` cursor. `source` is `done` + `approved`
+    /// and its back `asks_you` edge to `to` has budget, so one turn of `gate::edge_loop` runs
+    /// over it ([`Self::loop_over`]): budget only (blueprint A5), then the region retired target
+    /// first and source last (A6), so a crash part-way through replays the retirement. An edge
+    /// the snapshot does not carry is a snapshot no walk wrote: [`EngineError::Snapshot`].
+    async fn loop_back(
+        &self,
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        source: &RunStep,
+        to: &str,
+    ) -> Result<Option<Rest>, EngineError> {
+        let phase = Self::phase_at(run, snapshot, source.position)?;
+        let edge = crate::walk::Graph::of(snapshot)
+            .back_asks_you(&phase.name)
+            .find(|edge| edge.to == to)
+            .cloned();
+        let Some(edge) = edge else {
+            return Err(EngineError::Snapshot {
+                run,
+                reason: format!(
+                    "cursor `loop` names no back `asks_you` edge from `{}` to `{to}`",
+                    phase.name
+                ),
+            });
+        };
+        Box::pin(self.loop_over(run, snapshot, source, &edge)).await
     }
 
     /// §6.2's `retry`: supersede the answered step (or leave the failed one) and admit the next
@@ -1627,7 +1772,8 @@ where
     /// nothing written) refuses the accept while the promoted step can still be accepted again,
     /// instead of letting the walk the accept continues `fail_hard` at its next live step.
     /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
-    /// the merge, and the walk from `position + 1`.
+    /// the merge, and the walk from `position + 1`. On a node with an `asks_you` edge the tail is
+    /// `AnswerGate(Skipped)`'s instead (MOD-138 M2 blueprint A2): the accept declines the edges.
     async fn accept_artifact(
         &self,
         run: RunId,
@@ -1748,8 +1894,15 @@ where
         // error) did not, so the lease this command took is released here rather than left to
         // its TTL. The release is owner-guarded, so a second one, or one of a lease another
         // process holds, answers `Ok(false)`. A lost lease is never ours to give back (plan D128).
+        // Blueprint A2 (plan Q-B over D8): on a node with an `asks_you` edge the accept declines
+        // it, as a reject does: `skipped`, and the accepted work lands all the same.
+        let answer = if gate::asks_you(&snapshot, &phase.name) {
+            GateAnswer::Skipped
+        } else {
+            GateAnswer::Approved
+        };
         match self
-            .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
+            .answer_guarded(&run, &snapshot, &row, &phase, answer)
             .await
         {
             Ok(rest) => Ok(CommandOutcome::Accepted { rest }),
@@ -3146,19 +3299,25 @@ where
                         return Ok(rest);
                     }
                 }
-                // MOD-138 M2 T3: placeholders T5 fills (`decide`, `loop_back`). No lifted graph
-                // yields either (the parity oracle in `walk.rs`), and a refusal writes nothing.
-                Cursor::Decide { .. } => {
-                    return Err(EngineError::Snapshot {
-                        run,
-                        reason: "cursor `decide` is not walked yet (MOD-138 M2 T5)".to_owned(),
-                    });
+                // MOD-138 M2 D6, D7: writes the engine owes, which `ready` orders first (blueprint
+                // A6). No lifted graph yields either (the parity oracle in `walk.rs`). Both are
+                // boxed (D12): this frame sits under `settle_failed` and `walk_resumed_from`.
+                Cursor::Decide { step } => {
+                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
+                        continue;
+                    };
+                    if let Some(rest) = Box::pin(self.decide(&row, &snapshot, &step)).await? {
+                        return Ok(rest);
+                    }
                 }
-                Cursor::Loop { .. } => {
-                    return Err(EngineError::Snapshot {
-                        run,
-                        reason: "cursor `loop` is not walked yet (MOD-138 M2 T5)".to_owned(),
-                    });
+                Cursor::Loop { step, to } => {
+                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
+                        continue;
+                    };
+                    if let Some(rest) = Box::pin(self.loop_back(run, &snapshot, &step, &to)).await?
+                    {
+                        return Ok(rest);
+                    }
                 }
             }
         }
