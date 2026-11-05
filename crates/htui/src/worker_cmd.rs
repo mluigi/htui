@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use htui_core::qdrant::QdrantUrl;
-use htui_mcp::search::ConceptSearch;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::secret::{self, DsnSources};
 use htui_store::{PgStore, connect, identity};
@@ -15,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::cli::WorkerArgs;
 use crate::concepts;
-use crate::concepts_worker::{self, KeySource, Unresolved};
+use crate::concepts_worker::{self, KeySource, QdrantCheck, QdrantSource};
 
 /// MOD-158 D4: `--qdrant-key-stdin` was given and its line was blank, or missing. Not "nothing was
 /// read": with `--dsn-stdin` the DSN line before it was (MOD-158 R1, B-L5).
@@ -75,7 +74,7 @@ pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit>
 }
 
 /// [`run`] once logging is up. The signal handlers go in first, and the startup (the DSN and key
-/// reads, the keyring, the connect, the old keyring URL, the search gate's row read) races them:
+/// reads, the keyring, the connect, the old keyring URL, the first read of the URL row) races them:
 /// installing a handler replaces the default termination, so a signal the startup did not watch
 /// would be swallowed until the loop began. A signal during the startup is a clean exit 0, with
 /// nothing written after it.
@@ -115,20 +114,26 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
             log_old_keyring_url(old);
         }
     }
-    // MOD-158 D7 (Q3): `search_concepts` is offered when a URL resolves now, at start.
-    let gate = tokio::select! {
+    // MOD-160 D5: one awaited read of the URL row, so the first session knows whether
+    // `search_concepts` is offered; the source caches it, and later reads refresh it.
+    tokio::select! {
         biased;
         () = &mut shutdown => return stopped_before_ready(),
-        url = qdrant.source().url() => url,
-    };
+        _ = qdrant.source().url() => {}
+    }
     // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
     // the pool, never the runtime.
     let index_job = concepts::spawn_index_job(pg.clone());
+    // MOD-160 D9: one model-free look at Qdrant, said once; never awaited, so a Qdrant that does
+    // not answer never delays "htui worker ready".
+    let start_check = tokio::spawn(start_check(Arc::clone(qdrant.source())));
     // MOD-11 D11: a worker that cannot host tools would fail every document phase, so it is
     // refused before it claims anything.
     let tools = htui_mcp::McpHost::new(pg.clone())
         .map_err(|err| WorkerExit::Refused(format!("htui's MCP tools cannot be hosted: {err}")))?;
-    let tools = match worker_search(&gate) {
+    // MOD-160 D5: attached always, as in the TUI; the cached offer decides per session, so a URL
+    // set after start is offered without a restart (supersedes MOD-158 D7, Q3).
+    let tools = match crate::mcp_search::production() {
         Some(search) => tools.with_search(search),
         None => tools,
     };
@@ -140,23 +145,36 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     index_job.abort();
+    start_check.abort();
     tracing::info!("htui worker stopped");
     Ok(())
 }
 
-/// The worker's `search_concepts` index (MOD-11 D12, blueprint B-14, MOD-158 D7): `Some` exactly
-/// when a Qdrant URL resolved at worker start (`gate`, Q3), so the sessions search what this
-/// worker's index job keeps current; `None` leaves the tool unadvertised, with one `info` line
-/// saying why. The adapter resolves the URL and key per search, as the TUI's does, and searches
-/// with the model the index job loaded: both take it from `concepts_worker::shared_qdrant` (H-26).
-fn worker_search(gate: &Result<QdrantUrl, Unresolved>) -> Option<Arc<dyn ConceptSearch>> {
-    match gate {
-        Ok(_) => crate::mcp_search::production(),
-        Err(why) => {
-            tracing::info!("search_concepts is not offered: {why}");
-            None
-        }
+/// MOD-160 D9: the worker's start check of `source`'s Qdrant, logged once by [`start_line`].
+async fn start_check(source: Arc<QdrantSource>) {
+    let check = concepts_worker::check_qdrant(&source, htui_store::vector::COLLECTION).await;
+    match start_line(check.as_ref()) {
+        Some((tracing::Level::WARN, line)) => tracing::warn!("{line}"),
+        Some((_, line)) => tracing::info!("{line}"),
+        None => {}
     }
+}
+
+/// MOD-160 D9: the start line for `check`. A warning state is a `warn` line,
+/// `knowledge search unavailable: <state>: <cause>`; a Qdrant that answers without a key is an
+/// `info` line; anything else says nothing. Never an `error`: an `error` line becomes a GlitchTip
+/// report (`docs/htui-worker.md`), and the worker starts either way.
+fn start_line(check: Option<&QdrantCheck>) -> Option<(tracing::Level, String)> {
+    let check = check?;
+    if let Some(warning) = check.warning() {
+        return Some((
+            tracing::Level::WARN,
+            htui_core::qdrant::unavailable(&warning),
+        ));
+    }
+    check
+        .info()
+        .map(|info| (tracing::Level::INFO, info.to_owned()))
 }
 
 /// MOD-158 D10: the keyring's old `qdrant-url`, when there is one, is said once at `info`. A URL
@@ -345,11 +363,11 @@ fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'stati
 mod tests {
     use std::io::Cursor;
 
-    use htui_core::qdrant::QdrantUrl;
     use htui_store::secret;
+    use tracing::Level;
 
-    use super::{WorkerExit, read_startup_secrets_from, worker_search};
-    use crate::concepts_worker::Unresolved;
+    use super::{WorkerExit, read_startup_secrets_from, start_line};
+    use crate::concepts_worker::QdrantCheck;
 
     /// Plan D14: a startup refusal exits 2, a failure after start exits 1.
     #[test]
@@ -358,14 +376,30 @@ mod tests {
         assert_eq!(WorkerExit::Failed("lost".to_owned()).code(), 1);
     }
 
-    /// MOD-11 D12, B-14, MOD-158 D7 (Q3): the worker offers `search_concepts` only where a Qdrant
-    /// URL resolved at its start.
+    /// MOD-160 D9: the start line warns on each warning state and informs on a keyless Qdrant,
+    /// with the sentence first; it is never an `error`, which would become a GlitchTip report.
     #[test]
-    fn the_worker_offers_search_only_where_a_url_resolves_at_start() {
-        let url = QdrantUrl::parse("http://qdrant:6334").expect("a valid URL");
-        assert!(worker_search(&Ok(url)).is_some());
-        assert!(worker_search(&Err(Unresolved::NoUrl)).is_none());
-        assert!(worker_search(&Err(Unresolved::Offline)).is_none());
+    fn the_start_line_warns_or_informs_and_never_errors() {
+        for check in [
+            QdrantCheck::NotConfigured("no Qdrant URL is set".to_owned()),
+            QdrantCheck::Unavailable("cannot reach Qdrant".to_owned()),
+            QdrantCheck::KeyRefused("qdrant: access refused".to_owned()),
+            QdrantCheck::NoKey("qdrant: access refused".to_owned()),
+        ] {
+            let (level, line) = start_line(Some(&check)).expect("a warning");
+            assert_eq!(level, Level::WARN, "{check:?}");
+            let warning = check.warning().expect("a warning state");
+            assert_eq!(line, format!("knowledge search unavailable: {warning}"));
+        }
+        assert_eq!(
+            start_line(Some(&QdrantCheck::Keyless)),
+            Some((
+                Level::INFO,
+                "this Qdrant answers without an API key".to_owned()
+            ))
+        );
+        assert_eq!(start_line(Some(&QdrantCheck::Ready)), None);
+        assert_eq!(start_line(None), None, "nothing probed: offline");
     }
 
     /// The secrets `--dsn-stdin` and `--qdrant-key-stdin` read, in that order, with no prompt.

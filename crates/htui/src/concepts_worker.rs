@@ -23,7 +23,7 @@ use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::secret::{KeyHost, QdrantEnv, QdrantKeyError};
 use htui_store::vector::{
-    COLLECTION, ExistingCollection, Hit, QdrantStore, SearchQuery, VectorStore as _,
+    self, COLLECTION, ExistingCollection, Hit, Probe, QdrantStore, SearchQuery, VectorStore as _,
 };
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{Backend, PgStore, secret};
@@ -882,6 +882,104 @@ pub fn shared_index() -> Arc<dyn ConceptIndex> {
 pub fn shared_qdrant() -> Arc<QdrantIndex> {
     static SHARED: OnceLock<Arc<QdrantIndex>> = OnceLock::new();
     Arc::clone(SHARED.get_or_init(|| Arc::new(QdrantIndex::new())))
+}
+
+/// MOD-160 D9: what one model-free look at this process's Qdrant says. The worker's start line
+/// (and, with MOD-160 T4, Settings › Qdrant and the TUI's launch notice) all read it, so every
+/// surface says the same states in the same words. No variant carries the API key: each sentence is
+/// an [`Unresolved`] sentence or a [`Probe`]'s, and neither ever holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QdrantCheck {
+    /// No URL, or an unusable one: [`Unresolved`]'s sentence.
+    NotConfigured(String),
+    /// Unreachable, an embedder mismatch, the row or the key unreadable: the sentence.
+    Unavailable(String),
+    /// Refused while this box has a key: the sentence.
+    KeyRefused(String),
+    /// Refused, and no key from any source.
+    NoKey(String),
+    /// Answered without any key (Q4): an info line, not a warning.
+    Keyless,
+    /// Answered with a key, or nothing to say.
+    Ready,
+}
+
+impl QdrantCheck {
+    /// The verdict on `resolved` settings and the `probe` made with them: `None` when nothing was
+    /// probed (offline, or no probe). An empty Qdrant (`NoCollection`) is no warning: the index is
+    /// built by the next sync.
+    pub(crate) fn of(
+        resolved: Result<&QdrantSettings, &Unresolved>,
+        probe: Option<&Probe>,
+    ) -> Option<Self> {
+        let settings = match resolved {
+            Err(why @ (Unresolved::NoUrl | Unresolved::Unusable(_))) => {
+                return Some(Self::NotConfigured(why.sentence()));
+            }
+            Err(Unresolved::Offline) => return None,
+            Err(why @ (Unresolved::Read(_) | Unresolved::Key(_))) => {
+                return Some(Self::Unavailable(why.sentence()));
+            }
+            Ok(settings) => settings,
+        };
+        let keyed = settings.api_key.is_some();
+        Some(match probe? {
+            Probe::Ready | Probe::NoCollection if keyed => Self::Ready,
+            Probe::Ready | Probe::NoCollection => Self::Keyless,
+            Probe::Unreachable(sentence) | Probe::Mismatch(sentence) => {
+                Self::Unavailable(sentence.clone())
+            }
+            Probe::Refused(sentence) if keyed => Self::KeyRefused(sentence.clone()),
+            Probe::Refused(sentence) => Self::NoKey(sentence.clone()),
+        })
+    }
+
+    /// The warning state in words; `None` for [`Self::Keyless`] and [`Self::Ready`].
+    #[must_use]
+    pub const fn state(&self) -> Option<&'static str> {
+        match self {
+            Self::NotConfigured(_) => Some("no Qdrant is configured"),
+            Self::Unavailable(_) => Some("Qdrant is unreachable or refuses the collection"),
+            Self::KeyRefused(_) => Some("the Qdrant refused this box's API key"),
+            Self::NoKey(_) => Some("this box lacks the Qdrant API key"),
+            Self::Keyless | Self::Ready => None,
+        }
+    }
+
+    /// `"{state}: {cause}"` for the four warnings; `None` for [`Self::Keyless`] and
+    /// [`Self::Ready`].
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        let (Self::NotConfigured(cause)
+        | Self::Unavailable(cause)
+        | Self::KeyRefused(cause)
+        | Self::NoKey(cause)) = self
+        else {
+            return None;
+        };
+        self.state().map(|state| format!("{state}: {cause}"))
+    }
+
+    /// The info line (Q4), for [`Self::Keyless`] only.
+    #[must_use]
+    pub const fn info(&self) -> Option<&'static str> {
+        match self {
+            Self::Keyless => Some("this Qdrant answers without an API key"),
+            _ => None,
+        }
+    }
+}
+
+/// MOD-160 D9: `source`'s settings, then [`vector::probe`] of `collection` when they resolve. Loads
+/// no model, creates nothing, and is bounded by `vector::PROBE_TIMEOUT`. `None` when nothing was
+/// probed (offline).
+pub(crate) async fn check_qdrant(source: &QdrantSource, collection: &str) -> Option<QdrantCheck> {
+    let resolved = source.settings().await;
+    let probe = match &resolved {
+        Ok(settings) => Some(vector::probe(settings, collection).await),
+        Err(_) => None,
+    };
+    QdrantCheck::of(resolved.as_ref(), probe.as_ref())
 }
 
 /// A [`ConceptIndex`] over `MemVectorStore` (D230): ranks by shared terms, needs no model. It can be
@@ -2296,6 +2394,131 @@ mod tests {
         let why = searched.expect_err("another embedder's collection");
         assert!(why.contains(htui_store::vector::EMBEDDER_MISMATCH), "{why}");
         assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+    }
+
+    /// MOD-160 D9: every warning state, the info line, and what says nothing.
+    #[test]
+    fn qdrant_check_names_each_state() {
+        let keyless = settings("http://qdrant:6334", None);
+        let keyed = settings("http://qdrant:6334", Some("key"));
+        let unusable = Unresolved::Unusable("the `qdrant_url` setting is not a usable URL".into());
+        let read = Unresolved::Read(StoreError::Unreachable("refused".into()));
+        let key = Unresolved::Key(QdrantKeyError::Keyring("no Secret Service".into()));
+        let check = QdrantCheck::of;
+
+        assert_eq!(
+            check(Err(&Unresolved::NoUrl), None),
+            Some(QdrantCheck::NotConfigured(
+                concepts::NO_QDRANT_URL.to_owned()
+            ))
+        );
+        assert_eq!(
+            check(Err(&unusable), None),
+            Some(QdrantCheck::NotConfigured(unusable.sentence()))
+        );
+        assert_eq!(
+            check(Err(&Unresolved::Offline), None),
+            None,
+            "nothing probed"
+        );
+        for why in [&read, &key] {
+            assert_eq!(
+                check(Err(why), None),
+                Some(QdrantCheck::Unavailable(why.sentence()))
+            );
+        }
+
+        for probe in [Probe::Ready, Probe::NoCollection] {
+            assert_eq!(
+                check(Ok(&keyless), Some(&probe)),
+                Some(QdrantCheck::Keyless)
+            );
+            assert_eq!(check(Ok(&keyed), Some(&probe)), Some(QdrantCheck::Ready));
+        }
+        for probe in [
+            Probe::Unreachable("cannot reach".into()),
+            Probe::Mismatch("qdrant: embedder mismatch: other".into()),
+        ] {
+            let (Probe::Unreachable(sentence) | Probe::Mismatch(sentence)) = &probe else {
+                unreachable!()
+            };
+            for settings in [&keyless, &keyed] {
+                assert_eq!(
+                    check(Ok(settings), Some(&probe)),
+                    Some(QdrantCheck::Unavailable(sentence.clone()))
+                );
+            }
+        }
+        let refused = Probe::Refused("qdrant: access refused".into());
+        assert_eq!(
+            check(Ok(&keyed), Some(&refused)),
+            Some(QdrantCheck::KeyRefused("qdrant: access refused".into()))
+        );
+        assert_eq!(
+            check(Ok(&keyless), Some(&refused)),
+            Some(QdrantCheck::NoKey("qdrant: access refused".into()))
+        );
+        assert_eq!(check(Ok(&keyed), None), None, "nothing probed");
+
+        let cases = [
+            (
+                QdrantCheck::NotConfigured("why".into()),
+                "no Qdrant is configured",
+            ),
+            (
+                QdrantCheck::Unavailable("why".into()),
+                "Qdrant is unreachable or refuses the collection",
+            ),
+            (
+                QdrantCheck::KeyRefused("why".into()),
+                "the Qdrant refused this box's API key",
+            ),
+            (
+                QdrantCheck::NoKey("why".into()),
+                "this box lacks the Qdrant API key",
+            ),
+        ];
+        for (check, state) in cases {
+            assert_eq!(check.state(), Some(state), "{check:?}");
+            assert_eq!(check.warning(), Some(format!("{state}: why")), "{check:?}");
+            assert_eq!(check.info(), None, "{check:?}");
+        }
+        assert_eq!(
+            QdrantCheck::Keyless.info(),
+            Some("this Qdrant answers without an API key")
+        );
+        for quiet in [QdrantCheck::Keyless, QdrantCheck::Ready] {
+            assert_eq!(quiet.state(), None, "{quiet:?}");
+            assert_eq!(quiet.warning(), None, "{quiet:?}");
+        }
+        assert_eq!(QdrantCheck::Ready.info(), None);
+    }
+
+    /// MOD-160 D9: a check of a Qdrant that is down says so, and never says the key.
+    #[tokio::test]
+    async fn a_check_never_says_the_key() {
+        let source = source(Some("http://127.0.0.1:1"), Some("KEY-SENTINEL"), no_key);
+        let check = check_qdrant(&source, COLLECTION)
+            .await
+            .expect("settings resolve, so Qdrant is probed");
+        assert!(matches!(check, QdrantCheck::Unavailable(_)), "{check:?}");
+        let said = [
+            format!("{check:?}"),
+            check.warning().unwrap_or_default(),
+            check.state().unwrap_or_default().to_owned(),
+        ];
+        for line in said {
+            assert!(!line.contains("KEY-SENTINEL"), "{line}");
+        }
+        assert!(
+            check_qdrant(&source_offline(), COLLECTION).await.is_none(),
+            "offline: nothing probed"
+        );
+    }
+
+    /// No override, nothing published: offline.
+    fn source_offline() -> QdrantSource {
+        source(None, None, no_key)
     }
 
     /// MOD-11 T7, H-26: the TUI's concepts runtime and the MCP adapter search one index, so the

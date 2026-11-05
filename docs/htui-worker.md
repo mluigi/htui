@@ -242,10 +242,13 @@ in [`docs/htui-mcp.md`](htui-mcp.md).
   cannot be created or is not private leaves the worker running and fails each step with
   `agent spawn failed: htui's MCP listener could not start: …`. Under the systemd unit, check that
   `/tmp` is writable.
-- **`search_concepts`** is offered only when a Qdrant URL was set when the worker started: the
-  database-wide setting (**Settings › Qdrant** or `htui --set-qdrant-url`), or `HTUI_QDRANT_URL`
-  (see [The concepts index](#the-concepts-index)). A URL set later is indexed into at the next
-  sync, but the tool is offered from the worker's next start.
+- **`search_concepts`** is offered to each session that opens while a Qdrant URL is configured:
+  the database-wide setting (**Settings › Qdrant** or `htui --set-qdrant-url`), or
+  `HTUI_QDRANT_URL` (see [The concepts index](#the-concepts-index)). The worker reads the setting
+  once at start and again in the background, at most every 30 seconds while sessions open, so a URL
+  set or cleared later applies to the next sessions without a restart. A session keeps what it was
+  offered. While Qdrant is down the tool stays offered, and a call answers
+  `knowledge search unavailable: <cause>`; a project not indexed yet answers no hits.
 - **`command_run`** runs on this box, as the worker's user and with the worker's environment, in
   the box's command queue, which the worker shares with a TUI on the same box. A worker killed
   mid-command holds its slot until the next command of that class asks, 30 seconds later at the
@@ -461,6 +464,8 @@ read again after every sync; without it, or with any other value, the interval i
   exactly as for `--index-items`; runs never wait for it.
 - A Qdrant that does not answer, a model that does not load or a sync that fails is a `warn` line,
   and the next interval tries again. None of it touches runs.
+- **At start the worker looks at Qdrant once**, without the model and without creating anything,
+  and says what it found in one line (see [Logs](#logs)).
 - The sync shares the worker's pool, one query at a time, and is stopped on shutdown.
 
 ## Logs
@@ -472,6 +477,21 @@ read again after every sync; without it, or with any other value, the interval i
 - **`--log` goes after `worker`:** `htui worker --log PATH` works, `htui --log PATH worker` is
   refused. `HTUI_LOG` works either way. Beside `worker`, no flag of the TUI may be given
   (`htui --demo worker` is refused).
+- **Knowledge search at start.** Shortly after `htui worker ready`, the worker logs one line about
+  its Qdrant. It starts and runs either way: only knowledge search (`search_concepts`, the index)
+  is affected. The line is a `warn`, never an `error`, so it is no GlitchTip report:
+  - `knowledge search unavailable: no Qdrant is configured: …`: no URL is set, or the one set is
+    not usable. Set one in **Settings › Qdrant** or with `htui --set-qdrant-url`.
+  - `knowledge search unavailable: Qdrant is unreachable or refuses the collection: …`: Qdrant did
+    not answer within 3 seconds, the URL setting or the key could not be read, or the collection was
+    written by another embedding model.
+  - `knowledge search unavailable: the Qdrant refused this box's API key: …`: a key was found and
+    Qdrant refused it; give the worker the right one ([sources](#where-the-qdrant-api-key-comes-from)).
+  - `knowledge search unavailable: this box lacks the Qdrant API key: …`: Qdrant wants a key and the
+    worker found none.
+  - At `info`, `this Qdrant answers without an API key`: it works; consider protecting it with one.
+
+  Nothing is said when Postgres is not connected, or when Qdrant answers with a key.
 
 ## Exit codes
 
