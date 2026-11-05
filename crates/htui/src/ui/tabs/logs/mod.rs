@@ -13,6 +13,7 @@
 //! the newest line and follows again, as `chat.bottom` does; `logs.follow` toggles following.
 
 use core::cell::Cell;
+use core::fmt;
 use std::collections::VecDeque;
 
 use crossterm::event::KeyEvent;
@@ -82,7 +83,6 @@ enum Scroll {
 }
 
 /// The Logs tab (MOD-122 D4).
-#[derive(Debug)]
 pub struct LogsTab {
     /// The process's log; the tab only copies from it.
     buffer: LogBuffer,
@@ -100,6 +100,19 @@ pub struct LogsTab {
     scroll: Scroll,
     /// The lines pane's rows as last drawn, so a step knows the page.
     height: Cell<usize>,
+}
+
+impl fmt::Debug for LogsTab {
+    /// The state, never the lines (as [`LogBuffer`]'s own).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LogsTab")
+            .field("lines", &self.lines.len())
+            .field("next", &self.next)
+            .field("selected", &self.selected)
+            .field("min_level", &self.min_level)
+            .field("scroll", &self.scroll)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LogsTab {
