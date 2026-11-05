@@ -3568,7 +3568,8 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
 /// [`WriteStore::park_step`] (MOD-37 R-5), [`WriteStore::write_step_document`],
 /// [`WriteStore::add_step_note`], [`WriteStore::propose_link`] and [`WriteStore::withdraw_link`]
-/// (MOD-11 plan D13) take one and write only while the step's run carries
+/// (MOD-11 plan D13), and [`WriteStore::record_branch`] (MOD-138 M2 D5) take one and write only
+/// while the step's run carries
 /// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
 /// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
 /// still holds its old `Lease`, and the store answers it with
