@@ -100,6 +100,8 @@ pub enum Context {
     SettingsQueue,
     /// `[settings.project_types]`: the Project types section (no own action; list moves only).
     SettingsProjectTypes,
+    /// `[settings.logging]`: the Logging section (no own action; overrides only; MOD-122 B1).
+    SettingsLogging,
     /// `[concepts]`: the concepts search overlay.
     Concepts,
     /// `[switcher]`: the workspace switcher overlay.
@@ -146,6 +148,8 @@ pub enum Context {
     BacklogItem,
     /// `[chat]`: the Chat tab (live, parked, ended, replay).
     Chat,
+    /// `[logs]`: the Logs tab (MOD-122 B1).
+    Logs,
     /// `[queue]`: the queue overlay (MOD-67 M6 D2).
     Queue,
     /// `[picker]`: the directory picker a Settings section opens (MOD-67 M6 D3; today
@@ -192,6 +196,7 @@ impl Context {
         Self::SettingsSecrets,
         Self::SettingsQueue,
         Self::SettingsProjectTypes,
+        Self::SettingsLogging,
         Self::Concepts,
         Self::Switcher,
         Self::Migration,
@@ -213,6 +218,7 @@ impl Context {
         Self::BacklogFilter,
         Self::BacklogItem,
         Self::Chat,
+        Self::Logs,
         Self::Queue,
         Self::Picker,
         Self::Layout,
@@ -247,6 +253,7 @@ impl Context {
             Self::SettingsSecrets => "settings.secrets",
             Self::SettingsQueue => "settings.queue",
             Self::SettingsProjectTypes => "settings.project_types",
+            Self::SettingsLogging => "settings.logging",
             Self::Concepts => "concepts",
             Self::Switcher => "switcher",
             Self::Migration => "migration",
@@ -268,6 +275,7 @@ impl Context {
             Self::BacklogFilter => "backlog.filter_form",
             Self::BacklogItem => "backlog.item",
             Self::Chat => "chat",
+            Self::Logs => "logs",
             Self::Queue => "queue",
             Self::Picker => "picker",
             Self::Layout => "layout",
@@ -304,6 +312,7 @@ impl Context {
             Self::SettingsSecrets => "Secrets",
             Self::SettingsQueue => "Queue",
             Self::SettingsProjectTypes => "Project types",
+            Self::SettingsLogging => "Logging",
             Self::Concepts => "Search concepts",
             Self::Switcher => "Workspaces",
             Self::Migration => "Schema",
@@ -325,6 +334,7 @@ impl Context {
             Self::BacklogFilter => "Filter",
             Self::BacklogItem => "Item",
             Self::Chat => "Chat",
+            Self::Logs => "Logs",
             Self::Queue => "Queue",
             Self::Picker => "Picker",
             Self::Layout => "Layout",
@@ -337,7 +347,7 @@ impl Context {
     }
 
     /// A view's own context (a Settings section, an overlay, a Skills view or pane, the
-    /// Requirements tab, a Backlog sub-tab or form, the Chat tab, the queue overlay, the
+    /// Requirements tab, a Backlog sub-tab or form, the Chat and Logs tabs, the queue overlay, the
     /// directory picker): hosts view verbs, D10
     /// overrides and [`VIEW_DEFAULTS`]; skipped by the validator's per-context pass (MOD-67 M3
     /// PA-4).
@@ -356,6 +366,7 @@ impl Context {
                 | Self::SettingsSecrets
                 | Self::SettingsQueue
                 | Self::SettingsProjectTypes
+                | Self::SettingsLogging
                 | Self::Concepts
                 | Self::Switcher
                 | Self::Migration
@@ -375,6 +386,7 @@ impl Context {
                 | Self::BacklogFilter
                 | Self::BacklogItem
                 | Self::Chat
+                | Self::Logs
                 | Self::Queue
                 | Self::Picker
                 | Self::Leave
@@ -2369,41 +2381,43 @@ mod tests {
             Context::SettingsSecrets => 17,
             Context::SettingsQueue => 18,
             Context::SettingsProjectTypes => 19,
-            Context::Concepts => 20,
-            Context::Switcher => 21,
-            Context::Migration => 22,
-            Context::Waiting => 23,
-            Context::Skills => 24,
-            Context::SkillsLibrary => 25,
-            Context::SkillsTemplates => 26,
-            Context::SkillsAttach => 27,
-            Context::SkillsHelp => 28,
-            Context::Requirements => 29,
-            Context::Backlog => 30,
-            Context::BacklogBody => 31,
-            Context::BacklogRuns => 32,
-            Context::BacklogGraph => 33,
-            Context::BacklogDocs => 34,
-            Context::BacklogNotes => 35,
-            Context::BacklogPrompt => 36,
-            Context::BacklogReqs => 37,
-            Context::BacklogFilter => 38,
-            Context::BacklogItem => 39,
-            Context::Chat => 40,
-            Context::Queue => 41,
-            Context::Picker => 42,
-            Context::Layout => 43,
-            Context::History => 44,
-            Context::Leave => 45,
-            Context::Field => 46,
-            Context::Choice => 47,
-            Context::Answer => 48,
+            Context::SettingsLogging => 20,
+            Context::Concepts => 21,
+            Context::Switcher => 22,
+            Context::Migration => 23,
+            Context::Waiting => 24,
+            Context::Skills => 25,
+            Context::SkillsLibrary => 26,
+            Context::SkillsTemplates => 27,
+            Context::SkillsAttach => 28,
+            Context::SkillsHelp => 29,
+            Context::Requirements => 30,
+            Context::Backlog => 31,
+            Context::BacklogBody => 32,
+            Context::BacklogRuns => 33,
+            Context::BacklogGraph => 34,
+            Context::BacklogDocs => 35,
+            Context::BacklogNotes => 36,
+            Context::BacklogPrompt => 37,
+            Context::BacklogReqs => 38,
+            Context::BacklogFilter => 39,
+            Context::BacklogItem => 40,
+            Context::Chat => 41,
+            Context::Logs => 42,
+            Context::Queue => 43,
+            Context::Picker => 44,
+            Context::Layout => 45,
+            Context::History => 46,
+            Context::Leave => 47,
+            Context::Field => 48,
+            Context::Choice => 49,
+            Context::Answer => 50,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 49);
+        assert_eq!(Context::ALL.len(), 51);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -3219,6 +3233,7 @@ mod tests {
                 "settings.project_types",
                 "Project types",
             ),
+            (Context::SettingsLogging, "settings.logging", "Logging"),
             (Context::Concepts, "concepts", "Search concepts"),
             (Context::Switcher, "switcher", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
@@ -3240,6 +3255,7 @@ mod tests {
             (Context::BacklogFilter, "backlog.filter_form", "Filter"),
             (Context::BacklogItem, "backlog.item", "Item"),
             (Context::Chat, "chat", "Chat"),
+            (Context::Logs, "logs", "Logs"),
             (Context::Queue, "queue", "Queue"),
             (Context::Picker, "picker", "Picker"),
             (Context::Layout, "layout", "Layout"),
@@ -3265,6 +3281,8 @@ mod tests {
         assert!(
             Context::SettingsProjectTypes.is_view() && !Context::SettingsProjectTypes.is_shared()
         );
+        // MOD-122 B1: the Logging section is a view, as every section is.
+        assert!(Context::SettingsLogging.is_view() && !Context::SettingsLogging.is_shared());
         // MOD-67 M4 §3.1: `skills` is shared (Library and Templates inherit it), the rest views.
         assert!(Context::Skills.is_shared() && !Context::Skills.is_view());
         for context in [
@@ -3289,6 +3307,8 @@ mod tests {
             Context::BacklogFilter,
             Context::BacklogItem,
             Context::Chat,
+            // MOD-122 B1: the Logs tab's own context.
+            Context::Logs,
         ] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
         }
