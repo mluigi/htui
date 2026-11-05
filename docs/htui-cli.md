@@ -53,7 +53,8 @@ Claude Code session.
   `rejected`, and their documents.
 - **`--limit <N>`** (search only) is how many hits to return, 1 to 1000. The default is 10.
 - **`--log <PATH>`** appends logs to a file. It goes after `status` or `waiting`
-  (`htui status --log x.log`). `HTUI_LOG` works too.
+  (`htui status --log x.log`). `HTUI_LOG` works too. The TUI also keeps its log in memory and
+  **Settings › Logging** can set a file; neither applies to these commands.
 
 `status` and `waiting` are subcommands, so no TUI flag may stand beside them: `htui --demo status`
 and `htui --offline waiting` are usage errors. `--json`, `--cwd`, `--decisions` and `--limit` at
