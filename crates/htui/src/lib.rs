@@ -74,7 +74,9 @@ use crate::ui::state_file::UiStore;
 /// Runs the whole application, terminal included.
 ///
 /// Startup order (blueprint D.4), and it matters: logging (always captured in memory for the Logs
-/// tab, MOD-122), then the two keyring flags — which exit
+/// tab, MOD-122, with the saved settings of `ui-state.toml`'s `[logging]` applied at once, so a
+/// saved log file holds every later line, the verbs' below included), then the two keyring flags —
+/// which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the four Qdrant flags (MOD-158 D8: the URL setting and this box's API key),
 /// which act the same way, then the two concepts-index flags (MOD-34), which also print to the
@@ -116,6 +118,19 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     // time, and Sentry only on a startup `--log`, exactly as before. After the `mcp`/`worker`
     // returns, which install their own (or none), and before anything that logs.
     let logging = logging::init(logging::Startup::from_env(args.log.as_deref()))?;
+    // MOD-122 D5: the UI state from `ui-state.toml` in the config root, read right after the
+    // subscriber, so the saved logging settings apply before anything else logs (R1): the saved
+    // file and filter see the backend start, the MCP host and the store worker too. `--log`/
+    // `HTUI_LOG` and `HTUI_LOG_FILTER` keep theirs for this session; one that cannot apply is a
+    // notice. A file that cannot be used starts from the defaults and says why in the header
+    // (MOD-115 M2 D1). No config directory: every launch is the first and nothing is saved.
+    let ui_store = identity::config_root_path()
+        .ok()
+        .map_or(UiStore::Nowhere, |root| {
+            UiStore::File(root.join(ui::state_file::FILE_NAME))
+        });
+    let loaded = ui_store.load();
+    let logging_notice = logging.control().apply_saved(loaded.state.logging.as_ref());
 
     if let Some(cli::Command::Provision(provision)) = args.command.clone() {
         // MOD-45 D307: after `logging::init`, so `--log` works the ordinary way.
@@ -262,21 +277,8 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     // MOD-67 M2 D5: before `register_all`, so every `Ctx` the shell builds carries the file's keys.
     app.keys = keys;
-    // MOD-115 M2 D1: the UI state from `ui-state.toml` in the config root, before the tabs are
-    // registered; a file that cannot be used starts from the defaults and says why in the header.
-    // No config directory: every launch is the first and nothing is saved.
-    let ui_store = identity::config_root_path()
-        .ok()
-        .map_or(UiStore::Nowhere, |root| {
-            UiStore::File(root.join(ui::state_file::FILE_NAME))
-        });
-    let loaded = ui_store.load();
-    // MOD-122 D5: the saved logging settings, once `ui-state.toml` is read; `--log`/`HTUI_LOG` and
-    // `HTUI_LOG_FILTER` keep theirs for this session. One that cannot apply is a notice.
-    let logging_notice = app
-        .logging
-        .control()
-        .apply_saved(loaded.state.logging.as_ref());
+    // MOD-115 M2 D1: the UI state read after `logging::init`, applied before the tabs are
+    // registered.
     app.apply_ui_state(loaded.state);
     // RV2 H1: saved through a latest-wins writer thread, so no write or fsync runs on the loop.
     app.ui_store = ui_store.background();
@@ -469,8 +471,10 @@ mod tests {
     }
 
     /// MOD-122 D1, D5, D7: `run` installs the one subscriber before anything else that can log
-    /// (the key file included), hands it to the shell before the tabs are registered, and applies
-    /// the saved logging settings once `ui-state.toml` is read, before the UI state is taken.
+    /// (the key file included), applies the saved logging settings right after it (R1), so the
+    /// saved file and filter see every line from the backend's start on, and hands it to the
+    /// shell before the tabs are registered. The UI state is applied where it was, and the
+    /// file's own notice still wins the status line over a logging one.
     #[test]
     fn run_installs_logging_first_and_applies_saved_settings_before_the_tabs() {
         let file = include_str!("lib.rs");
@@ -479,11 +483,20 @@ mod tests {
             code.find(needle)
                 .unwrap_or_else(|| panic!("`{needle}` is in `run`"))
         };
-        assert!(at("logging::init(") < at("cli::Command::Provision"));
-        assert!(at("logging::init(") < at("keys::resolve("));
-        assert!(at("app.logging = logging;") < at("app::register_all(&mut app)"));
+        assert!(at("logging::init(") < at("ui_store.load()"));
         assert!(at("ui_store.load()") < at("apply_saved("));
-        assert!(at("apply_saved(") < at("app.apply_ui_state("));
+        for later in [
+            "cli::Command::Provision",
+            "keys::resolve(",
+            "connect::start(",
+            "htui_mcp::McpHost::new(",
+            "store_worker::spawn_hosted(",
+        ] {
+            assert!(at("apply_saved(") < at(later), "{later}");
+        }
+        assert!(at("app.logging = logging;") < at("app::register_all(&mut app)"));
+        assert!(at("app.apply_ui_state(loaded.state)") < at("app::register_all(&mut app)"));
+        assert!(code.contains("app.status = loaded.notice.or(logging_notice);"));
         assert!(!code.contains("init_tracing"), "the old installer is gone");
     }
 
