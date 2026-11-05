@@ -8,7 +8,17 @@
 **Complexity**: Large. The walk itself changes, so every engine path is affected. Adds one store verb,
 one migration and one cache migration. Linear graphs must walk exactly as before.
 **Routing**: PRD path (continuing), ultracode for implement and review (maintainer, 2026-11-05).
-**Status**: CONFIRMED 2026-11-05 (maintainer). Blueprint next (`code-architect`).
+**Status**: CONFIRMED 2026-11-05 (maintainer). Blueprint `.claude/plans/mod-138-m2-readiness-walker.blueprint.md`
+(findings F1-F23). Blueprint amendments **A1-A9 accepted by the maintainer 2026-11-05**, binding over the text below:
+A1 T1 owns the `run_step.branch` column end to end (migrations `0025`/`0008`, the three `query_as!(RunStep)`
+statements, mirror read and sync, `.sqlx`, migration pins); T2 keeps only `record_branch`. A2 accept-artifact on an
+`asks_you` node answers `Skipped` (declines). A3 a human reject's precedence: `changes_requested` loop > `asks_you`
+decline > `fails` loop > end the run. A4 `no_loop_target` also when the loop target has no row. A5 a back `asks_you`
+loop is bounded by budget alone (no no-progress test). A6 `Decide`/`Loop` sort before node cursors; `edge_loop`
+retires target first, source last. A7 resolve refuses a fan-out node with an `asks_you` or `fails` out-edge
+(`NotRunnable::FanOutEdge`). A8 three tests lose their subject and are rewritten (`review_loop.rs`'s Q-D case,
+`gate.rs` `the_loop_target_is_the_named_implement_phase`, `graph.rs` `non_default_edges_are_refused`). A9 the spent
+`asks_you` escalation does not block the item. Pins after M2: orch `CASES` 139, store 233.
 
 ## Summary
 
