@@ -304,7 +304,9 @@ pub enum Escalation {
         /// The item's latest note (the fan-out's selection note).
         note: Option<String>,
     },
-    /// The review loop gave up: item `blocked`, run `awaiting_approval`.
+    /// A graph loop gave up: item `blocked`, run `awaiting_approval`. Shown as `loop exhausted`:
+    /// since MOD-138 M2 a spent `fails` loop blocks too, so the word is kind-neutral (R1, E2);
+    /// the variant keeps its name.
     ReviewLoopExhausted {
         /// The parked run.
         run: RunId,
@@ -447,7 +449,8 @@ pub struct QueueOverview {
 ///    elsewhere is [`EntryState::Elsewhere`]; a live run beats everything below;
 /// 3. an item whose state is `failed` (MOD-144: latest graph run `failed`) is
 ///    [`Escalation::Failed`];
-/// 4. a `blocked` item whose latest run is parked is [`Escalation::ReviewLoopExhausted`],
+/// 4. a `blocked` item whose latest run is parked is [`Escalation::ReviewLoopExhausted`] (any
+///    graph loop that gave up, `changes_requested` or `fails`: `loop exhausted`),
 /// 5. any other `blocked` item is [`Escalation::Blocked`];
 /// 6. an `open` item whose latest run is parked (`needs you`) and parked a step is
 ///    [`Escalation::HardGateParked`], 7. one that parked no step is [`Escalation::JudgeUndecided`];
@@ -583,7 +586,7 @@ impl core::fmt::Display for Escalation {
             Self::HardGateParked { .. } => f.write_str("hard gate parked"),
             Self::JudgeUndecided { note, .. } => with_note(f, "judge undecided", note.as_deref()),
             Self::ReviewLoopExhausted { note, .. } => {
-                with_note(f, "review loop exhausted", note.as_deref())
+                with_note(f, "loop exhausted", note.as_deref())
             }
             Self::Blocked { note, .. } => with_note(f, "blocked", note.as_deref()),
             Self::Failed {
@@ -1034,13 +1037,13 @@ mod tests {
         );
         assert_eq!(
             state.to_string(),
-            "review loop exhausted (last note: review loop exhausted after 3 attempts)"
+            "loop exhausted (last note: review loop exhausted after 3 attempts)"
         );
 
         item.latest_note = None;
         assert_eq!(
             classify_entry(&item, here(), &facts(&item)).to_string(),
-            "review loop exhausted"
+            "loop exhausted"
         );
     }
 
