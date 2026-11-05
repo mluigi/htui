@@ -370,8 +370,9 @@ The checks run in this order, and the first one that fails decides the document:
   `no_qdrant_url`. Before MOD-158 the URL was checked first; a script that told "no URL" from "no
   Postgres" by the order should read `error.code`. The model is loaded only when there is a
   collection to search, so a Qdrant that does not answer, refuses the API key or holds no index is
-  answered without it. From the Qdrant URL on, every failure's `message` starts with
-  `knowledge search unavailable: ` (see [`search`](#search)).
+  answered without it. Every failure to read the Qdrant URL or API key, and every index failure,
+  has a `message` that starts with `knowledge search unavailable: `; a scope refusal keeps its own
+  sentence (see [`search`](#search)).
 
 ## Exit codes
 
