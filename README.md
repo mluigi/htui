@@ -432,8 +432,8 @@ conversation exactly as it was.
 
 The list shows `all` first, then each part of htui, with how many lines it holds and how many of
 them are warnings or errors. htui keeps the last 10 000 lines its log filter lets through in memory,
-whether or not it writes a log file. Lines arrive once a second while the tab is in front;
-scrolling up pauses following, so the lines you are reading stay put.
+whether or not it writes a log file. Lines arrive when you switch to the tab, then once a second
+while it is in front; scrolling up pauses following, so the lines you are reading stay put.
 
 ### Settings
 

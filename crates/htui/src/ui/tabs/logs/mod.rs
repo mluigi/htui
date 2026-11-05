@@ -5,9 +5,9 @@
 //! the selected source's lines on the right, one row each, coloured by level with the level word
 //! always printed, so monochrome loses nothing.
 //!
-//! The tab reads a [`LogBuffer`] and never logs: [`Tab::on_refresh`] copies the lines newer than
-//! the last sequence it saw (D2), so the lines pane moves once a second, as the shell's refresh
-//! does. The lines pane follows the newest line until a step up pauses it; a paused view is
+//! The tab reads a [`LogBuffer`] and never logs: [`Tab::on_activate`] and [`Tab::on_refresh`]
+//! copy the lines newer than the last sequence it saw (D2), so the lines pane is current when the
+//! tab comes to the front and moves once a second after, as the shell's refresh does. The lines pane follows the newest line until a step up pauses it; a paused view is
 //! anchored on the sequence of its top line (blueprint B4), so lines dropping off the ring, a new
 //! minimum level or another source never move what a paused reader sees. `logs.bottom` jumps to
 //! the newest line and follows again, as `chat.bottom` does; `logs.follow` toggles following.
@@ -524,6 +524,11 @@ impl Tab for LogsTab {
         self.pull();
     }
 
+    /// MOD-122 R1: new lines the moment the tab comes to the front, not a refresh later.
+    fn on_activate(&mut self, _ctx: &mut Ctx<'_>) {
+        self.pull();
+    }
+
     fn panes(&self) -> Panes {
         Panes::ListDetail(LOGS_LAYOUT)
     }
@@ -954,6 +959,26 @@ mod tests {
         let frame = harness.render();
         assert_eq!(shown(&frame, 0..62), paused, "paused: the view stays put");
         assert!(frame.contains(&source_row("all", 62, 0)), "{frame}");
+    }
+
+    /// MOD-122 R1: switching to the tab reads the buffer at once, so it never shows lines up to
+    /// a second old; the refresh carries on from there.
+    #[tokio::test]
+    async fn switching_to_the_tab_reads_the_buffer_at_once() {
+        let mut harness = Harness::demo();
+        crate::app::register_all(harness.app());
+        harness.settle().await;
+        let buffer = harness.app().logging.buffer().clone();
+        push_lines(&buffer, 0..3);
+
+        harness.key("6");
+        let frame = harness.render();
+
+        assert!(
+            frame.contains("Sources"),
+            "the Logs tab is in front: {frame}"
+        );
+        assert_eq!(shown(&frame, 0..3), [0, 1, 2], "{frame}");
     }
 
     #[tokio::test]

@@ -988,7 +988,8 @@ impl App {
         }
     }
 
-    /// Issues the active tab's `wants_requests`: called on activation and after a scope change.
+    /// Issues the active tab's `wants_requests`, then tells it it is in front
+    /// ([`Tab::on_activate`], MOD-122 R1): called on activation and after a scope change.
     pub(super) fn activate_tab(&mut self) {
         let Some(tab) = self.tabs.active() else {
             return;
@@ -998,6 +999,7 @@ impl App {
         for request in requests {
             self.dispatch(Origin::Tab(id), request);
         }
+        let _ = self.call_tab(id, |view, ctx| view.on_activate(ctx));
     }
 
     /// Stamps a request with a fresh `seq`, records it as the newest of its kind for this origin

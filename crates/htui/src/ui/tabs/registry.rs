@@ -116,6 +116,12 @@ pub trait Tab {
     /// changes. A view trait, not a store trait: the no-default rule does not apply.
     fn on_refresh(&mut self, _ctx: &mut Ctx<'_>) {}
 
+    /// This tab came to the front, or the scope changed under it while it was there: called
+    /// right after its [`wants_requests`](Tab::wants_requests) are issued, so a tab that reads
+    /// a source of its own (the Logs tab's buffer, MOD-122 R1) is current on its first frame,
+    /// not a refresh later. Defaulted to nothing, so no other tab changes.
+    fn on_activate(&mut self, _ctx: &mut Ctx<'_>) {}
+
     /// Whether this tab's own gesture wants the terminal's mouse right now (MOD-71 D1). Capture
     /// takes the terminal's own text selection away, so the event loop turns it on only while
     /// the active tab says yes (or, MOD-115 M2 MD8, is a list + detail tab, for the shell's pane
