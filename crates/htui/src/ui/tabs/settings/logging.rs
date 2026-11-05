@@ -72,6 +72,13 @@ fn overridden(by: &str, row: Row) -> String {
     )
 }
 
+/// A typed log file made absolute against the directory htui runs in, so the path saved to
+/// `ui-state.toml` names the same file whichever directory the next session starts from.
+/// Without a current directory to resolve against, the path stays as typed.
+fn absolute(text: String) -> PathBuf {
+    std::path::absolute(&text).unwrap_or_else(|_| PathBuf::from(text))
+}
+
 /// One row of the section, in screen order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
@@ -265,7 +272,8 @@ impl LoggingSection {
 
     /// `Enter` in the editor, the text trimmed. The filter: empty is [`DEFAULT_FILTER`], and a
     /// directive [`logging::parse_filter`] refuses keeps the editor open and sends nothing. The
-    /// file: empty is no file; opening it is the control's, through `App`.
+    /// file: empty is no file, and a relative path is taken from the directory htui runs in
+    /// ([`absolute`]); opening it is the control's, through `App`.
     fn submit(&mut self, ctx: &Ctx<'_>) {
         let Mode::Editing(editor) = &self.mode else {
             return;
@@ -284,7 +292,7 @@ impl LoggingSection {
                 }
                 LoggingAction::Filter(directive)
             }
-            Row::File => LoggingAction::File((!text.is_empty()).then(|| PathBuf::from(text))),
+            Row::File => LoggingAction::File((!text.is_empty()).then(|| absolute(text))),
         };
         self.mode = Mode::Browse;
         self.notice = None;
@@ -515,9 +523,11 @@ mod tests {
         let (_logging, mut section) = overridden(dir.path());
         assert_eq!(bench.key(&mut section, "j"), Handled::Consumed);
 
-        let frame = bench
-            .render_section(&section, WIDTH)
-            .replace(&dir.path().display().to_string(), "[TMP]");
+        // The whole path, so the separator `join` used is masked too on every platform.
+        let frame = bench.render_section(&section, WIDTH).replace(
+            &dir.path().join("htui.log").display().to_string(),
+            "[TMP]/htui.log",
+        );
 
         assert!(
             frame.contains("debug \u{b7} set by `HTUI_LOG_FILTER`"),
@@ -631,6 +641,25 @@ mod tests {
         assert_eq!(emitted(&bench), [LoggingAction::File(None)]);
     }
 
+    /// A relative path is taken from the directory htui runs in and emitted absolute, so the
+    /// saved file does not move with the directory the next session starts from.
+    #[tokio::test]
+    async fn a_relative_file_path_is_emitted_absolute() {
+        let bench = SectionBench::new().await;
+        let (_logging, mut section) = detached();
+        let here = std::env::current_dir().expect("the current directory");
+
+        bench.key(&mut section, "j");
+        bench.key(&mut section, "e");
+        retype(&bench, &mut section, 0, "logs/htui.log");
+        bench.key(&mut section, "enter");
+
+        assert_eq!(
+            emitted(&bench),
+            [LoggingAction::File(Some(here.join("logs/htui.log")))]
+        );
+    }
+
     /// B5: a field `--log` or `HTUI_LOG_FILTER` set for the session refuses its edit and says
     /// why, rather than saving a value that would not apply.
     #[tokio::test]
@@ -641,17 +670,32 @@ mod tests {
 
         assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
         assert!(!section.captures_input(), "no editor over the filter");
+        // The focused row's help says it, and so does the notice under the rows.
         let frame = bench.render_section(&section, WIDTH);
-        assert!(
-            frame.contains(
-                "set by `HTUI_LOG_FILTER` for this session: start htui without it to change the log filter here"
-            ),
-            "{frame}"
+        let why_filter = "set by `HTUI_LOG_FILTER` for this session: start htui without it to change the log filter here";
+        assert_eq!(
+            frame.matches(why_filter).count(),
+            2,
+            "help and notice: {frame}"
+        );
+        assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+        assert_eq!(
+            bench.key(&mut section, "esc"),
+            Handled::Pass,
+            "the notice is gone, so the next esc is the shell's"
         );
 
         bench.key(&mut section, "j");
         assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
         assert!(!section.captures_input(), "no editor over the file");
+        let frame = bench.render_section(&section, WIDTH);
+        let why_file =
+            "set by `--log` for this session: start htui without it to change the log file here";
+        assert_eq!(
+            frame.matches(why_file).count(),
+            2,
+            "help and notice: {frame}"
+        );
         assert!(emitted(&bench).is_empty());
         assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
     }
