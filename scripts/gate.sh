@@ -92,7 +92,9 @@ step_postgres() {
         echo "postgres: HTUI_TEST_DATABASE_URL unset - the Postgres suites return early and prove nothing"
         return 3
     fi
-    if [[ ! "$dsn" =~ ^postgres(ql)?://([^@/]*@)?([^:/?]+)(:([0-9]+))? ]]; then
+    # The userinfo runs to the last '@' before the path, and the host holds no '@': a password
+    # with an unencoded '@' stays out of the output.
+    if [[ ! "$dsn" =~ ^postgres(ql)?://([^/?#]*@)?([^:/?#@]+)(:([0-9]+))? ]]; then
         echo "postgres: DSN set, host not parsed (not probed)"
         return 0
     fi
@@ -113,7 +115,8 @@ step_qdrant() {
         echo "qdrant: HTUI_TEST_QDRANT_URL unset - the Qdrant suites return early and prove nothing"
         return 3
     fi
-    if [[ ! "$url" =~ ^(https?)://([^@/]*@)?(\[[^]/]+\]|[^:/?#]+)(:([0-9]+))? ]]; then
+    # Userinfo to the last '@', no '@' in the host: as step_postgres.
+    if [[ ! "$url" =~ ^(https?)://([^/?#]*@)?(\[[^]/]+\]|[^:/?#@]+)(:([0-9]+))? ]]; then
         echo "qdrant: URL set, host not parsed (not probed)"
         return 0
     fi
@@ -289,6 +292,9 @@ run_self_test() {
         || failures+=('postgres: an unparsed DSN failed')
     out="$(HTUI_TEST_DATABASE_URL='postgres://u:s3cret@127.0.0.1:1/db' step_postgres 2>&1)"
     [[ "$out" != *s3cret* ]] || failures+=('postgres: the DSN password was printed')
+    # An unencoded '@' in the password: the userinfo ends at the last '@', as the client splits it.
+    out="$(HTUI_TEST_DATABASE_URL='postgres://u:p@ss@127.0.0.1:1/db' step_postgres 2>&1)"
+    [[ "$out" != *ss@* ]] || failures+=('postgres: a password with an @ was printed')
 
     # Every step names a function: a missing one would only show up when that step runs.
     local s
@@ -304,6 +310,8 @@ run_self_test() {
         || failures+=('qdrant: an unparsed URL failed')
     out="$(HTUI_TEST_QDRANT_URL='http://u:s3cret@127.0.0.1:1' step_qdrant 2>&1)"
     [[ "$out" != *s3cret* ]] || failures+=('qdrant: the URL credentials were printed')
+    out="$(HTUI_TEST_QDRANT_URL='http://u:p@ss@127.0.0.1:1' step_qdrant 2>&1)"
+    [[ "$out" != *ss@* ]] || failures+=('qdrant: a password with an @ was printed')
 
     version_ge 2.1.296 2.1.287 || failures+=('version_ge: 2.1.296 < 2.1.287')
     version_ge 2.1.287 2.1.287 || failures+=('version_ge: equal versions refused')

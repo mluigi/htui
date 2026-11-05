@@ -78,7 +78,9 @@ function Step-Postgres {
         Write-Host 'postgres: HTUI_TEST_DATABASE_URL unset - the Postgres suites return early and prove nothing'
         return $Skip
     }
-    $m = [regex]::Match($dsn, '^postgres(ql)?://([^@/]*@)?([^:/?]+)(:([0-9]+))?')
+    # The userinfo runs to the last '@' before the path, and the host holds no '@': a password
+    # with an unencoded '@' stays out of the output.
+    $m = [regex]::Match($dsn, '^postgres(ql)?://([^/?#]*@)?([^:/?#@]+)(:([0-9]+))?')
     if (-not $m.Success) {
         Write-Host 'postgres: DSN set, host not parsed (not probed)'
         return $Pass
@@ -107,7 +109,8 @@ function Step-Qdrant {
         Write-Host 'qdrant: HTUI_TEST_QDRANT_URL unset - the Qdrant suites return early and prove nothing'
         return $Skip
     }
-    $m = [regex]::Match($url, '^(https?)://([^@/]*@)?(\[[^\]/]+\]|[^:/?#]+)(:([0-9]+))?')
+    # Userinfo to the last '@', no '@' in the host: as Step-Postgres.
+    $m = [regex]::Match($url, '^(https?)://([^/?#]*@)?(\[[^\]/]+\]|[^:/?#@]+)(:([0-9]+))?')
     if (-not $m.Success) {
         Write-Host 'qdrant: URL set, host not parsed (not probed)'
         return $Pass
@@ -284,6 +287,9 @@ function Invoke-GateSelfTest {
             if ((Step-Postgres | Select-Object -Last 1) -ne $Pass) { $failures += 'postgres: an unparsed DSN failed' }
             $env:HTUI_TEST_DATABASE_URL = 'postgres://u:s3cret@127.0.0.1:1/db'
             if ("$(Step-Postgres 6>&1)" -match 's3cret') { $failures += 'postgres: the DSN password was printed' }
+            # An unencoded '@' in the password: the userinfo ends at the last '@', as the client splits it.
+            $env:HTUI_TEST_DATABASE_URL = 'postgres://u:p@ss@127.0.0.1:1/db'
+            if ("$(Step-Postgres 6>&1)" -match 'ss@') { $failures += 'postgres: a password with an @ was printed' }
         } finally { $env:HTUI_TEST_DATABASE_URL = $savedDsn }
 
         # Every step names a function. A missing one ends its case's `if` before the case can fail,
@@ -303,6 +309,8 @@ function Invoke-GateSelfTest {
             if ((Step-Qdrant | Select-Object -Last 1) -ne $Pass) { $failures += 'qdrant: an unparsed URL failed' }
             $env:HTUI_TEST_QDRANT_URL = 'http://u:s3cret@127.0.0.1:1'
             if ("$(Step-Qdrant 6>&1)" -match 's3cret') { $failures += 'qdrant: the URL credentials were printed' }
+            $env:HTUI_TEST_QDRANT_URL = 'http://u:p@ss@127.0.0.1:1'
+            if ("$(Step-Qdrant 6>&1)" -match 'ss@') { $failures += 'qdrant: a password with an @ was printed' }
         } finally { $env:HTUI_TEST_QDRANT_URL = $savedQdrant }
 
         # last.json: the documented shape, and no .tmp left behind.
