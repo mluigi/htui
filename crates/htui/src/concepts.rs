@@ -1524,12 +1524,12 @@ mod tests {
             assert!(job.await.expect_err("aborted").is_cancelled());
         }
 
-        /// MOD-11 H-26: the job takes its model from the index `search_concepts` searches, so a
-        /// worker that indexes and serves the tool loads the 133 MB model once, not twice.
+        /// MOD-11 H-26: the index job and every search take the model from one load slot on the
+        /// index `search_concepts` searches, so a worker that indexes and serves the tool loads the
+        /// 133 MB model once, not twice. The second taker waits on the slot directly (MOD-160
+        /// P-1): a search asks Qdrant before the model, and this one's Qdrant is a closed port.
         #[tokio::test]
         async fn the_index_job_and_the_search_share_one_model_load() {
-            use crate::concepts_worker::ConceptIndex as _;
-
             let loads = Arc::new(AtomicUsize::new(0));
             let settings = concepts_worker::QdrantSource::new(
                 QdrantEnv::new(Some("http://127.0.0.1:1".to_owned()), None),
@@ -1557,12 +1557,12 @@ mod tests {
             .await
             .expect("the job loads its model through the index");
 
-            let search = index.search(query("anything", vec![ProjectId::new()], false, 10));
+            let model = index.embedder();
             assert!(
-                tokio::time::timeout(Duration::from_millis(500), search)
+                tokio::time::timeout(Duration::from_millis(500), model)
                     .await
                     .is_err(),
-                "the search waits on the job's load"
+                "a search's model waits on the job's load"
             );
             assert_eq!(loads.load(Ordering::SeqCst), 1, "one model for both");
             job.abort();
