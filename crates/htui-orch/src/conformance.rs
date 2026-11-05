@@ -487,15 +487,17 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// target to its source; no progress stops an edge loop before its `loop_limit`; and a graph
 /// with authored edges resolves (D6(c) lifted).
 ///
-/// **Twelve for MOD-138 M2 T5** (plan D6, D7, D8, Q-A, Q-B; blueprint A2, A3, A5, A9): `if` edges
+/// **Thirteen for MOD-138 M2 T5** (plan D6, D7, D8, Q-A, Q-B; blueprint A2, A3, A5, A9; the
+/// thirteenth, past blueprint §6's twelve, came with T5's first repair): `if` edges
 /// and `asks_you` edges. Each predicate of the closed set decides as specified and the decision
 /// is stored once on the source's `branch`; a declined branch is skipped and the join after it
 /// runs; an isolator error parks the branch undecided and `Unblock` resumes it; a node with an
 /// `asks_you` edge always stops (auto mode included), approve takes its edges and reject or
 /// accept artifact declines them with the work landed; a back `asks_you` approved loops, a crash
 /// between the approve and its loop is replayed, and a spent one escalates without blocking the
-/// item and walks on when approved; a decision is read from its row after a restart; and a
-/// reject on a node that also reads its verdict loops over `changes_requested`.
+/// item and walks on when approved; a decision is read from its row after a restart; a reject on
+/// a node that also reads its verdict loops over `changes_requested`; and a reject of a failed
+/// settle's park on an `asks_you` node is that gate's own and ends the run (D8).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
