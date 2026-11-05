@@ -4,7 +4,7 @@
 **Selected Milestone**: 1 — Logs tab and logging settings
 **Complexity**: Medium
 **Routing**: PRD path by `/handoff-run MOD-122`; ultracode accepted for the implement phase.
-**Grounded at**: `1c50e30c` (branch `hr/MOD-122`).
+**Grounded at**: `1c50e30c` (branch `hr/MOD-122`). **Blueprint**: `.claude/plans/mod-122-activity-and-logs-m1.blueprint.md` (its F1–F8 amend this plan; the blueprint wins where they differ).
 
 ## Summary
 
@@ -230,7 +230,8 @@ Manual check, on the host or in a PTY:
 | V6 | Integration test pins 5 tabs | ✓ | `crates/htui/tests/integration.rs:43-48` (read) |
 | V7 | `ui-state.toml` is version 1 with optional tables; unknown keys ignored | ✓ / partly | `ui/state_file.rs:42-57` (read): optional, `skip_serializing_if` tables; "unknown keys ignored" from the grounding sweep, re-checked in T1's first test |
 | V8 | Sections can emit actions through `Ctx` (`emit: &Emit`) | ✓ | `app/state.rs:88-124` (read) |
-| V9 | T2 ∩ T3 = {`app/mod.rs`, `README.md`}; T1 ∩ T2 = ∅; T1 ∩ T3 = ∅ | ✓ | Files to Change table: the per-task sets intersected by hand |
+| V9 | T2 ∩ T3 = {`app/mod.rs`, `README.md`}; T1 ∩ T2 = ∅; T1 ∩ T3 = ∅ | ✗ **falsified by the blueprint (F1, F3)**, amended | Every Settings section owns a key context and browse stack, so T3 also writes `keys/catalogue.rs`, `keys/views.rs`, `keys/stack.rs`. Amended: T1 adds both new `Context` variants (`Logs`, `SettingsLogging`) up front; T2 ∩ T3 is then {`app/mod.rs`, `README.md`, `keys/views.rs`, `keys/stack.rs`} in disjoint hunks (blueprint F1/F3); T2/T3 stay worktree-parallel, merged by hand, `keys::` tests re-run on the merged tree |
+| V13 | The validate lines pass two test filters to cargo | ✗ falsified (blueprint F4), amended | cargo takes one TESTNAME; use `cargo test -p htui --all-features --lib -- logging:: state_file:: --test-threads=1` |
 | V10 | `v`, `F` unbound in the global, list, layout and history layers; `G` is `list.bottom` and `chat.bottom` shadows it in Chat | ✓ (sweep) | Grounding sweep: `keys/catalogue.rs:1069`, `:1990`; re-checked by the catalogue tests in T2 |
 | V11 | `on_refresh` runs for the active tab only, every 4 ticks of 250 ms | ✓ (sweep) | `app/update.rs:24`, `:260-278`; `event_loop.rs:23` |
 | V12 | `htui-secrets` crate has no `tracing` dependency today | ✓ (sweep) | Grounding sweep; the D3 table maps it anyway for later calls |
