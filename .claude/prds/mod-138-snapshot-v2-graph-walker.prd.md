@@ -135,7 +135,7 @@ Decisions taken at the PRD gate (maintainer, 2026-10-27):
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Snapshot v2, the validator and the lift | New runs freeze a v2 snapshot (nodes, edges, bounds; divide expansion frozen, divide and subgraph refused) and are pinned to it; v1 runs read through the lift and behave as today; one validator refuses bad graphs at save and at resolve; items and kinds may use workspace and library graphs. The walk itself still runs one node at a time in order | complete (2026-11-03, `d114f91f`; record `docs/decisions/mod/mod-138-decisions.md`) | `.claude/plans/mod-138-m1-snapshot-v2.plan.md` |
-| 2 | The readiness walker | `ready()` replaces `cursor`: joins, derived skips, `if` predicates, `asks_you` parks answered through the gate, per-edge loops with region retirement, limits and no-progress, graph-aware `required_inputs`; the `is_review` name rule is gone. Driven one ready node at a time | pending | — |
+| 2 | The readiness walker | `ready()` replaces `cursor`: joins, derived skips, `if` predicates, `asks_you` parks answered through the gate, per-edge loops with region retirement, limits and no-progress, graph-aware `required_inputs`; the `is_review` name rule is gone. Driven one ready node at a time | in-progress | `.claude/plans/mod-138-m2-readiness-walker.plan.md` |
 | 3 | Concurrent nodes | Every ready node runs at once up to `max_parallel_sessions`, each per-node future boxed; landings into one repo serialised by a reconcile lock; `local` isolation on two nodes that can be live together refused at resolve; crash recovery finds the frontier among concurrent landings | pending | — |
 
 ## Open Questions
@@ -147,11 +147,16 @@ Decisions taken at the PRD gate (maintainer, 2026-10-27):
   `app_setting` rows like `max_agents_per_run` (a seed or migration), or code defaults until a
   Settings surface exists. **Settled in M1 (D13):** read from `app_setting` like `max_fan_out`, code
   defaults, no rows seeded; MOD-123's Settings surface may seed them.
-- [ ] `if` predicate inputs: where "the source step's changed paths" are read from (its tree's
+- [x] `if` predicate inputs: where "the source step's changed paths" are read from (its tree's
   `base_ref`..`after_hash` diff per repo, or a recorded diffstat), and how a source with no tree
-  (a check, a judge) answers path predicates. TBD — M2's `/plan`.
-- [ ] Gate interplay on `asks_you` (Q2): a source step that has its own `always` gate *and* an
-  outgoing `asks_you` edge — one park or two in sequence. TBD — M2's `/plan`.
+  (a check, a judge) answers path predicates. **Settled in M2 (Q-A, maintainer 2026-11-05):**
+  `Isolator::changed_paths` over the winner's recorded ranges, decided once and stored on
+  `run_step.branch` (migration `0025`, cache `0008`); no changed paths makes both path predicates
+  false.
+- [x] Gate interplay on `asks_you` (Q2): a source step that has its own `always` gate *and* an
+  outgoing `asks_you` edge — one park or two in sequence. **Settled in M2 (Q-B):** one park, never
+  downgraded; approve takes, reject or accept-artifact declines with the step `done` (`skipped`) and
+  its work landed.
 - [x] Which v1-pinned conformance expectations must change at the v1/v2 resume split (the
   `TopologyChanged` cases), and whether they are kept on v1 fixtures instead. **Settled in M1:** eight tests
   moved to v1 fixtures (`fake::rewrite_as_v1`), each with a v2 twin.
