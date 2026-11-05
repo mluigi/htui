@@ -52,7 +52,7 @@ use crate::fake::{
     FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
     rewrite_as_v1,
 };
-use crate::isolate::Clock as _;
+use crate::isolate::{ChangedPaths, Clock as _};
 use crate::promote;
 use crate::status::RunFailure;
 
@@ -486,6 +486,16 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// and escalates once spent; a loop on a diamond retires only the nodes on a path from its
 /// target to its source; no progress stops an edge loop before its `loop_limit`; and a graph
 /// with authored edges resolves (D6(c) lifted).
+///
+/// **Twelve for MOD-138 M2 T5** (plan D6, D7, D8, Q-A, Q-B; blueprint A2, A3, A5, A9): `if` edges
+/// and `asks_you` edges. Each predicate of the closed set decides as specified and the decision
+/// is stored once on the source's `branch`; a declined branch is skipped and the join after it
+/// runs; an isolator error parks the branch undecided and `Unblock` resumes it; a node with an
+/// `asks_you` edge always stops (auto mode included), approve takes its edges and reject or
+/// accept artifact declines them with the work landed; a back `asks_you` approved loops, a crash
+/// between the approve and its loop is replayed, and a spent one escalates without blocking the
+/// item and walks on when approved; a decision is read from its row after a restart; and a
+/// reject on a node that also reads its verdict loops over `changes_requested`.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -750,6 +760,25 @@ pub const CASES: &[&str] = &[
     "a_loop_on_a_diamond_retires_only_its_region",
     "an_edge_loop_without_progress_escalates",
     "a_graph_with_authored_edges_resolves",
+    // MOD-138 M2 T5 (plan D6, D7, D8, Q-A, Q-B; blueprint A2, A3, A5, A9): `if` edges are decided
+    // once from their facts and stored, a declined branch is skipped and its join still runs, an
+    // undecided branch parks and resumes; an `asks_you` node always stops, approve takes its
+    // edges and reject or accept declines them with the work landed, auto mode keeps the stop; a
+    // back `asks_you` loops on approve, is replayed after a crash and escalates once spent; a
+    // decision is read from its row after a restart; and a verdict-reading `asks_you` node's
+    // reject loops.
+    "each_if_predicate_decides_from_its_facts",
+    "a_declined_if_branch_is_skipped_and_the_join_runs",
+    "an_undecided_branch_parks_on_an_isolator_error_and_unblock_resumes_it",
+    "a_forward_asks_you_approved_runs_its_target",
+    "a_forward_asks_you_rejected_skips_its_target_and_lands_the_work",
+    "auto_mode_never_downgrades_an_asks_you_stop",
+    "a_back_asks_you_approved_loops",
+    "a_crash_between_an_asks_you_approve_and_its_loop_is_replayed",
+    "a_spent_back_asks_you_escalates_and_approve_walks_on",
+    "a_branch_decision_is_read_from_its_row_after_a_restart",
+    "accepting_an_artifact_on_an_asks_you_node_declines_its_edges",
+    "a_reject_on_a_verdict_reading_asks_you_node_loops",
 ];
 
 /// Run one case by name.
@@ -782,6 +811,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| pinned_resume_case(name, harness))
         .or_else(|| item_state_case(name, harness))
         .or_else(|| graph_walker_case(name, harness))
+        .or_else(|| branch_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -1237,6 +1267,50 @@ fn graph_walker_case<'a, H: CaseHarness>(
         }
         "a_graph_with_authored_edges_resolves" => {
             Box::pin(a_graph_with_authored_edges_resolves(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-138 M2 T5's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn branch_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "each_if_predicate_decides_from_its_facts" => {
+            Box::pin(each_if_predicate_decides_from_its_facts(harness))
+        }
+        "a_declined_if_branch_is_skipped_and_the_join_runs" => {
+            Box::pin(a_declined_if_branch_is_skipped_and_the_join_runs(harness))
+        }
+        "an_undecided_branch_parks_on_an_isolator_error_and_unblock_resumes_it" => {
+            Box::pin(an_undecided_branch_parks_on_an_isolator_error_and_unblock_resumes_it(harness))
+        }
+        "a_forward_asks_you_approved_runs_its_target" => {
+            Box::pin(a_forward_asks_you_approved_runs_its_target(harness))
+        }
+        "a_forward_asks_you_rejected_skips_its_target_and_lands_the_work" => {
+            Box::pin(a_forward_asks_you_rejected_skips_its_target_and_lands_the_work(harness))
+        }
+        "auto_mode_never_downgrades_an_asks_you_stop" => {
+            Box::pin(auto_mode_never_downgrades_an_asks_you_stop(harness))
+        }
+        "a_back_asks_you_approved_loops" => Box::pin(a_back_asks_you_approved_loops(harness)),
+        "a_crash_between_an_asks_you_approve_and_its_loop_is_replayed" => {
+            Box::pin(a_crash_between_an_asks_you_approve_and_its_loop_is_replayed(harness))
+        }
+        "a_spent_back_asks_you_escalates_and_approve_walks_on" => Box::pin(
+            a_spent_back_asks_you_escalates_and_approve_walks_on(harness),
+        ),
+        "a_branch_decision_is_read_from_its_row_after_a_restart" => Box::pin(
+            a_branch_decision_is_read_from_its_row_after_a_restart(harness),
+        ),
+        "accepting_an_artifact_on_an_asks_you_node_declines_its_edges" => {
+            Box::pin(accepting_an_artifact_on_an_asks_you_node_declines_its_edges(harness))
+        }
+        "a_reject_on_a_verdict_reading_asks_you_node_loops" => {
+            Box::pin(a_reject_on_a_verdict_reading_asks_you_node_loops(harness))
         }
         _ => return None,
     })
@@ -9632,6 +9706,827 @@ async fn a_graph_with_authored_edges_resolves<H: CaseHarness>(harness: &H) {
     );
 }
 
+// -- MOD-138 M2 T5: `if` decisions and `asks_you` (plan D6, D7, D8; blueprint A2, A3, A5, A9) ---
+
+/// An `if` edge's predicate, from its JSON.
+fn when(value: serde_json::Value) -> Option<htui_core::model::EdgePredicate> {
+    Some(htui_core::model::EdgePredicate(value))
+}
+
+/// The `branch` `record_branch` wrote on the step at `(position, 1)`, if any.
+async fn branch_at<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    position: i32,
+) -> Option<serde_json::Value> {
+    step_at(orch, run, position, 1).await.branch
+}
+
+/// `ChangedPaths` in `repo`, sorted as the isolator answers them.
+fn changed(repo: RepoId, paths: &[&str], truncated: bool) -> ChangedPaths {
+    ChangedPaths {
+        paths: paths
+            .iter()
+            .map(|path| (repo, (*path).to_owned()))
+            .collect(),
+        truncated,
+    }
+}
+
+/// FEAT-3's diamond `prd → {plan, implement} → review`: `prd → plan` is `if` on `predicate`,
+/// `prd → implement` on its negation, and both join at `review` over `next`.
+async fn feat_3_diamond<O: Orchestrate>(orch: &O, predicate: &serde_json::Value) {
+    author_edges(
+        orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::If, when(predicate.clone()), None),
+            (
+                "prd",
+                "implement",
+                EdgeKind::If,
+                when(serde_json::json!({ "not": predicate })),
+                None,
+            ),
+            ("plan", "review", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+        ],
+    )
+    .await;
+}
+
+/// FEAT-3's chain with its `plan → implement` link an `asks_you` edge, and the review loop's
+/// `changes_requested` edge kept.
+async fn feat_3_asks_at_plan<O: Orchestrate>(orch: &O) {
+    author_edges(
+        orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::AsksYou, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            (
+                "review",
+                "implement",
+                EdgeKind::ChangesRequested,
+                None,
+                Some(1),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// FEAT-3's chain over `next` with a back `asks_you` edge `review → plan` of `loop_limit`, and
+/// no `changes_requested` edge, so `review` reads no verdict and a reject declines.
+async fn feat_3_asks_back<O: Orchestrate>(orch: &O, loop_limit: i32) {
+    author_edges(
+        orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            ("review", "plan", EdgeKind::AsksYou, None, Some(loop_limit)),
+        ],
+    )
+    .await;
+}
+
+/// The shape of a FEAT-3 run after one turn of the back `asks_you` loop `review → plan`, its
+/// second `review` parked.
+const ONE_ASKS_YOU_TURN: [(i32, i32, StepStatus); 7] = [
+    (0, 1, StepStatus::Done),
+    (1, 1, StepStatus::Superseded),
+    (1, 2, StepStatus::Done),
+    (2, 1, StepStatus::Superseded),
+    (2, 2, StepStatus::Done),
+    (3, 1, StepStatus::Superseded),
+    (3, 2, StepStatus::AwaitingApproval),
+];
+
+/// One round of [`each_if_predicate_decides_from_its_facts`]: the facts, then each of `prd`'s
+/// three `if` edges with the decision it must get.
+struct Round {
+    why: &'static str,
+    /// The changed paths in the primary repo `htui`; `None` leaves the isolator unscripted.
+    paths: Option<(&'static [&'static str], bool)>,
+    /// `prd` runs a `verify_command` that passes; else it has none (`verify_outcome` `NULL`).
+    verify: bool,
+    edges: [(&'static str, serde_json::Value, bool); 3],
+}
+
+/// MOD-138 M2 D3, D6 (plan Q-A): each predicate of the closed `if` set decides as specified.
+/// One fresh run per round: `prd` (`never`) settles, the walk owes `Decide`, and the decision is
+/// written once to `prd`'s `branch` as `{"<to>": bool}` per `if` edge. Paths are read only when
+/// a predicate needs them (blueprint F13). The item requires the tag `gpu` and its key prefix is
+/// the fixture's.
+#[allow(clippy::too_many_lines)]
+async fn each_if_predicate_decides_from_its_facts<H: CaseHarness>(harness: &H) {
+    use serde_json::json;
+    let prefix = item_of(&harness.fresh(), ids::HTUI_FEAT_3).await.key_prefix;
+    let rounds = [
+        Round {
+            why: "paths: `all` over every path, `all` over some, a repo-qualified `any`",
+            paths: Some((&["src/a.rs", "src/b.rs"], false)),
+            verify: false,
+            edges: [
+                ("plan", json!({"all_changed_paths_match": ["src/**"]}), true),
+                (
+                    "implement",
+                    json!({"all_changed_paths_match": ["src/a.rs"]}),
+                    false,
+                ),
+                (
+                    "review",
+                    json!({"any_changed_path_matches": ["docs/**", "htui:src/b.rs"]}),
+                    true,
+                ),
+            ],
+        },
+        Round {
+            why: "no changed paths: no vacuous truth",
+            paths: None,
+            verify: false,
+            edges: [
+                ("plan", json!({"all_changed_paths_match": ["**"]}), false),
+                (
+                    "implement",
+                    json!({"any_changed_path_matches": ["**"]}),
+                    false,
+                ),
+                (
+                    "review",
+                    json!({"not": {"any_changed_path_matches": ["**"]}}),
+                    true,
+                ),
+            ],
+        },
+        Round {
+            why: "a truncated list: `all` cannot be proved, `any` reads the listed paths",
+            paths: Some((&["src/a.rs"], true)),
+            verify: false,
+            edges: [
+                (
+                    "plan",
+                    json!({"all_changed_paths_match": ["src/**"]}),
+                    false,
+                ),
+                (
+                    "implement",
+                    json!({"any_changed_path_matches": ["src/**"]}),
+                    true,
+                ),
+                (
+                    "review",
+                    json!({"any_changed_path_matches": ["docs/**"]}),
+                    false,
+                ),
+            ],
+        },
+        Round {
+            why: "a passing verify",
+            paths: None,
+            verify: true,
+            edges: [
+                ("plan", json!({"verify": "passed"}), true),
+                ("implement", json!({"verify": "failed"}), false),
+                ("review", json!({"not": {"verify": "failed"}}), true),
+            ],
+        },
+        Round {
+            why: "no verify outcome matches neither value",
+            paths: None,
+            verify: false,
+            edges: [
+                ("plan", json!({"verify": "passed"}), false),
+                ("implement", json!({"verify": "failed"}), false),
+                (
+                    "review",
+                    json!({"any": [{"verify": "passed"}, {"verify": "failed"}]}),
+                    false,
+                ),
+            ],
+        },
+        Round {
+            why: "the item's kind and tags",
+            paths: None,
+            verify: false,
+            edges: [
+                ("plan", json!({"item_kind": prefix}), true),
+                ("implement", json!({"item_kind": "NOPE"}), false),
+                ("review", json!({"item_tag": "gpu"}), true),
+            ],
+        },
+        Round {
+            why: "the combinators",
+            paths: None,
+            verify: false,
+            edges: [
+                (
+                    "plan",
+                    json!({"all": [{"item_tag": "gpu"}, {"item_kind": prefix}]}),
+                    true,
+                ),
+                (
+                    "implement",
+                    json!({"any": [{"item_tag": "cuda"}, {"item_kind": "NOPE"}]}),
+                    false,
+                ),
+                ("review", json!({"not": {"item_tag": "cuda"}}), true),
+            ],
+        },
+    ];
+    for round in rounds {
+        let why = round.why;
+        let orch = harness.fresh();
+        let repo = primary_repo(&orch).await;
+        require_tags(&orch, ids::HTUI_FEAT_3, &["gpu"]).await;
+        declare_tags(&orch, &["gpu"]).await;
+        let verify = round.verify;
+        // `prd` walks on by itself; every target parks at its own gate, so the run stops at the
+        // first one the decision takes.
+        feat_3_gated(&orch, Gate::Always, |phase| {
+            phase.input_kinds.clear();
+            if phase.name == "prd" {
+                phase.gate = Gate::Never;
+                if verify {
+                    phase.verify_command = Some("cargo test".to_owned());
+                }
+            }
+        })
+        .await;
+        if verify {
+            orch.verifier().script_report(FakeVerifier::pass());
+        }
+        if let Some((paths, truncated)) = round.paths {
+            orch.isolator()
+                .script_changed_paths(changed(repo, paths, truncated));
+        }
+        let edges: Vec<AuthoredEdge<'_>> = round
+            .edges
+            .iter()
+            .map(|(to, predicate, _)| ("prd", *to, EdgeKind::If, when(predicate.clone()), None))
+            .collect();
+        author_edges(&orch, ids::HTUI_FEAT_3, &edges).await;
+
+        let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+        let expected: serde_json::Map<String, serde_json::Value> = round
+            .edges
+            .iter()
+            .map(|(to, _, taken)| ((*to).to_owned(), serde_json::Value::Bool(*taken)))
+            .collect();
+        assert_eq!(
+            branch_at(&orch, run, 0).await,
+            Some(serde_json::Value::Object(expected)),
+            "{why}"
+        );
+        let needs_paths = round
+            .edges
+            .iter()
+            .any(|(_, predicate, _)| predicate.to_string().contains("changed_path"));
+        assert_eq!(
+            orch.isolator().changed_path_requests().len(),
+            usize::from(needs_paths),
+            "{why}: the paths are read once, and only when a predicate needs them"
+        );
+    }
+}
+
+/// MOD-138 M2 D2: on the diamond `prd → {plan, implement} → review`, the decision takes `plan`
+/// and declines `implement`. `implement` is skipped (no row is ever written for it), and the
+/// join `review` runs once its taken in-edge's source is done: a join waits for every in-edge
+/// to resolve, not for every one to be taken.
+async fn a_declined_if_branch_is_skipped_and_the_join_runs<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| phase.input_kinds.clear()).await;
+    let prefix = item_of(&orch, ids::HTUI_FEAT_3).await.key_prefix;
+    feat_3_diamond(&orch, &serde_json::json!({ "item_kind": prefix })).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ],
+        "`implement` is skipped and never gets a row"
+    );
+    assert_eq!(
+        branch_at(&orch, run, 0).await,
+        Some(serde_json::json!({"plan": true, "implement": false}))
+    );
+    assert!(
+        orch.isolator().changed_path_requests().is_empty(),
+        "no predicate needs paths"
+    );
+}
+
+/// MOD-138 M2 D6: a decision is never guessed. The isolator cannot read `prd`'s changed paths,
+/// so nothing is written to `branch`; the run parks with the `branch undecided` note, the item
+/// is not blocked, and `Unblock` resumes the run (`Decide` is resumable), which decides again,
+/// now with the paths, and walks on.
+async fn an_undecided_branch_parks_on_an_isolator_error_and_unblock_resumes_it<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    let repo = primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |phase| phase.input_kinds.clear()).await;
+    feat_3_diamond(
+        &orch,
+        &serde_json::json!({"any_changed_path_matches": ["src/**"]}),
+    )
+    .await;
+    orch.isolator().fail_changed_paths("git is gone");
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "{rest:?}"
+    );
+    assert_eq!(sorted_shape(&orch, run).await, [(0, 1, StepStatus::Done)]);
+    assert_eq!(branch_at(&orch, run, 0).await, None, "nothing was guessed");
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Open);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body
+            .starts_with("branch undecided: `prd`: changed paths unavailable: ")
+            && body.contains("git is gone")),
+        "{notes:?}"
+    );
+
+    orch.isolator()
+        .script_changed_paths(changed(repo, &["src/lib.rs"], false));
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(case, UnblockCase::Resume(run));
+    let rest = rest.expect("the resume case walks the run");
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        branch_at(&orch, run, 0).await,
+        Some(serde_json::json!({"plan": true, "implement": false}))
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+    assert_eq!(orch.isolator().changed_path_requests().len(), 2);
+}
+
+/// MOD-138 M2 D8 (plan Q-B): `plan → implement` is an `asks_you` edge, so `plan` stops after its
+/// `ok` settle although every phase gates `never`, with the stop note. Approve takes the edge:
+/// `implement` runs, and the run finishes.
+async fn a_forward_asks_you_approved_runs_its_target<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    feat_3_asks_at_plan(&orch).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(1), None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval)
+        ]
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body
+            == "step `plan` attempt 1 waits on you: approve takes `implement`; reject or accept \
+                artifact declines it, and the step's work lands either way; retry redoes the step"),
+        "{notes:?}"
+    );
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+    assert_eq!(at(&steps, 1, 1).gate_outcome, Some(GateOutcome::Approved));
+}
+
+/// MOD-138 M2 D8 (plan Q-B): a human's reject of a node whose only loop-free edge out is
+/// `asks_you` declines it: the step is `done` with `skipped` and the reject's note, its work is
+/// merged, `implement` and `review` are skipped (the skip propagates), and the run finishes.
+async fn a_forward_asks_you_rejected_skips_its_target_and_lands_the_work<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    feat_3_asks_at_plan(&orch).await;
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let plan = step_at(&orch, run, 1, 1).await;
+    assert_eq!(plan.status, StepStatus::AwaitingApproval);
+    let rest = act(&orch, run, Act::Reject).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "a declined link ends nothing: {rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [(0, 1, StepStatus::Done), (1, 1, StepStatus::Done)],
+        "`implement` and `review` are skipped"
+    );
+    let plan = step_at(&orch, run, 1, 1).await;
+    assert_eq!(
+        (plan.gate_outcome, plan.gate_note.as_deref()),
+        (Some(GateOutcome::Skipped), Some("not this"))
+    );
+    assert!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == plan.id),
+        "the declined step's work landed"
+    );
+}
+
+/// MOD-138 M2 D8, blueprint F14: auto mode downgrades every soft gate to `never`, and an
+/// `asks_you` node still stops; approve walks on, and the other steps pass `skipped`.
+async fn auto_mode_never_downgrades_an_asks_you_stop<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Always, |phase| phase.gate_hard = false).await;
+    feat_3_asks_at_plan(&orch).await;
+
+    let (run, rest) = start_in(&orch, ids::HTUI_FEAT_3, RunMode::Auto).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(1), None),
+        "{rest:?}"
+    );
+    let snapshot = snapshot_of(&orch, run).await;
+    assert!(
+        snapshot
+            .phases
+            .iter()
+            .all(|phase| phase.gate_effective == Gate::Never),
+        "auto mode downgraded every gate"
+    );
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        (0..4)
+            .map(|position| at(&steps, position, 1).gate_outcome)
+            .collect::<Vec<_>>(),
+        [
+            Some(GateOutcome::Skipped),
+            Some(GateOutcome::Approved),
+            Some(GateOutcome::Skipped),
+            Some(GateOutcome::Skipped),
+        ]
+    );
+}
+
+/// MOD-138 M2 D7: a back `asks_you` edge `review → plan` loops on approve. The approved `review`
+/// is `done`, the walk owes `Loop`, and the loop retires `plan`, `implement` and `review` (the
+/// region) and walks them again, `review` stopping at attempt 2 with budget left. A reject there
+/// declines the edge and the run finishes.
+async fn a_back_asks_you_approved_loops<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    feat_3_asks_back(&orch, 2).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(3), None),
+        "{rest:?}"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body
+            == "step `review` attempt 1 waits on you: approve takes `plan` (loops back); reject \
+                or accept artifact declines it, and the step's work lands either way; retry \
+                redoes the step"),
+        "{notes:?}"
+    );
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(3), None),
+        "{rest:?}"
+    );
+    assert_eq!(sorted_shape(&orch, run).await, ONE_ASKS_YOU_TURN);
+    assert_eq!(
+        step_at(&orch, run, 3, 1).await.gate_outcome,
+        Some(GateOutcome::Approved),
+        "the approve stays on the retired row"
+    );
+
+    let rest = act(&orch, run, Act::Reject).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "a reject declines the back edge: {rest:?}"
+    );
+    assert_eq!(
+        step_at(&orch, run, 3, 2).await.gate_outcome,
+        Some(GateOutcome::Skipped)
+    );
+}
+
+/// MOD-138 M2 D7, blueprint §2.4: a crash between the approve's `answer_gate` and its unpark
+/// leaves the run parked over a `done` + `approved` `review`, whose cursor is `Loop`, which is
+/// resumable. `Unblock` resumes the run: the unpark, the merge the approve owed, then the loop.
+async fn a_crash_between_an_asks_you_approve_and_its_loop_is_replayed<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    feat_3_asks_back(&orch, 2).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let review = step_at(&orch, run, 3, 1).await;
+    assert!(
+        orch.store()
+            .answer_gate(review.id, GateOutcome::Approved, None, orch.clock().now())
+            .await
+            .expect("MemStore takes the answer"),
+        "the crash: answered, never unparked"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(case, UnblockCase::Resume(run));
+    let rest = rest.expect("the resume case walks the run");
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(3), None),
+        "{rest:?}"
+    );
+    assert_eq!(sorted_shape(&orch, run).await, ONE_ASKS_YOU_TURN);
+    assert!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == review.id),
+        "the approved review's merge was replayed"
+    );
+}
+
+/// MOD-138 M2 D7, blueprint A9: with `loop_limit = 1` the second `review` stops as the
+/// escalation (`asks_you loop exhausted`), the item is not blocked, and approve then walks on:
+/// no `Loop` is owed once the budget is spent, so the run finishes with no third attempt.
+async fn a_spent_back_asks_you_escalates_and_approve_walks_on<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    feat_3_asks_back(&orch, 1).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (
+            RunStatus::AwaitingApproval,
+            Some(3),
+            Some(RunFailure::LoopExhausted {
+                kind: EdgeKind::AsksYou,
+                from: "review".to_owned(),
+                to: "plan".to_owned(),
+                attempts: 2,
+            })
+        ),
+        "{rest:?}"
+    );
+    assert_eq!(sorted_shape(&orch, run).await, ONE_ASKS_YOU_TURN);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "A9: the escalation does not block the item"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body
+            == "asks_you loop exhausted after 2 attempts: `review` to `plan`: phase `plan`, \
+                attempt 2, stop reason `exhausted`"),
+        "{notes:?}"
+    );
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert!(
+        steps_of(&orch, run)
+            .await
+            .iter()
+            .all(|step| step.attempt <= 2),
+        "no third attempt"
+    );
+    assert_eq!(
+        step_at(&orch, run, 3, 2).await.gate_outcome,
+        Some(GateOutcome::Approved)
+    );
+}
+
+/// MOD-138 M2 plan Q-A: a decision is written once and read from its row. `prd` decides on its
+/// changed paths and the run parks at `plan`'s gate; a restarted process (a fresh isolator)
+/// approves it, and walks the stored decision with no second `changed_paths` call, although its
+/// isolator would now answer no paths at all.
+async fn a_branch_decision_is_read_from_its_row_after_a_restart<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let repo = primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        phase.input_kinds.clear();
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    feat_3_diamond(
+        &orch,
+        &serde_json::json!({"any_changed_path_matches": ["src/**"]}),
+    )
+    .await;
+    orch.isolator()
+        .script_changed_paths(changed(repo, &["src/lib.rs"], false));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "{rest:?}"
+    );
+    let decided = Some(serde_json::json!({"plan": true, "implement": false}));
+    assert_eq!(branch_at(&orch, run, 0).await, decided);
+    assert_eq!(orch.isolator().changed_path_requests().len(), 1);
+
+    let other = orch.restarted();
+    other
+        .isolator()
+        .script_changed_paths(ChangedPaths::default());
+    let rest = approve(&other, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert!(
+        other.isolator().changed_path_requests().is_empty(),
+        "the decision was read from its row"
+    );
+    assert_eq!(branch_at(&other, run, 0).await, decided);
+    assert_eq!(
+        sorted_shape(&other, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+}
+
+/// Blueprint A2 (plan Q-B over D8): accept artifact on a node with an `asks_you` edge declines
+/// it. `prd → plan` is `asks_you`; `prd` is promoted and accepted: it lands `done` with
+/// `skipped`, its work is merged, every later node is skipped, and the run finishes.
+async fn accepting_an_artifact_on_an_asks_you_node_declines_its_edges<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    author_edges(
+        &orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::AsksYou, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            (
+                "review",
+                "implement",
+                EdgeKind::ChangesRequested,
+                None,
+                Some(1),
+            ),
+        ],
+    )
+    .await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "{rest:?}"
+    );
+    let prd = step_at(&orch, run, 0, 1).await;
+    promote(&orch, run, prd.id).await;
+    orch.verifier().script_report(FakeVerifier::pass());
+
+    let outcome = accept(&orch, run, prd.id)
+        .await
+        .expect("a promoted step with its document");
+    let CommandOutcome::Accepted { rest } = outcome else {
+        panic!("`AcceptArtifact` answers `Accepted`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_outcome),
+        (StepStatus::Done, Some(GateOutcome::Skipped))
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [(0, 1, StepStatus::Done)],
+        "`plan` and everything after it are skipped"
+    );
+    assert!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == prd.id),
+        "the accepted work landed"
+    );
+}
+
+/// Blueprint A3: a human's reject on a node with both a `changes_requested` and an `asks_you`
+/// edge loops over `changes_requested`, which wins over the decline. FEAT-3's `review` keeps
+/// its review loop and gains a back `asks_you` to `plan`: the reject retires `implement` and the
+/// rejected `review` (not `plan`), and the second `review` stops again.
+async fn a_reject_on_a_verdict_reading_asks_you_node_loops<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "review",
+        "plan",
+        EdgeKind::AsksYou,
+        None,
+        Some(2),
+    )
+    .await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(3)),
+        "the approving review stops at its `asks_you` edge: {rest:?}"
+    );
+
+    let rest = act(&orch, run, Act::Reject).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(3), None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::Done),
+            (3, 1, StepStatus::Cancelled),
+            (3, 2, StepStatus::AwaitingApproval),
+        ]
+    );
+    let review = step_at(&orch, run, 3, 1).await;
+    assert_eq!(
+        (review.gate_outcome, review.gate_note.as_deref()),
+        (Some(GateOutcome::Rejected), Some("not this"))
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -9656,8 +10551,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            127,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            139,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 12: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -9703,7 +10598,12 @@ mod tests {
              edge on a node not called `review`, a `review` with none passing unread, a `fails` \
              loop retiring its region, on a human's reject, replayed after a crash and spent, a \
              diamond's region, no progress on an edge loop, and a graph with authored edges \
-             resolving)"
+             resolving), and MOD-138 M2 T5's twelve `if` and `asks_you` cases (plan D6, D7, D8; \
+             blueprint A2, A3, A9: each `if` predicate, a declined branch and its join, an \
+             undecided branch parked and resumed, a forward `asks_you` approved and rejected, \
+             auto mode's stop, a back `asks_you` loop, its crash replay and its spent budget, a \
+             decision read from its row after a restart, accept declining, and a verdict-reading \
+             `asks_you` node's reject looping)"
         );
     }
 

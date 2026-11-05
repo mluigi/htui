@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        127,
+        139,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -30,7 +30,12 @@ fn cases_len_is_pinned() {
          nine loops over edges (plan D7, D10, Q-D: a `changes_requested` edge on a node not called \
          `review`, a `review` with none passing unread, a `fails` loop retiring its region, on a \
          human's reject, replayed after a crash and spent, a diamond's region, no progress on an \
-         edge loop, and a graph with authored edges resolving) 127"
+         edge loop, and a graph with authored edges resolving) 127, and MOD-138 M2 T5's twelve \
+         `if` and `asks_you` cases (plan D6, D7, D8; blueprint A2, A3, A9: each `if` predicate, a \
+         declined branch and its join, an undecided branch parked and resumed, a forward \
+         `asks_you` approved and rejected, auto mode's stop, a back `asks_you` loop, its crash \
+         replay and its spent budget, a decision read from its row after a restart, accept \
+         declining, and a verdict-reading `asks_you` node's reject looping) 139"
     );
 }
 
