@@ -1075,7 +1075,9 @@ pub trait WriteStore: ReadStore {
     ///    non-divide node);
     /// 8. `Constraint` with
     ///    [`graph_body_walk_refusal`](crate::store::graph_body_walk_refusal)'s sentence (MOD-138
-    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back).
+    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back),
+    ///    then (MOD-138 M2 D4, W4) an `if` edge's predicate outside the closed set
+    ///    ([`if_predicate_outside_the_closed_set`]).
     async fn replace_graph(
         &self,
         graph: StepGraphId,
