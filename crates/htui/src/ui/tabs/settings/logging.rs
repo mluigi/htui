@@ -438,7 +438,7 @@ mod tests {
     use super::LoggingSection;
     use crate::app::{Action, Handled, LoggingAction};
     use crate::logging::{Logging, Startup};
-    use crate::testkit::SectionBench;
+    use crate::testkit::{Harness, SectionBench};
     use crate::ui::tabs::settings::SettingsSection;
 
     /// The width every frame here is drawn at: the widest temporary path still fits one line.
@@ -674,5 +674,31 @@ mod tests {
             .find(|line| line.contains("filter "))
             .unwrap_or_default();
         assert!(row.ends_with(" warn"), "{frame}");
+    }
+
+    /// MOD-122 D5: the product registers `Logging` last, so eleven `l` reach it from Agents.
+    #[tokio::test]
+    async fn the_product_registers_logging_last() {
+        let mut harness = Harness::demo();
+        crate::app::register_all(harness.app());
+        harness.settle().await;
+        // Settings is the fourth tab.
+        harness.key("4");
+        harness.settle().await;
+        for _ in 0..11 {
+            harness.key("l");
+        }
+        harness.settle().await;
+
+        let frame = harness.render();
+        assert!(
+            frame.contains(" Project types  Logging "),
+            "Logging follows Project types: {frame}"
+        );
+        assert!(
+            frame.contains("j/k \u{b7} e edit"),
+            "the active section is Logging: {frame}"
+        );
+        assert!(frame.contains("EnvFilter directive"), "{frame}");
     }
 }

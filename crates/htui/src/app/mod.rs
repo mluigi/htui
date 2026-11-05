@@ -20,7 +20,7 @@ use crate::ui::overlay::{
     WorkspaceSwitcher,
 };
 use crate::ui::tabs::settings::{
-    AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
+    AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, LoggingSection,
     PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
     SecretsSection,
 };
@@ -89,6 +89,8 @@ pub fn register_all(app: &mut App) {
         Box::new(QueueSection::new()),
         // Last (MOD-146 D8): appending moves no existing section's line.
         Box::new(ProjectTypesSection::new()),
+        // Last (MOD-122 D5): appending moves no existing section's line.
+        Box::new(LoggingSection::new(app.logging.control().clone())),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
 
