@@ -9078,7 +9078,7 @@ fn node_id(body: &htui_core::model::GraphBody, name: &str) -> PhaseId {
 }
 
 /// One authored edge `from → to` of `kind` on `item`'s live graph (MOD-138 M2), beside the ones
-/// it has.
+/// it has. `predicate` is `Some` iff `kind` is `if` (the validator refuses anything else).
 ///
 /// # Panics
 /// As [`edit_graph`].
@@ -9088,6 +9088,7 @@ async fn add_edge<O: Orchestrate>(
     from: &str,
     to: &str,
     kind: EdgeKind,
+    predicate: Option<htui_core::model::EdgePredicate>,
     loop_limit: Option<i32>,
 ) {
     edit_graph(orch, item, |body| {
@@ -9098,34 +9099,40 @@ async fn add_edge<O: Orchestrate>(
             from,
             to,
             kind,
-            predicate: None,
+            predicate,
             loop_limit,
         });
     })
     .await;
 }
 
-/// `item`'s live graph with **every** edge replaced by `edges` (`(from, to, kind, loop_limit)`),
-/// the way an author draws a graph that is not a chain.
+/// One edge as [`author_edges`] takes it: `(from, to, kind, predicate, loop_limit)`, the
+/// arguments of [`add_edge`] after the item.
+type AuthoredEdge<'a> = (
+    &'a str,
+    &'a str,
+    EdgeKind,
+    Option<htui_core::model::EdgePredicate>,
+    Option<i32>,
+);
+
+/// `item`'s live graph with **every** edge replaced by `edges`, the way an author draws a graph
+/// that is not a chain. The nodes stay as they are: no T4 case authors one.
 ///
 /// # Panics
 /// As [`edit_graph`].
-async fn author_edges<O: Orchestrate>(
-    orch: &O,
-    item: ItemId,
-    edges: &[(&str, &str, EdgeKind, Option<i32>)],
-) {
+async fn author_edges<O: Orchestrate>(orch: &O, item: ItemId, edges: &[AuthoredEdge<'_>]) {
     edit_graph(orch, item, |body| {
         body.edges = edges
             .iter()
-            .map(|&(from, to, kind, loop_limit)| StepGraphEdge {
+            .map(|(from, to, kind, predicate, loop_limit)| StepGraphEdge {
                 id: EdgeId::new(),
                 graph_id: body.graph.id,
                 from: node_id(body, from),
                 to: node_id(body, to),
-                kind,
-                predicate: None,
-                loop_limit,
+                kind: *kind,
+                predicate: predicate.clone(),
+                loop_limit: *loop_limit,
             })
             .collect();
     })
@@ -9158,6 +9165,7 @@ async fn a_changes_requested_edge_loops_a_node_not_named_review<H: CaseHarness>(
         "audit",
         "implement",
         EdgeKind::ChangesRequested,
+        None,
         Some(1),
     )
     .await;
@@ -9199,9 +9207,9 @@ async fn a_review_with_no_changes_requested_edge_passes_unread<H: CaseHarness>(h
         &orch,
         ids::HTUI_FEAT_3,
         &[
-            ("prd", "plan", EdgeKind::Next, None),
-            ("plan", "implement", EdgeKind::Next, None),
-            ("implement", "review", EdgeKind::Next, None),
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
         ],
     )
     .await;
@@ -9246,6 +9254,7 @@ async fn a_fails_edge_loops_and_retires_its_region<H: CaseHarness>(harness: &H) 
         "review",
         "plan",
         EdgeKind::Fails,
+        None,
         Some(1),
     )
     .await;
@@ -9285,6 +9294,7 @@ async fn a_human_reject_of_a_fails_node_loops<H: CaseHarness>(harness: &H) {
         "plan",
         "prd",
         EdgeKind::Fails,
+        None,
         Some(1),
     )
     .await;
@@ -9316,19 +9326,47 @@ async fn a_human_reject_of_a_fails_node_loops<H: CaseHarness>(harness: &H) {
 /// `fails` loop leaves a `failed` row with no gate note under a `running` run. The adopter's
 /// sweep reaches `settle_failed`, which runs the loop the crash cut short rather than retrying
 /// the step on its own budget.
+///
+/// `apply` writes that `running -> failed` only for a `never` node (an `always` one parks on every
+/// outcome), so `plan` is `never` here, as the crash needs it. `prd` stays `always` only so the
+/// run rests where the hand-built rows begin.
 async fn a_fails_loop_cut_short_is_replayed_by_settle_failed<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
-    free_feat_3(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
     add_edge(
         &orch,
         ids::HTUI_FEAT_3,
         "plan",
         "prd",
         EdgeKind::Fails,
+        None,
         Some(1),
     )
     .await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let blob = run_of(&orch, run)
+        .await
+        .graph_snapshot
+        .expect("the walk created the run with a snapshot");
+    let snapshot: GraphSnapshot =
+        serde_json::from_value(blob).expect("the snapshot decodes as a `GraphSnapshot`");
+    let gate_of = |name: &str| {
+        snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == name)
+            .map(|phase| phase.gate_effective)
+    };
+    assert_eq!(
+        (gate_of("prd"), gate_of("plan")),
+        (Some(Gate::Always), Some(Gate::Never)),
+        "only a `never` node reaches `apply`'s `fails` loop"
+    );
 
     // The rows the crash left: `prd` approved, `plan` failed by the settle, the run `running`.
     let store = orch.store();
@@ -9407,6 +9445,7 @@ async fn a_spent_fails_loop_escalates<H: CaseHarness>(harness: &H) {
         "review",
         "implement",
         EdgeKind::Fails,
+        None,
         Some(1),
     )
     .await;
@@ -9464,11 +9503,11 @@ async fn a_loop_on_a_diamond_retires_only_its_region<H: CaseHarness>(harness: &H
         &orch,
         ids::HTUI_FEAT_3,
         &[
-            ("prd", "plan", EdgeKind::Next, None),
-            ("prd", "implement", EdgeKind::Next, None),
-            ("plan", "review", EdgeKind::Next, None),
-            ("implement", "review", EdgeKind::Next, None),
-            ("review", "plan", EdgeKind::ChangesRequested, Some(1)),
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("prd", "implement", EdgeKind::Next, None, None),
+            ("plan", "review", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            ("review", "plan", EdgeKind::ChangesRequested, None, Some(1)),
         ],
     )
     .await;
@@ -9515,6 +9554,7 @@ async fn an_edge_loop_without_progress_escalates<H: CaseHarness>(harness: &H) {
         "audit",
         "implement",
         EdgeKind::ChangesRequested,
+        None,
         Some(5),
     )
     .await;
@@ -9563,6 +9603,7 @@ async fn a_graph_with_authored_edges_resolves<H: CaseHarness>(harness: &H) {
         "review",
         "plan",
         EdgeKind::AsksYou,
+        None,
         None,
     )
     .await;
