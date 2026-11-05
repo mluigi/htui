@@ -157,7 +157,7 @@ Both keys are generated from htui's key catalogue (the `editor` context: `editor
 The editor waits in its pane, with the tab that asked for it; the rest of htui keeps working.
 
 **The editor's tab stays locked.** On that tab, while htui has the keys, only the editor's keys
-and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `5` (switch tabs), `w`
+and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `6` (switch tabs), `w`
 (switch workspace), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
 `Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
 `the editor is open: Ctrl+4 to the editor · Ctrl+x abort` and never reaches the view: a `Ctrl+S`
