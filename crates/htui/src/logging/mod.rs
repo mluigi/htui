@@ -337,7 +337,7 @@ impl LoggingControl {
         if let Some(by) = state.file_set_by {
             return Err(LoggingError::Overridden(by));
         }
-        let file = match path.map(open_append).transpose() {
+        let file = match path.map(open_regular).transpose() {
             Ok(file) => file,
             Err(err) => {
                 let err = LoggingError::File {
@@ -510,16 +510,11 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Opens `path` to append, creating it, as the `--log` file always was. Only a regular file
-/// (MOD-122 R1): opening a FIFO to write blocks until a reader comes, on the event loop or at
-/// startup, so a path that exists and is something else is refused before it is opened, and on
-/// Unix the open itself cannot block (`O_NONBLOCK`, cleared once the file is known to be one), so
-/// a FIFO put there in between is refused too.
+/// Opens `path` to append, creating it, as the `--log` file always was: a regular file or a
+/// device (`/dev/null`, `/dev/stderr`). On Unix the open itself never blocks (MOD-122 R1):
+/// opening a FIFO to write blocks until a reader comes, so it opens `O_NONBLOCK`, cleared once
+/// open, and a FIFO no one reads is refused at once instead of hanging startup.
 fn open_append(path: &Path) -> io::Result<std::fs::File> {
-    let not_regular = || io::Error::other("not a regular file");
-    if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
-        return Err(not_regular());
-    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -527,15 +522,45 @@ fn open_append(path: &Path) -> io::Result<std::fs::File> {
         &mut options,
         rustix::fs::OFlags::NONBLOCK.bits().cast_signed(),
     );
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(not_regular());
-    }
+    let file = options.open(path).map_err(|err| unread_fifo(path, err))?;
     #[cfg(unix)]
     rustix::fs::fcntl_setfl(
         &file,
         rustix::fs::fcntl_getfl(&file)? - rustix::fs::OFlags::NONBLOCK,
     )?;
+    Ok(file)
+}
+
+/// `ENXIO` from a non-blocking open of a FIFO means no one reads it; anything else stays as is.
+fn unread_fifo(path: &Path, err: io::Error) -> io::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        if rustix::io::Errno::from_io_error(&err) == Some(rustix::io::Errno::NXIO)
+            && std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_fifo())
+        {
+            return io::Error::other("a FIFO no one reads");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    err
+}
+
+/// [`open_append`] for a file set at run time (Settings › Logging, `ui-state.toml`): a regular
+/// file only (MOD-122 R1). A FIFO or a device written from the event loop can stall it, and a
+/// terminal would write over the TUI, so a path that exists and is something else is refused
+/// before it is opened, and one that turns into something else in between is refused after.
+fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    let not_regular = || io::Error::other("not a regular file");
+    if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(not_regular());
+    }
+    let file = open_append(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
     Ok(file)
 }
 
@@ -841,26 +866,19 @@ mod tests {
     }
 
     /// MOD-122 R1: `log` records (sqlx's, among others) pass `log`'s own max level before the
-    /// bridge sees them, so it follows the filter: the widest of the run-time filter and, with
-    /// Sentry on, the startup one.
+    /// bridge sees them. `tracing-subscriber`'s reload sets that level from
+    /// `LevelFilter::current()` (its `tracing-log` feature, on by default), so a run-time filter
+    /// reaches them with nothing of htui's own; this pins it. `LevelFilter::current()` is the
+    /// widest over every live subscriber, so only a raise is certain while other tests run.
     #[test]
-    fn the_log_bridge_level_follows_the_filter() {
+    fn a_reload_raises_the_log_crates_level() {
         let logging = Logging::build(Startup::default()).expect("built");
         let control = logging.control();
-        assert_eq!(control.log_level(), log::LevelFilter::Info);
-        control.set_filter("debug").expect("a valid directive");
-        assert_eq!(control.log_level(), log::LevelFilter::Debug);
         control
             .set_filter("warn,sqlx=trace")
             .expect("a valid directive");
-        assert_eq!(control.log_level(), log::LevelFilter::Trace);
-        control.set_filter("off").expect("a valid directive");
-        assert_eq!(control.log_level(), log::LevelFilter::Off);
-        control.apply_saved(Some(&LoggingPrefs {
-            filter: Some("error".to_owned()),
-            file: None,
-        }));
-        assert_eq!(control.log_level(), log::LevelFilter::Error);
+        assert_eq!(log::max_level(), log::LevelFilter::Trace);
+        drop(logging);
 
         let dir = tempfile::tempdir().expect("a temp dir");
         let with_sentry = Logging::build(Startup {
@@ -872,10 +890,10 @@ mod tests {
             .control()
             .set_filter("off")
             .expect("a valid directive");
-        assert_eq!(
-            with_sentry.control().log_level(),
-            log::LevelFilter::Info,
-            "Sentry's startup filter still wants info"
+        assert!(
+            log::max_level() >= log::LevelFilter::Info,
+            "Sentry's startup filter still wants info: {}",
+            log::max_level()
         );
     }
 
@@ -903,8 +921,32 @@ mod tests {
         assert!(read(&a).contains("to a"));
     }
 
-    /// MOD-122 R1: a FIFO (or any path that is not a regular file) is refused, at once: opening
-    /// one to write blocks until a reader comes, on the event loop or at startup.
+    /// MOD-122 R1: the startup `--log` opens a device as it always did (`/dev/null` keeps Sentry
+    /// on without writing a file); a file set at run time must be a regular one.
+    #[cfg(unix)]
+    #[test]
+    fn a_startup_device_still_opens_and_a_run_time_one_is_refused() {
+        let null = Path::new("/dev/null");
+        let logging = Logging::build(Startup {
+            file: Some(null.to_path_buf()),
+            filter: None,
+        })
+        .expect("`--log /dev/null` opens");
+        assert!(logging.sentry());
+        under(&logging, || tracing::info!(target: "htui::test", "dropped"));
+        assert_eq!(texts(&logging), ["dropped"]);
+
+        let plain = Logging::build(Startup::default()).expect("built");
+        let err = plain
+            .control()
+            .set_file(Some(null))
+            .expect_err("a device is refused at run time");
+        assert!(err.to_string().contains(": not a regular file;"), "{err}");
+    }
+
+    /// MOD-122 R1: a FIFO is refused at once: opening one to write blocks until a reader comes,
+    /// on the event loop or at startup. At run time any path that is not a regular file is
+    /// refused; at startup the open cannot block, so a FIFO no one reads is refused there.
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_refused_without_blocking() {
@@ -927,7 +969,10 @@ mod tests {
             filter: None,
         })
         .expect_err("at startup too");
-        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("a FIFO no one reads"),
+            "{err:#}"
+        );
     }
 
     /// MOD-122 R1: a filter set after the subscriber was dropped says so.
