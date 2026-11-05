@@ -95,10 +95,13 @@ impl LoggingDto {
     fn of(prefs: &LoggingPrefs) -> Self {
         Self {
             filter: prefs.filter.clone(),
+            // Settings › Logging refuses a path that is not UTF-8 (MOD-122 R1); were one to come
+            // here, it is left out: written lossily, it would name another file.
             file: prefs
                 .file
                 .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+                .and_then(|path| path.to_str())
+                .map(str::to_owned),
         }
     }
 
@@ -899,6 +902,28 @@ cap = 50
             render(&empty),
             "version = 1\n",
             "an empty table is not written"
+        );
+    }
+
+    /// MOD-122 R1: Settings refuses a log file whose path is not UTF-8; were one to reach the
+    /// file, it is left out rather than written lossily, which would name another file.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_file_that_is_not_utf8_is_left_out() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let state = UiState {
+            logging: Some(LoggingPrefs {
+                filter: Some("warn".to_owned()),
+                file: Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+                    b"/tmp/caf\xe9.log",
+                ))),
+            }),
+            ..UiState::default()
+        };
+        assert_eq!(
+            render(&state),
+            "version = 1\n\n[logging]\nfilter = \"warn\"\n"
         );
     }
 

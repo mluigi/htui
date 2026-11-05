@@ -16,7 +16,7 @@
 //! force (MD-A); `e` edits, and `Enter` is no view default here (B7).
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyEvent;
 use htui_core::model::Scope;
@@ -54,8 +54,8 @@ pub const FILTER_HELP: &str = "which lines htui keeps, as an EnvFilter directive
     htui=debug,sqlx=warn; applied at once and kept in ui-state.toml";
 
 /// The log file row's help.
-pub const FILE_HELP: &str = "a file htui appends its log to, as --log does; empty writes none; \
-    applied at once and kept in ui-state.toml";
+pub const FILE_HELP: &str = "a file htui appends its log to, as --log does (~/ is your home \
+    directory); empty writes none; applied at once and kept in ui-state.toml";
 
 /// What the log file row shows with no file.
 const NO_FILE: &str = "none";
@@ -72,12 +72,37 @@ fn overridden(by: &str, row: Row) -> String {
     )
 }
 
-/// A typed log file made absolute against the directory htui runs in, so the path saved to
+/// A typed log file as the path to save: a leading `~/` is `home`, as in a shell (MOD-122 R1),
+/// then the path is made absolute against the directory htui runs in, so the path saved to
 /// `ui-state.toml` names the same file whichever directory the next session starts from.
 /// Without a current directory to resolve against, the path stays as typed.
-fn absolute(text: String) -> PathBuf {
-    std::path::absolute(&text).unwrap_or_else(|_| PathBuf::from(text))
+///
+/// # Errors
+///
+/// A `~/` with no home directory, or a path that is not UTF-8 (a home or a current directory
+/// that is not): `ui-state.toml` keeps it as text, so it could not be kept as the same file.
+fn resolve(text: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    let rest = text
+        .strip_prefix("~/")
+        .or_else(|| text.strip_prefix(HOME_PREFIX_ALT));
+    let typed = match rest {
+        Some(rest) => home
+            .ok_or_else(|| "there is no home directory to put in place of `~`".to_owned())?
+            .join(rest),
+        None => PathBuf::from(text),
+    };
+    let path = std::path::absolute(&typed).unwrap_or(typed);
+    if path.to_str().is_none() {
+        return Err(format!(
+            "the path {} is not UTF-8, which ui-state.toml cannot keep",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
+
+/// Windows' own separator after `~`, beside `~/`; on Unix `\\` is a name's character.
+const HOME_PREFIX_ALT: &str = if cfg!(windows) { "~\\" } else { "~/" };
 
 /// One row of the section, in screen order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +223,8 @@ pub struct LoggingSection {
     mode: Mode,
     /// The last outcome, on the notice row under the form.
     notice: Option<Notice>,
+    /// What a typed `~/` stands for (`dirs::home_dir`); a test sets its own.
+    home: Option<PathBuf>,
     /// `(total rows, offset)` as of the last render, for the Settings pane's scrollbar.
     scroll: Cell<Option<ScrollSpan>>,
 }
@@ -214,6 +241,7 @@ impl LoggingSection {
             cursor: 0,
             mode: Mode::Browse,
             notice: None,
+            home: dirs::home_dir(),
             scroll: Cell::new(None),
         }
     }
@@ -272,8 +300,9 @@ impl LoggingSection {
 
     /// `Enter` in the editor, the text trimmed. The filter: empty is [`DEFAULT_FILTER`], and a
     /// directive [`logging::parse_filter`] refuses keeps the editor open and sends nothing. The
-    /// file: empty is no file, and a relative path is taken from the directory htui runs in
-    /// ([`absolute`]); opening it is the control's, through `App`.
+    /// file: empty is no file, `~/` is the home directory, and a relative path is taken from the
+    /// directory htui runs in; one [`resolve`] refuses keeps the editor open and sends nothing.
+    /// Opening it is the control's, through `App`.
     fn submit(&mut self, ctx: &Ctx<'_>) {
         let Mode::Editing(editor) = &self.mode else {
             return;
@@ -292,7 +321,14 @@ impl LoggingSection {
                 }
                 LoggingAction::Filter(directive)
             }
-            Row::File => LoggingAction::File((!text.is_empty()).then(|| absolute(text))),
+            Row::File if text.is_empty() => LoggingAction::File(None),
+            Row::File => match resolve(&text, self.home.as_deref()) {
+                Ok(path) => LoggingAction::File(Some(path)),
+                Err(why) => {
+                    self.notice = Some(Notice::Error(why));
+                    return;
+                }
+            },
         };
         self.mode = Mode::Browse;
         self.notice = None;
@@ -443,7 +479,7 @@ impl SettingsSection for LoggingSection {
 mod tests {
     use std::path::Path;
 
-    use super::LoggingSection;
+    use super::{LoggingSection, resolve};
     use crate::app::{Action, Handled, LoggingAction};
     use crate::logging::{Logging, Startup};
     use crate::testkit::{Harness, SectionBench};
@@ -659,6 +695,62 @@ mod tests {
         assert_eq!(
             emitted(&bench),
             [LoggingAction::File(Some(here.join("logs/htui.log")))]
+        );
+    }
+
+    /// MOD-122 R1: a leading `~/` is the home directory, as in a shell; a `~` anywhere else is
+    /// a name like any other.
+    #[tokio::test]
+    async fn a_home_relative_file_path_is_emitted_under_the_home_directory() {
+        let bench = SectionBench::new().await;
+        let (_logging, mut section) = detached();
+        let home = std::env::current_dir()
+            .expect("the current directory")
+            .join("home-mod122");
+        section.home = Some(home.clone());
+
+        bench.key(&mut section, "j");
+        bench.key(&mut section, "e");
+        retype(&bench, &mut section, 0, "~/logs/htui.log");
+        bench.key(&mut section, "enter");
+
+        assert_eq!(
+            emitted(&bench),
+            [LoggingAction::File(Some(home.join("logs/htui.log")))]
+        );
+        let here = std::env::current_dir().expect("the current directory");
+        assert_eq!(resolve("a~/b.log", None), Ok(here.join("a~/b.log")));
+        assert_eq!(resolve("~b.log", None), Ok(here.join("~b.log")));
+        assert_eq!(
+            resolve("~/b.log", None),
+            Err("there is no home directory to put in place of `~`".to_owned())
+        );
+    }
+
+    /// MOD-122 R1: `ui-state.toml` keeps a path as text, so a path that is not UTF-8 (here, a
+    /// home directory that is not) is refused with a notice rather than saved as another file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_that_is_not_utf8_is_refused_and_emits_nothing() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let bench = SectionBench::new().await;
+        let (_logging, mut section) = detached();
+        section.home = Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/home/caf\xe9",
+        )));
+
+        bench.key(&mut section, "j");
+        bench.key(&mut section, "e");
+        retype(&bench, &mut section, 0, "~/htui.log");
+        bench.key(&mut section, "enter");
+
+        assert!(emitted(&bench).is_empty());
+        assert!(section.captures_input(), "the editor stays open");
+        let frame = bench.render_section(&section, WIDTH);
+        assert!(
+            frame.contains("is not UTF-8, which ui-state.toml cannot keep"),
+            "{frame}"
         );
     }
 
