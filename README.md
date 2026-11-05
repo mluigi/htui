@@ -105,7 +105,7 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
 | `--json` | With `--search-items`: print one JSON document instead of lines. See [Scripting htui](#scripting-htui). |
 | `--cwd <PATH>` | With `--search-items`: only the project whose repository, registered on this machine, contains `PATH`. Cannot be combined with `--project`. |
-| `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app (`htui worker`, which has none, logs to standard error without it). |
+| `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app (`htui worker`, which has none, logs to standard error without it). The TUI keeps its log in memory either way, and **Settings › Logging** sets the filter and a log file while it runs; `--log` and `HTUI_LOG_FILTER` win over those for the session. |
 | `worker [--pool-size N] [--dsn-stdin] [--log PATH]` | Run this machine's runs with no terminal, so they outlive the TUI: `htui worker`. Needs the box's executor set to `worker` in **Settings › Boxes**; no other option may be given beside it, and `--log` goes after `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md). |
 | `provision <DESTINATION> [--dsn-stdin] [--replace-credential] [--log PATH]` | Install this build as the `htui-worker` service on another Linux machine over `ssh`, with the DSN encrypted there by `systemd-creds`, and set that box's executor to `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md#provisioning-a-remote-box). |
 | `status [--json] [--project SLUG \| --cwd PATH] [--log PATH]` | Print the top bar's facts and exit: the workspace, this machine, and how many runs are working and how many things wait on you. Reads only. See [Scripting htui](#scripting-htui). |
@@ -186,7 +186,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
 | **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
-| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile and agent personas. |
+| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
 | **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
 | **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow. |
 
@@ -447,6 +447,7 @@ scrolling up pauses following, so the lines you are reading stay put.
 | **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
 | **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), and a fresh check of its tools (`p`). |
 | **Personas** | Agent personas: create (`n`), edit the fields (`e`), the body (`b`) and the permission rules (`r`), delete (`d`), and import `.md` persona files (`I`). See [`docs/personas.md`](docs/personas.md). |
+| **Logging** | Which lines `htui` keeps (the filter, an `EnvFilter` directive such as `info` or `htui=debug`) and a file to append its log to (`e` edits). Both apply at once and are kept in `ui-state.toml`; a field set by `--log` or `HTUI_LOG_FILTER` says so and cannot be changed here for that session. |
 
 Deleting in **Hierarchy** shows what would be removed and asks you to type a confirmation, because
 it cannot be undone.

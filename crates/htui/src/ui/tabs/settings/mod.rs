@@ -4,9 +4,10 @@
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
 //! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2),
-//! MOD-10's secret provider (`Secrets`, milestone 4), MOD-12's queue caps (`Queue`, milestone 2)
-//! and MOD-146's project types (`Project types`) each want a section of this tab, and each should
-//! be a file plus one `register` line rather than a `match` arm growing in here.
+//! MOD-10's secret provider (`Secrets`, milestone 4), MOD-12's queue caps (`Queue`, milestone 2),
+//! MOD-146's project types (`Project types`) and MOD-122's log settings (`Logging`) each want a
+//! section of this tab, and each should be a file plus one `register` line rather than a `match`
+//! arm growing in here.
 //! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
@@ -17,6 +18,8 @@ pub mod boxes;
 pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
+/// The logging section (MOD-122).
+pub mod logging;
 pub mod personas;
 pub mod project_types;
 pub mod prompt;
@@ -46,6 +49,7 @@ pub use boxes::BoxesSection;
 pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
+pub use logging::LoggingSection;
 pub use personas::PersonasSection;
 pub use project_types::ProjectTypesSection;
 pub use prompt::PromptSection;
@@ -216,7 +220,7 @@ pub(crate) fn changed_elsewhere(retry: Option<&str>) -> String {
 }
 
 /// What the pane says with no section registered (only a test registers none; `register_all`
-/// registers ten).
+/// registers twelve).
 const NO_SECTIONS: &str = "No settings sections in this build.";
 /// The next step of [`NO_SECTIONS`].
 const NO_SECTIONS_NEXT: &str = "Install a build of htui that registers them.";

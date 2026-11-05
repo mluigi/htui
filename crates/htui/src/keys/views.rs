@@ -493,6 +493,18 @@ pub const PROJECT_TYPES_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// Settings › Logging, browsing (MOD-122 D5): no own action, so `[settings.logging]` holds
+/// overrides only; `e` edits the row under the cursor (no `Enter` view default, B7). An open
+/// editor is [`CAPTURE`]'s.
+pub const LOGGING_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsLogging, &[]),
+    SETTINGS,
+    Layer::only(Context::Common, &[Act::Edit, Act::Dismiss]),
+    LIST,
+    HISTORY,
+    GLOBAL,
+]);
+
 /// The concepts search overlay: its query field captures, so `?` is text and `F1` is help.
 pub const CONCEPTS_QUERY: Stack<'static> = Stack::new(&[
     Layer::view(
@@ -1118,6 +1130,7 @@ mod tests {
         source!("ui/tabs/settings/qdrant.rs"),
         source!("ui/tabs/settings/queue.rs"),
         source!("ui/tabs/settings/project_types.rs"),
+        source!("ui/tabs/settings/logging.rs"),
         source!("ui/tabs/settings/secrets.rs"),
         source!("ui/overlay/abort_confirm.rs"),
         source!("ui/overlay/concepts_search.rs"),
@@ -1235,6 +1248,7 @@ mod tests {
         SECRETS_CONFIRM,
         QUEUE_BROWSE,
         PROJECT_TYPES_BROWSE,
+        LOGGING_BROWSE,
         CONCEPTS_QUERY,
         SWITCHER,
         MIGRATION,
@@ -1303,6 +1317,7 @@ mod tests {
         ("SECRETS_BROWSE", &[SETTINGS_TAB_RS]),
         ("QUEUE_BROWSE", &[SETTINGS_TAB_RS]),
         ("PROJECT_TYPES_BROWSE", &[SETTINGS_TAB_RS]),
+        ("LOGGING_BROWSE", &[SETTINGS_TAB_RS]),
         ("LIBRARY_BROWSE", &[SKILLS_TAB_RS]),
         ("LIBRARY_REPORT", &[SKILLS_TAB_RS]),
         ("ATTACH_BROWSE", &[SKILLS_TAB_RS]),
@@ -1393,6 +1408,12 @@ mod tests {
         assert_eq!(resolve(PROJECT_TYPES_BROWSE, "k"), [Act::ListUp]);
         assert_eq!(resolve(PROJECT_TYPES_BROWSE, "l"), [Act::NextSection]);
         assert_eq!(resolve(PROJECT_TYPES_BROWSE, "enter"), []);
+        // MOD-122 B7: `e` edits, `Enter` is no view default here.
+        assert_eq!(resolve(LOGGING_BROWSE, "e"), [Act::Edit]);
+        assert_eq!(resolve(LOGGING_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(LOGGING_BROWSE, "l"), [Act::NextSection]);
+        assert_eq!(resolve(LOGGING_BROWSE, "esc"), [Act::Dismiss]);
+        assert_eq!(resolve(LOGGING_BROWSE, "enter"), []);
         assert_eq!(resolve(MIGRATION, "Y"), [Act::ConfirmYes]);
         assert_eq!(resolve(MIGRATION, "N"), [Act::ConfirmNo]);
         assert_eq!(resolve(PERSONAS_REPORT, "enter"), [Act::Back]);
@@ -1900,9 +1921,9 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D4: the Logs
-        // tab's the 77th.
-        assert_eq!(views.len(), 77);
+        // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
+        // Settings > Logging's the 77th, D4: the Logs tab's the 78th.
+        assert_eq!(views.len(), 78);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

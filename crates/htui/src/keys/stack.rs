@@ -270,6 +270,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in a Secrets question", views::SECRETS_CONFIRM),
     ("in Settings > Queue", views::QUEUE_BROWSE),
     ("in Settings > Project types", views::PROJECT_TYPES_BROWSE),
+    ("in Settings > Logging", views::LOGGING_BROWSE),
     ("in the concepts search", views::CONCEPTS_QUERY),
     ("in the workspace switcher", views::SWITCHER),
     ("in the migration prompt", views::MIGRATION),
@@ -422,11 +423,12 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        // MOD-115 M2 T6: the quit question's entry went with it.
-        assert_eq!(DECLARED.len(), 84);
-        assert_eq!(DECLARED[82], ("in the leave dialog", views::LEAVE));
+        // MOD-115 M2 T6: the quit question's entry went with it; MOD-122 D5 adds Settings >
+        // Logging's before it.
+        assert_eq!(DECLARED.len(), 85);
+        assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
-        assert_eq!(DECLARED[83], ("in Logs", views::LOGS_BROWSE));
+        assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");

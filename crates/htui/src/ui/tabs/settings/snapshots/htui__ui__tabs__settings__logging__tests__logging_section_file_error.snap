@@ -1,0 +1,10 @@
+---
+source: crates/htui/src/ui/tabs/settings/logging.rs
+expression: frame
+---
+▌filter      info
+             which lines htui keeps, as an EnvFilter directive such as info or htui=debug,sqlx=warn; applied at once and
+             kept in ui-state.toml
+ log file    none
+             cannot open the log file no-such-dir-mod122/htui.log: No such file or directory (os error 2); the previous
+             one stays

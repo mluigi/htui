@@ -664,7 +664,7 @@ impl LoggingSection {
 - **Browse keys** (`ctx.keys().actions(views::LOGGING_BROWSE, ctx.pressed(&key))`): `Edit` → refuse when the row's `*_set_by` is `Some(by)` with `overridden(by, row)` (B5) else open `TextField::with_text(current)` (the file row empty when none); `ListDown`/`ListUp` move the cursor; `Dismiss` clears a notice.
 - **Submit** (`FieldOutcome::Submit`), text trimmed:
   - Filter: empty → `DEFAULT_FILTER`. `logging::parse_filter(text)`: `Err(e)` → `Notice::Error(e.to_string())`, editor stays open, **nothing emitted**; `Ok` → `ctx.emit(Action::Logging(LoggingAction::Filter(text)))`, back to browse, notice cleared.
-  - File: empty → `ctx.emit(Action::Logging(LoggingAction::File(None)))`; else `File(Some(PathBuf::from(text)))`. Opening is the control's (via `App`): a refusal shows on the status line and as `state().file_error` under the row.
+  - File: empty → `ctx.emit(Action::Logging(LoggingAction::File(None)))`; else `File(Some(PathBuf::from(text)))`, made absolute first (implementation, `fc4edd66`: `std::path::absolute` against the directory htui runs in, so the path saved to `ui-state.toml` names the same file whichever directory the next session starts from; as typed when there is no current directory). Opening is the control's (via `App`): a refusal shows on the status line and as `state().file_error` under the row.
   - `FieldOutcome::Cancel` → browse; `Pass` → `modal_rest(views::CAPTURE, ctx.pressed(&key))`.
 - **Render**: one `kit::form` (`Form::new().label_width(10).focus(cursor).editing(editing)`), then the notice row, as `queue.rs:640-713`:
   - `filter`: `ReadOnly(state.filter)` plus `" \u{b7} set by {by}"` when overridden; help (focused) `FILTER_HELP` or `overridden(by, Filter)`.
@@ -701,7 +701,8 @@ The control comes from `Logging::detached()` (no subscriber), or from `Logging::
 | `editing_the_filter_to_a_valid_directive_emits_it` | `e`, type `debug`, `enter` → `drained() == [Action::Logging(Filter("debug"))]`, browse |
 | `an_invalid_directive_is_refused_and_emits_nothing` | `htui=[` → error notice naming it, editor open, `drained()` empty |
 | `an_empty_filter_emits_the_default` | → `Filter("info")` |
-| `a_file_path_is_emitted_as_typed_and_clearing_it_emits_no_file` | `File(Some(p))` (trimmed), then `File(None)` |
+| `an_absolute_file_path_is_emitted_trimmed_and_clearing_it_emits_no_file` | `File(Some(p))` (trimmed), then `File(None)` |
+| `a_relative_file_path_is_emitted_absolute` | a relative path is made absolute before it is emitted (`fc4edd66`) |
 | `an_overridden_field_refuses_the_edit_and_says_why` | `e` on each overridden row → notice, no editor, nothing emitted |
 | `the_section_shows_the_applied_value_on_the_next_frame` | `control.set_filter("warn")` directly → render shows `warn` |
 | `the_product_registers_logging_last` | `Harness::demo()` + `register_all` + `4` + eleven `l`: frame contains `" Project types  Logging "` and the browse hint |

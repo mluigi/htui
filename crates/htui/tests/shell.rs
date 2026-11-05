@@ -54,7 +54,7 @@ fn top_bar(frame: &str) -> String {
 }
 
 /// The header drawn 160 columns wide, then the harness back at the default 100x30. At 100 the
-/// five tab chips and `? keys` leave no room for the working count and the store label.
+/// six tab chips and `? keys` leave no room for the working count and the store label.
 fn wide_header(harness: &mut Harness) -> String {
     harness.resize(160, 30);
     let header = top_bar(&harness.render());
