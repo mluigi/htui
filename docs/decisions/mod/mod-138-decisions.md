@@ -189,3 +189,15 @@ On `hr/MOD-138` from `d114f91f`:
 - T4: `be89571d`..`41568891`;
 - T5: `065ea71d`..`1adff2c5`;
 - R1: `54feef88`..`ac4e2cd5`.
+
+## Milestone 2 gate
+
+`bash scripts/gate.sh` on `08908240` (the R1 tree plus docs):
+- **Passed:** fmt; clippy, with all features and without; the Postgres probe; abort-grep (SIGABRT 0);
+  migrations; the workflow-docs validator; the plugin suite. 146 test binaries are green.
+- **Failed:** only the sandbox's Qdrant timeouts (`create collection` / `create payload index ... Timeout
+  expired`): `qdrant_live` (16 of 20), `qdrant_worker` (2) and `state_cli_pg`
+  `a_search_over_an_index_answers_in_scope`. None runs M2 code.
+- **`cargo sqlx prepare --check`:** clean against a migrated scratch database (R1).
+- **Owed on the host:** the Qdrant suites, and the real Postgres gate on the merged tree.
+
