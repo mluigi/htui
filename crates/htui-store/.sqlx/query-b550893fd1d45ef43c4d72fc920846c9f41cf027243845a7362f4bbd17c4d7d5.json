@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS ( SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id WHERE s.id = $1 AND s.status = 'done' AND s.branch IS NULL AND r.lease_owner IS NOT DISTINCT FROM $3 FOR NO KEY UPDATE OF s FOR SHARE OF r) UPDATE run_step SET branch = $2 FROM locked WHERE run_step.id = locked.id AND run_step.branch IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b550893fd1d45ef43c4d72fc920846c9f41cf027243845a7362f4bbd17c4d7d5"
+}

@@ -306,6 +306,9 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<()> {
         WriteStore::record_commits(self, fence, step, commits).await
     }
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        WriteStore::record_branch(self, fence, step, branch).await
+    }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await
     }
@@ -695,6 +698,9 @@ impl htui_core::store::WorkerStore for Writer {
         commits: &[RunStepCommit],
     ) -> Result<()> {
         WriteStore::record_commits(self, fence, step, commits).await
+    }
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        WriteStore::record_branch(self, fence, step, branch).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await

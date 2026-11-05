@@ -1792,6 +1792,21 @@ pub trait WriteStore: ReadStore {
         commits: &[RunStepCommit],
     ) -> Result<()>;
 
+    /// MOD-138 M2 D5 (Q-A): `run_step.branch = branch`, the `if` decision of a done step; written
+    /// once, under `fence`, as [`pass_step`](Self::pass_step) is. `updated_at` moves (Postgres'
+    /// trigger; `MemStore`: its clock). The first decision wins, so every reader, offline ones
+    /// included, reads the same answer and a replayed decision writes nothing.
+    ///
+    /// # Errors
+    /// In this order: [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`branch_is_not_an_object_of_booleans`]) when `branch` is not an object whose every
+    /// member is a boolean ([`branch_refusal`]), judged before any read;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the step's run does not carry
+    /// `fence`'s lease. `Ok(false)`: the step is not `done`, or its `branch` is already set;
+    /// nothing is written.
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool>;
+
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
     ///
@@ -3255,6 +3270,26 @@ pub fn if_predicate_outside_the_closed_set(
         "the `if` edge from `{from}` to `{to}` in graph `{graph}` has a predicate outside the \
          closed set: {reason}"
     )
+}
+
+/// MOD-138 M2 D5: [`WriteStore::record_branch`]'s value is not an object whose every member is
+/// `true` or `false`.
+#[must_use]
+pub fn branch_is_not_an_object_of_booleans(step: StepId) -> String {
+    format!("run_step {step}: branch must be a JSON object whose every member is true or false")
+}
+
+/// MOD-138 M2 D5: [`WriteStore::record_branch`]'s value check, [`branch_is_not_an_object_of_booleans`]
+/// unless `branch` is an object whose every member is a JSON boolean. Both stores judge it here,
+/// before any read, so they refuse in the same words; Postgres' `chk_run_step_branch` is the
+/// backstop. A member holding an array (`{"a": [true]}`, `{"a": []}`) is refused, as that CHECK's
+/// `strict` jsonpath refuses it.
+#[must_use]
+pub fn branch_refusal(step: StepId, branch: &Value) -> Option<String> {
+    match branch {
+        Value::Object(members) if members.values().all(Value::is_boolean) => None,
+        _ => Some(branch_is_not_an_object_of_booleans(step)),
+    }
 }
 
 // ---- MOD-38: ANA-11's refusals ----
