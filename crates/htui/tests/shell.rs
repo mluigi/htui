@@ -540,6 +540,9 @@ async fn f9_toggles_the_about_panel_under_the_header() {
 #[tokio::test]
 async fn the_header_chips_follow_the_overlay_stack() {
     let mut harness = open_over_demo().await;
+    // MOD-122 D4: the sixth chip (`  ⁶Logs`, seven cells) leaves 100 columns no room for
+    // `F9 about`, so the header is read seven columns wider: the room it had before.
+    harness.resize(107, 30);
     let header = top_bar(&harness.render());
     assert!(
         !header.contains("about") && !header.contains("F9") && header.ends_with(" ?  keys"),
@@ -551,6 +554,7 @@ async fn the_header_chips_follow_the_overlay_stack() {
     assert!(header.ends_with(" F9  about   ?  keys"), "{header}");
 
     let mut harness = shell_reporting("online", Some(3)).await;
+    harness.resize(107, 30);
     let header = top_bar(&harness.render());
     assert!(
         !header.contains("about") && header.ends_with(" ?  keys"),

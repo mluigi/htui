@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
 ╭─────────── Skills  Templates ╮╭─ implement v1 (head v1) ─────────────────────────────────────────╮
 │ vulkan-tutorials             ││You are running the `implement` phase for {{item_key}}, attempt   │
 │   fix           v1   phase   ││{{attempt}}.                                                      │

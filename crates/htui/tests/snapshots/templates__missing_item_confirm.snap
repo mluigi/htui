@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           0 waiting ·  F1  keys
 ╭─ triage · new, saves v1 ──────────────── Skills  Templates ╮╭─ phase placeholders ───────────────╮
 │Triage {{item_key}}                                         ││{{item_key}} scalar                 │
 │                                                            ││{{item_title}} scalar               │

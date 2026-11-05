@@ -2,7 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           0 waiting ·  F1  keys
 ╭─ rust-style · editing from v2, saves v4 · ~42 tokens ───────────────────────── Skills  Templates ╮
 │XPrefer `expect` with a reason. One error enum per crate.                                         │
 │                                                                                                  │

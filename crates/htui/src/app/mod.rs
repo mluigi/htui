@@ -24,7 +24,7 @@ use crate::ui::tabs::settings::{
     PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
     SecretsSection,
 };
-use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsTab};
+use crate::ui::tabs::{BacklogTab, ChatTab, LogsTab, RequirementsTab, SettingsTab, SkillsTab};
 
 /// Registers every tab and every overlay factory, and names the workspace switcher as the
 /// startup overlay.
@@ -36,7 +36,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///
 /// 1. Backlog, Skills, Requirements and Settings are registered. Registration order is tab-strip
 ///    order and `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
-///    Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2).
+///    Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2). Chat follows them
+///    and, last, Logs (MOD-122 D4), so appending it moves no tab's digit.
 /// 2. The switcher's factory goes in under its own [`OverlayId`](crate::ui::overlay::OverlayId)
 ///    and global `w` is **offered** ([`App::offer`] with [`Act::Workspaces`], MOD-67 D5) rather
 ///    than mapped by the shell, because it names an overlay, and the shell must not know which
@@ -91,6 +92,8 @@ pub fn register_all(app: &mut App) {
         Box::new(ProjectTypesSection::new()),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
+    // Last (MOD-122 D4): `6`, so no tab's digit moves. The buffer is the one `run` installed.
+    app.register_tab(Box::new(LogsTab::new(app.logging.buffer().clone())));
 
     app.overlay_factories
         .register(WorkspaceSwitcher::ID, || Box::new(WorkspaceSwitcher::new()));

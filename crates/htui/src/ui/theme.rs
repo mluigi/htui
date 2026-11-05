@@ -17,8 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 
 /// The accent each main tab draws its focused pane border and header chip with (MOD-115).
-/// Reserved workspaces and logs tabs have theirs here too, so the ids are fixed before those
-/// tabs exist.
+/// The reserved workspaces tab has its own here too, so the id is fixed before that tab exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabAccents {
     /// The backlog tab.
@@ -33,7 +32,7 @@ pub struct TabAccents {
     pub requirements: Style,
     /// The reserved workspaces tab.
     pub workspaces: Style,
-    /// The reserved logs tab.
+    /// The logs tab (MOD-122).
     pub logs: Style,
 }
 
