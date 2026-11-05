@@ -765,8 +765,8 @@ pub const CASES: &[&str] = &[
     // undecided branch parks and resumes; an `asks_you` node always stops, approve takes its
     // edges and reject or accept declines them with the work landed, auto mode keeps the stop; a
     // back `asks_you` loops on approve, is replayed after a crash and escalates once spent; a
-    // decision is read from its row after a restart; and a verdict-reading `asks_you` node's
-    // reject loops.
+    // decision is read from its row after a restart; a verdict-reading `asks_you` node's reject
+    // loops; and a reject of a failed settle's park on an `asks_you` node is the ordinary one.
     "each_if_predicate_decides_from_its_facts",
     "a_declined_if_branch_is_skipped_and_the_join_runs",
     "an_undecided_branch_parks_on_an_isolator_error_and_unblock_resumes_it",
@@ -779,6 +779,7 @@ pub const CASES: &[&str] = &[
     "a_branch_decision_is_read_from_its_row_after_a_restart",
     "accepting_an_artifact_on_an_asks_you_node_declines_its_edges",
     "a_reject_on_a_verdict_reading_asks_you_node_loops",
+    "a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run",
 ];
 
 /// Run one case by name.
@@ -1312,6 +1313,9 @@ fn branch_case<'a, H: CaseHarness>(
         "a_reject_on_a_verdict_reading_asks_you_node_loops" => {
             Box::pin(a_reject_on_a_verdict_reading_asks_you_node_loops(harness))
         }
+        "a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run" => Box::pin(
+            a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run(harness),
+        ),
         _ => return None,
     })
 }
@@ -10527,6 +10531,71 @@ async fn a_reject_on_a_verdict_reading_asks_you_node_loops<H: CaseHarness>(harne
     );
 }
 
+/// MOD-138 M2 D8 ("on a failed settle its own gate applies"): only the stop of an `ok` settle
+/// declines on a reject. `plan → implement` is `asks_you` and `plan` gates `always`; `plan`
+/// refuses, so it parks at its own gate with no stop note, and a human's reject there is the
+/// ordinary one (blueprint A3, with no `changes_requested` or `fails` edge out of `plan`): the
+/// step is `failed` with `rejected`, the run ends `rejected: plan`, and none of `plan`'s work
+/// lands.
+async fn a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    feat_3_asks_at_plan(&orch).await;
+    orch.script(
+        "plan",
+        1,
+        ScriptedStep::failing(htui_agent::event::StopReason::Refusal),
+    );
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (RunStatus::AwaitingApproval, Some(1), None),
+        "the failed `plan` parks at its own gate: {rest:?}"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        !notes.iter().any(|body| body.contains(" waits on you: ")),
+        "a failed settle writes no stop note: {notes:?}"
+    );
+
+    let rest = act(&orch, run, Act::Reject).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (
+            RunStatus::Failed,
+            Some(1),
+            Some(RunFailure::Rejected {
+                phase: "plan".to_owned()
+            })
+        ),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [(0, 1, StepStatus::Done), (1, 1, StepStatus::Failed)]
+    );
+    let plan = step_at(&orch, run, 1, 1).await;
+    assert_eq!(
+        (plan.gate_outcome, plan.gate_note.as_deref()),
+        (Some(GateOutcome::Rejected), Some("not this"))
+    );
+    assert!(
+        !orch
+            .isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == plan.id),
+        "the failed step's work did not land"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -10551,8 +10620,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            139,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 12: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            140,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -10598,12 +10667,12 @@ mod tests {
              edge on a node not called `review`, a `review` with none passing unread, a `fails` \
              loop retiring its region, on a human's reject, replayed after a crash and spent, a \
              diamond's region, no progress on an edge loop, and a graph with authored edges \
-             resolving), and MOD-138 M2 T5's twelve `if` and `asks_you` cases (plan D6, D7, D8; \
+             resolving), and MOD-138 M2 T5's thirteen `if` and `asks_you` cases (plan D6, D7, D8; \
              blueprint A2, A3, A9: each `if` predicate, a declined branch and its join, an \
              undecided branch parked and resumed, a forward `asks_you` approved and rejected, \
              auto mode's stop, a back `asks_you` loop, its crash replay and its spent budget, a \
-             decision read from its row after a restart, accept declining, and a verdict-reading \
-             `asks_you` node's reject looping)"
+             decision read from its row after a restart, accept declining, a verdict-reading \
+             `asks_you` node's reject looping, and a failed settle's park rejected as ever)"
         );
     }
 

@@ -13,9 +13,9 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
-    BatchId, BoxId, Document, EdgeKind, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId,
-    Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId, StepStatus,
-    UserId, VerifyOutcome,
+    BatchId, BoxId, Document, EdgeKind, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, Note,
+    NoteId, Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId,
+    StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::store::{ParkOutcome, StepFence, StoreError};
@@ -570,8 +570,10 @@ pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
 /// edge after an `ok` settle.
 ///
 /// 1. The settle's own note, as every gate writes it ([`note_step`]).
-/// 2. The stop note (blueprint §3.4): what approve takes, what reject or accept artifact
-///    declines, and that the work lands either way.
+/// 2. The stop note (blueprint §3.4, [`stop_note`]): what approve takes, what reject or accept
+///    artifact declines, and that the work lands either way. It is also the marker
+///    [`stopped_to_ask`] reads: a human's reject declines only this stop, never the park of a
+///    failed settle at the node's own gate (plan D8).
 /// 3. The park ([`park`]), whatever `gate_effective` says.
 /// 4. When the node has back `asks_you` edges and none has budget left
 ///    ([`crate::walk::loop_budget_left`]), the stop is also the loop's escalation (D7): the
@@ -589,12 +591,24 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     let graph = crate::walk::Graph::of(ctx.snapshot);
     let forward: Vec<&SnapshotEdge> = graph.forward_asks_you(&phase.name).collect();
     let back: Vec<&SnapshotEdge> = graph.back_asks_you(&phase.name).collect();
+    let steps = if back.is_empty() {
+        Vec::new()
+    } else {
+        ctx.store.run_steps(ctx.run.id).await?
+    };
+    let (open, spent): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) = back
+        .iter()
+        .partition(|edge| crate::walk::loop_budget_left(ctx.snapshot, &steps, edge));
+    // Blueprint A3: a node that reads its verdict loops a reject over `changes_requested`.
+    let changes = graph
+        .loop_edge(&phase.name, EdgeKind::ChangesRequested)
+        .map(|edge| edge.to.as_str());
     if let Some(item) = ctx.item() {
         ctx.store
             .add_note(NewNote {
                 id: NoteId::new(),
                 item_id: item,
-                body: stop_note(step, &forward, &back),
+                body: stop_note(step, &forward, &open, &spent, changes),
                 created_by: ctx.user,
                 box_id: Some(ctx.box_id),
                 via_step_id: Some(step.id),
@@ -603,14 +617,7 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .await?;
     }
     let landing = park(ctx, step, phase).await?;
-    if back.is_empty() {
-        return Ok(landing);
-    }
-    let steps = ctx.store.run_steps(ctx.run.id).await?;
-    if back
-        .iter()
-        .any(|edge| crate::walk::loop_budget_left(ctx.snapshot, &steps, edge))
-    {
+    if back.is_empty() || !open.is_empty() {
         return Ok(landing);
     }
     let edge = back[0];
@@ -642,26 +649,85 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     }))
 }
 
+/// The head of every stop note of `step`, which [`stopped_to_ask`] matches.
+fn stop_head(step: &RunStep) -> String {
+    format!(
+        "step `{}` attempt {} waits on you: ",
+        step.phase_name, step.attempt
+    )
+}
+
 /// Blueprint §3.4's stop note: ``step `{name}` attempt {attempt} waits on you: approve takes
 /// {targets}; reject or accept artifact declines {it|them}, and the step's work lands either way;
-/// retry redoes the step``, the forward targets first, then the back ones marked `(loops back)`.
-fn stop_note(step: &RunStep, forward: &[&SnapshotEdge], back: &[&SnapshotEdge]) -> String {
+/// retry redoes the step``, the forward targets first, then the back ones with budget left marked
+/// `(loops back)`.
+///
+/// Two shapes say something else, because approve or reject does something else there:
+/// - a back edge whose budget is spent is no target (approve walks on, D7, blueprint A9): with
+///   no target left approve ``walks on``, and the spent ones follow as ``(the loop back to
+///   `plan` is spent)``;
+/// - on a node that reads its verdict (`changes` names its `changes_requested` target, blueprint
+///   A3) a reject loops and never declines: ``accept artifact declines {it|them}, and the step's
+///   work lands; reject loops back to `{changes}`; retry redoes the step``.
+fn stop_note(
+    step: &RunStep,
+    forward: &[&SnapshotEdge],
+    open: &[&SnapshotEdge],
+    spent: &[&SnapshotEdge],
+    changes: Option<&str>,
+) -> String {
     let targets: Vec<String> = forward
         .iter()
         .map(|edge| format!("`{}`", edge.to))
         .chain(
-            back.iter()
+            open.iter()
                 .map(|edge| format!("`{}` (loops back)", edge.to)),
         )
         .collect();
-    let them = if targets.len() == 1 { "it" } else { "them" };
+    let mut approve = if targets.is_empty() {
+        "approve walks on".to_owned()
+    } else {
+        format!("approve takes {}", targets.join(", "))
+    };
+    if !spent.is_empty() {
+        let names: Vec<String> = spent.iter().map(|edge| format!("`{}`", edge.to)).collect();
+        let (loops, are) = if names.len() == 1 {
+            ("loop", "is")
+        } else {
+            ("loops", "are")
+        };
+        approve.push_str(&format!(
+            " (the {loops} back to {} {are} spent)",
+            names.join(", ")
+        ));
+    }
+    let edges = forward.len() + open.len() + spent.len();
+    let them = if edges == 1 { "it" } else { "them" };
+    let answers = match changes {
+        Some(to) => format!(
+            "accept artifact declines {them}, and the step's work lands; reject loops back to \
+             `{to}`"
+        ),
+        None => format!(
+            "reject or accept artifact declines {them}, and the step's work lands either way"
+        ),
+    };
     format!(
-        "step `{}` attempt {} waits on you: approve takes {}; reject or accept artifact declines \
-         {them}, and the step's work lands either way; retry redoes the step",
-        step.phase_name,
-        step.attempt,
-        targets.join(", ")
+        "{}{approve}; {answers}; retry redoes the step",
+        stop_head(step)
     )
+}
+
+/// MOD-138 M2 D8: whether `step`'s park is the `asks_you` stop of an `ok` settle, read from the
+/// item's `notes`: [`asks_you_stop`] writes its stop note via the step before it parks, and no
+/// other park does. A failed settle parks at the node's own gate with no stop note, and a human's
+/// reject of that park is the ordinary one ([`crate::engine`]'s `rejection`), never a decline.
+#[must_use]
+pub fn stopped_to_ask(notes: &[Note], step: &RunStep) -> bool {
+    let head = stop_head(step);
+    notes
+        .iter()
+        .any(|note| note.via_step_id == Some(step.id) && note.body.starts_with(&head))
 }
 
 /// The escalation's item note (blueprint §3.4), byte-identical to the review loop's for a
@@ -2148,9 +2214,68 @@ mod tests {
         );
         assert!(
             notes.iter().any(|body| body
-                == "step `review` attempt 2 waits on you: approve takes `plan` (loops back); \
-                    reject or accept artifact declines it, and the step's work lands either \
-                    way; retry redoes the step"),
+                == "step `review` attempt 2 waits on you: approve walks on (the loop back to \
+                    `plan` is spent); reject or accept artifact declines it, and the step's work \
+                    lands either way; retry redoes the step"),
+            "the spent loop is not offered as approve's target: {notes:?}"
+        );
+    }
+
+    /// MOD-138 M2 blueprint A3 and §3.4: on a node that reads its verdict (it has a
+    /// `changes_requested` edge) a reject loops over that edge and never declines, so the stop
+    /// note says so: accept artifact declines, reject loops back to the `changes_requested`
+    /// target.
+    #[tokio::test]
+    async fn a_verdict_reading_asks_you_stop_says_that_reject_loops() {
+        use htui_core::model::{EdgeKind, Gate};
+        let store = MemStore::demo();
+        let extra = [
+            loop_edge("review", "implement", EdgeKind::ChangesRequested, Some(2)),
+            loop_edge("review", "plan", EdgeKind::AsksYou, Some(2)),
+        ];
+        let (run, snapshot) = run_4_with(&store, feat_edges(None, &extra)).await;
+        let mut phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "review")
+            .expect("the FEAT graph has a `review` phase")
+            .clone();
+        phase.gate_effective = Gate::Never;
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        step_of(
+            &store,
+            ids::RUN_4,
+            (1, 1, 0),
+            "plan",
+            &[StepStatus::Running, StepStatus::Done],
+        )
+        .await;
+        let review = step_of(
+            &store,
+            ids::RUN_4,
+            (3, 1, 0),
+            "review",
+            &[StepStatus::Running],
+        )
+        .await;
+
+        super::apply(&ctx, &review, &phase, Settle::Ok { note: None })
+            .await
+            .expect("the park and the note are written");
+        let notes = notes_of_run_4(&store, &run).await;
+        assert!(
+            notes.iter().any(|body| body
+                == "step `review` attempt 1 waits on you: approve takes `plan` (loops back); \
+                    accept artifact declines it, and the step's work lands; reject loops back \
+                    to `implement`; retry redoes the step"),
             "{notes:?}"
         );
     }

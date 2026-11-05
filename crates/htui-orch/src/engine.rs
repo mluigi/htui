@@ -95,10 +95,13 @@ const HANDOFF_TEMPLATE: &str = "handoff";
 /// promoted a step that was waiting at its gate (blueprint §7.5).
 const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
 
-/// MOD-138 M2 D8, blueprint A3: whether a human's reject of `node` declines its `asks_you`
+/// MOD-138 M2 D8, blueprint A3: whether a human's reject of `node` may decline its `asks_you`
 /// edges (`answer_gate(Skipped)`, the work lands) rather than failing the step. A reject's
-/// precedence is `changes_requested` (the loop) > `asks_you` (this decline) > `fails` (the loop)
-/// > the end of the run, so a node that also reads its verdict still loops.
+/// precedence is `changes_requested` (the loop), then `asks_you` (this decline), then `fails`
+/// (the loop), then the end of the run, so a node that also reads its verdict still loops. It
+/// declines only when the park is the `asks_you` stop of an `ok` settle
+/// (`gate::stopped_to_ask`), which `answer_guarded` reads next; a failed settle's park keeps the
+/// node's own gate (plan D8).
 fn declines_on_reject(snapshot: &GraphSnapshot, node: &str) -> bool {
     gate::asks_you(snapshot, node) && !snapshot.reads_verdict(node)
 }
@@ -960,6 +963,19 @@ where
         phase: &SnapshotPhase,
         answer: GateAnswer,
     ) -> Result<Rest, EngineError> {
+        // MOD-138 M2 D8: the pre-answer read. A reject declines only the `asks_you` stop of an
+        // `ok` settle, whose stop note names this step; a failed settle parked at the node's own
+        // gate is rejected as ever. Read before the lease, so a store error leaves none behind.
+        // Boxed (the engine's stack rule).
+        let declines = match &answer {
+            GateAnswer::Rejected { .. } if declines_on_reject(snapshot, &phase.name) => {
+                let item = Self::item_of(run)?;
+                let notes = Box::pin(self.parts.store.notes(item)).await?;
+                gate::stopped_to_ask(&notes, step)
+            }
+            _ => false,
+        };
+
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
         let until = self.take_lease(run.id).await?;
@@ -968,10 +984,10 @@ where
         let (outcome, note, to) = match &answer {
             GateAnswer::Approved => (GateOutcome::Approved, None, StepStatus::Done),
             GateAnswer::Skipped => (GateOutcome::Skipped, None, StepStatus::Done),
-            // MOD-138 M2 D8 (plan Q-B), blueprint A3: a human's reject of a node with an
-            // `asks_you` edge declines it: `skipped`, `done`, the note kept, and the work lands
+            // MOD-138 M2 D8 (plan Q-B), blueprint A3: a human's reject of a node's `asks_you`
+            // stop declines its edges: `skipped`, `done`, the note kept, and the work lands
             // below as for any done step. A `changes_requested` edge still wins (the loop).
-            GateAnswer::Rejected { note } if declines_on_reject(snapshot, &phase.name) => {
+            GateAnswer::Rejected { note } if declines => {
                 (GateOutcome::Skipped, Some(note.clone()), StepStatus::Done)
             }
             GateAnswer::Rejected { note } => (
@@ -1052,8 +1068,9 @@ where
     /// MOD-138 M2 D7, blueprint A3: the node's edges decide, never its name. A
     /// `changes_requested` edge loops over it (the review loop); else a `fails` edge loops over
     /// it; else the run ends `rejected: <phase>` (ANA-2 `:577-578`, blueprint A-8). A human's
-    /// reject reaches here from an `asks_you` node only when it also reads its verdict; any other
-    /// `asks_you` node's reject declines its edges instead (D8, `answer_guarded`).
+    /// reject reaches here from an `asks_you` node only when it also reads its verdict or when
+    /// the park is a failed settle's at the node's own gate; the reject of any other `asks_you`
+    /// stop declines its edges instead (D8, `answer_guarded`).
     async fn rejection(
         &self,
         run: &Run,
