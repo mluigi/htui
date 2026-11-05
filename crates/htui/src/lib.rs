@@ -25,6 +25,7 @@ pub mod hand_written;
 pub mod hierarchy;
 pub mod item_writes;
 pub mod keys;
+pub mod logging;
 pub mod mcp_cmd;
 pub mod mcp_search;
 pub mod persona_import;
