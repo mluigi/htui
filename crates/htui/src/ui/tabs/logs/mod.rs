@@ -152,20 +152,25 @@ impl LogsTab {
         }
         self.next = since.next;
         self.counts = since.counts;
+        self.keep_selection_listed();
+    }
+
+    /// D3: `other` is listed only while it holds a line, so a selected `other` that holds none
+    /// hands the cursor to `all`.
+    fn keep_selection_listed(&mut self) {
+        if self.selected == Some(Source::Other) && self.counts.of(Source::Other).lines == 0 {
+            self.selected = None;
+        }
     }
 
     /// The sources list: `all`, then every source in the requirement's order, `other` only
-    /// while it holds a line (D3) or is the one selected, so the cursor never loses its row.
+    /// while it holds a line (D3).
     fn rows(&self) -> Vec<Option<Source>> {
         let mut rows = vec![None];
         rows.extend(
             Source::ALL
                 .into_iter()
-                .filter(|&source| {
-                    source != Source::Other
-                        || self.counts.of(source).lines > 0
-                        || self.selected == Some(source)
-                })
+                .filter(|&source| source != Source::Other || self.counts.of(source).lines > 0)
                 .map(Some),
         );
         rows
@@ -532,7 +537,8 @@ impl Tab for LogsTab {
         }
     }
 
-    /// Back to a [`location`](Tab::location)'s source; the follow state stays as it is.
+    /// Back to a [`location`](Tab::location)'s source (an empty `other` lands on `all`, D3);
+    /// the follow state stays as it is.
     fn restore(&mut self, loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
         let Some(name) = loc
             .cursor
@@ -551,6 +557,7 @@ impl Tab for LogsTab {
             }
         };
         self.selected = selected;
+        self.keep_selection_listed();
         true
     }
 }
@@ -733,6 +740,38 @@ mod tests {
         buffer.push(at(2), Level::INFO, "hyper::client", "two".into());
         tab.pull();
         assert_eq!(tab.rows().last(), Some(&Some(Source::Other)));
+    }
+
+    /// D3: `other` is listed only while it holds a line, so a selected `other` whose lines
+    /// leave the ring hands the cursor to `all`.
+    #[test]
+    fn a_selected_other_that_empties_hands_the_cursor_to_all() {
+        let buffer = LogBuffer::new();
+        buffer.push(at(1), Level::WARN, "hyper::client", "reset".into());
+        let mut tab = LogsTab::new(buffer.clone());
+        tab.move_source(Act::ListUp);
+        while tab.selected != Some(Source::Other) {
+            tab.move_source(Act::ListDown);
+        }
+        push_lines(&buffer, 0..CAPACITY);
+        tab.pull();
+        assert_eq!(tab.selected, None, "the cursor is on `all`");
+        assert!(!tab.rows().contains(&Some(Source::Other)), "no `other` row");
+    }
+
+    /// D3: a location on `other` while it holds no line lands on `all`, the row it had.
+    #[tokio::test]
+    async fn restoring_an_empty_other_lands_on_all() {
+        let bench = SectionBench::new().await;
+        let mut tab = LogsTab::new(many(3));
+        tab.selected = Some(Source::Store);
+        let other = TabLoc {
+            cursor: Some("source:other".to_owned()),
+            ..TabLoc::default()
+        };
+        assert!(tab.restore(&other, &mut bench.ctx()));
+        assert_eq!(tab.selected, None);
+        assert!(!tab.rows().contains(&Some(Source::Other)));
     }
 
     #[tokio::test]
