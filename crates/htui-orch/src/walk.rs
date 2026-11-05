@@ -132,7 +132,8 @@ pub enum Reach {
 /// order (Kahn, ties by `position`), `None` on a forward cycle.
 ///
 /// Nodes are indices into `snapshot.phases`; a key names the first phase that holds it, as
-/// `graph::snapshot_walk_refusal` reads it. Palette nodes are not walked.
+/// `graph::snapshot_walk_refusal` reads it. Palette nodes are not walked, and no edge touching
+/// one is ever forward, a loop edge or a back `asks_you` edge (R1, W2).
 #[derive(Debug)]
 pub struct Graph<'a> {
     snapshot: &'a GraphSnapshot,
@@ -251,13 +252,24 @@ impl<'a> Graph<'a> {
         &self.edges
     }
 
+    /// Whether edge `e` has an end on a palette node. Every edge touching a palette node is left
+    /// out of the walk (`forward_mask`, MOD-137 rule e); an unknown key is not a palette end.
+    fn touches_palette(&self, e: usize) -> bool {
+        self.ends[e].is_some_and(|(from, to)| {
+            self.snapshot.phases[from].palette || self.snapshot.phases[to].palette
+        })
+    }
+
     /// The first `kind` edge out of `source` in snapshot edge order (blueprint F21); for
-    /// `changes_requested` and `fails`, whose loops D7 drives.
+    /// `changes_requested` and `fails`, whose loops D7 drives. An edge with a palette end is
+    /// left out, as the walk leaves it out (R1, W2).
     #[must_use]
     pub fn loop_edge(&self, source: &str, kind: EdgeKind) -> Option<&SnapshotEdge> {
         self.edges
             .iter()
-            .find(|edge| edge.from == source && edge.kind == kind)
+            .enumerate()
+            .find(|(e, edge)| edge.from == source && edge.kind == kind && !self.touches_palette(*e))
+            .map(|(_, edge)| edge)
     }
 
     /// The forward `asks_you` edges out of `source`, in edge order.
@@ -270,13 +282,17 @@ impl<'a> Graph<'a> {
             .map(|(_, edge)| edge)
     }
 
-    /// The back `asks_you` edges out of `source` (both ends known, not forward), in edge order.
+    /// The back `asks_you` edges out of `source` (both ends known, neither on a palette node, not
+    /// forward), in edge order. Every edge touching a palette node is left out of the walk, so
+    /// one into a palette node is no loop (R1, W2).
     pub fn back_asks_you<'g>(
         &'g self,
         source: &'g str,
     ) -> impl Iterator<Item = &'g SnapshotEdge> + 'g {
         self.out_of(source, EdgeKind::AsksYou)
-            .filter(|(e, _)| self.ends[*e].is_some() && !self.forward[*e])
+            .filter(|(e, _)| {
+                self.ends[*e].is_some() && !self.touches_palette(*e) && !self.forward[*e]
+            })
             .map(|(_, edge)| edge)
     }
 
@@ -925,6 +941,36 @@ mod tests {
             ],
             "the edge's own `loop_limit` wins over the target's `retry_limit`"
         );
+    }
+
+    /// R1 (W2): every edge touching a palette node is left out of the walk, so an approved
+    /// source with a budgeted `asks_you` edge into a palette node owes no `Loop`, and neither
+    /// `back_asks_you` nor `loop_edge` names a palette node. (Resolve and the store refuse such
+    /// an edge; this snapshot is hand-built.)
+    #[test]
+    fn an_asks_you_into_a_palette_node_owes_no_loop() {
+        let mut snapshot = graph(
+            &[("p", 0), ("s", 1), ("u", 2)],
+            &[
+                ("s", "u", NEXT),
+                ("s", "p", ASKS),
+                ("s", "p", EdgeKind::Fails),
+            ],
+        );
+        snapshot.phases[0].palette = true;
+        for edge in &mut snapshot.edges {
+            if edge.to == "p" {
+                edge.loop_limit = Some(5);
+            }
+        }
+        let p = done(&snapshot, "p");
+        let mut s = done(&snapshot, "s");
+        s.gate_outcome = Some(GateOutcome::Approved);
+        assert_eq!(ready(&snapshot, &[p, s]), [create(2)], "no `Loop` into `p`");
+        let graph = Graph::of(&snapshot);
+        assert_eq!(graph.back_asks_you("s").count(), 0);
+        assert_eq!(graph.loop_edge("s", EdgeKind::Fails), None);
+        assert_eq!(graph.loop_edge("s", ASKS), None);
     }
 
     /// D2: `Finished` once every node is done or skipped, a skipped tail included.
