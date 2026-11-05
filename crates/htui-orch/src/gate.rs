@@ -1,6 +1,7 @@
 //! The gate: the three-valued settle outcome (plan D2), ANA-2 §4.2's gate table, the `review`
-//! front-matter verdict parser (plan D10, ANA-5 §12 criterion 16) and `R-ORCH-3`'s review loop
-//! with its no-progress predicate (plan D4, D5, D11).
+//! front-matter verdict parser (plan D10, ANA-5 §12 criterion 16) and the loops over edges
+//! (MOD-138 M2 D7: `R-ORCH-3`'s review loop is the `changes_requested` one) with their
+//! no-progress predicate (plan D4, D5, D11).
 //!
 //! Stage 6 of the walk is the only place a gate is evaluated, and it is evaluated against a value
 //! rather than against a driver: [`settle`] is a pure function of what the session produced, so the
@@ -12,8 +13,9 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
-    BatchId, BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run,
-    RunId, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
+    BatchId, BoxId, Document, EdgeKind, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId,
+    Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId, StepStatus,
+    UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::store::{ParkOutcome, StepFence, StoreError};
@@ -21,13 +23,6 @@ use htui_core::store::{ParkOutcome, StepFence, StoreError};
 use crate::command::{EngineError, Rest, stale_run, stale_step};
 use crate::isolate::Clock;
 use crate::status::{RunFailure, latest_at, may_attempt, winner_at};
-
-/// The phase name §4.4 step 1 looks for when it picks a loop target (`docs/ANA-2.md:713-715`).
-///
-/// Named rather than assumed adjacent, which is what makes the rule work for the seeded `bug`
-/// graph, whose implement-shaped phase is called `fix` and is therefore *not* matched — it falls
-/// through to "the immediately preceding position", which is the same answer.
-const IMPLEMENT_PHASE: &str = "implement";
 
 // ---------------------------------------------------------------------------------------------
 // The verdict parser (plan D10, ANA-5 `:1322-1336`)
@@ -234,12 +229,13 @@ pub struct SettleInput<'a> {
     /// `Failed` by this function's first rule and a verify on it would record nothing. `None` is
     /// **not** `unavailable`: the latter is a command that was asked for and could not run.
     pub verify_outcome: Option<VerifyOutcome>,
-    /// Whether the phase's front matter is read at all: `SnapshotPhase::name == "review"`, which
-    /// is what the walk passes (`crate::engine`'s stage 5) and not `output_kind`. The two agree on
-    /// every seeded phase — `phase_row` writes `output_kind` equal to the name
-    /// (`crates/htui-core/src/seed.rs:230`) — and a graph edited through `create_phase` can set
-    /// them apart, so which one decides is worth stating.
-    pub is_review: bool,
+    /// Whether the phase's front matter is read at all: the node has an outgoing
+    /// `changes_requested` edge (`GraphSnapshot::reads_verdict`, MOD-138 M2 D7), which is what the
+    /// walk passes (`crate::engine`'s stage 5). Not the node's name and not its `output_kind`: a
+    /// node called `review` with no such edge passes its verdict unread (plan Q-D), and one called
+    /// anything else with the edge reads it. On every lifted v1 graph the two readings agree but
+    /// for a review placed first, which the lift gives no loop edge.
+    pub reads_verdict: bool,
 }
 
 /// ANA-2 §4.2's settle, first hit winning (`docs/ANA-2.md:436-441`).
@@ -274,7 +270,7 @@ pub fn settle(input: &SettleInput<'_>) -> Settle {
     if input.verify_outcome == Some(VerifyOutcome::Fail) {
         return Settle::Failed(StepFailure::VerifyFailed);
     }
-    if !input.is_review {
+    if !input.reads_verdict {
         return Settle::Ok { note: None };
     }
     match parse_verdict(&output.body) {
@@ -309,7 +305,7 @@ fn deadline_elapsed(input: &SettleInput<'_>) -> bool {
 
 /// What the walk holds while it writes a gate answer or runs the loop.
 ///
-/// A borrowed bundle rather than eight arguments repeated across [`apply`] and [`review_loop`]:
+/// A borrowed bundle rather than eight arguments repeated across [`apply`] and [`edge_loop`]:
 /// both need the same seven things, and the engine builds it once per iteration.
 #[derive(Debug)]
 pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> {
@@ -359,7 +355,7 @@ impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> 
 pub enum Landing {
     /// The step is `done`; the walk moves on.
     Advance,
-    /// The review loop retired the chain (plan D5) and the walk re-derives from the rows, where
+    /// A loop retired its region (plan D5, MOD-138 M2 D7) and the walk re-derives from the rows, where
     /// the cursor creates the loop's next attempt. **Nothing is reconciled** (plan D135): the
     /// retired review's commits stay on its labelled branch and never reach the primary.
     Retired,
@@ -431,10 +427,20 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
         }
         (Gate::Never, Settle::Failed(failure)) => {
             note_step(ctx, step, Some(&failure.to_string()), now).await?;
-            retry_or_fail(ctx, step, phase, &failure, now).await
+            // MOD-138 M2 D7: a node with a `fails` edge loops over it instead of retrying itself.
+            let fails = crate::walk::Graph::of(ctx.snapshot)
+                .loop_edge(&phase.name, EdgeKind::Fails)
+                .cloned();
+            let Some(edge) = fails else {
+                return retry_or_fail(ctx, step, phase, &failure, now).await;
+            };
+            move_step(ctx, step.id, StepStatus::Running, StepStatus::Failed, now).await?;
+            let step = reread(ctx, step).await?;
+            let outcome = Box::pin(edge_loop(ctx, &step, &edge)).await?;
+            Ok(landing(outcome, &edge, &step))
         }
         (Gate::Never, Settle::Rejected { verdict_line }) => {
-            // Both entry points converge on `review_loop` with identical rows, which is what plan
+            // Both entry points converge on `edge_loop` with identical rows, which is what plan
             // D4's "one routine" costs: the automatic path parks the step first, because
             // `answer_gate` is a compare-and-set on `awaiting_approval` and there is no other
             // writer that records `gate_outcome = 'rejected'` with the note.
@@ -448,19 +454,21 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .await?;
             reject_step(ctx.store, ctx.run.id, step.id, verdict_line.clone(), now).await?;
             let step = reread(ctx, step).await?;
-            match review_loop(ctx, &step).await? {
-                LoopOutcome::Resumed { .. } => Ok(Landing::Retired),
-                LoopOutcome::Escalated { attempts, .. } => Ok(Landing::Rest(Rest {
-                    run: RunStatus::AwaitingApproval,
-                    position: Some(step.position),
-                    failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
-                })),
-                LoopOutcome::NoTarget => Ok(Landing::Rest(Rest {
+            // `Rejected` is settled only by a node that reads its verdict, which is having this
+            // edge (MOD-138 M2 D7), so `None` is a snapshot no resolve wrote.
+            let changes = crate::walk::Graph::of(ctx.snapshot)
+                .loop_edge(&phase.name, EdgeKind::ChangesRequested)
+                .cloned();
+            let Some(edge) = changes else {
+                no_target(ctx, now).await?;
+                return Ok(Landing::Rest(Rest {
                     run: RunStatus::Failed,
                     position: Some(step.position),
                     failure: Some(RunFailure::NoLoopTarget),
-                })),
-            }
+                }));
+            };
+            let outcome = Box::pin(edge_loop(ctx, &step, &edge)).await?;
+            Ok(landing(outcome, &edge, &step))
         }
     }
 }
@@ -657,10 +665,10 @@ async fn reread<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The review loop (plan D4, D5, D11; ANA-2 §4.4 `:712-753`)
+// The loops over edges (plan D4, D5, D11; ANA-2 §4.4 `:712-753`; MOD-138 M2 D7)
 // ---------------------------------------------------------------------------------------------
 
-/// Why the review loop stopped instead of running another iteration.
+/// Why a loop stopped instead of running another iteration.
 ///
 /// **Named `LoopStop` and not `StopReason`**, which is what the blueprint's §5.6 calls it: this
 /// module already matches on `htui_agent::event::StopReason` inside [`settle`], and two types with
@@ -668,9 +676,10 @@ async fn reread<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// refused a second `ResolvedPhase`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopStop {
-    /// The implement phase's `retry_limit` is spent (`docs/ANA-2.md:716`).
+    /// The loop edge's budget is spent (`docs/ANA-2.md:716`): its `loop_limit`, else the
+    /// target's `retry_limit` (MOD-138 M2 D7).
     Exhausted,
-    /// Two consecutive implement attempts produced an identical `after_hash` per repo, "both
+    /// Two consecutive attempts of the loop's target produced an identical `after_hash` per repo, "both
     /// `NULL`" included (`:735-739`).
     NoProgressHash,
     /// Two consecutive review documents are byte-identical after canonicalisation (`:735-739`).
@@ -687,33 +696,52 @@ impl core::fmt::Display for LoopStop {
     }
 }
 
-/// What one turn of the review loop decided.
+/// What one turn of a loop decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopOutcome {
-    /// The chain was retired; the walk resumes at `(position, attempt)`, which the cursor creates.
+    /// The region was retired; the walk resumes at `(position, attempt)`, which the cursor
+    /// creates.
     Resumed {
-        /// `p_impl`.
+        /// The loop target's position.
         position: i32,
         /// The attempt the cursor will create there.
         attempt: i32,
     },
-    /// Parked for a human: run `awaiting_approval`, item `blocked`, note written.
+    /// Parked for a human: run `awaiting_approval`, item `blocked` (not for an `asks_you` loop,
+    /// blueprint A9), note written.
     Escalated {
-        /// `N` of `review loop exhausted after N attempts`: the implement attempt just judged.
+        /// `N` of `review loop exhausted after N attempts`: the target's attempt just judged.
         attempts: i32,
         /// Which predicate stopped it.
         reason: LoopStop,
     },
-    /// §4.4 step 1 found no position to loop back to; the run failed with `no_loop_target`.
+    /// The edge's target is not in the snapshot or never ran (blueprint A4); the run failed with
+    /// `no_loop_target`.
     NoTarget,
 }
 
-/// `R-ORCH-3`'s loop, one routine for both of plan D4's entry points (`docs/ANA-2.md:712-753`).
+/// MOD-138 M2 D7: one turn of a loop over `edge` (`changes_requested`, `fails` or a back
+/// `asks_you`) out of `source`, the step the loop judges. `R-ORCH-3`'s review loop is the
+/// `changes_requested` case, one routine for both of plan D4's entry points
+/// (`docs/ANA-2.md:712-753`).
 ///
-/// The caller has already left `review` at `failed` with `gate_outcome = 'rejected'` and its
-/// `gate_note`, and has already moved the run to `running` if it was parked (blueprint A-5) — so
-/// the human path and the automatic path arrive here with
-/// identical rows and this function never asks which one it was.
+/// The caller has already left `source` where the loop finds it: `failed` (with `gate_outcome =
+/// 'rejected'` and its `gate_note` for a verdict or a human's reject), or `done` + `approved` for
+/// a back `asks_you`, with the run `running` (blueprint A-5) — so every entry point arrives here
+/// with identical rows and this function never asks which one it was.
+///
+/// 1. **Target**: the phase whose key is `edge.to`, looked up by name and never by index. A key
+///    the snapshot does not name, or a target with **no row** (it never ran: unreached or
+///    skipped, blueprint A4), is [`LoopOutcome::NoTarget`], and the run fails `no_loop_target`.
+/// 2. **No progress** ([`no_progress`], plan D11), except on an `asks_you` edge (blueprint A5):
+///    a human approves every turn of that one, so its budget alone bounds it.
+/// 3. **Budget**: [`crate::walk::loop_budget_left`], `edge.loop_limit` or else the target's
+///    `retry_limit`. On a lifted v1 graph the lift's `loop_limit` *is* the target's `retry_limit`
+///    (V4), so this is the review loop's budget.
+/// 4. **Region**: every node on a forward path from the target to the source, both included
+///    ([`crate::walk::Graph::region`]), retired target first and source last (blueprint A6), each
+///    slot through [`retire_slot`]. A node off every such path keeps its rows (ANA-33 §7.3: rows
+///    win), so a side branch of a diamond is not re-run.
 ///
 /// **Retiring is status by status** (plan D5, fact-check F14b/F15): `pending`,
 /// `awaiting_approval` and `done` are superseded; a `running` step is **cancelled**, because
@@ -723,104 +751,114 @@ pub enum LoopOutcome {
 /// only `status`, so its `gate_outcome` and `gate_note` survive (`retire_slot` explains why
 /// plan D5's "left alone" cannot work); `superseded` and `cancelled` are already retired.
 ///
-/// The successor step is **not** created here, unlike the blueprint's §5.6 step 6: retiring
-/// `p_impl` makes the cursor answer `Create { p_impl, next_attempt }` on its own
-/// (`crate::status::cursor`), so the new attempt goes through stage 1's capability interlock and
+/// The successor step is **not** created here, unlike the blueprint's §5.6 step 6: retiring the
+/// target makes the walker answer `Create { target, next_attempt }` on its own
+/// (`crate::walk::ready`), so the new attempt goes through stage 1's capability interlock and
 /// the selector like any other, and `next_attempt` stays the single reader of
 /// `UNIQUE (run_id, position, attempt, fanout_index)`.
 ///
 /// # Errors
 /// Every [`EngineError`] the writes can raise, and [`EngineError::StaleWrite`] when a retired row
 /// or, on escalation, the run was moved by another writer first (plan D125).
-pub async fn review_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+pub async fn edge_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
-    review: &RunStep,
+    source: &RunStep,
+    edge: &SnapshotEdge,
 ) -> Result<LoopOutcome, EngineError> {
     let now = ctx.clock.now();
-    let Some(target) = loop_target(ctx.snapshot, review.position) else {
-        ctx.store
-            .finish_run(
-                ctx.run.id,
-                RunStatus::Failed,
-                Some(&RunFailure::NoLoopTarget.to_string()),
-                now,
-            )
-            .await?;
-        return Ok(LoopOutcome::NoTarget);
-    };
-    // By `position`, never by index. [`loop_target`] promises a phase whose `position` is `target`
-    // and says nothing about where in the array it sits, and density is manufactured by
-    // `graph::resolve`'s renumbering alone: `ck_run_graph_snapshot` checks non-null, `NewRun` takes
-    // the blob as given, and milestone 5's sweep adopts runs this process did not mint. Read
-    // positionally, a snapshot with a hole in it indexes past the array — a panic, not a refusal —
-    // and an unsorted one silently reads a different phase's `retry_limit` and name. This is
-    // `Engine::phase_at`'s lookup, written out because that one is `engine.rs`'s private associated
-    // function and reaching it from here would mean naming the whole generic `Engine`.
-    let Some(impl_phase) = ctx
+    // By key, never by index: nothing promises a dense, sorted array (`graph::resolve`'s
+    // renumbering is the only thing that makes one, and milestone 5's sweep adopts runs this
+    // process did not mint). Read positionally, a snapshot with a hole in it indexes past the
+    // array — a panic, not a refusal — and an unsorted one reads another phase's budget and name.
+    let Some(target) = ctx
         .snapshot
         .phases
         .iter()
-        .find(|phase| phase.position == target)
+        .find(|phase| phase.name == edge.to)
     else {
-        ctx.store
-            .finish_run(
-                ctx.run.id,
-                RunStatus::Failed,
-                Some(&RunFailure::NoLoopTarget.to_string()),
-                now,
-            )
-            .await?;
-        return Ok(LoopOutcome::NoTarget);
+        return no_target(ctx, now).await;
     };
 
     let steps = ctx.store.run_steps(ctx.run.id).await?;
-    let Some(attempt) = latest_at(&steps, target).map(|step| step.attempt) else {
-        ctx.store
-            .finish_run(
-                ctx.run.id,
-                RunStatus::Failed,
-                Some(&RunFailure::NoLoopTarget.to_string()),
-                now,
-            )
-            .await?;
-        return Ok(LoopOutcome::NoTarget);
+    // Blueprint A4: a target with no row never ran. Its attempt would read as 0, the budget
+    // would always hold, and a skipped target is never re-run (its in-edges are outside the
+    // region), so the loop could not end.
+    let Some(attempt) = latest_at(&steps, target.position).map(|step| step.attempt) else {
+        return no_target(ctx, now).await;
     };
 
-    if let Some(reason) = no_progress(ctx, &steps, target, review.position, attempt).await? {
-        return escalate(ctx, review, impl_phase, attempt, reason, now).await;
+    if edge.kind != EdgeKind::AsksYou
+        && let Some(reason) =
+            no_progress(ctx, &steps, target.position, source.position, attempt).await?
+    {
+        return escalate(ctx, source, target, edge, attempt, reason, now).await;
     }
-    if !may_attempt(attempt + 1, impl_phase.retry_limit) {
-        return escalate(ctx, review, impl_phase, attempt, LoopStop::Exhausted, now).await;
+    if !crate::walk::loop_budget_left(ctx.snapshot, &steps, edge) {
+        return escalate(ctx, source, target, edge, attempt, LoopStop::Exhausted, now).await;
     }
 
-    retire(ctx, &steps, target, review.position, now).await?;
+    let mut region = crate::walk::Graph::of(ctx.snapshot).region(&edge.to, &source.phase_name);
+    if region.is_empty() {
+        // Only a hand-built snapshot gets here: the validator refuses a loop edge whose target
+        // does not reach its source (W3). Its two ends are still the loop's, target first.
+        region = vec![target.position, source.position];
+    }
+    retire(ctx, &steps, &region, now).await?;
     Ok(LoopOutcome::Resumed {
-        position: target,
+        position: target.position,
         attempt: attempt + 1,
     })
 }
 
-/// §4.4 step 1: the greatest position below `review` named `implement`, else the one before it.
-///
-/// `None` when `review` is at position 0, or when the snapshot has no such position — plan D5's
-/// terminal review, which fails the run with `no_loop_target`.
+/// The loop found nothing to go back to: the run fails `no_loop_target` (plan D5, blueprint A4).
+async fn no_target<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    now: DateTime<Utc>,
+) -> Result<LoopOutcome, EngineError> {
+    ctx.store
+        .finish_run(
+            ctx.run.id,
+            RunStatus::Failed,
+            Some(&RunFailure::NoLoopTarget.to_string()),
+            now,
+        )
+        .await?;
+    Ok(LoopOutcome::NoTarget)
+}
+
+/// MOD-138 M2 D7: what an escalated loop over `edge` reports. A `changes_requested` loop keeps
+/// [`RunFailure::ReviewLoopExhausted`] and its bytes (`docs/ANA-2.md:746`); a `fails` or
+/// `asks_you` loop is [`RunFailure::LoopExhausted`], naming its kind and both ends.
 #[must_use]
-pub fn loop_target(snapshot: &GraphSnapshot, review_position: i32) -> Option<i32> {
-    let named = snapshot
-        .phases
-        .iter()
-        .filter(|phase| phase.position < review_position && phase.name == IMPLEMENT_PHASE)
-        .map(|phase| phase.position)
-        .max();
-    named.or_else(|| {
-        let previous = review_position - 1;
-        (previous >= 0
-            && snapshot
-                .phases
-                .iter()
-                .any(|phase| phase.position == previous))
-        .then_some(previous)
-    })
+pub fn loop_failure(edge: &SnapshotEdge, attempts: i32) -> RunFailure {
+    match edge.kind {
+        EdgeKind::ChangesRequested => RunFailure::ReviewLoopExhausted(attempts),
+        kind => RunFailure::LoopExhausted {
+            kind,
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            attempts,
+        },
+    }
+}
+
+/// Where a loop over `edge` out of `source` leaves the walk: `Resumed` re-derives from the rows
+/// ([`Landing::Retired`]), `Escalated` rests parked with [`loop_failure`], and `NoTarget` rests
+/// `failed` with `no_loop_target` (the loop already wrote `finish_run`).
+fn landing(outcome: LoopOutcome, edge: &SnapshotEdge, source: &RunStep) -> Landing {
+    match outcome {
+        LoopOutcome::Resumed { .. } => Landing::Retired,
+        LoopOutcome::Escalated { attempts, .. } => Landing::Rest(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(source.position),
+            failure: Some(loop_failure(edge, attempts)),
+        }),
+        LoopOutcome::NoTarget => Landing::Rest(Rest {
+            run: RunStatus::Failed,
+            position: Some(source.position),
+            failure: Some(RunFailure::NoLoopTarget),
+        }),
+    }
 }
 
 /// Plan D11's predicate, evaluated only when there is a previous attempt to compare against.
@@ -967,16 +1005,16 @@ async fn reviews_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Siz
     Ok(sha256_hex(&canonical(&newest.body)) == sha256_hex(&canonical(&previous.body)))
 }
 
-/// §4.4 step 3, widened to the whole chain by plan D5 and split by status by fact-check F14b: every
-/// position of `from..=to` is retired through [`retire_slot`].
+/// §4.4 step 3, widened to the whole chain by plan D5, split by status by fact-check F14b and
+/// carried to the loop's region by MOD-138 M2 D7: every position of `region`, in its order
+/// (target first, source last, blueprint A6), is retired through [`retire_slot`].
 async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
-    from: i32,
-    to: i32,
+    region: &[i32],
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
-    for position in from..=to {
+    for &position in region {
         retire_slot(ctx, steps, position, now).await?;
     }
     Ok(())
@@ -1044,16 +1082,23 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
     Ok(())
 }
 
-/// ANA-2 §4.4's escalation rows (`:741-753`), as blueprint A-4 amends them.
+/// ANA-2 §4.4's escalation rows (`:741-753`), as blueprint A-4 amends them, for any loop edge
+/// (MOD-138 M2 D7).
 ///
 /// `run.failure` stays NULL: no shipped writer sets `failure` on a non-terminal run, and
 /// `finish_run` is terminal-only by plan D7. The exact wording therefore lives in the `item_note`
 /// — which is what criterion 6 asserts (`docs/ANA-2.md:2101-2102`) — and in the
-/// [`RunFailure::ReviewLoopExhausted`] the caller receives. Carried as **R-3** for milestone 6 (milestone 5 left it open, blueprint R-25).
+/// [`loop_failure`] the caller receives, byte-identical to the review loop's for a
+/// `changes_requested` edge. Carried as **R-3** for milestone 6 (milestone 5 left it open,
+/// blueprint R-25).
+///
+/// The item is blocked, except for an `asks_you` loop (blueprint A9): its source still waits at
+/// a gate a human answers, and `answer_gate` has no item guard.
 async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
-    review: &RunStep,
-    impl_phase: &SnapshotPhase,
+    source: &RunStep,
+    target: &SnapshotPhase,
+    edge: &SnapshotEdge,
     attempts: i32,
     reason: LoopStop,
     now: DateTime<Utc>,
@@ -1063,7 +1108,9 @@ async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
     // MOD-144: blocking writes are `open -> blocked`; D17's `Ok(false)` still reads "already
     // moved".
-    ctx.move_item(Status::Open, Status::Blocked).await?;
+    if edge.kind != EdgeKind::AsksYou {
+        ctx.move_item(Status::Open, Status::Blocked).await?;
+    }
     if let Some(item) = ctx.item() {
         ctx.store
             .add_note(NewNote {
@@ -1071,12 +1118,12 @@ async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
                 item_id: item,
                 body: format!(
                     "{}: phase `{}`, attempt {attempts}, stop reason `{reason}`",
-                    RunFailure::ReviewLoopExhausted(attempts),
-                    impl_phase.name
+                    loop_failure(edge, attempts),
+                    target.name
                 ),
                 created_by: ctx.user,
                 box_id: Some(ctx.box_id),
-                via_step_id: Some(review.id),
+                via_step_id: Some(source.id),
                 created_at: now,
             })
             .await?;
@@ -1101,10 +1148,11 @@ mod tests {
     use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
-        GateContext, LoopStop, Settle, SettleInput, StepFailure, Verdict, loop_target, no_progress,
-        parse_verdict, retire_slot, settle,
+        GateContext, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, edge_loop,
+        loop_failure, no_progress, parse_verdict, retire_slot, settle,
     };
     use crate::isolate::SystemClock;
+    use crate::status::RunFailure;
 
     /// A `review` document body, since `settle` reads the front matter off one.
     fn document(body: &str) -> Document {
@@ -1115,17 +1163,6 @@ mod tests {
             .expect("the fixture seeds documents");
         document.body = body.to_owned();
         document
-    }
-
-    /// The `feature` snapshot every fixture graph run carries.
-    fn snapshot() -> GraphSnapshot {
-        let run = demo_data()
-            .runs
-            .into_iter()
-            .find(|row| row.id == ids::RUN_1)
-            .expect("the fixture holds RUN_1");
-        serde_json::from_value(run.graph_snapshot.expect("RUN_1 carries a snapshot"))
-            .expect("the fixture snapshot is a `GraphSnapshot`")
     }
 
     /// A settle input that settles `ok`, which every case below then spoils in exactly one way.
@@ -1143,7 +1180,7 @@ mod tests {
             deadline_cut: false,
             output,
             verify_outcome: None,
-            is_review: false,
+            reads_verdict: false,
         }
     }
 
@@ -1426,7 +1463,7 @@ mod tests {
 
         let rejecting = document("---\nverdict: request-changes\n---\nno tests");
         let input = SettleInput {
-            is_review: true,
+            reads_verdict: true,
             ..ok_input(&ended, Some(&rejecting))
         };
         assert_eq!(
@@ -1445,7 +1482,7 @@ mod tests {
 
         let odd = document("---\nverdict: Block\n---\nhmm");
         let input = SettleInput {
-            is_review: true,
+            reads_verdict: true,
             ..ok_input(&ended, Some(&odd))
         };
         assert_eq!(
@@ -1458,7 +1495,7 @@ mod tests {
 
         let silent = document("no front matter");
         let input = SettleInput {
-            is_review: true,
+            reads_verdict: true,
             ..ok_input(&ended, Some(&silent))
         };
         assert_eq!(
@@ -1503,24 +1540,195 @@ mod tests {
         );
     }
 
-    /// §4.4 step 1 on the seeded `feature` graph, and on the two shapes plan D5 calls terminal.
+    /// A loop edge `from → to` of `kind`, with `loop_limit`.
+    fn loop_edge(
+        from: &str,
+        to: &str,
+        kind: htui_core::model::EdgeKind,
+        loop_limit: Option<i32>,
+    ) -> htui_core::model::SnapshotEdge {
+        htui_core::model::SnapshotEdge {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind,
+            predicate: None,
+            loop_limit,
+        }
+    }
+
+    /// MOD-138 M2 D7: a `changes_requested` loop's escalation keeps the review loop's bytes; a
+    /// `fails` or `asks_you` loop's names its kind and both ends.
     #[test]
-    fn the_loop_target_is_the_named_implement_phase() {
-        let snapshot = snapshot();
+    fn loop_failure_is_review_for_changes_requested() {
+        use htui_core::model::EdgeKind;
         assert_eq!(
-            loop_target(&snapshot, 3),
-            Some(2),
-            "`implement` is at position 2 of the seeded `feature` graph"
+            loop_failure(
+                &loop_edge("audit", "implement", EdgeKind::ChangesRequested, Some(1)),
+                2
+            ),
+            RunFailure::ReviewLoopExhausted(2)
         );
         assert_eq!(
-            loop_target(&snapshot, 2),
-            Some(1),
-            "no `implement` below position 2, so the immediately preceding position"
+            loop_failure(&loop_edge("test", "implement", EdgeKind::Fails, Some(1)), 2),
+            RunFailure::LoopExhausted {
+                kind: EdgeKind::Fails,
+                from: "test".to_owned(),
+                to: "implement".to_owned(),
+                attempts: 2,
+            }
         );
         assert_eq!(
-            loop_target(&snapshot, 0),
-            None,
-            "a review at position 0 is terminal (plan D5)"
+            loop_failure(&loop_edge("review", "plan", EdgeKind::AsksYou, None), 1),
+            RunFailure::LoopExhausted {
+                kind: EdgeKind::AsksYou,
+                from: "review".to_owned(),
+                to: "plan".to_owned(),
+                attempts: 1,
+            }
+        );
+    }
+
+    /// MOD-138 M2 D7 on a diamond `a → {b, c} → d` with `d → b` `changes_requested`: the region is
+    /// every node on a forward path from `b` to `d`, so `b` is superseded and the rejecting `d`
+    /// cancelled, while `a` and the side branch `c` keep their `done` rows. The nodes sit at
+    /// positions 10 to 13 so `RUN_3`'s own rows (position 0) are never in the way.
+    #[tokio::test]
+    async fn edge_loop_retires_only_rows_in_the_region() {
+        use htui_core::model::EdgeKind;
+        let store = MemStore::demo();
+        let (run, mut snapshot) = run_3();
+        let template = snapshot.phases[0].clone();
+        snapshot.v = GraphSnapshot::V;
+        snapshot.phases = [("a", 10), ("b", 11), ("c", 12), ("d", 13)]
+            .into_iter()
+            .map(|(name, position)| {
+                let mut phase = template.clone();
+                phase.name = name.to_owned();
+                phase.output_kind = name.to_owned();
+                phase.position = position;
+                phase.fan_out = 1;
+                phase.retry_limit = 1;
+                phase
+            })
+            .collect();
+        let next = |from: &str, to: &str| loop_edge(from, to, EdgeKind::Next, None);
+        let back = loop_edge("d", "b", EdgeKind::ChangesRequested, Some(1));
+        snapshot.edges = vec![
+            next("a", "b"),
+            next("a", "c"),
+            next("b", "d"),
+            next("c", "d"),
+            back.clone(),
+        ];
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        let done = [StepStatus::Running, StepStatus::Done];
+        let a = step_at(&store, 10, "a", 1, 0, &done).await;
+        let b = step_at(&store, 11, "b", 1, 0, &done).await;
+        let c = step_at(&store, 12, "c", 1, 0, &done).await;
+        let d = step_at(
+            &store,
+            13,
+            "d",
+            1,
+            0,
+            &[StepStatus::Running, StepStatus::Failed],
+        )
+        .await;
+
+        let outcome = edge_loop(&ctx, &d, &back)
+            .await
+            .expect("the loop reads rows and retires them");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Resumed {
+                position: 11,
+                attempt: 2
+            }
+        );
+        assert_eq!(status_of(&store, b.id).await, StepStatus::Superseded);
+        assert_eq!(status_of(&store, d.id).await, StepStatus::Cancelled);
+        assert_eq!(
+            status_of(&store, a.id).await,
+            StepStatus::Done,
+            "upstream of the target"
+        );
+        assert_eq!(
+            status_of(&store, c.id).await,
+            StepStatus::Done,
+            "`c` is on no path from `b` to `d`: rows win (ANA-33 §7.3)"
+        );
+    }
+
+    /// Blueprint A5: a back `asks_you` loop is bounded by its budget alone, because a human
+    /// approves every turn. The same rows that stop a `changes_requested` loop on
+    /// `no_progress_review` let an `asks_you` loop over the same ends retire and resume.
+    #[tokio::test]
+    async fn an_asks_you_loop_skips_the_no_progress_test() {
+        use htui_core::model::EdgeKind;
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        let implement = step_at(
+            &store,
+            2,
+            "implement",
+            2,
+            0,
+            &[StepStatus::Running, StepStatus::Done],
+        )
+        .await;
+        let first = review_at(&store, 1, GateOutcome::Rejected).await;
+        let second = review_at(&store, 2, GateOutcome::Rejected).await;
+        for by in [&first, &second] {
+            produce(
+                &store,
+                "review",
+                Some(by),
+                "---\nverdict: request-changes\n---\nno tests\n",
+            )
+            .await;
+        }
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            Some(LoopStop::NoProgressReview),
+            "the control: these rows stop a review loop"
+        );
+
+        let asks = loop_edge("review", "implement", EdgeKind::AsksYou, Some(5));
+        let second = steps
+            .iter()
+            .find(|row| row.id == second.id)
+            .expect("the review row");
+        let outcome = edge_loop(&ctx, second, &asks)
+            .await
+            .expect("the loop reads rows and retires them");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Resumed {
+                position: 2,
+                attempt: 3
+            }
+        );
+        assert_eq!(
+            status_of(&store, implement.id).await,
+            StepStatus::Superseded
         );
     }
 

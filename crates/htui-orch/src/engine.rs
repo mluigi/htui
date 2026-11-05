@@ -34,13 +34,13 @@ use htui_agent::record::{
 };
 use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
-    Document, DocumentId, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
     NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo,
     RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
-    StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
+    SessionEvent, SnapshotCandidate, SnapshotEdge, SnapshotPersona, SnapshotPhase,
+    SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
+    Transport, UserId, VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -81,14 +81,6 @@ use crate::status::{
     next_attempt, resumable, winner_at,
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
-
-/// The phase whose output document carries ANA-2 §4.4's front-matter verdict (`:440`).
-///
-/// A name rather than a flag on the row, because that is what ANA-2 has: `:440` says "a
-/// `review`-phase output document", and all four seeded graphs that have one call it `review`
-/// (`crates/htui-core/src/seed.rs:88-160`). The `bug` graph's implement-shaped phase is `fix` and
-/// its review phase is still `review`, which is the case that shows the name is the rule.
-const REVIEW_PHASE: &str = "review";
 
 /// The `prompt_template.name` of the judge role (`crates/htui-core/src/prompt/template.rs:54`),
 /// read when the snapshot pinned no judge template (plan D53).
@@ -1039,9 +1031,14 @@ where
         }
     }
 
-    /// [`Self::after_rejection`] up to the walk: `None` is the review loop's `Resumed`, and the
-    /// caller walks on. Plan D131 reaches it for a rejection a crash left unfinished, with the
-    /// step already `failed`.
+    /// [`Self::after_rejection`] up to the walk: `None` is the loop's `Resumed`, and the caller
+    /// walks on. Plan D131 reaches it for a rejection a crash left unfinished, with the step
+    /// already `failed`.
+    ///
+    /// MOD-138 M2 D7, blueprint A3: the node's edges decide, never its name. A
+    /// `changes_requested` edge loops over it (the review loop); else a `fails` edge loops over
+    /// it; else the run ends `rejected: <phase>` (ANA-2 `:577-578`, blueprint A-8). An `asks_you`
+    /// node never reaches here with a human's reject, which declines its edges instead (D8).
     async fn rejection(
         &self,
         run: &Run,
@@ -1050,9 +1047,14 @@ where
         phase: &SnapshotPhase,
         now: DateTime<Utc>,
     ) -> Result<Option<Rest>, EngineError> {
-        let loopable =
-            phase.name == REVIEW_PHASE && gate::loop_target(snapshot, step.position).is_some();
-        if !loopable {
+        let edge = {
+            let graph = crate::walk::Graph::of(snapshot);
+            graph
+                .loop_edge(&phase.name, EdgeKind::ChangesRequested)
+                .or_else(|| graph.loop_edge(&phase.name, EdgeKind::Fails))
+                .cloned()
+        };
+        let Some(edge) = edge else {
             self.parts
                 .store
                 .finish_run(
@@ -1075,21 +1077,32 @@ where
                     phase: phase.name.clone(),
                 }),
             }));
-        }
+        };
+        Box::pin(self.loop_over(run.id, snapshot, step, &edge)).await
+    }
 
-        let run = self.run(run.id).await?;
+    /// MOD-138 M2 D7: one turn of `gate::edge_loop` over `edge` out of `step`, under a re-read
+    /// run, mapped as `gate::apply`'s landing maps it: `Resumed` is `None` and the caller walks on;
+    /// `Escalated` rests parked with `gate::loop_failure`; `NoTarget` rests `failed`, and since the
+    /// loop wrote that `finish_run` itself (`gate::edge_loop`'s `NoTarget` sites) the engine still
+    /// owes its cleanup (plan D36).
+    async fn loop_over(
+        &self,
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        edge: &SnapshotEdge,
+    ) -> Result<Option<Rest>, EngineError> {
+        let run = self.run(run).await?;
         let ctx = self.gate_context(&run, snapshot);
-        match gate::review_loop(&ctx, step).await? {
+        match gate::edge_loop(&ctx, step, edge).await? {
             LoopOutcome::Resumed { .. } => Ok(None),
             LoopOutcome::Escalated { attempts, .. } => Ok(Some(Rest {
                 run: RunStatus::AwaitingApproval,
                 position: Some(step.position),
-                failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
+                failure: Some(gate::loop_failure(edge, attempts)),
             })),
             LoopOutcome::NoTarget => {
-                // `review_loop` failed the run itself (`gate.rs`'s three `NoTarget` sites), so
-                // this is a terminal `finish_run` the engine did not write and still owes a
-                // cleanup for (plan D36).
                 self.cleanup_run(run.id).await?;
                 Ok(Some(Rest {
                     run: RunStatus::Failed,
@@ -2751,7 +2764,7 @@ where
                 let settled = recover::resettle(
                     output.as_ref(),
                     verify,
-                    phase.name == REVIEW_PHASE,
+                    snapshot.reads_verdict(&phase.name),
                     step.started_at.unwrap_or(now),
                     now,
                 );
@@ -2939,13 +2952,16 @@ where
     /// `running` for ever. What the step's own columns say decides, in this order:
     ///
     /// 1. `gate_outcome = rejected`: a human's (or a review's) rejection, which ends the run or
-    ///    runs the review loop exactly as `answer_gate` does ([`Self::rejection`]). Retrying a
+    ///    runs the node's loop exactly as `answer_gate` does ([`Self::rejection`]). Retrying a
     ///    step a human turned down would be the one wrong answer.
-    /// 2. `gate_note = interrupted, tree not reset`: D93's park, whatever the budget says; a tree
+    /// 2. MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge, failed by anything but an
+    ///    interruption, runs its `fails` loop: the crash fell between `gate::apply`'s
+    ///    `running -> failed` and its `edge_loop`.
+    /// 3. `gate_note = interrupted, tree not reset`: D93's park, whatever the budget says; a tree
     ///    the sweep left alone is never walked over.
-    /// 3. Budget left: `admit` the next attempt, as `retry_or_fail` and D92 both would have.
-    /// 4. `gate_note = interrupted`: D94's out-of-budget park.
-    /// 5. Otherwise `finish_run(failed)` and plan D36's cleanup.
+    /// 4. Budget left: `admit` the next attempt, as `retry_or_fail` and D92 both would have.
+    /// 5. `gate_note = interrupted`: D94's out-of-budget park.
+    /// 6. Otherwise `finish_run(failed)` and plan D36's cleanup.
     ///
     /// `Some(rest)` is where the run came to rest; `None` means the walk goes on.
     async fn settle_failed(
@@ -2960,6 +2976,17 @@ where
             return self.rejection(run, snapshot, step, &phase, now).await;
         }
         let note = step.gate_note.as_deref().unwrap_or_default();
+        // MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge loops over it, in place of its
+        // own `retry_limit`, on a failure of its own; an interrupted step (D92, D93) is a crash,
+        // not a failure, and keeps the retry below.
+        if !note.starts_with(INTERRUPTED) {
+            let fails = crate::walk::Graph::of(snapshot)
+                .loop_edge(&phase.name, EdgeKind::Fails)
+                .cloned();
+            if let Some(edge) = fails {
+                return Box::pin(self.loop_over(run.id, snapshot, step, &edge)).await;
+            }
+        }
         let not_reset = note == NOT_RESET;
         if !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
             return self.admit(run, snapshot, &phase, step.attempt + 1).await;
@@ -3371,7 +3398,7 @@ where
                     ));
                 }
                 // MOD-37 R-31: the tail `answer_guarded` would have run, by plan D131's settle.
-                // Boxed: `settle_failed` holds `admit`'s and `review_loop`'s futures, and this
+                // Boxed: `settle_failed` holds `admit`'s and `edge_loop`'s futures, and this
                 // walk sits under `resume`, under `Unblock`.
                 if let Some(rejected) = crashed_rejection(&at, &steps) {
                     let row = self.run(run).await?;
@@ -3898,7 +3925,7 @@ where
             deadline_cut,
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
-            is_review: phase.name == REVIEW_PHASE,
+            reads_verdict: snapshot.reads_verdict(&phase.name),
         });
         self.parts
             .store
@@ -3940,7 +3967,7 @@ where
             }
             Landing::Rest(rest) => {
                 // `gate.rs` writes its own terminal `finish_run` — `retry_or_fail`'s exhausted
-                // budget and `review_loop`'s `NoTarget` — and holds no isolator, so the cleanup
+                // budget and `edge_loop`'s `NoTarget` — and holds no isolator, so the cleanup
                 // that owes it is here (plan D36). A park is not terminal and is not cleaned up.
                 if rest.run.is_terminal() {
                     self.cleanup_run(run.id).await?;
@@ -4268,6 +4295,7 @@ where
                 prompt: &prompt,
                 base: &base,
                 persona,
+                reads_verdict: snapshot.reads_verdict(&phase.name),
             })
         }))
         .await;
@@ -4557,6 +4585,7 @@ where
             prompt,
             base,
             persona,
+            reads_verdict,
         } = *stage;
         let item = Self::item_of(run)?;
 
@@ -4691,7 +4720,7 @@ where
             deadline_cut,
             output: output.as_ref(),
             verify_outcome: None,
-            is_review: phase.name == REVIEW_PHASE,
+            reads_verdict,
         });
         self.parts
             .store
@@ -7207,6 +7236,10 @@ struct CandidateStage<'s> {
     base: &'s BTreeMap<RepoId, String>,
     /// MOD-26 D12: the phase's frozen persona.
     persona: Option<&'s SnapshotPersona>,
+    /// MOD-138 M2 D7: the node reads its verdict (`GraphSnapshot::reads_verdict`). Resolve
+    /// refuses a verdict-reading node that fans out (D10), so this is `false` on every snapshot
+    /// a resolve wrote; it is carried rather than assumed so settle reads one rule everywhere.
+    reads_verdict: bool,
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).
@@ -11010,6 +11043,7 @@ mod tests {
                 prompt: &prompt,
                 base: &BTreeMap::new(),
                 persona: None,
+                reads_verdict: false,
             })
             .await
             .expect_err("the candidate's compare-and-set found the row moved");

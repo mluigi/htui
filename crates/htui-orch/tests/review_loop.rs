@@ -1,11 +1,11 @@
-//! `gate::review_loop` against a `graph_snapshot` whose phases are not a dense, sorted array.
+//! `gate::edge_loop` against a `graph_snapshot` whose phases are not a dense, sorted array.
 //!
 //! Every snapshot the walk mints today *is* dense and sorted, because `graph::resolve` renumbers
 //! the phases it reads (`crates/htui-orch/src/graph.rs`). Nothing else promises it: the column is
 //! `ck_run_graph_snapshot`-checked for non-null and nothing more, `NewRun.graph_snapshot` is taken
 //! as given by both stores, and milestone 5's recovery sweep adopts runs this process did not
 //! create. So "the phase at index `p` has `position == p`" is an assumption about a value that
-//! arrives from outside, and these three cases are what it costs to stop assuming it.
+//! arrives from outside, and these cases are what it costs to stop assuming it.
 //!
 //! The loop is driven directly rather than through the walk on purpose: `Engine` mints its snapshot
 //! through `graph::resolve` and therefore cannot produce one of these shapes, which is exactly why
@@ -17,13 +17,13 @@
 use chrono::Utc;
 use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{
-    GraphSnapshot, ItemId, NewRun, NewRunStep, Run, RunId, RunMode, SnapshotPhase, StepId,
-    StepStatus,
+    EdgeKind, GraphSnapshot, ItemId, NewRun, NewRunStep, Run, RunId, RunMode, SnapshotEdge,
+    SnapshotPhase, StepId, StepStatus,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::command::EngineError;
 use htui_orch::fake::TestClock;
-use htui_orch::gate::{GateContext, LoopOutcome, LoopStop, review_loop};
+use htui_orch::gate::{GateContext, LoopOutcome, LoopStop, edge_loop};
 
 /// The item every case here queues its run on: seeded `open`, so `create_run` accepts it.
 const ITEM: ItemId = ids::HTUI_ANA_2;
@@ -136,6 +136,17 @@ async fn step_at(
     step.id
 }
 
+/// The `review` node's `changes_requested` edge as the walker reads it: these snapshots are v1
+/// blobs decoded by serde, so it is the lift's (MOD-138 M2 D1, `GraphSnapshot::walk_edges`).
+fn review_edge(snapshot: &GraphSnapshot) -> SnapshotEdge {
+    snapshot
+        .walk_edges()
+        .iter()
+        .find(|edge| edge.from == "review" && edge.kind == EdgeKind::ChangesRequested)
+        .cloned()
+        .expect("the lift gives a `review` with an earlier phase its loop edge")
+}
+
 /// The step row, re-read.
 async fn row(store: &MemStore, run: RunId, step: StepId) -> htui_core::model::RunStep {
     store
@@ -150,7 +161,7 @@ async fn row(store: &MemStore, run: RunId, step: StepId) -> htui_core::model::Ru
 /// A snapshot with a **gap**: `implement` at position 4 and `review` at position 5, four phases in
 /// the array.
 ///
-/// `loop_target` answers 4, which is a legal index into nothing: the array holds four entries. Read
+/// The loop's target is position 4, which is a legal index into nothing: the array holds four entries. Read
 /// positionally this panics with an out-of-bounds index, which is a walk that dies rather than a
 /// run that refuses — and ANA-2 invariant 7 wants a row a human can read either way.
 #[tokio::test]
@@ -174,9 +185,13 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
     };
-    let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
-        .await
-        .expect("the loop reads rows and writes rows; neither refuses here");
+    let outcome = edge_loop(
+        &ctx,
+        &row(&store, run.id, review).await,
+        &review_edge(&snapshot),
+    )
+    .await
+    .expect("the loop reads rows and writes rows; neither refuses here");
 
     assert_eq!(
         outcome,
@@ -233,9 +248,13 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
     };
-    let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
-        .await
-        .expect("the loop reads rows and writes rows; neither refuses here");
+    let outcome = edge_loop(
+        &ctx,
+        &row(&store, run.id, review).await,
+        &review_edge(&snapshot),
+    )
+    .await
+    .expect("the loop reads rows and writes rows; neither refuses here");
 
     assert_eq!(
         outcome,
@@ -259,14 +278,67 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
     );
 }
 
-/// A sparse snapshot with **no** loop target at all: `prd` at 0 and `review` at 2, and nothing at 1.
+/// A sparse snapshot whose review has **no implement** before it: `prd` at 0 and `review` at 2,
+/// and nothing at 1 (MOD-138 M2 Q-D, rewritten from the pre-M2 name rule's refusal).
 ///
-/// `loop_target` refuses this one before any lookup — no earlier `implement`, and the immediately
-/// preceding position names no phase — so the run ends `failed` with `no_loop_target` and the loop
-/// answers [`LoopOutcome::NoTarget`]. Pinned here beside the other two because "sparse" must mean a
-/// named refusal in every branch that meets it, not a panic in one and a refusal in another.
+/// The loop follows the `changes_requested` edge the lift gives the review: no earlier
+/// `implement`, so the phase before it **in order** (MOD-137's rule), `prd`, whatever the gap in
+/// positions. `prd` ran, so the loop retires `prd` and the rejecting review and resumes at `prd`'s
+/// second attempt.
 #[tokio::test]
-async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
+async fn a_sparse_snapshot_loops_to_the_phase_before_it_in_order() {
+    let store = MemStore::demo();
+    let clock = TestClock::new();
+    let mut snapshot = feature_snapshot();
+    let mut review = phase(&snapshot, "review");
+    review.position = 2;
+    snapshot.phases = vec![phase(&snapshot, "prd"), review];
+
+    let run = claimed_with(&store, snapshot.clone()).await;
+    let prd = step_at(&store, run.id, 0, "prd", StepStatus::Done).await;
+    let step = step_at(&store, run.id, 2, "review", StepStatus::Failed).await;
+
+    let ctx = GateContext {
+        store: &store,
+        clock: &clock,
+        run: &run,
+        snapshot: &snapshot,
+        user: store.this_user().expect("the fixture seeds one `app_user`"),
+        box_id: ids::BOX,
+        fence: StepFence::Unleased,
+    };
+    let edge = review_edge(&snapshot);
+    assert_eq!(
+        edge.to, "prd",
+        "the lift's target: the phase before the review in order"
+    );
+    let outcome = edge_loop(&ctx, &row(&store, run.id, step).await, &edge)
+        .await
+        .expect("the loop reads rows and writes rows; neither refuses here");
+
+    assert_eq!(
+        outcome,
+        LoopOutcome::Resumed {
+            position: 0,
+            attempt: 2
+        }
+    );
+    assert_eq!(
+        row(&store, run.id, prd).await.status,
+        StepStatus::Superseded
+    );
+    assert_eq!(
+        row(&store, run.id, step).await.status,
+        StepStatus::Cancelled
+    );
+}
+
+/// Blueprint A4: a loop whose target **never ran** refuses by name. The same sparse snapshot, with
+/// no `prd` row: the target's attempt would read as 0, the budget would always hold and a
+/// skipped target would never re-run, so the loop could not end. The run fails `no_loop_target`
+/// and the loop answers [`LoopOutcome::NoTarget`].
+#[tokio::test]
+async fn a_loop_to_a_target_that_never_ran_is_no_loop_target() {
     let store = MemStore::demo();
     let clock = TestClock::new();
     let mut snapshot = feature_snapshot();
@@ -286,9 +358,13 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
     };
-    let outcome = review_loop(&ctx, &row(&store, run.id, step).await)
-        .await
-        .expect("a terminal review is a refusal, not an error");
+    let outcome = edge_loop(
+        &ctx,
+        &row(&store, run.id, step).await,
+        &review_edge(&snapshot),
+    )
+    .await
+    .expect("a target that never ran is a refusal, not an error");
 
     assert_eq!(outcome, LoopOutcome::NoTarget);
     assert_eq!(
@@ -300,7 +376,12 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
             .failure
             .as_deref(),
         Some("no_loop_target"),
-        "plan D5's terminal review, on a snapshot with a hole in it"
+        "A4: a row-less target refuses by name"
+    );
+    assert_eq!(
+        row(&store, run.id, step).await.status,
+        StepStatus::Failed,
+        "nothing is retired"
     );
 }
 
@@ -331,9 +412,13 @@ async fn an_escalation_on_a_run_another_writer_moved_is_a_stale_write() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
     };
-    let refused = review_loop(&ctx, &row(&store, run.id, review).await)
-        .await
-        .expect_err("the run is not `running`, so the escalation's move is refused");
+    let refused = edge_loop(
+        &ctx,
+        &row(&store, run.id, review).await,
+        &review_edge(&snapshot),
+    )
+    .await
+    .expect_err("the run is not `running`, so the escalation's move is refused");
     assert!(
         matches!(
             &refused,

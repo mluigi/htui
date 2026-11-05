@@ -8,7 +8,7 @@
 use core::fmt;
 
 use htui_core::model::{
-    GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
+    EdgeKind, GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
 };
 use htui_core::scrub::Unmasked;
 
@@ -129,6 +129,19 @@ pub enum RunFailure {
         /// What the scan found.
         files: crate::isolate::EnvFiles,
     },
+    /// MOD-138 M2 D7: a `fails` or `asks_you` loop ran out of budget or, for `fails`, made no
+    /// progress. A `changes_requested` loop keeps [`RunFailure::ReviewLoopExhausted`] and its
+    /// bytes (`gate::loop_failure`). `run.failure` stays NULL, as for the review loop (R-3).
+    LoopExhausted {
+        /// The loop edge's kind: `fails` or `asks_you`.
+        kind: EdgeKind,
+        /// The edge's source node.
+        from: String,
+        /// The edge's target node, the one the loop would have re-run.
+        to: String,
+        /// The target's attempt just judged.
+        attempts: i32,
+    },
 }
 
 impl RunFailure {
@@ -183,6 +196,15 @@ impl fmt::Display for RunFailure {
             Self::EnvFilesRefused { provider, files } => {
                 f.write_str(&crate::isolate::env_files::refused(provider, files))
             }
+            Self::LoopExhausted {
+                kind,
+                from,
+                to,
+                attempts,
+            } => write!(
+                f,
+                "{kind} loop exhausted after {attempts} attempts: `{from}` to `{to}`"
+            ),
         }
     }
 }
@@ -538,6 +560,32 @@ mod tests {
             .expect("the fixture holds RUN_1");
         serde_json::from_value(run.graph_snapshot.expect("RUN_1 carries a snapshot"))
             .expect("the fixture snapshot is a `GraphSnapshot`")
+    }
+
+    /// MOD-138 M2 D7: a `fails` or `asks_you` loop's escalation names the kind, both ends and the
+    /// attempt just judged; the note and the `Rest` read the same bytes.
+    #[test]
+    fn loop_exhausted_display() {
+        assert_eq!(
+            RunFailure::LoopExhausted {
+                kind: htui_core::model::EdgeKind::Fails,
+                from: "test".to_owned(),
+                to: "implement".to_owned(),
+                attempts: 2,
+            }
+            .to_string(),
+            "fails loop exhausted after 2 attempts: `test` to `implement`"
+        );
+        assert_eq!(
+            RunFailure::LoopExhausted {
+                kind: htui_core::model::EdgeKind::AsksYou,
+                from: "review".to_owned(),
+                to: "plan".to_owned(),
+                attempts: 1,
+            }
+            .to_string(),
+            "asks_you loop exhausted after 1 attempts: `review` to `plan`"
+        );
     }
 
     /// ANA-2 writes five of these as prose or as identifier-shaped codes and two of them are
