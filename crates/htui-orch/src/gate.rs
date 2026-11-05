@@ -575,9 +575,11 @@ pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
 ///    [`stopped_to_ask`] reads: a human's reject declines only this stop, never the park of a
 ///    failed settle at the node's own gate (plan D8).
 /// 3. The park ([`park`]), whatever `gate_effective` says.
-/// 4. When the node has back `asks_you` edges and none has budget left
+/// 4. When the node has back `asks_you` edges whose targets ran and none of them has budget left
 ///    ([`crate::walk::loop_budget_left`]), the stop is also the loop's escalation (D7): the
-///    [`loop_failure`] note of the first of them and the failure on the rest. The item is **not**
+///    [`loop_failure`] note of the first of them and the failure on the rest. A back edge whose
+///    target has no row (a decision skipped it, or it never ran) is set aside (blueprint A4, T5
+///    repair 2): no `Loop` is owed over it and it never escalates. The item is **not**
 ///    blocked (blueprint A9): the stop is already the checkpoint a human answers, and approve
 ///    then walks on, since no `Loop` is owed.
 async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
@@ -596,7 +598,18 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     } else {
         ctx.store.run_steps(ctx.run.id).await?
     };
-    let (open, spent): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) = back
+    // Blueprint A4: a back edge whose target has no row (a decision skipped it, or it never ran)
+    // is neither open nor spent: the walk owes no `Loop` over it, `edge_loop` reads it as
+    // `NoTarget`, and it is never the loop's escalation.
+    let (ran, never_ran): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) =
+        back.iter().partition(|edge| {
+            ctx.snapshot
+                .phases
+                .iter()
+                .find(|phase| phase.name == edge.to)
+                .is_some_and(|target| latest_at(&steps, target.position).is_some())
+        });
+    let (open, spent): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) = ran
         .iter()
         .partition(|edge| crate::walk::loop_budget_left(ctx.snapshot, &steps, edge));
     // Blueprint A3: a node that reads its verdict loops a reject over `changes_requested`.
@@ -608,7 +621,7 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .add_note(NewNote {
                 id: NoteId::new(),
                 item_id: item,
-                body: stop_note(step, &forward, &open, &spent, changes),
+                body: stop_note(step, &forward, &open, &spent, &never_ran, changes),
                 created_by: ctx.user,
                 box_id: Some(ctx.box_id),
                 via_step_id: Some(step.id),
@@ -617,10 +630,9 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .await?;
     }
     let landing = park(ctx, step, phase).await?;
-    if back.is_empty() || !open.is_empty() {
+    let Some(&edge) = spent.first().filter(|_| open.is_empty()) else {
         return Ok(landing);
-    }
-    let edge = back[0];
+    };
     let target = ctx
         .snapshot
         .phases
@@ -666,6 +678,8 @@ fn stop_head(step: &RunStep) -> String {
 /// - a back edge whose budget is spent is no target (approve walks on, D7, blueprint A9): with
 ///   no target left approve ``walks on``, and the spent ones follow as ``(the loop back to
 ///   `plan` is spent)``;
+/// - a back edge whose target has no row is no target either: ``(`plan` never ran, so there is
+///   no loop back to it)`` follows, after any spent ones;
 /// - on a node that reads its verdict (`changes` names its `changes_requested` target, blueprint
 ///   A3) a reject loops and never declines: ``accept artifact declines {it|them}, and the step's
 ///   work lands; reject loops back to `{changes}`; retry redoes the step``.
@@ -674,6 +688,7 @@ fn stop_note(
     forward: &[&SnapshotEdge],
     open: &[&SnapshotEdge],
     spent: &[&SnapshotEdge],
+    never_ran: &[&SnapshotEdge],
     changes: Option<&str>,
 ) -> String {
     let targets: Vec<String> = forward
@@ -701,7 +716,18 @@ fn stop_note(
             names.join(", ")
         ));
     }
-    let edges = forward.len() + open.len() + spent.len();
+    if !never_ran.is_empty() {
+        let names: Vec<String> = never_ran
+            .iter()
+            .map(|edge| format!("`{}`", edge.to))
+            .collect();
+        let it = if names.len() == 1 { "it" } else { "them" };
+        approve.push_str(&format!(
+            " ({} never ran, so there is no loop back to {it})",
+            names.join(", ")
+        ));
+    }
+    let edges = forward.len() + open.len() + spent.len() + never_ran.len();
     let them = if edges == 1 { "it" } else { "them" };
     let answers = match changes {
         Some(to) => format!(
@@ -2218,6 +2244,142 @@ mod tests {
                     `plan` is spent); reject or accept artifact declines it, and the step's work \
                     lands either way; retry redoes the step"),
             "the spent loop is not offered as approve's target: {notes:?}"
+        );
+    }
+
+    /// MOD-138 M2 D7, blueprint A4 (T5 repair 2): a back `asks_you` edge whose target has no
+    /// row (an `if` decision skipped it, or it never ran) is neither open nor spent. The walk
+    /// owes no `Loop` over it and `edge_loop` reads it as `NoTarget`, so the stop is no
+    /// escalation: no `LoopExhausted` failure or note, and the stop note says the target never
+    /// ran instead of calling its loop spent.
+    #[tokio::test]
+    async fn a_back_asks_you_stop_over_a_target_that_never_ran_does_not_escalate() {
+        use crate::command::Rest;
+        use htui_core::model::{EdgeKind, Gate, RunStatus};
+        let store = MemStore::demo();
+        let back = loop_edge("review", "plan", EdgeKind::AsksYou, Some(3));
+        let (run, snapshot) = run_4_with(&store, feat_edges(None, &[back])).await;
+        let mut phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "review")
+            .expect("the FEAT graph has a `review` phase")
+            .clone();
+        phase.gate_effective = Gate::Never;
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        // `plan` has no row: a decision skipped it.
+        let review = step_of(
+            &store,
+            ids::RUN_4,
+            (3, 1, 0),
+            "review",
+            &[StepStatus::Running],
+        )
+        .await;
+
+        let landing = super::apply(&ctx, &review, &phase, Settle::Ok { note: None })
+            .await
+            .expect("the park and the note are written");
+        assert_eq!(
+            landing,
+            super::Landing::Rest(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(3),
+                failure: None,
+            }),
+            "a loop that never ran is not exhausted"
+        );
+        let notes = notes_of_run_4(&store, &run).await;
+        assert!(
+            !notes.iter().any(|body| body.contains("loop exhausted")),
+            "no escalation note: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|body| body
+                == "step `review` attempt 1 waits on you: approve walks on (`plan` never ran, \
+                    so there is no loop back to it); reject or accept artifact declines it, and \
+                    the step's work lands either way; retry redoes the step"),
+            "{notes:?}"
+        );
+    }
+
+    /// The same shape beside a spent back edge: only the spent one escalates, and the stop note
+    /// names each for what it is.
+    #[tokio::test]
+    async fn a_spent_back_asks_you_beside_one_that_never_ran_still_escalates() {
+        use crate::command::Rest;
+        use htui_core::model::{EdgeKind, Gate, RunStatus};
+        let store = MemStore::demo();
+        let extra = [
+            loop_edge("review", "prd", EdgeKind::AsksYou, Some(3)),
+            loop_edge("review", "plan", EdgeKind::AsksYou, Some(1)),
+        ];
+        let (run, snapshot) = run_4_with(&store, feat_edges(None, &extra)).await;
+        let mut phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "review")
+            .expect("the FEAT graph has a `review` phase")
+            .clone();
+        phase.gate_effective = Gate::Never;
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        step_of(
+            &store,
+            ids::RUN_4,
+            (1, 2, 0),
+            "plan",
+            &[StepStatus::Running, StepStatus::Done],
+        )
+        .await;
+        let review = step_of(
+            &store,
+            ids::RUN_4,
+            (3, 2, 0),
+            "review",
+            &[StepStatus::Running],
+        )
+        .await;
+
+        let landing = super::apply(&ctx, &review, &phase, Settle::Ok { note: None })
+            .await
+            .expect("the park and the notes are written");
+        assert_eq!(
+            landing,
+            super::Landing::Rest(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(3),
+                failure: Some(RunFailure::LoopExhausted {
+                    kind: EdgeKind::AsksYou,
+                    from: "review".to_owned(),
+                    to: "plan".to_owned(),
+                    attempts: 2,
+                }),
+            })
+        );
+        let notes = notes_of_run_4(&store, &run).await;
+        assert!(
+            notes.iter().any(|body| body
+                == "step `review` attempt 2 waits on you: approve walks on (the loop back to \
+                    `plan` is spent) (`prd` never ran, so there is no loop back to it); reject \
+                    or accept artifact declines them, and the step's work lands either way; \
+                    retry redoes the step"),
+            "{notes:?}"
         );
     }
 
