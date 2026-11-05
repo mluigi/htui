@@ -649,7 +649,10 @@ fn stop_note(step: &RunStep, forward: &[&SnapshotEdge], back: &[&SnapshotEdge]) 
     let targets: Vec<String> = forward
         .iter()
         .map(|edge| format!("`{}`", edge.to))
-        .chain(back.iter().map(|edge| format!("`{}` (loops back)", edge.to)))
+        .chain(
+            back.iter()
+                .map(|edge| format!("`{}` (loops back)", edge.to)),
+        )
         .collect();
     let them = if targets.len() == 1 { "it" } else { "them" };
     format!(
@@ -2004,14 +2007,7 @@ mod tests {
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
             };
-            let prd = step_of(
-                &store,
-                ids::RUN_4,
-                (0, 1, 0),
-                "prd",
-                &[StepStatus::Running],
-            )
-            .await;
+            let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
             let landing = super::apply(
                 &ctx,
@@ -2046,7 +2042,9 @@ mod tests {
             assert_eq!(parked.status, RunStatus::AwaitingApproval, "{gate:?}");
             let notes = notes_of_run_4(&store, &run).await;
             assert!(
-                notes.iter().any(|body| body == "step `prd` attempt 1: fine"),
+                notes
+                    .iter()
+                    .any(|body| body == "step `prd` attempt 1: fine"),
                 "{gate:?}: the settle's own note: {notes:?}"
             );
             assert!(
