@@ -70,6 +70,10 @@ zeroize            = { workspace = true }
 sentry = { workspace = true }
 sentry-anyhow = { workspace = true }
 sentry-tracing = { workspace = true }
+# MOD-122 R1: the `log` crate's max level follows the run-time filter (`logging::LoggingControl`),
+# so a record from a crate that logs through `log` (sqlx) reaches the bridge. 0.4.34 is already in
+# the lock through sqlx and tracing-log, so nothing new is compiled.
+log = "0.4"
 # MOD-9 D9: the $EDITOR temp file (removed on drop); already in the lock (was dev-only). The store
 # worker's swap tests also open a throwaway `cache.sqlite` with it, never the user's.
 tempfile = "3"
@@ -93,7 +97,9 @@ dirs                   = { workspace = true }
 # MOD-57 M1 (pane.rs kill path): SIGHUP then SIGKILL to the in-pane editor's process group, and a
 # non-reaping `waitid`, without `unsafe`. 1.1.4 with `process` is already in htui's graph (via
 # cap-std and fs4), so nothing new is compiled.
-rustix                 = { workspace = true }
+# MOD-122 R1: `fs`, so the log file opens with `O_NONBLOCK` (a FIFO never blocks it); already enabled
+# in htui's graph (cap-std, fs4), so nothing new is compiled.
+rustix                 = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.

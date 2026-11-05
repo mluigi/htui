@@ -259,14 +259,19 @@ impl tracing::field::Visit for LineVisitor {
 
 impl LineVisitor {
     /// The message then the fields; without a message, the fields alone; `\r` and `\n` folded to
-    /// a space, so a line is one row.
+    /// a space, so a line is one row. Most lines hold neither and are not copied again (MOD-122
+    /// R1).
     fn text(&self) -> String {
         let text = if self.message.is_empty() {
             self.fields.trim_start().to_owned()
         } else {
             format!("{}{}", self.message, self.fields)
         };
-        text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+        if text.contains(['\r', '\n']) {
+            text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+        } else {
+            text
+        }
     }
 }
 

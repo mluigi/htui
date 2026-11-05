@@ -1,12 +1,13 @@
-//! htui's own log (MOD-122): what every `tracing` event that passed the global filter becomes.
+//! htui's own log (MOD-122): what every `tracing` event that passes the filter becomes.
 //!
-//! One subscriber, always (plan D1): a global [`EnvFilter`] that can be reloaded at run time, a
-//! [`MemoryLayer`] into the [`LogBuffer`] the Logs tab reads, a `fmt` layer writing through a
-//! file that can be switched on, moved or off at run time, and the Sentry layer **only** when a
-//! log file was given at startup (`--log`/`HTUI_LOG`), exactly as before MOD-122.
+//! One subscriber, always (plan D1): a [`MemoryLayer`] into the [`LogBuffer`] the Logs tab reads
+//! and a `fmt` layer writing through a file that can be switched on, moved or off at run time,
+//! both behind one `EnvFilter` that can be reloaded at run time; and the Sentry layer **only**
+//! when a log file was given at startup (`--log`/`HTUI_LOG`), behind a filter of its own fixed
+//! at startup, so it sees exactly what it saw before MOD-122 whatever Settings › Logging sets.
 //!
 //! [`buffer`] keeps the last [`CAPACITY`] lines in memory; [`source`] maps an event's target to
-//! the part of htui it came from. [`init`] is `run`'s and nothing else's; a test builds a
+//! the part of htui it came from. `init` is `run`'s and nothing else's; a test builds a
 //! [`Logging`] and runs its events under `tracing::dispatcher::with_default` (D7), and the
 //! harnesses' `App` holds a [`Logging::detached`] one, which has no subscriber at all.
 
@@ -19,42 +20,50 @@ pub use source::Source;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tracing::Dispatch;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::{EnvFilter, Registry, reload};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::layer::{Layer as _, Layered, SubscriberExt as _};
+use tracing_subscriber::{EnvFilter, Registry, filter, reload};
 
 /// The filter when neither `HTUI_LOG_FILTER` nor a saved setting gives one.
-pub const DEFAULT_FILTER: &str = "info";
+pub(crate) const DEFAULT_FILTER: &str = "info";
 /// The variable whose directive wins over the saved filter for the session.
-pub const FILTER_VAR: &str = "HTUI_LOG_FILTER";
+const FILTER_VAR: &str = "HTUI_LOG_FILTER";
 /// What Settings › Logging names as the override of the log file.
-pub const SET_BY_FLAG: &str = "`--log`";
+pub(crate) const SET_BY_FLAG: &str = "`--log`";
 /// What Settings › Logging names as the override of the filter.
-pub const SET_BY_VAR: &str = "`HTUI_LOG_FILTER`";
+pub(crate) const SET_BY_VAR: &str = "`HTUI_LOG_FILTER`";
+
+/// The Sentry layer's slot (D1), boxed so a test can stand a layer of its own in for it.
+type SentryLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
+
+/// What the buffer and the file layers sit on: the registry and the Sentry slot.
+type Base = Layered<Option<SentryLayer>, Registry>;
 
 /// What the process was started with (flag and environment). Each wins over its saved value for
 /// the session (D5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Startup {
+pub(crate) struct Startup {
     /// `--log`/`HTUI_LOG` (clap reads both).
-    pub file: Option<PathBuf>,
+    pub(crate) file: Option<PathBuf>,
     /// `HTUI_LOG_FILTER`, when it holds a usable directive.
-    pub filter: Option<String>,
+    pub(crate) filter: Option<String>,
 }
 
 impl Startup {
     /// `run`'s: `--log`/`HTUI_LOG` and `HTUI_LOG_FILTER`.
     #[must_use]
-    pub fn from_env(log: Option<&Path>) -> Self {
+    pub(crate) fn from_env(log: Option<&Path>) -> Self {
         Self::from_parts(log, std::env::var(FILTER_VAR).ok())
     }
 
     /// A blank or unparsable variable counts as unset, as before MOD-122 (it fell back to
     /// `info`).
     #[must_use]
-    pub fn from_parts(log: Option<&Path>, filter_var: Option<String>) -> Self {
+    pub(crate) fn from_parts(log: Option<&Path>, filter_var: Option<String>) -> Self {
         let filter = filter_var
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty() && parse_filter(value).is_ok());
@@ -82,7 +91,7 @@ impl LoggingPrefs {
     }
 }
 
-/// D7: what [`init`] hands back; `App` holds it.
+/// D7: what `init` hands back; `App` holds it.
 pub struct Logging {
     buffer: LogBuffer,
     control: LoggingControl,
@@ -96,28 +105,49 @@ impl Logging {
     /// # Errors
     ///
     /// The startup log file cannot be opened.
-    pub fn build(startup: Startup) -> anyhow::Result<Self> {
+    pub(crate) fn build(startup: Startup) -> anyhow::Result<Self> {
+        Self::build_with(startup, || Box::new(sentry_tracing::layer()))
+    }
+
+    /// [`build`](Self::build) with `sentry` making the layer for the Sentry slot, so a test can
+    /// watch what reaches it.
+    fn build_with(startup: Startup, sentry: impl FnOnce() -> SentryLayer) -> anyhow::Result<Self> {
         let initial = startup.filter.as_deref().unwrap_or(DEFAULT_FILTER);
         let (filter, handle) = reload::Layer::new(parse_filter(initial)?);
         let file = startup.file.as_deref().map(open_append).transpose()?;
         let switch = FileSwitch::new(file);
         let buffer = LogBuffer::new();
-        // D1: Sentry rides a startup log file only, exactly as before (MOD-99 owns widening it).
-        let sentry = startup.file.is_some();
-        let subscriber = tracing_subscriber::registry()
-            .with(filter)
-            .with(MemoryLayer::new(buffer.clone()))
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(switch.clone())
-                    .with_ansi(false),
-            )
-            .with(sentry.then(sentry_tracing::layer));
+        // D1: Sentry rides a startup log file only, exactly as before (MOD-99 owns widening it),
+        // behind its own copy of the startup filter, which nothing reloads (MOD-122 R1): a filter
+        // set in Settings changes what htui keeps, never what reaches Sentry.
+        let sentry_filter = startup
+            .file
+            .is_some()
+            .then(|| parse_filter(initial))
+            .transpose()?;
+        let sentry_level = sentry_filter
+            .as_ref()
+            .map_or(LevelFilter::OFF, |filter| widest(filter.max_level_hint()));
+        let sentry = sentry_filter.map(|filter| sentry().with_filter(filter).boxed());
+        let on = Arc::clone(&switch.on);
+        // MOD-122 R1: with no file the `fmt` layer is filtered out, so no line is formatted for
+        // nothing; asked per event, since the file switches at run time.
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(switch.clone())
+            .with_ansi(false)
+            .with_filter(filter::dynamic_filter_fn(move |_, _| {
+                on.load(Ordering::Relaxed)
+            }));
+        let local = MemoryLayer::new(buffer.clone())
+            .and_then(file_layer)
+            .with_filter(filter);
+        let with_sentry = sentry.is_some();
+        let subscriber = tracing_subscriber::registry().with(sentry).with(local);
         Ok(Self {
             buffer,
-            control: LoggingControl::new(Some(handle), switch, &startup),
+            control: LoggingControl::new(Some(handle), switch, sentry_level, &startup),
             dispatch: Some(Dispatch::new(subscriber)),
-            sentry,
+            sentry: with_sentry,
         })
     }
 
@@ -127,7 +157,12 @@ impl Logging {
     pub fn detached() -> Self {
         Self {
             buffer: LogBuffer::new(),
-            control: LoggingControl::new(None, FileSwitch::default(), &Startup::default()),
+            control: LoggingControl::new(
+                None,
+                FileSwitch::default(),
+                LevelFilter::OFF,
+                &Startup::default(),
+            ),
             dispatch: None,
             sentry: false,
         }
@@ -171,13 +206,13 @@ impl fmt::Debug for Logging {
     }
 }
 
-/// [`Logging::build`], then installed process-wide (the same call as before MOD-122, so the
-/// `log` bridge is unchanged). `run` calls it once; nothing else may.
+/// [`Logging::build`], then installed process-wide (the same call as before MOD-122, which also
+/// installs the `log` bridge). `run` calls it once; nothing else may.
 ///
 /// # Errors
 ///
 /// The startup log file cannot be opened, or a subscriber is already installed.
-pub fn init(startup: Startup) -> anyhow::Result<Logging> {
+pub(crate) fn init(startup: Startup) -> anyhow::Result<Logging> {
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     let logging = Logging::build(startup)?;
@@ -185,6 +220,8 @@ pub fn init(startup: Startup) -> anyhow::Result<Logging> {
         dispatch
             .try_init()
             .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))?;
+        logging.control.0.installed.store(true, Ordering::Relaxed);
+        logging.control.bridge_log();
     }
     Ok(logging)
 }
@@ -195,8 +232,13 @@ pub struct LoggingControl(Arc<ControlInner>);
 
 struct ControlInner {
     /// `None` when detached: the filter is recorded, nothing reloads.
-    reload: Option<reload::Handle<EnvFilter, Registry>>,
+    reload: Option<reload::Handle<EnvFilter, Base>>,
     file: FileSwitch,
+    /// The widest level the Sentry layer's fixed filter lets through; `OFF` without the layer.
+    sentry: LevelFilter,
+    /// `init` installed this subscriber process-wide, so the `log` crate's max level is its to
+    /// keep (MOD-122 R1). Never set in a test: nothing process-global moves there.
+    installed: AtomicBool,
     state: Mutex<LoggingState>,
 }
 
@@ -217,8 +259,9 @@ pub struct LoggingState {
 
 impl LoggingControl {
     fn new(
-        reload: Option<reload::Handle<EnvFilter, Registry>>,
+        reload: Option<reload::Handle<EnvFilter, Base>>,
         file: FileSwitch,
+        sentry: LevelFilter,
         startup: &Startup,
     ) -> Self {
         let state = LoggingState {
@@ -234,6 +277,8 @@ impl LoggingControl {
         Self(Arc::new(ControlInner {
             reload,
             file,
+            sentry,
+            installed: AtomicBool::new(false),
             state: Mutex::new(state),
         }))
     }
@@ -248,35 +293,48 @@ impl LoggingControl {
         self.lock().clone()
     }
 
-    /// Reloads the global filter with `directive`.
+    /// Reloads the buffer's and the file's filter with `directive`. The state's lock is held from
+    /// the override check to the record, so two changes never interleave (MOD-122 R1).
     ///
     /// # Errors
     ///
     /// [`LoggingError::Overridden`] while `HTUI_LOG_FILTER` sets it; [`LoggingError::Filter`]
-    /// for a directive [`parse_filter`] refuses (nothing changes); [`LoggingError::Gone`] when
-    /// the subscriber was dropped.
+    /// for a directive `parse_filter` refuses (nothing changes); [`LoggingError::Gone`] when
+    /// the subscriber was dropped, [`LoggingError::Poisoned`] when its filter's lock is.
     pub fn set_filter(&self, directive: &str) -> Result<(), LoggingError> {
-        if let Some(by) = self.lock().filter_set_by {
+        let mut state = self.lock();
+        if let Some(by) = state.filter_set_by {
             return Err(LoggingError::Overridden(by));
         }
         let directive = directive.trim();
         let filter = parse_filter(directive)?;
         if let Some(handle) = &self.0.reload {
-            handle.reload(filter).map_err(|_| LoggingError::Gone)?;
+            handle.reload(filter).map_err(|err| {
+                if err.is_poisoned() {
+                    LoggingError::Poisoned
+                } else {
+                    LoggingError::Gone
+                }
+            })?;
         }
-        self.lock().filter = directive.to_owned();
+        state.filter = directive.to_owned();
+        drop(state);
+        self.bridge_log();
         Ok(())
     }
 
     /// Switches the log file: `Some` is opened (create, append) **before** the swap, and the old
-    /// file is closed once the writer's lock is let go; `None` is no file.
+    /// file is closed once the writer's lock is let go; `None` is no file. The state's lock is
+    /// held throughout, as [`set_filter`](Self::set_filter)'s.
     ///
     /// # Errors
     ///
     /// [`LoggingError::Overridden`] while `--log` sets it; [`LoggingError::File`] when the file
-    /// cannot be opened (the previous one stays, and `file_error` says why).
+    /// cannot be opened or is not a regular file (the previous one stays, and `file_error` says
+    /// why).
     pub fn set_file(&self, path: Option<&Path>) -> Result<(), LoggingError> {
-        if let Some(by) = self.lock().file_set_by {
+        let mut state = self.lock();
+        if let Some(by) = state.file_set_by {
             return Err(LoggingError::Overridden(by));
         }
         let file = match path.map(open_append).transpose() {
@@ -286,16 +344,35 @@ impl LoggingControl {
                     path: path.map(Path::to_path_buf).unwrap_or_default(),
                     why: one_line(&err.to_string()),
                 };
-                self.lock().file_error = Some(err.to_string());
+                state.file_error = Some(err.to_string());
                 return Err(err);
             }
         };
         let old = self.0.file.swap(file);
         drop(old);
-        let mut state = self.lock();
         state.file = path.map(Path::to_path_buf);
         state.file_error = None;
         Ok(())
+    }
+
+    /// The `log` crate's max level this subscriber wants (MOD-122 R1): the widest of the run-time
+    /// filter and the Sentry layer's. `log` drops a record above its max level before the bridge
+    /// sees it, and `init` sets it once, from the startup filter.
+    fn log_level(&self) -> log::LevelFilter {
+        let local = self.0.reload.as_ref().map_or(LevelFilter::OFF, |handle| {
+            handle
+                .with_current(|filter| widest(filter.max_level_hint()))
+                .unwrap_or(LevelFilter::OFF)
+        });
+        as_log(local.max(self.0.sentry))
+    }
+
+    /// Raises or lowers the `log` crate's max level to [`log_level`](Self::log_level), only for
+    /// the subscriber `init` installed.
+    fn bridge_log(&self) {
+        if self.0.installed.load(Ordering::Relaxed) {
+            log::set_max_level(self.log_level());
+        }
     }
 
     /// D5 at startup: each saved field `HTUI_LOG_FILTER` or `--log` does not override is applied.
@@ -365,10 +442,12 @@ pub enum LoggingError {
         /// Why, on one line.
         why: String,
     },
-    /// A flag or variable sets this setting for the session ([`SET_BY_FLAG`], [`SET_BY_VAR`]).
+    /// A flag or variable sets this setting for the session (`SET_BY_FLAG`, `SET_BY_VAR`).
     Overridden(&'static str),
     /// The subscriber the filter belonged to was dropped.
     Gone,
+    /// The filter's lock was poisoned by a thread that panicked holding it; nothing changed.
+    Poisoned,
 }
 
 impl fmt::Display for LoggingError {
@@ -384,6 +463,7 @@ impl fmt::Display for LoggingError {
             ),
             Self::Overridden(by) => write!(f, "set by {by} for this session"),
             Self::Gone => f.write_str("the log subscriber is gone"),
+            Self::Poisoned => f.write_str("the log filter's lock is poisoned"),
         }
     }
 }
@@ -408,36 +488,88 @@ pub fn parse_filter(directive: &str) -> Result<EnvFilter, LoggingError> {
     EnvFilter::try_new(directive).map_err(|err| refuse(one_line(&err.to_string())))
 }
 
+/// A filter's max level hint, `None` (no hint) read as the widest.
+fn widest(hint: Option<LevelFilter>) -> LevelFilter {
+    hint.unwrap_or(LevelFilter::TRACE)
+}
+
+/// `level` as the `log` crate's.
+fn as_log(level: LevelFilter) -> log::LevelFilter {
+    match level.into_level() {
+        None => log::LevelFilter::Off,
+        Some(tracing::Level::ERROR) => log::LevelFilter::Error,
+        Some(tracing::Level::WARN) => log::LevelFilter::Warn,
+        Some(tracing::Level::INFO) => log::LevelFilter::Info,
+        Some(tracing::Level::DEBUG) => log::LevelFilter::Debug,
+        Some(_) => log::LevelFilter::Trace,
+    }
+}
+
 /// `text` with every run of whitespace, line breaks included, as one space.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Opens `path` to append, creating it, as the `--log` file always was.
+/// Opens `path` to append, creating it, as the `--log` file always was. Only a regular file
+/// (MOD-122 R1): opening a FIFO to write blocks until a reader comes, on the event loop or at
+/// startup, so a path that exists and is something else is refused before it is opened, and on
+/// Unix the open itself cannot block (`O_NONBLOCK`, cleared once the file is known to be one), so
+/// a FIFO put there in between is refused too.
 fn open_append(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let not_regular = || io::Error::other("not a regular file");
+    if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(not_regular());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        rustix::fs::OFlags::NONBLOCK.bits().cast_signed(),
+    );
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    #[cfg(unix)]
+    rustix::fs::fcntl_setfl(
+        &file,
+        rustix::fs::fcntl_getfl(&file)? - rustix::fs::OFlags::NONBLOCK,
+    )?;
+    Ok(file)
 }
 
 /// The `fmt` layer's writer (D1): the current file, or none (writes dropped). Clone = the same
 /// slot.
 #[derive(Clone, Default)]
-struct FileSwitch(Arc<Mutex<Option<std::fs::File>>>);
+struct FileSwitch {
+    slot: Arc<Mutex<Option<std::fs::File>>>,
+    /// Whether the slot holds a file: the `fmt` layer's filter (MOD-122 R1).
+    on: Arc<AtomicBool>,
+    /// How many writers the `fmt` layer asked for, so a test sees whether it formatted.
+    #[cfg(test)]
+    made: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl FileSwitch {
     fn new(file: Option<std::fs::File>) -> Self {
-        Self(Arc::new(Mutex::new(file)))
+        let switch = Self::default();
+        drop(switch.swap(file));
+        switch
     }
 
     /// Puts `file` in the slot and hands back the one it replaces, to be dropped (closed) after
     /// the lock is let go.
     fn swap(&self, file: Option<std::fs::File>) -> Option<std::fs::File> {
-        std::mem::replace(
-            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
-            file,
-        )
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        self.on.store(file.is_some(), Ordering::Relaxed);
+        std::mem::replace(&mut *slot, file)
+    }
+
+    /// How many writers the `fmt` layer asked for.
+    #[cfg(test)]
+    fn writers(&self) -> usize {
+        self.made.load(Ordering::Relaxed)
     }
 }
 
@@ -463,7 +595,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileSwitch {
     type Writer = SwitchWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        SwitchWriter(self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        #[cfg(test)]
+        self.made.fetch_add(1, Ordering::Relaxed);
+        SwitchWriter(self.slot.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -472,7 +606,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Logging, LoggingError, LoggingPrefs, SET_BY_FLAG, SET_BY_VAR, Startup, parse_filter,
+        LogBuffer, Logging, LoggingError, LoggingPrefs, MemoryLayer, SET_BY_FLAG, SET_BY_VAR,
+        SentryLayer, Startup, parse_filter,
     };
 
     /// Runs `f` under `logging`'s own subscriber, scoped to this thread (D7).
@@ -652,25 +787,161 @@ mod tests {
         assert_eq!(Startup::from_parts(None, None), Startup::default());
     }
 
-    /// D1: what reaches Sentry is MOD-99's call, so the layer rides a startup log file only.
+    /// D1: what reaches Sentry is MOD-99's call, so the layer rides a startup log file only, under
+    /// the startup filter (MOD-122 R1): a saved file never brings it in, and a filter set at run
+    /// time neither mutes nor widens it. A buffer stands in for Sentry, in the same slot.
     #[test]
-    fn sentry_rides_only_a_startup_log_file() {
+    fn sentry_rides_only_a_startup_log_file_under_the_startup_filter() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let a = dir.path().join("a.log");
-        let built = Logging::build(Startup::default()).expect("built");
-        assert!(!built.sentry());
-        built.control().apply_saved(Some(&LoggingPrefs {
-            filter: None,
+        let sentry = LogBuffer::new();
+        let stand_in = || -> SentryLayer { Box::new(MemoryLayer::new(sentry.clone())) };
+        let sent = || -> Vec<String> {
+            sentry
+                .since(0)
+                .lines
+                .into_iter()
+                .map(|line| line.text)
+                .collect()
+        };
+
+        let without = Logging::build_with(Startup::default(), stand_in).expect("built");
+        assert!(!without.sentry());
+        without.control().apply_saved(Some(&LoggingPrefs {
+            filter: Some("trace".to_owned()),
             file: Some(a.clone()),
         }));
-        assert!(!built.sentry(), "a saved file never brings Sentry in");
+        under(&without, || tracing::error!(target: "htui::test", "kept"));
+        assert_eq!(texts(&without), ["kept"]);
+        assert!(sent().is_empty(), "a saved file never brings Sentry in");
         assert!(!Logging::detached().sentry());
-        let with_file = Logging::build(Startup {
-            file: Some(a),
+
+        let with = Logging::build_with(
+            Startup {
+                file: Some(a),
+                filter: None,
+            },
+            stand_in,
+        )
+        .expect("built");
+        assert!(with.sentry());
+        with.control().set_filter("off").expect("a valid directive");
+        under(&with, || {
+            tracing::info!(target: "htui::test", "to sentry");
+            tracing::debug!(target: "htui::test", "under the startup filter");
+        });
+        assert_eq!(sent(), ["to sentry"], "`off` does not mute Sentry");
+        assert!(texts(&with).is_empty(), "`off` mutes the buffer");
+        with.control()
+            .set_filter("trace")
+            .expect("a valid directive");
+        under(&with, || tracing::debug!(target: "htui::test", "debug"));
+        assert_eq!(sent(), ["to sentry"], "`trace` does not widen Sentry");
+        assert_eq!(texts(&with), ["debug"]);
+    }
+
+    /// MOD-122 R1: `log` records (sqlx's, among others) pass `log`'s own max level before the
+    /// bridge sees them, so it follows the filter: the widest of the run-time filter and, with
+    /// Sentry on, the startup one.
+    #[test]
+    fn the_log_bridge_level_follows_the_filter() {
+        let logging = Logging::build(Startup::default()).expect("built");
+        let control = logging.control();
+        assert_eq!(control.log_level(), log::LevelFilter::Info);
+        control.set_filter("debug").expect("a valid directive");
+        assert_eq!(control.log_level(), log::LevelFilter::Debug);
+        control
+            .set_filter("warn,sqlx=trace")
+            .expect("a valid directive");
+        assert_eq!(control.log_level(), log::LevelFilter::Trace);
+        control.set_filter("off").expect("a valid directive");
+        assert_eq!(control.log_level(), log::LevelFilter::Off);
+        control.apply_saved(Some(&LoggingPrefs {
+            filter: Some("error".to_owned()),
+            file: None,
+        }));
+        assert_eq!(control.log_level(), log::LevelFilter::Error);
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let with_sentry = Logging::build(Startup {
+            file: Some(dir.path().join("a.log")),
             filter: None,
         })
         .expect("built");
-        assert!(with_file.sentry());
+        with_sentry
+            .control()
+            .set_filter("off")
+            .expect("a valid directive");
+        assert_eq!(
+            with_sentry.control().log_level(),
+            log::LevelFilter::Info,
+            "Sentry's startup filter still wants info"
+        );
+    }
+
+    /// MOD-122 R1: with no file the `fmt` layer is filtered out, so nothing is formatted for a
+    /// line no file will hold; the buffer still keeps every line.
+    #[test]
+    fn nothing_is_formatted_for_the_file_without_a_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let a = dir.path().join("a.log");
+        let logging = Logging::build(Startup::default()).expect("built");
+        let control = logging.control();
+        let switch = control.0.file.clone();
+        under(&logging, || tracing::info!(target: "htui::test", "no file"));
+        assert_eq!(switch.writers(), 0, "formatted with no file");
+        control.set_file(Some(&a)).expect("a opens");
+        under(&logging, || tracing::info!(target: "htui::test", "to a"));
+        assert_eq!(switch.writers(), 1);
+        control.set_file(None).expect("no file");
+        under(
+            &logging,
+            || tracing::info!(target: "htui::test", "no file again"),
+        );
+        assert_eq!(switch.writers(), 1, "formatted after the file went");
+        assert_eq!(texts(&logging), ["no file", "to a", "no file again"]);
+        assert!(read(&a).contains("to a"));
+    }
+
+    /// MOD-122 R1: a FIFO (or any path that is not a regular file) is refused, at once: opening
+    /// one to write blocks until a reader comes, on the event loop or at startup.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        let logging = Logging::build(Startup::default()).expect("built");
+        let err = logging
+            .control()
+            .set_file(Some(&fifo))
+            .expect_err("a FIFO is refused");
+        assert!(err.to_string().contains(": not a regular file;"), "{err}");
+        assert_eq!(logging.control().state().file, None);
+        let err = Logging::build(Startup {
+            file: Some(fifo),
+            filter: None,
+        })
+        .expect_err("at startup too");
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    /// MOD-122 R1: a filter set after the subscriber was dropped says so.
+    #[test]
+    fn a_dropped_subscriber_is_gone() {
+        let logging = Logging::build(Startup::default()).expect("built");
+        let control = logging.control().clone();
+        drop(logging);
+        assert_eq!(control.set_filter("debug"), Err(LoggingError::Gone));
+        assert_eq!(control.state().filter, "info", "nothing is recorded");
+        assert_eq!(
+            LoggingError::Poisoned.to_string(),
+            "the log filter's lock is poisoned"
+        );
     }
 
     #[test]

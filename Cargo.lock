@@ -3052,6 +3052,7 @@ dependencies = [
  "htui-store",
  "htui-worker",
  "insta",
+ "log",
  "portable-pty",
  "proc-macro2",
  "rataflow",
