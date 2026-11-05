@@ -45,10 +45,10 @@
 use Context::{
     Answer, Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes,
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
-    Field, Form, Global, History, Layout, Leave, List, Overlay, Pane, Picker, Queue, Requirements,
-    Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds,
-    SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp,
-    SkillsLibrary, SkillsTemplates, Switcher, Waiting,
+    Field, Form, Global, History, Layout, Leave, List, Logs, Overlay, Pane, Picker, Queue,
+    Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy,
+    SettingsKinds, SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach,
+    SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -842,6 +842,12 @@ pub enum Act {
     RequirementsPriorityLater,
     /// `settings.qdrant.adopt`: use the old keyring Qdrant URL for every box (MOD-158 D10).
     QdrantAdopt,
+    /// `logs.level`: cycle the Logs tab's minimum level, trace → … → error → trace (MOD-122 D4).
+    LogsLevel,
+    /// `logs.follow`: follow the newest line, or pause where the view is (MOD-122 D4).
+    LogsFollow,
+    /// `logs.bottom`: the newest line, following again (MOD-122 D4).
+    LogsBottom,
 }
 
 impl Act {
@@ -2000,6 +2006,11 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::ChatTop, Chat, "top", &["g"], "top"),
     // transcript.rs:488.
     row(Act::ChatBottom, Chat, "bottom", &["G"], "bottom"),
+    // [logs] (MOD-122 D4). `j`/`k`/`g` are `list.*`; `G` is the view's, as `chat.bottom` is.
+    // logs/mod.rs: on_key.
+    row(Act::LogsLevel, Logs, "level", &["v"], "minimum level"),
+    row(Act::LogsFollow, Logs, "follow", &["F"], "follow"),
+    row(Act::LogsBottom, Logs, "bottom", &["G"], "newest"),
     // [queue]: the queue overlay (MOD-67 M6 D2). `j`/`k` are `list.down`/`up`, `Esc` is
     // `overlay.close`, `?` is `global.help`.
     // queue.rs:450.
@@ -2670,6 +2681,9 @@ mod tests {
         Act::RequirementsPriorityMust,
         Act::RequirementsPriorityLater,
         Act::QdrantAdopt,
+        Act::LogsLevel,
+        Act::LogsFollow,
+        Act::LogsBottom,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2889,6 +2903,9 @@ mod tests {
             Act::RequirementsPriorityMust => 210,
             Act::RequirementsPriorityLater => 211,
             Act::QdrantAdopt => 212,
+            Act::LogsLevel => 213,
+            Act::LogsFollow => 214,
+            Act::LogsBottom => 215,
         }
     }
 
@@ -2922,7 +2939,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 213);
+        assert_eq!(CATALOGUE.len(), 216);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

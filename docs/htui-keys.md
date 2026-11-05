@@ -302,6 +302,11 @@ thoughts   = ["t"]           # thoughts
 top        = ["g"]           # top
 bottom     = ["G"]           # bottom
 
+[logs]
+level  = ["v"]  # minimum level
+follow = ["F"]  # follow
+bottom = ["G"]  # newest
+
 [queue]
 move_down = ["J"]      # move down
 move_up   = ["K"]      # move up

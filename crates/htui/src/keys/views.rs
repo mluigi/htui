@@ -1015,6 +1015,21 @@ pub const CHAT_REPLAY: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The Logs tab (MOD-122 D4): its own verbs, the list moves **without** `list.bottom` (its `G`
+/// is the view's `logs.bottom`, which also jumps there), the pane scroll, then the layout and
+/// history layers of a list + detail tab.
+pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Logs,
+        &[Act::LogsLevel, Act::LogsFollow, Act::LogsBottom],
+    ),
+    Layer::only(Context::List, &[Act::ListDown, Act::ListUp, Act::ListTop]),
+    PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
+    GLOBAL,
+]);
+
 /// The queue overlay (MOD-12 M3 D8; MOD-67 M6 D2): its own verbs, the list moves, then the
 /// overlay layers the other list overlays compose (`overlay.close`, `global.help`).
 pub const QUEUE_OVERLAY: Stack<'static> = Stack::new(&[
@@ -1131,6 +1146,7 @@ mod tests {
         source!("ui/tabs/backlog/detail/requirements.rs"),
         source!("ui/tabs/backlog/detail/runs.rs"),
         source!("ui/tabs/chat/mod.rs"),
+        source!("ui/tabs/logs/mod.rs"),
     ];
 
     /// Act sites beside [`VIEWS`] (MOD-67 M6 D7): files that handle a view stack's acts without
@@ -1264,6 +1280,7 @@ mod tests {
         ITEM_DIVERGENCE,
         CHAT_LIVE,
         CHAT_REPLAY,
+        LOGS_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
         LEAVE,
@@ -1620,6 +1637,13 @@ mod tests {
         assert_eq!(resolve(CHAT_REPLAY, "esc"), [Act::Back]);
         assert_eq!(resolve(CHAT_REPLAY, "i"), []);
         assert_eq!(resolve(CHAT_REPLAY, "t"), [Act::ChatThoughts]);
+        // MOD-122 D4: the Logs tab's `G` is its own, and its list layer offers no `list.bottom`.
+        assert_eq!(resolve(LOGS_BROWSE, "G"), [Act::LogsBottom]);
+        assert_eq!(resolve(LOGS_BROWSE, "v"), [Act::LogsLevel]);
+        assert_eq!(resolve(LOGS_BROWSE, "F"), [Act::LogsFollow]);
+        assert_eq!(resolve(LOGS_BROWSE, "end"), []);
+        assert_eq!(resolve(LOGS_BROWSE, "k"), [Act::ListUp]);
+        assert_eq!(resolve(LOGS_BROWSE, "K"), [Act::PaneScrollUp]);
     }
 
     /// MOD-67 M6 §4.3: the queue overlay's and the directory picker's stacks.
@@ -1876,8 +1900,9 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        // MOD-146 D8: Settings > Project types' browse stack is the 76th.
-        assert_eq!(views.len(), 76);
+        // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D4: the Logs
+        // tab's the 77th.
+        assert_eq!(views.len(), 77);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
