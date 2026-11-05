@@ -1410,7 +1410,9 @@ async fn the_0007_project_type_reaches_the_mirror() {
 /// MOD-138 M2 D5 (`cache_migrations/0008_run_step_branch.sql`): `run_step.branch` reaches the
 /// mirror. No demo step carries a decision, so an equality against Postgres proves nothing about
 /// it: this writes one by raw SQL (the step trigger bumps `updated_at`), refreshes, and reads it off
-/// the mirror through both reads that build a `RunStep`.
+/// the mirror through both reads that build a `RunStep`: `run_steps` on the done `RUN_1`, and
+/// `waiting_candidates` on the queued `RUN_2` once its item, FEAT-3, is blocked. The CHECK does not
+/// look at the step's status, so a pending step can carry one here.
 #[tokio::test]
 async fn the_0008_branch_reaches_the_mirror() {
     let Some(db) = common::demo_db().await else {
@@ -1418,13 +1420,26 @@ async fn the_0008_branch_reaches_the_mirror() {
     };
     let cache = open_cache(&db).await;
     let branch = serde_json::json!({"deploy": true, "docs": false});
+    let waiting_branch = serde_json::json!({"ship": false});
 
-    sqlx::query("UPDATE run_step SET branch = $2 WHERE id = $1")
-        .bind(ids::STEP_IMPL.as_uuid())
-        .bind(&branch)
-        .execute(&db.pool)
-        .await
-        .expect("decide the implement step's branch");
+    for (step, value) in [
+        (ids::STEP_IMPL, &branch),
+        (ids::STEP_R2_PRD, &waiting_branch),
+    ] {
+        sqlx::query("UPDATE run_step SET branch = $2 WHERE id = $1")
+            .bind(step.as_uuid())
+            .bind(value)
+            .execute(&db.pool)
+            .await
+            .expect("decide the step's branch");
+    }
+    assert!(
+        db.store
+            .transition(ids::HTUI_FEAT_3, Status::Open, Status::Blocked)
+            .await
+            .expect("transition"),
+        "FEAT-3 is blocked, so its queued RUN_2 is a waiting candidate's"
+    );
     run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
         .await
         .expect("one pass");
@@ -1448,6 +1463,34 @@ async fn the_0008_branch_reaches_the_mirror() {
     assert!(
         others.into_iter().all(|step| step.branch.is_none()),
         "an undecided step mirrors none"
+    );
+
+    let scope = platform_scope().await;
+    let candidates = cache
+        .waiting_candidates(&scope)
+        .await
+        .expect("mirror waiting_candidates");
+    assert_eq!(
+        candidates,
+        db.store
+            .waiting_candidates(&scope)
+            .await
+            .expect("pg waiting_candidates"),
+        "the mirror and Postgres list the same candidates, steps whole"
+    );
+    let waiting = candidates
+        .iter()
+        .find(|row| row.item.id == ids::HTUI_FEAT_3)
+        .expect("FEAT-3 is a waiting candidate")
+        .runs
+        .iter()
+        .flat_map(|(_, steps)| steps)
+        .find(|step| step.id == ids::STEP_R2_PRD)
+        .expect("RUN_2's step rides FEAT-3's candidate");
+    assert_eq!(
+        waiting.branch.as_ref(),
+        Some(&waiting_branch),
+        "`run_step.branch` comes off the mirror through `waiting_candidates` too"
     );
 
     teardown(db, &[&cache]).await;

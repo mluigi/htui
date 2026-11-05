@@ -10,10 +10,12 @@
 -- migrates: migrate from a TUI first.
 --
 -- The CHECK admits NULL or an object whose every member is a JSON boolean (jsonb_path_exists in a
--- CHECK was probed on PostgreSQL 16.15 for T1: accepted).
+-- CHECK was probed on PostgreSQL 16.15 for T1: accepted). The path is `strict`: in the default lax
+-- mode `$.*` unwraps an array member before the filter runs, so {"k": [true]} and {"k": []} would
+-- pass.
 
 ALTER TABLE run_step ADD COLUMN branch JSONB
   CONSTRAINT chk_run_step_branch
   CHECK (branch IS NULL
          OR (jsonb_typeof(branch) = 'object'
-             AND NOT jsonb_path_exists(branch, '$.* ? (@.type() != "boolean")')));
+             AND NOT jsonb_path_exists(branch, 'strict $.* ? (@.type() != "boolean")')));

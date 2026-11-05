@@ -5188,6 +5188,10 @@ async fn the_branch_column_admits_an_object_of_booleans_and_null() {
         json!({"deploy": null}),
         json!({"deploy": "true"}),
         json!({"deploy": {"nested": true}}),
+        // A lax jsonpath unwraps an array member before its filter runs, so these two would pass
+        // a CHECK written without `strict`.
+        json!({"deploy": [true]}),
+        json!({"deploy": []}),
         json!([true]),
         json!(true),
         json!("deploy"),
