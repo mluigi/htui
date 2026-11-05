@@ -988,7 +988,7 @@ pub(crate) async fn check_qdrant(source: &QdrantSource, collection: &str) -> Opt
 #[derive(Debug, Default)]
 pub struct MemIndex {
     /// The fake the calls go to.
-    store: htui_store::vector::MemVectorStore,
+    store: vector::MemVectorStore,
     /// What every call answers instead, when set.
     failure: Option<String>,
     /// How long every call sleeps first, when set.
@@ -1023,7 +1023,7 @@ impl MemIndex {
 
     /// The fake store, for assertions.
     #[must_use]
-    pub const fn store(&self) -> &htui_store::vector::MemVectorStore {
+    pub const fn store(&self) -> &vector::MemVectorStore {
         &self.store
     }
 
@@ -2392,7 +2392,7 @@ mod tests {
         let searched = index.search(any_query()).await;
         created.drop_collection().await.expect("drop");
         let why = searched.expect_err("another embedder's collection");
-        assert!(why.contains(htui_store::vector::EMBEDDER_MISMATCH), "{why}");
+        assert!(why.contains(vector::EMBEDDER_MISMATCH), "{why}");
         assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
     }
 
