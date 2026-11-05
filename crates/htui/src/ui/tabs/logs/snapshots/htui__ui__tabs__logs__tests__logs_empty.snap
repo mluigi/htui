@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/ui/tabs/logs/mod.rs
+expression: frame
+---
+no workspace   ¹Logs    0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · list+detail
+╭─ Sources ──────────────────╮╭─ all · min trace · following ──────────────────────────────────────╮
+│▌all              0 · ⚠ 0   ││                                                                    │
+│ ui               0 · ⚠ 0   ││                                                                    │
+│ store            0 · ⚠ 0   ││                                                                    │
+│ orchestrator     0 · ⚠ 0   ││                                                                    │
+│ agents           0 · ⚠ 0   ││                                                                    │
+│ mcp              0 · ⚠ 0   ││                                                                    │
+│ worker           0 · ⚠ 0   ││                                                                    │
+│ secrets          0 · ⚠ 0   ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                          No log lines yet.                         │
+│                            ││  htui's own log appears here; Settings › Logging sets what is kept │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+╰─v level · F follow …───────╯╰────────────────────────────────────────────────────────────────────╯

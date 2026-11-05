@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           0 waiting ·  F1  keys
 ╭─ proposal from scripted · sent → proposed ─────‹ Templates ╮╭─ phase placeholders ───────────────╮
 │--- sent                                                    ││{{item_key}} scalar                 │
 │+++ proposed                                                ││{{item_title}} scalar               │

@@ -42,15 +42,15 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     );
     assert_eq!(
         harness.app().tabs.len(),
-        5,
-        "Backlog, Skills, Requirements, Settings and Chat, in that order (MOD-2 milestone 3 \
-         registered Chat, MOD-39 plan T3 put Requirements third)"
+        6,
+        "Backlog, Skills, Requirements, Settings, Chat and Logs, in that order (MOD-2 milestone 3 \
+         registered Chat, MOD-39 plan T3 put Requirements third, MOD-122 D4 put Logs last)"
     );
     assert!(
         harness.app().overlays.is_empty(),
         "the startup workspace was entered from the first reply, so no switcher was ever opened"
     );
-    // At 100 columns the five tab chips and `? keys` leave no room for the working count and the
+    // At 100 columns the six tab chips and `? keys` leave no room for the working count and the
     // store, so the header is read at 160 and the snapshot below keeps the 100-column frame.
     harness.resize(160, 30);
     let header = top_bar(&harness.render());
@@ -62,6 +62,11 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     assert!(
         frame.contains(" \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings"),
         "the tab chips are in registration order: {frame}"
+    );
+    // MOD-122 D4: Logs registers last, so it takes `6` and no other tab's digit moves.
+    assert!(
+        header.contains("\u{2075}Chat  \u{2076}Logs"),
+        "Chat keeps 5 and Logs takes 6: {header}"
     );
     assert!(
         harness.app().keys_line().contains("w workspaces"),

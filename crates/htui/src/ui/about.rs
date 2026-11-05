@@ -79,8 +79,18 @@ const REQUIREMENTS: About = About {
     ],
 };
 
-/// The about text of `tab`, if it has one: the five main tabs do, anything else (a test double,
-/// the reserved workspaces and logs tabs before they exist) does not.
+/// The Logs tab (MOD-122 D4).
+const LOGS: About = About {
+    purpose: "htui's own log as it runs: pick a source, set the minimum level, follow or scroll back.",
+    actions: &[
+        (Act::LogsLevel, "level"),
+        (Act::LogsFollow, "follow"),
+        (Act::LogsBottom, "newest"),
+    ],
+};
+
+/// The about text of `tab`, if it has one: the six main tabs do, anything else (a test double,
+/// the reserved workspaces tab before it exists) does not.
 #[must_use]
 pub fn about_for(tab: TabId) -> Option<&'static About> {
     match tab.0 {
@@ -89,6 +99,7 @@ pub fn about_for(tab: TabId) -> Option<&'static About> {
         "skills" => Some(&SKILLS),
         "settings" => Some(&SETTINGS),
         "requirements" => Some(&REQUIREMENTS),
+        "logs" => Some(&LOGS),
         _ => None,
     }
 }
@@ -138,7 +149,14 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier};
 
-    const TABS: [&str; 5] = ["backlog", "chat", "skills", "settings", "requirements"];
+    const TABS: [&str; 6] = [
+        "backlog",
+        "chat",
+        "skills",
+        "settings",
+        "requirements",
+        "logs",
+    ];
 
     fn draw(width: u16, height: u16, about: &About, keys: &Keys, stack: Stack<'_>) -> Buffer {
         draw_themed(width, height, about, keys, stack, &Theme::default())

@@ -175,6 +175,11 @@ close = []  # close; Esc always"#;
                        top        = [\"g\"]           # top\n\
                        bottom     = [\"G\"]           # bottom\n\
                        \n\
+                       [logs]\n\
+                       level  = [\"v\"]  # minimum level\n\
+                       follow = [\"F\"]  # follow\n\
+                       bottom = [\"G\"]  # newest\n\
+                       \n\
                        [queue]\n\
                        move_down = [\"J\"]      # move down\n\
                        move_up   = [\"K\"]      # move up\n\

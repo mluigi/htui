@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           0 waiting ·  F1  keys
 ╭─ judge · editing from v1, saves v2 ───── Skills  Templates ╮╭─ judge placeholders ───────────────╮
 │You are judging {{phase}} candidates for {{item_key}}. You d││{{item_key}} scalar                 │
 │                                                            ││{{phase}} scalar                    │

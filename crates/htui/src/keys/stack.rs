@@ -330,6 +330,8 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // MOD-115 M2 §1.5: the leave dialog, appended so every first-reported phrase is unchanged.
     // It replaced the quit question (T6), whose entry went with `quit_confirm.rs`.
     ("in the leave dialog", views::LEAVE),
+    // MOD-122 D4: the Logs tab, appended so every first-reported phrase is unchanged.
+    ("in Logs", views::LOGS_BROWSE),
 ];
 
 impl Keys {
@@ -421,8 +423,10 @@ mod tests {
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
         // MOD-115 M2 T6: the quit question's entry went with it.
-        assert_eq!(DECLARED.len(), 83);
+        assert_eq!(DECLARED.len(), 84);
         assert_eq!(DECLARED[82], ("in the leave dialog", views::LEAVE));
+        // MOD-122 D4: the Logs tab, appended after it.
+        assert_eq!(DECLARED[83], ("in Logs", views::LOGS_BROWSE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
