@@ -475,6 +475,17 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// no longer hashes to its own `topology` parks with both digests; a v1 run whose live graph
 /// gained a non-default edge walks on; and a v1 run on a refused live graph whose phases changed
 /// parks with the topology note.
+///
+/// **Three for MOD-144** (ANA-35 §7.1): a queued cancel writes no item, a stopped run holds its
+/// item, and a rework run on a finished item is admitted.
+///
+/// **Nine for MOD-138 M2 T4** (plan D7, D10, Q-D; blueprint A3, A6, F8): loops follow edges, not
+/// names. A `changes_requested` edge loops a node not called `review`, and a `review` with no
+/// such edge passes its verdict unread; a `fails` edge loops on the node's own failure retiring
+/// its region, on a human's reject, and in `settle_failed`'s replay of a loop a crash cut short,
+/// and escalates once spent; a loop on a diamond retires only the nodes on a path from its
+/// target to its source; no progress stops an edge loop before its `loop_limit`; and a graph
+/// with authored edges resolves (D6(c) lifted).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -725,6 +736,20 @@ pub const CASES: &[&str] = &[
     "a_queued_cancel_writes_no_item",
     "a_stopped_run_holds_its_item",
     "a_rework_run_on_a_finished_item_is_admitted",
+    // MOD-138 M2 T4 (plan D7, D10, Q-D; blueprint A3, A6, F8): loops follow edges, not names. A
+    // `changes_requested` edge loops a node not called `review`, and a `review` without one
+    // passes unread; a `fails` edge loops on a failure, on a human's reject and in a crash's
+    // replay, and escalates out of budget; a loop on a diamond retires only its region; no
+    // progress stops an edge loop; and a graph with authored edges resolves.
+    "a_changes_requested_edge_loops_a_node_not_named_review",
+    "a_review_with_no_changes_requested_edge_passes_unread",
+    "a_fails_edge_loops_and_retires_its_region",
+    "a_human_reject_of_a_fails_node_loops",
+    "a_fails_loop_cut_short_is_replayed_by_settle_failed",
+    "a_spent_fails_loop_escalates",
+    "a_loop_on_a_diamond_retires_only_its_region",
+    "an_edge_loop_without_progress_escalates",
+    "a_graph_with_authored_edges_resolves",
 ];
 
 /// Run one case by name.
@@ -756,6 +781,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| spend_guard_case(name, harness))
         .or_else(|| pinned_resume_case(name, harness))
         .or_else(|| item_state_case(name, harness))
+        .or_else(|| graph_walker_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -1176,6 +1202,41 @@ fn item_state_case<'a, H: CaseHarness>(
         "a_stopped_run_holds_its_item" => Box::pin(a_stopped_run_holds_its_item(harness)),
         "a_rework_run_on_a_finished_item_is_admitted" => {
             Box::pin(a_rework_run_on_a_finished_item_is_admitted(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-138 M2 T4's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn graph_walker_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_changes_requested_edge_loops_a_node_not_named_review" => Box::pin(
+            a_changes_requested_edge_loops_a_node_not_named_review(harness),
+        ),
+        "a_review_with_no_changes_requested_edge_passes_unread" => Box::pin(
+            a_review_with_no_changes_requested_edge_passes_unread(harness),
+        ),
+        "a_fails_edge_loops_and_retires_its_region" => {
+            Box::pin(a_fails_edge_loops_and_retires_its_region(harness))
+        }
+        "a_human_reject_of_a_fails_node_loops" => {
+            Box::pin(a_human_reject_of_a_fails_node_loops(harness))
+        }
+        "a_fails_loop_cut_short_is_replayed_by_settle_failed" => {
+            Box::pin(a_fails_loop_cut_short_is_replayed_by_settle_failed(harness))
+        }
+        "a_spent_fails_loop_escalates" => Box::pin(a_spent_fails_loop_escalates(harness)),
+        "a_loop_on_a_diamond_retires_only_its_region" => {
+            Box::pin(a_loop_on_a_diamond_retires_only_its_region(harness))
+        }
+        "an_edge_loop_without_progress_escalates" => {
+            Box::pin(an_edge_loop_without_progress_escalates(harness))
+        }
+        "a_graph_with_authored_edges_resolves" => {
+            Box::pin(a_graph_with_authored_edges_resolves(harness))
         }
         _ => return None,
     })
@@ -8738,7 +8799,7 @@ async fn a_running_v2_run_walks_on_after_a_live_edit<H: CaseHarness>(harness: &H
         panic!("a v2 run walks its snapshot: {resumed:?}");
     };
     assert_eq!(
-        (rest.run, rest.failure),
+        (rest.run, rest.failure.clone()),
         (RunStatus::Done, None),
         "every phase is `never`, so the snapshot walks to the end"
     );
@@ -8969,6 +9030,567 @@ async fn a_v1_run_on_a_refused_graph_whose_phases_changed_parks<H: CaseHarness>(
     );
 }
 
+// -- MOD-138 M2 T4: loops over edges (plan D7, D10; blueprint A3, A4, A6, A8) ------------------
+
+/// Rewrites `item`'s live graph through `replace_graph` after `edit`: the body the store holds,
+/// edited, and checked by the shared validator as any save is (MOD-138 D9).
+///
+/// # Panics
+/// When the item resolves to no graph, or `replace_graph` refuses the body.
+async fn edit_graph<O: Orchestrate>(
+    orch: &O,
+    item: ItemId,
+    edit: impl FnOnce(&mut htui_core::model::GraphBody),
+) {
+    let graph = orch
+        .store()
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph")
+        .graph
+        .id;
+    let mut body = orch
+        .store()
+        .graph_body(graph)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item's graph is there");
+    edit(&mut body);
+    let outcome = orch
+        .store()
+        .replace_graph(graph, body.graph.revision, body)
+        .await
+        .expect("the store takes the edited graph");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+}
+
+/// The phase id of `name` in `body`.
+///
+/// # Panics
+/// When the graph has no such phase.
+fn node_id(body: &htui_core::model::GraphBody, name: &str) -> PhaseId {
+    body.nodes
+        .iter()
+        .find(|node| node.phase.name == name)
+        .map(|node| node.phase.id)
+        .unwrap_or_else(|| panic!("the graph has a `{name}` phase"))
+}
+
+/// One authored edge `from → to` of `kind` on `item`'s live graph (MOD-138 M2), beside the ones
+/// it has.
+///
+/// # Panics
+/// As [`edit_graph`].
+async fn add_edge<O: Orchestrate>(
+    orch: &O,
+    item: ItemId,
+    from: &str,
+    to: &str,
+    kind: EdgeKind,
+    loop_limit: Option<i32>,
+) {
+    edit_graph(orch, item, |body| {
+        let (from, to) = (node_id(body, from), node_id(body, to));
+        body.edges.push(StepGraphEdge {
+            id: EdgeId::new(),
+            graph_id: body.graph.id,
+            from,
+            to,
+            kind,
+            predicate: None,
+            loop_limit,
+        });
+    })
+    .await;
+}
+
+/// `item`'s live graph with **every** edge replaced by `edges` (`(from, to, kind, loop_limit)`),
+/// the way an author draws a graph that is not a chain.
+///
+/// # Panics
+/// As [`edit_graph`].
+async fn author_edges<O: Orchestrate>(
+    orch: &O,
+    item: ItemId,
+    edges: &[(&str, &str, EdgeKind, Option<i32>)],
+) {
+    edit_graph(orch, item, |body| {
+        body.edges = edges
+            .iter()
+            .map(|&(from, to, kind, loop_limit)| StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: body.graph.id,
+                from: node_id(body, from),
+                to: node_id(body, to),
+                kind,
+                predicate: None,
+                loop_limit,
+            })
+            .collect();
+    })
+    .await;
+}
+
+/// `(position, attempt, status)` of every step of the run, sorted.
+async fn sorted_shape<O: Orchestrate>(orch: &O, run: RunId) -> Vec<(i32, i32, StepStatus)> {
+    let mut shape = step_shape(orch, run).await;
+    shape.sort_by_key(|&(position, attempt, _)| (position, attempt));
+    shape
+}
+
+/// MOD-138 M2 D7 (plan Q-D): a node reads its verdict because it has a `changes_requested` edge,
+/// not because it is called `review`. FEAT-3's `review` renamed `audit` gets no loop from the
+/// default rule; an authored `audit → implement` edge loops it like the review loop: the
+/// request-changes verdict retires `implement` and the rejecting `audit`, and the second audit's
+/// approval walks the run to `done`.
+async fn a_changes_requested_edge_loops_a_node_not_named_review<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "review" {
+            phase.name = "audit".to_owned();
+        }
+    })
+    .await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "audit",
+        "implement",
+        EdgeKind::ChangesRequested,
+        Some(1),
+    )
+    .await;
+    orch.script("audit", 1, ScriptedStep::review("request-changes", "first"));
+    orch.script("audit", 2, ScriptedStep::review("approve", "second"));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "the loop ran once and the second audit approved: {rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::Done),
+            (3, 1, StepStatus::Cancelled),
+            (3, 2, StepStatus::Done),
+        ]
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(at(&steps, 3, 1).gate_outcome, Some(GateOutcome::Rejected));
+    assert_eq!(
+        at(&steps, 3, 1).gate_note.as_deref(),
+        Some("verdict: request-changes")
+    );
+}
+
+/// MOD-138 M2 Q-D, the other half: a node called `review` with no `changes_requested` edge does
+/// not read its verdict. Its `request-changes` passes unread, as any `ok` settle does, and the
+/// run finishes with one review.
+async fn a_review_with_no_changes_requested_edge_passes_unread<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    author_edges(
+        &orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::Next, None),
+            ("plan", "implement", EdgeKind::Next, None),
+            ("implement", "review", EdgeKind::Next, None),
+        ],
+    )
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "unread"),
+    );
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+    let review = at(&steps_of(&orch, run).await, 3, 1).clone();
+    assert_eq!(review.gate_outcome, Some(GateOutcome::Skipped));
+    assert_eq!(
+        review.gate_note, None,
+        "no verdict was read, so none was noted"
+    );
+}
+
+/// MOD-138 M2 D7: a `never` node with a `fails` edge loops over it on a failure, in place of its
+/// own `retry_limit`. `review → plan` `fails`: the review's missing output retires the region
+/// `plan, implement, review` (target first), `prd` keeps its row, and the second pass finishes.
+async fn a_fails_edge_loops_and_retires_its_region<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "review",
+        "plan",
+        EdgeKind::Fails,
+        Some(1),
+    )
+    .await;
+    orch.script("review", 1, ScriptedStep::done_without_output());
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Superseded),
+            (1, 2, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::Done),
+            (3, 1, StepStatus::Cancelled),
+            (3, 2, StepStatus::Done),
+        ],
+        "the failed review is cancelled (`failed -> superseded` is illegal), and its own retry \
+         would have left `plan` and `implement` alone"
+    );
+}
+
+/// MOD-138 M2 D7, blueprint A3: a human's reject of a node with no `changes_requested` edge
+/// loops over its `fails` edge, where it used to end the run `rejected: plan`. `plan → prd`
+/// `fails`: `prd` and the rejected `plan` are retired and `prd` parks again at attempt 2.
+async fn a_human_reject_of_a_fails_node_loops<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "plan",
+        "prd",
+        EdgeKind::Fails,
+        Some(1),
+    )
+    .await;
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve(&orch, run, 1).await; // prd -> plan parks
+    let rest = act(&orch, run, Act::Reject).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "the loop resumed at `prd`, whose `always` gate parked it"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Superseded),
+            (0, 2, StepStatus::AwaitingApproval),
+            (1, 1, StepStatus::Cancelled),
+        ]
+    );
+    assert_eq!(
+        at(&steps_of(&orch, run).await, 1, 1).gate_outcome,
+        Some(GateOutcome::Rejected),
+        "the human's answer stays on the retired row"
+    );
+}
+
+/// MOD-138 M2 D7, blueprint F8: a crash between `gate::apply`'s `running -> failed` and its
+/// `fails` loop leaves a `failed` row with no gate note under a `running` run. The adopter's
+/// sweep reaches `settle_failed`, which runs the loop the crash cut short rather than retrying
+/// the step on its own budget.
+async fn a_fails_loop_cut_short_is_replayed_by_settle_failed<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "plan",
+        "prd",
+        EdgeKind::Fails,
+        Some(1),
+    )
+    .await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+
+    // The rows the crash left: `prd` approved, `plan` failed by the settle, the run `running`.
+    let store = orch.store();
+    let now = orch.clock().now();
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert!(
+        store
+            .answer_gate(prd.id, GateOutcome::Approved, None, now)
+            .await
+            .expect("MemStore takes the answer")
+    );
+    let plan = store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 1,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "plan".to_owned(),
+            agent_id: None,
+            model: None,
+        })
+        .await
+        .expect("`(1, 1, 0)` is free");
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::Failed),
+    ] {
+        assert!(
+            store
+                .transition_step(plan.id, from, to, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+    }
+    assert!(
+        store
+            .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+            .await
+            .expect("MemStore takes the move")
+    );
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert_eq!(adopted[0].run, run);
+    let resumed = other.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("a v2 run walks its snapshot: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "the replayed loop resumed at `prd`"
+    );
+    assert_eq!(
+        sorted_shape(&other, run).await,
+        [
+            (0, 1, StepStatus::Superseded),
+            (0, 2, StepStatus::AwaitingApproval),
+            (1, 1, StepStatus::Cancelled),
+        ],
+        "a retry of `plan` would have left `prd` done and created `(1, 2)`"
+    );
+}
+
+/// MOD-138 M2 D7: a `fails` loop out of budget escalates as the review loop does: the run parks
+/// at the failing node, the item is blocked and the note names the loop, with
+/// `RunFailure::LoopExhausted` on the rest.
+async fn a_spent_fails_loop_escalates<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "review",
+        "implement",
+        EdgeKind::Fails,
+        Some(1),
+    )
+    .await;
+    for attempt in [1, 2] {
+        orch.script("review", attempt, ScriptedStep::done_without_output());
+    }
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    let failure = RunFailure::LoopExhausted {
+        kind: EdgeKind::Fails,
+        from: "review".to_owned(),
+        to: "implement".to_owned(),
+        attempts: 2,
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(3), Some(failure.clone())),
+        "`loop_limit = 1` permits two attempts of `implement`"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::AwaitingApproval);
+    assert!(
+        row.failure.is_none(),
+        "`run.failure` stays NULL on a parked run"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    let expected = format!("{failure}: phase `implement`, attempt 2, stop reason `exhausted`");
+    assert!(notes.contains(&expected), "{notes:?}");
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::Done),
+            (3, 1, StepStatus::Cancelled),
+            (3, 2, StepStatus::Failed),
+        ],
+        "the loop stopped before retiring the second failure"
+    );
+}
+
+/// MOD-138 M2 D7, ANA-33 §7.3 (blueprint §2.6): on the diamond `prd → {plan, implement} →
+/// review` with `review → plan` `changes_requested`, the loop retires only the region on a path
+/// from `plan` to `review`. `implement`, a side branch, keeps its `done` row and is not re-run;
+/// the join waits for `plan`'s second attempt and the second review finishes the run.
+async fn a_loop_on_a_diamond_retires_only_its_region<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    author_edges(
+        &orch,
+        ids::HTUI_FEAT_3,
+        &[
+            ("prd", "plan", EdgeKind::Next, None),
+            ("prd", "implement", EdgeKind::Next, None),
+            ("plan", "review", EdgeKind::Next, None),
+            ("implement", "review", EdgeKind::Next, None),
+            ("review", "plan", EdgeKind::ChangesRequested, Some(1)),
+        ],
+    )
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Superseded),
+            (1, 2, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Cancelled),
+            (3, 2, StepStatus::Done),
+        ],
+        "`implement` is on no path from `plan` to `review`: rows win"
+    );
+}
+
+/// MOD-138 M2 D7: no progress stops an edge loop before its budget does. `audit → implement`
+/// `changes_requested` with `loop_limit = 5`, no repo in scope, and two identical audits: the
+/// second turn escalates on `no_progress_review` with the review loop's bytes.
+async fn an_edge_loop_without_progress_escalates<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "review" {
+            phase.name = "audit".to_owned();
+        }
+    })
+    .await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "audit",
+        "implement",
+        EdgeKind::ChangesRequested,
+        Some(5),
+    )
+    .await;
+    for attempt in [1, 2] {
+        orch.script(
+            "audit",
+            attempt,
+            ScriptedStep::review("request-changes", "same words"),
+        );
+    }
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (
+            RunStatus::AwaitingApproval,
+            Some(3),
+            Some(RunFailure::ReviewLoopExhausted(2))
+        ),
+        "the budget allows six attempts; no progress stopped the second"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body
+            == "review loop exhausted after 2 attempts: phase `implement`, attempt 2, stop \
+                reason `no_progress_review`"),
+        "{notes:?}"
+    );
+    assert!(
+        !steps_of(&orch, run)
+            .await
+            .iter()
+            .any(|step| step.attempt > 2),
+        "no third attempt"
+    );
+}
+
+/// MOD-138 M2 D10: D6(c) is lifted. A live graph with an authored back `asks_you` edge, which
+/// M1 refused as not yet runnable, starts a v2 run whose snapshot carries the edge.
+async fn a_graph_with_authored_edges_resolves<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "review",
+        "plan",
+        EdgeKind::AsksYou,
+        None,
+    )
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "the run started and parked at `prd`'s gate"
+    );
+    let blob = run_of(&orch, run)
+        .await
+        .graph_snapshot
+        .expect("the walk created the run with a snapshot");
+    let snapshot: GraphSnapshot =
+        serde_json::from_value(blob).expect("the engine wrote a `GraphSnapshot`");
+    assert_eq!(snapshot.v, GraphSnapshot::V);
+    assert!(
+        snapshot
+            .edges
+            .iter()
+            .any(|edge| (edge.from.as_str(), edge.to.as_str(), edge.kind)
+                == ("review", "plan", EdgeKind::AsksYou)),
+        "{:?}",
+        snapshot.edges
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -8993,8 +9615,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            118,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            127,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -9035,7 +9657,12 @@ mod tests {
              (plan D5: a v2 run walking on after a live edit on the three resume paths, a \
              tampered v2 snapshot parked; blueprint A6: a v1 run on a refused live graph \
              walking on, and parked once its phases moved), and MOD-144's three (a queued cancel \
-             writing no item, a stopped run holding its item, a rework run on a finished item)"
+             writing no item, a stopped run holding its item, a rework run on a finished item), \
+             and MOD-138 M2 T4's nine loops over edges (plan D7, D10, Q-D: a `changes_requested` \
+             edge on a node not called `review`, a `review` with none passing unread, a `fails` \
+             loop retiring its region, on a human's reject, replayed after a crash and spent, a \
+             diamond's region, no progress on an edge loop, and a graph with authored edges \
+             resolving)"
         );
     }
 
