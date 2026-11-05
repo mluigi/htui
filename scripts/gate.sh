@@ -8,8 +8,8 @@
 # Usage:
 #   bash scripts/gate.sh [--only <step>] [--detach] [--status] [--self-test]
 #
-#   --only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, test, abort-grep,
-#                  migrations, workflow-docs, plugin)
+#   --only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, qdrant, test,
+#                  abort-grep, migrations, workflow-docs, plugin)
 #   --detach       relaunch under setsid, log to target/gate/run.log, print the PID and return
 #   --status       print target/gate/last.json and exit
 #
@@ -41,7 +41,7 @@ TEST_LOG="${GATE_TEST_LOG:-$GATE_DIR/test.log}"
 MIGRATIONS_DIR="${GATE_MIGRATIONS_DIR:-$REPO_ROOT/crates/htui-store/migrations}"
 PLUGIN_DIR="$REPO_ROOT/.claude/skills/htui-dev"
 MIN_CLAUDE="2.1.287"
-STEPS=(fmt clippy-all clippy-bare postgres test abort-grep migrations workflow-docs plugin)
+STEPS=(fmt clippy-all clippy-bare postgres qdrant test abort-grep migrations workflow-docs plugin)
 
 STEP_NAMES=(); STEP_STATUS=(); STEP_SECONDS=()
 STARTED=""
@@ -102,6 +102,30 @@ step_postgres() {
         return 1
     fi
     echo "postgres: $host:$port reachable; the Postgres suites run live"
+}
+
+step_qdrant() {
+    # MOD-160 D10: the Qdrant suites return early without HTUI_TEST_QDRANT_URL, as the Postgres
+    # ones do without a DSN. Same verdicts as step_postgres. Never print more than host:port: the
+    # URL may carry credentials.
+    local url="${HTUI_TEST_QDRANT_URL:-}" host port
+    if [[ -z "$url" ]]; then
+        echo "qdrant: HTUI_TEST_QDRANT_URL unset - the Qdrant suites return early and prove nothing"
+        return 3
+    fi
+    if [[ ! "$url" =~ ^(https?)://([^@/]*@)?(\[[^]/]+\]|[^:/?#]+)(:([0-9]+))? ]]; then
+        echo "qdrant: URL set, host not parsed (not probed)"
+        return 0
+    fi
+    host="${BASH_REMATCH[3]}"; host="${host#[}"; host="${host%]}"
+    # The port the client would dial: the URL's, else the scheme's.
+    port="${BASH_REMATCH[5]:-}"
+    [[ -n "$port" ]] || { [[ "${BASH_REMATCH[1]}" == https ]] && port=443 || port=80; }
+    if ! timeout 3 bash -c ">/dev/tcp/$host/$port" 2>/dev/null; then
+        echo "qdrant: $host:$port unreachable - the Qdrant suites would fail"
+        return 1
+    fi
+    echo "qdrant: $host:$port reachable; the Qdrant suites run live"
 }
 
 step_test() {
@@ -265,6 +289,21 @@ run_self_test() {
         || failures+=('postgres: an unparsed DSN failed')
     out="$(HTUI_TEST_DATABASE_URL='postgres://u:s3cret@127.0.0.1:1/db' step_postgres 2>&1)"
     [[ "$out" != *s3cret* ]] || failures+=('postgres: the DSN password was printed')
+
+    # Every step names a function: a missing one would only show up when that step runs.
+    local s
+    for s in "${STEPS[@]}"; do
+        declare -F "step_${s//-/_}" >/dev/null || failures+=("step $s has no step_${s//-/_}")
+    done
+
+    ( unset HTUI_TEST_QDRANT_URL; step_qdrant >/dev/null; [[ $? -eq 3 ]] ) \
+        || failures+=('qdrant: an unset URL was not skipped')
+    ( HTUI_TEST_QDRANT_URL='http://127.0.0.1:1' step_qdrant >/dev/null; [[ $? -eq 1 ]] ) \
+        || failures+=('qdrant: an unreachable host passed')
+    ( HTUI_TEST_QDRANT_URL='not-a-url' step_qdrant >/dev/null ) \
+        || failures+=('qdrant: an unparsed URL failed')
+    out="$(HTUI_TEST_QDRANT_URL='http://u:s3cret@127.0.0.1:1' step_qdrant 2>&1)"
+    [[ "$out" != *s3cret* ]] || failures+=('qdrant: the URL credentials were printed')
 
     version_ge 2.1.296 2.1.287 || failures+=('version_ge: 2.1.296 < 2.1.287')
     version_ge 2.1.287 2.1.287 || failures+=('version_ge: equal versions refused')

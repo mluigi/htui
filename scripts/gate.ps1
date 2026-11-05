@@ -4,8 +4,8 @@
 # Usage:
 #   pwsh -NoProfile -File scripts/gate.ps1 [-Only <step>] [-Detach] [-Status] [-SelfTest]
 #
-#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, test, abort-grep,
-#                 migrations, workflow-docs, plugin)
+#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, qdrant, test,
+#                 abort-grep, migrations, workflow-docs, plugin)
 #   -Detach       relaunch in a hidden process, log to target/gate/run.log, print the PID
 #   -Status       print target/gate/last.json and exit
 #
@@ -15,7 +15,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
+    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
     [string]$Only,
     [switch]$Detach,
     [switch]$Status,
@@ -32,7 +32,7 @@ $script:TestLog = if ($env:GATE_TEST_LOG) { $env:GATE_TEST_LOG } else { Join-Pat
 $script:MigrationsDir = if ($env:GATE_MIGRATIONS_DIR) { $env:GATE_MIGRATIONS_DIR } else { Join-Path $RepoRoot 'crates/htui-store/migrations' }
 $PluginDir = Join-Path $RepoRoot '.claude/skills/htui-dev'
 $MinClaude = [version]'2.1.287'
-$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
+$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Started = ''
@@ -95,6 +95,36 @@ function Step-Postgres {
         }
     } finally { $client.Dispose() }
     Write-Host "postgres: ${hostName}:$port reachable; the Postgres suites run live"
+    return $Pass
+}
+
+function Step-Qdrant {
+    # MOD-160 D10: the Qdrant suites return early without HTUI_TEST_QDRANT_URL, as the Postgres
+    # ones do without a DSN. Same verdicts as Step-Postgres. Never print more than host:port: the
+    # URL may carry credentials.
+    $url = $env:HTUI_TEST_QDRANT_URL
+    if (-not $url) {
+        Write-Host 'qdrant: HTUI_TEST_QDRANT_URL unset - the Qdrant suites return early and prove nothing'
+        return $Skip
+    }
+    $m = [regex]::Match($url, '^(https?)://([^@/]*@)?(\[[^\]/]+\]|[^:/?#]+)(:([0-9]+))?')
+    if (-not $m.Success) {
+        Write-Host 'qdrant: URL set, host not parsed (not probed)'
+        return $Pass
+    }
+    $hostName = $m.Groups[3].Value.TrimStart('[').TrimEnd(']')
+    # The port the client would dial: the URL's, else the scheme's.
+    $port = if ($m.Groups[5].Success) { [int]$m.Groups[5].Value } elseif ($m.Groups[1].Value -eq 'https') { 443 } else { 80 }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $reached = $false
+        try { $reached = $client.ConnectAsync($hostName, $port).Wait(3000) } catch { $reached = $false }
+        if (-not $reached) {
+            Write-Host "qdrant: ${hostName}:$port unreachable - the Qdrant suites would fail"
+            return $Fail
+        }
+    } finally { $client.Dispose() }
+    Write-Host "qdrant: ${hostName}:$port reachable; the Qdrant suites run live"
     return $Pass
 }
 
@@ -255,6 +285,25 @@ function Invoke-GateSelfTest {
             $env:HTUI_TEST_DATABASE_URL = 'postgres://u:s3cret@127.0.0.1:1/db'
             if ("$(Step-Postgres 6>&1)" -match 's3cret') { $failures += 'postgres: the DSN password was printed' }
         } finally { $env:HTUI_TEST_DATABASE_URL = $savedDsn }
+
+        # Every step names a function. A missing one ends its case's `if` before the case can fail,
+        # so the cases below cannot catch it.
+        foreach ($s in $Steps) {
+            $fn = 'Step-' + (($s -split '-' | ForEach-Object { $_.Substring(0, 1).ToUpper() + $_.Substring(1) }) -join '')
+            if (-not (Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue)) { $failures += "step $s has no $fn" }
+        }
+
+        $savedQdrant = $env:HTUI_TEST_QDRANT_URL
+        try {
+            $env:HTUI_TEST_QDRANT_URL = $null
+            if ((Step-Qdrant | Select-Object -Last 1) -ne $Skip) { $failures += 'qdrant: an unset URL was not skipped' }
+            $env:HTUI_TEST_QDRANT_URL = 'http://127.0.0.1:1'
+            if ((Step-Qdrant | Select-Object -Last 1) -ne $Fail) { $failures += 'qdrant: an unreachable host passed' }
+            $env:HTUI_TEST_QDRANT_URL = 'not-a-url'
+            if ((Step-Qdrant | Select-Object -Last 1) -ne $Pass) { $failures += 'qdrant: an unparsed URL failed' }
+            $env:HTUI_TEST_QDRANT_URL = 'http://u:s3cret@127.0.0.1:1'
+            if ("$(Step-Qdrant 6>&1)" -match 's3cret') { $failures += 'qdrant: the URL credentials were printed' }
+        } finally { $env:HTUI_TEST_QDRANT_URL = $savedQdrant }
 
         # last.json: the documented shape, and no .tmp left behind.
         $script:GateDir = Join-Path $tmp 'gate'; $script:LastJson = Join-Path $script:GateDir 'last.json'
