@@ -763,3 +763,27 @@ Each commit compiles, passes its tests and featureless clippy. Commit with expli
 | `with_default` tests in parallel with other dispatchers see `Interest::sometimes` | Correct by design (per-dispatch `enabled`); the reload rebuilds the interest cache across live dispatchers |
 | A paused view's anchor line drops out of the ring | `partition_point` lands on the next retained line, `top` clamps (`a_paused_view_keeps_its_line_when_old_lines_drop`) |
 | Six chips crowd the 100-column header | F7: T2 re-reads the header assertion and reviews `integration__demo_shell` |
+
+## R1 amendments (review-fix round)
+
+Changed by the rust-reviewer's findings; D1-D7 otherwise stand.
+
+- **Filter placement (D1, B-layers).** The reloadable `EnvFilter` is no longer global: it is the
+  per-layer filter of `MemoryLayer.and_then(fmt)`. The Sentry layer (still only on a startup
+  `--log`) sits on the registry behind its own copy of the startup filter (`HTUI_LOG_FILTER` or
+  `info`), which nothing reloads, so Settings › Logging never mutes or widens Sentry. The `fmt`
+  layer has a second, dynamic per-layer filter: off while the `FileSwitch` holds no file.
+- **`log` bridge.** After every successful reload, the `log` crate's max level is set to the
+  widest of the run-time filter's and Sentry's level hints, only for the subscriber `init`
+  installed (`installed` flag), so tests move no process-global state. `log` is a direct
+  dependency; rustix gains `fs` (`O_NONBLOCK` open of the log file; a path that is not a regular
+  file is refused).
+- **Startup apply (D5, lib.rs §wiring).** `ui-state.toml` is read and its `[logging]` applied
+  after `--print-keys` (the last verb or flag that exits) and before `connect::start`, not after
+  the store worker's spawn: the saved settings see every line the TUI logs and stay the TUI's
+  (`docs/htui-cli.md`: they do not apply to `status`/`waiting`).
+- **Tab activation.** `Tab` gains a defaulted `on_activate(&mut self, ctx)`, called by
+  `App::activate_tab` after the tab's requests; `LogsTab` pulls its buffer there.
+- **Log file path (Settings).** A leading `~/` is the home directory (`dirs::home_dir`); a path
+  that is not UTF-8 is refused in the section; `ui-state.toml` leaves one out rather than
+  writing it lossily.
