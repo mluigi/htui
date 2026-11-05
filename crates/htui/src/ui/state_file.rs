@@ -9,6 +9,10 @@
 //! [about]
 //! visible = false
 //!
+//! [logging]                   # Settings › Logging (MOD-122 D5); `file = ""` is no file
+//! filter = "info"             # an EnvFilter directive, checked when it is applied
+//! file = "/home/me/htui.log"
+//!
 //! [layout.backlog]            # the tab's id
 //! preset = "ide"              # Preset::name
 //! list_percent = 55           # exactly one of list_percent / list_cells
@@ -33,6 +37,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
+use crate::logging::LoggingPrefs;
 use crate::ui::shell::{ListSize, Preset, TabLayout};
 
 /// The file's name in the config root.
@@ -51,6 +56,8 @@ pub struct UiState {
     /// Each modal's size as `(width, height)`, keyed by the modal's name (reserved for `R-TUI-12`:
     /// nothing reads it in M2, it is kept so a later htui's sizes survive).
     pub modals: BTreeMap<String, (u16, u16)>,
+    /// MOD-122 D5: `[logging]`; `None` = nothing saved.
+    pub logging: Option<LoggingPrefs>,
 }
 
 /// The file as TOML: the tables [`parse`] reads after the version and [`render`] writes.
@@ -59,6 +66,9 @@ struct FileDto {
     version: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     about: Option<AboutDto>,
+    // Between `about` and `layout`, so a file without it still renders byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logging: Option<LoggingDto>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     layout: BTreeMap<String, LayoutDto>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -70,6 +80,37 @@ struct FileDto {
 struct AboutDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     visible: Option<bool>,
+}
+
+/// `[logging]` (MOD-122 D5). Strings, so a path never fails to serialise.
+#[derive(Debug, Serialize, Deserialize)]
+struct LoggingDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+}
+
+impl LoggingDto {
+    fn of(prefs: &LoggingPrefs) -> Self {
+        Self {
+            filter: prefs.filter.clone(),
+            file: prefs
+                .file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// `file = ""` is no file; a table with neither is no setting. The filter is not checked
+    /// here: a bad one is refused, with a notice, when it is applied (D5).
+    fn into_prefs(self) -> Option<LoggingPrefs> {
+        let prefs = LoggingPrefs {
+            filter: self.filter,
+            file: self.file.filter(|file| !file.is_empty()).map(PathBuf::from),
+        };
+        (!prefs.is_empty()).then_some(prefs)
+    }
 }
 
 /// `[layout.<tab>]`.
@@ -127,6 +168,10 @@ pub fn parse(text: &str) -> Result<UiState, String> {
         let about: AboutDto = shaped("about", about)?;
         state.about = about.visible;
     }
+    if let Some(logging) = table.get("logging") {
+        let logging: LoggingDto = shaped("logging", logging)?;
+        state.logging = logging.into_prefs();
+    }
     for (name, value) in tables(&table, "layout")? {
         let at = format!("layout.{name}");
         let layout: LayoutDto = shaped(&at, value)?;
@@ -153,6 +198,11 @@ pub fn render(state: &UiState) -> String {
         about: state.about.map(|visible| AboutDto {
             visible: Some(visible),
         }),
+        logging: state
+            .logging
+            .as_ref()
+            .filter(|prefs| !prefs.is_empty())
+            .map(LoggingDto::of),
         layout: state
             .layouts
             .iter()
@@ -559,7 +609,10 @@ fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{FILE_NAME, UiState, parse, render};
+    use crate::logging::LoggingPrefs;
     use crate::ui::shell::{ListSize, Preset, TabLayout};
 
     /// A state with every table: the blueprint's example plus a Skills-shaped layout.
@@ -587,6 +640,10 @@ mod tests {
             },
         );
         state.modals.insert("item_form".to_owned(), (80, 24));
+        state.logging = Some(LoggingPrefs {
+            filter: Some("htui=debug,info".to_owned()),
+            file: Some(PathBuf::from("/home/me/htui.log")),
+        });
         state
     }
 
@@ -808,6 +865,89 @@ cap = 50
         for why in [missing, negative, about] {
             assert!(!why.contains('\n'), "one line for the notice: {why}");
         }
+    }
+
+    /// MOD-122 D5: `[logging]` round-trips, and is written after `[about]`, before the layouts.
+    #[test]
+    fn the_logging_table_round_trips() {
+        let state = full();
+        let text = render(&state);
+        assert_eq!(parse(&text), Ok(state));
+        let logging = text.find("[logging]").expect("[logging] is written");
+        let layout = text.find("[layout.backlog]").expect("a layout is written");
+        assert!(text.find("[about]").expect("[about]") < logging, "{text}");
+        assert!(logging < layout, "{text}");
+        assert!(text.contains("filter = \"htui=debug,info\""), "{text}");
+        assert!(text.contains("file = \"/home/me/htui.log\""), "{text}");
+        let filter_only = UiState {
+            logging: Some(LoggingPrefs {
+                filter: Some("warn".to_owned()),
+                file: None,
+            }),
+            ..UiState::default()
+        };
+        assert_eq!(
+            render(&filter_only),
+            "version = 1\n\n[logging]\nfilter = \"warn\"\n"
+        );
+        assert_eq!(parse(&render(&filter_only)), Ok(filter_only));
+        let empty = UiState {
+            logging: Some(LoggingPrefs::default()),
+            ..UiState::default()
+        };
+        assert_eq!(
+            render(&empty),
+            "version = 1\n",
+            "an empty table is not written"
+        );
+    }
+
+    #[test]
+    fn a_file_without_logging_reads_as_no_setting() {
+        assert_eq!(parse("version = 1\n").map(|s| s.logging), Ok(None));
+        assert_eq!(
+            parse("version = 1\n[logging]\n").map(|s| s.logging),
+            Ok(None)
+        );
+        assert_eq!(
+            parse("version = 1\n[logging]\nfile = \"\"\n").map(|s| s.logging),
+            Ok(None),
+            "an empty file is no file"
+        );
+        assert_eq!(
+            parse("version = 1\n[logging]\nfilter = \"debug\"\nfile = \"\"\n").map(|s| s.logging),
+            Ok(Some(LoggingPrefs {
+                filter: Some("debug".to_owned()),
+                file: None,
+            }))
+        );
+    }
+
+    /// D5: a bad directive is kept here and refused, with a notice, when it is applied; the rest
+    /// of the file is used.
+    #[test]
+    fn a_bad_filter_in_the_file_is_kept_not_refused() {
+        let state = parse(
+            "version = 1\n[logging]\nfilter = \"htui=[\"\n[layout.backlog]\npreset = \"ide\"\n\
+             list_percent = 55\nactivity_percent = 30\nlist = true\nactivity = true\nzoom = false\n",
+        )
+        .expect("the file is used");
+        assert_eq!(
+            state.logging.and_then(|logging| logging.filter).as_deref(),
+            Some("htui=[")
+        );
+        assert!(state.layouts.contains_key("backlog"));
+    }
+
+    #[test]
+    fn a_logging_table_of_the_wrong_shape_names_where() {
+        let why = reason("version = 1\n[logging]\nfilter = 3\n");
+        assert!(why.starts_with("logging: "), "{why}");
+        assert!(!why.contains('\n'), "one line for the notice: {why}");
+        assert_eq!(
+            reason("version = 1\nlogging = 3\n").split(':').next(),
+            Some("logging")
+        );
     }
 
     mod store {
