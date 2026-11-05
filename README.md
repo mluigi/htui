@@ -179,7 +179,7 @@ and says why on the status line; update `htui` to connect.
 Everything happens in a **workspace**. Press `w` to switch workspaces. If the database has none
 yet, create one in **Settings › Hierarchy** with `N`.
 
-`htui` has five tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `5`.
+`htui` has six tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `6`.
 
 | Tab | What it is for |
 |---|---|
@@ -188,6 +188,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
 | **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile and agent personas. |
 | **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
+| **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
 
@@ -198,7 +199,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | `q` / `Ctrl+c` | Leave htui: a dialog lists the work leaving stops; `Enter` or a second `Ctrl+c` leaves, `Esc` stays |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab |
-| `1` … `5` | Go to a tab |
+| `1` … `6` | Go to a tab |
 | `w` | Switch workspace |
 | `?` | Show or hide the key help |
 | `Esc` | Close the open pop-up |
@@ -419,6 +420,20 @@ for it to exit.
 
 **Replays** open read-only over the Chat tab. `Esc` closes the replay and brings back your live
 conversation exactly as it was.
+
+### Logs
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Pick a source in the list, or scroll the lines when they have focus |
+| `v` | Raise the minimum level: trace, debug, info, warn, error, then trace again |
+| `F` | Follow the newest line, or pause where you are |
+| `G` | Jump to the newest line and follow again |
+
+The list shows `all` first, then each part of htui, with how many lines it holds and how many of
+them are warnings or errors. htui keeps the last 10 000 lines its log filter lets through in memory,
+whether or not it writes a log file. Lines arrive once a second while the tab is in front;
+scrolling up pauses following, so the lines you are reading stay put.
 
 ### Settings
 
