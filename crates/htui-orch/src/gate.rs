@@ -1732,6 +1732,88 @@ mod tests {
         );
     }
 
+    /// Blueprint A4, both of `edge_loop`'s `NoTarget` sites, on the `running` `RUN_4` (`RUN_3` is
+    /// `done`, so its `finish_run` would be refused): a target that has **no row** (`plan` never
+    /// ran) and a key the snapshot does not name (`audit`). Either way the run fails
+    /// `no_loop_target` and no row is retired.
+    #[tokio::test]
+    async fn edge_loop_to_a_rowless_target_is_no_target() {
+        use htui_core::model::{EdgeKind, RunStatus};
+        for (to, why) in [
+            ("plan", "a target with no row never ran"),
+            ("audit", "a key the snapshot does not name"),
+        ] {
+            let store = MemStore::demo();
+            let run = store
+                .run(ids::RUN_4)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("RUN_4 exists");
+            assert_eq!(run.status, RunStatus::Running, "the fixture's live run");
+            let snapshot: GraphSnapshot =
+                serde_json::from_value(run.graph_snapshot.clone().expect("a graph run"))
+                    .expect("the fixture snapshot is a `GraphSnapshot`");
+            assert!(
+                snapshot.phases.iter().any(|phase| phase.name == "plan"),
+                "the FEAT graph has a `plan` phase"
+            );
+            let ctx = GateContext {
+                store: &store,
+                clock: &SystemClock,
+                run: &run,
+                snapshot: &snapshot,
+                user: ids::USER,
+                box_id: ids::BOX,
+                fence: StepFence::Unleased,
+            };
+            let prd = step_of(
+                &store,
+                ids::RUN_4,
+                (0, 1, 0),
+                "prd",
+                &[StepStatus::Running, StepStatus::Done],
+            )
+            .await;
+            let review = step_of(
+                &store,
+                ids::RUN_4,
+                (3, 1, 0),
+                "review",
+                &[StepStatus::Running, StepStatus::Failed],
+            )
+            .await;
+
+            let edge = loop_edge("review", to, EdgeKind::ChangesRequested, Some(2));
+            let outcome = edge_loop(&ctx, &review, &edge)
+                .await
+                .expect("the loop reads rows and fails the run");
+            assert_eq!(outcome, LoopOutcome::NoTarget, "{why}");
+
+            let row = store
+                .run(ids::RUN_4)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("RUN_4 exists");
+            assert_eq!(row.status, RunStatus::Failed, "{why}");
+            assert_eq!(row.failure.as_deref(), Some("no_loop_target"), "{why}");
+            let steps = store.run_steps(ids::RUN_4).await.expect("RUN_4 exists");
+            let status = |id| {
+                steps
+                    .iter()
+                    .find(|step| step.id == id)
+                    .expect("the row exists")
+                    .status
+            };
+            assert_eq!(status(prd.id), StepStatus::Done, "{why}: nothing retired");
+            assert_eq!(
+                status(review.id),
+                StepStatus::Failed,
+                "{why}: nothing retired"
+            );
+            assert_eq!(steps.len(), 2, "{why}: no successor row");
+        }
+    }
+
     /// The stop reasons are read out of an `item_note` by a human and asserted by criterion 7.
     #[test]
     fn loop_stop_display_is_what_the_note_carries() {
@@ -1762,10 +1844,29 @@ mod tests {
         fanout_index: i32,
         path: &[StepStatus],
     ) -> RunStep {
+        step_of(
+            store,
+            ids::RUN_3,
+            (position, attempt, fanout_index),
+            phase_name,
+            path,
+        )
+        .await
+    }
+
+    /// [`step_at`] on any fixture run: a `phase_name` row of `run_id` at `(position, attempt,
+    /// fanout_index)`, walked through `path` from `pending`.
+    async fn step_of(
+        store: &MemStore,
+        run_id: htui_core::model::RunId,
+        (position, attempt, fanout_index): (i32, i32, i32),
+        phase_name: &str,
+        path: &[StepStatus],
+    ) -> RunStep {
         let row = store
             .create_step(NewRunStep {
                 id: htui_core::model::StepId::new(),
-                run_id: ids::RUN_3,
+                run_id,
                 position,
                 attempt,
                 fanout_index,
