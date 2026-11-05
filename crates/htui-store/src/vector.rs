@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// The collection name. Not versioned by name (MOD-159): a payload change bumps
@@ -64,6 +65,9 @@ pub const QDRANT_REFUSED: &str = "qdrant: access refused";
 pub const QUERY_EMBED_FAILED: &str = "qdrant: cannot embed the query";
 /// Longest snippet a point carries in its payload, in characters.
 pub const SNIPPET_CHARS: usize = 280;
+/// MOD-160 D9: how long a [`probe`] waits for Qdrant to connect and to answer each call, and for
+/// the whole look. The gate's `qdrant` step waits as long. Searches keep the client's own 5 s.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Payload keys.
 const TYPE: &str = "type";
@@ -906,33 +910,13 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     /// What an existing collection is to this embedder, read and never written: refuses another
     /// width or another embedder (MOD-68 D8). Shared by `check_collection` and `open_existing_to`.
     async fn existing(&self) -> Result<Existing, StoreError> {
-        let info = self
-            .client
-            .collection_info(&self.collection)
-            .await
-            .map_err(|e| qdrant("collection info", e))?
-            .result
-            .ok_or_else(|| backend("collection info", "no result"))?;
-        let stored = info
-            .config
-            .as_ref()
-            .and_then(|c| c.metadata.get(EMBEDDER_KEY))
-            .cloned()
-            .map(serde_json::Value::from);
-        let payload = info
-            .config
-            .as_ref()
-            .and_then(|c| c.metadata.get(PAYLOAD_SCHEMA_KEY))
-            .cloned()
-            .map(serde_json::Value::from);
-        check_existing(
+        read_existing(
+            &self.client,
             &self.collection,
-            dense_size(&info),
-            stored,
-            payload,
             &self.embedder.identity(),
             self.embedder.dim(),
         )
+        .await
     }
 
     /// Whether the collection now records an embedder. A Qdrant that predates collection
@@ -990,15 +974,53 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     }
 }
 
-/// The client [`QdrantStore`] and [`ExistingCollection`] call Qdrant through, before any call.
-fn client(settings: &QdrantSettings) -> Result<Qdrant, StoreError> {
+/// What an existing `collection` is to an embedder `mine` of width `dim`, read through `client`
+/// and never written (MOD-68 D8, MOD-160 D3): [`check_existing`] over the collection's info. No
+/// embedder is needed, so [`ExistingCollection::check`] runs it before the model is loaded.
+async fn read_existing(
+    client: &Qdrant,
+    collection: &str,
+    mine: &EmbedderIdentity,
+    dim: usize,
+) -> Result<Existing, StoreError> {
+    let info = client
+        .collection_info(collection)
+        .await
+        .map_err(|e| qdrant("collection info", e))?
+        .result
+        .ok_or_else(|| backend("collection info", "no result"))?;
+    let stored = info
+        .config
+        .as_ref()
+        .and_then(|c| c.metadata.get(EMBEDDER_KEY))
+        .cloned()
+        .map(serde_json::Value::from);
+    let payload = info
+        .config
+        .as_ref()
+        .and_then(|c| c.metadata.get(PAYLOAD_SCHEMA_KEY))
+        .cloned()
+        .map(serde_json::Value::from);
+    check_existing(collection, dense_size(&info), stored, payload, mine, dim)
+}
+
+/// The client's builder before `build()` (MOD-160 P-9): [`probe`] bounds it with
+/// [`PROBE_TIMEOUT`], everything else builds it as it is.
+fn client_config(settings: &QdrantSettings) -> qdrant_client::config::QdrantConfig {
     // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on its
     // own health probe; the first call fails fast on a bad server anyway.
     let mut builder = Qdrant::from_url(settings.url.as_str()).skip_compatibility_check();
     if let Some(key) = &settings.api_key {
         builder = builder.api_key(key.as_str());
     }
-    builder.build().map_err(|e| backend("client", e))
+    builder
+}
+
+/// The client [`QdrantStore`] and [`ExistingCollection`] call Qdrant through, before any call.
+fn client(settings: &QdrantSettings) -> Result<Qdrant, StoreError> {
+    client_config(settings)
+        .build()
+        .map_err(|e| backend("client", e))
 }
 
 /// A collection Qdrant said exists, before any embedder is loaded (review R1 M3):
@@ -1062,6 +1084,104 @@ impl ExistingCollection {
         // `Matches`, `Stamp` and `Rebuild` all pass: only `check_collection` writes.
         store.existing().await?;
         Ok(store)
+    }
+
+    /// MOD-160 D3: [`open`](Self::open)'s width and embedder check, before any embedder exists,
+    /// so a collection this htui cannot search is refused without loading the model. Reads only:
+    /// `Matches`, `Stamp` and `Rebuild` all pass, as in `open`, which keeps its own check.
+    ///
+    /// # Errors
+    /// `embedder mismatch` ([`is_embedder_mismatch`]) for another width, another embedder's
+    /// vectors or a newer payload stamp; [`QDRANT_REFUSED`] ([`is_qdrant_refused`]) when Qdrant
+    /// refuses the API key; [`StoreError::Backend`] when the collection cannot be read.
+    pub async fn check(&self, mine: &EmbedderIdentity, dim: usize) -> Result<(), StoreError> {
+        read_existing(&self.client, &self.collection, mine, dim)
+            .await
+            .map(drop)
+    }
+}
+
+/// MOD-160 D9: what a model-free look at Qdrant found ([`probe`]). Every sentence is a
+/// [`StoreError`]'s message, which never carries the API key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The collection exists and passes the check.
+    Ready,
+    /// Qdrant answered and holds no collection: an empty index, never a warning.
+    NoCollection,
+    /// No answer within [`PROBE_TIMEOUT`], or a transport or server error: its sentence.
+    Unreachable(String),
+    /// Qdrant refused the API key ([`is_qdrant_refused`]): its sentence.
+    Refused(String),
+    /// Another width, another embedder or a newer payload stamp ([`is_embedder_mismatch`]): its
+    /// sentence.
+    Mismatch(String),
+}
+
+impl Probe {
+    /// The probe's verdict on a failed call: `Refused`, `Mismatch`, else `Unreachable`.
+    #[must_use]
+    pub fn from_error(err: &StoreError) -> Self {
+        let sentence = match err {
+            StoreError::Backend(message) => message.clone(),
+            other => other.to_string(),
+        };
+        if is_qdrant_refused(err) {
+            Self::Refused(sentence)
+        } else if is_embedder_mismatch(err) {
+            Self::Mismatch(sentence)
+        } else {
+            Self::Unreachable(sentence)
+        }
+    }
+}
+
+/// MOD-160 D9: `collection_exists`, then [`ExistingCollection::check`] against the pinned model's
+/// identity ([`crate::model::identity`], [`crate::embed::DENSE_DIM`]). The client is bounded by
+/// [`PROBE_TIMEOUT`]. Loads no model and creates nothing.
+#[cfg(feature = "local-embed")]
+pub async fn probe(settings: &QdrantSettings, collection: &str) -> Probe {
+    probe_with(
+        settings,
+        collection,
+        &crate::model::identity(),
+        crate::embed::DENSE_DIM,
+    )
+    .await
+}
+
+/// [`probe`] against an embedder `mine` of width `dim` (the live tests' `HashEmbedder`, MOD-160
+/// P-10). The whole look, both calls included, is bounded by [`PROBE_TIMEOUT`].
+pub async fn probe_with(
+    settings: &QdrantSettings,
+    collection: &str,
+    mine: &EmbedderIdentity,
+    dim: usize,
+) -> Probe {
+    let look = async {
+        let client = client_config(settings)
+            .timeout(PROBE_TIMEOUT)
+            .connect_timeout(PROBE_TIMEOUT)
+            .build()
+            .map_err(|e| backend("client", e))?;
+        let exists = client
+            .collection_exists(collection)
+            .await
+            .map_err(|e| qdrant("collection exists", e))?;
+        if !exists {
+            return Ok(Probe::NoCollection);
+        }
+        read_existing(&client, collection, mine, dim)
+            .await
+            .map(|_| Probe::Ready)
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, look).await {
+        Ok(Ok(probe)) => probe,
+        Ok(Err(err)) => Probe::from_error(&err),
+        Err(_) => Probe::Unreachable(format!(
+            "qdrant: no answer within {} s",
+            PROBE_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -1847,6 +1967,76 @@ mod tests {
         assert!(!is_qdrant_refused(&StoreError::Unreachable(format!(
             "{QDRANT_REFUSED}: not a backend error"
         ))));
+    }
+
+    /// MOD-160 D9: a failed call reads as the warning it is: Qdrant refusing the key, a collection
+    /// this htui cannot search, and everything else (no answer, a transport or server error).
+    #[test]
+    fn probe_from_error_tells_refused_mismatch_and_unreachable() {
+        for code in [7, 16] {
+            let err = qdrant_with_code("collection exists", Some(code), "Invalid api-key");
+            let Probe::Refused(sentence) = Probe::from_error(&err) else {
+                panic!("{err} is a refusal");
+            };
+            assert!(sentence.starts_with(QDRANT_REFUSED), "{sentence}");
+            assert!(sentence.contains("API key"), "names the remedy: {sentence}");
+        }
+        let mismatch = check_existing(C, Some(8), None, None, &bge(), 384).unwrap_err();
+        let Probe::Mismatch(sentence) = Probe::from_error(&mismatch) else {
+            panic!("{mismatch} is a mismatch");
+        };
+        assert!(sentence.starts_with(EMBEDDER_MISMATCH), "{sentence}");
+        assert!(sentence.contains("8-wide"), "{sentence}");
+        for code in [None, Some(14), Some(2)] {
+            let err = qdrant_with_code("collection exists", code, "transport error");
+            assert_eq!(
+                Probe::from_error(&err),
+                Probe::Unreachable("qdrant: collection exists: transport error".to_owned()),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            Probe::from_error(&StoreError::Unreachable("gone".into())),
+            Probe::Unreachable(sentence) if sentence.contains("gone")
+        ));
+    }
+
+    fn closed_port(api_key: Option<&str>) -> QdrantSettings {
+        QdrantSettings::new(
+            htui_core::qdrant::QdrantUrl::parse("http://127.0.0.1:1").expect("a valid URL"),
+            api_key.map(str::to_owned),
+        )
+    }
+
+    /// MOD-160 D9, P-9: a probe answers within its bound in real time, and nothing listens on
+    /// port 1. Its sentence never carries the API key.
+    #[tokio::test]
+    async fn a_probe_of_a_closed_port_is_unreachable_within_the_bound() {
+        let settings = closed_port(Some("SENTINEL-KEY"));
+        let probe = tokio::time::timeout(
+            PROBE_TIMEOUT + Duration::from_secs(2),
+            probe_with(&settings, C, &bge(), 384),
+        )
+        .await
+        .expect("the probe is bounded");
+        let Probe::Unreachable(sentence) = &probe else {
+            panic!("a closed port is unreachable: {probe:?}");
+        };
+        assert!(!sentence.contains("SENTINEL"), "{sentence}");
+        assert!(!format!("{probe:?}").contains("SENTINEL"), "{probe:?}");
+    }
+
+    /// MOD-160 D9: `probe` is `probe_with` the pinned model's identity, and loads nothing.
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    async fn the_pinned_probe_of_a_closed_port_is_unreachable() {
+        let probe = tokio::time::timeout(
+            PROBE_TIMEOUT + Duration::from_secs(2),
+            probe(&closed_port(None), C),
+        )
+        .await
+        .expect("the probe is bounded");
+        assert!(matches!(probe, Probe::Unreachable(_)), "{probe:?}");
     }
 
     /// An embedder that never answers with a vector.
