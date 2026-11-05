@@ -367,6 +367,11 @@ pub struct RunStep {
     pub verify_exit_code: Option<i32>,
     /// `run_step.promoted_at` (ANA-2 §4.8).
     pub promoted_at: Option<DateTime<Utc>>,
+    /// `run_step.branch` (`JSONB`, MOD-138 M2 D5): `{"<to key>": bool}` per `if` edge of the
+    /// step's node, written once by `record_branch`; `None` until decided and on every node with
+    /// no `if` edge.
+    #[serde(default)]
+    pub branch: Option<Value>,
     /// `run_step.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -2502,5 +2507,35 @@ mod tests {
             )
         };
         assert!(!raw.reads_verdict("review"));
+    }
+
+    /// D5: a step encoded before `run_step.branch` existed decodes with none; a decided one
+    /// round-trips.
+    #[test]
+    fn run_step_branch_defaults_when_absent() {
+        let mut step = crate::fixtures::demo_data()
+            .steps
+            .into_iter()
+            .next()
+            .expect("the fixture holds steps");
+        step.branch = Some(json!({"deploy": true, "docs": false}));
+        let mut value = serde_json::to_value(&step).expect("encodes");
+        assert_eq!(value["branch"], json!({"deploy": true, "docs": false}));
+        let back: super::RunStep = serde_json::from_value(value.clone()).expect("decodes");
+        assert_eq!(back, step);
+
+        value
+            .as_object_mut()
+            .expect("a step is an object")
+            .remove("branch");
+        let old: super::RunStep = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(old.branch, None);
+        assert_eq!(
+            super::RunStep {
+                branch: step.branch.clone(),
+                ..old
+            },
+            step
+        );
     }
 }

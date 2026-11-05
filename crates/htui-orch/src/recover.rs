@@ -864,6 +864,7 @@ mod tests {
             verify_outcome: None,
             verify_exit_code: None,
             promoted_at: None,
+            branch: None,
             updated_at: at(0),
         }
     }

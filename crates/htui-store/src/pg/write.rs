@@ -6986,6 +6986,7 @@ impl WriteStore for PgStore {
                       verify_outcome      AS "verify_outcome: VerifyOutcome",
                       verify_exit_code,
                       promoted_at,
+                      branch,
                       updated_at
             "#,
             new.id.as_uuid(),

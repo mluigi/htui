@@ -1407,6 +1407,52 @@ async fn the_0007_project_type_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-138 M2 D5 (`cache_migrations/0008_run_step_branch.sql`): `run_step.branch` reaches the
+/// mirror. No demo step carries a decision, so an equality against Postgres proves nothing about
+/// it: this writes one by raw SQL (the step trigger bumps `updated_at`), refreshes, and reads it off
+/// the mirror through both reads that build a `RunStep`.
+#[tokio::test]
+async fn the_0008_branch_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let branch = serde_json::json!({"deploy": true, "docs": false});
+
+    sqlx::query("UPDATE run_step SET branch = $2 WHERE id = $1")
+        .bind(ids::STEP_IMPL.as_uuid())
+        .bind(&branch)
+        .execute(&db.pool)
+        .await
+        .expect("decide the implement step's branch");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let pg_steps = db.store.run_steps(ids::RUN_1).await.expect("pg run steps");
+    let mirrored = cache.run_steps(ids::RUN_1).await.expect("cache run steps");
+    let step = mirrored
+        .iter()
+        .find(|step| step.id == ids::STEP_IMPL)
+        .expect("the implement step is mirrored");
+    assert_eq!(
+        step.branch.as_ref(),
+        Some(&branch),
+        "`run_step.branch` comes off the mirror"
+    );
+    assert_eq!(
+        mirrored, pg_steps,
+        "and the two backends project the steps alike"
+    );
+    let others = mirrored.iter().filter(|step| step.id != ids::STEP_IMPL);
+    assert!(
+        others.into_iter().all(|step| step.branch.is_none()),
+        "an undecided step mirrors none"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// `run_step_tree` is the seventeenth mirrored table, and — having no `updated_at` of its own —
 /// it rides its parent step's, exactly as `run_step_commit` does (ANA-2 §4.6, plan D9).
 ///

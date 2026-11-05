@@ -1679,6 +1679,7 @@ fn steps() -> Vec<RunStep> {
         verify_outcome: None,
         verify_exit_code: None,
         promoted_at: None,
+        branch: None,
         updated_at: demo_at(2, 8),
     });
     steps.push(fanout_candidate(
@@ -1738,6 +1739,7 @@ fn fanout_candidate(
         verify_outcome: None,
         verify_exit_code: None,
         promoted_at: None,
+        branch: None,
         updated_at: demo_at(1, 17),
     }
 }
@@ -1774,6 +1776,7 @@ fn done_step(
         verify_outcome: None,
         verify_exit_code: None,
         promoted_at: None,
+        branch: None,
         updated_at: demo_at(1, hour + 1),
     }
 }

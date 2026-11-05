@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,\n                                  agent_id, model, status)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')\n            RETURNING id                  AS \"id: StepId\",\n                      run_id              AS \"run_id: RunId\",\n                      position,\n                      attempt,\n                      fanout_index,\n                      phase_name,\n                      agent_id            AS \"agent_id: AgentId\",\n                      model,\n                      status              AS \"status: StepStatus\",\n                      gate_outcome        AS \"gate_outcome: GateOutcome\",\n                      gate_note,\n                      selected,\n                      exit_code,\n                      prompt_digest,\n                      trim_record,\n                      usage,\n                      isolation_path,\n                      started_at,\n                      finished_at,\n                      verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                      verify_exit_code,\n                      promoted_at,\n                      updated_at\n            ",
+  "query": "\n                SELECT id                  AS \"id: StepId\",\n                       run_id              AS \"run_id: RunId\",\n                       position,\n                       attempt,\n                       fanout_index,\n                       phase_name,\n                       agent_id            AS \"agent_id: AgentId\",\n                       model,\n                       status              AS \"status: StepStatus\",\n                       gate_outcome        AS \"gate_outcome: GateOutcome\",\n                       gate_note,\n                       selected,\n                       exit_code,\n                       prompt_digest,\n                       trim_record,\n                       usage,\n                       isolation_path,\n                       started_at,\n                       finished_at,\n                       verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                       verify_exit_code,\n                       promoted_at,\n                       branch,\n                       updated_at\n                  FROM run_step\n                 WHERE run_id = ANY($1)\n                ",
   "describe": {
     "columns": [
       {
@@ -247,6 +247,17 @@
       },
       {
         "ordinal": 22,
+        "name": "branch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "branch"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -259,14 +270,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Text",
-        "Uuid",
-        "Text"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -292,8 +296,9 @@
       true,
       true,
       true,
+      true,
       false
     ]
   },
-  "hash": "2c6d8426fee490fe17b3c7768b1653f999e78e20f4e47216e6f32a9d602a6d82"
+  "hash": "a5b0c818041bdb13a80290f5f9f52f617f4e43d7a205baf96d34554258dc374f"
 }
