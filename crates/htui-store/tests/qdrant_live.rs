@@ -1083,6 +1083,30 @@ async fn probe_of_a_matching_collection_is_ready() {
     assert_eq!(probed, Probe::Ready);
 }
 
+/// A key no request header can carry, against a Qdrant that answers: qdrant-client's interceptor
+/// would echo it ("Malformed API key or token: <the key>"); the probe refuses it unechoed.
+#[tokio::test]
+async fn probe_with_a_malformed_key_is_refused_and_never_echoes_it() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url).expect("valid URL"),
+        Some("SENTINEL-KEY-\u{1}".to_owned()),
+    );
+    let probed = probe_with(
+        &settings,
+        &fresh_name(),
+        &EmbedderIdentity::hash(DENSE_DIM),
+        DENSE_DIM,
+    )
+    .await;
+    let Probe::Refused(sentence) = &probed else {
+        panic!("a malformed key is refused: {probed:?}");
+    };
+    assert!(!sentence.contains("SENTINEL"), "{sentence}");
+}
+
 /// The pinned model's identity against a `HashEmbedder` collection: a mismatch, told without
 /// loading (or downloading) the model.
 #[cfg(feature = "local-embed")]

@@ -57,7 +57,8 @@ pub const PAYLOAD_SCHEMA: u64 = 2;
 pub const EMBEDDER_MISMATCH: &str = "qdrant: embedder mismatch";
 /// How the message begins when Qdrant answered and refused this client's credentials (gRPC
 /// `UNAUTHENTICATED` or `PERMISSION_DENIED`, review R1 M2): Qdrant is there, so it is not "cannot
-/// reach", and only another API key clears it. The one spelling [`is_qdrant_refused`] reads.
+/// reach", and only another API key clears it. A key no request header can carry is refused the
+/// same way before any call (`client_config`). The one spelling [`is_qdrant_refused`] reads.
 pub const QDRANT_REFUSED: &str = "qdrant: access refused";
 /// How the message begins when [`QdrantStore`]'s search could not turn the query into a vector
 /// (review R1 M2): the embedding model failed, not Qdrant. The one spelling
@@ -1004,21 +1005,39 @@ async fn read_existing(
     check_existing(collection, dense_size(&info), stored, payload, mine, dim)
 }
 
+/// Whether `key` can travel as a request header: no control byte but tab, no DEL (`http`'s
+/// `HeaderValue::from_str` rule, which qdrant-client's interceptor applies on every call).
+fn is_header_value(key: &str) -> bool {
+    key.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+}
+
 /// The client's builder before `build()` (MOD-160 P-9): [`probe`] bounds it with
 /// [`PROBE_TIMEOUT`], everything else builds it as it is.
-fn client_config(settings: &QdrantSettings) -> qdrant_client::config::QdrantConfig {
+///
+/// A key no header can carry is refused here, as [`QDRANT_REFUSED`] (only another key clears
+/// it): qdrant-client's interceptor would answer every call with "Malformed API key or token:
+/// <the key>", and that text would reach a sentence, a log line and Settings.
+fn client_config(
+    settings: &QdrantSettings,
+) -> Result<qdrant_client::config::QdrantConfig, StoreError> {
     // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on its
     // own health probe; the first call fails fast on a bad server anyway.
     let mut builder = Qdrant::from_url(settings.url.as_str()).skip_compatibility_check();
     if let Some(key) = &settings.api_key {
+        if !is_header_value(key) {
+            return Err(StoreError::Backend(format!(
+                "{QDRANT_REFUSED}: client: the API key holds a control character a request \
+                 header cannot carry; check the Qdrant API key in Settings > Qdrant"
+            )));
+        }
         builder = builder.api_key(key.as_str());
     }
-    builder
+    Ok(builder)
 }
 
 /// The client [`QdrantStore`] and [`ExistingCollection`] call Qdrant through, before any call.
 fn client(settings: &QdrantSettings) -> Result<Qdrant, StoreError> {
-    client_config(settings)
+    client_config(settings)?
         .build()
         .map_err(|e| backend("client", e))
 }
@@ -1159,7 +1178,7 @@ pub async fn probe_with(
     dim: usize,
 ) -> Probe {
     let look = async {
-        let client = client_config(settings)
+        let client = client_config(settings)?
             .timeout(PROBE_TIMEOUT)
             .connect_timeout(PROBE_TIMEOUT)
             .build()
@@ -2024,6 +2043,45 @@ mod tests {
         };
         assert!(!sentence.contains("SENTINEL"), "{sentence}");
         assert!(!format!("{probe:?}").contains("SENTINEL"), "{probe:?}");
+    }
+
+    /// MOD-160 T1 repair: qdrant-client's interceptor answers a key no request header can carry
+    /// with "Malformed API key or token: <the key>". The key is refused before any client exists,
+    /// as a refused key (only another key clears it), and no sentence echoes it.
+    #[tokio::test]
+    async fn a_malformed_api_key_is_refused_before_any_call_and_never_echoed() {
+        for key in [
+            "SENTINEL-KEY-\u{1}",
+            "SENTINEL\r\nX-Other: 1",
+            "SENTINEL\u{7f}",
+        ] {
+            let settings = closed_port(Some(key));
+            let Err(err) = client(&settings) else {
+                panic!("{key:?} cannot be a request header");
+            };
+            assert!(is_qdrant_refused(&err), "{err}");
+            assert!(!err.to_string().contains("SENTINEL"), "{err}");
+            assert!(err.to_string().contains("Settings > Qdrant"), "{err}");
+            let probe = tokio::time::timeout(
+                PROBE_TIMEOUT + Duration::from_secs(2),
+                probe_with(&settings, C, &bge(), 384),
+            )
+            .await
+            .expect("the probe is bounded");
+            let Probe::Refused(sentence) = &probe else {
+                panic!("a malformed key is refused: {probe:?}");
+            };
+            assert!(!sentence.contains("SENTINEL"), "{sentence}");
+            assert!(!format!("{probe:?}").contains("SENTINEL"), "{probe:?}");
+        }
+    }
+
+    /// The refusal is exactly the header rule: a tab and non-ASCII text are carried as they are.
+    #[test]
+    fn a_key_a_header_can_carry_builds_a_client() {
+        for key in ["k\tey", "cl\u{e9}", "plain-key_0.9~"] {
+            assert!(client(&closed_port(Some(key))).is_ok(), "{key:?}");
+        }
     }
 
     /// MOD-160 D9: `probe` is `probe_with` the pinned model's identity, and loads nothing.
