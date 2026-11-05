@@ -399,6 +399,12 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 ) -> Result<Landing, EngineError> {
     let now = ctx.clock.now();
     match (phase.gate_effective, settle) {
+        // MOD-138 M2 D8 (plan Q-B): a node with an outgoing `asks_you` edge stops after every
+        // `ok` settle, whatever its own gate says (auto mode's downgrade included). A failed or
+        // rejected settle keeps the node's own gate, below.
+        (_, Settle::Ok { note }) if asks_you(ctx.snapshot, &phase.name) => {
+            Box::pin(asks_you_stop(ctx, step, phase, note.as_deref(), now)).await
+        }
         // `always` parks on every outcome; `on_failure` and `never` park on none of the three
         // without first being told which one it is, so the two arms below split on the outcome.
         (Gate::Always, outcome) => {
@@ -549,6 +555,120 @@ async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
         position: Some(phase.position),
         failure: None,
     }))
+}
+
+/// MOD-138 M2 D8: whether `node` has any outgoing `asks_you` edge, forward or back.
+#[must_use]
+pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
+    snapshot
+        .walk_edges()
+        .iter()
+        .any(|edge| edge.from == node && edge.kind == EdgeKind::AsksYou)
+}
+
+/// MOD-138 M2 D8 (plan Q-B), blueprint §1.5: the stop of a node with an outgoing `asks_you`
+/// edge after an `ok` settle.
+///
+/// 1. The settle's own note, as every gate writes it ([`note_step`]).
+/// 2. The stop note (blueprint §3.4): what approve takes, what reject or accept artifact
+///    declines, and that the work lands either way.
+/// 3. The park ([`park`]), whatever `gate_effective` says.
+/// 4. When the node has back `asks_you` edges and none has budget left
+///    ([`crate::walk::loop_budget_left`]), the stop is also the loop's escalation (D7): the
+///    [`loop_failure`] note of the first of them and the failure on the rest. The item is **not**
+///    blocked (blueprint A9): the stop is already the checkpoint a human answers, and approve
+///    then walks on, since no `Loop` is owed.
+async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    step: &RunStep,
+    phase: &SnapshotPhase,
+    note: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Landing, EngineError> {
+    note_step(ctx, step, note, now).await?;
+    let graph = crate::walk::Graph::of(ctx.snapshot);
+    let forward: Vec<&SnapshotEdge> = graph.forward_asks_you(&phase.name).collect();
+    let back: Vec<&SnapshotEdge> = graph.back_asks_you(&phase.name).collect();
+    if let Some(item) = ctx.item() {
+        ctx.store
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body: stop_note(step, &forward, &back),
+                created_by: ctx.user,
+                box_id: Some(ctx.box_id),
+                via_step_id: Some(step.id),
+                created_at: now,
+            })
+            .await?;
+    }
+    let landing = park(ctx, step, phase).await?;
+    if back.is_empty() {
+        return Ok(landing);
+    }
+    let steps = ctx.store.run_steps(ctx.run.id).await?;
+    if back
+        .iter()
+        .any(|edge| crate::walk::loop_budget_left(ctx.snapshot, &steps, edge))
+    {
+        return Ok(landing);
+    }
+    let edge = back[0];
+    let target = ctx
+        .snapshot
+        .phases
+        .iter()
+        .find(|candidate| candidate.name == edge.to);
+    let attempts = target
+        .and_then(|target| latest_at(&steps, target.position))
+        .map_or(0, |row| row.attempt);
+    if let Some(item) = ctx.item() {
+        ctx.store
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body: escalation_note(edge, &edge.to, attempts, LoopStop::Exhausted),
+                created_by: ctx.user,
+                box_id: Some(ctx.box_id),
+                via_step_id: Some(step.id),
+                created_at: now,
+            })
+            .await?;
+    }
+    Ok(Landing::Rest(Rest {
+        run: RunStatus::AwaitingApproval,
+        position: Some(phase.position),
+        failure: Some(loop_failure(edge, attempts)),
+    }))
+}
+
+/// Blueprint §3.4's stop note: ``step `{name}` attempt {attempt} waits on you: approve takes
+/// {targets}; reject or accept artifact declines {it|them}, and the step's work lands either way;
+/// retry redoes the step``, the forward targets first, then the back ones marked `(loops back)`.
+fn stop_note(step: &RunStep, forward: &[&SnapshotEdge], back: &[&SnapshotEdge]) -> String {
+    let targets: Vec<String> = forward
+        .iter()
+        .map(|edge| format!("`{}`", edge.to))
+        .chain(back.iter().map(|edge| format!("`{}` (loops back)", edge.to)))
+        .collect();
+    let them = if targets.len() == 1 { "it" } else { "them" };
+    format!(
+        "step `{}` attempt {} waits on you: approve takes {}; reject or accept artifact declines \
+         {them}, and the step's work lands either way; retry redoes the step",
+        step.phase_name,
+        step.attempt,
+        targets.join(", ")
+    )
+}
+
+/// The escalation's item note (blueprint §3.4), byte-identical to the review loop's for a
+/// `changes_requested` edge: ``{loop_failure}: phase `{target}`, attempt {attempts}, stop reason
+/// `{reason}` ``.
+fn escalation_note(edge: &SnapshotEdge, target: &str, attempts: i32, reason: LoopStop) -> String {
+    format!(
+        "{}: phase `{target}`, attempt {attempts}, stop reason `{reason}`",
+        loop_failure(edge, attempts)
+    )
 }
 
 /// §4.2's `never` + `failed` cell: retry while the budget holds, else end the run.
@@ -1116,11 +1236,7 @@ async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .add_note(NewNote {
                 id: NoteId::new(),
                 item_id: item,
-                body: format!(
-                    "{}: phase `{}`, attempt {attempts}, stop reason `{reason}`",
-                    loop_failure(edge, attempts),
-                    target.name
-                ),
+                body: escalation_note(edge, &target.name, attempts, reason),
                 created_by: ctx.user,
                 box_id: Some(ctx.box_id),
                 via_step_id: Some(source.id),
@@ -1812,6 +1928,233 @@ mod tests {
             );
             assert_eq!(steps.len(), 2, "{why}: no successor row");
         }
+    }
+
+    /// `RUN_4` (the fixture's `running` FEAT run) and its snapshot, made v2 with `edges` in place
+    /// of its lift: the gate's park needs a `running` run, which `RUN_3` is not.
+    async fn run_4_with(
+        store: &MemStore,
+        edges: Vec<htui_core::model::SnapshotEdge>,
+    ) -> (Run, GraphSnapshot) {
+        let run = store
+            .run(ids::RUN_4)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("RUN_4 exists");
+        let mut snapshot: GraphSnapshot =
+            serde_json::from_value(run.graph_snapshot.clone().expect("a graph run"))
+                .expect("the fixture snapshot is a `GraphSnapshot`");
+        snapshot.v = GraphSnapshot::V;
+        snapshot.edges = edges;
+        (run, snapshot)
+    }
+
+    /// FEAT's chain `prd → plan → implement → review` over `next`, with `swap` in place of the
+    /// `prd → plan` link when it is `Some`, and `extra` after.
+    fn feat_edges(
+        swap: Option<htui_core::model::SnapshotEdge>,
+        extra: &[htui_core::model::SnapshotEdge],
+    ) -> Vec<htui_core::model::SnapshotEdge> {
+        use htui_core::model::EdgeKind;
+        let mut edges = vec![
+            swap.unwrap_or_else(|| loop_edge("prd", "plan", EdgeKind::Next, None)),
+            loop_edge("plan", "implement", EdgeKind::Next, None),
+            loop_edge("implement", "review", EdgeKind::Next, None),
+        ];
+        edges.extend_from_slice(extra);
+        edges
+    }
+
+    /// The bodies of `RUN_4`'s item's notes.
+    async fn notes_of_run_4(store: &MemStore, run: &Run) -> Vec<String> {
+        store
+            .notes(run.item_id.expect("a graph run has an item"))
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect()
+    }
+
+    /// MOD-138 M2 D8 (plan Q-B): a node with an outgoing `asks_you` edge parks an `ok` settle
+    /// whatever its own gate says, `never` and `on_failure` included, and writes the stop note
+    /// naming what approve takes and what reject declines. Auto mode's downgrade is a
+    /// `gate_effective` of `never`, so this is also why auto mode never skips the stop.
+    #[tokio::test]
+    async fn an_asks_you_node_parks_an_ok_settle_whatever_its_gate() {
+        use crate::command::Rest;
+        use htui_core::model::{EdgeKind, Gate, RunStatus};
+        for gate in [Gate::Always, Gate::OnFailure, Gate::Never] {
+            let store = MemStore::demo();
+            let asks = loop_edge("prd", "plan", EdgeKind::AsksYou, None);
+            let (run, snapshot) = run_4_with(&store, feat_edges(Some(asks), &[])).await;
+            let mut phase = snapshot
+                .phases
+                .iter()
+                .find(|phase| phase.name == "prd")
+                .expect("the FEAT graph has a `prd` phase")
+                .clone();
+            phase.gate_effective = gate;
+            let ctx = GateContext {
+                store: &store,
+                clock: &SystemClock,
+                run: &run,
+                snapshot: &snapshot,
+                user: ids::USER,
+                box_id: ids::BOX,
+                fence: StepFence::Unleased,
+            };
+            let prd = step_of(
+                &store,
+                ids::RUN_4,
+                (0, 1, 0),
+                "prd",
+                &[StepStatus::Running],
+            )
+            .await;
+
+            let landing = super::apply(
+                &ctx,
+                &prd,
+                &phase,
+                Settle::Ok {
+                    note: Some("fine".to_owned()),
+                },
+            )
+            .await
+            .expect("the park is written");
+            assert_eq!(
+                landing,
+                super::Landing::Rest(Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    failure: None,
+                }),
+                "{gate:?}"
+            );
+            let steps = store.run_steps(ids::RUN_4).await.expect("RUN_4 exists");
+            let row = steps
+                .iter()
+                .find(|row| row.id == prd.id)
+                .expect("the row exists");
+            assert_eq!(row.status, StepStatus::AwaitingApproval, "{gate:?}");
+            let parked = store
+                .run(ids::RUN_4)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("RUN_4 exists");
+            assert_eq!(parked.status, RunStatus::AwaitingApproval, "{gate:?}");
+            let notes = notes_of_run_4(&store, &run).await;
+            assert!(
+                notes.iter().any(|body| body == "step `prd` attempt 1: fine"),
+                "{gate:?}: the settle's own note: {notes:?}"
+            );
+            assert!(
+                notes.iter().any(|body| body
+                    == "step `prd` attempt 1 waits on you: approve takes `plan`; reject or \
+                        accept artifact declines it, and the step's work lands either way; \
+                        retry redoes the step"),
+                "{gate:?}: the stop note: {notes:?}"
+            );
+        }
+    }
+
+    /// MOD-138 M2 D7, blueprint A9: once a back `asks_you` edge's budget is spent, the source
+    /// still stops at its gate, now as the escalation: the `LoopExhausted` note and failure, the
+    /// run `awaiting_approval`, and the item **not** blocked, because the stop is the checkpoint
+    /// and `answer_gate` has no item guard.
+    #[tokio::test]
+    async fn a_spent_back_asks_you_stop_writes_the_escalation_without_blocking() {
+        use crate::command::Rest;
+        use htui_core::model::{EdgeKind, Gate, RunStatus};
+        let store = MemStore::demo();
+        let back = loop_edge("review", "plan", EdgeKind::AsksYou, Some(1));
+        let (run, snapshot) = run_4_with(&store, feat_edges(None, &[back])).await;
+        let mut phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "review")
+            .expect("the FEAT graph has a `review` phase")
+            .clone();
+        phase.gate_effective = Gate::Never;
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+        };
+        let item = run.item_id.expect("a graph run has an item");
+        let before = store
+            .item(item)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the item exists")
+            .status;
+        // `plan` ran twice already: `may_attempt(3, 1)` is spent.
+        step_of(
+            &store,
+            ids::RUN_4,
+            (1, 2, 0),
+            "plan",
+            &[StepStatus::Running, StepStatus::Done],
+        )
+        .await;
+        let review = step_of(
+            &store,
+            ids::RUN_4,
+            (3, 2, 0),
+            "review",
+            &[StepStatus::Running],
+        )
+        .await;
+
+        let landing = super::apply(&ctx, &review, &phase, Settle::Ok { note: None })
+            .await
+            .expect("the park and the notes are written");
+        assert_eq!(
+            landing,
+            super::Landing::Rest(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(3),
+                failure: Some(RunFailure::LoopExhausted {
+                    kind: EdgeKind::AsksYou,
+                    from: "review".to_owned(),
+                    to: "plan".to_owned(),
+                    attempts: 2,
+                }),
+            })
+        );
+        let parked = store
+            .run(ids::RUN_4)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("RUN_4 exists");
+        assert_eq!(parked.status, RunStatus::AwaitingApproval);
+        let after = store
+            .item(item)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the item exists")
+            .status;
+        assert_eq!(after, before, "A9: the item is not moved");
+        assert_ne!(after, htui_core::model::Status::Blocked);
+        let notes = notes_of_run_4(&store, &run).await;
+        assert!(
+            notes.iter().any(|body| body
+                == "asks_you loop exhausted after 2 attempts: `review` to `plan`: phase `plan`, \
+                    attempt 2, stop reason `exhausted`"),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|body| body
+                == "step `review` attempt 2 waits on you: approve takes `plan` (loops back); \
+                    reject or accept artifact declines it, and the step's work lands either \
+                    way; retry redoes the step"),
+            "{notes:?}"
+        );
     }
 
     /// The stop reasons are read out of an `item_note` by a human and asserted by criterion 7.
