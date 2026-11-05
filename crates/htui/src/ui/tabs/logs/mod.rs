@@ -346,7 +346,12 @@ impl LogsTab {
                 .collect();
             frame.render_widget(Paragraph::new(rows), inner);
         }
-        let title = format!("{source} \u{b7} min {level} \u{b7} {state}");
+        // D4: the border is the only place the state and the level show; a title too long for
+        // it puts them first and leaves the source (the list's cursor names it) to be clipped.
+        let mut title = format!("{source} \u{b7} min {level} \u{b7} {state}");
+        if !Pane::title_fits(area, &title, &[], 0) {
+            title = format!("{state} \u{b7} min {level} \u{b7} {source}");
+        }
         let mut pane = Pane::new(&title)
             .focus(focus)
             .accent(ctx.accent())
@@ -803,6 +808,29 @@ mod tests {
         assert!(frame.contains("Sources"), "{frame}");
         assert!(frame.contains("ERROR"), "{frame}");
         insta::assert_snapshot!("logs_narrow", frame);
+    }
+
+    /// D4: the border is the only place the follow state and the level show, so a narrow
+    /// pane gives up the source name (the list's cursor names it) before either.
+    #[tokio::test]
+    async fn a_narrow_border_keeps_the_state_and_the_level() {
+        let mut harness = logs_at(&mixed(), 60, 20).await;
+        for _ in 0..3 {
+            harness.key("j");
+        }
+        let frame = harness.render();
+        let top = frame.lines().nth(1).expect("the pane borders");
+        assert!(top.contains("following"), "{top}");
+        assert!(top.contains("min trace"), "{top}");
+        harness.key("F");
+        let frame = harness.render();
+        let top = frame.lines().nth(1).expect("the pane borders");
+        assert!(top.contains("paused"), "{top}");
+        assert!(top.contains("min trace"), "{top}");
+        assert!(
+            top.contains("\u{b7} orc"),
+            "the source keeps what room is left: {top}"
+        );
     }
 
     #[tokio::test]
