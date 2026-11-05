@@ -151,9 +151,11 @@ impl Logging {
         self.dispatch.as_ref()
     }
 
-    /// Whether the Sentry layer is in the subscriber (D1 pin).
+    /// Whether the Sentry layer is in the subscriber (D1 pin). Test-only:
+    /// nothing outside the pin reads it.
+    #[cfg(test)]
     #[must_use]
-    pub const fn sentry(&self) -> bool {
+    pub(crate) const fn sentry(&self) -> bool {
         self.sentry
     }
 }
