@@ -3,6 +3,7 @@
 **Source PRD**: `.claude/prds/mod-122-activity-and-logs.prd.md`
 **Selected Milestone**: 1 — Logs tab and logging settings
 **Complexity**: Medium
+**Status**: implemented on `hr/MOD-122` (`96cc49ba`..`83dd23c0`, 2026-11-05), review round R1 applied; changed decisions recorded in the blueprint's R1 amendments.
 **Routing**: PRD path by `/handoff-run MOD-122`; ultracode accepted for the implement phase.
 **Grounded at**: `1c50e30c` (branch `hr/MOD-122`). **Blueprint**: `.claude/plans/mod-122-activity-and-logs-m1.blueprint.md` (its F1–F8 amend this plan; the blueprint wins where they differ).
 

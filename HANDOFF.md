@@ -1013,6 +1013,14 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 229 (`htui-core/tests/mem_s
   Enter jumps to the source with history, filters: all workspaces, needs you, failures, this
   workspace, live across background workspaces) and the Logs tab (`htui`'s own log by source with
   counts, levels, minimum level, follow, scroll pausing it). MOD-115 is done (`docs/decisions/mod/mod-115.md`).
+  Scope extended at framing (2026-11-05): logging set from Settings, always captured in memory, and worker
+  logs visible from the main instance; PRD `.claude/prds/mod-122-activity-and-logs.prd.md` (M1 logs and
+  settings, M2 worker logs, M3 activity panel).
+  **Phase M1 landed (`hr/MOD-122` `83dd23c0`, 2026-11-05):** an always-on in-memory log (10 000-line ring,
+  sources by target with line and warning counts) beside the optional file; a Logs tab (last tab: level
+  `v`, follow `F`, `G`, scrolling up pauses, reads on activation); Settings › Logging sets the filter and the
+  log file live, saved in `ui-state.toml` `[logging]`, flag/env override for the session; Sentry keeps its
+  startup-only `--log` gate and its own fixed filter (MOD-99). Live-Qdrant tests owed on the host. M2, M3 open.
 - [ ] **MOD-123 - Settings redesign** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.5). `R-TUI-8`,
   `R-ORCH-15`, `R-ORCH-1`, `R-ENT-17`. Fields edit on their row with help beneath; `←`/`→` change a
   choice or toggle, saved at once; Connection renamed **Postgres**; Backlog › Hierarchy removed (its
