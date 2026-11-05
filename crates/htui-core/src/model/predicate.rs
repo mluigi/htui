@@ -13,6 +13,7 @@
 
 use serde_json::Value;
 
+use crate::model::ItemKind;
 use crate::model::run::VerifyOutcome;
 use crate::model::skill_glob::{self, GlobError, SkillGlob};
 
@@ -107,11 +108,17 @@ const GLOBS: &str = "a non-empty array of globs";
 const STRING: &str = "a non-empty string";
 const PREDICATES: &str = "a non-empty array of predicates";
 const VERIFY: &str = "\"passed\" or \"failed\"";
+/// R1 (S3): the `item_kind.prefix` CHECK ([`invalid_prefix`](crate::store::invalid_prefix)'s
+/// rule, [`ItemKind::prefix_is_valid`]), so a predicate can only name a prefix a kind can hold.
+const PREFIX_RULE: &str = "an item-kind prefix matching `^[A-Z][A-Z0-9]{1,15}$`";
+/// R1 (S3): a tag a human typed is matched by bytes, so blank or padded text is refused.
+const TAG_RULE: &str = "a non-blank tag with no leading or trailing whitespace";
 
 impl IfPredicate {
     /// Parses one predicate. Every glob list must be non-empty, as must `all` and `any`;
-    /// `item_kind` and `item_tag` take non-empty strings; each glob is trimmed and read by
-    /// [`SkillGlob::parse`].
+    /// `item_kind` and `item_tag` take non-empty strings, `item_kind` one matching the item-kind
+    /// prefix rule `^[A-Z][A-Z0-9]{1,15}$` ([`ItemKind::prefix_is_valid`]) and `item_tag` one that
+    /// is non-blank and equal to its trim (R1, S3); each glob is trimmed and read by [`SkillGlob::parse`].
     ///
     /// # Errors
     /// [`PredicateError`]: the first refusal, depth first, in array order.
@@ -166,8 +173,26 @@ impl IfPredicate {
                     });
                 }
             }),
-            "item_kind" => Self::ItemKind(text("item_kind")?),
-            "item_tag" => Self::ItemTag(text("item_tag")?),
+            "item_kind" => {
+                let prefix = text("item_kind")?;
+                if !ItemKind::prefix_is_valid(&prefix) {
+                    return Err(PredicateError::BadValue {
+                        key: "item_kind",
+                        want: PREFIX_RULE,
+                    });
+                }
+                Self::ItemKind(prefix)
+            }
+            "item_tag" => {
+                let tag = text("item_tag")?;
+                if tag.trim().is_empty() || tag.trim() != tag {
+                    return Err(PredicateError::BadValue {
+                        key: "item_tag",
+                        want: TAG_RULE,
+                    });
+                }
+                Self::ItemTag(tag)
+            }
             "all" => Self::All(members("all")?),
             "any" => Self::Any(members("any")?),
             "not" => Self::Not(Box::new(Self::parse_at(value, depth + 1)?)),
@@ -283,7 +308,10 @@ impl<'a> Compiled<'a> {
 mod tests {
     use serde_json::json;
 
-    use super::{BranchFacts, IfPredicate, MAX_DEPTH, PathGlob, PredicateError, VerifyWant};
+    use super::{
+        BranchFacts, IfPredicate, MAX_DEPTH, PREFIX_RULE, PathGlob, PredicateError, TAG_RULE,
+        VerifyWant,
+    };
     use crate::model::VerifyOutcome;
     use crate::model::skill_glob::GlobError;
 
@@ -350,6 +378,16 @@ mod tests {
             IfPredicate::ItemTag("gpu".to_owned())
         );
         assert_eq!(
+            parse(json!({"item_kind": "A1234567890BCDEF"})),
+            IfPredicate::ItemKind("A1234567890BCDEF".to_owned()),
+            "sixteen characters, the prefix rule's longest"
+        );
+        assert_eq!(
+            parse(json!({"item_tag": "needs gpu"})),
+            IfPredicate::ItemTag("needs gpu".to_owned()),
+            "inner whitespace is kept"
+        );
+        assert_eq!(
             parse(json!({"all": [{"verify": "passed"}, {"not": {"item_tag": "gpu"}}]})),
             IfPredicate::All(vec![
                 IfPredicate::Verify(VerifyWant::Passed),
@@ -357,8 +395,8 @@ mod tests {
             ])
         );
         assert_eq!(
-            parse(json!({"any": [{"item_kind": "A"}]})),
-            IfPredicate::Any(vec![IfPredicate::ItemKind("A".to_owned())])
+            parse(json!({"any": [{"item_kind": "BUG"}]})),
+            IfPredicate::Any(vec![IfPredicate::ItemKind("BUG".to_owned())])
         );
     }
 
@@ -388,6 +426,21 @@ mod tests {
             ),
             (json!({"item_kind": ""}), "item_kind", "a non-empty string"),
             (json!({"item_tag": 3}), "item_tag", "a non-empty string"),
+            // R1 (S3): `item_kind` is an item-kind prefix, `^[A-Z][A-Z0-9]{1,15}$` (the
+            // `item_kind.prefix` CHECK, `invalid_prefix`); `item_tag` is non-blank and trimmed.
+            (json!({"item_kind": "A"}), "item_kind", PREFIX_RULE),
+            (json!({"item_kind": "htui"}), "item_kind", PREFIX_RULE),
+            (json!({"item_kind": " HTUI"}), "item_kind", PREFIX_RULE),
+            (json!({"item_kind": "1HTUI"}), "item_kind", PREFIX_RULE),
+            (json!({"item_kind": "HTUI-X"}), "item_kind", PREFIX_RULE),
+            (
+                json!({"item_kind": "ABCDEFGHIJKLMNOPQ"}),
+                "item_kind",
+                PREFIX_RULE,
+            ),
+            (json!({"item_tag": "  "}), "item_tag", TAG_RULE),
+            (json!({"item_tag": " gpu"}), "item_tag", TAG_RULE),
+            (json!({"item_tag": "gpu\n"}), "item_tag", TAG_RULE),
             (
                 json!({"all_changed_paths_match": []}),
                 "all_changed_paths_match",
@@ -531,7 +584,7 @@ mod tests {
             ..facts(&[])
         };
         assert!(parse(json!({"item_kind": "HTUI"})).evaluate(&tagged));
-        assert!(!parse(json!({"item_kind": "htui"})).evaluate(&tagged));
+        assert!(!parse(json!({"item_kind": "HTUIS"})).evaluate(&tagged));
         assert!(!parse(json!({"item_kind": "HTU"})).evaluate(&tagged));
         assert!(parse(json!({"item_tag": "linux"})).evaluate(&tagged));
         assert!(!parse(json!({"item_tag": "mac"})).evaluate(&tagged));
@@ -558,7 +611,7 @@ mod tests {
     #[test]
     fn needs_paths_finds_a_nested_path_predicate() {
         assert!(!parse(json!({"verify": "passed"})).needs_paths());
-        assert!(!parse(json!({"all": [{"item_kind": "A"}, {"item_tag": "b"}]})).needs_paths());
+        assert!(!parse(json!({"all": [{"item_kind": "BUG"}, {"item_tag": "b"}]})).needs_paths());
         assert!(parse(json!({"all_changed_paths_match": ["a"]})).needs_paths());
         assert!(
             parse(json!({
