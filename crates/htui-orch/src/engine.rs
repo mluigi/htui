@@ -13272,9 +13272,9 @@ mod tests {
         );
     }
 
-    /// MOD-138 D4, D5 (plan risk row 1): an unedited v1 run's lifted snapshot hashes to the live
-    /// graph's v2 digest, so it resumes `Walked`, is driven through its next gate, and resumes
-    /// `Walked` again, with no topology note anywhere.
+    /// MOD-138 D4, D5 (plan risk row 1), M2 D11: an unedited v1 run's phase-only (v1) digest
+    /// equals the live graph's v1 digest, so it resumes `Walked`, is driven through its next gate,
+    /// and resumes `Walked` again, with no topology note anywhere.
     #[tokio::test]
     async fn a_v1_run_on_an_unchanged_graph_walks() {
         let harness = Harness::new().await;
