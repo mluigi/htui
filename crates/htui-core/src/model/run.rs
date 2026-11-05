@@ -624,6 +624,27 @@ impl GraphSnapshot {
         }
     }
 
+    /// MOD-138 M2 D1: the edges every walker reads: the stored ones, or for a `v == V1` blob
+    /// holding none (decoded by serde, not through `snapshot_of`, so never lifted) the lift,
+    /// computed here. A v2 snapshot with no edges is **not** lifted: its nodes are roots.
+    #[must_use]
+    pub fn walk_edges(&self) -> std::borrow::Cow<'_, [SnapshotEdge]> {
+        if self.v == Self::V1 && self.edges.is_empty() {
+            std::borrow::Cow::Owned(default_snapshot_edges(&self.phases))
+        } else {
+            std::borrow::Cow::Borrowed(&self.edges)
+        }
+    }
+
+    /// MOD-138 M2 D7: `node` reads its verdict iff it has an outgoing `changes_requested` edge
+    /// (over [`Self::walk_edges`]), whatever it is called.
+    #[must_use]
+    pub fn reads_verdict(&self, node: &str) -> bool {
+        self.walk_edges()
+            .iter()
+            .any(|edge| edge.from == node && edge.kind == EdgeKind::ChangesRequested)
+    }
+
     /// MOD-144 (ANA-35 §7.1 `default_for`): the `output_kind` of the snapshot's highest-`position`
     /// phase, read from `phases[]` alone so any `v` decodes; `None` without phases. A phase with
     /// no readable `position` or `output_kind` is skipped.
@@ -2383,5 +2404,103 @@ mod tests {
             v2, before,
             "a v2 snapshot keeps the edges it froze, none included"
         );
+    }
+
+    // ---- MOD-138 M2 T1: walk_edges, reads_verdict (D1, D7) ----
+
+    fn feature_phases() -> Vec<super::SnapshotPhase> {
+        vec![
+            phase_at("prd", 0, 1),
+            phase_at("plan", 1, 1),
+            phase_at("implement", 2, 3),
+            phase_at("review", 3, 1),
+        ]
+    }
+
+    /// D1: a raw v1 blob with no edges (as serde decodes one) walks its lift, computed on the
+    /// spot; a lifted v1 and a v2 lend their own edges.
+    #[test]
+    fn walk_edges_lifts_a_raw_v1_blob_and_borrows_a_v2() {
+        use std::borrow::Cow;
+        let raw = super::GraphSnapshot {
+            v: super::GraphSnapshot::V1,
+            ..graph_snapshot(feature_phases(), Vec::new())
+        };
+        let mut lifted = raw.clone();
+        lifted.lift_v1();
+        let walked = raw.walk_edges();
+        assert!(matches!(walked, Cow::Owned(_)), "the lift is computed");
+        assert_eq!(&*walked, lifted.edges.as_slice(), "and equals lift_v1's");
+        assert!(raw.edges.is_empty(), "walk_edges never writes the blob");
+        assert!(matches!(lifted.walk_edges(), Cow::Borrowed(_)));
+
+        let mut v2 = graph_snapshot(feature_phases(), Vec::new());
+        v2.edges = vec![edge(
+            "prd",
+            "plan",
+            crate::model::kind::EdgeKind::Next,
+            None,
+        )];
+        let walked = v2.walk_edges();
+        assert!(matches!(walked, Cow::Borrowed(_)));
+        assert_eq!(&*walked, v2.edges.as_slice());
+    }
+
+    /// D1: a v2 snapshot with no edges is not lifted: its nodes are roots.
+    #[test]
+    fn a_v2_snapshot_with_no_edges_is_not_lifted() {
+        let v2 = graph_snapshot(feature_phases(), Vec::new());
+        assert_eq!(v2.v, super::GraphSnapshot::V);
+        assert!(v2.walk_edges().is_empty());
+        assert!(!v2.reads_verdict("review"));
+    }
+
+    /// D7: a node reads its verdict exactly when it has an outgoing `changes_requested` edge,
+    /// whatever its name; a raw v1 blob answers through its lift.
+    #[test]
+    fn reads_verdict_is_having_a_changes_requested_edge() {
+        use crate::model::kind::EdgeKind;
+        let raw = super::GraphSnapshot {
+            v: super::GraphSnapshot::V1,
+            ..graph_snapshot(feature_phases(), Vec::new())
+        };
+        assert!(raw.reads_verdict("review"), "the lift's review loop");
+        for node in ["prd", "plan", "implement", "absent"] {
+            assert!(!raw.reads_verdict(node), "{node}");
+        }
+
+        let mut v2 = graph_snapshot(
+            vec![
+                phase_at("implement", 0, 1),
+                phase_at("check", 1, 1),
+                phase_at("review", 2, 1),
+            ],
+            Vec::new(),
+        );
+        v2.edges = vec![
+            edge("implement", "check", EdgeKind::Next, None),
+            edge("check", "review", EdgeKind::Next, None),
+            edge("check", "implement", EdgeKind::ChangesRequested, Some(2)),
+            edge("review", "implement", EdgeKind::Fails, Some(2)),
+        ];
+        assert!(v2.reads_verdict("check"), "not named review, still reads");
+        assert!(
+            !v2.reads_verdict("review"),
+            "named review, a `fails` edge only: no verdict"
+        );
+        assert!(!v2.reads_verdict("implement"));
+    }
+
+    /// Q-D: a `review` first in its graph gets no loop edge from the lift, so reads no verdict.
+    #[test]
+    fn a_review_first_in_its_graph_reads_no_verdict() {
+        let raw = super::GraphSnapshot {
+            v: super::GraphSnapshot::V1,
+            ..graph_snapshot(
+                vec![phase_at("review", 0, 1), phase_at("implement", 1, 2)],
+                Vec::new(),
+            )
+        };
+        assert!(!raw.reads_verdict("review"));
     }
 }

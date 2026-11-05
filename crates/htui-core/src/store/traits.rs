@@ -3240,6 +3240,23 @@ pub fn workspace_graph_is_held(graph: &str, holder: &str, project: &str) -> Stri
     )
 }
 
+// ---- MOD-138 M2: the readiness walker's refusals (plan D4; blueprint §1.2) ----
+
+/// MOD-138 M2 D4 (W4): an `if` edge's predicate is outside the closed set
+/// ([`IfPredicate::parse`](crate::model::IfPredicate::parse)); `reason` is the parse refusal.
+#[must_use]
+pub fn if_predicate_outside_the_closed_set(
+    from: &str,
+    to: &str,
+    graph: StepGraphId,
+    reason: &str,
+) -> String {
+    format!(
+        "the `if` edge from `{from}` to `{to}` in graph `{graph}` has a predicate outside the \
+         closed set: {reason}"
+    )
+}
+
 // ---- MOD-38: ANA-11's refusals ----
 
 /// ANA-11 §4.2 under ANA-35 §7.1's law: close-out refuses this resolution for an item in this

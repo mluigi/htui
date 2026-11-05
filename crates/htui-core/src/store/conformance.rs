@@ -44,7 +44,7 @@ use crate::model::{
 };
 use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
-    SkillBinding, Split, StepGraphEdge,
+    PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
 use crate::prompt::TemplateRole;
@@ -73,7 +73,8 @@ use crate::store::traits::{
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
 use crate::store::traits::{
-    forward_edges_form_a_cycle, graph_not_usable, loop_edge_runs_forward, workspace_graph_is_held,
+    forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
+    loop_edge_runs_forward, workspace_graph_is_held,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -315,6 +316,8 @@ pub const CASES: &[&str] = &[
     "transition_never_touches_closed_at",
     // MOD-144 R1 (M1): the engine's StartRun refusals block only an item no live run holds
     "block_if_idle_writes_nothing_over_a_live_run",
+    // MOD-138 M2: the closed `if` set (plan D4, W4)
+    "replace_graph_refuses_an_if_predicate_outside_the_closed_set",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1011,6 +1014,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "block_if_idle_writes_nothing_over_a_live_run" => {
             Box::pin(block_if_idle_writes_nothing_over_a_live_run(store)).await
+        }
+        "replace_graph_refuses_an_if_predicate_outside_the_closed_set" => {
+            Box::pin(replace_graph_refuses_an_if_predicate_outside_the_closed_set(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -23548,6 +23554,54 @@ async fn replace_graph_refuses_a_forward_fails<S: WriteStore>(store: &S) {
     .await;
 }
 
+/// MOD-138 M2 D4 (W4): an `if` edge whose predicate is outside the closed set is refused naming
+/// the edge and the parse refusal; nothing is written. The same edge with a closed-set predicate
+/// is applied and stored as given.
+async fn replace_graph_refuses_an_if_predicate_outside_the_closed_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_an_if_predicate_outside_the_closed_set";
+    let (graph, phases) = scratch_graph(CASE, store, "guarded", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let mut written = before.clone();
+    written.edges = seed::default_edges(&phases, EdgeId::new);
+    let mut guarded = graph_edge(graph, phases[0].id, phases[2].id, EdgeKind::If);
+    guarded.predicate = Some(EdgePredicate(json!({"verdict": "approve"})));
+    written.edges.push(guarded);
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await,
+        &if_predicate_outside_the_closed_set(
+            "plan",
+            "review",
+            graph,
+            &PredicateError::Unknown("verdict".to_owned()).to_string(),
+        ),
+        "an `if` predicate outside the closed set",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written, the revision unchanged"
+    );
+
+    let last = written.edges.len() - 1;
+    written.edges[last].predicate = Some(EdgePredicate(
+        json!({"any_changed_path_matches": ["docs/**"]}),
+    ));
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        answer.edges.contains(&written.edges[last]),
+        "{CASE}: a closed-set predicate is stored as given"
+    );
+}
+
 /// MOD-138 D9 (W2, blueprint F18): `review → plan` `asks_you` is a back edge over the `next`
 /// chain, so the default edges plus it are applied and stored as given.
 async fn replace_graph_accepts_an_asks_you_back_edge<S: WriteStore>(store: &S) {
@@ -25156,7 +25210,9 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
     let fresh_id = fresh.id;
     body.nodes.push(bare_node(fresh));
     let mut when = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::If);
-    when.predicate = Some(EdgePredicate(json!({"verdict": "approve", "min": 2})));
+    when.predicate = Some(EdgePredicate(
+        json!({"all": [{"verify": "passed"}, {"item_kind": "HTUI"}]}),
+    ));
     body.edges = vec![
         when,
         graph_edge(graph, phases[1].id, fresh_id, EdgeKind::Next),
