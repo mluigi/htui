@@ -1313,8 +1313,11 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
 /// `changes_requested` edge. Carried as **R-3** for milestone 6 (milestone 5 left it open,
 /// blueprint R-25).
 ///
-/// The item is blocked, except for an `asks_you` loop (blueprint A9): its source still waits at
-/// a gate a human answers, and `answer_gate` has no item guard.
+/// The item is blocked. An `asks_you` edge never escalates here: `walk::ready` admits its
+/// `Loop` only while `walk::loop_budget_left` holds, and `edge_loop` skips the no-progress test
+/// for it (blueprint A5), so its budget-spent escalation is [`asks_you_stop`]'s (A9), which never
+/// blocks the item. The `AsksYou` guard below only keeps a direct caller from blocking the item
+/// over a source that is `done` + `approved`, which `answer_gate` (no item guard) would walk on.
 async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     source: &RunStep,
