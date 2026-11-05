@@ -17,11 +17,13 @@ use futures::future::{BoxFuture, Shared};
 use htui_core::model::Scope;
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
 use htui_core::store::{MemStore, StoreError};
-use htui_store::embed::RtenEmbedder;
+use htui_store::embed::{DENSE_DIM, RtenEmbedder};
 use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::secret::{KeyHost, QdrantEnv, QdrantKeyError};
-use htui_store::vector::{Hit, QdrantStore, SearchQuery, VectorStore as _};
+use htui_store::vector::{
+    COLLECTION, ExistingCollection, Hit, QdrantStore, SearchQuery, VectorStore as _,
+};
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{Backend, PgStore, secret};
 use tokio::sync::mpsc;
@@ -380,10 +382,21 @@ pub struct QdrantIndex {
     load: Mutex<Option<Load>>,
     /// What loads the model.
     loader: Loader,
-    /// The last connection made, for the settings it was made with (review 3).
+    /// The last connection made, for the settings it was made with (review 3), and how (D4).
     connections: Connections<QdrantStore<RtenEmbedder>>,
     /// Where the settings come from (MOD-158 D6).
     source: Arc<QdrantSource>,
+    /// The collection searched and synced: [`COLLECTION`], or a test's throwaway one (P-10).
+    collection: String,
+}
+
+/// How a cached store was made (MOD-160 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// `QdrantStore::connect`: the collection ensured (payload indexes, stamp, MOD-144 rebuild).
+    Ensured,
+    /// `ExistingCollection::open` (D2): read-only; never serves a sync.
+    ReadOnly,
 }
 
 /// One cached connection, keyed by the URL and key it was made with (review 3).
@@ -391,9 +404,28 @@ pub struct QdrantIndex {
 /// `QdrantStore::connect` is a round trip and five waited payload-index writes, too much to pay per
 /// search. The lock is never held across an `await`: two requests that miss together both connect,
 /// and the later `put` wins, which costs one spare connection and nothing else.
+///
+/// MOD-160 D4: the slot records how its store was made. A search opens an existing collection
+/// read-only and never creates one (D2), so its store has none of what `ensure_collection` does; a
+/// sync relies on that, so it takes only an ensured store and otherwise connects.
 struct Connections<T> {
-    /// The settings and the connection made with them.
-    slot: Mutex<Option<(QdrantSettings, Arc<T>)>>,
+    /// The settings, how the connection was made, and the connection.
+    slot: Mutex<Option<Cached<T>>>,
+}
+
+/// What [`Connections`] holds.
+struct Cached<T> {
+    /// The settings the connection was made with.
+    settings: QdrantSettings,
+    /// How (D4).
+    made: Made,
+    /// The connection.
+    connection: Arc<T>,
+}
+
+/// Whether `a` and `b` name the same URL and key.
+fn same_settings(a: &QdrantSettings, b: &QdrantSettings) -> bool {
+    a.url == b.url && a.api_key.as_deref() == b.api_key.as_deref()
 }
 
 impl<T> Default for Connections<T> {
@@ -405,20 +437,31 @@ impl<T> Default for Connections<T> {
 }
 
 impl<T> Connections<T> {
-    /// The cached connection, when it was made with `settings`' URL and key.
-    fn get(&self, settings: &QdrantSettings) -> Option<Arc<T>> {
+    /// The cached connection for `settings`' URL and key that `need` accepts: `ReadOnly` takes
+    /// either kind, `Ensured` only an ensured one (D4).
+    fn get(&self, settings: &QdrantSettings, need: Made) -> Option<Arc<T>> {
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         slot.as_ref()
-            .filter(|(made_for, _)| {
-                made_for.url == settings.url
-                    && made_for.api_key.as_deref() == settings.api_key.as_deref()
-            })
-            .map(|(_, connection)| Arc::clone(connection))
+            .filter(|cached| same_settings(&cached.settings, settings))
+            .filter(|cached| need == Made::ReadOnly || cached.made == Made::Ensured)
+            .map(|cached| Arc::clone(&cached.connection))
     }
 
-    /// Caches `connection` as the one for `settings`.
-    fn put(&self, settings: QdrantSettings, connection: Arc<T>) {
-        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((settings, connection));
+    /// Caches `connection` as the one for `settings`. A `ReadOnly` put never replaces an `Ensured`
+    /// connection for the same settings: a search racing an index run keeps the better one.
+    fn put(&self, settings: QdrantSettings, made: Made, connection: Arc<T>) {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let keeps_better = made == Made::ReadOnly
+            && slot.as_ref().is_some_and(|cached| {
+                cached.made == Made::Ensured && same_settings(&cached.settings, &settings)
+            });
+        if !keeps_better {
+            *slot = Some(Cached {
+                settings,
+                made,
+                connection,
+            });
+        }
     }
 
     /// The settings stopped resolving (no URL, offline, an unusable setting): no connection, and
@@ -444,7 +487,7 @@ impl<T> Connections<T> {
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if slot
             .as_ref()
-            .is_some_and(|(_, cached)| Arc::ptr_eq(cached, connection))
+            .is_some_and(|cached| Arc::ptr_eq(&cached.connection, connection))
         {
             *slot = None;
         }
@@ -488,6 +531,16 @@ impl QdrantIndex {
                 QdrantEnv::default(),
                 KeySource::Interactive,
             )),
+            collection: COLLECTION.to_owned(),
+        }
+    }
+
+    /// The same index over the collection `name` (MOD-160 P-10: a live test's throwaway one).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the live tests' seam"))]
+    pub(crate) fn with_collection(self, name: &str) -> Self {
+        Self {
+            collection: name.to_owned(),
+            ..self
         }
     }
 
@@ -531,21 +584,49 @@ impl QdrantIndex {
 
     /// Qdrant at `settings`, over the shared model: the cached connection when it was made with
     /// the same URL and key, else a new one, cached (review 3). The worker's index job opens its
-    /// store here, so a changed URL or key reconnects it too (MOD-158 D7).
+    /// store here, so a changed URL or key reconnects it too (MOD-158 D7). It creates the
+    /// collection when there is none, so only a sync connects (MOD-160 D2), and only an ensured
+    /// store serves it (D4): a read-only one cached by a search is replaced.
     pub(crate) async fn connect(
         &self,
         settings: QdrantSettings,
     ) -> Result<Arc<QdrantStore<RtenEmbedder>>, String> {
-        if let Some(store) = self.connections.get(&settings) {
+        if let Some(store) = self.connections.get(&settings, Made::Ensured) {
             return Ok(store);
         }
         let embedder = self.embedder().await?;
-        let store = QdrantStore::connect(&settings, embedder)
+        let store = QdrantStore::connect_to(&settings, embedder, &self.collection)
             .await
             .map(Arc::new)
-            .map_err(|e| format!("{:#}", crate::concepts::qdrant_refusal(e)))?;
-        self.connections.put(settings, Arc::clone(&store));
+            .map_err(refusal)?;
+        self.connections
+            .put(settings, Made::Ensured, Arc::clone(&store));
         Ok(store)
+    }
+
+    /// MOD-160 D2, a search's store: Qdrant and the collection first, then the embedder check
+    /// without the model (D3), then the shared model, then the store, cached read-only (D4).
+    /// `Ok(None)` when the collection does not exist: an empty index, with nothing created, cached
+    /// or loaded.
+    async fn open_read_only(
+        &self,
+        settings: QdrantSettings,
+    ) -> Result<Option<Arc<QdrantStore<RtenEmbedder>>>, String> {
+        let Some(found) = ExistingCollection::find_in(&settings, &self.collection)
+            .await
+            .map_err(refusal)?
+        else {
+            return Ok(None);
+        };
+        found
+            .check(&model::identity(), DENSE_DIM)
+            .await
+            .map_err(refusal)?;
+        let embedder = self.embedder().await?;
+        let store = found.open(embedder).await.map(Arc::new).map_err(refusal)?;
+        self.connections
+            .put(settings, Made::ReadOnly, Arc::clone(&store));
+        Ok(Some(store))
     }
 
     /// The worker's index job's `forget` (MOD-158 R1, B-L1): `Some(store)` after a failed sync on
@@ -565,15 +646,28 @@ impl QdrantIndex {
     }
 }
 
+/// A failed Qdrant call as the error a user reads ([`crate::concepts::qdrant_refusal`]).
+fn refusal(err: StoreError) -> String {
+    format!("{:#}", crate::concepts::qdrant_refusal(err))
+}
+
 // Settings before the model, in both: a box with no URL fails in microseconds without downloading
-// anything. Any failure drops the connection it used, so the next request reconnects: telling a
-// dropped connection from a refused query would mean parsing the client's errors, and a spare
-// reconnect after a refusal costs what every request cost before the cache (review 3).
+// anything. A search then asks Qdrant and the collection before the model too, and never creates
+// one (MOD-160 D2); a sync connects, which does. Any failure drops the connection it used, so the
+// next request reconnects: telling a dropped connection from a refused query would mean parsing the
+// client's errors, and a spare reconnect after a refusal costs what every request cost before the
+// cache (review 3).
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
             let settings = self.settings().await?;
-            let store = self.connect(settings).await?;
+            let store = match self.connections.get(&settings, Made::ReadOnly) {
+                Some(store) => store,
+                None => match self.open_read_only(settings).await? {
+                    Some(store) => store,
+                    None => return Ok(Vec::new()),
+                },
+            };
             store.search(&query).await.map_err(|e| {
                 self.connections.forget(&store);
                 e.to_string()
@@ -1643,6 +1737,123 @@ mod tests {
         );
     }
 
+    /// A loader that counts its calls and never finishes: a test that sees a load fails its count.
+    fn counting(
+        loads: &Arc<AtomicUsize>,
+    ) -> impl Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync + 'static {
+        let loads = Arc::clone(loads);
+        move || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A query over one project, so the runtime would not answer it empty itself.
+    fn any_query() -> SearchQuery {
+        concepts::query(
+            "anything",
+            vec![htui_core::model::ProjectId::new()],
+            false,
+            10,
+        )
+    }
+
+    /// Whether the index caches no connection.
+    fn nothing_cached(index: &QdrantIndex) -> bool {
+        index
+            .connections
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// MOD-160 D2: a search asks Qdrant before the model, so a Qdrant that is down costs no
+    /// 133 MB download and caches nothing.
+    #[tokio::test]
+    async fn a_search_against_an_unreachable_qdrant_loads_no_model() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads)).with_source(Arc::new(source(
+            Some("http://127.0.0.1:1"),
+            None,
+            no_key,
+        )));
+
+        let why = index
+            .search(any_query())
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(why.starts_with("cannot reach Qdrant"), "{why}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "nothing is cached");
+    }
+
+    /// `HTUI_TEST_QDRANT_URL` (never `HTUI_QDRANT_*`, blueprint P-13), or the skip line.
+    fn test_qdrant() -> Option<String> {
+        let Ok(url) = std::env::var("HTUI_TEST_QDRANT_URL") else {
+            eprintln!("skipped: HTUI_TEST_QDRANT_URL not set");
+            return None;
+        };
+        Some(url)
+    }
+
+    /// A collection name no other test uses.
+    fn fresh_collection() -> String {
+        format!("htui_test_{}", uuid::Uuid::now_v7().simple())
+    }
+
+    /// MOD-160 D2 (live): a TUI search of a collection that does not exist answers no hits, creates
+    /// nothing and loads no model.
+    #[tokio::test]
+    async fn a_tui_search_against_an_empty_qdrant_creates_no_collection_and_loads_nothing() {
+        let Some(url) = test_qdrant() else {
+            return;
+        };
+        let fresh = fresh_collection();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads))
+            .with_source(Arc::new(source(Some(&url), None, no_key)))
+            .with_collection(&fresh);
+
+        let hits = index
+            .search(any_query())
+            .await
+            .expect("an empty index is not a failure");
+        assert!(hits.is_empty(), "{hits:?}");
+        let found = ExistingCollection::find_in(&settings(&url, None), &fresh)
+            .await
+            .expect("Qdrant answers");
+        assert!(found.is_none(), "the search created the collection");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "nothing is cached");
+    }
+
+    /// MOD-160 D3 (live): a collection another embedder wrote is refused before the model loads.
+    #[tokio::test]
+    async fn a_tui_search_of_another_embedders_collection_is_refused_before_the_model() {
+        let Some(url) = test_qdrant() else {
+            return;
+        };
+        let fresh = fresh_collection();
+        let created = QdrantStore::connect_to(
+            &settings(&url, None),
+            htui_store::embed::HashEmbedder::new(DENSE_DIM),
+            &fresh,
+        )
+        .await
+        .expect("Qdrant answers");
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads))
+            .with_source(Arc::new(source(Some(&url), None, no_key)))
+            .with_collection(&fresh);
+
+        let searched = index.search(any_query()).await;
+        created.drop_collection().await.expect("drop");
+        let why = searched.expect_err("another embedder's collection");
+        assert!(why.contains(htui_store::vector::EMBEDDER_MISMATCH), "{why}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+    }
+
     /// MOD-11 T7, H-26: the TUI's concepts runtime and the MCP adapter search one index, so the
     /// process loads one embedding model.
     #[test]
@@ -1674,14 +1885,14 @@ mod tests {
         let connections = Connections::<u32>::default();
         let made_for = settings("http://qdrant:6334", Some("key"));
         assert!(
-            connections.get(&made_for).is_none(),
+            connections.get(&made_for, Made::ReadOnly).is_none(),
             "nothing connected yet"
         );
 
         let first = Arc::new(1);
-        connections.put(made_for.clone(), Arc::clone(&first));
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&first));
         let reused = connections
-            .get(&made_for)
+            .get(&made_for, Made::Ensured)
             .expect("the same settings reuse it");
         assert!(Arc::ptr_eq(&reused, &first));
         for moved in [
@@ -1689,21 +1900,64 @@ mod tests {
             settings("http://qdrant:6334", None),
             settings("http://elsewhere:6334", Some("key")),
         ] {
-            assert!(connections.get(&moved).is_none(), "{moved:?}");
+            for need in [Made::Ensured, Made::ReadOnly] {
+                assert!(connections.get(&moved, need).is_none(), "{moved:?}");
+            }
         }
 
         // An error on a connection another request has already replaced leaves the new one.
         let second = Arc::new(2);
-        connections.put(made_for.clone(), Arc::clone(&second));
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&second));
         connections.forget(&first);
-        let kept = connections.get(&made_for).expect("the replacement stays");
+        let kept = connections
+            .get(&made_for, Made::Ensured)
+            .expect("the replacement stays");
         assert!(Arc::ptr_eq(&kept, &second));
 
         connections.forget(&second);
         assert!(
-            connections.get(&made_for).is_none(),
+            connections.get(&made_for, Made::ReadOnly).is_none(),
             "after an error the next request reconnects"
         );
+    }
+
+    /// MOD-160 D4: a store a search opened read-only (no payload indexes, no stamp, no MOD-144
+    /// rebuild) serves later searches but never a sync, and never displaces an ensured one.
+    #[test]
+    fn a_read_only_connection_never_serves_a_sync() {
+        let connections = Connections::<u32>::default();
+        let made_for = settings("http://qdrant:6334", None);
+
+        let read_only = Arc::new(1);
+        connections.put(made_for.clone(), Made::ReadOnly, Arc::clone(&read_only));
+        let searched = connections
+            .get(&made_for, Made::ReadOnly)
+            .expect("a search takes it");
+        assert!(Arc::ptr_eq(&searched, &read_only));
+        assert!(
+            connections.get(&made_for, Made::Ensured).is_none(),
+            "a sync connects instead"
+        );
+
+        let ensured = Arc::new(2);
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&ensured));
+        for need in [Made::Ensured, Made::ReadOnly] {
+            let served = connections.get(&made_for, need).expect("an ensured store");
+            assert!(Arc::ptr_eq(&served, &ensured), "{need:?}");
+        }
+
+        // A search that opened read-only while an index run connected keeps the better one.
+        connections.put(made_for.clone(), Made::ReadOnly, Arc::new(3));
+        let kept = connections
+            .get(&made_for, Made::Ensured)
+            .expect("the ensured store stays");
+        assert!(Arc::ptr_eq(&kept, &ensured));
+
+        // A read-only store for other settings replaces it: the slot holds one connection.
+        let elsewhere = settings("http://elsewhere:6334", None);
+        connections.put(elsewhere.clone(), Made::ReadOnly, Arc::new(4));
+        assert!(connections.get(&made_for, Made::ReadOnly).is_none());
+        assert!(connections.get(&elsewhere, Made::ReadOnly).is_some());
     }
 
     /// MOD-158 R1 (B-L6): an unusable `HTUI_QDRANT_URL` is a `warn` line, never its value; a
@@ -1759,11 +2013,17 @@ mod tests {
     fn unresolved_settings_drop_the_cached_connection() {
         let connections = Connections::<u32>::default();
         let made_for = settings("http://qdrant:6334", Some("key"));
-        connections.put(made_for.clone(), Arc::new(1));
+        connections.put(made_for.clone(), Made::Ensured, Arc::new(1));
         assert!(connections.resolved(Ok(made_for.clone())).is_ok());
-        assert!(connections.get(&made_for).is_some(), "resolving keeps it");
-        for why in [Unresolved::NoUrl, Unresolved::Offline] {
-            connections.put(made_for.clone(), Arc::new(2));
+        assert!(
+            connections.get(&made_for, Made::Ensured).is_some(),
+            "resolving keeps it"
+        );
+        for (why, made) in [
+            (Unresolved::NoUrl, Made::Ensured),
+            (Unresolved::Offline, Made::ReadOnly),
+        ] {
+            connections.put(made_for.clone(), made, Arc::new(2));
             assert!(connections.resolved(Err(why)).is_err());
             assert!(
                 connections
