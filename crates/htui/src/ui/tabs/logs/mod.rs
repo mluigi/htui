@@ -391,9 +391,11 @@ impl LogsTab {
         )
     }
 
-    /// One line, one row (blueprint B6): time, level word, the source under `all`, the text,
-    /// clipped to `width`. A narrow pane gives up the source column, then the time, before the
-    /// text; the level word always stays (D4).
+    /// One line, one row (blueprint B6): time, level word, source under `all`, text, clipped
+    /// to `width`. A deliberate deviation from B6's fixed shape: a pane narrower than
+    /// [`SOURCE_WIDTH`] gives up the source column and one narrower than [`TIME_WIDTH`] the time
+    /// too, so the text keeps room (at 60 columns the pane holds 28 cells, exactly the full
+    /// prefix). The level word always stays (D4).
     fn line(&self, line: &LogLine, width: u16, theme: &Theme) -> Line<'static> {
         let style = level_style(line.level, theme);
         let mut spans = Vec::with_capacity(4);
