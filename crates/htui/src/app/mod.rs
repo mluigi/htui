@@ -6,8 +6,8 @@ pub mod state;
 pub mod update;
 
 pub use action::{
-    Action, Handled, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealKind,
-    RevealTarget, TabAction,
+    Action, Handled, HistoryAction, LayoutAction, LoggingAction, OverlayAction, PaneAction,
+    RevealKind, RevealTarget, TabAction,
 };
 // Only tests outside `app` read it (the item form's and the Backlog's claim tests, R1 nit a).
 #[cfg(test)]

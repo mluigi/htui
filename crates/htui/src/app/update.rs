@@ -7,10 +7,12 @@ use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
 use crate::app::action::{
-    Action, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealTarget, TabAction,
+    Action, HistoryAction, LayoutAction, LoggingAction, OverlayAction, PaneAction, RevealTarget,
+    TabAction,
 };
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
+use crate::logging::LoggingPrefs;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
@@ -64,6 +66,7 @@ impl App {
             Action::Pane(pane) => self.step_pane(pane),
             Action::Layout(step) => self.change_layout(step),
             Action::History(step) => self.go_history(step),
+            Action::Logging(change) => self.change_logging(change),
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
                 self.on_tick();
@@ -71,6 +74,35 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    /// MOD-122 D5, D6: applies one logging setting through the control; on success records it in
+    /// the UI state, saves `ui-state.toml` (the latest-wins writer) and logs the directive or the
+    /// path, never a value read from the keyring or the environment. A refusal goes on the status
+    /// line and nothing changes.
+    fn change_logging(&mut self, change: LoggingAction) {
+        let control = self.logging.control().clone();
+        let applied = match &change {
+            LoggingAction::Filter(directive) => control.set_filter(directive),
+            LoggingAction::File(path) => control.set_file(path.as_deref()),
+        };
+        if let Err(err) = applied {
+            self.status = Some(err.to_string());
+            return;
+        }
+        let prefs = self.ui.logging.get_or_insert_with(LoggingPrefs::default);
+        match change {
+            LoggingAction::Filter(directive) => {
+                let directive = directive.trim().to_owned();
+                tracing::info!(filter = %directive, "log filter set in Settings");
+                prefs.filter = Some(directive);
+            }
+            LoggingAction::File(path) => {
+                tracing::info!(file = ?path, "log file set in Settings");
+                prefs.file = path;
+            }
+        }
+        self.save_ui_state();
     }
 
     /// Tab movement. A move that lands on another tab issues that tab's `wants_requests`.
@@ -1996,5 +2028,106 @@ mod tests {
         app.pending_edit = Some((TabId("pointer"), asked()));
         assert!(app.take_external_edit().is_some());
         assert_eq!(lost.get(), 0, "capture never applied: nothing to lose");
+    }
+
+    /// The text a memory store holds.
+    fn stored(store: &crate::ui::state_file::UiStore) -> Option<String> {
+        let crate::ui::state_file::UiStore::Memory(text) = store else {
+            panic!("a memory store");
+        };
+        text.lock().expect("unpoisoned").clone()
+    }
+
+    /// MOD-122 D5: a logging setting applies through the control and is saved in
+    /// `ui-state.toml` beside what was there; nothing else moves.
+    #[test]
+    fn a_logging_action_applies_and_saves() {
+        use crate::app::LoggingAction;
+        use crate::logging::LoggingPrefs;
+        use crate::ui::shell::{ListSize, TabLayout};
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, _rx, _seen) = shell();
+        let store = UiStore::memory();
+        app.ui_store = store.clone();
+        let layout = TabLayout {
+            list: ListSize::Percent(55),
+            ..TabLayout::DEFAULT
+        };
+        app.ui.layouts.insert("backlog".to_owned(), layout);
+
+        app.update(Action::Logging(LoggingAction::Filter("debug".to_owned())));
+        assert_eq!(app.status, None);
+        assert_eq!(app.logging.control().state().filter, "debug");
+        let saved = store.load().state;
+        assert_eq!(
+            saved.logging,
+            Some(LoggingPrefs {
+                filter: Some("debug".to_owned()),
+                file: None,
+            })
+        );
+        assert_eq!(saved.layouts.get("backlog"), Some(&layout));
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("htui.log");
+        app.update(Action::Logging(LoggingAction::File(Some(file.clone()))));
+        assert_eq!(
+            app.logging.control().state().file.as_deref(),
+            Some(file.as_path())
+        );
+        assert_eq!(
+            store.load().state.logging,
+            Some(LoggingPrefs {
+                filter: Some("debug".to_owned()),
+                file: Some(file),
+            })
+        );
+
+        app.update(Action::Logging(LoggingAction::File(None)));
+        assert_eq!(app.logging.control().state().file, None);
+        let saved = store.load().state;
+        assert_eq!(
+            saved.logging,
+            Some(LoggingPrefs {
+                filter: Some("debug".to_owned()),
+                file: None,
+            })
+        );
+        assert_eq!(saved.layouts.get("backlog"), Some(&layout));
+    }
+
+    /// MOD-122 D5: a setting that cannot apply says why on the status line; nothing changes and
+    /// nothing is saved.
+    #[test]
+    fn a_refused_logging_action_says_why_and_saves_nothing() {
+        use crate::app::LoggingAction;
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, _rx, _seen) = shell();
+        let store = UiStore::memory();
+        app.ui_store = store.clone();
+        let dir = tempfile::tempdir().expect("a temp dir");
+
+        app.update(Action::Logging(LoggingAction::File(Some(
+            dir.path().to_path_buf(),
+        ))));
+        let status = app.status.clone().expect("the refusal is said");
+        assert!(
+            status.contains(&dir.path().display().to_string()),
+            "{status}"
+        );
+        assert_eq!(app.logging.control().state().file, None);
+        assert_eq!(stored(&store), None, "nothing is saved");
+
+        app.update(Action::Logging(LoggingAction::Filter("htui=[".to_owned())));
+        let status = app.status.clone().expect("the refusal is said");
+        assert!(
+            status.starts_with("`htui=[` is not a log filter: "),
+            "{status}"
+        );
+        assert_eq!(app.logging.control().state().filter, "info");
+        assert_eq!(stored(&store), None, "nothing is saved");
+        assert_eq!(app.ui.logging, None);
     }
 }

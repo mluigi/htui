@@ -68,6 +68,8 @@ pub enum Action {
     Layout(LayoutAction),
     /// Go back or forward through the places visited (MOD-115 M2 D5): the `[history]` keys.
     History(HistoryAction),
+    /// Apply and save one logging setting (MOD-122 D5): emitted by Settings › Logging.
+    Logging(LoggingAction),
     /// Show or hide the key help.
     ToggleHelp,
     /// Show or hide the about panel under the header (`global.about`, MOD-115).
@@ -136,6 +138,16 @@ pub enum HistoryAction {
     Back,
     /// `history.forward`: where back was pressed.
     Forward,
+}
+
+/// One logging setting (MOD-122 D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoggingAction {
+    /// A filter directive the section validated
+    /// ([`logging::parse_filter`](crate::logging::parse_filter)).
+    Filter(String),
+    /// A log file, or none.
+    File(Option<std::path::PathBuf>),
 }
 
 /// Opening and closing overlays.

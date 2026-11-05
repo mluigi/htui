@@ -19,6 +19,7 @@ use crate::app::pane::OpenEditor;
 use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::translate::translate;
 use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
+use crate::logging::Logging;
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::header::{self, Flash, ShellChips};
 use crate::ui::kit::empty::{self, NextStep};
@@ -540,6 +541,9 @@ pub struct App {
     /// MOD-115 M2 D1: where the UI state is saved. `App::new` keeps it in memory, so a test never
     /// touches the home directory; only `run` hands it the real `ui-state.toml`.
     pub ui_store: UiStore,
+    /// MOD-122 D7: the log buffer and control. `App::new`'s is detached (no subscriber, so a test
+    /// never installs one); `run` hands it the installed one before the tabs are registered.
+    pub logging: Logging,
     /// MOD-115 M2 D5: the places visited this session, in memory.
     pub(crate) history: History,
     /// MOD-115 M2 §8: set while an outer entry (`on_key`, `on_mouse`, `update`) records, so the
@@ -619,6 +623,7 @@ impl App {
             pane_claim: Cell::new(None),
             last_claim: None,
             ui_store: UiStore::memory(),
+            logging: Logging::detached(),
             history: History::default(),
             recording: false,
             history_move: false,

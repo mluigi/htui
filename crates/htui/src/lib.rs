@@ -61,7 +61,6 @@ pub mod testkit;
 /// it too: a blocking task (a first model download) must not hold the process (MOD-64 review 1).
 pub const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
-use std::path::Path;
 use std::sync::Arc;
 
 use htui_core::store::MemStore;
@@ -74,7 +73,8 @@ use crate::ui::state_file::UiStore;
 
 /// Runs the whole application, terminal included.
 ///
-/// Startup order (blueprint D.4), and it matters: logging, then the two keyring flags — which exit
+/// Startup order (blueprint D.4), and it matters: logging (always captured in memory for the Logs
+/// tab, MOD-122), then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the four Qdrant flags (MOD-158 D8: the URL setting and this box's API key),
 /// which act the same way, then the two concepts-index flags (MOD-34), which also print to the
@@ -112,13 +112,16 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             .await
             .map_err(anyhow::Error::from);
     }
-    init_tracing(args.log.as_deref())?;
+    // MOD-122 D1: one subscriber, always: the in-memory log, a file that can be switched at run
+    // time, and Sentry only on a startup `--log`, exactly as before. After the `mcp`/`worker`
+    // returns, which install their own (or none), and before anything that logs.
+    let logging = logging::init(logging::Startup::from_env(args.log.as_deref()))?;
 
     if let Some(cli::Command::Provision(provision)) = args.command.clone() {
-        // MOD-45 D307: after `init_tracing`, so `--log` works the ordinary way.
+        // MOD-45 D307: after `logging::init`, so `--log` works the ordinary way.
         return provision::run(provision).await.map_err(anyhow::Error::from);
     }
-    // MOD-92: the read-only state verbs, after `init_tracing` (a `--log` file, never stdout) and
+    // MOD-92: the read-only state verbs, after `logging::init` (a `--log` file, never stdout) and
     // before anything that writes: the keyring flags, the key file, the cache.
     if let Some(cli::Command::Status(state)) = args.command.clone() {
         return state_cmd::run(state_cmd::Verb::Status, state)
@@ -130,7 +133,7 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             .await
             .map_err(anyhow::Error::from);
     }
-    // MOD-93: after `init_tracing`, so `--log` works; it writes only its own directory.
+    // MOD-93: after `logging::init`, so `--log` works; it writes only its own directory.
     if let Some(cli::Command::Claude(cli::ClaudeArgs {
         command: cli::ClaudeCommand::Emit(emit),
     })) = args.command.clone()
@@ -251,6 +254,9 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     );
 
     let mut app = App::new(request_tx);
+    // MOD-122 D7: before `register_all`, which hands the buffer and the control to the Logs tab
+    // and Settings › Logging.
+    app.logging = logging;
     app.top_bar.store = label;
     // MOD-80 D4: a NO_COLOR terminal gets the modifier-only theme.
     app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
@@ -265,10 +271,16 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             UiStore::File(root.join(ui::state_file::FILE_NAME))
         });
     let loaded = ui_store.load();
+    // MOD-122 D5: the saved logging settings, once `ui-state.toml` is read; `--log`/`HTUI_LOG` and
+    // `HTUI_LOG_FILTER` keep theirs for this session. One that cannot apply is a notice.
+    let logging_notice = app
+        .logging
+        .control()
+        .apply_saved(loaded.state.logging.as_ref());
     app.apply_ui_state(loaded.state);
     // RV2 H1: saved through a latest-wins writer thread, so no write or fsync runs on the loop.
     app.ui_store = ui_store.background();
-    app.status = loaded.notice;
+    app.status = loaded.notice.or(logging_notice);
     app::register_all(&mut app);
     app.start();
 
@@ -351,34 +363,6 @@ fn session_dsn(reader: &mut dyn std::io::BufRead) -> anyhow::Result<String> {
     htui_store::Dsn::parse(&line)
         .map_err(|err| anyhow::anyhow!("the DSN on stdin cannot be used: {err}"))?;
     Ok(std::mem::take(&mut *line))
-}
-
-/// Sends `tracing` to a file, or nowhere at all.
-///
-/// Never to stdout: stdout is the TUI (plan Patterns/Logging). `HTUI_LOG_FILTER` overrides the
-/// default `info` level.
-fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let Some(path) = path else { return Ok(()) };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let filter = tracing_subscriber::EnvFilter::try_from_env("HTUI_LOG_FILTER")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file)
-        .with_ansi(false);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .with(sentry_tracing::layer())
-        .try_init()
-        .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))
 }
 
 /// MOD-10 D15, M4 blueprint A-5: the process's one secret source, or none under `--demo`, which
@@ -482,6 +466,25 @@ mod tests {
             assert!(clear_dsn < place && place < index_items);
         }
         assert!(index_items < at("keys::resolve("));
+    }
+
+    /// MOD-122 D1, D5, D7: `run` installs the one subscriber before anything else that can log
+    /// (the key file included), hands it to the shell before the tabs are registered, and applies
+    /// the saved logging settings once `ui-state.toml` is read, before the UI state is taken.
+    #[test]
+    fn run_installs_logging_first_and_applies_saved_settings_before_the_tabs() {
+        let file = include_str!("lib.rs");
+        let code = &file[..file.find("#[cfg(test)]").unwrap_or(file.len())];
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is in `run`"))
+        };
+        assert!(at("logging::init(") < at("cli::Command::Provision"));
+        assert!(at("logging::init(") < at("keys::resolve("));
+        assert!(at("app.logging = logging;") < at("app::register_all(&mut app)"));
+        assert!(at("ui_store.load()") < at("apply_saved("));
+        assert!(at("apply_saved(") < at("app.apply_ui_state("));
+        assert!(!code.contains("init_tracing"), "the old installer is gone");
     }
 
     /// MOD-115 M2 RV2 H1: `run` saves the UI state through the background writer, and once the
