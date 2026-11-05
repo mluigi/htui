@@ -1237,6 +1237,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.record_branch(fence, step, branch).await,
+            Self::Online(pg) => pg.record_branch(fence, step, branch).await,
+        }
+    }
+
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         match self {
             Self::Memory(store) => store.record_command_run(new).await,

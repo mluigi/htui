@@ -1048,6 +1048,14 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<()> {
         self.inner.record_commits(fence, step, commits).await
     }
+    async fn record_branch(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        branch: &Value,
+    ) -> StoreResult<bool> {
+        self.inner.record_branch(fence, step, branch).await
+    }
     async fn record_command_run(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
         self.inner.record_command_run(new).await
     }

@@ -71,20 +71,21 @@ use crate::store::traits::{
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
     EXECUTOR_MUST_BE_KNOWN, ParkOutcome, QueueStored, QueueTarget, QueueToken, ReadStore,
     SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
-    batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
-    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
-    expected_on_row, failure_disagrees_with_status, finish_run_needs_a_terminal_status,
-    graph_not_usable, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
-    item_not_in_project, lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run,
-    link_outside_project, memory_entry_closed, memory_subject_taken, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    persona_is_bound, persona_patch_refusal, project_settings_not_an_object, prompt_template_key,
-    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
-    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    batch_is_closed, branch_refusal, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
+    document_needs_a_step, expected_on_row, failure_disagrees_with_status,
+    finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
+    link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
+    memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
+    not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
+    project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
+    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, startable, step_document_refusal, step_is_not_promotable, step_note_refusal,
+    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -6706,6 +6707,34 @@ impl State {
         Ok(true)
     }
 
+    /// MOD-138 M2 D5: `branch` on a `done` step whose `branch` is unset, under `fence`. The value
+    /// first (no read), then existence, then the fence, then the status, as Postgres decides them.
+    fn record_branch(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        branch: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        if let Some(refusal) = branch_refusal(step, branch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
+        if row.status != StepStatus::Done || row.branch.is_some() {
+            return Ok(false);
+        }
+        row.branch = Some(branch.clone());
+        row.updated_at = now;
+        Ok(true)
+    }
+
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.
     fn answer_gate(
         &mut self,
@@ -10114,6 +10143,11 @@ impl WriteStore for MemStore {
         commits: &[RunStepCommit],
     ) -> Result<()> {
         self.write(|state| state.record_commits(fence, step, commits))
+    }
+
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.record_branch(fence, step, branch, now))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {

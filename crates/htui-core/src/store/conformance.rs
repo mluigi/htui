@@ -67,14 +67,14 @@ use crate::store::traits::{
     withdrawn_requirement_cited,
 };
 use crate::store::traits::{
+    branch_is_not_an_object_of_booleans, forward_edges_form_a_cycle, graph_not_usable,
+    if_predicate_outside_the_closed_set, loop_edge_runs_forward, workspace_graph_is_held,
+};
+use crate::store::traits::{
     divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
     fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
-};
-use crate::store::traits::{
-    forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
-    loop_edge_runs_forward, workspace_graph_is_held,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -318,6 +318,10 @@ pub const CASES: &[&str] = &[
     "block_if_idle_writes_nothing_over_a_live_run",
     // MOD-138 M2: the closed `if` set (plan D4, W4)
     "replace_graph_refuses_an_if_predicate_outside_the_closed_set",
+    // MOD-138 M2: `record_branch`, the walker's stored `if` decision (plan D5, Q-A)
+    "record_branch_first_write_wins",
+    "record_branch_refuses_a_step_not_done",
+    "record_branch_refuses_a_stale_fence",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1017,6 +1021,13 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "replace_graph_refuses_an_if_predicate_outside_the_closed_set" => {
             Box::pin(replace_graph_refuses_an_if_predicate_outside_the_closed_set(store)).await
+        }
+        "record_branch_first_write_wins" => Box::pin(record_branch_first_write_wins(store)).await,
+        "record_branch_refuses_a_step_not_done" => {
+            Box::pin(record_branch_refuses_a_step_not_done(store)).await
+        }
+        "record_branch_refuses_a_stale_fence" => {
+            Box::pin(record_branch_refuses_a_stale_fence(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -23599,6 +23610,259 @@ async fn replace_graph_refuses_an_if_predicate_outside_the_closed_set<S: WriteSt
     assert!(
         answer.edges.contains(&written.edges[last]),
         "{CASE}: a closed-set predicate is stored as given"
+    );
+}
+
+// ---- MOD-138 M2: `record_branch` (plan D5, Q-A; blueprint §1.3) ------------------------------
+
+/// MOD-138 M2: a fresh step of a run `a` holds, driven `pending -> running -> done`.
+async fn leased_done_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    a: Uuid,
+    at: DateTime<Utc>,
+) -> (RunId, StepId) {
+    let (run, step) = leased_step(case, store, a, at).await;
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::Done),
+    ] {
+        assert!(
+            store.transition_step(step, from, to, at).await.expect(case),
+            "{case}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    (run, step)
+}
+
+/// MOD-138 M2 D5: [`WriteStore::record_branch`] writes a `done` step's decision once. The value
+/// is judged first, before any read, so a value that is not an object of booleans (an array
+/// member included, as `chk_run_step_branch`'s strict jsonpath refuses it) is `Constraint` even
+/// for an unknown step. The first write is `Ok(true)` and stored as given; a second is
+/// `Ok(false)` and the first decision stays; an unknown step is `NotFound`.
+async fn record_branch_first_write_wins<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_branch_first_write_wins";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_done_step(CASE, store, a, at).await;
+    let before = step_row(CASE, store, run, step).await;
+    assert_eq!(before.branch, None, "{CASE}: a done step starts undecided");
+
+    for refused in [
+        json!(null),
+        json!(true),
+        json!("deploy"),
+        json!(["deploy"]),
+        json!({"deploy": 1}),
+        json!({"deploy": "true"}),
+        json!({"deploy": null}),
+        json!({"deploy": {"ok": true}}),
+        json!({"deploy": [true]}),
+        json!({"deploy": []}),
+        json!({"deploy": true, "docs": [false]}),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .record_branch(StepFence::Lease(a), step, &refused)
+                .await,
+            &branch_is_not_an_object_of_booleans(step),
+            &format!("the branch {refused}"),
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        before,
+        "{CASE}: the refused values wrote nothing"
+    );
+    let unknown = StepId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .record_branch(StepFence::Unleased, unknown, &json!({"deploy": [true]}))
+            .await,
+        &branch_is_not_an_object_of_booleans(unknown),
+        "an array member on an unknown step (the value is judged before any read)",
+    );
+
+    let decision = json!({"deploy": true, "docs": false});
+    assert!(
+        store
+            .record_branch(StepFence::Lease(a), step, &decision)
+            .await
+            .expect(CASE),
+        "{CASE}: the first decision of a done step is written"
+    );
+    let row = step_row(CASE, store, run, step).await;
+    assert_eq!(
+        row.branch.as_ref(),
+        Some(&decision),
+        "{CASE}: the decision is stored as given"
+    );
+    assert!(
+        row.updated_at >= before.updated_at,
+        "{CASE}: `updated_at` does not go back"
+    );
+    assert_eq!(
+        RunStep {
+            branch: None,
+            updated_at: before.updated_at,
+            ..row.clone()
+        },
+        before,
+        "{CASE}: no other column moves"
+    );
+
+    assert!(
+        !store
+            .record_branch(StepFence::Lease(a), step, &json!({"deploy": false}))
+            .await
+            .expect(CASE),
+        "{CASE}: a second decision is a replay"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the first decision wins and the replay wrote nothing"
+    );
+
+    let missing = store
+        .record_branch(StepFence::Lease(a), StepId::new(), &decision)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {missing:?}"
+    );
+}
+
+/// MOD-138 M2 D5: only a `done` step takes a decision. Every other status answers `Ok(false)`
+/// and writes nothing.
+async fn record_branch_refuses_a_step_not_done<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_branch_refuses_a_step_not_done";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, _) = leased_step(CASE, store, a, at).await;
+    let decision = json!({"deploy": true});
+    let moves: [(StepStatus, &[StepStatus]); 7] = [
+        (StepStatus::Pending, &[]),
+        (StepStatus::Running, &[StepStatus::Running]),
+        (
+            StepStatus::AwaitingApproval,
+            &[StepStatus::Running, StepStatus::AwaitingApproval],
+        ),
+        (
+            StepStatus::Stopped,
+            &[StepStatus::Running, StepStatus::Stopped],
+        ),
+        (
+            StepStatus::Failed,
+            &[StepStatus::Running, StepStatus::Failed],
+        ),
+        (StepStatus::Superseded, &[]),
+        (StepStatus::Cancelled, &[StepStatus::Cancelled]),
+    ];
+    for (position, (status, path)) in (1..).zip(moves) {
+        let step = store
+            .create_step(new_run_step(run, position, 1, 0))
+            .await
+            .expect(CASE)
+            .id;
+        let mut from = StepStatus::Pending;
+        for &to in path {
+            assert!(
+                store.transition_step(step, from, to, at).await.expect(CASE),
+                "{CASE}: {from} -> {to} is a sanctioned move"
+            );
+            from = to;
+        }
+        if status == StepStatus::Superseded {
+            store.supersede_step(step).await.expect(CASE);
+        }
+        let before = step_row(CASE, store, run, step).await;
+        assert_eq!(before.status, status, "{CASE}: the step is {status}");
+        assert!(
+            !store
+                .record_branch(StepFence::Lease(a), step, &decision)
+                .await
+                .expect(CASE),
+            "{CASE}: a {status} step takes no decision"
+        );
+        assert_eq!(
+            step_row(CASE, store, run, step).await,
+            before,
+            "{CASE}: the {status} step is unwritten"
+        );
+    }
+}
+
+/// MOD-138 M2 D5: the decision is written under the walk's fence. A lease the run does not carry,
+/// or no lease at all, is `Fenced` and writes nothing, checked before the status (as
+/// [`WriteStore::pass_step`]'s review L3): a stale writer of a decided step is told it lost the
+/// run, not "already decided". An unknown step is `NotFound` before the fence.
+async fn record_branch_refuses_a_stale_fence<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_branch_refuses_a_stale_fence";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_done_step(CASE, store, a, at).await;
+    let decision = json!({"deploy": false});
+    let fenced = |outcome: Result<bool, StoreError>, what: &str| {
+        assert!(
+            matches!(outcome, Err(StoreError::Fenced { step: s }) if s == step),
+            "{CASE}: {what} is fenced, got {outcome:?}"
+        );
+    };
+
+    let before = step_row(CASE, store, run, step).await;
+    for fence in [StepFence::Lease(b), StepFence::Unleased] {
+        fenced(
+            store.record_branch(fence, step, &decision).await,
+            &format!("a decision under {fence:?}"),
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        before,
+        "{CASE}: the fenced decisions wrote nothing"
+    );
+
+    let missing = store
+        .record_branch(StepFence::Lease(b), StepId::new(), &decision)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound before the fence, got {missing:?}"
+    );
+
+    assert!(
+        store
+            .record_branch(StepFence::Lease(a), step, &decision)
+            .await
+            .expect(CASE),
+        "{CASE}: the run's own lease decides"
+    );
+    let decided = step_row(CASE, store, run, step).await;
+    fenced(
+        store
+            .record_branch(StepFence::Lease(b), step, &json!({"deploy": true}))
+            .await,
+        "a stale decision of a decided step",
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        decided,
+        "{CASE}: the stale decision wrote nothing"
     );
 }
 

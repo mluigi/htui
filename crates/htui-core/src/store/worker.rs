@@ -337,6 +337,13 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         step: StepId,
         commits: &[RunStepCommit],
     ) -> impl Future<Output = Result<()>> + Send;
+    /// [`WriteStore::record_branch`].
+    fn record_branch(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        branch: &Value,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::record_command_run`].
     fn record_command_run(
         &self,
@@ -883,6 +890,9 @@ impl WorkerStore for MemStore {
         commits: &[RunStepCommit],
     ) -> Result<()> {
         WriteStore::record_commits(self, fence, step, commits).await
+    }
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        WriteStore::record_branch(self, fence, step, branch).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await
