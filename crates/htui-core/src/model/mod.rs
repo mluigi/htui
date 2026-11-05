@@ -94,6 +94,7 @@ pub mod memory;
 pub mod note;
 pub mod overlap;
 pub mod persona;
+pub mod predicate;
 pub mod queue;
 pub mod queue_settings;
 pub mod quota;
@@ -156,6 +157,7 @@ pub use persona::{
     PersonaMatch, PersonaNotInSnapshot, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
     RuleLineError, SnapshotPersona,
 };
+pub use predicate::{BranchFacts, IfPredicate, PathGlob, PredicateError, VerifyWant};
 pub use queue::{
     BatchClose, BatchFigures, BatchStop, EntryState, Escalation, Hold, LiveFacts,
     MIN_BUDGET_FOR_NEW_ATTEMPT, QueueBatch, QueueEntry, QueueMove, QueueOverview, QueueRow,

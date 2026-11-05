@@ -768,6 +768,7 @@ impl ReadStore for PgStore {
                    verify_outcome      AS "verify_outcome: VerifyOutcome",
                    verify_exit_code,
                    promoted_at,
+                   branch,
                    updated_at
               FROM run_step
              WHERE run_id = $1
@@ -1428,6 +1429,7 @@ impl ReadStore for PgStore {
                        verify_outcome      AS "verify_outcome: VerifyOutcome",
                        verify_exit_code,
                        promoted_at,
+                       branch,
                        updated_at
                   FROM run_step
                  WHERE run_id = ANY($1)

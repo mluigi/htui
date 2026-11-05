@@ -7645,6 +7645,51 @@ async fn pass_step_takes_the_step_first() {
     db.drop_db().await;
 }
 
+/// MOD-138 M2: a leased running step passed to `done`, so `record_branch` has a step to decide.
+async fn leased_done_step(db: &common::TestDb) -> (RunId, StepId, uuid::Uuid) {
+    let (run, step, owner) = leased_running_step(db).await;
+    assert!(
+        db.store
+            .pass_step(StepFence::Lease(owner), step, None, Utc::now())
+            .await
+            .expect("pass the step"),
+        "the running step passes to done"
+    );
+    (run, step, owner)
+}
+
+/// The step's stored `branch`, read past the store.
+async fn stored_branch(db: &common::TestDb, step: StepId) -> Option<serde_json::Value> {
+    sqlx::query_scalar("SELECT branch FROM run_step WHERE id = $1")
+        .bind(step.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the branch")
+}
+
+/// MOD-138 M2 D5: `record_branch` (MOD-77's order, as `pass_step`) waits on a held step holding
+/// nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_branch_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_done_step(&db).await;
+    let store = db.store.clone();
+    let decision = serde_json::json!({"deploy": true, "docs": false});
+    let written = decision.clone();
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .record_branch(StepFence::Lease(owner), step, &written)
+            .await
+    })
+    .await;
+    assert!(answer.expect("the decision lands"), "the done step decides");
+    assert_eq!(stored_branch(&db, step).await, Some(decision));
+
+    db.drop_db().await;
+}
+
 /// MOD-77 plan D1: `upsert_step_tree` waits on a held step holding nothing on its run, then lands
 /// and writes the primary's `isolation_path`.
 #[tokio::test(flavor = "multi_thread")]
@@ -8026,6 +8071,29 @@ async fn pass_step_locks_the_step_for_update_up_front() {
     })
     .await;
     assert!(answer.expect("the pass lands"), "the running step passes");
+
+    db.drop_db().await;
+}
+
+/// MOD-138 M2 D5: `record_branch` takes the step's update lock up front (its locking CTE's
+/// `FOR NO KEY UPDATE OF s`), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_branch_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_done_step(&db).await;
+    let store = db.store.clone();
+    let decision = serde_json::json!({"deploy": false});
+    let written = decision.clone();
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store
+            .record_branch(StepFence::Lease(owner), step, &written)
+            .await
+    })
+    .await;
+    assert!(answer.expect("the decision lands"), "the done step decides");
+    assert_eq!(stored_branch(&db, step).await, Some(decision));
 
     db.drop_db().await;
 }

@@ -23,7 +23,9 @@
 //! MOD-24 adds [`kill_point`], the crash tests' hook at three seams of a walk and the command
 //! poll; without `test-support` it compiles to nothing. MOD-11 adds [`tools`], the seam a session's
 //! MCP tool host is opened through (plan D4). MOD-10 M3 adds [`secrets`], one walk's resolved
-//! secrets as its sessions' env and its scrubber in one object (D11).
+//! secrets as its sessions' env and its scrubber in one object (D11). MOD-138 M2 adds
+//! [`walk`], the readiness walker: joins, derived skips, `if` and `asks_you` edges and loop
+//! regions over the snapshot's nodes and edges (plan D2).
 #![warn(missing_docs)]
 
 pub mod closeout;
@@ -47,6 +49,7 @@ pub mod select;
 pub mod status;
 pub mod tools;
 pub mod verify;
+pub mod walk;
 
 pub use command::{
     Command, CommandOutcome, EngineError, GateAnswer, HandoffText, Opening, OpeningPath, Rest,
@@ -56,7 +59,7 @@ pub use command::{
 pub use engine::{
     Adopted, AgentSelector, ControlFor, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate,
     Next, NoSink, PolicyFor, Resume, RunFence, SessionKey, SessionSink, Tails, ask_policy,
-    live_step_at, never_cancelled, required_inputs,
+    live_step_at, never_cancelled,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};
@@ -79,6 +82,7 @@ pub use status::{
     Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,
 };
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};
+pub use walk::required_inputs;
 
 // Four of the blueprint's `engine::` names are exported from elsewhere, and the crate-root paths
 // are unchanged by it: `Clock` and `SystemClock` are `isolate`'s (their only implementor this

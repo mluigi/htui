@@ -5,18 +5,19 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::{
-    AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, PersonaId, PhaseId, ProjectId,
-    Split, StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
+    AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, IfPredicate, PersonaId,
+    PhaseId, ProjectId, Split, StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
 };
 use crate::prompt::template::TemplateRole;
 use crate::seed::{default_edge_plan, default_edges};
 use crate::store::traits::{
     already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
     edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
-    fan_out_below_one, forward_edges_form_a_cycle, loop_edge_runs_forward, max_parts_below_one,
-    palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_part_key_is_taken,
-    phase_position_is_taken, phase_token_budget_refusal, reserved_phase_name, retry_limit_negative,
-    row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
+    fan_out_below_one, forward_edges_form_a_cycle, if_predicate_outside_the_closed_set,
+    loop_edge_runs_forward, max_parts_below_one, palette_phase_has_edges, parts_off_divide,
+    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken,
+    phase_token_budget_refusal, reserved_phase_name, retry_limit_negative, row_names_another_graph,
+    row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
@@ -345,23 +346,13 @@ pub fn walk_refusal(
     edges: &[WalkEdge],
 ) -> Option<String> {
     let counted = |end: usize| nodes.get(end).is_some_and(|node| !node.palette);
-    let edges: Vec<&WalkEdge> = edges
-        .iter()
-        .filter(|edge| counted(edge.from) && counted(edge.to))
-        .collect();
-    let guided = adjacency(
+    let mask = forward_mask(nodes, edges);
+    let forward = adjacency(
         nodes.len(),
         edges
             .iter()
-            .filter(|edge| matches!(edge.kind, EdgeKind::Next | EdgeKind::If)),
-    );
-    let forward = adjacency(
-        nodes.len(),
-        edges.iter().filter(|edge| match edge.kind {
-            EdgeKind::Next | EdgeKind::If => true,
-            EdgeKind::AsksYou => !reaches(&guided, edge.to, edge.from),
-            EdgeKind::ChangesRequested | EdgeKind::Fails => false,
-        }),
+            .zip(&mask)
+            .filter_map(|(edge, &forward)| forward.then_some(edge)),
     );
     if let Some(cycle) = first_cycle(&forward) {
         let path: Vec<&str> = cycle.into_iter().map(|index| nodes[index].name).collect();
@@ -369,6 +360,7 @@ pub fn walk_refusal(
     }
     edges
         .iter()
+        .filter(|edge| counted(edge.from) && counted(edge.to))
         .filter(|edge| matches!(edge.kind, EdgeKind::ChangesRequested | EdgeKind::Fails))
         .find(|edge| !reaches(&forward, edge.to, edge.from))
         .map(|edge| {
@@ -376,8 +368,38 @@ pub fn walk_refusal(
         })
 }
 
+/// MOD-138 M2 D2: per edge, whether it is forward: `next`, `if`, and an `asks_you` whose target
+/// does not reach its source over `next`/`if` (W2, F18 of M1). An edge on a palette node, or
+/// naming an index outside `nodes`, is `false`. [`walk_refusal`] is written over it, so the
+/// validator and the walker cannot disagree.
+#[must_use]
+pub fn forward_mask(nodes: &[WalkNode<'_>], edges: &[WalkEdge]) -> Vec<bool> {
+    let counted = |edge: &WalkEdge| {
+        [edge.from, edge.to]
+            .iter()
+            .all(|&end| nodes.get(end).is_some_and(|node| !node.palette))
+    };
+    let guided = adjacency(
+        nodes.len(),
+        edges
+            .iter()
+            .filter(|edge| counted(edge) && matches!(edge.kind, EdgeKind::Next | EdgeKind::If)),
+    );
+    edges
+        .iter()
+        .map(|edge| {
+            counted(edge)
+                && match edge.kind {
+                    EdgeKind::Next | EdgeKind::If => true,
+                    EdgeKind::AsksYou => !reaches(&guided, edge.to, edge.from),
+                    EdgeKind::ChangesRequested | EdgeKind::Fails => false,
+                }
+        })
+        .collect()
+}
+
 /// Successor lists over `len` nodes, each in edge slice order.
-fn adjacency<'e>(len: usize, edges: impl Iterator<Item = &'e &'e WalkEdge>) -> Vec<Vec<usize>> {
+fn adjacency<'e>(len: usize, edges: impl Iterator<Item = &'e WalkEdge>) -> Vec<Vec<usize>> {
     let mut next = vec![Vec::new(); len];
     for edge in edges {
         next[edge.from].push(edge.to);
@@ -452,8 +474,9 @@ fn first_cycle(next: &[Vec<usize>]) -> Option<Vec<usize>> {
 
 /// MOD-138 D9 over a body: nodes in body order, edges in body order, by phase name; an edge
 /// naming a phase the body lacks is skipped (rule (a) of [`graph_body_topology_refusal`] refuses
-/// it first). Both stores' `replace_graph` call it straight after the topology rules, and
-/// `htui_orch::graph::override_graph` pre-checks a clone with it.
+/// it first). Then MOD-138 M2's W4: an `if` predicate outside the closed set. Both stores'
+/// `replace_graph` call it straight after the topology rules, resolve reads a live graph through
+/// it, and `htui_orch::graph::override_graph` pre-checks a clone with it.
 #[must_use]
 pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<String> {
     let index: HashMap<PhaseId, usize> = body
@@ -481,7 +504,30 @@ pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<S
             })
         })
         .collect();
-    walk_refusal(graph, &nodes, &edges)
+    walk_refusal(graph, &nodes, &edges).or_else(|| if_predicate_refusal(graph, body))
+}
+
+/// MOD-138 M2 D4 (W4), after W1 to W3: per body edge in order, an `if` edge whose predicate
+/// (a JSON `null` read as none, [`edge_predicate`]; rule (b) refuses a missing one first) is
+/// outside the closed set, [`if_predicate_outside_the_closed_set`] with the parse refusal. An edge
+/// naming a phase the body lacks is skipped, as the walk skips it.
+fn if_predicate_refusal(graph: StepGraphId, body: &GraphBody) -> Option<String> {
+    let name = |id: PhaseId| {
+        body.nodes
+            .iter()
+            .find(|node| node.phase.id == id)
+            .map(|node| node.phase.name.as_str())
+    };
+    body.edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::If)
+        .find_map(|edge| {
+            let predicate = edge_predicate(edge)?;
+            let (from, to) = (name(edge.from)?, name(edge.to)?);
+            IfPredicate::parse(&predicate.0).err().map(|reason| {
+                if_predicate_outside_the_closed_set(from, to, graph, &reason.to_string())
+            })
+        })
 }
 
 // ---- MOD-138 D7: the default-edge rule (blueprint §1.5) ----
@@ -592,13 +638,13 @@ mod tests {
 
     use super::{
         WalkEdge, WalkNode, body_agent_refs, body_persona_refs, default_edges_follow,
-        edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
+        edge_predicate, forward_mask, graph_body_shape_refusal, graph_body_topology_refusal,
         graph_body_walk_refusal, graph_usable_by, phase_row_refusal, walk_refusal,
     };
     use crate::model::{
         AgentId, CommandQueue, EdgeId, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope,
-        NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, ProjectId, Split, StepGraph,
-        StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
+        NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PredicateError, ProjectId, Split,
+        StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
     };
     use crate::seed::{self, default_edges};
     use crate::store::traits::{
@@ -609,8 +655,8 @@ mod tests {
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
     use crate::store::traits::{
-        fan_out_below_one, forward_edges_form_a_cycle, loop_edge_runs_forward,
-        phase_token_budget_refusal, retry_limit_negative,
+        fan_out_below_one, forward_edges_form_a_cycle, if_predicate_outside_the_closed_set,
+        loop_edge_runs_forward, phase_token_budget_refusal, retry_limit_negative,
     };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
@@ -1455,7 +1501,7 @@ mod tests {
         assert_eq!(graph_body_walk_refusal(graph, &body), Some(cycle.clone()));
         body.edges.pop();
         let mut guarded = edge(graph, review, plan, EdgeKind::If);
-        guarded.predicate = Some(EdgePredicate(serde_json::json!({"verdict": "approve"})));
+        guarded.predicate = Some(EdgePredicate(serde_json::json!({"verify": "passed"})));
         body.edges.push(guarded);
         assert_eq!(graph_body_topology_refusal(graph, &body), None);
         assert_eq!(graph_body_walk_refusal(graph, &body), Some(cycle));
@@ -1600,6 +1646,113 @@ mod tests {
         );
         body.edges.pop();
         assert_eq!(graph_body_walk_refusal(graph, &body), None);
+    }
+
+    // ---- MOD-138 M2: forward_mask (D2) and W4 (D4) ----
+
+    /// D2: the mask is the validator's own split: `next`/`if` forward, an `asks_you` forward
+    /// unless its target reaches its source over `next`/`if`, loop kinds never; an edge on a
+    /// palette node or past the slice is never forward.
+    #[test]
+    fn forward_mask_is_the_validators_classification() {
+        let walk_node = |name, palette| WalkNode { name, palette };
+        let nodes = [
+            walk_node("a", false),
+            walk_node("b", false),
+            walk_node("c", false),
+            walk_node("p", true),
+        ];
+        let walk_edge = |from, to, kind| WalkEdge { from, to, kind };
+        let edges = [
+            walk_edge(0, 1, EdgeKind::Next),
+            walk_edge(1, 2, EdgeKind::If),
+            walk_edge(2, 0, EdgeKind::AsksYou),
+            walk_edge(0, 2, EdgeKind::AsksYou),
+            walk_edge(2, 1, EdgeKind::ChangesRequested),
+            walk_edge(2, 0, EdgeKind::Fails),
+            walk_edge(0, 3, EdgeKind::Next),
+            walk_edge(3, 0, EdgeKind::Next),
+            walk_edge(0, 9, EdgeKind::Next),
+        ];
+        assert_eq!(
+            forward_mask(&nodes, &edges),
+            vec![true, true, false, true, false, false, false, false, false]
+        );
+        assert!(forward_mask(&nodes, &[]).is_empty());
+        // The palette edges would close `a → p → a`; left out, the walk accepts the graph.
+        assert_eq!(walk_refusal(StepGraphId::new(), &nodes, &edges), None);
+    }
+
+    /// D4 (W4): an `if` predicate outside the closed set is refused, naming the edge and the
+    /// parse refusal; a closed-set one passes.
+    #[test]
+    fn walk_refuses_an_if_predicate_outside_the_closed_set() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        let mut guarded = edge(graph, plan, review, EdgeKind::If);
+        guarded.predicate = Some(EdgePredicate(
+            serde_json::json!({"all": [{"verify": "passed"}, {"item_kind": "HTUI"}]}),
+        ));
+        body.edges.push(guarded);
+        assert_eq!(graph_body_topology_refusal(graph, &body), None);
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+
+        body.edges[3].predicate = Some(EdgePredicate(serde_json::json!({"verdict": "approve"})));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(if_predicate_outside_the_closed_set(
+                "plan",
+                "review",
+                graph,
+                &PredicateError::Unknown("verdict".to_owned()).to_string(),
+            ))
+        );
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body).as_deref(),
+            Some(
+                format!(
+                    "the `if` edge from `plan` to `review` in graph `{graph}` has a predicate \
+                     outside the closed set: `verdict` is not in the closed set \
+                     (all_changed_paths_match, any_changed_path_matches, verify, item_kind, \
+                     item_tag, all, any, not)"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// W4 fires after W1 to W3: a forward `fails` is named first; once mended, the predicate.
+    #[test]
+    fn w4_fires_after_the_loop_rules() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        let mut guarded = edge(graph, plan, review, EdgeKind::If);
+        guarded.predicate = Some(EdgePredicate(serde_json::json!({"verify": "maybe"})));
+        body.edges.push(guarded);
+        body.edges.push(edge(graph, plan, review, EdgeKind::Fails));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(loop_edge_runs_forward(
+                EdgeKind::Fails,
+                "plan",
+                "review",
+                graph
+            ))
+        );
+        body.edges.pop();
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(if_predicate_outside_the_closed_set(
+                "plan",
+                "review",
+                graph,
+                &PredicateError::BadValue {
+                    key: "verify",
+                    want: "\"passed\" or \"failed\""
+                }
+                .to_string(),
+            ))
+        );
     }
 
     // ---- MOD-138 D7: default_edges_follow (blueprint §1.5) ----

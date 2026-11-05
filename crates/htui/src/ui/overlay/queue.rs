@@ -369,7 +369,7 @@ fn escalation_sentence(escalation: &Escalation) -> String {
         Escalation::HardGateParked { .. } => "hard gate parked".to_owned(),
         Escalation::JudgeUndecided { note, .. } => with_note("judge undecided", note.as_deref()),
         Escalation::ReviewLoopExhausted { note, .. } => {
-            with_note("review loop exhausted", note.as_deref())
+            with_note("loop exhausted", note.as_deref())
         }
         Escalation::Blocked { note, .. } => with_note("blocked", note.as_deref()),
         Escalation::Failed {
@@ -1016,7 +1016,7 @@ mod tests {
             "not ready: item is \u{25cf} done",
             "hard gate parked",
             "judge undecided (last note: pick a branch)",
-            "review loop exhausted",
+            "loop exhausted",
             "blocked (last note: pick a branch)",
             "failed: exit 1",
             "missing tags: gpu",
@@ -1077,7 +1077,7 @@ mod tests {
                     run,
                     note: Some("round 3\nmore".to_owned()),
                 }),
-                "review loop exhausted (last note: round 3)",
+                "loop exhausted (last note: round 3)",
             ),
             (
                 EntryState::Waiting(Wait::NotReady(ItemState::NeedsYou)),

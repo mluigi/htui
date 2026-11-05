@@ -1075,7 +1075,9 @@ pub trait WriteStore: ReadStore {
     ///    non-divide node);
     /// 8. `Constraint` with
     ///    [`graph_body_walk_refusal`](crate::store::graph_body_walk_refusal)'s sentence (MOD-138
-    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back).
+    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back),
+    ///    then (MOD-138 M2 D4, W4) an `if` edge's predicate outside the closed set
+    ///    ([`if_predicate_outside_the_closed_set`]).
     async fn replace_graph(
         &self,
         graph: StepGraphId,
@@ -1791,6 +1793,21 @@ pub trait WriteStore: ReadStore {
         step: StepId,
         commits: &[RunStepCommit],
     ) -> Result<()>;
+
+    /// MOD-138 M2 D5 (Q-A): `run_step.branch = branch`, the `if` decision of a done step; written
+    /// once, under `fence`, as [`pass_step`](Self::pass_step) is. `updated_at` moves (Postgres'
+    /// trigger; `MemStore`: its clock). The first decision wins, so every reader, offline ones
+    /// included, reads the same answer and a replayed decision writes nothing.
+    ///
+    /// # Errors
+    /// In this order: [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`branch_is_not_an_object_of_booleans`]) when `branch` is not an object whose every
+    /// member is a boolean ([`branch_refusal`]), judged before any read;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the step's run does not carry
+    /// `fence`'s lease. `Ok(false)`: the step is not `done`, or its `branch` is already set;
+    /// nothing is written.
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool>;
 
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
@@ -3240,6 +3257,43 @@ pub fn workspace_graph_is_held(graph: &str, holder: &str, project: &str) -> Stri
     )
 }
 
+// ---- MOD-138 M2: the readiness walker's refusals (plan D4; blueprint §1.2) ----
+
+/// MOD-138 M2 D4 (W4): an `if` edge's predicate is outside the closed set
+/// ([`IfPredicate::parse`](crate::model::IfPredicate::parse)); `reason` is the parse refusal.
+#[must_use]
+pub fn if_predicate_outside_the_closed_set(
+    from: &str,
+    to: &str,
+    graph: StepGraphId,
+    reason: &str,
+) -> String {
+    format!(
+        "the `if` edge from `{from}` to `{to}` in graph `{graph}` has a predicate outside the \
+         closed set: {reason}"
+    )
+}
+
+/// MOD-138 M2 D5: [`WriteStore::record_branch`]'s value is not an object whose every member is
+/// `true` or `false`.
+#[must_use]
+pub fn branch_is_not_an_object_of_booleans(step: StepId) -> String {
+    format!("run_step {step}: branch must be a JSON object whose every member is true or false")
+}
+
+/// MOD-138 M2 D5: [`WriteStore::record_branch`]'s value check, [`branch_is_not_an_object_of_booleans`]
+/// unless `branch` is an object whose every member is a JSON boolean. Both stores judge it here,
+/// before any read, so they refuse in the same words; Postgres' `chk_run_step_branch` is the
+/// backstop. A member holding an array (`{"a": [true]}`, `{"a": []}`) is refused, as that CHECK's
+/// `strict` jsonpath refuses it.
+#[must_use]
+pub fn branch_refusal(step: StepId, branch: &Value) -> Option<String> {
+    match branch {
+        Value::Object(members) if members.values().all(Value::is_boolean) => None,
+        _ => Some(branch_is_not_an_object_of_booleans(step)),
+    }
+}
+
 // ---- MOD-38: ANA-11's refusals ----
 
 /// ANA-11 §4.2 under ANA-35 §7.1's law: close-out refuses this resolution for an item in this
@@ -3516,7 +3570,8 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
 /// [`WriteStore::park_step`] (MOD-37 R-5), [`WriteStore::write_step_document`],
 /// [`WriteStore::add_step_note`], [`WriteStore::propose_link`] and [`WriteStore::withdraw_link`]
-/// (MOD-11 plan D13) take one and write only while the step's run carries
+/// (MOD-11 plan D13), and [`WriteStore::record_branch`] (MOD-138 M2 D5) take one and write only
+/// while the step's run carries
 /// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
 /// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
 /// still holds its old `Lease`, and the store answers it with

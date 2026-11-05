@@ -1,10 +1,13 @@
-# MOD-138 - Snapshot v2 and the graph walker: the decisions so far, milestone 1 (in progress, 2026-11-03)
+# MOD-138 - Snapshot v2 and the graph walker: the decisions so far, milestones 1 and 2 (in progress, 2026-11-05)
 
 **Requirements:** `R-ORCH-1`, `R-ORCH-2`, `R-ORCH-3`, `R-ORCH-4` (seam), `R-ORCH-11`.
 **Origin:** ANA-33 (`docs/ANA-33.md` §7.2, §7.3, §7.7, §10; `docs/decisions/ana/ana-33.md`).
 **Artifacts:** PRD `.claude/prds/mod-138-snapshot-v2-graph-walker.prd.md` (PRD gate Q1-Q4); M1
 `.claude/plans/mod-138-m1-snapshot-v2.plan.md` (decisions D1-D13, amendments A1-A7 in its Status block,
-verified claims) and `.claude/plans/mod-138-m1-snapshot-v2.blueprint.md` (findings F1-F19).
+verified claims) and `.claude/plans/mod-138-m1-snapshot-v2.blueprint.md` (findings F1-F19); M2
+`.claude/plans/mod-138-m2-readiness-walker.plan.md` (decisions D1-D12, maintainer answers Q-A..Q-D, amendments
+A1-A12 in its Status block, verified claims) and `.claude/plans/mod-138-m2-readiness-walker.blueprint.md`
+(findings F1-F23).
 Routed **PRD** by `/handoff-run` (C2 and C4, at the threshold), ultracode for implement and review, built on
 `hr/MOD-138` in an hr sandbox.
 
@@ -97,3 +100,104 @@ See the M1 plan's Status block for the final gate on the merged tree. Known fail
 reproduced on `main` or environmental: the sandbox Qdrant times out (`qdrant_live`, `qdrant_worker`,
 `state_cli_pg`); `htui-store` `cache.rs` `the_spawned_refresher_passes_and_follows_the_scope` fails on `main`
 (`8a4a88c6`) too. The host's Postgres gate on the merged tree is owed, as for every `hr` run.
+
+## Milestone 2: the readiness walker (2026-11-05)
+
+Maintainer answers before planning (2026-11-05):
+- **Q-A:** an `if` is decided once and stored (`run_step.branch`).
+- **Q-B:** `asks_you` is one prompt, the gate answer.
+- **Q-C:** the recovery frontier stays position-based until M3.
+- **Q-D:** the "a node named review loops" rule goes.
+
+What was built:
+- **The closed `if` set** (`htui-core` `model/predicate.rs`, D3):
+  - `all_changed_paths_match` and `any_changed_path_matches` (`repo:glob`; a bare glob means the primary
+    repo), `verify`, `item_kind` (the key-prefix grammar), `item_tag`, and the combinators `all`, `any`, `not`
+    (nesting cap 32).
+  - The validator refuses anything else as W4, at save and at resolve.
+- **`run_step.branch`**: migration **`0025_run_step_branch`** (JSONB, `chk_run_step_branch` a strict, silent
+  jsonpath: an object of booleans) and cache **`0008_run_step_branch`**.
+  - `WriteStore::record_branch` writes it once (first write wins, fenced, only on a `done` step), with the same
+    refusal sentence in both stores.
+- **The walker** (`htui-orch` `walk.rs`, D1, D2):
+  - `ready()` re-derives readiness from rows each pass: joins wait for every forward in-edge, and need one taken.
+  - Skips are derived and propagate, and rows win.
+  - Order is topological over forward edges, with `Cursor::Decide` and `Cursor::Loop` first (A6).
+  - `status::cursor` is `ready()[0]`.
+  - A parity oracle (about 98,500 row combinations per form, over raw v1, v2 and gapped lifts) proves that
+    every lifted linear graph walks exactly as the old position scan, which is kept test-only.
+  - `required_inputs` follows forward reach (D9).
+- **Loops over edges** (D7, Q-D): `gate::edge_loop` replaces `review_loop` and `loop_target`.
+  - Any `changes_requested`, `fails` or back `asks_you` edge loops to its named target.
+  - The region is the forward paths from target to source, retired target first, source last.
+  - The budget is the edge's `loop_limit`, else the target's `retry_limit`.
+  - The no-progress test applies, except for `asks_you` (A5), and a spent loop ends in `RunFailure::LoopExhausted`.
+  - A node reads a verdict when it has a `changes_requested` edge (`reads_verdict`).
+  - The `changes_requested` note bytes are kept.
+- **Decisions and asks** (D6, D8):
+  - `Decide` evaluates a node's `if` edges from `BranchFacts`; it reads changed paths only when a predicate
+    needs them, and records the decision. An isolator error parks resumably.
+  - An `asks_you` node always stops after an ok settle; auto mode does not skip it. Approve takes the edge.
+  - Reject declines only that stop (A10); a reject of a failed park takes the node's own gate path. Reject
+    order is `changes_requested` loop, then `asks_you` decline, then `fails` loop, then end the run (A3).
+  - Accept-artifact declines (A2). A spent back `asks_you` writes its escalation without blocking the item (A9).
+- **Resolve** runs authored edges (D10). It refuses a fan-out node with an `asks_you`/`fails` edge (A7) and a back
+  `asks_you` beside another `asks_you` edge (A11, `NotRunnable::MixedAsksYou`, until M3).
+- **v1 resume** compares the phase-only digest (D11).
+- **The queue** now says "loop exhausted" for any blocked loop escalation, not "review loop exhausted".
+
+## Milestone 2 review
+
+`rust-reviewer` ran as three area instances: core and store; walker and resolve; loops, `asks_you` and the
+engine. All three approved: one medium finding, nine low. A verifier per finding then confirmed or partly
+confirmed all ten.
+
+Fixed in round R1:
+- **E1, medium:** the stop note promised approve would take every target, but a loop retires the source.
+  The maintainer chose to refuse that shape until M3 (A11).
+- **E2:** the queue label.
+- **W2:** a palette end is no loop edge.
+- **S1:** an order-independent CHECK.
+- **S3:** `item_kind` and `item_tag` values are checked.
+- **S2, E4:** two docs.
+
+Not changed:
+- **E3:** the escalation note after the park, as the blueprint and D125 order it; the stop note already says
+  the loop is spent.
+
+Owed to **M3**:
+- the graph-aware recovery frontier (Q-C). The gap is wider than the plan first said: any graph whose
+  forward order differs from position order, which only tests can store until MOD-141;
+- `last_output_kind` (F23);
+- the semantics of mixed `asks_you` edges (A11).
+
+Owed to **M3/MOD-141** (D9 gap): a join that lists a kind whose only producer an `if` declined still requires
+it, so a strict step fails `MissingInput`. Likely rule: a kind with only skipped producers is optional.
+
+## Pins after M2
+
+Store conformance `CASES` 233 (was 229); `htui-orch` `CASES` 140 (was 118); migrations through
+`0025_run_step_branch`, cache through `0008_run_step_branch` (`TABLES` 51 unchanged).
+
+## Milestone 2 commits
+
+On `hr/MOD-138` from `d114f91f`:
+- plan and blueprint: `31131717`, `eb731e4f`, `8abe9c1d`;
+- T1: `9ccc959b`..`8f9f49fa`;
+- T2: `f691a956`..`bf25ed41` (merge `0586659d`);
+- T3: `af21d537`, `1bc38e2e` (merge `bb0f321b`);
+- T4: `be89571d`..`41568891`;
+- T5: `065ea71d`..`1adff2c5`;
+- R1: `54feef88`..`ac4e2cd5`.
+
+## Milestone 2 gate
+
+`bash scripts/gate.sh` on `08908240` (the R1 tree plus docs):
+- **Passed:** fmt; clippy, with all features and without; the Postgres probe; abort-grep (SIGABRT 0);
+  migrations; the workflow-docs validator; the plugin suite. 146 test binaries are green.
+- **Failed:** only the sandbox's Qdrant timeouts (`create collection` / `create payload index ... Timeout
+  expired`): `qdrant_live` (16 of 20), `qdrant_worker` (2) and `state_cli_pg`
+  `a_search_over_an_index_answers_in_scope`. None runs M2 code.
+- **`cargo sqlx prepare --check`:** clean against a migrated scratch database (R1).
+- **Owed on the host:** the Qdrant suites, and the real Postgres gate on the merged tree.
+

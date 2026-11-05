@@ -64,17 +64,17 @@ use htui_core::store::traits::{
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
     QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError, StoredSetting,
-    TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
-    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
-    finish_run_needs_a_terminal_status, graph_not_usable, illegal_move, invalid_area_code,
-    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
-    legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
-    prompt_template_refusal, queue_target_refusal, queue_token_refusal, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, startable, step_is_not_promotable, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    TransitionLaw, UpdateOutcome, WriteStore, already_exists, branch_refusal, chat_step_status,
+    check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
+    failure_disagrees_with_status, finish_run_needs_a_terminal_status, graph_not_usable,
+    illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
+    item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal,
+    not_a_fanout_candidate, not_a_terminal_status, persona_is_bound, persona_patch_refusal,
+    prompt_template_key, prompt_template_refusal, queue_target_refusal, queue_token_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
+    skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use htui_core::store::{
     body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
@@ -6986,6 +6986,7 @@ impl WriteStore for PgStore {
                       verify_outcome      AS "verify_outcome: VerifyOutcome",
                       verify_exit_code,
                       promoted_at,
+                      branch,
                       updated_at
             "#,
             new.id.as_uuid(),
@@ -7625,6 +7626,46 @@ impl WriteStore for PgStore {
         }
 
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// MOD-138 M2 D5: `pass_step`'s one-statement shape. The value is judged in Rust first
+    /// (`branch_refusal`, `MemStore`'s words), so `chk_run_step_branch` is only the backstop. The
+    /// locking CTE takes the step for update and shares its run (MOD-77's step-then-run order),
+    /// matching only a `done` step with no decision under `fence`'s lease; the `UPDATE` repeats
+    /// `branch IS NULL`, so of two racing decisions the second matches no row. `updated_at` is the
+    /// trigger's.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`], then [`StoreError::NotFound`] `{ entity: "run_step" }`, then
+    /// [`StoreError::Fenced`], told apart from "not done or already decided" by `fenced_miss` on a
+    /// miss.
+    async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
+        if let Some(refusal) = branch_refusal(step, branch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let written = sqlx::query!(
+            "WITH locked AS ( \
+                 SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+                  WHERE s.id = $1 AND s.status = 'done' AND s.branch IS NULL \
+                    AND r.lease_owner IS NOT DISTINCT FROM $3 \
+                    FOR NO KEY UPDATE OF s FOR SHARE OF r) \
+             UPDATE run_step SET branch = $2 \
+               FROM locked \
+              WHERE run_step.id = locked.id AND run_step.branch IS NULL",
+            step.as_uuid(),
+            branch,
+            fence.owner(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if written == 1 {
+            return Ok(true);
+        }
+        Box::pin(fenced_miss(&self.pool, step, fence)).await
     }
 
     /// One `command_run` row, every column the caller's (plan D31).

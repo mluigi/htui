@@ -112,7 +112,8 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -123,8 +124,9 @@ async fn migrations_apply_on_a_clean_database() {
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
-         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql and \
-         MOD-144's 0024_item_status.sql, in ordinal order"
+         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
+         MOD-144's 0024_item_status.sql and MOD-138 M2's 0025_run_step_branch.sql, in ordinal \
+         order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -3902,8 +3904,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(24),
-        "twenty-four embedded migrations, none applied (through MOD-144's 0024_item_status.sql)"
+        MigrationState::Pending(25),
+        "twenty-five embedded migrations, none applied (through MOD-138's 0025_run_step_branch.sql)"
     );
 
     db.drop_db().await;
@@ -4003,8 +4005,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(24),
-        "twenty-four embedded migrations, through MOD-144's 0024_item_status.sql"
+        MigrationState::Pending(25),
+        "twenty-five embedded migrations, through MOD-138's 0025_run_step_branch.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4012,8 +4014,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(24),
-        "every one of the twenty-four, through MOD-144's 0024_item_status.sql, is pending"
+        HeadlessError::MigrationsPending(25),
+        "every one of the twenty-five, through MOD-138's 0025_run_step_branch.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4035,8 +4037,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(24),
-        "every one of the twenty-four, through MOD-144's 0024_item_status.sql, is pending"
+        HeadlessError::MigrationsPending(25),
+        "every one of the twenty-five, through MOD-138's 0025_run_step_branch.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4187,9 +4189,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        24,
-        "the later applies migrate nothing: the twenty-four embedded migrations (through MOD-144's \
-         0024_item_status.sql) are applied once"
+        25,
+        "the later applies migrate nothing: the twenty-five embedded migrations (through MOD-138's \
+         0025_run_step_branch.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -5141,6 +5143,75 @@ async fn the_opening_column_admits_three_values_and_null() {
         Some("23514"),
         "the opening CHECK refuses it: {err}"
     );
+    set(None).await.expect("NULL is admitted");
+
+    db.drop_db().await;
+}
+
+/// MOD-138 M2 D5 (`0025_run_step_branch.sql`): `run_step.branch` admits `NULL` and a JSON object
+/// whose every member is a boolean (the empty object included); `chk_run_step_branch` refuses
+/// any other shape.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn the_branch_column_admits_an_object_of_booleans_and_null() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let set = |branch: Option<serde_json::Value>| {
+        sqlx::query("UPDATE run_step SET branch = $2 WHERE id = $1")
+            .bind(ids::STEP_IMPL.as_uuid())
+            .bind(branch)
+            .execute(&db.pool)
+    };
+
+    for branch in [
+        json!({"deploy": true, "docs": false}),
+        json!({"deploy": false}),
+        json!({}),
+    ] {
+        let done = set(Some(branch.clone()))
+            .await
+            .unwrap_or_else(|err| panic!("`{branch}` is admitted: {err}"));
+        assert_eq!(done.rows_affected(), 1, "`{branch}` lands on the step");
+        let stored: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT branch FROM run_step WHERE id = $1")
+                .bind(ids::STEP_IMPL.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the branch back");
+        assert_eq!(stored, Some(branch.clone()), "`{branch}` reads back");
+    }
+    for branch in [
+        json!({"deploy": 1}),
+        json!({"deploy": null}),
+        json!({"deploy": "true"}),
+        json!({"deploy": {"nested": true}}),
+        // A lax jsonpath unwraps an array member before its filter runs, so these two would pass
+        // a CHECK written without `strict`.
+        json!({"deploy": [true]}),
+        json!({"deploy": []}),
+        json!([true]),
+        json!(true),
+        json!("deploy"),
+        json!(null),
+    ] {
+        let err = set(Some(branch.clone()))
+            .await
+            .expect_err("a value that is not an object of booleans is refused");
+        let database = err.as_database_error();
+        assert_eq!(
+            database.and_then(|e| e.code()).as_deref(),
+            Some("23514"),
+            "`{branch}`: the branch CHECK refuses it: {err}"
+        );
+        assert_eq!(
+            database.and_then(|e| e.constraint()),
+            Some("chk_run_step_branch"),
+            "`{branch}`: named by its constraint"
+        );
+    }
     set(None).await.expect("NULL is admitted");
 
     db.drop_db().await;

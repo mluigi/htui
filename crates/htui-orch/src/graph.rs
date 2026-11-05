@@ -29,8 +29,8 @@ use htui_core::model::{
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
-    check_attachment, edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
-    graph_body_walk_refusal, references_no_row, walk_refusal,
+    check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
+    graph_body_topology_refusal, graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
 
@@ -209,7 +209,9 @@ pub enum ResolveError {
         fan_out: i32,
     },
     /// Plan D64 (OQ-5): a `review` phase cannot fan out, because the loop's gate reads one review
-    /// verdict and a group's review would need a judge of reviews nothing defines.
+    /// verdict and a group's review would need a judge of reviews nothing defines. MOD-138 M2 D10
+    /// widens it from the name to the rule: any node that reads its verdict (an outgoing
+    /// `changes_requested` edge) is refused too, and a phase called `review` still is.
     #[error(
         "phase `{phase}` is a review with fan_out {fan_out}; a review cannot fan out (plan D64)"
     )]
@@ -271,11 +273,13 @@ pub enum ResolveError {
         /// The validator's sentence.
         reason: String,
     },
-    /// MOD-138 D6: a graph M1 freezes but cannot walk yet; lifted by MOD-139, MOD-140 and M2.
+    /// MOD-138 D6: a graph M1 freezes but cannot walk yet; lifted by MOD-139, MOD-140 and M3.
+    /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, or the source of the first
-        /// edge that is not a default one.
+        /// The node refused: the divide phase, the palette phase, the fanned-out node with an
+        /// `asks_you` or `fails` edge (blueprint A7), or the node with a back `asks_you` edge
+        /// beside another `asks_you` edge (R1, E1).
         node: String,
         /// Why.
         reason: NotRunnable,
@@ -294,12 +298,21 @@ pub enum NotRunnable {
     /// (b) A palette node.
     #[error("a palette node is placed by a planner, which runs from MOD-140 on")]
     Palette,
-    /// (c) Stored edges other than the default ones of the phases.
+    /// Blueprint A7 (MOD-138 M2): a fanned-out node with an outgoing `asks_you` or `fails`
+    /// edge. Group routing runs neither the `asks_you` stop nor the `fails` loop, so its winner
+    /// would decline every `asks_you` edge in silence and a group failure would never loop. (M2
+    /// lifted D6(c): authored edges otherwise resolve.)
+    #[error("a fanned-out node's `asks_you` or `fails` edge runs from MOD-138 M3")]
+    FanOutEdge,
+    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
+    /// edges, at least one of them back (forward plus back, or back plus back). `ready()` takes
+    /// only the first back edge with budget and the loop retires the source, so a forward target
+    /// would never start while the loop has budget and approve could not take every edge (plan
+    /// Q-B). M3 (or MOD-141) lifts it.
     #[error(
-        "its edges are not the default ones its phases imply (`next` in position order and the \
-         review loop); other edges run once the readiness walker lands (MOD-138 M2)"
+        "a node with a back `asks_you` edge beside another `asks_you` edge runs from MOD-138 M3"
     )]
-    NonDefaultEdges,
+    MixedAsksYou,
 }
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the **typed** phase slice (plan D9).
@@ -522,7 +535,26 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
             },
         });
     }
-    if let Err(refusal) = not_yet_runnable(&phases, &rows, &stored) {
+    // MOD-138 M2 D10, blueprint A7: a fanned-out node that reads its verdict is the plain
+    // `ReviewFanOut` error; one with an `asks_you` or `fails` edge cannot run yet.
+    match fan_out_edge_refusal(&phases, &edges) {
+        Ok(()) => {}
+        Err(refusal @ ResolveError::NotYetRunnable { .. }) => {
+            return Ok(Resolution::Refused {
+                phases: unexpanded,
+                refusal,
+            });
+        }
+        Err(err) => return Err(err),
+    }
+    // R1 (E1): a back `asks_you` edge beside another `asks_you` edge cannot run yet.
+    if let Err(refusal) = mixed_asks_you_refusal(&phases, &edges) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal,
+        });
+    }
+    if let Err(refusal) = not_yet_runnable(&phases) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
             refusal,
@@ -631,14 +663,9 @@ fn live_graph_refusal(
 
 /// MOD-138 D6: what M1 freezes but cannot walk, first refusal wins: (a) the first node, in
 /// position order, that is not a `step` (an expanded `divide` node, named by the divide phase);
-/// (b) the first palette node; (c) stored edges other than `seed::default_edges` of the
-/// non-palette rows (blueprint A5), compared as multisets of `(from, to, kind, loop_limit,
-/// predicate is none)`.
-fn not_yet_runnable(
-    phases: &[SnapshotPhase],
-    rows: &[ResolvedPhase],
-    stored: &[StepGraphEdge],
-) -> std::result::Result<(), ResolveError> {
+/// (b) the first palette node. M2 lifted (c), the refusal of authored edges (D10): the
+/// readiness walker runs them.
+fn not_yet_runnable(phases: &[SnapshotPhase]) -> std::result::Result<(), ResolveError> {
     let refuse = |node: &str, reason| {
         Err(ResolveError::NotYetRunnable {
             node: node.to_owned(),
@@ -655,44 +682,92 @@ fn not_yet_runnable(
     if let Some(phase) = phases.iter().find(|phase| phase.palette) {
         return refuse(&phase.name, NotRunnable::Palette);
     }
+    Ok(())
+}
 
-    let linear: Vec<StepGraphPhase> = rows
-        .iter()
-        .filter(|row| !row.phase.palette)
-        .map(|row| row.phase.clone())
-        .collect();
-    let defaults = htui_core::seed::default_edges(&linear, EdgeId::new);
-    let shape = |edge: &StepGraphEdge| {
-        (
-            edge.from,
-            edge.to,
-            edge.kind,
-            edge.loop_limit,
-            edge_predicate(edge).is_none(),
-        )
-    };
-    // The first edge of `left`, in its order, that `right` does not match one for one.
-    let unmatched = |left: &[StepGraphEdge], right: &[StepGraphEdge]| {
-        let mut counts: HashMap<_, usize> = HashMap::new();
-        for edge in right {
-            *counts.entry(shape(edge)).or_default() += 1;
+/// MOD-138 M2 D10 and blueprint A7, over every fanned-out node in position order, first refusal
+/// wins: a node that reads its verdict (an outgoing `changes_requested` edge, the rule
+/// `GraphSnapshot::reads_verdict` reads) is [`ResolveError::ReviewFanOut`], the plain error
+/// `snapshot_phase`'s name check raises; a node with an outgoing `asks_you` or `fails` edge is
+/// [`NotRunnable::FanOutEdge`].
+fn fan_out_edge_refusal(
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> std::result::Result<(), ResolveError> {
+    let mut fanned: Vec<&SnapshotPhase> = phases.iter().filter(|phase| phase.fan_out > 1).collect();
+    fanned.sort_by_key(|phase| phase.position);
+    for phase in fanned {
+        let out = |kinds: &[EdgeKind]| {
+            edges
+                .iter()
+                .any(|edge| edge.from == phase.name && kinds.contains(&edge.kind))
+        };
+        if out(&[EdgeKind::ChangesRequested]) {
+            return Err(ResolveError::ReviewFanOut {
+                phase: phase.name.clone(),
+                fan_out: phase.fan_out,
+            });
         }
-        left.iter()
-            .find(|edge| match counts.get_mut(&shape(edge)) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    false
-                }
-                _ => true,
-            })
-            .map(|edge| edge.from)
-    };
-    if let Some(from) = unmatched(stored, &defaults).or_else(|| unmatched(&defaults, stored)) {
-        let node = rows
+        if out(&[EdgeKind::AsksYou, EdgeKind::Fails]) {
+            return Err(ResolveError::NotYetRunnable {
+                node: phase.name.clone(),
+                reason: NotRunnable::FanOutEdge,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// R1 (E1, maintainer decision 2026-11-05), run after [`fan_out_edge_refusal`]: the first walked
+/// node in position order with two or more outgoing `asks_you` edges, at least one of them back,
+/// is [`NotRunnable::MixedAsksYou`]. Forward and back are [`forward_mask`]'s classification, the
+/// walker's own; an edge with a palette end or an unknown key is left out, as the walk leaves it
+/// out. `ready()` takes only the first back edge with budget and the loop retires the source, so
+/// on that shape approve could not take every edge (plan Q-B) until M3 (or MOD-141) runs it.
+fn mixed_asks_you_refusal(
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> std::result::Result<(), ResolveError> {
+    let nodes: Vec<WalkNode<'_>> = phases
+        .iter()
+        .map(|phase| WalkNode {
+            name: &phase.name,
+            palette: phase.palette,
+        })
+        .collect();
+    let index = |key: &str| {
+        phases
             .iter()
-            .find(|row| row.phase.id == from)
-            .map_or_else(|| from.to_string(), |row| row.phase.name.clone());
-        return refuse(&node, NotRunnable::NonDefaultEdges);
+            .position(|phase| phase.name == key && !phase.palette)
+    };
+    let walk: Vec<WalkEdge> = edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: index(&edge.from)?,
+                to: index(&edge.to)?,
+                kind: edge.kind,
+            })
+        })
+        .collect();
+    let mask = forward_mask(&nodes, &walk);
+    let mut walked: Vec<usize> = (0..phases.len())
+        .filter(|&node| !phases[node].palette)
+        .collect();
+    walked.sort_by_key(|&node| (phases[node].position, node));
+    for node in walked {
+        let asks: Vec<bool> = walk
+            .iter()
+            .zip(&mask)
+            .filter(|(edge, _)| edge.from == node && edge.kind == EdgeKind::AsksYou)
+            .map(|(_, &forward)| forward)
+            .collect();
+        if asks.len() >= 2 && asks.contains(&false) {
+            return Err(ResolveError::NotYetRunnable {
+                node: phases[node].name.clone(),
+                reason: NotRunnable::MixedAsksYou,
+            });
+        }
     }
     Ok(())
 }
@@ -5008,9 +5083,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
-    /// MOD-138 D6(c): edges other than the default ones run once M2's readiness walker lands.
+    /// MOD-138 M2 D10 (A8, replacing D6(c)'s `non_default_edges_are_refused`): a graph with
+    /// authored edges resolves, and its snapshot carries them.
     #[tokio::test]
-    async fn non_default_edges_are_refused() {
+    async fn a_graph_with_authored_edges_resolves() {
         let store = MemStore::demo();
         replace_feature(&store, |body| {
             let id = |name: &str| {
@@ -5032,16 +5108,170 @@ question and not a test fix. Decide the version bump first, then paste the new d
             });
         })
         .await;
-        let error = resolve_feat(&store, &TestSource::claude(&store))
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
             .await
-            .expect_err("a non-default edge cannot run yet");
+            .expect("the readiness walker runs authored edges")
+            .snapshot;
+        assert!(
+            snapshot
+                .edges
+                .iter()
+                .any(|edge| (edge.from.as_str(), edge.to.as_str(), edge.kind)
+                    == ("review", "plan", EdgeKind::AsksYou)),
+            "{:?}",
+            snapshot.edges
+        );
+    }
+
+    /// MOD-138 M2 D10: `ReviewFanOut` is widened from the name to the rule. A node that reads its
+    /// verdict (an outgoing `changes_requested` edge) may not fan out, whatever it is called.
+    #[tokio::test]
+    async fn a_verdict_reading_node_may_not_fan_out() {
+        let store = store_with(|data| {
+            let review = feature_phase(data, "review");
+            for phase in &mut data.phases {
+                if phase.id == review {
+                    phase.name = "audit".to_owned();
+                    phase.fan_out = 2;
+                    phase.split = Split::for_fan_out(2);
+                }
+            }
+        });
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect_err("`audit` reads its verdict, so it cannot fan out");
         assert_eq!(
             error,
-            ResolveError::NotYetRunnable {
-                node: "review".to_owned(),
-                reason: NotRunnable::NonDefaultEdges,
+            ResolveError::ReviewFanOut {
+                phase: "audit".to_owned(),
+                fan_out: 2,
             }
         );
+    }
+
+    /// Blueprint A7: group routing never runs the `asks_you` stop or the `fails` loop, so a
+    /// fanned-out node with either edge is refused as not yet runnable (M3 or MOD-139 lifts it).
+    #[tokio::test]
+    async fn an_asks_you_or_fails_node_may_not_fan_out() {
+        for kind in [EdgeKind::AsksYou, EdgeKind::Fails] {
+            let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 2);
+            replace_feature(&store, |body| {
+                let id = |name: &str| {
+                    body.nodes
+                        .iter()
+                        .find(|node| node.phase.name == name)
+                        .map(|node| node.phase.id)
+                        .expect("the feature graph has the phase")
+                };
+                let (implement, plan) = (id("implement"), id("plan"));
+                body.edges.push(StepGraphEdge {
+                    id: EdgeId::new(),
+                    graph_id: ids::GRAPH_HTUI_FEAT,
+                    from: implement,
+                    to: plan,
+                    kind,
+                    predicate: None,
+                    loop_limit: kind.needs_loop_limit().then_some(1),
+                });
+            })
+            .await;
+            let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+                .await
+                .expect_err("a fanned-out node's `asks_you` or `fails` edge cannot run yet");
+            assert_eq!(
+                error,
+                ResolveError::NotYetRunnable {
+                    node: "implement".to_owned(),
+                    reason: NotRunnable::FanOutEdge,
+                },
+                "{kind}"
+            );
+            assert!(error.to_string().contains("MOD-138 M3"), "{error}");
+        }
+    }
+
+    /// The feature graph with `asks_you` edges `(from, to)` added (no `loop_limit`), resolved
+    /// for FEAT-1.
+    async fn resolve_with_asks_you(
+        edges: &[(&str, &str)],
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let id = |name: &str| {
+                body.nodes
+                    .iter()
+                    .find(|node| node.phase.name == name)
+                    .map(|node| node.phase.id)
+                    .expect("the feature graph has the phase")
+            };
+            let ends: Vec<(PhaseId, PhaseId)> =
+                edges.iter().map(|(from, to)| (id(from), id(to))).collect();
+            for (from, to) in ends {
+                body.edges.push(StepGraphEdge {
+                    id: EdgeId::new(),
+                    graph_id: ids::GRAPH_HTUI_FEAT,
+                    from,
+                    to,
+                    kind: EdgeKind::AsksYou,
+                    predicate: None,
+                    loop_limit: None,
+                });
+            }
+        })
+        .await;
+        resolve_feat(&store, &TestSource::claude(&store)).await
+    }
+
+    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
+    /// edges, one of them back, cannot run yet. `ready()` takes only the first open back edge and
+    /// the loop retires the source, so approve could never take every edge (plan Q-B). Forward
+    /// plus back, and back plus back, are both refused, naming the node.
+    #[tokio::test]
+    async fn a_node_with_a_back_asks_you_beside_another_asks_you_is_refused() {
+        for (node, edges) in [
+            ("plan", [("plan", "review"), ("plan", "prd")]),
+            ("review", [("review", "plan"), ("review", "prd")]),
+        ] {
+            let error = resolve_with_asks_you(&edges)
+                .await
+                .expect_err("a mixed `asks_you` node cannot run yet");
+            assert_eq!(
+                error,
+                ResolveError::NotYetRunnable {
+                    node: node.to_owned(),
+                    reason: NotRunnable::MixedAsksYou,
+                },
+                "{edges:?}"
+            );
+            let sentence = error.to_string();
+            assert!(sentence.contains(&format!("`{node}`")), "{sentence}");
+            assert!(sentence.contains("MOD-138 M3"), "{sentence}");
+        }
+    }
+
+    /// R1 (E1): the shapes the `asks_you` stop can answer still resolve: two forward `asks_you`
+    /// edges out of one node, and a single back one.
+    #[tokio::test]
+    async fn forward_asks_you_edges_or_a_single_back_one_resolve() {
+        for edges in [
+            &[("prd", "implement"), ("prd", "review")][..],
+            &[("review", "plan")][..],
+        ] {
+            let snapshot = resolve_with_asks_you(edges)
+                .await
+                .unwrap_or_else(|error| panic!("{edges:?} resolves: {error}"))
+                .snapshot;
+            let asks = snapshot
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::AsksYou)
+                .count();
+            assert_eq!(asks, edges.len(), "{:?}", snapshot.edges);
+        }
     }
 
     /// MOD-138 D9: a live graph the validator refuses (a forward cycle, planted under

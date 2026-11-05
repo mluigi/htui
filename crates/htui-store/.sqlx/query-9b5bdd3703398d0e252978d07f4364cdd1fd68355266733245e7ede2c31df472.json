@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, promoted_at, opening, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
+  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, promoted_at, opening, branch, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
@@ -258,6 +258,17 @@
       },
       {
         "ordinal": 23,
+        "name": "branch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "branch"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -298,8 +309,9 @@
       true,
       true,
       true,
+      true,
       false
     ]
   },
-  "hash": "1320f0b1c856fc3af5d0d034f4ca36014b21a40364e3335165003c3cf0334833"
+  "hash": "9b5bdd3703398d0e252978d07f4364cdd1fd68355266733245e7ede2c31df472"
 }

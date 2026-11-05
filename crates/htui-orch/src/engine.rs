@@ -33,14 +33,15 @@ use htui_agent::record::{
     drive,
 };
 use htui_core::model::{
-    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
-    Document, DocumentId, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo,
-    RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
-    StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
+    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, BranchFacts, Claim, CommandRunId,
+    CommandRunStatus, Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Isolation, Item,
+    ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId,
+    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
+    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
+    min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -82,14 +83,6 @@ use crate::status::{
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
-/// The phase whose output document carries ANA-2 §4.4's front-matter verdict (`:440`).
-///
-/// A name rather than a flag on the row, because that is what ANA-2 has: `:440` says "a
-/// `review`-phase output document", and all four seeded graphs that have one call it `review`
-/// (`crates/htui-core/src/seed.rs:88-160`). The `bug` graph's implement-shaped phase is `fix` and
-/// its review phase is still `review`, which is the case that shows the name is the rule.
-const REVIEW_PHASE: &str = "review";
-
 /// The `prompt_template.name` of the judge role (`crates/htui-core/src/prompt/template.rs:54`),
 /// read when the snapshot pinned no judge template (plan D53).
 const JUDGE_TEMPLATE: &str = "judge";
@@ -101,6 +94,17 @@ const HANDOFF_TEMPLATE: &str = "handoff";
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
 const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
+
+/// MOD-138 M2 D8, blueprint A3: whether a human's reject of `node` may decline its `asks_you`
+/// edges (`answer_gate(Skipped)`, the work lands) rather than failing the step. A reject's
+/// precedence is `changes_requested` (the loop), then `asks_you` (this decline), then `fails`
+/// (the loop), then the end of the run, so a node that also reads its verdict still loops. It
+/// declines only when the park is the `asks_you` stop of an `ok` settle
+/// (`gate::stopped_to_ask`), which `answer_guarded` reads next; a failed settle's park keeps the
+/// node's own gate (plan D8).
+fn declines_on_reject(snapshot: &GraphSnapshot, node: &str) -> bool {
+    gate::asks_you(snapshot, node) && !snapshot.reads_verdict(node)
+}
 
 /// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
 const JUDGE_FANOUT_INDEX: i32 = -1;
@@ -546,9 +550,9 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
     /// The snapshot was walked: a v2 run whose snapshot recomputes to its own `topology`
-    /// (MOD-138 D5), or a v1 run whose live graph still hashes to the lifted snapshot's v2
-    /// digest, or whose live graph M1 refuses (D6, D9) but whose live phases still hash to the
-    /// run's own v1 phase-only digest (blueprint A6). A v1 run whose live graph no longer
+    /// (MOD-138 D5), or a v1 run whose live phases, resolved or refused once built (blueprint
+    /// A6), still hash to the run's own v1 phase-only digest (MOD-138 M2 D11: a v1 run walks its
+    /// lift, which its phases alone decide). A v1 run whose live graph no longer
     /// resolves under a start-time rule (a fan-out or agent cap, a review or local fan-out, no
     /// candidate) was not compared at all: the item's `live graph not comparable` note says
     /// which rule refused it.
@@ -557,14 +561,12 @@ pub enum Resume {
     /// walks its snapshot, and §4.9's resume says a mismatch is a human's decision, not the
     /// engine's.
     TopologyChanged {
-        /// The lifted snapshot's v2 digest ([`graph::topology_v2`] over its phases and its
-        /// lifted edges), the graph this run walks. When M1 refuses the live graph (D6, D9) once
-        /// its phases are built, the run's v1 phase-only digest ([`graph::topology`]) instead
-        /// (blueprint A6).
+        /// The run's v1 phase-only digest ([`graph::topology`] over its phases as a pre-MOD-138
+        /// binary froze them), the graph this run walks (MOD-138 M2 D11, blueprint A6).
         snapshot: String,
-        /// The live graph's v2 digest; when M1 refuses the live graph once its phases are built,
-        /// the live phases' v1 digest (A6); when it refuses it before (D9's validator, with a
-        /// phase that then fails to build), `not runnable: <refusal>`.
+        /// The live phases' v1 digest, whether the live graph resolves or is refused once its
+        /// phases are built (D11, A6); when it is refused before (D9's validator, with a phase
+        /// that then fails to build), `not runnable: <refusal>`.
         live: String,
         /// Where the run is, unchanged.
         rest: Rest,
@@ -961,6 +963,19 @@ where
         phase: &SnapshotPhase,
         answer: GateAnswer,
     ) -> Result<Rest, EngineError> {
+        // MOD-138 M2 D8: the pre-answer read. A reject declines only the `asks_you` stop of an
+        // `ok` settle, whose stop note names this step; a failed settle parked at the node's own
+        // gate is rejected as ever. Read before the lease, so a store error leaves none behind.
+        // Boxed (the engine's stack rule).
+        let declines = match &answer {
+            GateAnswer::Rejected { .. } if declines_on_reject(snapshot, &phase.name) => {
+                let item = Self::item_of(run)?;
+                let notes = Box::pin(self.parts.store.notes(item)).await?;
+                gate::stopped_to_ask(&notes, step)
+            }
+            _ => false,
+        };
+
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
         let until = self.take_lease(run.id).await?;
@@ -969,6 +984,12 @@ where
         let (outcome, note, to) = match &answer {
             GateAnswer::Approved => (GateOutcome::Approved, None, StepStatus::Done),
             GateAnswer::Skipped => (GateOutcome::Skipped, None, StepStatus::Done),
+            // MOD-138 M2 D8 (plan Q-B), blueprint A3: a human's reject of a node's `asks_you`
+            // stop declines its edges: `skipped`, `done`, the note kept, and the work lands
+            // below as for any done step. A `changes_requested` edge still wins (the loop).
+            GateAnswer::Rejected { note } if declines => {
+                (GateOutcome::Skipped, Some(note.clone()), StepStatus::Done)
+            }
             GateAnswer::Rejected { note } => (
                 GateOutcome::Rejected,
                 Some(note.clone()),
@@ -1008,7 +1029,8 @@ where
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
         let tail = async {
-            if matches!(answer, GateAnswer::Rejected { .. }) {
+            // The mapped outcome, not the human's verb: a declined `asks_you` reject is `done`.
+            if outcome == GateOutcome::Rejected {
                 return self.after_rejection(run, snapshot, step, phase, now).await;
             }
             // `answer_gate` moved the step `awaiting_approval -> done`
@@ -1039,9 +1061,16 @@ where
         }
     }
 
-    /// [`Self::after_rejection`] up to the walk: `None` is the review loop's `Resumed`, and the
-    /// caller walks on. Plan D131 reaches it for a rejection a crash left unfinished, with the
-    /// step already `failed`.
+    /// [`Self::after_rejection`] up to the walk: `None` is the loop's `Resumed`, and the caller
+    /// walks on. Plan D131 reaches it for a rejection a crash left unfinished, with the step
+    /// already `failed`.
+    ///
+    /// MOD-138 M2 D7, blueprint A3: the node's edges decide, never its name. A
+    /// `changes_requested` edge loops over it (the review loop); else a `fails` edge loops over
+    /// it; else the run ends `rejected: <phase>` (ANA-2 `:577-578`, blueprint A-8). A human's
+    /// reject reaches here from an `asks_you` node only when it also reads its verdict or when
+    /// the park is a failed settle's at the node's own gate; the reject of any other `asks_you`
+    /// stop declines its edges instead (D8, `answer_guarded`).
     async fn rejection(
         &self,
         run: &Run,
@@ -1050,9 +1079,14 @@ where
         phase: &SnapshotPhase,
         now: DateTime<Utc>,
     ) -> Result<Option<Rest>, EngineError> {
-        let loopable =
-            phase.name == REVIEW_PHASE && gate::loop_target(snapshot, step.position).is_some();
-        if !loopable {
+        let edge = {
+            let graph = crate::walk::Graph::of(snapshot);
+            graph
+                .loop_edge(&phase.name, EdgeKind::ChangesRequested)
+                .or_else(|| graph.loop_edge(&phase.name, EdgeKind::Fails))
+                .cloned()
+        };
+        let Some(edge) = edge else {
             self.parts
                 .store
                 .finish_run(
@@ -1075,21 +1109,32 @@ where
                     phase: phase.name.clone(),
                 }),
             }));
-        }
+        };
+        Box::pin(self.loop_over(run.id, snapshot, step, &edge)).await
+    }
 
-        let run = self.run(run.id).await?;
+    /// MOD-138 M2 D7: one turn of `gate::edge_loop` over `edge` out of `step`, under a re-read
+    /// run, mapped as `gate::apply`'s landing maps it: `Resumed` is `None` and the caller walks on;
+    /// `Escalated` rests parked with `gate::loop_failure`; `NoTarget` rests `failed`, and since the
+    /// loop wrote that `finish_run` itself (`gate::edge_loop`'s `NoTarget` sites) the engine still
+    /// owes its cleanup (plan D36).
+    async fn loop_over(
+        &self,
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        edge: &SnapshotEdge,
+    ) -> Result<Option<Rest>, EngineError> {
+        let run = self.run(run).await?;
         let ctx = self.gate_context(&run, snapshot);
-        match gate::review_loop(&ctx, step).await? {
+        match gate::edge_loop(&ctx, step, edge).await? {
             LoopOutcome::Resumed { .. } => Ok(None),
             LoopOutcome::Escalated { attempts, .. } => Ok(Some(Rest {
                 run: RunStatus::AwaitingApproval,
                 position: Some(step.position),
-                failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
+                failure: Some(gate::loop_failure(edge, attempts)),
             })),
             LoopOutcome::NoTarget => {
-                // `review_loop` failed the run itself (`gate.rs`'s three `NoTarget` sites), so
-                // this is a terminal `finish_run` the engine did not write and still owes a
-                // cleanup for (plan D36).
                 self.cleanup_run(run.id).await?;
                 Ok(Some(Rest {
                     run: RunStatus::Failed,
@@ -1098,6 +1143,134 @@ where
                 }))
             }
         }
+    }
+
+    /// MOD-138 M2 D6 (plan Q-A), blueprint §2.2: the walk's `Decide` cursor. `winner` is `done`
+    /// and its node's `if` edges are undecided, so every one is evaluated now, once, and the
+    /// answer written to `run_step.branch` as `{"<to>": bool}` under the walk's lease. Every
+    /// later reader, a restarted process or an offline view, reads the row and never decides
+    /// again; `record_branch`'s `Ok(false)` (a replay, or the step moved) writes nothing and the
+    /// walk re-derives from the rows either way.
+    ///
+    /// The facts (D3): the winner's changed paths over its recorded ranges (the ranges `diff`
+    /// reads), by scope name, with the primary repo's name for a bare glob (blueprint F12); its
+    /// `verify_outcome`; the item's `key_prefix` and `required_tags`. The isolator is asked only
+    /// when some predicate needs paths (F13). A decision is never guessed: an isolator error
+    /// writes no `branch` and parks the run (`park_on_resume`: the note ``branch undecided:
+    /// `<node>`: changed paths unavailable: <err>``, run `running -> awaiting_approval`, the item
+    /// unwritten). `Decide` is a resumable park, so `Unblock` resumes the run and this runs again.
+    ///
+    /// A predicate outside the closed set, or an `if` edge with none, is a snapshot no resolve
+    /// wrote (W4 refuses both at save and at resolve), so it is [`EngineError::Snapshot`].
+    async fn decide(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        winner: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let phase = Self::phase_at(run.id, snapshot, winner.position)?;
+        let mut edges = Vec::new();
+        for edge in crate::walk::Graph::of(snapshot).if_edges(&phase.name) {
+            let refused = |reason: String| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "the `if` edge from `{}` to `{}` has no predicate of the closed set: {reason}",
+                    edge.from, edge.to
+                ),
+            };
+            let predicate = edge
+                .predicate
+                .as_ref()
+                .ok_or_else(|| refused("it has none".to_owned()))?;
+            let predicate =
+                IfPredicate::parse(&predicate.0).map_err(|err| refused(err.to_string()))?;
+            edges.push((edge.to.clone(), predicate));
+        }
+        let item = self.item(Self::item_of(run)?).await?;
+        let mut facts = BranchFacts {
+            verify: winner.verify_outcome,
+            item_prefix: item.key_prefix.clone(),
+            item_tags: item.required_tags.clone(),
+            ..BranchFacts::default()
+        };
+        if edges.iter().any(|(_, predicate)| predicate.needs_paths()) {
+            let repos = self.parts.store.repos(run.project_id).await?;
+            let trees = self.parts.store.step_trees(winner.id).await?;
+            let commits = self.parts.store.step_commits(winner.id).await?;
+            let changed = match self.parts.isolator.changed_paths(&trees, &commits).await {
+                Ok(changed) => changed,
+                Err(err) => {
+                    let body = format!(
+                        "branch undecided: `{}`: changed paths unavailable: {err}",
+                        phase.name
+                    );
+                    return Box::pin(self.park_on_resume(run.clone(), item.id, body))
+                        .await
+                        .map(Some);
+                }
+            };
+            // By scope name, as `Self::changed_paths` maps them: a path in a repo outside the
+            // run's scope is dropped.
+            let scoped = |id: &RepoId| {
+                repos
+                    .iter()
+                    .find(|repo| repo.id == *id && run.repo_scope.contains(id))
+            };
+            facts.paths = changed
+                .paths
+                .into_iter()
+                .filter_map(|(id, path)| scoped(&id).map(|repo| (repo.name.clone(), path)))
+                .collect();
+            facts.truncated = changed.truncated;
+            facts.primary = run
+                .repo_scope
+                .iter()
+                .filter_map(scoped)
+                .find(|repo| repo.is_primary)
+                .map(|repo| repo.name.clone());
+        }
+        let branch: serde_json::Map<String, Value> = edges
+            .iter()
+            .map(|(to, predicate)| (to.clone(), Value::Bool(predicate.evaluate(&facts))))
+            .collect();
+        self.parts
+            .store
+            .record_branch(
+                StepFence::Lease(self.parts.owner),
+                winner.id,
+                &Value::Object(branch),
+            )
+            .await?;
+        Ok(None)
+    }
+
+    /// MOD-138 M2 D7, blueprint §2.4: the walk's `Loop` cursor. `source` is `done` + `approved`
+    /// and its back `asks_you` edge to `to` has budget, so one turn of `gate::edge_loop` runs
+    /// over it ([`Self::loop_over`]): budget only (blueprint A5), then the region retired target
+    /// first and source last (A6), so a crash part-way through replays the retirement. An edge
+    /// the snapshot does not carry is a snapshot no walk wrote: [`EngineError::Snapshot`].
+    async fn loop_back(
+        &self,
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        source: &RunStep,
+        to: &str,
+    ) -> Result<Option<Rest>, EngineError> {
+        let phase = Self::phase_at(run, snapshot, source.position)?;
+        let edge = crate::walk::Graph::of(snapshot)
+            .back_asks_you(&phase.name)
+            .find(|edge| edge.to == to)
+            .cloned();
+        let Some(edge) = edge else {
+            return Err(EngineError::Snapshot {
+                run,
+                reason: format!(
+                    "cursor `loop` names no back `asks_you` edge from `{}` to `{to}`",
+                    phase.name
+                ),
+            });
+        };
+        Box::pin(self.loop_over(run, snapshot, source, &edge)).await
     }
 
     /// §6.2's `retry`: supersede the answered step (or leave the failed one) and admit the next
@@ -1616,7 +1789,8 @@ where
     /// nothing written) refuses the accept while the promoted step can still be accepted again,
     /// instead of letting the walk the accept continues `fail_hard` at its next live step.
     /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
-    /// the merge, and the walk from `position + 1`.
+    /// the merge, and the walk from `position + 1`. On a node with an `asks_you` edge the tail is
+    /// `AnswerGate(Skipped)`'s instead (MOD-138 M2 blueprint A2): the accept declines the edges.
     async fn accept_artifact(
         &self,
         run: RunId,
@@ -1737,8 +1911,15 @@ where
         // error) did not, so the lease this command took is released here rather than left to
         // its TTL. The release is owner-guarded, so a second one, or one of a lease another
         // process holds, answers `Ok(false)`. A lost lease is never ours to give back (plan D128).
+        // Blueprint A2 (plan Q-B over D8): on a node with an `asks_you` edge the accept declines
+        // it, as a reject does: `skipped`, and the accepted work lands all the same.
+        let answer = if gate::asks_you(&snapshot, &phase.name) {
+            GateAnswer::Skipped
+        } else {
+            GateAnswer::Approved
+        };
         match self
-            .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
+            .answer_guarded(&run, &snapshot, &row, &phase, answer)
             .await
         {
             Ok(rest) => Ok(CommandOutcome::Accepted { rest }),
@@ -2751,7 +2932,7 @@ where
                 let settled = recover::resettle(
                     output.as_ref(),
                     verify,
-                    phase.name == REVIEW_PHASE,
+                    snapshot.reads_verdict(&phase.name),
                     step.started_at.unwrap_or(now),
                     now,
                 );
@@ -2939,13 +3120,16 @@ where
     /// `running` for ever. What the step's own columns say decides, in this order:
     ///
     /// 1. `gate_outcome = rejected`: a human's (or a review's) rejection, which ends the run or
-    ///    runs the review loop exactly as `answer_gate` does ([`Self::rejection`]). Retrying a
+    ///    runs the node's loop exactly as `answer_gate` does ([`Self::rejection`]). Retrying a
     ///    step a human turned down would be the one wrong answer.
-    /// 2. `gate_note = interrupted, tree not reset`: D93's park, whatever the budget says; a tree
+    /// 2. MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge, failed by anything but an
+    ///    interruption, runs its `fails` loop: the crash fell between `gate::apply`'s
+    ///    `running -> failed` and its `edge_loop`.
+    /// 3. `gate_note = interrupted, tree not reset`: D93's park, whatever the budget says; a tree
     ///    the sweep left alone is never walked over.
-    /// 3. Budget left: `admit` the next attempt, as `retry_or_fail` and D92 both would have.
-    /// 4. `gate_note = interrupted`: D94's out-of-budget park.
-    /// 5. Otherwise `finish_run(failed)` and plan D36's cleanup.
+    /// 4. Budget left: `admit` the next attempt, as `retry_or_fail` and D92 both would have.
+    /// 5. `gate_note = interrupted`: D94's out-of-budget park.
+    /// 6. Otherwise `finish_run(failed)` and plan D36's cleanup.
     ///
     /// `Some(rest)` is where the run came to rest; `None` means the walk goes on.
     async fn settle_failed(
@@ -2960,6 +3144,17 @@ where
             return self.rejection(run, snapshot, step, &phase, now).await;
         }
         let note = step.gate_note.as_deref().unwrap_or_default();
+        // MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge loops over it, in place of its
+        // own `retry_limit`, on a failure of its own; an interrupted step (D92, D93) is a crash,
+        // not a failure, and keeps the retry below.
+        if !note.starts_with(INTERRUPTED) {
+            let fails = crate::walk::Graph::of(snapshot)
+                .loop_edge(&phase.name, EdgeKind::Fails)
+                .cloned();
+            if let Some(edge) = fails {
+                return Box::pin(self.loop_over(run.id, snapshot, step, &edge)).await;
+            }
+        }
         let not_reset = note == NOT_RESET;
         if !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
             return self.admit(run, snapshot, &phase, step.attempt + 1).await;
@@ -3121,6 +3316,26 @@ where
                         return Ok(rest);
                     }
                 }
+                // MOD-138 M2 D6, D7: writes the engine owes, which `ready` orders first (blueprint
+                // A6). No lifted graph yields either (the parity oracle in `walk.rs`). Both are
+                // boxed (D12): this frame sits under `settle_failed` and `walk_resumed_from`.
+                Cursor::Decide { step } => {
+                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
+                        continue;
+                    };
+                    if let Some(rest) = Box::pin(self.decide(&row, &snapshot, &step)).await? {
+                        return Ok(rest);
+                    }
+                }
+                Cursor::Loop { step, to } => {
+                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
+                        continue;
+                    };
+                    if let Some(rest) = Box::pin(self.loop_back(run, &snapshot, &step, &to)).await?
+                    {
+                        return Ok(rest);
+                    }
+                }
             }
         }
         Err(EngineError::Stalled {
@@ -3136,13 +3351,14 @@ where
     /// is recomputed from the snapshot's own phases and edges, and the live graph is never read;
     /// a recomputed digest that differs from the stored one is [`Resume::SnapshotTampered`].
     ///
-    /// A **v1** run re-resolves the item's **live** graph and compares its v2 digest with the
-    /// lifted snapshot's. On a mismatch the walk is not advanced and an `item_note` records both
-    /// digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the
-    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses (D6, D9)
-    /// once its phases are built is compared on the v1 phase-only digest (blueprint A6): equal
-    /// walks on, different is such a mismatch. One refused before any phase could be built is a
-    /// mismatch.
+    /// A **v1** run re-resolves the item's **live** graph and compares its phases on the v1
+    /// phase-only digest with the run's own (MOD-138 M2 D11, blueprint A6): a v1 run walks its
+    /// lift, which its phases alone decide, so the live graph's edges are not compared, whether
+    /// it resolves or is refused once its phases are built (D9's validator, a divide or palette
+    /// node). On a mismatch the walk is not advanced and an `item_note` records both digests;
+    /// invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the divergence
+    /// is a human's decision rather than the engine's. One refused before any phase could be built
+    /// is a mismatch.
     ///
     /// A v1 run's live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
@@ -3189,12 +3405,12 @@ where
     ///
     /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its digest is recomputed
     /// from its own phases and edges ([`graph::topology_v2`]) and the live graph is never read.
-    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare, edge-aware: the
-    /// live graph's v2 digest against the lifted snapshot's. Blueprint A6: a live graph M1
-    /// refuses as not yet runnable or invalid (D6, D9) is compared as before MOD-138, on the v1
-    /// phase-only digest of its live phases against the run's own ([`v1_topology`]), since a v1
-    /// run always walked by position: equal walks on, different parks with the topology note. A
-    /// refusal raised before any phase could be built has nothing to compare, and is a mismatch.
+    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare on phases alone
+    /// (MOD-138 M2 D11): the v1 phase-only digest of the live phases against the run's own
+    /// ([`v1_topology`]), whether the live graph resolves or is refused as not yet runnable or
+    /// invalid once its phases are built (blueprint A6), since a v1 run always walks the lift of
+    /// its phases: equal walks on, different parks with the topology note. A refusal raised
+    /// before any phase could be built has nothing to compare, and is a mismatch.
     async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
@@ -3218,7 +3434,8 @@ where
             }));
         }
 
-        // D5 v1: the live compare, edge-aware.
+        // D5 v1: the live compare, on phases alone (M2 D11). `lifted` names the snapshot this run
+        // walks in the `live graph not comparable` note.
         let lifted = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
         let (walks, live) = match Box::pin(graph::resolve_or_refused(
             self.parts.store,
@@ -3231,16 +3448,25 @@ where
         ))
         .await
         {
-            Ok(graph::Resolution::Resolved(live)) => (lifted.clone(), live.snapshot.topology),
-            // Blueprint A6: a live graph M1 refuses (D6, D9) is compared on the v1 phase-only
-            // digest, as before MOD-138; its edges never moved a v1 walk.
+            // MOD-138 M2 D11: a v1 run always walks its lift, which is derived from its phases,
+            // so it is compared on the v1 phase-only digest whether the live graph resolves or
+            // is refused once its phases are built (blueprint A6). For every graph M1 could
+            // resolve this is M1's answer: its edges were the default edges of its phases. With
+            // D6(c) lifted, an edge-aware compare would park runs M1 walked on.
+            Ok(graph::Resolution::Resolved(live)) => (
+                v1_topology(&snapshot.phases)?,
+                v1_topology(&live.snapshot.phases)?,
+            ),
             Ok(graph::Resolution::Refused { phases, .. }) => {
                 (v1_topology(&snapshot.phases)?, v1_topology(&phases)?)
             }
             // A6: refused before a phase could be built, so nothing compares; it did change.
             Err(
                 err @ (ResolveError::NotYetRunnable { .. } | ResolveError::InvalidGraph { .. }),
-            ) => (lifted.clone(), format!("not runnable: {err}")),
+            ) => (
+                v1_topology(&snapshot.phases)?,
+                format!("not runnable: {err}"),
+            ),
             Err(err @ ResolveError::ProjectCaps { .. }) => {
                 // A malformed cap would otherwise add an item note on every resume; the run keeps
                 // walking its snapshot, and the cause is logged instead.
@@ -3357,7 +3583,7 @@ where
                     ));
                 }
                 // MOD-37 R-31: the tail `answer_guarded` would have run, by plan D131's settle.
-                // Boxed: `settle_failed` holds `admit`'s and `review_loop`'s futures, and this
+                // Boxed: `settle_failed` holds `admit`'s and `edge_loop`'s futures, and this
                 // walk sits under `resume`, under `Unblock`.
                 if let Some(rejected) = crashed_rejection(&at, &steps) {
                     let row = self.run(run).await?;
@@ -3884,7 +4110,7 @@ where
             deadline_cut,
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
-            is_review: phase.name == REVIEW_PHASE,
+            reads_verdict: snapshot.reads_verdict(&phase.name),
         });
         self.parts
             .store
@@ -3926,7 +4152,7 @@ where
             }
             Landing::Rest(rest) => {
                 // `gate.rs` writes its own terminal `finish_run` — `retry_or_fail`'s exhausted
-                // budget and `review_loop`'s `NoTarget` — and holds no isolator, so the cleanup
+                // budget and `edge_loop`'s `NoTarget` — and holds no isolator, so the cleanup
                 // that owes it is here (plan D36). A park is not terminal and is not cleaned up.
                 if rest.run.is_terminal() {
                     self.cleanup_run(run.id).await?;
@@ -4254,6 +4480,7 @@ where
                 prompt: &prompt,
                 base: &base,
                 persona,
+                reads_verdict: snapshot.reads_verdict(&phase.name),
             })
         }))
         .await;
@@ -4543,6 +4770,7 @@ where
             prompt,
             base,
             persona,
+            reads_verdict,
         } = *stage;
         let item = Self::item_of(run)?;
 
@@ -4677,7 +4905,7 @@ where
             deadline_cut,
             output: output.as_ref(),
             verify_outcome: None,
-            is_review: phase.name == REVIEW_PHASE,
+            reads_verdict,
         });
         self.parts
             .store
@@ -6025,7 +6253,7 @@ where
             .store
             .resolve_inputs(item, run.id, &phase.input_kinds)
             .await?;
-        let required = required_inputs(phase, &snapshot.phases);
+        let required = crate::walk::required_inputs(phase, snapshot);
         let mut documents = Vec::with_capacity(resolved.len());
         let mut notes = Vec::new();
         for input in resolved {
@@ -6966,7 +7194,10 @@ where
             Cursor::Create { position, .. }
             | Cursor::Fan { position, .. }
             | Cursor::Select { position, .. } => Some(position),
-            Cursor::Run(step) | Cursor::Rest { step, .. } => steps
+            Cursor::Run(step)
+            | Cursor::Rest { step, .. }
+            | Cursor::Decide { step }
+            | Cursor::Loop { step, .. } => steps
                 .iter()
                 .find(|row| row.id == step)
                 .map(|row| row.position),
@@ -7190,6 +7421,10 @@ struct CandidateStage<'s> {
     base: &'s BTreeMap<RepoId, String>,
     /// MOD-26 D12: the phase's frozen persona.
     persona: Option<&'s SnapshotPersona>,
+    /// MOD-138 M2 D7: the node reads its verdict (`GraphSnapshot::reads_verdict`). Resolve
+    /// refuses a verdict-reading node that fans out (D10), so this is `false` on every snapshot
+    /// a resolve wrote; it is carried rather than assumed so settle reads one rule everywhere.
+    reads_verdict: bool,
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).
@@ -7486,32 +7721,6 @@ struct VerifyStage<'a> {
     /// MOD-37 M4 D1: the step deadline cut the session; the verify gets `Some(ZERO)` at once,
     /// whatever the engine clock says.
     deadline_cut: bool,
-}
-
-/// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
-///
-/// A kind is required unless a **later** position of the same snapshot produces it. The seeded
-/// `implement` phase lists `review` in `input_kinds` (`crates/htui-core/src/seed.rs:87-90`) —
-/// ANA-2 §4.1's own seed amendment, so the review loop can feed a review back — while §4.2 makes a
-/// missing input a hard failure before a token is spent (`:412-414`). On attempt 1 no review
-/// exists, so a literal reading fails validation criterion 1 at position 2, and the seed and the
-/// contract cannot both be right as written.
-///
-/// This is the one reading under which both hold: a forward input is still mandatory, and the
-/// loop's back-edge is absent exactly when it has not run yet. Its absence is recorded in the trim
-/// record's notes rather than being silent.
-#[must_use]
-pub fn required_inputs(phase: &SnapshotPhase, phases: &[SnapshotPhase]) -> Vec<String> {
-    phase
-        .input_kinds
-        .iter()
-        .filter(|kind| {
-            !phases
-                .iter()
-                .any(|later| later.position > phase.position && later.output_kind == **kind)
-        })
-        .cloned()
-        .collect()
 }
 
 /// MOD-12 M2 D6: what one session may spend, and the batch when the batch's remainder was the
@@ -7877,13 +8086,12 @@ mod tests {
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 
-    use super::{
-        AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
-    };
+    use super::{AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey};
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::{Clock as _, IsolateError};
     use crate::status::RunFailure;
+    use crate::walk::required_inputs;
 
     /// MOD-26 I-4's refusal as milestone 1 persisted it in `RunFailure::PromptRefused.reason`,
     /// written out literally so the stored reason's bytes are pinned independently of
@@ -8069,7 +8277,7 @@ mod tests {
             .expect("the seeded `feature` graph has one");
         assert_eq!(implement.input_kinds, ["plan", "review"]);
         assert_eq!(
-            required_inputs(implement, &snapshot.phases),
+            required_inputs(implement, &snapshot),
             ["plan"],
             "`review` is the loop's back edge and cannot exist on attempt 1 (plan D21)"
         );
@@ -8080,7 +8288,7 @@ mod tests {
             .find(|phase| phase.name == "review")
             .expect("the seeded `feature` graph has one");
         assert_eq!(
-            required_inputs(review, &snapshot.phases),
+            required_inputs(review, &snapshot),
             ["implement"],
             "nothing later produces `implement`, so it is required"
         );
@@ -11020,6 +11228,7 @@ mod tests {
                 prompt: &prompt,
                 base: &BTreeMap::new(),
                 persona: None,
+                reads_verdict: false,
             })
             .await
             .expect_err("the candidate's compare-and-set found the row moved");
@@ -11818,6 +12027,118 @@ mod tests {
                 2,
                 "no attempt was admitted"
             );
+        }
+    }
+
+    /// A `fails` edge `from → to` with `loop_limit = 1` on `FEAT-3`'s live graph, beside the
+    /// `next` edges it has; the run started after it freezes it into its snapshot.
+    async fn add_fails_edge(harness: &Harness, from: &str, to: &str) {
+        let store = &harness.orch.store;
+        let graph = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3 resolves")
+            .graph
+            .id;
+        let mut body = store
+            .graph_body(graph)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3's graph is there");
+        let id_of = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .unwrap_or_else(|| panic!("the graph has a `{name}` phase"))
+        };
+        let edge = htui_core::model::StepGraphEdge {
+            id: htui_core::model::EdgeId::new(),
+            graph_id: body.graph.id,
+            from: id_of(from),
+            to: id_of(to),
+            kind: htui_core::model::EdgeKind::Fails,
+            predicate: None,
+            loop_limit: Some(1),
+        };
+        body.edges.push(edge);
+        let revision = body.graph.revision;
+        let outcome = store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect("the store takes a `fails` edge");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// MOD-138 M2 D7 (blueprint F8): `settle_failed` runs a node's `fails` loop only for a failure
+    /// of the node's own. A step the sweep failed `interrupted` (D92) or `interrupted, tree not
+    /// reset` (D93) was a crash, so a `fails` edge out of `plan` changes nothing: the sweep admits
+    /// attempt 2 on `plan`'s own budget, or completes the park, and retires no row of the loop's
+    /// region. The `Settle` row is the control: the same edge loops a failure of `plan`'s own,
+    /// so the edge is live in the snapshot and the other rows are not vacuous.
+    #[tokio::test]
+    async fn an_interrupted_failure_on_a_fails_node_does_not_loop() {
+        for (attempt, by) in [
+            (1, FailedBy::Sweep("interrupted")),
+            (2, FailedBy::Sweep("interrupted")),
+            (1, FailedBy::Sweep("interrupted, tree not reset")),
+            (1, FailedBy::Settle),
+        ] {
+            let harness = Harness::new().await;
+            add_fails_edge(&harness, "plan", "prd").await;
+            let (run, _) = failed_under_a_running_run(&harness, attempt, by).await;
+            let other = Harness {
+                orch: harness.orch.restarted(),
+            };
+
+            let adopted = super::sweep_fake(&other.orch)
+                .await
+                .expect("the adoption itself succeeds");
+            assert_eq!(adopted.len(), 1, "{adopted:?}");
+            assert_eq!(adopted[0].run, run);
+            let steps = other.orch.steps(run).await;
+            let status_at = |position: i32, attempt: i32| {
+                steps
+                    .iter()
+                    .find(|step| step.position == position && step.attempt == attempt)
+                    .map(|step| step.status)
+            };
+            let FailedBy::Sweep(note) = by else {
+                assert_eq!(
+                    (status_at(0, 1), status_at(1, 1)),
+                    (Some(StepStatus::Superseded), Some(StepStatus::Cancelled)),
+                    "the control: a failure of `plan`'s own runs `plan → prd` and retires its \
+                     region: {steps:?}"
+                );
+                continue;
+            };
+            let next = if attempt == 1 && note == "interrupted" {
+                super::Next::Walk
+            } else {
+                super::Next::Parked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    failure: Some(RunFailure::Interrupted {
+                        phase: "plan".to_owned(),
+                        reset: note == "interrupted",
+                    }),
+                })
+            };
+            assert_eq!(adopted[0].next, next, "`{note}`, attempt {attempt}");
+            assert_eq!(
+                (status_at(0, 1), status_at(1, attempt), status_at(0, 2)),
+                (Some(StepStatus::Done), Some(StepStatus::Failed), None),
+                "`{note}`, attempt {attempt}: an interruption retires nothing in the loop's \
+                 region and admits no attempt of its target: {steps:?}"
+            );
+            if next == super::Next::Walk {
+                assert_eq!(
+                    status_at(1, 2),
+                    Some(StepStatus::Pending),
+                    "`plan`'s own retry was admitted: {steps:?}"
+                );
+            }
         }
     }
 
@@ -13127,9 +13448,9 @@ mod tests {
         );
     }
 
-    /// MOD-138 D4, D5 (plan risk row 1): an unedited v1 run's lifted snapshot hashes to the live
-    /// graph's v2 digest, so it resumes `Walked`, is driven through its next gate, and resumes
-    /// `Walked` again, with no topology note anywhere.
+    /// MOD-138 D4, D5 (plan risk row 1), M2 D11: an unedited v1 run's phase-only (v1) digest
+    /// equals the live graph's v1 digest, so it resumes `Walked`, is driven through its next gate,
+    /// and resumes `Walked` again, with no topology note anywhere.
     #[tokio::test]
     async fn a_v1_run_on_an_unchanged_graph_walks() {
         let harness = Harness::new().await;

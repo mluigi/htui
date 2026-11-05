@@ -24,7 +24,7 @@ expression: bench.render(&overlay)
           │  QX-13  entry 13  not ready: item is ● done                                  │
           │  QX-14  entry 14  hard gate parked                                           │
           │  QX-15  entry 15  judge undecided (last note: pick a branch)                 │
-          │  QX-16  entry 16  review loop exhausted                                      │
+          │  QX-16  entry 16  loop exhausted                                             │
           │  QX-17  entry 17  blocked (last note: pick a branch)                         │
           │  QX-18  entry 18  failed: exit 1                                             │
           │  QX-19  entry 19  missing tags: gpu                                          │

@@ -308,7 +308,7 @@ fn run_of(row: &SqliteRow) -> Result<Run> {
 const RUN_STEP_SELECT: &str = "id, run_id, position, attempt, fanout_index, phase_name, agent_id, \
      model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, \
      usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
-     promoted_at, updated_at";
+     promoted_at, branch, updated_at";
 
 /// One `run_step` row, every column of [`RUN_STEP_SELECT`].
 fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
@@ -341,6 +341,7 @@ fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
         verify_outcome: get::<Option<VerifyOutcome>>(row, "verify_outcome")?,
         verify_exit_code: get(row, "verify_exit_code")?,
         promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
+        branch: opt_json_col("run_step.branch", opt_text(row, "branch")?.as_deref())?,
         updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
     })
 }

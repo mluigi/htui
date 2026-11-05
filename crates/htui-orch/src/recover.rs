@@ -322,12 +322,13 @@ pub fn verify_of(
 ///
 /// The deadline is dropped because the sweep's clock is not the step's, and the cap because the
 /// recorder's breach is not durable (plan R-13); `now` is therefore inert. `verify` is
-/// [`verify_of`]'s, and `is_review` is `SnapshotPhase::name == "review"`, as stage 5 passes it.
+/// [`verify_of`]'s, and `reads_verdict` is `GraphSnapshot::reads_verdict` of the step's node (an
+/// outgoing `changes_requested` edge, MOD-138 M2 D7), as stage 5 passes it.
 #[must_use]
 pub fn resettle(
     output: Option<&Document>,
     verify: Option<VerifyOutcome>,
-    is_review: bool,
+    reads_verdict: bool,
     started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Settle {
@@ -344,7 +345,7 @@ pub fn resettle(
         deadline_cut: false,
         output,
         verify_outcome: verify,
-        is_review,
+        reads_verdict,
     })
 }
 
@@ -864,6 +865,7 @@ mod tests {
             verify_outcome: None,
             verify_exit_code: None,
             promoted_at: None,
+            branch: None,
             updated_at: at(0),
         }
     }
@@ -1439,7 +1441,7 @@ mod tests {
             done(0, 1),
             done(1, 1),
             step(2, 1, 0, StepStatus::Superseded),
-            // The rejected review of attempt 1, retired by `review_loop`.
+            // The rejected review of attempt 1, retired by `edge_loop`.
             step(3, 1, 0, StepStatus::Cancelled),
             done(2, 2),
         ];
