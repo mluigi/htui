@@ -575,13 +575,16 @@ pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
 ///    [`stopped_to_ask`] reads: a human's reject declines only this stop, never the park of a
 ///    failed settle at the node's own gate (plan D8).
 /// 3. The park ([`park`]), whatever `gate_effective` says.
-/// 4. When the node has back `asks_you` edges whose targets ran and none of them has budget left
+/// 4. When the node's back `asks_you` edge has a target that ran and no budget left
 ///    ([`crate::walk::loop_budget_left`]), the stop is also the loop's escalation (D7): the
-///    [`loop_failure`] note of the first of them and the failure on the rest. A back edge whose
-///    target has no row (a decision skipped it, or it never ran) is set aside (blueprint A4, T5
-///    repair 2): no `Loop` is owed over it and it never escalates. The item is **not**
-///    blocked (blueprint A9): the stop is already the checkpoint a human answers, and approve
-///    then walks on, since no `Loop` is owed.
+///    [`loop_failure`] note and failure. A back edge whose target has no row (a decision skipped
+///    it, or it never ran) is set aside (blueprint A4, T5 repair 2): no `Loop` is owed over it
+///    and it never escalates. The item is **not** blocked (blueprint A9): the stop is already
+///    the checkpoint a human answers, and approve then walks on, since no `Loop` is owed.
+///
+/// Resolve refuses a back `asks_you` edge beside another `asks_you` edge (R1, E1:
+/// `NotRunnable::MixedAsksYou`), so the node has forward `asks_you` edges only, or exactly one
+/// back one; only the first back edge is read.
 async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
@@ -592,26 +595,31 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     note_step(ctx, step, note, now).await?;
     let graph = crate::walk::Graph::of(ctx.snapshot);
     let forward: Vec<&SnapshotEdge> = graph.forward_asks_you(&phase.name).collect();
-    let back: Vec<&SnapshotEdge> = graph.back_asks_you(&phase.name).collect();
-    let steps = if back.is_empty() {
-        Vec::new()
-    } else {
-        ctx.store.run_steps(ctx.run.id).await?
+    // R1 (E1): resolve refuses a back `asks_you` edge beside another `asks_you` edge, so a node
+    // that stops here has forward edges only, or exactly this one back edge.
+    let back_edge = graph.back_asks_you(&phase.name).next();
+    let steps = match back_edge {
+        Some(_) => ctx.store.run_steps(ctx.run.id).await?,
+        None => Vec::new(),
     };
-    // Blueprint A4: a back edge whose target has no row (a decision skipped it, or it never ran)
-    // is neither open nor spent: the walk owes no `Loop` over it, `edge_loop` reads it as
-    // `NoTarget`, and it is never the loop's escalation.
-    let (ran, never_ran): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) =
-        back.iter().partition(|edge| {
-            ctx.snapshot
-                .phases
-                .iter()
-                .find(|phase| phase.name == edge.to)
-                .is_some_and(|target| latest_at(&steps, target.position).is_some())
-        });
-    let (open, spent): (Vec<&SnapshotEdge>, Vec<&SnapshotEdge>) = ran
-        .iter()
-        .partition(|edge| crate::walk::loop_budget_left(ctx.snapshot, &steps, edge));
+    let back = back_edge.map(|edge| {
+        let ran = ctx
+            .snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == edge.to)
+            .is_some_and(|target| latest_at(&steps, target.position).is_some());
+        // Blueprint A4: a back edge whose target has no row (a decision skipped it, or it never
+        // ran) is neither open nor spent: the walk owes no `Loop` over it, `edge_loop` reads it
+        // as `NoTarget`, and it is never the loop's escalation.
+        if !ran {
+            BackAsksYou::NeverRan(edge)
+        } else if crate::walk::loop_budget_left(ctx.snapshot, &steps, edge) {
+            BackAsksYou::Open(edge)
+        } else {
+            BackAsksYou::Spent(edge)
+        }
+    });
     // Blueprint A3: a node that reads its verdict loops a reject over `changes_requested`.
     let changes = graph
         .loop_edge(&phase.name, EdgeKind::ChangesRequested)
@@ -621,7 +629,7 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .add_note(NewNote {
                 id: NoteId::new(),
                 item_id: item,
-                body: stop_note(step, &forward, &open, &spent, &never_ran, changes),
+                body: stop_note(step, &forward, back, changes),
                 created_by: ctx.user,
                 box_id: Some(ctx.box_id),
                 via_step_id: Some(step.id),
@@ -630,7 +638,7 @@ async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             .await?;
     }
     let landing = park(ctx, step, phase).await?;
-    let Some(&edge) = spent.first().filter(|_| open.is_empty()) else {
+    let Some(BackAsksYou::Spent(edge)) = back else {
         return Ok(landing);
     };
     let target = ctx
@@ -669,65 +677,63 @@ fn stop_head(step: &RunStep) -> String {
     )
 }
 
+/// The one back `asks_you` edge of a node that stops to ask (R1, E1), by what approve does over
+/// it.
+#[derive(Debug, Clone, Copy)]
+enum BackAsksYou<'e> {
+    /// Its target ran and has budget left: approve loops back to it.
+    Open(&'e SnapshotEdge),
+    /// Its target ran and its budget is spent: no target; the stop is the escalation (D7, A9).
+    Spent(&'e SnapshotEdge),
+    /// Its target has no row (a decision skipped it, or it never ran): no target, no escalation
+    /// (blueprint A4).
+    NeverRan(&'e SnapshotEdge),
+}
+
 /// Blueprint §3.4's stop note: ``step `{name}` attempt {attempt} waits on you: approve takes
 /// {targets}; reject or accept artifact declines {it|them}, and the step's work lands either way;
-/// retry redoes the step``, the forward targets first, then the back ones with budget left marked
-/// `(loops back)`.
+/// retry redoes the step``. The targets are the forward ones, or the one back edge with budget
+/// left marked `(loops back)`: resolve refuses a back `asks_you` edge beside another (R1, E1).
 ///
-/// Two shapes say something else, because approve or reject does something else there:
-/// - a back edge whose budget is spent is no target (approve walks on, D7, blueprint A9): with
-///   no target left approve ``walks on``, and the spent ones follow as ``(the loop back to
-///   `plan` is spent)``;
-/// - a back edge whose target has no row is no target either: ``(`plan` never ran, so there is
-///   no loop back to it)`` follows, after any spent ones;
+/// Three shapes say something else, because approve or reject does something else there:
+/// - a back edge whose budget is spent is no target (approve walks on, D7, blueprint A9):
+///   ``approve walks on (the loop back to `plan` is spent)``;
+/// - a back edge whose target has no row is no target either: ``approve walks on (`plan` never
+///   ran, so there is no loop back to it)``;
 /// - on a node that reads its verdict (`changes` names its `changes_requested` target, blueprint
 ///   A3) a reject loops and never declines: ``accept artifact declines {it|them}, and the step's
 ///   work lands; reject loops back to `{changes}`; retry redoes the step``.
 fn stop_note(
     step: &RunStep,
     forward: &[&SnapshotEdge],
-    open: &[&SnapshotEdge],
-    spent: &[&SnapshotEdge],
-    never_ran: &[&SnapshotEdge],
+    back: Option<BackAsksYou<'_>>,
     changes: Option<&str>,
 ) -> String {
-    let targets: Vec<String> = forward
+    let mut targets: Vec<String> = forward
         .iter()
         .map(|edge| format!("`{}`", edge.to))
-        .chain(
-            open.iter()
-                .map(|edge| format!("`{}` (loops back)", edge.to)),
-        )
         .collect();
+    if let Some(BackAsksYou::Open(edge)) = back {
+        targets.push(format!("`{}` (loops back)", edge.to));
+    }
     let mut approve = if targets.is_empty() {
         "approve walks on".to_owned()
     } else {
         format!("approve takes {}", targets.join(", "))
     };
-    if !spent.is_empty() {
-        let names: Vec<String> = spent.iter().map(|edge| format!("`{}`", edge.to)).collect();
-        let (loops, are) = if names.len() == 1 {
-            ("loop", "is")
-        } else {
-            ("loops", "are")
-        };
-        approve.push_str(&format!(
-            " (the {loops} back to {} {are} spent)",
-            names.join(", ")
-        ));
+    match back {
+        Some(BackAsksYou::Spent(edge)) => {
+            approve.push_str(&format!(" (the loop back to `{}` is spent)", edge.to));
+        }
+        Some(BackAsksYou::NeverRan(edge)) => {
+            approve.push_str(&format!(
+                " (`{}` never ran, so there is no loop back to it)",
+                edge.to
+            ));
+        }
+        Some(BackAsksYou::Open(_)) | None => {}
     }
-    if !never_ran.is_empty() {
-        let names: Vec<String> = never_ran
-            .iter()
-            .map(|edge| format!("`{}`", edge.to))
-            .collect();
-        let it = if names.len() == 1 { "it" } else { "them" };
-        approve.push_str(&format!(
-            " ({} never ran, so there is no loop back to {it})",
-            names.join(", ")
-        ));
-    }
-    let edges = forward.len() + open.len() + spent.len() + never_ran.len();
+    let edges = forward.len() + usize::from(back.is_some());
     let them = if edges == 1 { "it" } else { "them" };
     let answers = match changes {
         Some(to) => format!(
@@ -2311,23 +2317,24 @@ mod tests {
         );
     }
 
-    /// The same shape beside a spent back edge: only the spent one escalates, and the stop note
-    /// names each for what it is.
+    /// R1 (E1): with two forward `asks_you` edges and no back one (resolve refuses a back edge
+    /// beside another `asks_you` edge), the stop note names both targets and says reject
+    /// declines them; nothing escalates.
     #[tokio::test]
-    async fn a_spent_back_asks_you_beside_one_that_never_ran_still_escalates() {
+    async fn two_forward_asks_you_targets_are_both_named_in_the_stop_note() {
         use crate::command::Rest;
         use htui_core::model::{EdgeKind, Gate, RunStatus};
         let store = MemStore::demo();
         let extra = [
-            loop_edge("review", "prd", EdgeKind::AsksYou, Some(3)),
-            loop_edge("review", "plan", EdgeKind::AsksYou, Some(1)),
+            loop_edge("prd", "implement", EdgeKind::AsksYou, None),
+            loop_edge("prd", "review", EdgeKind::AsksYou, None),
         ];
         let (run, snapshot) = run_4_with(&store, feat_edges(None, &extra)).await;
         let mut phase = snapshot
             .phases
             .iter()
-            .find(|phase| phase.name == "review")
-            .expect("the FEAT graph has a `review` phase")
+            .find(|phase| phase.name == "prd")
+            .expect("the FEAT graph has a `prd` phase")
             .clone();
         phase.gate_effective = Gate::Never;
         let ctx = GateContext {
@@ -2339,46 +2346,25 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
         };
-        step_of(
-            &store,
-            ids::RUN_4,
-            (1, 2, 0),
-            "plan",
-            &[StepStatus::Running, StepStatus::Done],
-        )
-        .await;
-        let review = step_of(
-            &store,
-            ids::RUN_4,
-            (3, 2, 0),
-            "review",
-            &[StepStatus::Running],
-        )
-        .await;
+        let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
-        let landing = super::apply(&ctx, &review, &phase, Settle::Ok { note: None })
+        let landing = super::apply(&ctx, &prd, &phase, Settle::Ok { note: None })
             .await
-            .expect("the park and the notes are written");
+            .expect("the park and the note are written");
         assert_eq!(
             landing,
             super::Landing::Rest(Rest {
                 run: RunStatus::AwaitingApproval,
-                position: Some(3),
-                failure: Some(RunFailure::LoopExhausted {
-                    kind: EdgeKind::AsksYou,
-                    from: "review".to_owned(),
-                    to: "plan".to_owned(),
-                    attempts: 2,
-                }),
+                position: Some(0),
+                failure: None,
             })
         );
         let notes = notes_of_run_4(&store, &run).await;
         assert!(
             notes.iter().any(|body| body
-                == "step `review` attempt 2 waits on you: approve walks on (the loop back to \
-                    `plan` is spent) (`prd` never ran, so there is no loop back to it); reject \
-                    or accept artifact declines them, and the step's work lands either way; \
-                    retry redoes the step"),
+                == "step `prd` attempt 1 waits on you: approve takes `implement`, `review`; \
+                    reject or accept artifact declines them, and the step's work lands either \
+                    way; retry redoes the step"),
             "{notes:?}"
         );
     }

@@ -29,8 +29,8 @@ use htui_core::model::{
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
-    check_attachment, edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
-    graph_body_walk_refusal, references_no_row, walk_refusal,
+    check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
+    graph_body_topology_refusal, graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
 
@@ -277,8 +277,9 @@ pub enum ResolveError {
     /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, or the fanned-out node with
-        /// an `asks_you` or `fails` edge (blueprint A7).
+        /// The node refused: the divide phase, the palette phase, the fanned-out node with an
+        /// `asks_you` or `fails` edge (blueprint A7), or the node with a back `asks_you` edge
+        /// beside another `asks_you` edge (R1, E1).
         node: String,
         /// Why.
         reason: NotRunnable,
@@ -303,6 +304,15 @@ pub enum NotRunnable {
     /// lifted D6(c): authored edges otherwise resolve.)
     #[error("a fanned-out node's `asks_you` or `fails` edge runs from MOD-138 M3")]
     FanOutEdge,
+    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
+    /// edges, at least one of them back (forward plus back, or back plus back). `ready()` takes
+    /// only the first back edge with budget and the loop retires the source, so a forward target
+    /// would never start while the loop has budget and approve could not take every edge (plan
+    /// Q-B). M3 (or MOD-141) lifts it.
+    #[error(
+        "a node with a back `asks_you` edge beside another `asks_you` edge runs from MOD-138 M3"
+    )]
+    MixedAsksYou,
 }
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the **typed** phase slice (plan D9).
@@ -537,6 +547,13 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         }
         Err(err) => return Err(err),
     }
+    // R1 (E1): a back `asks_you` edge beside another `asks_you` edge cannot run yet.
+    if let Err(refusal) = mixed_asks_you_refusal(&phases, &edges) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal,
+        });
+    }
     if let Err(refusal) = not_yet_runnable(&phases) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
@@ -695,6 +712,60 @@ fn fan_out_edge_refusal(
             return Err(ResolveError::NotYetRunnable {
                 node: phase.name.clone(),
                 reason: NotRunnable::FanOutEdge,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// R1 (E1, maintainer decision 2026-11-05), run after [`fan_out_edge_refusal`]: the first walked
+/// node in position order with two or more outgoing `asks_you` edges, at least one of them back,
+/// is [`NotRunnable::MixedAsksYou`]. Forward and back are [`forward_mask`]'s classification, the
+/// walker's own; an edge with a palette end or an unknown key is left out, as the walk leaves it
+/// out. `ready()` takes only the first back edge with budget and the loop retires the source, so
+/// on that shape approve could not take every edge (plan Q-B) until M3 (or MOD-141) runs it.
+fn mixed_asks_you_refusal(
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> std::result::Result<(), ResolveError> {
+    let nodes: Vec<WalkNode<'_>> = phases
+        .iter()
+        .map(|phase| WalkNode {
+            name: &phase.name,
+            palette: phase.palette,
+        })
+        .collect();
+    let index = |key: &str| {
+        phases
+            .iter()
+            .position(|phase| phase.name == key && !phase.palette)
+    };
+    let walk: Vec<WalkEdge> = edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: index(&edge.from)?,
+                to: index(&edge.to)?,
+                kind: edge.kind,
+            })
+        })
+        .collect();
+    let mask = forward_mask(&nodes, &walk);
+    let mut walked: Vec<usize> = (0..phases.len())
+        .filter(|&node| !phases[node].palette)
+        .collect();
+    walked.sort_by_key(|&node| (phases[node].position, node));
+    for node in walked {
+        let asks: Vec<bool> = walk
+            .iter()
+            .zip(&mask)
+            .filter(|(edge, _)| edge.from == node && edge.kind == EdgeKind::AsksYou)
+            .map(|(_, &forward)| forward)
+            .collect();
+        if asks.len() >= 2 && asks.contains(&false) {
+            return Err(ResolveError::NotYetRunnable {
+                node: phases[node].name.clone(),
+                reason: NotRunnable::MixedAsksYou,
             });
         }
     }
@@ -5120,6 +5191,86 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 "{kind}"
             );
             assert!(error.to_string().contains("MOD-138 M3"), "{error}");
+        }
+    }
+
+    /// The feature graph with `asks_you` edges `(from, to)` added (no `loop_limit`), resolved
+    /// for FEAT-1.
+    async fn resolve_with_asks_you(
+        edges: &[(&str, &str)],
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let id = |name: &str| {
+                body.nodes
+                    .iter()
+                    .find(|node| node.phase.name == name)
+                    .map(|node| node.phase.id)
+                    .expect("the feature graph has the phase")
+            };
+            let ends: Vec<(PhaseId, PhaseId)> =
+                edges.iter().map(|(from, to)| (id(from), id(to))).collect();
+            for (from, to) in ends {
+                body.edges.push(StepGraphEdge {
+                    id: EdgeId::new(),
+                    graph_id: ids::GRAPH_HTUI_FEAT,
+                    from,
+                    to,
+                    kind: EdgeKind::AsksYou,
+                    predicate: None,
+                    loop_limit: None,
+                });
+            }
+        })
+        .await;
+        resolve_feat(&store, &TestSource::claude(&store)).await
+    }
+
+    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
+    /// edges, one of them back, cannot run yet. `ready()` takes only the first open back edge and
+    /// the loop retires the source, so approve could never take every edge (plan Q-B). Forward
+    /// plus back, and back plus back, are both refused, naming the node.
+    #[tokio::test]
+    async fn a_node_with_a_back_asks_you_beside_another_asks_you_is_refused() {
+        for (node, edges) in [
+            ("plan", [("plan", "review"), ("plan", "prd")]),
+            ("review", [("review", "plan"), ("review", "prd")]),
+        ] {
+            let error = resolve_with_asks_you(&edges)
+                .await
+                .expect_err("a mixed `asks_you` node cannot run yet");
+            assert_eq!(
+                error,
+                ResolveError::NotYetRunnable {
+                    node: node.to_owned(),
+                    reason: NotRunnable::MixedAsksYou,
+                },
+                "{edges:?}"
+            );
+            let sentence = error.to_string();
+            assert!(sentence.contains(&format!("`{node}`")), "{sentence}");
+            assert!(sentence.contains("MOD-138 M3"), "{sentence}");
+        }
+    }
+
+    /// R1 (E1): the shapes the `asks_you` stop can answer still resolve: two forward `asks_you`
+    /// edges out of one node, and a single back one.
+    #[tokio::test]
+    async fn forward_asks_you_edges_or_a_single_back_one_resolve() {
+        for edges in [
+            &[("prd", "implement"), ("prd", "review")][..],
+            &[("review", "plan")][..],
+        ] {
+            let snapshot = resolve_with_asks_you(edges)
+                .await
+                .unwrap_or_else(|error| panic!("{edges:?} resolves: {error}"))
+                .snapshot;
+            let asks = snapshot
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::AsksYou)
+                .count();
+            assert_eq!(asks, edges.len(), "{:?}", snapshot.edges);
         }
     }
 
