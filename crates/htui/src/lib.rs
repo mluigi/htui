@@ -74,9 +74,7 @@ use crate::ui::state_file::UiStore;
 /// Runs the whole application, terminal included.
 ///
 /// Startup order (blueprint D.4), and it matters: logging (always captured in memory for the Logs
-/// tab, MOD-122, with the saved settings of `ui-state.toml`'s `[logging]` applied at once, so a
-/// saved log file holds every later line, the verbs' below included), then the two keyring flags —
-/// which exit
+/// tab, MOD-122), then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the four Qdrant flags (MOD-158 D8: the URL setting and this box's API key),
 /// which act the same way, then the two concepts-index flags (MOD-34), which also print to the
@@ -86,8 +84,10 @@ use crate::ui::state_file::UiStore;
 /// and exits. `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print
 /// one answer and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the
 /// keyring flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes
-/// right after the state verbs: it writes only its plugin directory, prints and exits. With
-/// `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
+/// right after the state verbs: it writes only its plugin directory, prints and exits. The saved
+/// logging settings (MOD-122 D5) apply after `--print-keys`, before the backend, so they are the
+/// TUI's alone and see its every line. With `--dsn-stdin`, the session's DSN is read from stdin
+/// before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
 /// back an offline backend, and the connection runs on its own task (ANA-9 §4.4). A missing DSN, an
@@ -118,19 +118,6 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     // time, and Sentry only on a startup `--log`, exactly as before. After the `mcp`/`worker`
     // returns, which install their own (or none), and before anything that logs.
     let logging = logging::init(logging::Startup::from_env(args.log.as_deref()))?;
-    // MOD-122 D5: the UI state from `ui-state.toml` in the config root, read right after the
-    // subscriber, so the saved logging settings apply before anything else logs (R1): the saved
-    // file and filter see the backend start, the MCP host and the store worker too. `--log`/
-    // `HTUI_LOG` and `HTUI_LOG_FILTER` keep theirs for this session; one that cannot apply is a
-    // notice. A file that cannot be used starts from the defaults and says why in the header
-    // (MOD-115 M2 D1). No config directory: every launch is the first and nothing is saved.
-    let ui_store = identity::config_root_path()
-        .ok()
-        .map_or(UiStore::Nowhere, |root| {
-            UiStore::File(root.join(ui::state_file::FILE_NAME))
-        });
-    let loaded = ui_store.load();
-    let logging_notice = logging.control().apply_saved(loaded.state.logging.as_ref());
 
     if let Some(cli::Command::Provision(provision)) = args.command.clone() {
         // MOD-45 D307: after `logging::init`, so `--log` works the ordinary way.
@@ -215,6 +202,21 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     if args.print_keys {
         return print_keys(&mut std::io::stdout().lock(), &keys::print(&keys));
     }
+
+    // MOD-122 D5: the UI state from `ui-state.toml` in the config root, read once the verbs and
+    // flags that exit have gone (a saved log file is the TUI's, `docs/htui-cli.md`) and before
+    // anything of the TUI's logs (R1): the saved file and filter see the backend start, the MCP
+    // host and the store worker. `--log`/`HTUI_LOG` and `HTUI_LOG_FILTER` keep theirs for this
+    // session; one that cannot apply is a notice. A file that cannot be used starts from the
+    // defaults and says why in the header (MOD-115 M2 D1). No config directory: every launch is
+    // the first and nothing is saved.
+    let ui_store = identity::config_root_path()
+        .ok()
+        .map_or(UiStore::Nowhere, |root| {
+            UiStore::File(root.join(ui::state_file::FILE_NAME))
+        });
+    let loaded = ui_store.load();
+    let logging_notice = logging.control().apply_saved(loaded.state.logging.as_ref());
 
     let started = if args.demo {
         Started::detached(Backend::memory(MemStore::demo()))
@@ -471,10 +473,10 @@ mod tests {
     }
 
     /// MOD-122 D1, D5, D7: `run` installs the one subscriber before anything else that can log
-    /// (the key file included), applies the saved logging settings right after it (R1), so the
-    /// saved file and filter see every line from the backend's start on, and hands it to the
-    /// shell before the tabs are registered. The UI state is applied where it was, and the
-    /// file's own notice still wins the status line over a logging one.
+    /// (the key file included), applies the saved logging settings once the verbs and flags that
+    /// exit have gone and before the backend starts (R1), so the saved file and filter see every
+    /// line the TUI logs, and hands it to the shell before the tabs are registered. The UI state
+    /// is applied where it was, and the file's own notice still wins the status line.
     #[test]
     fn run_installs_logging_first_and_applies_saved_settings_before_the_tabs() {
         let file = include_str!("lib.rs");
@@ -483,11 +485,12 @@ mod tests {
             code.find(needle)
                 .unwrap_or_else(|| panic!("`{needle}` is in `run`"))
         };
-        assert!(at("logging::init(") < at("ui_store.load()"));
+        assert!(at("logging::init(") < at("cli::Command::Provision"));
+        assert!(at("logging::init(") < at("keys::resolve("));
+        assert!(at("if args.print_keys {") < at("ui_store.load()"));
         assert!(at("ui_store.load()") < at("apply_saved("));
         for later in [
-            "cli::Command::Provision",
-            "keys::resolve(",
+            "session_dsn(&mut std::io::stdin().lock())",
             "connect::start(",
             "htui_mcp::McpHost::new(",
             "store_worker::spawn_hosted(",
