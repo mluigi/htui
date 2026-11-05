@@ -11854,6 +11854,118 @@ mod tests {
         }
     }
 
+    /// A `fails` edge `from → to` with `loop_limit = 1` on `FEAT-3`'s live graph, beside the
+    /// `next` edges it has; the run started after it freezes it into its snapshot.
+    async fn add_fails_edge(harness: &Harness, from: &str, to: &str) {
+        let store = &harness.orch.store;
+        let graph = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3 resolves")
+            .graph
+            .id;
+        let mut body = store
+            .graph_body(graph)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3's graph is there");
+        let id_of = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .unwrap_or_else(|| panic!("the graph has a `{name}` phase"))
+        };
+        let edge = htui_core::model::StepGraphEdge {
+            id: htui_core::model::EdgeId::new(),
+            graph_id: body.graph.id,
+            from: id_of(from),
+            to: id_of(to),
+            kind: htui_core::model::EdgeKind::Fails,
+            predicate: None,
+            loop_limit: Some(1),
+        };
+        body.edges.push(edge);
+        let revision = body.graph.revision;
+        let outcome = store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect("the store takes a `fails` edge");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// MOD-138 M2 D7 (blueprint F8): `settle_failed` runs a node's `fails` loop only for a failure
+    /// of the node's own. A step the sweep failed `interrupted` (D92) or `interrupted, tree not
+    /// reset` (D93) was a crash, so a `fails` edge out of `plan` changes nothing: the sweep admits
+    /// attempt 2 on `plan`'s own budget, or completes the park, and retires no row of the loop's
+    /// region. The `Settle` row is the control: the same edge loops a failure of `plan`'s own,
+    /// so the edge is live in the snapshot and the other rows are not vacuous.
+    #[tokio::test]
+    async fn an_interrupted_failure_on_a_fails_node_does_not_loop() {
+        for (attempt, by) in [
+            (1, FailedBy::Sweep("interrupted")),
+            (2, FailedBy::Sweep("interrupted")),
+            (1, FailedBy::Sweep("interrupted, tree not reset")),
+            (1, FailedBy::Settle),
+        ] {
+            let harness = Harness::new().await;
+            add_fails_edge(&harness, "plan", "prd").await;
+            let (run, _) = failed_under_a_running_run(&harness, attempt, by).await;
+            let other = Harness {
+                orch: harness.orch.restarted(),
+            };
+
+            let adopted = super::sweep_fake(&other.orch)
+                .await
+                .expect("the adoption itself succeeds");
+            assert_eq!(adopted.len(), 1, "{adopted:?}");
+            assert_eq!(adopted[0].run, run);
+            let steps = other.orch.steps(run).await;
+            let status_at = |position: i32, attempt: i32| {
+                steps
+                    .iter()
+                    .find(|step| step.position == position && step.attempt == attempt)
+                    .map(|step| step.status)
+            };
+            let FailedBy::Sweep(note) = by else {
+                assert_eq!(
+                    (status_at(0, 1), status_at(1, 1)),
+                    (Some(StepStatus::Superseded), Some(StepStatus::Cancelled)),
+                    "the control: a failure of `plan`'s own runs `plan → prd` and retires its \
+                     region: {steps:?}"
+                );
+                continue;
+            };
+            let next = if attempt == 1 && note == "interrupted" {
+                super::Next::Walk
+            } else {
+                super::Next::Parked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    failure: Some(RunFailure::Interrupted {
+                        phase: "plan".to_owned(),
+                        reset: note == "interrupted",
+                    }),
+                })
+            };
+            assert_eq!(adopted[0].next, next, "`{note}`, attempt {attempt}");
+            assert_eq!(
+                (status_at(0, 1), status_at(1, attempt), status_at(0, 2)),
+                (Some(StepStatus::Done), Some(StepStatus::Failed), None),
+                "`{note}`, attempt {attempt}: an interruption retires nothing in the loop's \
+                 region and admits no attempt of its target: {steps:?}"
+            );
+            if next == super::Next::Walk {
+                assert_eq!(
+                    status_at(1, 2),
+                    Some(StepStatus::Pending),
+                    "`plan`'s own retry was admitted: {steps:?}"
+                );
+            }
+        }
+    }
+
     /// Plan D131, the human's half: a rejection that crashed before its `finish_run` is still a
     /// rejection. `plan` cannot loop, so the run ends `rejected: plan` rather than retrying a step
     /// a human turned down.
