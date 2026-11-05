@@ -12,10 +12,12 @@
 -- The CHECK admits NULL or an object whose every member is a JSON boolean (jsonb_path_exists in a
 -- CHECK was probed on PostgreSQL 16.15 for T1: accepted). The path is `strict`: in the default lax
 -- mode `$.*` unwraps an array member before the filter runs, so {"k": [true]} and {"k": []} would
--- pass.
+-- pass. It is also `silent` (the fourth argument): PostgreSQL does not promise to evaluate AND
+-- left to right, and strict `$.*` on a non-object raises instead of answering, so silent makes it
+-- answer NULL there and the object test alone refuses the row, whatever the order (R1, S1).
 
 ALTER TABLE run_step ADD COLUMN branch JSONB
   CONSTRAINT chk_run_step_branch
   CHECK (branch IS NULL
          OR (jsonb_typeof(branch) = 'object'
-             AND NOT jsonb_path_exists(branch, 'strict $.* ? (@.type() != "boolean")')));
+             AND NOT jsonb_path_exists(branch, 'strict $.* ? (@.type() != "boolean")', '{}', true)));
