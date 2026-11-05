@@ -494,7 +494,7 @@ Rows are cloned from a fixture `RunStep` with fresh `StepId`s. The full suite sh
 
 | Note | Format |
 |---|---|
-| Stop (D8) | ``"step `{name}` attempt {attempt} waits on you: approve takes {targets}; reject or accept artifact declines {them}, and the step's work lands either way; retry redoes the step"``. `targets` is ``"`deploy`, `plan` (loops back)"``. |
+| Stop (D8) | ``"step `{name}` attempt {attempt} waits on you: approve takes {targets}; reject or accept artifact declines {them}, and the step's work lands either way; retry redoes the step"``. `targets` is ``"`deploy`"`` or ``"`plan` (loops back)"``: since A11 (review, 2026-11-05) resolve refuses a back `asks_you` beside another `asks_you` edge, so forward targets and a back edge never share a note. As landed, a spent back edge reads ``"approve walks on (the loop back to `plan` is spent)"``, one whose target never ran ``"(`plan` never ran, so there is no loop back to it)"``, and a node that reads its verdict ``"accept artifact declines {them}, and the step's work lands; reject loops back to `{target}`"`` (T5 repairs). |
 | D6 park | ``"branch undecided: `{node}`: changed paths unavailable: {err}"`` (the plan's text). |
 | Escalation | ``"{loop_failure}: phase `{target}`, attempt {attempts}, stop reason `{reason}`"`` (unchanged for `changes_requested`). |
 

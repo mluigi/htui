@@ -58,20 +58,21 @@ install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats cas
 `htui provision` with a key; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-144 (checked against the tree 2026-11-03): migrations run through
-`0024_item_status` (MOD-144: three-value `item.status`, `uq_run_item_live`; no new table), before it
+Live coordinates after MOD-138 M2 (checked against the tree 2026-11-05): migrations run through
+`0025_run_step_branch` (MOD-138 M2: `run_step.branch`, the recorded `if` decision; no new table; mirrored by cache
+`0008_run_step_branch`), before it `0024_item_status` (MOD-144: three-value `item.status`, `uq_run_item_live`; no new table), before it
 `0023_default_edges_repair` (MOD-138 M1: re-derives default edges once; no table, not mirrored), before it `0022_memory`
 (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0025`** (cache: through `0007_project_type`, next `0008`;
+`workspace_stop`), so **the next migration is `0026`** (cache: through `0008_run_step_branch`, next `0009`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges, and MOD-144's `0023` became `0024` behind MOD-138's (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
 `htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143,
-MOD-147 and MOD-159. Pins: store conformance `CASES` 229 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 118 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
+MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 140 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
@@ -1102,6 +1103,14 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 229 (`htui-core/tests/mem_s
   kind's graph checked only when changed, A7). The walk is still the position cursor. Record:
   `docs/decisions/mod/mod-138-decisions.md`. Next, per `.claude/prds/mod-138-snapshot-v2-graph-walker.prd.md`: M2
   the readiness walker (lifts the non-default-edge refusal), M3 concurrent nodes.
+  **Phase M2 landed (`hr/MOD-138` `ac4e2cd5`, 2026-11-05):** the readiness walker (`walk.rs` `ready()`: joins,
+  derived skips, topological order; a parity oracle pins every lifted linear graph to the old position scan), the
+  closed `if` set decided once into `run_step.branch` (migration `0025`, cache `0008`, `record_branch`), loops over
+  `changes_requested`/`fails`/back `asks_you` edges with region retirement (the review-name rule is gone), `asks_you`
+  stops (approve takes, reject and accept decline), resolve running authored edges. Owed to M3: the graph-aware
+  recovery frontier (a graph whose forward order differs from position order can re-reconcile the wrong step),
+  `last_output_kind`, and mixed `asks_you` edges (resolve refuses a back `asks_you` beside another until then); to
+  M3/MOD-141, `required_inputs` for a join behind a declined `if`. Record: `docs/decisions/mod/mod-138-decisions.md`.
 - [ ] **MOD-139 - Divided fan-out runtime: planner, parts, integrate** (from ANA-33, `docs/ANA-33.md` §7.4, §7.5,
   §7.7, §7.8, §7.11, §10). `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`. Migration: `run_step.role`,
   `parent_step_id` and `node_key`; `run_plan` (append-only); a cache mirror migration for both (the next free

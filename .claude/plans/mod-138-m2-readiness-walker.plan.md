@@ -20,6 +20,17 @@ retires target first, source last. A7 resolve refuses a fan-out node with an `as
 `gate.rs` `the_loop_target_is_the_named_implement_phase`, `graph.rs` `non_default_edges_are_refused`). A9 the spent
 `asks_you` escalation does not block the item. Pins after M2: orch `CASES` 139, store 233.
 
+**Landed 2026-11-05** (T1-T5 and review round R1 on `hr/MOD-138`; record in
+`docs/decisions/mod/mod-138-decisions.md`). Later amendments: **A10** (T5 verify): a reject declines only the
+`asks_you` stop after an ok settle (`gate::stopped_to_ask`); a reject of a failed park on an `asks_you` node takes its
+own gate's path (D8), pinned by a 13th T5 case, so **orch `CASES` is 140**, store 233. **A11** (review, maintainer
+2026-11-05): Q-B's "every `asks_you` edge is taken" cannot hold while a back edge has budget (the loop retires the
+source), so resolve refuses a node with a back `asks_you` edge beside another `asks_you` edge
+(`NotRunnable::MixedAsksYou`) until M3; the stop note covers only the shapes left (forward targets, or one back edge:
+open, spent or never ran). **A12** (T1 verify): `chk_run_step_branch` is a strict, silent jsonpath. The Q-C gap is
+wider than written: any graph whose forward order differs from position order (a reordered chain, not only a loop).
+Owed to M3/MOD-141 (D9 gap): a join listing a kind whose only producer an `if` declined still requires it.
+
 ## Summary
 
 `status::cursor`'s position scan is replaced by a pure `walk::ready(snapshot, steps)` over the
@@ -58,8 +69,9 @@ Divide and palette nodes are still refused (MOD-139, MOD-140).
 
   No new keys. Settles the PRD open question "gate interplay on `asks_you`".
 - **Q-C, recovery frontier: stays in M3** as the PRD has it. M2 keeps `recover::frontier`'s position
-  rule. Known M2 gap: a loop on a branching graph can leave a side-branch node at a higher position
-  than the step that just landed, so crash recovery would re-reconcile the wrong node. Branching
+  rule. Known M2 gap: any graph whose forward order differs from position order (a reordered chain,
+  or a loop on a branching graph; widened at review) can leave a node at a higher position than the
+  step that just landed, so crash recovery would re-reconcile the wrong node. Branching
   graphs can only be stored by tests until MOD-141. Recorded under Risks, and owed to M3.
 - **Q-D, the name rule goes, both edge cases accepted.**
   - A node named `review` with no `changes_requested` edge (first in its graph) no longer reads its
