@@ -377,6 +377,13 @@ async fn a_failing_search_says_unavailable_and_ctrl_e_shows_why() {
         "{frame}"
     );
     assert!(frame.contains("Ctrl+e why"), "the border names it: {frame}");
+    // R-3: the row stays whole on the border at 100 columns; `move` gives way to `why`, since a
+    // failed search has no hits to move through, and `close` still ends the row.
+    assert!(
+        frame.contains("Ctrl+r index · Ctrl+e why · Esc close"),
+        "the border row is whole: {frame}"
+    );
+    assert!(!frame.contains("↑/↓ move"), "move gives way: {frame}");
     assert!(!frame.contains("connection refused"), "{frame}");
     insta::assert_snapshot!("error", frame);
 
