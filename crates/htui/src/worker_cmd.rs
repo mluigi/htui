@@ -383,6 +383,7 @@ mod tests {
         for check in [
             QdrantCheck::NotConfigured("no Qdrant URL is set".to_owned()),
             QdrantCheck::Unavailable("cannot reach Qdrant".to_owned()),
+            QdrantCheck::Unreadable("the keyring is locked".to_owned()),
             QdrantCheck::KeyRefused("qdrant: access refused".to_owned()),
             QdrantCheck::NoKey("qdrant: access refused".to_owned()),
         ] {

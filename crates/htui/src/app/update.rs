@@ -1486,6 +1486,35 @@ mod tests {
         );
     }
 
+    /// MOD-160 R1 (review gate): settings this box cannot read (the `qdrant_url` row, or its
+    /// keyring) never reached Qdrant, so the notice says so and never calls Qdrant unreachable;
+    /// the cause stays Settings › Qdrant's row.
+    #[test]
+    fn unreadable_settings_are_never_said_unreachable() {
+        let (mut app, mut rx) = launched();
+        app.update(Action::Reply(store_state("online", None)));
+        let [seq] = probe_seqs(&mut rx)[..] else {
+            panic!("one probe")
+        };
+        app.update(Action::Reply(probe_reply(
+            seq,
+            Some(QdrantCheck::Unreadable(
+                "the keyring cannot be read: no Secret Service".to_owned(),
+            )),
+        )));
+        let said = app.status.clone().expect("the notice");
+        assert_eq!(
+            said,
+            "knowledge search unavailable: this box cannot read the Qdrant settings \u{2014} \
+             Settings \u{203a} Qdrant"
+        );
+        assert!(!said.contains("unreachable"), "{said}");
+        assert!(
+            !said.contains("Secret Service"),
+            "the cause is the row's: {said}"
+        );
+    }
+
     /// MOD-160 D9, Q4: a ready Qdrant, a keyless one (an info line, Settings' alone) and nothing
     /// probed (offline, no runtime) say nothing at launch.
     #[test]

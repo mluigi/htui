@@ -903,8 +903,11 @@ pub fn shared_qdrant() -> Arc<QdrantIndex> {
 pub enum QdrantCheck {
     /// No URL, or an unusable one: [`Unresolved`]'s sentence.
     NotConfigured(String),
-    /// Unreachable, an embedder mismatch, the row or the key unreadable: the sentence.
+    /// Unreachable, or an embedder mismatch: the probe's sentence.
     Unavailable(String),
+    /// The `qdrant_url` row or this box's key could not be read, so Qdrant was never contacted:
+    /// [`Unresolved`]'s sentence (MOD-160 R1: never said to be unreachable).
+    Unreadable(String),
     /// Refused while this box has a key: the sentence.
     KeyRefused(String),
     /// Refused, and no key from any source.
@@ -929,7 +932,7 @@ impl QdrantCheck {
             }
             Err(Unresolved::Offline) => return None,
             Err(why @ (Unresolved::Read(_) | Unresolved::Key(_))) => {
-                return Some(Self::Unavailable(why.sentence()));
+                return Some(Self::Unreadable(why.sentence()));
             }
             Ok(settings) => settings,
         };
@@ -951,18 +954,20 @@ impl QdrantCheck {
         match self {
             Self::NotConfigured(_) => Some("no Qdrant is configured"),
             Self::Unavailable(_) => Some("Qdrant is unreachable or refuses the collection"),
+            Self::Unreadable(_) => Some("this box cannot read the Qdrant settings"),
             Self::KeyRefused(_) => Some("the Qdrant refused this box's API key"),
             Self::NoKey(_) => Some("this box lacks the Qdrant API key"),
             Self::Keyless | Self::Ready => None,
         }
     }
 
-    /// `"{state}: {cause}"` for the four warnings; `None` for [`Self::Keyless`] and
+    /// `"{state}: {cause}"` for the five warnings; `None` for [`Self::Keyless`] and
     /// [`Self::Ready`].
     #[must_use]
     pub fn warning(&self) -> Option<String> {
         let (Self::NotConfigured(cause)
         | Self::Unavailable(cause)
+        | Self::Unreadable(cause)
         | Self::KeyRefused(cause)
         | Self::NoKey(cause)) = self
         else {
@@ -2531,10 +2536,17 @@ mod tests {
             None,
             "nothing probed"
         );
+        // R1 (review gate): the row or this box's keyring unreadable never contacted Qdrant, so it
+        // is never said to be unreachable.
         for why in [&read, &key] {
-            assert_eq!(
-                check(Err(why), None),
-                Some(QdrantCheck::Unavailable(why.sentence()))
+            let unreadable = check(Err(why), None).expect("a warning");
+            assert_eq!(unreadable, QdrantCheck::Unreadable(why.sentence()));
+            assert!(
+                !unreadable
+                    .state()
+                    .unwrap_or_default()
+                    .contains("unreachable"),
+                "{unreadable:?}"
             );
         }
 
@@ -2578,6 +2590,10 @@ mod tests {
             (
                 QdrantCheck::Unavailable("why".into()),
                 "Qdrant is unreachable or refuses the collection",
+            ),
+            (
+                QdrantCheck::Unreadable("why".into()),
+                "this box cannot read the Qdrant settings",
             ),
             (
                 QdrantCheck::KeyRefused("why".into()),

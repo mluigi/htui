@@ -483,8 +483,9 @@ read again after every sync; without it, or with any other value, the interval i
   - `knowledge search unavailable: no Qdrant is configured: …`: no URL is set, or the one set is
     not usable. Set one in **Settings › Qdrant** or with `htui --set-qdrant-url`.
   - `knowledge search unavailable: Qdrant is unreachable or refuses the collection: …`: Qdrant did
-    not answer within 3 seconds, the URL setting or the key could not be read, or the collection was
-    written by another embedding model.
+    not answer within 3 seconds, or the collection was written by another embedding model.
+  - `knowledge search unavailable: this box cannot read the Qdrant settings: …`: the URL setting or
+    the key could not be read (a keyring that cannot be read, say), so Qdrant was never contacted.
   - `knowledge search unavailable: the Qdrant refused this box's API key: …`: a key was found and
     Qdrant refused it; give the worker the right one ([sources](#where-the-qdrant-api-key-comes-from)).
   - `knowledge search unavailable: this box lacks the Qdrant API key: …`: Qdrant wants a key and the

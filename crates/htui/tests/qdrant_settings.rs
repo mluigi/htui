@@ -1323,6 +1323,12 @@ fn mismatch() -> QdrantCheck {
     )
 }
 
+fn settings_unreadable() -> QdrantCheck {
+    QdrantCheck::Unreadable(
+        "the keyring cannot be read: no Secret Service provider is running".to_owned(),
+    )
+}
+
 fn key_refused() -> QdrantCheck {
     QdrantCheck::KeyRefused("qdrant: access refused: the API key was not accepted".to_owned())
 }
@@ -1428,6 +1434,12 @@ async fn each_warning_state_draws_its_row() {
             stored(),
             mismatch(),
             "Qdrant is unreachable or refuses the collection",
+        ),
+        (
+            "probe_unreadable",
+            unreadable(),
+            settings_unreadable(),
+            "this box cannot read the Qdrant settings",
         ),
         (
             "probe_key_refused",
@@ -1612,6 +1624,7 @@ async fn no_probe_line_renders_a_key() {
         no_url(),
         unreachable(),
         mismatch(),
+        settings_unreadable(),
         key_refused(),
         no_key(),
         QdrantCheck::Keyless,
@@ -1660,7 +1673,11 @@ async fn the_same_snapshot_after_an_outage_probes_again() {
         assert_eq!(probes_of(&bench), 0, "{outage:?}: no probe while offline");
 
         bench.reply(&mut section, &StoreReply::Qdrant(stored()));
-        assert_eq!(probes_of(&bench), 1, "{outage:?}: back online, probed again");
+        assert_eq!(
+            probes_of(&bench),
+            1,
+            "{outage:?}: back online, probed again"
+        );
         let frame = flattened(&frame_of(&bench, &section));
         assert!(!frame.contains("knowledge search"), "{outage:?}: {frame}");
     }
