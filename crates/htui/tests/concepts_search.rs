@@ -18,7 +18,9 @@ use htui::concepts_worker::{ConceptsRuntime, MemIndex, NOT_AVAILABLE};
 use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::ConceptsSearch;
-use htui::ui::overlay::concepts_search::{INDEXING, LOADING, changed, hit_row, idle, index_report};
+use htui::ui::overlay::concepts_search::{
+    INDEXING, LOADING, changed, hit_row, idle, index_report, unavailable_status,
+};
 use htui::ui::tabs::{BacklogTab, ChatTab, RequirementsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
@@ -359,8 +361,11 @@ async fn decisions_in_one_project_list_only_closed_items() {
     insta::assert_snapshot!("decisions_project", frame);
 }
 
+/// MOD-160 D7: a failing search says the one sentence in the box, the why key in force named on
+/// its status row and border; `Ctrl+E` opens the cause with where it is fixed, and closes it. The
+/// shell's status line stays empty throughout.
 #[tokio::test]
-async fn a_failing_index_is_an_inline_error_and_the_status_line_stays_empty() {
+async fn a_failing_search_says_unavailable_and_ctrl_e_shows_why() {
     let failing = Arc::new(MemIndex::new().failing("qdrant: query: connection refused"));
     let mut harness = open(Some(failing)).await;
     search(&mut harness, MIXED).await;
@@ -368,10 +373,78 @@ async fn a_failing_index_is_an_inline_error_and_the_status_line_stays_empty() {
     assert_eq!(harness.app().status, None);
     let frame = harness.render();
     assert!(
-        frame.contains("qdrant: query: connection refused"),
+        frame.contains(&unavailable_status(Some("Ctrl+e"))),
         "{frame}"
     );
+    assert!(frame.contains("Ctrl+e why"), "the border names it: {frame}");
+    // R-3: the row stays whole on the border at 100 columns; `move` gives way to `why`, since a
+    // failed search has no hits to move through, and `close` still ends the row.
+    assert!(
+        frame.contains("Ctrl+r index · Ctrl+e why · Esc close"),
+        "the border row is whole: {frame}"
+    );
+    assert!(!frame.contains("↑/↓ move"), "move gives way: {frame}");
+    assert!(!frame.contains("connection refused"), "{frame}");
     insta::assert_snapshot!("error", frame);
+
+    harness.key("ctrl-e");
+    let frame = harness.render();
+    assert!(
+        frame.contains("qdrant: query: connection refused \u{2014} Settings \u{203a} Qdrant"),
+        "{frame}"
+    );
+    assert!(search_is_open(&mut harness));
+    assert_eq!(harness.app().status, None);
+    insta::assert_snapshot!("error_why", frame);
+
+    harness.key("ctrl-e");
+    let frame = harness.render();
+    assert!(!frame.contains("connection refused"), "closed: {frame}");
+}
+
+/// MOD-160 D7: `[concepts] why = "f6"` moves the why key: the status row and the border name
+/// `F6`, `Ctrl+E` does nothing (and types nothing), and `F6` opens the cause.
+#[tokio::test]
+async fn a_rebound_why_key_moves_the_hint_and_acts() {
+    let keys =
+        htui::keys::load_str("version = 1\n[concepts]\nwhy = \"f6\"\n").expect("the keys load");
+    let failing = Arc::new(MemIndex::new().failing("qdrant: query: connection refused"));
+    let mut harness = in_platform(
+        Harness::demo()
+            .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+            .with_concepts_runtime(ConceptsRuntime::new(failing))
+            .with_keys(keys),
+    )
+    .await;
+    search(&mut harness, MIXED).await;
+    let frame = harness.render();
+    assert!(frame.contains(&unavailable_status(Some("F6"))), "{frame}");
+    assert!(
+        frame.contains("F6 why"),
+        "the hint names the new chord: {frame}"
+    );
+    assert!(!frame.contains("Ctrl+e"), "and not the old one: {frame}");
+
+    harness.key("ctrl-e");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(search_is_open(&mut harness));
+    assert!(
+        !frame.contains("connection refused"),
+        "`Ctrl+E` opened nothing: {frame}"
+    );
+    assert!(
+        !frame.contains(&format!("query {MIXED}e")),
+        "and typed nothing: {frame}"
+    );
+
+    harness.key("f6");
+    let frame = harness.render();
+    assert!(
+        frame.contains("qdrant: query: connection refused \u{2014} Settings \u{203a} Qdrant"),
+        "`F6` opened the cause: {frame}"
+    );
+    assert_eq!(harness.app().status, None);
 }
 
 #[tokio::test]
@@ -396,6 +469,14 @@ async fn ctrl_r_reindexes_and_prints_the_report_line() {
 async fn without_a_concepts_runtime_the_search_says_not_available() {
     let mut harness = open(None).await;
     search(&mut harness, MIXED).await;
+    let frame = harness.render();
+    // MOD-160 D7: the sentence on the status row, the harness's own cause behind the why key.
+    assert!(
+        frame.contains(&unavailable_status(Some("Ctrl+e"))),
+        "{frame}"
+    );
+    assert!(!frame.contains(NOT_AVAILABLE), "{frame}");
+    harness.key("ctrl-e");
     let frame = harness.render();
     assert!(frame.contains(NOT_AVAILABLE), "{frame}");
     assert_eq!(harness.app().status, None);

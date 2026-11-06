@@ -785,7 +785,8 @@ mod tests {
             texts(keys.help_lines(views::CONCEPTS_QUERY, all)),
             [
                 "Search concepts: Ctrl+d decisions only · Ctrl+p cycle project scope · Ctrl+r \
-                 re-index scope · Up previous hit · Down next hit",
+                 re-index scope · Up previous hit · Down next hit · Ctrl+e why search is \
+                 unavailable",
                 "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor right · \
                  Home line start · End line end · Backspace delete back · Del delete forward · \
                  PgUp page up · PgDn page down",
