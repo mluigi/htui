@@ -5,6 +5,10 @@
 > recommended). Tree read at `f8826cb9` (branch `hr/MOD-160`). The plan stays the spec. §0 lists where
 > the tree disagrees with a plan claim or a plan file set. Every row is **adopted**, and none reopens
 > a decision. Line numbers are `HEAD` at `f8826cb9`.
+>
+> **Status: implemented 2026-11-06** (T1-T6, review fixes R1; `docs/decisions/mod/mod-160.md`). R1 departs
+> from T2.5's table: an unreadable URL row or keyring maps to the new `QdrantCheck::Unreadable`, not
+> `Unavailable`.
 
 ## 0. Plan corrections
 

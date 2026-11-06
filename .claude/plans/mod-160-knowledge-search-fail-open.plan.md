@@ -11,6 +11,8 @@ warning); no requirement edit.
 **Complexity**: Large (store, TUI index, MCP host, worker, overlay, Settings, CLI, gate).
 **Status**: confirmed 2026-11-05. Design questions Q1-Q4 answered by the maintainer 2026-11-05, all
 as recommended (D5, D7, D10, D9).
+**Done 2026-11-06** on `hr/MOD-160`: T1-T6 plus review fixes R1; write-up `docs/decisions/mod/mod-160.md`
+(D7 hint-row deviation accepted; R1 adds `QdrantCheck::Unreadable`).
 
 ## Summary
 
