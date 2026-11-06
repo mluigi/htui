@@ -949,9 +949,9 @@ impl QdrantSection {
             .collect()
     }
 
-    /// MOD-160 D9: after a snapshot, one probe for what it shows, unless the last probe was sent
-    /// for the same URL row, override and key. The old answer is dropped with it: it was about
-    /// the settings before.
+    /// MOD-160 D9: after a snapshot (a read's or a compare-and-set miss's), one probe for what it
+    /// shows, unless the last probe was sent for the same URL row, override and key. The old
+    /// answer is dropped with it: it was about the settings before.
     fn probe_for(&mut self, snapshot: &QdrantSnapshot, ctx: &Ctx<'_>) {
         if !probes(&snapshot.url) {
             return;
@@ -1194,7 +1194,11 @@ impl SettingsSection for QdrantSection {
                 self.on_snapshot(snapshot);
                 self.probe_for(snapshot, ctx);
             }
-            StoreReply::QdrantStale(snapshot) => self.on_stale(snapshot),
+            // A miss installs a fresh snapshot too, perhaps another box's URL: probe for it.
+            StoreReply::QdrantStale(snapshot) => {
+                self.on_stale(snapshot);
+                self.probe_for(snapshot, ctx);
+            }
             StoreReply::QdrantProbe(check) => self.probe.clone_from(check),
             StoreReply::Failed { request, message } => self.on_failed(request, message, ctx),
             _ => {}

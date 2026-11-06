@@ -1524,6 +1524,35 @@ async fn a_moved_snapshot_drops_the_old_answer() {
     assert!(!frame.contains("knowledge search"), "{frame}");
 }
 
+/// D9: a compare-and-set miss installs a fresh snapshot too, and one whose URL another box moved
+/// drops the old URL's answer and asks for one probe: the old warning never stands under the
+/// new URL's row.
+#[tokio::test]
+async fn a_stale_snapshot_whose_url_moved_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+    bench.key(&mut section, "e");
+    typed(&bench, &mut section, "https://mine.example:6334");
+    bench.key(&mut section, "Enter");
+    let _ = sent_by(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::QdrantStale(Box::new(snapshot(
+            UrlRowState::Set {
+                url: url(OTHER),
+                token: later(),
+            },
+            QdrantState::Stored,
+        ))),
+    );
+    assert!(
+        matches!(sent_by(&bench).as_slice(), [StoreRequest::ProbeQdrant]),
+        "one probe for the stale snapshot"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains(OTHER), "the row now: {frame}");
+    assert!(!frame.contains("knowledge search"), "{frame}");
+}
+
 /// D9: a key write answers with a fresh snapshot read, and that snapshot probes again even
 /// when it reads the same as before (one stored key replaced by another): the refused key's
 /// warning never stays on screen beside the new key's "stored".
