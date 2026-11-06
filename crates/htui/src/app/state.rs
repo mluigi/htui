@@ -504,6 +504,14 @@ pub struct App {
     /// Whether that notice is waiting for a clear status line: it never displaces another notice,
     /// and the next tick with nothing on the line says it.
     pub(super) qdrant_offer_pending: bool,
+    /// Whether the launch's Qdrant probe has been sent (MOD-160 D9, blueprint P-12): once, on the
+    /// first `StoreState` that says `online`, and only after `register_all` (`qdrant_offer_check`).
+    pub(super) qdrant_probe_sent: bool,
+    /// Whether the probe's answer has been taken, so a warning is said once per launch.
+    pub(super) qdrant_warning_noted: bool,
+    /// The launch's "knowledge search unavailable" notice, waiting for a clear status line as the
+    /// old-URL offer does (MOD-160 D9).
+    pub(super) qdrant_warning_pending: Option<String>,
     /// Whether the no-DSN redirect has already fired this session (MOD-15 M6 D6).
     ///
     /// `ConnectionInfo` is re-issued whenever the shell asks again, so without this a box with an
@@ -612,6 +620,9 @@ impl App {
             qdrant_offer_check: false,
             qdrant_offer_noted: false,
             qdrant_offer_pending: false,
+            qdrant_probe_sent: false,
+            qdrant_warning_noted: false,
+            qdrant_warning_pending: None,
             connection_redirect_done: false,
             pending_edit: None,
             mouse: false,
