@@ -1645,3 +1645,23 @@ async fn no_probe_line_renders_a_key() {
         assert!(!format!("{check:?}").contains(KEY_SENTINEL), "{check:?}");
     }
 }
+
+/// D9: an outage forgets what the last probe was sent for, so the store coming back with the
+/// same URL, override and key probes again: the pre-outage answer ("unreachable") is never drawn
+/// under a Qdrant that may answer now, and nothing is drawn until the new probe answers.
+#[tokio::test]
+async fn the_same_snapshot_after_an_outage_probes_again() {
+    for outage in [
+        snapshot(UrlRowState::Offline, QdrantState::Stored),
+        QdrantSnapshot::not_applicable(),
+    ] {
+        let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+        bench.reply(&mut section, &StoreReply::Qdrant(outage.clone()));
+        assert_eq!(probes_of(&bench), 0, "{outage:?}: no probe while offline");
+
+        bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+        assert_eq!(probes_of(&bench), 1, "{outage:?}: back online, probed again");
+        let frame = flattened(&frame_of(&bench, &section));
+        assert!(!frame.contains("knowledge search"), "{outage:?}: {frame}");
+    }
+}

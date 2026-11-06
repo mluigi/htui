@@ -366,8 +366,9 @@ pub struct QdrantSection {
     scroll: Cell<Option<ScrollSpan>>,
     /// The last probe's answer (MOD-160 D9); `None` until it answers, or when nothing was probed.
     probe: Option<QdrantCheck>,
-    /// What the last probe was sent for; `None` before the first, after `r`, and once a write is
-    /// answered or refused: a written key reads the same (`Stored`) as the one it replaced.
+    /// What the last probe was sent for; `None` before the first, after `r`, after a snapshot
+    /// that is not probed (offline, `--demo`), and once a write is answered or refused: a written
+    /// key reads the same (`Stored`) as the one it replaced.
     probed_for: Option<ProbedFor>,
 }
 
@@ -951,9 +952,13 @@ impl QdrantSection {
 
     /// MOD-160 D9: after a snapshot (a read's or a compare-and-set miss's), one probe for what it
     /// shows, unless the last probe was sent for the same URL row, override and key. The old
-    /// answer is dropped with it: it was about the settings before.
+    /// answer is dropped with it: it was about the settings before. A snapshot that is not probed
+    /// (offline, `--demo`) forgets both, so the first online snapshot after it probes again even
+    /// when it reads as before: the pre-outage answer may no longer hold.
     fn probe_for(&mut self, snapshot: &QdrantSnapshot, ctx: &Ctx<'_>) {
         if !probes(&snapshot.url) {
+            self.probed_for = None;
+            self.probe = None;
             return;
         }
         let now = (
