@@ -170,7 +170,7 @@ fn asks_again(reload: Option<&str>) -> String {
 
 /// `HTUI_QDRANT_URL` in force, under the URL row (MOD-158 D3, D9). `why` is the shipped
 /// [`QdrantUrlError`](htui_core::qdrant::QdrantUrlError) sentence (blueprint P-20).
-fn url_override(found: &Result<QdrantUrl, htui_core::qdrant::QdrantUrlError>) -> String {
+fn url_override(found: &Result<QdrantUrl, QdrantUrlError>) -> String {
     match found {
         Ok(url) => format!(
             "HTUI_QDRANT_URL={url} is in force in this process, which does not use this setting"
