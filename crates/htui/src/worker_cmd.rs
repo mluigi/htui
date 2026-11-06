@@ -126,7 +126,7 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     let index_job = concepts::spawn_index_job(pg.clone());
     // MOD-160 D9: one model-free look at Qdrant, said once; never awaited, so a Qdrant that does
     // not answer never delays "htui worker ready".
-    let start_check = tokio::spawn(start_check(Arc::clone(qdrant.source())));
+    let start_check_task = tokio::spawn(start_check(Arc::clone(qdrant.source())));
     // MOD-11 D11: a worker that cannot host tools would fail every document phase, so it is
     // refused before it claims anything.
     let tools = htui_mcp::McpHost::new(pg.clone())
@@ -145,7 +145,7 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     index_job.abort();
-    start_check.abort();
+    start_check_task.abort();
     tracing::info!("htui worker stopped");
     Ok(())
 }
