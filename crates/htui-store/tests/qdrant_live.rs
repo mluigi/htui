@@ -908,17 +908,19 @@ fn settings(url: &str) -> QdrantSettings {
     )
 }
 
-/// `check` on the collection `name`, which exists, against `mine` of width `dim`.
+/// `check` on the collection `name` against `mine` of width `dim`; `None` when no such collection
+/// is found. It never panics, so a caller drops its collection before it asserts.
 async fn check(
     url: &str,
     name: &str,
     mine: &EmbedderIdentity,
     dim: usize,
-) -> Result<(), StoreError> {
-    let found = ExistingCollection::find_in(&settings(url), name)
-        .await?
-        .expect("the collection exists");
-    found.check(mine, dim).await
+) -> Option<Result<(), StoreError>> {
+    match ExistingCollection::find_in(&settings(url), name).await {
+        Ok(Some(found)) => Some(found.check(mine, dim).await),
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    }
 }
 
 #[tokio::test]
@@ -932,7 +934,9 @@ async fn check_refuses_another_width_before_any_embedder() {
         .expect("Qdrant answers");
     let checked = check(&url, &name, &EmbedderIdentity::hash(DENSE_DIM), DENSE_DIM).await;
     built.drop_collection().await.expect("drop");
-    let err = checked.expect_err("another width is refused");
+    let err = checked
+        .expect("the collection exists")
+        .expect_err("another width is refused");
     assert!(is_embedder_mismatch(&err), "{err}");
     let err = err.to_string();
     assert!(err.contains("8-wide"), "{err}");
@@ -956,7 +960,9 @@ async fn check_refuses_another_embedder() {
     let client = raw(&url);
     let stored = stored_identity(&client, &name).await;
     built.drop_collection().await.expect("drop");
-    let err = checked.expect_err("another embedder is refused");
+    let err = checked
+        .expect("the collection exists")
+        .expect_err("another embedder is refused");
     assert!(is_embedder_mismatch(&err), "{err}");
     let err = err.to_string();
     assert!(err.contains("hash/384"), "{err}");
@@ -988,7 +994,9 @@ async fn check_passes_an_unstamped_collection_and_writes_nothing() {
         .result
         .expect("a result");
     client.delete_collection(&name).await.expect("drop");
-    checked.expect("an unstamped collection of the right width passes");
+    checked
+        .expect("the collection exists")
+        .expect("an unstamped collection of the right width passes");
     assert_eq!(identity, None, "no stamp is written");
     assert_eq!(payload, None, "no payload layout is written");
     assert_eq!(info.payload_schema.len(), 0, "no payload index is created");
@@ -1027,7 +1035,9 @@ async fn check_passes_an_older_payload_stamp_and_drops_nothing() {
     let payload = stored_payload_schema(&client, &name).await;
     client.delete_collection(&name).await.expect("drop");
 
-    checked.expect("an older payload stamp passes read-only");
+    checked
+        .expect("the collection exists")
+        .expect("an older payload stamp passes read-only");
     assert!(filled > 0, "control: the sync wrote points");
     assert_eq!(kept, filled, "nothing was dropped");
     assert_eq!(
