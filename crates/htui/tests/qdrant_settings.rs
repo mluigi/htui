@@ -1524,6 +1524,57 @@ async fn a_moved_snapshot_drops_the_old_answer() {
     assert!(!frame.contains("knowledge search"), "{frame}");
 }
 
+/// D9: a key write answers with a fresh snapshot read, and that snapshot probes again even
+/// when it reads the same as before (one stored key replaced by another): the refused key's
+/// warning never stays on screen beside the new key's "stored".
+#[tokio::test]
+async fn a_key_written_over_a_refused_one_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(key_refused())).await;
+    bench.key(&mut section, "j");
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    typed(&bench, &mut section, "a-new-key");
+    bench.key(&mut section, "Enter");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::SetQdrantApiKey(_)]
+        ),
+        "the key is stored"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert_eq!(probes_of(&bench), 1, "the new key's snapshot probes again");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("knowledge search"), "{frame}");
+    assert!(!frame.contains("refused this box's API key"), "{frame}");
+}
+
+/// D9: a refused key write may have landed before its follow-up read failed, so the re-read
+/// it sends probes again even when it reads the same as before.
+#[tokio::test]
+async fn a_refused_key_write_re_read_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(key_refused())).await;
+    bench.key(&mut section, "j");
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    typed(&bench, &mut section, "a-new-key");
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_qdrant_api_key",
+            message: "the keyring is locked".to_owned(),
+        },
+    );
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "a failed write reads the section again"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert_eq!(probes_of(&bench), 1, "the re-read probes again");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("refused this box's API key"), "{frame}");
+}
+
 /// No probe row ever draws a key: a key typed and stored just before the probe answers is
 /// nowhere in the frame or the section's `Debug`, whatever the probe said.
 #[tokio::test]

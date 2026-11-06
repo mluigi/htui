@@ -366,7 +366,8 @@ pub struct QdrantSection {
     scroll: Cell<Option<ScrollSpan>>,
     /// The last probe's answer (MOD-160 D9); `None` until it answers, or when nothing was probed.
     probe: Option<QdrantCheck>,
-    /// What the last probe was sent for; `None` before the first, and after `r`.
+    /// What the last probe was sent for; `None` before the first, after `r`, and once a write is
+    /// answered or refused: a written key reads the same (`Stored`) as the one it replaced.
     probed_for: Option<ProbedFor>,
 }
 
@@ -1042,6 +1043,11 @@ impl QdrantSection {
             self.busy.take()
         };
         self.take(snapshot);
+        // MOD-160 D9: a write's snapshot probes again even when it reads as before, since one
+        // stored key replaced by another reads `Stored` both times.
+        if write.is_some() {
+            self.probed_for = None;
+        }
 
         let said = match write {
             Some("set_qdrant_url") => Some(URL_SET),
@@ -1097,6 +1103,8 @@ impl QdrantSection {
             self.busy = None;
             self.refuse(message.to_owned());
             self.read_out = true;
+            // It may have landed before its follow-up read failed: the re-read probes again.
+            self.probed_for = None;
             ctx.request(StoreRequest::QdrantInfo);
         } else if request == "qdrant_info" {
             self.read_out = false;
