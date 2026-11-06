@@ -397,8 +397,14 @@ impl Harness {
                         }
                     }
                     // MOD-64 D231: through the concepts runtime when a test installed one; without
-                    // one `store_worker::serve` answers them `NOT_AVAILABLE` (D244).
-                    (StoreRequest::SearchConcepts(_) | StoreRequest::IndexConcepts { .. }, _) => {
+                    // one `store_worker::serve` answers them `NOT_AVAILABLE` (D244), and a Qdrant
+                    // probe "nothing probed" (MOD-160 D9).
+                    (
+                        StoreRequest::SearchConcepts(_)
+                        | StoreRequest::IndexConcepts { .. }
+                        | StoreRequest::ProbeQdrant,
+                        _,
+                    ) => {
                         match self.concepts.as_mut() {
                             Some(concepts) => {
                                 match concepts.serve(&self.backend, &self.replies.0, &envelope) {

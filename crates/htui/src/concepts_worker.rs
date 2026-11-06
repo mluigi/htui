@@ -1,9 +1,10 @@
 //! The concepts index behind the TUI's search (MOD-64 D230-D232, D237, D238).
 //!
 //! `SearchConcepts` loads an embedding model and calls Qdrant; `IndexConcepts` reads every item of
-//! the scope. Neither may run in the store worker's serial loop (`R-NF-3`): [`ConceptsRuntime`]
-//! serves both on tasks of their own, the way `AgentRuntime::preview` serves a preview, and each
-//! task sends its own reply. The index is an object-safe [`ConceptIndex`]: [`QdrantIndex`] in
+//! the scope; `ProbeQdrant` (MOD-160 D9) asks Qdrant, which may take its 3 s bound when it is
+//! down. None may run in the store worker's serial loop (`R-NF-3`): [`ConceptsRuntime`] serves
+//! them on tasks of their own, the way `AgentRuntime::preview` serves a preview, and each task
+//! sends its own reply. The index is an object-safe [`ConceptIndex`]: [`QdrantIndex`] in
 //! production, `MemIndex` in tests.
 
 use std::collections::HashMap;
@@ -36,8 +37,8 @@ use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, St
 /// What both requests answer when nothing serves them: the test harness without a runtime (D231).
 pub const NOT_AVAILABLE: &str = "concepts search is not available";
 
-/// The two `StoreRequest::name`s this module serves, in that order (D241).
-pub const REQUEST_NAMES: [&str; 2] = ["search_concepts", "index_concepts"];
+/// The three `StoreRequest::name`s this module serves, in that order (D241, MOD-160 D9).
+pub const REQUEST_NAMES: [&str; 3] = ["search_concepts", "index_concepts", "probe_qdrant"];
 
 /// One concepts answer, its error inside (D232, blueprint D242): a Qdrant failure is the overlay's
 /// to show and never becomes `StoreReply::Failed`, which the shell also puts on the status line.
@@ -73,6 +74,12 @@ pub trait ConceptIndex: Send + Sync {
     }
     /// MOD-160 D5: this process wrote or cleared the `qdrant_url` row; the offer is read again.
     fn url_changed(&self) {}
+    /// MOD-160 D9: a model-free look at the Qdrant this index searches, for Settings › Qdrant and
+    /// the TUI's launch notice. `None`: nothing was probed (offline, or an index that reads no
+    /// settings).
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(async { None })
+    }
 }
 
 /// "Postgres is not connected" for the Qdrant URL (MOD-158 D6): no store is published (offline,
@@ -860,6 +867,10 @@ impl ConceptIndex for QdrantIndex {
     fn url_changed(&self) {
         self.source.reread();
     }
+
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(check_qdrant(&self.source, &self.collection))
+    }
 }
 
 /// The process's one production index (MOD-11 T7, H-26): [`ConceptsRuntime::production`] and
@@ -884,10 +895,10 @@ pub fn shared_qdrant() -> Arc<QdrantIndex> {
     Arc::clone(SHARED.get_or_init(|| Arc::new(QdrantIndex::new())))
 }
 
-/// MOD-160 D9: what one model-free look at this process's Qdrant says. The worker's start line
-/// (and, with MOD-160 T4, Settings › Qdrant and the TUI's launch notice) all read it, so every
-/// surface says the same states in the same words. No variant carries the API key: each sentence is
-/// an [`Unresolved`] sentence or a [`Probe`]'s, and neither ever holds it.
+/// MOD-160 D9: what one model-free look at this process's Qdrant says. The worker's start line,
+/// Settings › Qdrant and the TUI's launch notice (both through `StoreRequest::ProbeQdrant`) all
+/// read it, so every surface says the same states in the same words. No variant carries the API
+/// key: each sentence is an [`Unresolved`] sentence or a [`Probe`]'s, and neither ever holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QdrantCheck {
     /// No URL, or an unusable one: [`Unresolved`]'s sentence.
@@ -993,6 +1004,8 @@ pub struct MemIndex {
     failure: Option<String>,
     /// How long every call sleeps first, when set.
     delay: Option<Duration>,
+    /// What a probe answers (MOD-160 D9); `None`: nothing probed.
+    check: Option<QdrantCheck>,
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -1017,6 +1030,15 @@ impl MemIndex {
     pub fn delayed(self, by: Duration) -> Self {
         Self {
             delay: Some(by),
+            ..self
+        }
+    }
+
+    /// A probe answers `check` (after the delay; the failure does not apply to it).
+    #[must_use]
+    pub fn with_check(self, check: QdrantCheck) -> Self {
+        Self {
+            check: Some(check),
             ..self
         }
     }
@@ -1063,6 +1085,14 @@ impl ConceptIndex for MemIndex {
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(async move {
+            // The wait applies; a configured failure is a search's or a sync's, not a probe's.
+            let _ = self.pause().await;
+            self.check.clone()
+        })
+    }
 }
 
 /// What [`ConceptsRuntime::serve`] decided (the `RunServed` shape, blueprint D243).
@@ -1074,10 +1104,11 @@ pub enum ConceptsServed {
     Deferred,
 }
 
-/// Serves `SearchConcepts` and `IndexConcepts` on tasks of their own, inside the store worker's
-/// loop beside `AgentRuntime` and `RunRuntime` (D231). One task per `(origin, request kind)`: a
-/// newer request of the same kind from the same view aborts the older one, whose answer the shell
-/// would drop anyway. A search never aborts an index run: they are different kinds.
+/// Serves `SearchConcepts`, `IndexConcepts` and `ProbeQdrant` on tasks of their own, inside the
+/// store worker's loop beside `AgentRuntime` and `RunRuntime` (D231). One task per
+/// `(origin, request kind)`: a newer request of the same kind from the same view aborts the older
+/// one, whose answer the shell would drop anyway. A search never aborts an index run: they are
+/// different kinds.
 pub struct ConceptsRuntime {
     /// The index every task searches and writes.
     index: Arc<dyn ConceptIndex>,
@@ -1233,7 +1264,17 @@ impl ConceptsRuntime {
                     });
                 })
             }
-            // The loop routes only the two above here; the two runtimes' rule for anything else.
+            // MOD-160 D9: a model-free look at Qdrant, bounded by the probe's 3 s, on its own task
+            // like the two above. Its answer is never `Failed`: "nothing probed" is `None`.
+            StoreRequest::ProbeQdrant => tokio::spawn(async move {
+                let check = index.check().await;
+                let _ = replies.send(ReplyEnvelope {
+                    seq,
+                    origin,
+                    reply: StoreReply::QdrantProbe(check),
+                });
+            }),
+            // The loop routes only the three above here; the two runtimes' rule for anything else.
             other => {
                 return ConceptsServed::Reply(StoreReply::Failed {
                     request: other.name(),
@@ -1611,6 +1652,75 @@ mod tests {
             REQUEST_NAMES[1],
             StoreRequest::IndexConcepts { scope }.name()
         );
+        assert_eq!(REQUEST_NAMES[2], StoreRequest::ProbeQdrant.name());
+        assert!(
+            !StoreRequest::ProbeQdrant.is_qdrant(),
+            "the probe is served off the loop, never by `qdrant_settings_info` (P-7)"
+        );
+    }
+
+    /// MOD-160 D9: a probe is a task of the runtime, answered in its own variant and never
+    /// `Failed`; an index that cannot look answers "nothing probed".
+    #[tokio::test]
+    async fn a_probe_is_a_concepts_reply_task_and_never_failed() {
+        let (backend, _) = platform().await;
+        let check = QdrantCheck::NoKey("qdrant: access refused".to_owned());
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new().with_check(check.clone())));
+        let replies = serve_one(
+            &mut runtime,
+            &backend,
+            &envelope(7, StoreRequest::ProbeQdrant),
+        )
+        .await;
+        let [reply] = replies.as_slice() else {
+            panic!("one answer: {replies:?}")
+        };
+        assert_eq!((reply.seq, &reply.origin), (7, &PROBE));
+        assert!(
+            matches!(&reply.reply, StoreReply::QdrantProbe(Some(said)) if *said == check),
+            "{:?}",
+            reply.reply
+        );
+
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new()));
+        let replies = serve_one(
+            &mut runtime,
+            &backend,
+            &envelope(8, StoreRequest::ProbeQdrant),
+        )
+        .await;
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [ReplyEnvelope {
+                    seq: 8,
+                    reply: StoreReply::QdrantProbe(None),
+                    ..
+                }]
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// MOD-160 D9: the production index's probe of a closed port answers "unavailable", within
+    /// the probe's bound, and loads no model.
+    #[tokio::test]
+    async fn a_qdrant_index_probe_of_a_closed_port_is_unavailable() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads)).with_source(Arc::new(source(
+            Some("http://127.0.0.1:1"),
+            None,
+            no_key,
+        )));
+        let check = tokio::time::timeout(Duration::from_secs(10), index.check())
+            .await
+            .expect("the probe is bounded");
+        assert!(
+            matches!(check, Some(QdrantCheck::Unavailable(_))),
+            "{check:?}"
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "a probe caches nothing");
     }
 
     /// A source over `env_url` and `env_key`, its keyring answering `keyring`, nothing published.
