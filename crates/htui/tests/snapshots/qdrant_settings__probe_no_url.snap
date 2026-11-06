@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+ URL       not set · for every box
+▌new URL
+           no Qdrant URL is set; type one and press Enter
+ API key   not stored
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+knowledge search unavailable: no Qdrant is configured: no Qdrant URL is set; set one in Settings >
+Qdrant or with `htui --set-qdrant-url`
