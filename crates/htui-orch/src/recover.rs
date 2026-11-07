@@ -394,6 +394,14 @@ pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
 ///   `finished_at`: a later landing moved `HEAD`, so the earlier in-place node landed, and
 ///   re-landing it would refuse `primary_moved` (or, for `local`, record another node's commit).
 ///   A tie keeps it.
+/// - **The landing rule (A9 over landings, T1 repair 1).** A done winner a loop later retired is
+///   no longer a winner, yet its landing moved `HEAD` too. So an in-place member of a
+///   `fan_out = 1` node is also dropped when any other row of the run, in any status and at any
+///   position, has a `started_at` strictly after the member's `finished_at`. Under A3 nothing
+///   that starts a session is admitted while an in-place future is in flight, and that future
+///   lands before it returns, so such a row started after the landing. A tie keeps the member,
+///   as A9's. A fanned-out winner lands at its selection, which no column stamps, so this rule
+///   leaves it to the two above.
 #[must_use]
 pub fn frontiers(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<StepId> {
     let graph = crate::walk::Graph::of(snapshot);
@@ -421,6 +429,13 @@ pub fn frontiers(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<StepId> {
             .iter()
             .any(|(_, _, other)| other.finished_at > winner.finished_at)
     };
+    let started_after = |phase: &SnapshotPhase, winner: &RunStep| {
+        let finished = winner.finished_at.unwrap_or(DateTime::<Utc>::MIN_UTC);
+        phase.fan_out == 1
+            && steps.iter().any(|row| {
+                row.id != winner.id && row.started_at.is_some_and(|started| started > finished)
+            })
+    };
     winners
         .iter()
         .filter(|(position, _, winner)| {
@@ -433,7 +448,7 @@ pub fn frontiers(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<StepId> {
             !matches!(
                 phase.isolation,
                 Isolation::Local | Isolation::SharedSerialized
-            ) || !landed_later(winner)
+            ) || !(landed_later(winner) || started_after(phase, winner))
         })
         .map(|(_, _, winner)| winner.id)
         .collect()
@@ -1788,5 +1803,107 @@ mod tests {
             timed(&snapshot, "w", 1, StepStatus::Running, Some(10), None),
         ];
         assert!(frontiers(&snapshot, &rows).is_empty());
+    }
+
+    /// A hand-built graph (`walk.rs`'s builder), every node at `shared_serialized`.
+    fn in_place(nodes: &[(&str, i32)], edges: &[(&str, &str, EdgeKind)]) -> Snapshot {
+        let mut snapshot = walk_fx::graph(nodes, edges);
+        for phase in &mut snapshot.phases {
+            phase.isolation = Isolation::SharedSerialized;
+        }
+        snapshot
+    }
+
+    /// A9 over landings (repair 1): an in-place winner whose only proof of landing is a row a
+    /// loop later retired. `implement` attempt 1 started after `plan` finished, so `plan`
+    /// landed; re-landing it would refuse `primary_moved`. Linear parity with [`frontier`].
+    #[test]
+    fn an_in_place_winner_landed_before_a_retired_row_is_not_a_member() {
+        let snapshot = in_place(
+            &[("plan", 0), ("implement", 1), ("review", 2)],
+            &[
+                ("plan", "implement", NEXT),
+                ("implement", "review", NEXT),
+                ("review", "implement", EdgeKind::ChangesRequested),
+            ],
+        );
+        let rows = [
+            landed(&snapshot, "plan", 0, 1),
+            timed(
+                &snapshot,
+                "implement",
+                1,
+                StepStatus::Superseded,
+                Some(2),
+                Some(3),
+            ),
+            timed(
+                &snapshot,
+                "review",
+                1,
+                StepStatus::Cancelled,
+                Some(4),
+                Some(5),
+            ),
+            timed(&snapshot, "implement", 2, StepStatus::Pending, None, None),
+        ];
+        assert_eq!(frontier(&snapshot, &rows), None, "M2's rule");
+        assert!(
+            frontiers(&snapshot, &rows).is_empty(),
+            "`implement` attempt 1 started after `plan` finished, so `plan` landed"
+        );
+    }
+
+    /// A9 over landings (repair 1), on a branch: the in-place sink `x` finished before `c`'s
+    /// first attempt started, which a loop since retired.
+    #[test]
+    fn an_in_place_sink_landed_before_a_retired_arm_is_not_a_member() {
+        let snapshot = in_place(
+            &[("a", 0), ("x", 1), ("c", 2), ("d", 3)],
+            &[
+                ("a", "x", NEXT),
+                ("a", "c", NEXT),
+                ("c", "d", NEXT),
+                ("d", "c", EdgeKind::ChangesRequested),
+            ],
+        );
+        let rows = [
+            landed(&snapshot, "a", 0, 1),
+            landed(&snapshot, "x", 2, 3),
+            timed(&snapshot, "c", 1, StepStatus::Superseded, Some(4), Some(5)),
+            timed(&snapshot, "d", 1, StepStatus::Superseded, Some(6), Some(7)),
+            timed(&snapshot, "c", 2, StepStatus::Running, Some(8), None),
+        ];
+        assert!(frontiers(&snapshot, &rows).is_empty());
+    }
+
+    /// The landing rule is strict, as A9's tie: a row started at the instant the in-place winner
+    /// finished (a frozen clock) proves nothing, so the member is kept. A fanned-out winner lands
+    /// at its selection, which no column stamps, so a row started after its `finished_at` does
+    /// not drop it.
+    #[test]
+    fn the_landing_rule_keeps_a_tie_and_a_selected_winner() {
+        let snapshot = in_place(
+            &[("a", 0), ("b", 1), ("c", 2)],
+            &[("a", "c", NEXT), ("b", "c", NEXT)],
+        );
+        let a = landed(&snapshot, "a", 0, 1);
+        let tied = timed(&snapshot, "b", 1, StepStatus::Running, Some(1), None);
+        assert_eq!(frontiers(&snapshot, &[a.clone(), tied]), [a.id]);
+
+        let mut snapshot = in_place(
+            &[("f", 0), ("b", 1), ("c", 2)],
+            &[("f", "c", NEXT), ("b", "c", NEXT)],
+        );
+        snapshot.phases[0].fan_out = 2;
+        let mut rows = Vec::new();
+        for index in 0..2 {
+            let mut candidate = landed(&snapshot, "f", 0, 1);
+            candidate.fanout_index = index;
+            candidate.selected = Some(index == 0);
+            rows.push(candidate);
+        }
+        rows.push(timed(&snapshot, "b", 1, StepStatus::Running, Some(2), None));
+        assert_eq!(frontiers(&snapshot, &rows), [rows[0].id]);
     }
 }
