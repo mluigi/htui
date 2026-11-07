@@ -781,7 +781,7 @@ struct WalkEnd {
     cancelled: Option<EngineError>,
     /// The first other error.
     error: Option<EngineError>,
-    /// The position whose future ended the walk while siblings were live.
+    /// The position whose future first ended the walk (a terminal rest or an error).
     ender: Option<i32>,
     /// The walk's cut was sent.
     cut: bool,
@@ -836,11 +836,14 @@ impl WalkEnd {
         }
     }
 
-    /// Ends the walk at `position`: with siblings live, cut them (blueprint A5).
+    /// Ends the walk at `position`, which names the ender in the cut notes: with siblings live,
+    /// cut them (blueprint A5).
     fn end_at(&mut self, position: Option<i32>, siblings: bool, walks: &WalkScopes, run: RunId) {
+        if self.ender.is_none() {
+            self.ender = position;
+        }
         if siblings && !self.cut {
             self.cut = true;
-            self.ender = position;
             walks.cut(run);
         }
     }

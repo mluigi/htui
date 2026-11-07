@@ -524,13 +524,14 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// a node that also reads its verdict loops over `changes_requested`; and a reject of a failed
 /// settle's park on an `asks_you` node is that gate's own and ends the run (D8).
 ///
-/// **Sixteen for MOD-138 M3 T3** (plan D1-D5; blueprint A2-A6, A11; the T1 verify's owed
+/// **Seventeen for MOD-138 M3 T3** (plan D1-D5; blueprint A2-A6, A11; the T1 verify's owed
 /// selection): concurrent nodes. A chain's isolator calls are unchanged; incomparable branches
 /// are live at once up to `max_parallel_sessions`, a heavier node alone; a join waits for both
 /// landings; worktree branches both land, in-place ones never overlap anything, and an owed
 /// selection lands before an in-place node; a park drains its siblings, a sibling's park on the
 /// parked run parks its step only, and one answer of two parks re-parks; a node ending the run
-/// cuts its live sibling and the cleanup waits for the drain; a loop on one branch retires only
+/// cuts its live sibling, an end after a park cancels the parked step, and the cleanup waits for
+/// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
@@ -830,6 +831,7 @@ pub const CASES: &[&str] = &[
     "a_sibling_parking_on_a_parked_run_parks_its_step_only",
     "one_answer_of_two_parks_re_parks_without_walking_on",
     "a_node_ending_the_run_cuts_its_live_sibling",
+    "a_park_then_an_end_cancels_the_parked_step",
     "a_terminal_branch_defers_cleanup_until_its_sibling_settles",
     "a_loop_on_one_branch_retires_only_its_region",
     "a_loop_owed_beside_its_successor_runs_first",
@@ -10697,6 +10699,9 @@ fn concurrency_case<'a, H: CaseHarness>(
         "a_node_ending_the_run_cuts_its_live_sibling" => {
             Box::pin(a_node_ending_the_run_cuts_its_live_sibling(harness))
         }
+        "a_park_then_an_end_cancels_the_parked_step" => {
+            Box::pin(a_park_then_an_end_cancels_the_parked_step(harness))
+        }
         "a_terminal_branch_defers_cleanup_until_its_sibling_settles" => Box::pin(
             a_terminal_branch_defers_cleanup_until_its_sibling_settles(harness),
         ),
@@ -11375,6 +11380,59 @@ async fn a_node_ending_the_run_cuts_its_live_sibling<H: CaseHarness>(harness: &H
     assert_eq!(run_of(&orch, run).await.status, RunStatus::Failed);
 }
 
+/// MOD-138 M3 D3 (blueprint §3.6 step 4): a park and then an end. `plan` parks at its gate while
+/// `implement`'s session is held; released, `implement` fails the run with nothing else in
+/// flight. The run ended under a parked step, so the walk cancels `plan`'s row with a note naming
+/// `implement` and answers the terminal rest, which wins over the park (A11).
+async fn a_park_then_an_end_cancels_the_parked_step<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| match phase.name.as_str() {
+        "plan" => phase.gate = Gate::Always,
+        "implement" => phase.retry_limit = 0,
+        _ => {}
+    })
+    .await;
+    orch.script("implement", 1, ScriptedStep::done_without_output());
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+
+    let release = async {
+        within(implement.live(1), "implement live").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        within(
+            until_steps(&orch, run, |steps| {
+                latest_row(steps, 1).is_some_and(|step| step.status == StepStatus::AwaitingApproval)
+            }),
+            "plan parked",
+        )
+        .await;
+        implement.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), release) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        rest.run,
+        RunStatus::Failed,
+        "the end wins over the park: {rest:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Cancelled),
+        "no step waits on a finished run"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "step `plan` attempt 1 cancelled: the run ended at `implement`"),
+        "{notes:?}"
+    );
+    assert_eq!(orch.isolator().cleanups(), 1);
+}
+
 /// MOD-138 M3 A4: a terminal path inside one node's future leaves the cleanup to the walk while
 /// a sibling is in flight. `plan`'s landing is held inside its reconcile when `implement`'s
 /// session (held until then) fails the run: no cleanup yet. Once the landing answers, the walk
@@ -11539,8 +11597,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            156,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 16: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            157,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -11592,14 +11650,14 @@ mod tests {
              auto mode's stop, a back `asks_you` loop, its crash replay and its spent budget, a \
              decision read from its row after a restart, accept declining, a verdict-reading \
              `asks_you` node's reject looping, and a failed settle's park rejected as ever), and \
-             MOD-138 M3 T3's sixteen concurrency cases (plan D1-D5, blueprint A2-A6, A11: a linear \
+             MOD-138 M3 T3's seventeen concurrency cases (plan D1-D5, blueprint A2-A6, A11: a linear \
              graph's isolator call order unchanged, two branches live at once, a cap of two over three \
              branches, a fan-out heavier than the cap alone, a join waiting for both landings, two \
              worktree landings into one repository, shared_serialized branches never overlapping, \
              an in-place node never overlapping a worktree node, an owed selection landing before an \
              in-place node, a park draining its sibling, a sibling parking on a parked run, one answer \
-             of two parks re-parking, a node ending the run cutting its live sibling, cleanup \
-             deferred until the sibling settled, a loop on one branch retiring only its region, and \
+             of two parks re-parking, a node ending the run cutting its live sibling, a park then \
+             an end cancelling the parked step, cleanup deferred until the sibling settled, a loop on one branch retiring only its region, and \
              an owed loop running before its successor)"
         );
     }

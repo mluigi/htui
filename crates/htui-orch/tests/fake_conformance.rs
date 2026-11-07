@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        156,
+        157,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -36,13 +36,13 @@ fn cases_len_is_pinned() {
          `asks_you` approved and rejected, auto mode's stop, a back `asks_you` loop, its crash \
          replay and its spent budget, a decision read from its row after a restart, accept \
          declining, a verdict-reading `asks_you` node's reject looping, and a failed settle's park \
-         rejected as ever) 140, and MOD-138 M3 T3's sixteen concurrency cases (plan D1-D5, \
+         rejected as ever) 140, and MOD-138 M3 T3's seventeen concurrency cases (plan D1-D5, \
          blueprint A2-A6, A11: a linear graph's call order, two branches live at once, a cap of two, \
          a fan-out heavier than the cap, a join waiting for both landings, two worktree landings, \
          shared_serialized never overlapping, in-place beside worktree, an owed selection before an \
          in-place node, a park draining its sibling, a sibling parking on a parked run, one answer of \
-         two parks re-parking, a cut sibling, deferred cleanup, a loop on one branch, an owed loop \
-         before its successor) 156"
+         two parks re-parking, a cut sibling, a park then an end, deferred cleanup, a loop on one branch, an owed loop \
+         before its successor) 157"
     );
 }
 
