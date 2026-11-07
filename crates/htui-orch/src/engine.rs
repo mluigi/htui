@@ -695,6 +695,78 @@ impl WalkScopes {
     }
 }
 
+#[cfg(test)]
+mod walk_scopes {
+    use htui_agent::record::{Control, RELAY_GRACE, Signal, control_channel};
+    use htui_core::model::RunId;
+
+    use super::WalkScopes;
+
+    /// The scope lives as long as its guard; a run with no open walk has no walk control.
+    #[test]
+    fn a_scope_lives_as_long_as_its_guard() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        assert!(scopes.control(run).is_none());
+        let guard = scopes.open(run);
+        assert!(scopes.control(run).is_some());
+        drop(guard);
+        assert!(scopes.control(run).is_none());
+    }
+
+    /// A run cancel is forwarded once, its grace kept; the cut then changes nothing. A cut alone
+    /// is `RELAY_GRACE`'s cancel.
+    #[test]
+    fn a_cancel_is_forwarded_once_and_a_cut_is_a_cancel() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let _guard = scopes.open(run);
+        let walk = scopes.control(run).expect("an open walk");
+        let (sender, own) = control_channel();
+        scopes.forward(run, &own);
+        assert_eq!(walk.signal(), Signal::Run, "nothing to forward yet");
+        let grace = std::time::Duration::from_secs(7);
+        sender.send_replace(Signal::Cancel { grace });
+        scopes.forward(run, &own);
+        scopes.cut(run);
+        assert_eq!(
+            walk.signal(),
+            Signal::Cancel { grace },
+            "the run's cancel came first"
+        );
+
+        let other = RunId::new();
+        let _guard = scopes.open(other);
+        scopes.cut(other);
+        assert_eq!(
+            scopes
+                .control(other)
+                .map(|control: Control| control.signal()),
+            Some(Signal::Cancel { grace: RELAY_GRACE })
+        );
+    }
+
+    /// A4: the cleanup is deferred only beside a sibling, and owed once.
+    #[test]
+    fn a_cleanup_defers_only_beside_a_sibling() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        assert!(!scopes.defer_cleanup(run), "no walk: clean up now");
+        let _guard = scopes.open(run);
+        scopes.set_in_flight(run, 1);
+        assert!(!scopes.defer_cleanup(run), "alone: clean up now");
+        scopes.set_in_flight(run, 2);
+        assert!(scopes.defer_cleanup(run), "a sibling is live");
+        assert!(scopes.shares_park(run));
+        assert!(scopes.take_cleanup_owed(run));
+        assert!(!scopes.take_cleanup_owed(run), "owed once");
+        scopes.set_in_flight(run, 1);
+        assert!(!scopes.shares_park(run), "alone and unparked");
+        scopes.mark_parked(run);
+        assert!(scopes.shares_park(run), "a future of the walk parked it");
+    }
+}
+
 /// How one walk ended so far (blueprint §3.4, §3.6, A11): the first of each kind, kept for
 /// [`Engine::settle_walk`].
 #[derive(Debug, Default)]

@@ -3871,4 +3871,69 @@ mod tests {
             ]
         );
     }
+
+    /// MOD-138 M3 T3 (F14): with `interleave_reconciles` two landings are in progress at once
+    /// and the high-water mark says so; without it each answers at its first poll. The call log
+    /// records both, and a stalled call dropped still closes its count.
+    #[tokio::test]
+    async fn interleaved_reconciles_overlap_and_are_counted() {
+        use futures::FutureExt as _;
+
+        let isolator = FakeIsolator::new();
+        let (first, second) = (StepId::new(), StepId::new());
+        assert!(isolator.reconcile(first, &[], &[]).now_or_never().is_some());
+        assert_eq!(isolator.reconcile_high_water(), 1);
+        isolator.interleave_reconciles();
+        let mut one = isolator.reconcile(first, &[], &[]);
+        let mut two = isolator.reconcile(second, &[], &[]);
+        assert!(one.as_mut().now_or_never().is_none(), "it yields once");
+        assert!(two.as_mut().now_or_never().is_none());
+        assert_eq!(isolator.reconcile_high_water(), 2);
+        drop((one, two));
+        assert_eq!(
+            isolator.call_log(),
+            [
+                super::IsolatorCall::Reconcile(first),
+                super::IsolatorCall::Reconcile(first),
+                super::IsolatorCall::Reconcile(second),
+            ]
+        );
+        assert_eq!(isolator.in_place_overlaps(), 0, "no tree is in place");
+    }
+
+    /// MOD-138 M3 T3: an in-place step's window opening beside another step's open window is an
+    /// overlap, in either order; two `worktree` windows are not.
+    #[tokio::test]
+    async fn an_in_place_window_beside_another_is_an_overlap() {
+        let isolator = FakeIsolator::new();
+        let run = htui_core::model::RunId::new();
+        let (a, b, c) = (StepId::new(), StepId::new(), StepId::new());
+        for step in [a, b] {
+            isolator
+                .prepare(run, step, &[], Isolation::Worktree, None)
+                .await
+                .expect("the fake prepares");
+        }
+        assert_eq!(isolator.in_place_overlaps(), 0, "two worktree trees");
+        isolator
+            .prepare(run, c, &[], Isolation::Local, None)
+            .await
+            .expect("the fake prepares");
+        assert_eq!(
+            isolator.in_place_overlaps(),
+            1,
+            "an in-place tree beside them"
+        );
+        for step in [a, b, c] {
+            isolator
+                .capture(step, &[])
+                .await
+                .expect("the fake captures");
+        }
+        isolator
+            .prepare(run, a, &[], Isolation::Local, None)
+            .await
+            .expect("the fake prepares");
+        assert_eq!(isolator.in_place_overlaps(), 1, "alone, no overlap");
+    }
 }
