@@ -534,12 +534,15 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
 ///
-/// **Ten for MOD-138 M3 T4** (plan D6; blueprint A7-A10): recovery among concurrent landings.
-/// Every done winner that may not have landed is re-landed, in topological order, by the sweep,
-/// by a crash-cut unpark's resume and, before its own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered chain walked last, a done branch beside a still
-/// running one, an already landed branch (idempotently), only the later of two in-place
-/// landings, and a loop's re-run target beside its side successor's older row; every running row
-/// is adjudicated, and running branches recovered into parks park each without `StaleWrite`.
+/// **Eleven for MOD-138 M3 T4** (plan D6; blueprint A7-A10, and the hand-back twin of T3's
+/// repair 2): recovery among concurrent landings. Every done winner that may not have landed is
+/// re-landed, in topological order, by the sweep, by a crash-cut unpark's resume and, before its
+/// own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered
+/// chain walked last, a done branch beside a still running one, an already landed branch
+/// (idempotently), only the later of two in-place landings, and a loop's re-run target beside
+/// its side successor's older row. Every running row is adjudicated, and running branches
+/// recovered into parks park each without `StaleWrite`. A rejection handed back beside another
+/// parked step ends the run and cancels that step, as the in-process answer does.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -858,6 +861,7 @@ pub const CASES: &[&str] = &[
     "a_re_run_loop_target_is_re_landed_beside_an_older_side_successor",
     "a_crash_cut_unpark_on_a_branching_run_lands_every_frontier",
     "answering_one_of_two_parks_lands_a_crashed_answers_winner",
+    "a_rejection_handed_back_cancels_the_other_parked_step",
 ];
 
 /// Run one case by name.
@@ -11838,6 +11842,9 @@ fn concurrent_recovery_case<'a, H: CaseHarness>(
         "answering_one_of_two_parks_lands_a_crashed_answers_winner" => Box::pin(
             answering_one_of_two_parks_lands_a_crashed_answers_winner(harness),
         ),
+        "a_rejection_handed_back_cancels_the_other_parked_step" => Box::pin(
+            a_rejection_handed_back_cancels_the_other_parked_step(harness),
+        ),
         _ => return None,
     })
 }
@@ -12394,6 +12401,69 @@ async fn answering_one_of_two_parks_lands_a_crashed_answers_winner<H: CaseHarnes
     );
 }
 
+/// MOD-138 M3 (T3 repair 2's hand-back twin, MOD-41 plan D12): on a `worker` box the answer is
+/// only written and handed back. `plan` and `implement` both parked on the diamond, `plan` is
+/// rejected and has no loop edge: the adopter finishes the rejection as the in-process tail
+/// does. The run fails at `plan`, and `implement`'s parked row is cancelled with a note naming
+/// `plan` rather than parked again over a rejected sibling.
+async fn a_rejection_handed_back_cancels_the_other_parked_step<H: CaseHarness>(harness: &H) {
+    let a = harness.fresh();
+    feat_3_graph(&a, DIAMOND, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    let (run, rest) = start(&a, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "{rest:?}");
+
+    a.set_tails(Tails::HandBack);
+    let rest = answer_at(
+        &a,
+        run,
+        1,
+        GateAnswer::Rejected {
+            note: "wrong plan".to_owned(),
+        },
+    )
+    .await;
+    assert_handed_back(&a, run, &rest).await;
+
+    let b = a.restarted();
+    let Resume::Walked(rest) = adopted(&b, run).await else {
+        panic!("the live graph did not move, so the adopter walks its snapshot");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (
+            RunStatus::Failed,
+            Some(1),
+            Some(RunFailure::Rejected {
+                phase: "plan".to_owned()
+            })
+        ),
+        "the adopter ends the run where the in-process tail does: {rest:?}"
+    );
+    assert_eq!(run_of(&b, run).await.status, RunStatus::Failed);
+    assert_eq!(
+        sorted_shape(&b, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed),
+            (2, 1, StepStatus::Cancelled),
+        ],
+        "no row waits on a finished run"
+    );
+    let notes = notes_of(&b, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "step `implement` attempt 1 cancelled: the run ended at `plan`"),
+        "{notes:?}"
+    );
+    assert_eq!(b.isolator().cleanups(), 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -12418,8 +12488,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            170,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            171,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -12489,7 +12559,8 @@ mod tests {
              branches both adjudicated, running branches recovered into a park each, and a re-run \
              loop target re-landed beside an older side successor, and a crash-cut unpark on a \
              branching run landing every frontier member, and an answer to one of two parks \
-             landing the other, crashed answer's winner first)"
+             landing the other, crashed answer's winner first), and T4's hand-back twin of T3 \
+             repair 2 (a rejection handed back cancelling the other parked step)"
         );
     }
 
