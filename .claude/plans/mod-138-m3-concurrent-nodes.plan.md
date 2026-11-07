@@ -9,6 +9,15 @@ parallel landings); M1/M2 record `docs/decisions/mod/mod-138-decisions.md`; M2 p
 migration (Q-1). Linear graphs must walk exactly as before.
 **Routing**: PRD path (continuing), ultracode for implement and review (maintainer, 2026-11-07).
 **Status**: CONFIRMED 2026-11-07 (maintainer). Fact-checked: 23 claims, 8 amended.
+Blueprint `.claude/plans/mod-138-m3-concurrent-nodes.blueprint.md` (findings F1-F23). Blueprint amendments **A1-A12
+accepted by the maintainer 2026-11-07**, binding over the text below; under A3, D7 (`local` on concurrent nodes
+refused at resolve) is kept. In short: A1 nodes keyed by position, owned `drive_node` futures; A2 a node is admitted
+only when incomparable with every in-flight node; A3 an in-place node's session is exclusive against every
+tree-touching future; A4 `cleanup_run` deferred while siblings are in flight; A5 a walk-scoped cut channel, the
+scheduler writes the `cancelled` rows; A6 strict park and `status::run_resumable`; A7 `recover_run` adjudicates every
+running row; A8 a successor proves a landing only if it started at or after the winner finished; A9 the in-place
+frontier rule over every mode; A10 an answer lands the other frontier members first; A11 a drained walk returns the
+first park's rest, an ending rest wins; A12 task file sets per blueprint §7.
 
 ## Summary
 
