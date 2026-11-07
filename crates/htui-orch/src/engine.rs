@@ -80,7 +80,7 @@ use crate::secrets::RunSecrets;
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
     Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
-    next_attempt, resumable, winner_at,
+    next_attempt, run_resumable, winner_at,
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
@@ -2783,9 +2783,8 @@ where
             if row.status == RunStatus::AwaitingApproval {
                 let snapshot = Self::snapshot_of(&row)?;
                 let steps = self.parts.store.run_steps(run).await?;
-                if resumable(&cursor(&snapshot, &steps), &steps)
-                    && !self.unpark(&row, self.now()).await?
-                {
+                // MOD-138 M3 A6: every cursor of `ready`, not the first alone.
+                if run_resumable(&snapshot, &steps) && !self.unpark(&row, self.now()).await? {
                     return Err(stale_run(
                         run,
                         RunStatus::AwaitingApproval,
@@ -2974,7 +2973,8 @@ where
             let resumable = if run.status.is_active() {
                 let snapshot = Self::snapshot_of(&run)?;
                 let steps = self.parts.store.run_steps(run.id).await?;
-                resumable(&cursor(&snapshot, &steps), &steps)
+                // MOD-138 M3 A6: every cursor of `ready`, as the Runs pane reads it.
+                run_resumable(&snapshot, &steps)
             } else {
                 false
             };
@@ -4042,8 +4042,9 @@ where
             let steps = self.parts.store.run_steps(run).await?;
             let at = cursor(&snapshot, &steps);
             // Blueprint D196 (widened by MOD-37 R-31): the one predicate `Unblock`'s third case
-            // reads too.
-            if resumable(&at, &steps) {
+            // reads too. MOD-138 M3 A6: over every cursor of `ready`; a sibling's owed `Decide`
+            // sorts first, and a run parked beside it on a real gate is not resumable.
+            if run_resumable(&snapshot, &steps) {
                 // MOD-4 plan D180 (R-31): the unpark is this walk's first compare-and-set, and a
                 // run another command unparked first is not this walk's to merge or walk.
                 if !self.unpark(row, self.now()).await? {

@@ -523,6 +523,15 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// item and walks on when approved; a decision is read from its row after a restart; a reject on
 /// a node that also reads its verdict loops over `changes_requested`; and a reject of a failed
 /// settle's park on an `asks_you` node is that gate's own and ends the run (D8).
+///
+/// **Sixteen for MOD-138 M3 T3** (plan D1-D5; blueprint A2-A6, A11; the T1 verify's owed
+/// selection): concurrent nodes. A chain's isolator calls are unchanged; incomparable branches
+/// are live at once up to `max_parallel_sessions`, a heavier node alone; a join waits for both
+/// landings; worktree branches both land, in-place ones never overlap anything, and an owed
+/// selection lands before an in-place node; a park drains its siblings, a sibling's park on the
+/// parked run parks its step only, and one answer of two parks re-parks; a node ending the run
+/// cuts its live sibling and the cleanup waits for the drain; a loop on one branch retires only
+/// its region; and an owed loop runs before its comparable successor.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -809,6 +818,21 @@ pub const CASES: &[&str] = &[
     "a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run",
     // MOD-138 M3 T3 (plan D1, D3, D4; blueprint A2-A6, A11): concurrent nodes.
     "a_linear_graph_keeps_its_call_order",
+    "two_independent_branches_are_live_at_once",
+    "three_branches_under_a_cap_of_two_never_run_three",
+    "a_fan_out_heavier_than_the_cap_runs_alone",
+    "a_join_waits_for_both_predecessors_to_land",
+    "two_worktree_landings_into_one_repository_both_land",
+    "shared_serialized_branches_never_overlap",
+    "an_in_place_node_never_overlaps_a_worktree_node",
+    "an_owed_selection_lands_before_an_in_place_node",
+    "a_park_on_one_branch_drains_the_other",
+    "a_sibling_parking_on_a_parked_run_parks_its_step_only",
+    "one_answer_of_two_parks_re_parks_without_walking_on",
+    "a_node_ending_the_run_cuts_its_live_sibling",
+    "a_terminal_branch_defers_cleanup_until_its_sibling_settles",
+    "a_loop_on_one_branch_retires_only_its_region",
+    "a_loop_owed_beside_its_successor_runs_first",
 ];
 
 /// Run one case by name.
@@ -10637,6 +10661,51 @@ fn concurrency_case<'a, H: CaseHarness>(
         "a_linear_graph_keeps_its_call_order" => {
             Box::pin(a_linear_graph_keeps_its_call_order(harness))
         }
+        "two_independent_branches_are_live_at_once" => {
+            Box::pin(two_independent_branches_are_live_at_once(harness))
+        }
+        "three_branches_under_a_cap_of_two_never_run_three" => {
+            Box::pin(three_branches_under_a_cap_of_two_never_run_three(harness))
+        }
+        "a_fan_out_heavier_than_the_cap_runs_alone" => {
+            Box::pin(a_fan_out_heavier_than_the_cap_runs_alone(harness))
+        }
+        "a_join_waits_for_both_predecessors_to_land" => {
+            Box::pin(a_join_waits_for_both_predecessors_to_land(harness))
+        }
+        "two_worktree_landings_into_one_repository_both_land" => {
+            Box::pin(two_worktree_landings_into_one_repository_both_land(harness))
+        }
+        "shared_serialized_branches_never_overlap" => {
+            Box::pin(shared_serialized_branches_never_overlap(harness))
+        }
+        "an_in_place_node_never_overlaps_a_worktree_node" => {
+            Box::pin(an_in_place_node_never_overlaps_a_worktree_node(harness))
+        }
+        "an_owed_selection_lands_before_an_in_place_node" => {
+            Box::pin(an_owed_selection_lands_before_an_in_place_node(harness))
+        }
+        "a_park_on_one_branch_drains_the_other" => {
+            Box::pin(a_park_on_one_branch_drains_the_other(harness))
+        }
+        "a_sibling_parking_on_a_parked_run_parks_its_step_only" => Box::pin(
+            a_sibling_parking_on_a_parked_run_parks_its_step_only(harness),
+        ),
+        "one_answer_of_two_parks_re_parks_without_walking_on" => {
+            Box::pin(one_answer_of_two_parks_re_parks_without_walking_on(harness))
+        }
+        "a_node_ending_the_run_cuts_its_live_sibling" => {
+            Box::pin(a_node_ending_the_run_cuts_its_live_sibling(harness))
+        }
+        "a_terminal_branch_defers_cleanup_until_its_sibling_settles" => Box::pin(
+            a_terminal_branch_defers_cleanup_until_its_sibling_settles(harness),
+        ),
+        "a_loop_on_one_branch_retires_only_its_region" => {
+            Box::pin(a_loop_on_one_branch_retires_only_its_region(harness))
+        }
+        "a_loop_owed_beside_its_successor_runs_first" => {
+            Box::pin(a_loop_owed_beside_its_successor_runs_first(harness))
+        }
         _ => return None,
     })
 }
@@ -10697,6 +10766,755 @@ async fn a_linear_graph_keeps_its_call_order<H: CaseHarness>(harness: &H) {
     assert_eq!(orch.live_sessions_high_water(), 1);
 }
 
+/// MOD-138 M3 T3: how long a concurrency case waits on held sessions before it calls the walk
+/// serial. Real time: the sessions are held by the fake, never by the clock.
+const HELD: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `fut` under [`HELD`]: a serial walk never has two held sessions live, so it would wait for ever.
+async fn within<F: Future>(fut: F, what: &str) -> F::Output {
+    tokio::time::timeout(HELD, fut)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the walk did not get there; is it serial?"))
+}
+
+/// Yields until `check` holds over the run's steps: the case's half of a `join` with the walk.
+async fn until_steps<O: Orchestrate>(orch: &O, run: RunId, check: impl Fn(&[RunStep]) -> bool) {
+    while !check(&steps_of(orch, run).await) {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The FEAT-3 run the case started, once `StartRun` wrote it (the seeded `RUN_2` aside).
+async fn feat_3_run<O: Orchestrate>(orch: &O) -> Option<RunId> {
+    orch.store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.id != ids::RUN_2)
+        .map(|run| run.id)
+}
+
+/// FEAT-3 ungated, every phase's `input_kinds` cleared and `mutate` applied, over `edges`.
+async fn feat_3_graph<O: Orchestrate>(
+    orch: &O,
+    edges: &[AuthoredEdge<'_>],
+    mutate: impl Fn(&mut StepGraphPhase),
+) {
+    feat_3_gated(orch, Gate::Never, |phase| {
+        phase.input_kinds.clear();
+        mutate(phase);
+    })
+    .await;
+    author_edges(orch, ids::HTUI_FEAT_3, edges).await;
+}
+
+/// The diamond `prd → {plan, implement} → review`, every edge `next`.
+const DIAMOND: &[AuthoredEdge<'static>] = &[
+    ("prd", "plan", EdgeKind::Next, None, None),
+    ("prd", "implement", EdgeKind::Next, None, None),
+    ("plan", "review", EdgeKind::Next, None, None),
+    ("implement", "review", EdgeKind::Next, None, None),
+];
+
+/// `prd → {plan, implement, review}`: three branches, every one a sink.
+const FAN_OF_THREE: &[AuthoredEdge<'static>] = &[
+    ("prd", "plan", EdgeKind::Next, None, None),
+    ("prd", "implement", EdgeKind::Next, None, None),
+    ("prd", "review", EdgeKind::Next, None, None),
+];
+
+/// `prd → plan → review` and `prd → implement`, a sink beside the chain.
+const CHAIN_AND_SINK: &[AuthoredEdge<'static>] = &[
+    ("prd", "plan", EdgeKind::Next, None, None),
+    ("plan", "review", EdgeKind::Next, None, None),
+    ("prd", "implement", EdgeKind::Next, None, None),
+];
+
+/// Answers the parked step at `position` (fan-out index 0, its latest attempt).
+async fn answer_at<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    position: i32,
+    answer: GateAnswer,
+) -> Rest {
+    let step = steps_of(orch, run)
+        .await
+        .into_iter()
+        .filter(|step| step.position == position && step.fanout_index == 0)
+        .max_by_key(|step| step.attempt)
+        .expect("the position has a step");
+    assert_eq!(step.status, StepStatus::AwaitingApproval, "{step:?}");
+    let outcome = orch
+        .dispatch(Command::AnswerGate {
+            run,
+            step: step.id,
+            answer,
+        })
+        .await
+        .expect("the parked gate is answerable");
+    let CommandOutcome::Answered { rest } = outcome else {
+        panic!("`AnswerGate` answers `Answered`, not {outcome:?}");
+    };
+    rest
+}
+
+/// The latest row at `position` (fan-out index 0), if any.
+fn latest_row(steps: &[RunStep], position: i32) -> Option<&RunStep> {
+    steps
+        .iter()
+        .filter(|step| step.position == position && step.fanout_index == 0)
+        .max_by_key(|step| step.attempt)
+}
+
+/// MOD-138 M3 D1: on the diamond `prd → {plan, implement} → review`, `plan` and `implement` are
+/// incomparable, so both sessions are live at once (held by the fake until both are), and the
+/// join runs once both landed.
+async fn two_independent_branches_are_live_at_once<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |_| {}).await;
+    let hold = orch.hold_sessions(&[("plan", 1), ("implement", 1)]);
+
+    let release = async {
+        within(hold.live(2), "both branches live").await;
+        hold.release();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        orch.live_sessions_high_water(),
+        2,
+        "the two branches, and never more"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
+}
+
+/// MOD-138 M3 D1: three branches under a frozen `max_parallel_sessions = 2` never have more than
+/// two sessions live; the third runs once one of them ended, and all three finish.
+async fn three_branches_under_a_cap_of_two_never_run_three<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(2));
+    feat_3_graph(&orch, FAN_OF_THREE, |_| {}).await;
+    let hold = orch.hold_sessions(&[("plan", 1), ("implement", 1), ("review", 1)]);
+
+    let release = async {
+        within(hold.live(2), "two branches live").await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(hold.reached(), 2, "the cap holds the third back");
+        hold.release();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(orch.live_sessions_high_water(), 2);
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+}
+
+/// MOD-138 M3 D1: a node whose `fan_out` (3) is above the cap (2) still runs, alone: its three
+/// candidates are live together and `implement` (weight 1) is not even created beside the group.
+/// The judgeless group parks for a human, which drains the walk; the selection walks on.
+async fn a_fan_out_heavier_than_the_cap_runs_alone<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(2));
+    orch.store()
+        .set_app_setting("max_agents_per_run", serde_json::json!(16));
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" {
+            phase.fan_out = 3;
+        }
+    })
+    .await;
+    let hold = orch.hold_sessions(&[("plan", 1), ("implement", 1)]);
+
+    let release = async {
+        within(hold.live(3), "the group live").await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            hold.reached(),
+            3,
+            "`implement` waits beside the heavy group"
+        );
+        hold.release();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the judgeless group parks for a human: {rest:?}"
+    );
+    assert_eq!(orch.live_sessions_high_water(), 3);
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        latest_row(&steps, 2).map(|step| step.status),
+        Some(StepStatus::Pending),
+        "`implement` was created beside the weightless selection, and the park drained the walk"
+    );
+    assert!(latest_row(&steps, 3).is_none(), "the join waits");
+
+    let rest = act(
+        &orch,
+        run,
+        Act::Select {
+            position: 1,
+            index: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(orch.live_sessions_high_water(), 3);
+}
+
+/// MOD-138 M3 D2: a join is not created until both predecessors landed. `plan`'s landing is held
+/// inside its reconcile; `implement` finishes and lands meanwhile, and `review` has no row until
+/// `plan`'s reconcile answers.
+async fn a_join_waits_for_both_predecessors_to_land<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |_| {}).await;
+    primary_repo(&orch).await;
+    // `prd`'s landing is the first reconcile, `plan`'s the second: `implement`'s session is held
+    // until `plan` is inside it.
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    let (reached, resume) = orch.isolator().pause_nth_reconcile(2);
+
+    let meddle = async {
+        within(reached.notified(), "plan's landing").await;
+        implement.release();
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        within(
+            until_steps(&orch, run, |steps| {
+                latest_row(steps, 2).is_some_and(|step| step.status == StepStatus::Done)
+                    && orch.isolator().reconciles().len() == 3
+            }),
+            "implement landed",
+        )
+        .await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            latest_row(&steps, 1).map(|step| step.status),
+            Some(StepStatus::Done),
+            "`plan` is done, its landing held"
+        );
+        assert!(
+            latest_row(&steps, 3).is_none(),
+            "no join row while a predecessor's landing is in flight"
+        );
+        resume.notify_one();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle);
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    let log = call_log_of(&orch, run).await;
+    let first = |entry: &str| {
+        log.iter()
+            .position(|call| call == entry)
+            .unwrap_or_else(|| panic!("{entry} in {log:?}"))
+    };
+    assert!(first("reconcile 1/1/0") < first("prepare 3/1/0"), "{log:?}");
+    assert!(first("reconcile 2/1/0") < first("prepare 3/1/0"), "{log:?}");
+}
+
+/// MOD-138 M3 D5: two `worktree` branches into one repository both land, each its own merge, and
+/// the join runs after both. The fake has no admin lock, so their landings may interleave here;
+/// the real isolator's per-repository lock is what serialises them (`tests/gix_isolator.rs`).
+async fn two_worktree_landings_into_one_repository_both_land<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        phase.isolation = Some(Isolation::Worktree);
+    })
+    .await;
+    primary_repo(&orch).await;
+    orch.isolator().interleave_reconciles();
+    orch.interleave_sessions();
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    let log = call_log_of(&orch, run).await;
+    for landing in ["reconcile 1/1/0", "reconcile 2/1/0"] {
+        assert_eq!(
+            log.iter().filter(|call| *call == landing).count(),
+            1,
+            "{landing} once: {log:?}"
+        );
+    }
+    assert_eq!(
+        orch.live_sessions_high_water(),
+        2,
+        "both branches were live together"
+    );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
+}
+
+/// MOD-138 M3 D4 (A3): two `shared_serialized` branches work in the primary checkout, so they
+/// never overlap: one tree-touching future at a time, sessions and landings alike, even with
+/// every session and landing yielding.
+async fn shared_serialized_branches_never_overlap<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.isolation = Some(Isolation::SharedSerialized);
+        }
+    })
+    .await;
+    primary_repo(&orch).await;
+    orch.isolator().interleave_reconciles();
+    orch.interleave_sessions();
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        orch.isolator().in_place_overlaps(),
+        0,
+        "{:?}",
+        call_log_of(&orch, run).await
+    );
+    assert_eq!(orch.isolator().reconcile_high_water(), 1);
+    assert_eq!(orch.live_sessions_high_water(), 1);
+}
+
+/// MOD-138 M3 A3: an in-place (`shared_serialized`) branch never overlaps a `worktree` one: a
+/// worktree landing merges into, and refuses on, the checkout the in-place agent edits.
+async fn an_in_place_node_never_overlaps_a_worktree_node<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        phase.isolation = Some(match phase.name.as_str() {
+            "plan" => Isolation::SharedSerialized,
+            _ => Isolation::Worktree,
+        });
+    })
+    .await;
+    primary_repo(&orch).await;
+    orch.isolator().interleave_reconciles();
+    orch.interleave_sessions();
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        orch.isolator().in_place_overlaps(),
+        0,
+        "{:?}",
+        call_log_of(&orch, run).await
+    );
+    assert_eq!(orch.isolator().reconcile_high_water(), 1);
+    assert_eq!(orch.live_sessions_high_water(), 1);
+}
+
+/// MOD-138 M3 (T1 verify, A9): an owed selection lands before an in-place node touches its trees.
+/// `audit` (FEAT-3's `review`, renamed so it may fan out) fans out two `worktree` candidates off
+/// `prd`; `implement` (`shared_serialized`) waits behind `plan`. When `audit`'s group settles,
+/// `implement`'s run and `audit`'s auto-win are both owed and `implement` sorts first; the
+/// winner still lands before `implement` prepares its checkout.
+async fn an_owed_selection_lands_before_an_in_place_node<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(
+        &orch,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("prd", "audit", EdgeKind::Next, None, None),
+        ],
+        |phase| {
+            phase.isolation = Some(Isolation::Worktree);
+            if phase.name == "implement" {
+                phase.isolation = Some(Isolation::SharedSerialized);
+            }
+            if phase.name == "review" {
+                phase.name = "audit".to_owned();
+                phase.fan_out = 2;
+                phase.verify_command = Some("cargo test".to_owned());
+            }
+        },
+    )
+    .await;
+    primary_repo(&orch).await;
+    set_judge(&orch, ids::HTUI_FEAT_3).await;
+    // The fake answers every step's verify in call order: `prd`, then `plan` and the group in
+    // whichever order they reach it; exactly one candidate passes either way.
+    for report in [
+        FakeVerifier::pass(),
+        FakeVerifier::pass(),
+        FakeVerifier::fail(1),
+        FakeVerifier::pass(),
+    ] {
+        orch.verifier().script_report(report);
+    }
+
+    // The group is held until `implement` is created, so its selection and `implement`'s run are
+    // owed in one pass.
+    let group = orch.hold_sessions(&[("audit", 1)]);
+    let release = async {
+        within(group.live(2), "the group live").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        within(
+            until_steps(&orch, run, |steps| latest_row(steps, 2).is_some()),
+            "implement created",
+        )
+        .await;
+        group.release();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?} {:?}",
+        notes_of(&orch, ids::HTUI_FEAT_3).await
+    );
+    let log = call_log_of(&orch, run).await;
+    let first = |entry: &str| {
+        log.iter()
+            .position(|call| call.starts_with(entry))
+            .unwrap_or_else(|| panic!("{entry} in {log:?}"))
+    };
+    assert!(
+        first("reconcile 3/1/") < first("prepare 2/1/0"),
+        "the auto-win landed before the in-place node prepared: {log:?}"
+    );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0, "{log:?}");
+}
+
+/// MOD-138 M3 D3 (Q-2): a park on one branch drains the other. `plan` parks at its gate;
+/// `implement`, already admitted, runs on through its session, gate and landing; the run rests
+/// at `plan`'s park and the join is not created.
+async fn a_park_on_one_branch_drains_the_other<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    primary_repo(&orch).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(1), None)
+    );
+    let steps = steps_of(&orch, run).await;
+    let implement = latest_row(&steps, 2).expect("`implement` was admitted");
+    assert_eq!(implement.status, StepStatus::Done, "the sibling ran on");
+    assert!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == implement.id),
+        "and landed"
+    );
+    assert!(latest_row(&steps, 3).is_none(), "nothing new was admitted");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+}
+
+/// MOD-138 M3 D3 (V15): a sibling parking on a run its sibling already parked parks its step
+/// only. Both are answered in turn: the first answer parks the run again on the second (A6, no
+/// note), and the second walks the run on to `done`.
+async fn a_sibling_parking_on_a_parked_run_parks_its_step_only<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the first park's rest (A11)"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+            (2, 1, StepStatus::AwaitingApproval),
+        ]
+    );
+
+    let rest = answer_at(&orch, run, 1, GateAnswer::Approved).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(2)),
+        "parked again on `implement`"
+    );
+    let rest = answer_at(&orch, run, 2, GateAnswer::Approved).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ]
+    );
+}
+
+/// MOD-138 M3 A6 (V20): after a drain the run rests on two parked steps. Answering one walks no
+/// further: `plan`'s successor `review` is not created while `implement` still waits, the run is
+/// parked again with no second note, and the second answer walks on.
+async fn one_answer_of_two_parks_re_parks_without_walking_on<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, CHAIN_AND_SINK, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+
+    let rest = answer_at(&orch, run, 1, GateAnswer::Approved).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(2), None),
+        "re-parked on `implement`"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        latest_row(&steps, 3).is_none(),
+        "`review` is not created while a step still waits (A6)"
+    );
+    assert_eq!(
+        notes_of(&orch, ids::HTUI_FEAT_3).await,
+        notes,
+        "the re-park writes no note"
+    );
+
+    let rest = answer_at(&orch, run, 2, GateAnswer::Approved).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        latest_row(&steps_of(&orch, run).await, 3).map(|step| step.status),
+        Some(StepStatus::Done)
+    );
+}
+
+/// FEAT-3 on the diamond with `implement` failing for good: it writes no output document and
+/// has no retry left, so its settle ends the run.
+async fn diamond_with_a_failing_implement<O: Orchestrate>(orch: &O) {
+    feat_3_graph(orch, DIAMOND, |phase| {
+        if phase.name == "implement" {
+            phase.retry_limit = 0;
+        }
+    })
+    .await;
+    orch.script("implement", 1, ScriptedStep::done_without_output());
+}
+
+/// MOD-138 M3 D3 (A5): a node ending the run cuts its live sibling. `plan`'s session is held
+/// live; `implement`'s session (held until `plan`'s is live) ends with no output and no retry
+/// left, which fails the run. The walk's cut cancels `plan`'s session, its row ends `cancelled`
+/// with a note naming `implement`, and cleanup runs once.
+async fn a_node_ending_the_run_cuts_its_live_sibling<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    diamond_with_a_failing_implement(&orch).await;
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+
+    let release = async {
+        within(plan.live(1), "plan live").await;
+        implement.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), release) },
+        "the cut",
+    )
+    .await;
+    assert_eq!(rest.run, RunStatus::Failed, "{rest:?}");
+    assert_eq!(
+        plan.reached(),
+        1,
+        "`plan`'s session was live when the run ended"
+    );
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran");
+    assert_eq!(plan.status, StepStatus::Cancelled);
+    assert_eq!(
+        latest_row(&steps, 2).map(|step| step.status),
+        Some(StepStatus::Failed),
+        "the ender keeps its failure"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "step `plan` attempt 1 cancelled: the run ended at `implement`"),
+        "{notes:?}"
+    );
+    assert_eq!(orch.isolator().cleanups(), 1);
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Failed);
+}
+
+/// MOD-138 M3 A4: a terminal path inside one node's future leaves the cleanup to the walk while
+/// a sibling is in flight. `plan`'s landing is held inside its reconcile when `implement`'s
+/// session (held until then) fails the run: no cleanup yet. Once the landing answers, the walk
+/// drains and cleans up, once.
+async fn a_terminal_branch_defers_cleanup_until_its_sibling_settles<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    diamond_with_a_failing_implement(&orch).await;
+    primary_repo(&orch).await;
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    // `prd`'s landing is the first reconcile, `plan`'s the second.
+    let (reached, resume) = orch.isolator().pause_nth_reconcile(2);
+
+    let meddle = async {
+        within(reached.notified(), "plan's landing").await;
+        implement.release();
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        loop {
+            if run_of(&orch, run).await.status == RunStatus::Failed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            orch.isolator().cleanups(),
+            0,
+            "the run failed with `plan` landing: its trees stay"
+        );
+        resume.notify_one();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the drain",
+    )
+    .await;
+    assert_eq!(rest.run, RunStatus::Failed, "{rest:?}");
+    assert_eq!(orch.isolator().cleanups(), 1, "once, when the walk drained");
+    let log = call_log_of(&orch, run).await;
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("cleanup run"),
+        "{log:?}"
+    );
+}
+
+/// MOD-138 M3 (F2a): a loop on one branch while the other is live retires only its region.
+/// `review → plan` is `changes_requested` on the chain `prd → plan → review`, beside the sink
+/// `implement`, whose session is held live throughout; the loop re-runs `plan` and `review` and
+/// never touches `implement`.
+async fn a_loop_on_one_branch_retires_only_its_region<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let mut edges = CHAIN_AND_SINK.to_vec();
+    edges.push(("review", "plan", EdgeKind::ChangesRequested, None, Some(1)));
+    feat_3_graph(&orch, &edges, |_| {}).await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    let hold = orch.hold_sessions(&[("implement", 1)]);
+
+    let release = async {
+        within(hold.live(1), "implement live").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        within(
+            until_steps(&orch, run, |steps| {
+                steps.iter().any(|step| {
+                    step.position == 3 && step.attempt == 2 && step.status == StepStatus::Done
+                })
+            }),
+            "the loop's second review",
+        )
+        .await;
+        hold.release();
+    };
+    let ((run, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let shape = sorted_shape(&orch, run).await;
+    assert_eq!(
+        shape
+            .iter()
+            .filter(|(position, _, _)| *position == 2)
+            .collect::<Vec<_>>(),
+        [&(2, 1, StepStatus::Done)],
+        "`implement` ran once and was never retired: {shape:?}"
+    );
+    assert!(
+        shape.contains(&(1, 2, StepStatus::Done)) && shape.contains(&(3, 2, StepStatus::Done)),
+        "{shape:?}"
+    );
+}
+
+/// MOD-138 M3 A2 (F2): on the chain `prd → plan → implement → review` with a back `asks_you`
+/// edge `implement → plan`, approving `implement` owes the loop **and** takes `implement →
+/// review`, so `ready` is `[Loop, Create(review)]`. `review` is comparable with `implement`, so
+/// only the loop runs: `review` is never created while the loop retires `plan..implement`.
+async fn a_loop_owed_beside_its_successor_runs_first<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(
+        &orch,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            ("implement", "plan", EdgeKind::AsksYou, None, Some(1)),
+        ],
+        |_| {},
+    )
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(2)),
+        "`implement` stops to ask"
+    );
+    let rest = answer_at(&orch, run, 2, GateAnswer::Approved).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(2)),
+        "the loop re-ran `plan` and `implement`, which stops again: {rest:?}"
+    );
+    let shape = sorted_shape(&orch, run).await;
+    assert!(
+        !shape.iter().any(|(position, _, _)| *position == 3),
+        "`review` was never created beside the owed loop: {shape:?}"
+    );
+    assert!(shape.contains(&(1, 2, StepStatus::Done)), "{shape:?}");
+    assert!(
+        shape.contains(&(2, 2, StepStatus::AwaitingApproval)),
+        "{shape:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -10721,8 +11539,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            141,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            156,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 16: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -10774,8 +11592,15 @@ mod tests {
              auto mode's stop, a back `asks_you` loop, its crash replay and its spent budget, a \
              decision read from its row after a restart, accept declining, a verdict-reading \
              `asks_you` node's reject looping, and a failed settle's park rejected as ever), and \
-             MOD-138 M3 T3's one concurrency case (plan D1: a linear graph's isolator call order \
-             unchanged)"
+             MOD-138 M3 T3's sixteen concurrency cases (plan D1-D5, blueprint A2-A6, A11: a linear \
+             graph's isolator call order unchanged, two branches live at once, a cap of two over three \
+             branches, a fan-out heavier than the cap alone, a join waiting for both landings, two \
+             worktree landings into one repository, shared_serialized branches never overlapping, \
+             an in-place node never overlapping a worktree node, an owed selection landing before an \
+             in-place node, a park draining its sibling, a sibling parking on a parked run, one answer \
+             of two parks re-parking, a node ending the run cutting its live sibling, cleanup \
+             deferred until the sibling settled, a loop on one branch retiring only its region, and \
+             an owed loop running before its successor)"
         );
     }
 

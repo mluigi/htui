@@ -14,7 +14,7 @@ use htui_core::model::{
 };
 use htui_core::store::{Result as StoreResult, StepFence, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
-use htui_orch::status::{group_at, judge_at, resumable};
+use htui_orch::status::{group_at, judge_at, run_resumable};
 use htui_orch::{
     Command, CommandOutcome, Cursor, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
     UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at,
@@ -472,7 +472,8 @@ fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase
     for (run, steps) in runs {
         let resumable = if run.status.is_active() {
             let snapshot = snapshot_of(run).map_err(|err| err.to_string())?;
-            resumable(&cursor(&snapshot, steps), steps)
+            // MOD-138 M3 A6: every cursor of `ready`, as the engine's `unblock_case` reads it.
+            run_resumable(&snapshot, steps)
         } else {
             false
         };
