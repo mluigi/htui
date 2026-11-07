@@ -350,35 +350,13 @@ pub fn resettle(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The frontier (plan D97, blueprint A-3)
+// The frontiers (MOD-138 M3 D6; plan D97, blueprint A-3)
 // ---------------------------------------------------------------------------------------------
 
-/// D97 as redefined (C129): the latest-attempt `done` winner at the highest position `p` having one
-/// (`selected == Some(true)`, or the one `fanout_index = 0` row of a `fan_out = 1` phase),
-/// provided every row at a position > `p` is `Superseded | Cancelled`.
-///
-/// Retired rows are ignored because a review rejection retires `target..=review` before the walk
-/// creates the next implement attempt, so the rejected review already sits after that attempt's
-/// winner. Every **live** row after `p` was created after `p`'s reconcile returned, so a live one
-/// means there is nothing to re-reconcile. Under blueprint A-3 the sweep reads this over the rows
-/// as adopted, before any step is adjudicated: a `running` row after `p` makes it `None`.
-#[must_use]
-pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
-    let winner = snapshot
-        .phases
-        .iter()
-        .rev()
-        .find_map(|phase| winner_at(phase, steps))?;
-    steps
-        .iter()
-        .filter(|step| step.position > winner.position)
-        .all(|step| matches!(step.status, StepStatus::Superseded | StepStatus::Cancelled))
-        .then_some(winner.id)
-}
-
 /// MOD-138 M3 D6 (Q-1, A8, A9): every done winner that may not have landed, in
-/// forward-topological order (ties by position). It replaces [`frontier`]'s position rule once
-/// T4 converts its callers.
+/// forward-topological order (ties by position). It replaced M2's position rule (plan D97 as
+/// redefined, C129: the done winner at the highest position, when every row after it is
+/// retired) in T4, which also removed that rule.
 ///
 /// - **Members.** The done winner (`winner_at`: latest attempt, `selected`, or index 0 when
 ///   `fan_out = 1`) of each walked node.
@@ -503,8 +481,8 @@ mod tests {
 
     use crate::gate::{Settle, StepFailure};
     use crate::recover::{
-        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, frontier, frontiers, heartbeat,
-        resettle, verify_of,
+        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, frontiers, heartbeat, resettle,
+        verify_of,
     };
     use crate::walk::tests as walk_fx;
 
@@ -1469,104 +1447,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // frontier
-    // -----------------------------------------------------------------------------------------
-
-    fn done(position: i32, attempt: i32) -> RunStep {
-        step(position, attempt, 0, StepStatus::Done)
-    }
-
-    #[test]
-    fn frontier_is_the_highest_done_winner_without_a_successor() {
-        let snapshot = snapshot();
-        let mut steps = vec![done(0, 1), done(1, 1), done(2, 1)];
-        assert_eq!(
-            frontier(&snapshot, &steps),
-            Some(steps[2].id),
-            "a crash between implement's `done` and its reconcile"
-        );
-        // An earlier attempt at the same position is not the winner.
-        steps[1].status = StepStatus::Superseded;
-        steps.push(done(1, 2));
-        assert_eq!(frontier(&snapshot, &steps), Some(steps[2].id));
-        // The last position: `Cursor::Finished` would `finish_run` over an unmerged primary.
-        steps.push(done(3, 1));
-        assert_eq!(frontier(&snapshot, &steps), Some(steps[4].id));
-        // Nothing `done` at all.
-        assert_eq!(
-            frontier(&snapshot, &[step(0, 1, 0, StepStatus::Running)]),
-            None
-        );
-        assert_eq!(frontier(&snapshot, &[]), None);
-    }
-
-    #[test]
-    fn frontier_is_none_mid_position() {
-        let snapshot = snapshot();
-        for status in [
-            StepStatus::Pending,
-            StepStatus::Running,
-            StepStatus::AwaitingApproval,
-            StepStatus::Failed,
-            StepStatus::Done,
-        ] {
-            let steps = [done(0, 1), done(1, 1), done(2, 1), step(3, 1, 0, status)];
-            let expected = (status == StepStatus::Done).then_some(steps[3].id);
-            assert_eq!(frontier(&snapshot, &steps), expected, "{status} at p + 1");
-        }
-        // The latest attempt at `p` is live: `p - 1`'s winner has a live successor.
-        let retried = [
-            done(0, 1),
-            done(1, 1),
-            step(2, 1, 0, StepStatus::Superseded),
-            step(2, 2, 0, StepStatus::Pending),
-        ];
-        assert_eq!(frontier(&snapshot, &retried), None);
-    }
-
-    #[test]
-    fn frontier_ignores_retired_rows_after_a_review_rejection() {
-        let snapshot = snapshot();
-        let steps = [
-            done(0, 1),
-            done(1, 1),
-            step(2, 1, 0, StepStatus::Superseded),
-            // The rejected review of attempt 1, retired by `edge_loop`.
-            step(3, 1, 0, StepStatus::Cancelled),
-            done(2, 2),
-        ];
-        assert_eq!(
-            frontier(&snapshot, &steps),
-            Some(steps[4].id),
-            "implement attempt 2 (C129)"
-        );
-    }
-
-    #[test]
-    fn frontier_of_a_fan_out_is_the_selected_winner() {
-        let mut snapshot = snapshot();
-        snapshot.phases[2].fan_out = 3;
-        let mut steps = vec![done(0, 1), done(1, 1)];
-        for index in 0..3 {
-            let mut candidate = step(2, 1, index, StepStatus::Done);
-            candidate.selected = Some(index == 1);
-            steps.push(candidate);
-        }
-        steps.push(step(2, 1, -1, StepStatus::Done));
-        assert_eq!(
-            frontier(&snapshot, &steps),
-            Some(steps[3].id),
-            "the selected candidate, not index 0 and not the judge"
-        );
-        // Nothing selected yet: index 0 of a fanned-out slot is not a winner, and the done
-        // candidates are live rows after `plan`, so there is no frontier at all.
-        for candidate in &mut steps[2..5] {
-            candidate.selected = Some(false);
-        }
-        assert_eq!(frontier(&snapshot, &steps), None);
-    }
-
-    // -----------------------------------------------------------------------------------------
     // frontiers (MOD-138 M3 D6, Q-1, A8, A9)
     // -----------------------------------------------------------------------------------------
 
@@ -1652,12 +1532,11 @@ mod tests {
         );
         let a = landed(&snapshot, "a", 0, 1);
         let b = landed(&snapshot, "b", 2, 3);
-        let rows = [a.clone(), b.clone()];
-        assert_eq!(frontiers(&snapshot, &rows), [b.id]);
+        let rows = [a, b.clone()];
         assert_eq!(
-            frontier(&snapshot, &rows),
-            Some(a.id),
-            "the position rule picks `a`, whose successor already landed"
+            frontiers(&snapshot, &rows),
+            [b.id],
+            "not `a`, the highest position, whose successor already landed"
         );
     }
 
@@ -1887,7 +1766,8 @@ mod tests {
 
     /// A9 over landings (repair 1): an in-place winner whose only proof of landing is a row a
     /// loop later retired. `implement` attempt 1 started after `plan` finished, so `plan`
-    /// landed; re-landing it would refuse `primary_moved`. Linear parity with [`frontier`].
+    /// landed; re-landing it would refuse `primary_moved`. Linear parity with M2's position rule,
+    /// which found no frontier here either.
     #[test]
     fn an_in_place_winner_landed_before_a_retired_row_is_not_a_member() {
         let snapshot = in_place(
@@ -1918,7 +1798,6 @@ mod tests {
             ),
             timed(&snapshot, "implement", 2, StepStatus::Pending, None, None),
         ];
-        assert_eq!(frontier(&snapshot, &rows), None, "M2's rule");
         assert!(
             frontiers(&snapshot, &rows).is_empty(),
             "`implement` attempt 1 started after `plan` finished, so `plan` landed"
