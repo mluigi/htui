@@ -665,6 +665,32 @@ pub fn required_inputs(
     snapshot: &GraphSnapshot,
     steps: &[RunStep],
 ) -> Vec<String> {
+    input_needs(phase, snapshot, steps)
+        .into_iter()
+        .filter_map(|(kind, need)| (need == InputNeed::Required).then_some(kind))
+        .collect()
+}
+
+/// Why `phase` needs (or may go without) one of its `input_kinds` (T1 repair 1), so a missing
+/// document's note names the rule that made it optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputNeed {
+    /// Required: a missing document refuses a strict spec.
+    Required,
+    /// Optional because a node reachable from this one produces it (M2 D9): not run yet.
+    Later,
+    /// Optional because every upstream producer is skipped behind a declined `if` (M3 D11).
+    SkippedUpstream,
+}
+
+/// Each of `phase`'s `input_kinds`, in order, with its [`InputNeed`] under
+/// [`required_inputs`]' two rules; the later-producer rule wins when both apply.
+#[must_use]
+pub fn input_needs(
+    phase: &SnapshotPhase,
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+) -> Vec<(String, InputNeed)> {
     let graph = Graph::of(snapshot);
     let reachable = graph.reachable_from(&phase.name);
     let upstream: Vec<usize> = graph
@@ -697,9 +723,16 @@ pub fn required_inputs(
     phase
         .input_kinds
         .iter()
-        .filter(|kind| !reachable.iter().any(|later| later.output_kind == **kind))
-        .filter(|kind| !skipped_upstream(kind))
-        .cloned()
+        .map(|kind| {
+            let need = if reachable.iter().any(|later| later.output_kind == *kind) {
+                InputNeed::Later
+            } else if skipped_upstream(kind) {
+                InputNeed::SkippedUpstream
+            } else {
+                InputNeed::Required
+            };
+            (kind.clone(), need)
+        })
         .collect()
 }
 
@@ -714,7 +747,7 @@ pub(crate) mod tests {
     };
     use serde_json::json;
 
-    use super::{Graph, ready, ready_masked, required_inputs};
+    use super::{Graph, InputNeed, input_needs, ready, ready_masked, required_inputs};
     use crate::status::Cursor;
 
     /// `RUN_1`'s snapshot and its first step, the shapes every node and row here is cloned from.
@@ -1552,6 +1585,36 @@ pub(crate) mod tests {
             required_inputs(&d, &snapshot, &[a, e]),
             ["b"],
             "`e` produces `b` and was not skipped"
+        );
+    }
+
+    /// D11 (T1 repair 1): `input_needs` says why each listed kind is optional, so `phase_spec`'s
+    /// note names the right rule: a later producer (M2 D9) or skipped upstream producers.
+    #[test]
+    fn input_needs_tells_a_later_producer_from_a_skipped_one() {
+        let mut snapshot = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3), ("e", 4)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+                ("d", "e", NEXT),
+            ],
+        );
+        snapshot.phases[3].input_kinds = vec!["b".into(), "c".into(), "e".into(), "x".into()];
+        let d = snapshot.phases[3].clone();
+        let mut a = done(&snapshot, "a");
+        a.branch = Some(json!({ "b": false }));
+        let c = done(&snapshot, "c");
+        assert_eq!(
+            input_needs(&d, &snapshot, &[a, c]),
+            [
+                ("b".to_owned(), InputNeed::SkippedUpstream),
+                ("c".to_owned(), InputNeed::Required),
+                ("e".to_owned(), InputNeed::Later),
+                ("x".to_owned(), InputNeed::Required),
+            ]
         );
     }
 

@@ -6256,26 +6256,41 @@ where
         // MOD-138 M3 D11: a kind whose every upstream producer is skipped behind a declined `if`
         // is optional, which reads the run's rows (V18); one read, so the callers are unchanged.
         let steps = self.parts.store.run_steps(run.id).await?;
-        let required = crate::walk::required_inputs(phase, snapshot, &steps);
+        use crate::walk::InputNeed;
+        let needs = crate::walk::input_needs(phase, snapshot, &steps);
+        // A kind `resolve_inputs` answers is always listed; an unlisted one stays optional, as
+        // `required_inputs` answered it.
+        let need = |kind: &str| {
+            needs
+                .iter()
+                .find(|(listed, _)| listed == kind)
+                .map_or(InputNeed::Later, |(_, need)| *need)
+        };
         let mut documents = Vec::with_capacity(resolved.len());
         let mut notes = Vec::new();
         for input in resolved {
-            match input.document {
-                Some(document) => documents.push(InputDocument {
+            match (input.document, need(&input.kind)) {
+                (Some(document), _) => documents.push(InputDocument {
                     kind: document.kind,
                     version: document.version,
                     body: document.body,
                 }),
-                None if strict && required.contains(&input.kind) => {
+                (None, InputNeed::Required) if strict => {
                     return Ok(Err(StageThree::MissingInput(input.kind)));
                 }
-                None if required.contains(&input.kind) => notes.push(format!(
+                (None, InputNeed::Required) => notes.push(format!(
                     "input `{}` resolves to no document; the handoff opens without it",
                     input.kind
                 )),
-                None => notes.push(format!(
+                (None, InputNeed::Later) => notes.push(format!(
                     "input `{}` is produced at a later position and has not run yet; \
                      it is optional on this attempt (plan D21)",
+                    input.kind
+                )),
+                // MOD-138 M3 D11 (T1 repair 1): the producers are upstream and will never run.
+                (None, InputNeed::SkippedUpstream) => notes.push(format!(
+                    "input `{}`'s producers were skipped behind a declined `if`; \
+                     it is optional (MOD-138 M3 D11)",
                     input.kind
                 )),
             }
