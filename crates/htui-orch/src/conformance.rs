@@ -12888,3 +12888,95 @@ mod recovery_paths {
         );
     }
 }
+
+/// MOD-138 M3 T3: engine paths around concurrency no [`CASES`] entry reaches.
+#[cfg(test)]
+mod concurrency_paths {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{EdgeKind, GraphSnapshot, RunStatus, StepStatus};
+
+    use super::{
+        FakeOrchestrator, Orchestrate, Resume, approve_without_walking, author_edges, item_of,
+        notes_of, start, step_shape, stored_v,
+    };
+
+    /// T2 repair 1, pinned at the engine (MOD-138 M3 D7, M2 D11): an in-flight **v1** run of a
+    /// `local` project whose live graph became a diamond. The live graph now refuses at resolve
+    /// (`LocalConcurrent`), which `resolve_or_refused` answers as `Resolution::Refused` with the
+    /// live phases; they still hash to the run's own v1 digest, so `resume` walks the run's lift
+    /// on, as under M2, and writes no topology note.
+    #[tokio::test]
+    async fn a_v1_run_whose_live_graph_became_a_local_diamond_walks_on() {
+        let orch = FakeOrchestrator::demo();
+        super::free_feat_3(&orch).await;
+        let project = item_of(&orch, ids::HTUI_FEAT_3).await.project_id;
+        orch.store()
+            .set_project_settings(project, serde_json::json!({"default_isolation": "local"}));
+        let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "a `local` chain starts and parks at `prd`'s gate"
+        );
+        crate::fake::rewrite_as_v1(orch.store(), run).await;
+        assert_eq!(stored_v(&orch, run).await, GraphSnapshot::V1);
+        approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+        author_edges(
+            &orch,
+            ids::HTUI_FEAT_3,
+            &[
+                ("prd", "plan", EdgeKind::Next, None, None),
+                ("prd", "implement", EdgeKind::Next, None, None),
+                ("plan", "review", EdgeKind::Next, None, None),
+                ("implement", "review", EdgeKind::Next, None, None),
+            ],
+        )
+        .await;
+        let live = crate::graph::resolve_or_refused(
+            orch.store(),
+            &orch.graphs(),
+            &item_of(&orch, ids::HTUI_FEAT_3).await,
+            htui_core::model::RunMode::Manual,
+            &std::collections::BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the live graph's phases build");
+        assert!(
+            matches!(
+                live,
+                crate::graph::Resolution::Refused {
+                    refusal: crate::graph::ResolveError::LocalConcurrent { .. },
+                    ..
+                }
+            ),
+            "the live graph is a `local` diamond, refused at resolve"
+        );
+
+        let resumed = orch.resume(run).await.expect("the run is readable");
+        let Resume::Walked(rest) = resumed else {
+            panic!("a refused live graph whose phases did not move is walked: {resumed:?}");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(1)),
+            "the run walks its own lift: position 1 ran and parked at its gate"
+        );
+        assert_eq!(
+            step_shape(&orch, run).await,
+            [
+                (0, 1, StepStatus::Done),
+                (1, 1, StepStatus::AwaitingApproval),
+            ]
+        );
+        let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+        assert!(
+            !notes
+                .iter()
+                .any(|body| body.starts_with("topology mismatch")
+                    || body.starts_with("live graph not comparable")),
+            "{notes:?}"
+        );
+    }
+}

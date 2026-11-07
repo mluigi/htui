@@ -4453,9 +4453,9 @@ mod role_gate {
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, demo_data, edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, ItemId, NewDocument,
-        NewRepo, NewRun, RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase,
-        TIMESTAMPTZ_DIGITS, Transport,
+        Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, EdgeId, EdgeKind, Executor, Gate,
+        ItemId, NewDocument, NewRepo, NewRun, RepoBoxPath, RepoId, RunId, RunMode, RunStatus,
+        RunStep, SnapshotPhase, StepGraphEdge, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -6030,6 +6030,296 @@ mod role_gate {
 
             assert_eq!((source.calls(), provider.resolves()), (2, 2));
         }
+    }
+
+    /// MOD-138 M3 T3: [`HoldImplement`]'s gate, released by the case.
+    type Release = tokio::sync::watch::Receiver<bool>;
+
+    /// One turn, then `done`, for every session; the session of FEAT-3's `implement` step is
+    /// held at its start until the case releases it, after signalling `reached`.
+    #[derive(Debug)]
+    struct HoldImplement {
+        store: MemStore,
+        reached: Arc<tokio::sync::Notify>,
+        release: Release,
+    }
+
+    impl TransportBuilder for HoldImplement {
+        fn build(
+            &self,
+            agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            let done = Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }))]);
+            Ok(Box::new(HeldDriver {
+                inner: FakeDriver::new(agent.name.clone(), caps, done),
+                store: self.store.clone(),
+                reached: Arc::clone(&self.reached),
+                release: self.release.clone(),
+            }))
+        }
+    }
+
+    /// [`HoldImplement`]'s driver.
+    #[derive(Debug)]
+    struct HeldDriver {
+        inner: FakeDriver,
+        store: MemStore,
+        reached: Arc<tokio::sync::Notify>,
+        release: Release,
+    }
+
+    impl HeldDriver {
+        /// Whether `cwd` is the tree of an `implement` step: the fake isolator roots each step's
+        /// tree at `<root>/<run>/<step>`.
+        async fn implements(&self, cwd: &std::path::Path) -> bool {
+            let Some(leaf) = cwd.file_name().and_then(|leaf| leaf.to_str()) else {
+                return false;
+            };
+            for run in self
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("the read answers")
+            {
+                let steps = self
+                    .store
+                    .run_steps(run.id)
+                    .await
+                    .expect("the read answers");
+                if steps
+                    .iter()
+                    .any(|step| step.id.to_string() == leaf && step.phase_name == "implement")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    impl AgentDriver for HeldDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: htui_agent::driver::SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+        {
+            Box::pin(async move {
+                if self.implements(&spec.cwd).await {
+                    self.reached.notify_one();
+                    let mut release = self.release.clone();
+                    let _ = release.wait_for(|released| *released).await;
+                }
+                self.inner.start(spec, prompt).await
+            })
+        }
+    }
+
+    /// FEAT-3 as the diamond `prd → {plan, implement} → review`, every input cleared, `plan`
+    /// gated `always` and every other phase `never`.
+    async fn feat_3_diamond_gated_at_plan(store: &MemStore) {
+        let graph = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the read answers")
+            .expect("the item resolves to a graph")
+            .graph
+            .id;
+        let mut body = store
+            .graph_body(graph)
+            .await
+            .expect("the read answers")
+            .expect("the graph is there");
+        for node in &mut body.nodes {
+            node.phase.input_kinds.clear();
+            node.phase.gate = if node.phase.name == "plan" {
+                Gate::Always
+            } else {
+                Gate::Never
+            };
+        }
+        let id = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .unwrap_or_else(|| panic!("FEAT-3 has a `{name}` phase"))
+        };
+        body.edges = [
+            ("prd", "plan"),
+            ("prd", "implement"),
+            ("plan", "review"),
+            ("implement", "review"),
+        ]
+        .iter()
+        .map(|(from, to)| StepGraphEdge {
+            id: EdgeId::new(),
+            graph_id: graph,
+            from: id(from),
+            to: id(to),
+            kind: EdgeKind::Next,
+            predicate: None,
+            loop_limit: None,
+        })
+        .collect();
+        let outcome = store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect("the store takes the diamond");
+        assert!(
+            matches!(outcome, htui_core::store::CasOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// MOD-138 M3 D3 (V13, V14): an `AnswerGate` sent while a walk drains waits on the run's
+    /// lock, announced by one `Waiting` frame, and lands once the walk ended. On the diamond,
+    /// `plan` parks at its gate while `implement`'s session is held; the walk drains on it, the
+    /// answer to `plan` waits, and when `implement` is released the walk rests, the answer takes
+    /// the lock, approves `plan` and walks the run to `done`. No second walk ever ran beside the
+    /// first.
+    #[tokio::test]
+    async fn an_answer_sent_while_a_walk_drains_waits_then_lands() {
+        let store = seeded(MemStore::demo()).await;
+        feat_3_diamond_gated_at_plan(&store).await;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = tokio::sync::watch::channel(false);
+        let mut factory = DriverFactory::new();
+        factory.register(
+            "acp",
+            Box::new(HoldImplement {
+                store: store.clone(),
+                reached: Arc::clone(&reached),
+                release: released,
+            }),
+        );
+        let mut runtime: RunRuntime<Backend, Timed> = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_author(Arc::new(OutputAuthor));
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        let live = LiveChats::default();
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                1,
+                RunRequest::Stream {
+                    item: ids::HTUI_FEAT_3,
+                },
+                &live,
+            )
+            .await;
+
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                2,
+                RunRequest::Orch(crate::OrchRequest::Command(htui_orch::Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace: None,
+                })),
+                &live,
+            )
+            .await;
+        tokio::time::timeout(PATIENCE, reached.notified())
+            .await
+            .expect("`implement`'s session starts and is held");
+        let (run, plan) = tokio::time::timeout(PATIENCE, async {
+            loop {
+                for row in store
+                    .runs(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("the read answers")
+                {
+                    let steps = store.run_steps(row.id).await.expect("the read answers");
+                    if let Some(plan) = steps.iter().find(|step| {
+                        step.phase_name == "plan" && step.status == StepStatus::AwaitingApproval
+                    }) {
+                        return (row.id, plan.id);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("`plan` parks while `implement` is held: the walk drains");
+        assert_eq!(status_of(&store, run).await, RunStatus::AwaitingApproval);
+
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                3,
+                RunRequest::Orch(crate::OrchRequest::Command(
+                    htui_orch::Command::AnswerGate {
+                        run,
+                        step: plan,
+                        answer: htui_orch::GateAnswer::Approved,
+                    },
+                )),
+                &live,
+            )
+            .await;
+        let waiting = || {
+            sink.frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(_, frame)| {
+                    frame.run == Some(run) && matches!(frame.kind, FrameKind::Waiting)
+                })
+                .count()
+        };
+        tokio::time::timeout(PATIENCE, async {
+            while waiting() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the answer announces its wait on the draining walk");
+        let plan_status = || async {
+            store
+                .run_steps(run)
+                .await
+                .expect("the read answers")
+                .iter()
+                .find(|step| step.id == plan)
+                .map(|step| step.status)
+        };
+        assert_eq!(
+            plan_status().await,
+            Some(StepStatus::AwaitingApproval),
+            "the answer waits for the drain"
+        );
+
+        release.send_replace(true);
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        rests_at(&store, run, RunStatus::Done).await;
+        assert_eq!(
+            plan_status().await,
+            Some(StepStatus::Done),
+            "the answer landed"
+        );
+        assert_eq!(waiting(), 1, "one `Waiting` frame for the queued answer");
     }
 }
 
