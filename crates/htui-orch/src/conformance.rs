@@ -49,8 +49,8 @@ use crate::command::{
 };
 use crate::engine::{Adopted, Next, Resume, SessionKey, Tails};
 use crate::fake::{
-    FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
-    rewrite_as_v1,
+    FakeIsolator, FakeOrchestrator, FakeVerifier, IsolatorCall, RESTART_GAP, ScriptedStep,
+    SessionHold, TestClock, rewrite_as_v1,
 };
 use crate::isolate::{ChangedPaths, Clock as _};
 use crate::promote;
@@ -236,6 +236,19 @@ pub trait Orchestrate {
     /// here.
     #[must_use]
     fn hosted(self) -> Self;
+
+    /// MOD-138 M3 T3 (F14): hold every session of the listed `(phase, attempt)`s before its first
+    /// event until the hold is released or the session cancelled. A serial walk never has two
+    /// held sessions live, so a case awaiting them runs under `tokio::time::timeout`.
+    #[must_use]
+    fn hold_sessions(&self, keys: &[(&str, i32)]) -> SessionHold;
+
+    /// MOD-138 M3 T3: the most sessions live at once in this orchestrator's engines.
+    fn live_sessions_high_water(&self) -> usize;
+
+    /// MOD-138 M3 T3 (F14): every session yields once before its first event, so admitted node
+    /// futures interleave.
+    fn interleave_sessions(&self);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -358,6 +371,18 @@ impl Orchestrate for FakeOrchestrator {
 
     fn hosted(self) -> Self {
         self.with_tool_host(Arc::new(crate::fake::FakeToolHost::default()))
+    }
+
+    fn hold_sessions(&self, keys: &[(&str, i32)]) -> SessionHold {
+        Self::hold_sessions(self, keys)
+    }
+
+    fn live_sessions_high_water(&self) -> usize {
+        Self::live_sessions_high_water(self)
+    }
+
+    fn interleave_sessions(&self) {
+        Self::interleave_sessions(self);
     }
 }
 
@@ -782,6 +807,8 @@ pub const CASES: &[&str] = &[
     "accepting_an_artifact_on_an_asks_you_node_declines_its_edges",
     "a_reject_on_a_verdict_reading_asks_you_node_loops",
     "a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run",
+    // MOD-138 M3 T3 (plan D1, D3, D4; blueprint A2-A6, A11): concurrent nodes.
+    "a_linear_graph_keeps_its_call_order",
 ];
 
 /// Run one case by name.
@@ -815,6 +842,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| item_state_case(name, harness))
         .or_else(|| graph_walker_case(name, harness))
         .or_else(|| branch_case(name, harness))
+        .or_else(|| concurrency_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -10598,6 +10626,77 @@ async fn a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run<H: CaseHarne
     );
 }
 
+// -- MOD-138 M3 T3: concurrent nodes (plan D1, D3, D4; blueprint A2-A6, A11) --------------------
+
+/// MOD-138 M3 T3's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn concurrency_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_linear_graph_keeps_its_call_order" => {
+            Box::pin(a_linear_graph_keeps_its_call_order(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// The isolator's call log, each step named `position/attempt/fanout_index` and the run `run`.
+async fn call_log_of<O: Orchestrate>(orch: &O, run: RunId) -> Vec<String> {
+    let steps = steps_of(orch, run).await;
+    let name = |step: StepId| {
+        steps.iter().find(|row| row.id == step).map_or_else(
+            || "?".to_owned(),
+            |row| format!("{}/{}/{}", row.position, row.attempt, row.fanout_index),
+        )
+    };
+    orch.isolator()
+        .call_log()
+        .into_iter()
+        .map(|call| match call {
+            IsolatorCall::Prepare(step) => format!("prepare {}", name(step)),
+            IsolatorCall::Capture(step) => format!("capture {}", name(step)),
+            IsolatorCall::Reconcile(step) => format!("reconcile {}", name(step)),
+            IsolatorCall::Reset(step) => format!("reset {}", name(step)),
+            IsolatorCall::Cleanup(id) => format!("cleanup {}", if id == run { "run" } else { "?" }),
+            IsolatorCall::Release(id) => format!("release {}", if id == run { "run" } else { "?" }),
+        })
+        .collect()
+}
+
+/// MOD-138 M3 D1 (plan risk "a linear graph's behaviour shifts"): a chain still runs one node
+/// future at a time, so FEAT-3 walked ungated over a repository makes exactly the isolator calls
+/// it made before the concurrent scheduler, in the same order. The literal was recorded on the
+/// serial walk (blueprint §7's first TDD step).
+async fn a_linear_graph_keeps_its_call_order<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    primary_repo(&orch).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    assert_eq!(
+        call_log_of(&orch, run).await,
+        [
+            "prepare 0/1/0",
+            "capture 0/1/0",
+            "reconcile 0/1/0",
+            "prepare 1/1/0",
+            "capture 1/1/0",
+            "reconcile 1/1/0",
+            "prepare 2/1/0",
+            "capture 2/1/0",
+            "reconcile 2/1/0",
+            "prepare 3/1/0",
+            "capture 3/1/0",
+            "reconcile 3/1/0",
+            "cleanup run",
+        ],
+        "one node future at a time, in position order, cleanup once at the end"
+    );
+    assert_eq!(orch.live_sessions_high_water(), 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -10622,8 +10721,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            140,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            141,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -10674,7 +10773,9 @@ mod tests {
              undecided branch parked and resumed, a forward `asks_you` approved and rejected, \
              auto mode's stop, a back `asks_you` loop, its crash replay and its spent budget, a \
              decision read from its row after a restart, accept declining, a verdict-reading \
-             `asks_you` node's reject looping, and a failed settle's park rejected as ever)"
+             `asks_you` node's reject looping, and a failed settle's park rejected as ever), and \
+             MOD-138 M3 T3's one concurrency case (plan D1: a linear graph's isolator call order \
+             unchanged)"
         );
     }
 

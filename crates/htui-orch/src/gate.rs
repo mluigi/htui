@@ -582,9 +582,9 @@ pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
 ///    and it never escalates. The item is **not** blocked (blueprint A9): the stop is already
 ///    the checkpoint a human answers, and approve then walks on, since no `Loop` is owed.
 ///
-/// Resolve refuses a back `asks_you` edge beside another `asks_you` edge (R1, E1:
-/// `NotRunnable::MixedAsksYou`), so the node has forward `asks_you` edges only, or exactly one
-/// back one; only the first back edge is read.
+/// The shared validator refuses a back `asks_you` edge beside another `asks_you` edge (rule W5 of
+/// `walk_refusal`, MOD-138 M3 D8: at save and at resolve), so the node has forward `asks_you`
+/// edges only, or exactly one back one; only the first back edge is read.
 async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,

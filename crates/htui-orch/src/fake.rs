@@ -161,6 +161,65 @@ pub struct FakeIsolator {
     /// MOD-89 review L5: the signal the next [`env_files`](Isolator::env_files) call sends, and
     /// the grace of the cancel it sends, before it answers. One-shot.
     cancel_at_env_files: Mutex<Option<(watch::Sender<Signal>, std::time::Duration)>>,
+    /// MOD-138 M3 T3: every `prepare`, `capture`, `reconcile`, `reset`, `cleanup` and `release`,
+    /// in call order, refusals included, for the linear call-order case.
+    call_log: Mutex<Vec<IsolatorCall>>,
+    /// MOD-138 M3 T3 (F14): whether each `reconcile` yields once after it records itself, so two
+    /// landings in flight interleave rather than each running to completion in one poll.
+    interleave_reconciles: AtomicBool,
+    /// MOD-138 M3 T3: the `reconcile` calls in progress now, and the most there ever were.
+    reconciling: Mutex<(u32, u32)>,
+    /// MOD-138 M3 T3: each step's open window, by `(step, Window)`, and whether it is in place:
+    /// `prepare`..`capture` for a tree, the call itself for a `reconcile`.
+    windows: Mutex<BTreeMap<(StepId, Window), bool>>,
+    /// MOD-138 M3 T3: how many windows opened beside another step's open window while either of
+    /// the two was in place (`local` or `shared_serialized`).
+    in_place_overlaps: Mutex<u32>,
+}
+
+/// One [`FakeIsolator`] call, as [`FakeIsolator::call_log`] records it (MOD-138 M3 T3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolatorCall {
+    /// `prepare` for the step.
+    Prepare(StepId),
+    /// `capture` for the step.
+    Capture(StepId),
+    /// `reconcile` with the step as the winner.
+    Reconcile(StepId),
+    /// `reset` of the step's trees.
+    Reset(StepId),
+    /// The run-terminal `cleanup`.
+    Cleanup(RunId),
+    /// `release` of the run's guards.
+    Release(RunId),
+}
+
+/// Which of a step's two isolator windows is open (MOD-138 M3 T3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Window {
+    /// `prepare` to `capture`: the step's agent may be working in its trees.
+    Tree,
+    /// Inside `reconcile`: the step is landing.
+    Landing,
+}
+
+/// Closes a `reconcile`'s window and its in-progress count on every exit, the stall's drop
+/// included.
+struct Reconciling<'a> {
+    isolator: &'a FakeIsolator,
+    winner: StepId,
+}
+
+impl Drop for Reconciling<'_> {
+    fn drop(&mut self) {
+        self.isolator.close_window(self.winner, Window::Landing);
+        let mut reconciling = self
+            .isolator
+            .reconciling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reconciling.0 = reconciling.0.saturating_sub(1);
+    }
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -484,6 +543,74 @@ impl FakeIsolator {
         key.and_then(|key| held.remove(&key))
     }
 
+    /// MOD-138 M3 T3: every call this isolator has seen, in order (see [`IsolatorCall`]).
+    #[must_use]
+    pub fn call_log(&self) -> Vec<IsolatorCall> {
+        self.call_log
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// MOD-138 M3 T3 (F14): from now on each `reconcile` yields once after it records itself, so
+    /// two landings in flight are both inside `reconcile` at once unless the walk serialises them.
+    pub fn interleave_reconciles(&self) {
+        self.interleave_reconciles.store(true, Ordering::SeqCst);
+    }
+
+    /// MOD-138 M3 T3: the most `reconcile` calls that were in progress at once.
+    #[must_use]
+    pub fn reconcile_high_water(&self) -> u32 {
+        self.reconciling
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .1
+    }
+
+    /// MOD-138 M3 T3: how many times a step's window (`prepare`..`capture`, or inside
+    /// `reconcile`) opened while another step's was open and either of the two was in place
+    /// (`local` or `shared_serialized`). A concurrent walk must keep this at `0` (blueprint A3).
+    #[must_use]
+    pub fn in_place_overlaps(&self) -> u32 {
+        *self
+            .in_place_overlaps
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+    }
+
+    fn log(&self, call: IsolatorCall) {
+        self.call_log
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push(call);
+    }
+
+    /// Opens `step`'s `window`, counting an overlap when another step's window is open and either
+    /// is in place.
+    fn open_window(&self, step: StepId, window: Window, in_place: bool) {
+        let mut windows = self
+            .windows
+            .lock()
+            .expect("no panic holds the fake isolator's lock");
+        if windows
+            .iter()
+            .any(|(&(other, _), &other_in_place)| other != step && (in_place || other_in_place))
+        {
+            *self
+                .in_place_overlaps
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+        }
+        windows.insert((step, window), in_place);
+    }
+
+    fn close_window(&self, step: StepId, window: Window) {
+        self.windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(step, window));
+    }
+
     /// The next synthetic-hash ordinal.
     fn tick(&self) -> u32 {
         let mut calls = self
@@ -526,6 +653,7 @@ impl Isolator for FakeIsolator {
         slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
+            self.log(IsolatorCall::Prepare(step));
             *self
                 .prepares
                 .lock()
@@ -553,6 +681,11 @@ impl Isolator for FakeIsolator {
                     .expect("no panic holds the fake isolator's lock")
                     .insert((run, step), guard);
             }
+            self.open_window(
+                step,
+                Window::Tree,
+                matches!(isolation, Isolation::Local | Isolation::SharedSerialized),
+            );
             let root = self
                 .tree_root
                 .lock()
@@ -606,6 +739,8 @@ impl Isolator for FakeIsolator {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
+            self.log(IsolatorCall::Capture(step));
+            self.close_window(step, Window::Tree);
             drop(self.release_step(step));
             let commits = self.commits(step, trees);
             self.captured
@@ -634,7 +769,7 @@ impl Isolator for FakeIsolator {
         siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            let _ = trees;
+            self.log(IsolatorCall::Reconcile(winner));
             let call = {
                 let mut reconciles = self
                     .reconciles
@@ -643,6 +778,29 @@ impl Isolator for FakeIsolator {
                 reconciles.push((winner, siblings.to_vec()));
                 reconciles.len()
             };
+            // MOD-138 M3 T3: the landing's window and the in-progress count, closed on every exit.
+            {
+                let mut reconciling = self
+                    .reconciling
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                reconciling.0 += 1;
+                reconciling.1 = reconciling.1.max(reconciling.0);
+            }
+            self.open_window(
+                winner,
+                Window::Landing,
+                trees.iter().any(|tree| {
+                    matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized)
+                }),
+            );
+            let _landing = Reconciling {
+                isolator: self,
+                winner,
+            };
+            if self.interleave_reconciles.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             // Blueprint F-A: the crash between `done` and the merge. Recorded, signalled, and
             // then this call never answers; the case drops the walk.
             if let Some((stalled, resume)) = self.reconcile_stall_at(call) {
@@ -767,7 +925,12 @@ impl Isolator for FakeIsolator {
     /// answer "how many cleanups", and the synthetic hashes are the other one's job.
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
-            let _ = (run, trees);
+            let _ = trees;
+            self.log(IsolatorCall::Cleanup(run));
+            self.windows
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .clear();
             // One run per fake in every case, so the run's guards are all of them.
             self.held
                 .lock()
@@ -789,7 +952,8 @@ impl Isolator for FakeIsolator {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ResetReport> {
         Box::pin(async move {
-            let _ = step;
+            self.log(IsolatorCall::Reset(step));
+            self.close_window(step, Window::Tree);
             *self
                 .resets
                 .lock()
@@ -812,6 +976,11 @@ impl Isolator for FakeIsolator {
     /// D99: every `shared_serialized` guard a step of `run` holds, dropped; counted.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
+            self.log(IsolatorCall::Release(run));
+            self.windows
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .clear();
             *self
                 .releases
                 .lock()
@@ -1752,6 +1921,165 @@ pub struct FakeOrchestrator {
     /// none (a provider project is then refused). Carried by [`restarted`](Self::restarted): a
     /// source is the machine's, like the keyring.
     secret_source: Mutex<Option<Arc<dyn SecretSource>>>,
+    /// MOD-138 M3 T3 (F14): every session's gauge, the holds and the interleaving switch. A
+    /// [`restarted`](Self::restarted) process starts with a fresh one.
+    sessions: Arc<Sessions>,
+}
+
+/// MOD-138 M3 T3 (F14): what [`FakeOrchestrator`] counts of its sessions. Counting adds no
+/// await, so no case that does not ask for a hold or the interleaving changes.
+#[derive(Debug, Default)]
+struct Sessions {
+    /// Sessions started and not yet dropped.
+    live: AtomicUsize,
+    /// The most that were ever live at once.
+    high_water: AtomicUsize,
+    /// Whether each session yields once before its first event.
+    interleave: AtomicBool,
+    /// The holds a case asked for, each matching `(phase, attempt)` sessions.
+    holds: Mutex<Vec<Arc<HoldState>>>,
+}
+
+/// One [`FakeOrchestrator::hold_sessions`]: the keys it holds, how many held sessions are live
+/// at their hold, and whether it was released.
+#[derive(Debug)]
+struct HoldState {
+    keys: Vec<(String, i32)>,
+    live: watch::Sender<usize>,
+    released: watch::Sender<bool>,
+}
+
+/// MOD-138 M3 T3 (F14): sessions held open before their first event, so a case can see them live
+/// together. A cancel releases a held session, as a cut must. A serial walk never has two live,
+/// so a case awaiting [`live`](Self::live) runs under `tokio::time::timeout`.
+#[derive(Debug, Clone)]
+pub struct SessionHold(Arc<HoldState>);
+
+impl SessionHold {
+    /// Returns once `n` held sessions have reached their hold.
+    pub async fn live(&self, n: usize) {
+        let mut seen = self.0.live.subscribe();
+        // A closed channel cannot happen: `self` holds the sender.
+        let _ = seen.wait_for(|live| *live >= n).await;
+    }
+
+    /// How many held sessions have reached their hold so far.
+    #[must_use]
+    pub fn reached(&self) -> usize {
+        *self.0.live.borrow()
+    }
+
+    /// Lets every held session, now and later, play its script.
+    pub fn release(&self) {
+        self.0.released.send_replace(true);
+    }
+}
+
+/// The driver [`FakeOrchestrator::driver_for_key`] hands out: the scripted one, its sessions
+/// counted (MOD-138 M3 T3), the shape of [`ToolWriting`].
+#[derive(Debug)]
+struct Counted {
+    inner: Box<dyn AgentDriver>,
+    sessions: Arc<Sessions>,
+    hold: Option<Arc<HoldState>>,
+}
+
+impl AgentDriver for Counted {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn caps(&self) -> DriverCaps {
+        self.inner.caps()
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: SessionSpec,
+        prompt: String,
+    ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+        Box::pin(async move {
+            let inner = self.inner.start(spec, prompt).await?;
+            let live = self.sessions.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.sessions.high_water.fetch_max(live, Ordering::SeqCst);
+            Ok(Box::new(CountedSession {
+                inner,
+                sessions: Arc::clone(&self.sessions),
+                hold: self.hold.clone(),
+                first: true,
+                arrived: false,
+                cancelled: false,
+            }) as Box<dyn AgentSession>)
+        })
+    }
+}
+
+/// A live session of [`Counted`]: counted from its start to its drop.
+#[derive(Debug)]
+struct CountedSession {
+    inner: Box<dyn AgentSession>,
+    sessions: Arc<Sessions>,
+    hold: Option<Arc<HoldState>>,
+    /// Before the first event: the interleaving yield and the hold still apply.
+    first: bool,
+    /// The hold counted this session live.
+    arrived: bool,
+    /// `cancel` was called: no hold applies any more.
+    cancelled: bool,
+}
+
+impl Drop for CountedSession {
+    fn drop(&mut self) {
+        self.sessions.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl AgentSession for CountedSession {
+    fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+        self.inner.session_ref()
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>> {
+        Box::pin(async move {
+            if self.first {
+                if self.sessions.interleave.load(Ordering::SeqCst) {
+                    self.first = false;
+                    tokio::task::yield_now().await;
+                }
+                if let Some(hold) = self.hold.clone()
+                    && !self.cancelled
+                {
+                    if !self.arrived {
+                        self.arrived = true;
+                        hold.live.send_modify(|live| *live += 1);
+                    }
+                    let mut released = hold.released.subscribe();
+                    // Dropped here by a cut (`drive` selects on its control): the next pull is
+                    // the cancel's drain, which `cancelled` lets through.
+                    let _ = released.wait_for(|released| *released).await;
+                }
+                self.first = false;
+            }
+            self.inner.next_event().await
+        })
+    }
+
+    fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+        self.inner.send_follow_up(text)
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        request_id: htui_agent::driver::PermissionRequestId,
+        answer: htui_agent::driver::PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        self.inner.answer_permission(request_id, answer)
+    }
+
+    fn cancel<'a>(&'a mut self, grace: std::time::Duration) -> DriverFuture<'a, ()> {
+        self.cancelled = true;
+        self.inner.cancel(grace)
+    }
 }
 
 impl FakeOrchestrator {
@@ -1795,6 +2123,7 @@ impl FakeOrchestrator {
             steal_before_tool_writes: AtomicBool::new(false),
             tool_writes: Arc::new(Mutex::new(Vec::new())),
             secret_source: Mutex::new(None),
+            sessions: Arc::new(Sessions::default()),
         }
     }
 
@@ -1863,7 +2192,59 @@ impl FakeOrchestrator {
             steal_before_tool_writes: AtomicBool::new(false),
             tool_writes: Arc::new(Mutex::new(Vec::new())),
             secret_source: Mutex::new(self.secret_source()),
+            sessions: Arc::new(Sessions::default()),
         }
+    }
+
+    /// MOD-138 M3 T3 (F14): the most sessions this orchestrator's engines had live at once.
+    #[must_use]
+    pub fn live_sessions_high_water(&self) -> usize {
+        self.sessions.high_water.load(Ordering::SeqCst)
+    }
+
+    /// MOD-138 M3 T3 (F14): from now on each session yields once before its first event, so the
+    /// walk's admitted node futures interleave rather than each running to completion in turn.
+    pub fn interleave_sessions(&self) {
+        self.sessions.interleave.store(true, Ordering::SeqCst);
+    }
+
+    /// MOD-138 M3 T3 (F14): every session of the listed `(phase, attempt)`s started from now on
+    /// waits before its first event until the returned hold is released, or the session is
+    /// cancelled.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn hold_sessions(&self, keys: &[(&str, i32)]) -> SessionHold {
+        let state = Arc::new(HoldState {
+            keys: keys
+                .iter()
+                .map(|(phase, attempt)| ((*phase).to_owned(), *attempt))
+                .collect(),
+            live: watch::channel(0).0,
+            released: watch::channel(false).0,
+        });
+        self.sessions
+            .holds
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .push(Arc::clone(&state));
+        SessionHold(state)
+    }
+
+    /// The hold `key`'s session waits on, if a case asked for one.
+    fn hold_for(&self, key: &SessionKey<'_>) -> Option<Arc<HoldState>> {
+        self.sessions
+            .holds
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .iter()
+            .find(|hold| {
+                hold.keys
+                    .iter()
+                    .any(|(phase, attempt)| phase == key.phase && *attempt == key.attempt)
+            })
+            .cloned()
     }
 
     /// MOD-10 D15: every engine built over this harness from now on resolves a provider
@@ -2227,6 +2608,16 @@ impl FakeOrchestrator {
     /// the shape `engine::DriverFor` hands the walk.
     #[must_use]
     pub fn driver_for_key(&self, key: &SessionKey<'_>) -> Box<dyn AgentDriver> {
+        // MOD-138 M3 T3: every session counted, and held when a case asked for it.
+        Box::new(Counted {
+            inner: self.scripted_driver(key),
+            sessions: Arc::clone(&self.sessions),
+            hold: self.hold_for(key),
+        })
+    }
+
+    /// [`driver_for_key`](Self::driver_for_key)'s driver before it is counted.
+    fn scripted_driver(&self, key: &SessionKey<'_>) -> Box<dyn AgentDriver> {
         let scripted = self.script_for_key(key);
         match scripted.spawn_failure {
             Some(reason) => Box::new(RefusingDriver {

@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        140,
+        141,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -36,7 +36,8 @@ fn cases_len_is_pinned() {
          `asks_you` approved and rejected, auto mode's stop, a back `asks_you` loop, its crash \
          replay and its spent budget, a decision read from its row after a restart, accept \
          declining, a verdict-reading `asks_you` node's reject looping, and a failed settle's park \
-         rejected as ever) 140"
+         rejected as ever) 140, and MOD-138 M3 T3's one concurrency case (plan D1: a linear \
+         graph's isolator call order unchanged) 141"
     );
 }
 
