@@ -4163,7 +4163,8 @@ where
     /// `selected` parked step — is a command that crashed between its first write and its
     /// `unpark`. Every guard refuses it, so the run is unparked here, the frontier that command
     /// would have reconciled is reconciled (plan D97; a refusal parks the run again), and the walk
-    /// goes on. A run parked at a real rest (`Rest`), or at a fan-out slot a human has to route
+    /// goes on. MOD-138 M3 D6: every member of [`recover::frontiers`], in topological order, since
+    /// a drain can leave several answered steps unmerged. A run parked at a real rest (`Rest`), or at a fan-out slot a human has to route
     /// (`Fan`, `Select`), is left where it is.
     ///
     /// MOD-37 R-31: a `Rest` at a `failed` + `rejected` step ([`crashed_rejection`]) is a
@@ -4181,7 +4182,6 @@ where
         if row.status == RunStatus::AwaitingApproval {
             let snapshot = Self::snapshot_of(row)?;
             let steps = self.parts.store.run_steps(run).await?;
-            let at = cursor(&snapshot, &steps);
             // Blueprint D196 (widened by MOD-37 R-31): the one predicate `Unblock`'s third case
             // reads too. MOD-138 M3 A6: over every cursor of `ready`; a sibling's owed `Decide`
             // sorts first, and a run parked beside it on a real gate is not resumable.
@@ -4197,21 +4197,39 @@ where
                 }
                 // MOD-37 R-31: the tail `answer_guarded` would have run, by plan D131's settle.
                 // Boxed: `settle_failed` holds `admit`'s and `edge_loop`'s futures, and this
-                // walk sits under `resume`, under `Unblock`.
-                if let Some(rejected) = crashed_rejection(&at, &steps) {
+                // walk sits under `resume`, under `Unblock`. MOD-138 M3 T4: read from the first
+                // `failed` rest of `ready`, which a sibling's owed write may sort behind.
+                if let Some(rejected) = crate::walk::ready(&snapshot, &steps)
+                    .iter()
+                    .find(|cursor| {
+                        matches!(
+                            cursor,
+                            Cursor::Rest {
+                                status: StepStatus::Failed,
+                                ..
+                            }
+                        )
+                    })
+                    .and_then(|at| crashed_rejection(at, &steps))
+                {
                     let row = self.run(run).await?;
                     return match Box::pin(self.settle_failed(&row, &snapshot, rejected)).await? {
                         Some(rest) => Ok(rest),
                         None => self.run_to_rest(run).await,
                     };
                 }
-                if let Some(winner) = recover::frontier(&snapshot, &steps)
-                    && let Some(done) = steps.iter().find(|step| step.id == winner)
-                {
+                // MOD-138 M3 D6: every frontier member, in topological order, each boxed (D10);
+                // the first refusal parks the run again and the members after it wait.
+                let row = self.run(run).await?;
+                for winner in recover::frontiers(&snapshot, &steps) {
+                    let Some(done) = steps.iter().find(|step| step.id == winner) else {
+                        continue;
+                    };
                     let siblings =
                         Self::siblings(&group_at(&steps, done.position, done.attempt), winner);
-                    let row = self.run(run).await?;
-                    if let Some(rest) = self.reconcile_done_step(&row, done, &siblings).await? {
+                    if let Some(rest) =
+                        Box::pin(self.reconcile_done_step(&row, done, &siblings)).await?
+                    {
                         return Ok(rest);
                     }
                 }
