@@ -29,8 +29,8 @@ use htui_core::model::{
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
-    check_attachment, edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
-    graph_body_walk_refusal, references_no_row, walk_refusal,
+    check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
+    graph_body_topology_refusal, graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
 
@@ -207,6 +207,22 @@ pub enum ResolveError {
         phase: String,
         /// `step_graph_phase.fan_out`.
         fan_out: i32,
+    },
+    /// MOD-138 M3 D7: two non-palette nodes that can be live together (neither reaches the other
+    /// over forward edges, [`forward_mask`]'s classification) both resolve to `local`, the
+    /// maintainer's one working tree. The first pair in position order. Every phase resolves to
+    /// `phase.isolation.unwrap_or(default_isolation)`, so a per-phase `worktree` override on
+    /// either node is the remedy, a `local` project's included.
+    #[error(
+        "phases `{first}` and `{second}` are both `local` and can run at the same time (neither \
+         reaches the other over forward edges), and `local` shares one working tree; set \
+         `worktree` isolation on one of them (MOD-138 M3 D7)"
+    )]
+    LocalConcurrent {
+        /// The earlier node's key, by position.
+        first: String,
+        /// The later node's key.
+        second: String,
     },
     /// Plan D64 (OQ-5): a `review` phase cannot fan out, because the loop's gate reads one review
     /// verdict and a group's review would need a judge of reviews nothing defines. MOD-138 M2 D10
@@ -545,6 +561,8 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         });
     }
 
+    local_concurrent_refusal(&phases, &edges)?;
+
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
         per_token_cap_run: caps.run_micros,
@@ -697,6 +715,81 @@ fn fan_out_edge_refusal(
                 node: phase.name.clone(),
                 reason: NotRunnable::FanOutEdge,
             });
+        }
+    }
+    Ok(())
+}
+
+/// MOD-138 M3 D7, once the expansion passed the walk checks (so the forward edges are acyclic):
+/// the first pair, in position order, of non-palette nodes that both resolved to
+/// [`Isolation::Local`] and that neither reaches the other over forward edges (`next`, `if`, a
+/// forward `asks_you`: [`forward_mask`], the walker's own split) is
+/// [`ResolveError::LocalConcurrent`]. Such nodes can be live together, and `local` is one
+/// working tree. The reachability is built here over the snapshot's node keys; an edge naming a
+/// palette node or an unknown key is left out, as the walk leaves it out.
+fn local_concurrent_refusal(
+    phases: &[SnapshotPhase],
+    edges: &[SnapshotEdge],
+) -> std::result::Result<(), ResolveError> {
+    let mut local: Vec<usize> = (0..phases.len())
+        .filter(|&node| !phases[node].palette && phases[node].isolation == Isolation::Local)
+        .collect();
+    if local.len() < 2 {
+        return Ok(());
+    }
+    local.sort_by_key(|&node| (phases[node].position, node));
+    let nodes: Vec<WalkNode<'_>> = phases
+        .iter()
+        .map(|phase| WalkNode {
+            name: &phase.name,
+            palette: phase.palette,
+        })
+        .collect();
+    let index = |key: &str| phases.iter().position(|phase| phase.name == key);
+    let walk: Vec<WalkEdge> = edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: index(&edge.from)?,
+                to: index(&edge.to)?,
+                kind: edge.kind,
+            })
+        })
+        .collect();
+    let mut forward = vec![Vec::new(); phases.len()];
+    for (edge, _) in walk
+        .iter()
+        .zip(forward_mask(&nodes, &walk))
+        .filter(|(_, forward)| *forward)
+    {
+        forward[edge.from].push(edge.to);
+    }
+    // Every node each `local` node reaches over forward edges, itself included.
+    let reached: Vec<Vec<bool>> = local
+        .iter()
+        .map(|&from| {
+            let mut seen = vec![false; phases.len()];
+            let mut queue = vec![from];
+            seen[from] = true;
+            while let Some(at) = queue.pop() {
+                for &next in &forward[at] {
+                    if !seen[next] {
+                        seen[next] = true;
+                        queue.push(next);
+                    }
+                }
+            }
+            seen
+        })
+        .collect();
+    for (i, &first) in local.iter().enumerate() {
+        for (j, &second) in local.iter().enumerate().skip(i + 1) {
+            if !reached[i][second] && !reached[j][first] {
+                return Err(ResolveError::LocalConcurrent {
+                    first: phases[first].name.clone(),
+                    second: phases[second].name.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -5262,6 +5355,152 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 ids::GRAPH_HTUI_FEAT
             ))
         );
+    }
+
+    // ---- MOD-138 M3 D7: `local` on two nodes that can be live together ----
+
+    /// The feature graph as a diamond, `prd → {plan, implement} → review` over `next` edges (its
+    /// review loop kept), with `isolation` set per named node.
+    fn diamond(body: &mut GraphBody, isolation: &[(&str, Isolation)]) {
+        let id = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .expect("the feature graph has the phase")
+        };
+        let next: Vec<(PhaseId, PhaseId)> = [
+            ("prd", "plan"),
+            ("prd", "implement"),
+            ("plan", "review"),
+            ("implement", "review"),
+        ]
+        .iter()
+        .map(|(from, to)| (id(from), id(to)))
+        .collect();
+        body.edges.retain(|edge| edge.kind != EdgeKind::Next);
+        for (from, to) in next {
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from,
+                to,
+                kind: EdgeKind::Next,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+        for (name, mode) in isolation {
+            for node in &mut body.nodes {
+                if node.phase.name == *name {
+                    node.phase.isolation = Some(*mode);
+                }
+            }
+        }
+    }
+
+    /// The feature graph under `settings`, made a diamond with `isolation`, resolved for FEAT-1.
+    async fn resolve_diamond(
+        settings: Value,
+        isolation: &[(&str, Isolation)],
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let store = store_with_settings(settings);
+        replace_feature(&store, |body| diamond(body, isolation)).await;
+        resolve_feat(&store, &TestSource::claude(&store)).await
+    }
+
+    /// D7: `local` on a diamond's two arms, which neither reaches the other over forward edges,
+    /// is refused naming both nodes (first pair in position order) and the per-phase `worktree`
+    /// remedy.
+    #[tokio::test]
+    async fn local_on_a_diamonds_two_arms_is_refused() {
+        let error = resolve_diamond(
+            json!({}),
+            &[("plan", Isolation::Local), ("implement", Isolation::Local)],
+        )
+        .await
+        .expect_err("two `local` nodes that can be live together");
+        assert_eq!(
+            error,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "phases `plan` and `implement` are both `local` and can run at the same time (neither \
+             reaches the other over forward edges), and `local` shares one working tree; set \
+             `worktree` isolation on one of them (MOD-138 M3 D7)"
+        );
+
+        // A `local` project: every node is `local`, and the arms are still the first pair.
+        let error = resolve_diamond(json!({"default_isolation": "local"}), &[])
+            .await
+            .expect_err("a `local` project's diamond");
+        assert_eq!(
+            error,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+    }
+
+    /// D7's remedy and its edges: a `local` project resolves its chain, and its diamond once one
+    /// arm says `worktree`; a diamond in `worktree`, or in `shared_serialized` on both arms,
+    /// resolves; one `local` arm beside a `worktree` one resolves.
+    #[tokio::test]
+    async fn local_on_a_chain_or_off_the_diamonds_arms_resolves() {
+        let store = store_with_settings(json!({"default_isolation": "local"}));
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a `local` chain is one node at a time")
+            .snapshot;
+        assert!(
+            snapshot
+                .phases
+                .iter()
+                .all(|phase| phase.isolation == Isolation::Local),
+            "{:?}",
+            snapshot.phases
+        );
+
+        for (settings, isolation, what) in [
+            (
+                json!({"default_isolation": "local"}),
+                &[("implement", Isolation::Worktree)][..],
+                "a `local` project, one arm `worktree`",
+            ),
+            (json!({}), &[][..], "the default `worktree`"),
+            (
+                json!({}),
+                &[
+                    ("plan", Isolation::SharedSerialized),
+                    ("implement", Isolation::SharedSerialized),
+                ][..],
+                "`shared_serialized` on both arms",
+            ),
+            (
+                json!({}),
+                &[("plan", Isolation::Local)][..],
+                "one `local` arm",
+            ),
+        ] {
+            let snapshot = resolve_diamond(settings, isolation)
+                .await
+                .unwrap_or_else(|error| panic!("{what} resolves: {error}"))
+                .snapshot;
+            assert_eq!(
+                snapshot
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::Next)
+                    .count(),
+                4,
+                "{what}: the diamond is frozen"
+            );
+        }
     }
 
     /// R1 (E1): the shapes the `asks_you` stop can answer still resolve: two forward `asks_you`
