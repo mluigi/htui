@@ -585,6 +585,12 @@ impl Drop for ScopeGuard<'_> {
     }
 }
 
+impl gate::WalkPark for WalkScopes {
+    fn shares_park(&self, run: RunId) -> bool {
+        Self::shares_park(self, run)
+    }
+}
+
 impl WalkScopes {
     /// An empty registry; `const` so [`Engine::new`] stays a `const fn`.
     const fn new() -> Self {
@@ -7699,6 +7705,7 @@ where
             user: self.parts.user,
             box_id: self.parts.box_id,
             fence: StepFence::Lease(self.parts.owner),
+            walk: Some(&self.walks),
         }
     }
 
@@ -7749,13 +7756,16 @@ where
         }
     }
 
-    /// [`Self::move_step`] for the run row.
     /// MOD-138 M3 D3 (blueprint §3.7, F6): the run `running -> awaiting_approval`, or already
     /// there because a sibling parked it first. Any other status is `stale_run`, as before.
     ///
     /// Only a walk of this engine with a sibling live, or one that already parked, can have
     /// parked it: outside one (a sweep's recovery, a command's window) a parked run is another
-    /// writer's, and plan D145's `StaleWrite` stands.
+    /// writer's, and plan D145's `StaleWrite` stands. This narrows §3.7's unconditional
+    /// tolerance (`a_stale_write_mid_sweep_writes_no_note` pins D145). The gate twin reads the
+    /// same rule through [`GateContext::walk`]. **T4 (A7) owes its own allowance**: `recover_run`
+    /// opens no walk, so a second `park_interrupted` in one recovery still meets `StaleWrite`
+    /// until the recovery records its own first park.
     async fn park_the_run(&self, run: RunId, now: DateTime<Utc>) -> Result<(), EngineError> {
         if self
             .parts
@@ -7774,6 +7784,7 @@ where
         ))
     }
 
+    /// [`Self::move_step`] for the run row.
     async fn move_run(
         &self,
         run: RunId,

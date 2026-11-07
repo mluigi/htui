@@ -324,6 +324,19 @@ pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> 
     /// The walk's lease, `StepFence::Lease(parts.owner)`, which the gate's pass and park write
     /// under (MOD-37 R-5).
     pub fence: StepFence,
+    /// MOD-138 M3 D3 (F6, T3 repair 1): the walk this gate write runs in, which says whether a
+    /// sibling node of it may have parked the run; `None` outside a walk. Only then does a park
+    /// accept a run that already reads `awaiting_approval`: any other parked run is another
+    /// writer's, and plan D125/D145's `StaleWrite` stands.
+    pub walk: Option<&'a dyn WalkPark>,
+}
+
+/// MOD-138 M3 D3 (F6): the open walk a [`GateContext`] runs in, asked by a park whether the run it
+/// finds parked may be a sibling's park. The engine's walk registry answers it.
+pub trait WalkPark: core::fmt::Debug + Sync {
+    /// Whether a sibling of the caller's node future may have parked `run`: a walk of it is open
+    /// with another future in flight, or one of its futures parked already.
+    fn shares_park(&self, run: RunId) -> bool;
 }
 
 impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> {
@@ -547,7 +560,7 @@ async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             ));
         }
         ParkOutcome::RunMoved => {
-            if !run_parked(ctx).await? {
+            if !sibling_parked(ctx).await? {
                 return Err(stale_run(
                     ctx.run.id,
                     RunStatus::Running,
@@ -870,11 +883,16 @@ pub(crate) async fn reject_step<S: htui_core::store::WorkerStore + ?Sized>(
     }
 }
 
-/// MOD-138 M3 D3 (V15): whether the walk's run reads `awaiting_approval` now, which under a
-/// concurrent walk is a sibling's park.
-async fn run_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+/// MOD-138 M3 D3 (V15, F6): whether the walk's run reads `awaiting_approval` now **and** a
+/// sibling node of the walk may have parked it ([`WalkPark::shares_park`], the engine twin's
+/// rule). Outside a walk, or in one with no sibling to have parked it, a parked run is another
+/// writer's (T3 repair 1), and the caller's `StaleWrite` stands (plan D125, D145).
+async fn sibling_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
 ) -> Result<bool, EngineError> {
+    if !ctx.walk.is_some_and(|walk| walk.shares_park(ctx.run.id)) {
+        return Ok(false);
+    }
     Ok(ctx
         .store
         .run(ctx.run.id)
@@ -883,7 +901,8 @@ async fn run_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 }
 
 /// MOD-138 M3 D3 (blueprint §3.7): the run `running -> awaiting_approval`, or already there
-/// because a sibling parked it first. Any other status is `stale_run`, as before.
+/// because a sibling parked it first ([`sibling_parked`]). Any other status, and a run another
+/// writer parked, is `stale_run`, as before.
 async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     now: DateTime<Utc>,
@@ -897,7 +916,7 @@ async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             now,
         )
         .await?
-        || run_parked(ctx).await?
+        || sibling_parked(ctx).await?
     {
         return Ok(());
     }
@@ -1886,6 +1905,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let done = [StepStatus::Running, StepStatus::Done];
         let a = step_at(&store, 10, "a", 1, 0, &done).await;
@@ -1941,6 +1961,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let implement = step_at(
             &store,
@@ -2023,6 +2044,7 @@ mod tests {
                 user: ids::USER,
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
+                walk: None,
             };
             let prd = step_of(
                 &store,
@@ -2145,6 +2167,7 @@ mod tests {
                 user: ids::USER,
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
+                walk: None,
             };
             let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
@@ -2222,6 +2245,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let item = run.item_id.expect("a graph run has an item");
         let before = store
@@ -2321,6 +2345,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         // `plan` has no row: a decision skipped it.
         let review = step_of(
@@ -2386,6 +2411,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
@@ -2438,6 +2464,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         step_of(
             &store,
@@ -2475,6 +2502,211 @@ mod tests {
         assert_eq!(LoopStop::Exhausted.to_string(), "exhausted");
         assert_eq!(LoopStop::NoProgressHash.to_string(), "no_progress_hash");
         assert_eq!(LoopStop::NoProgressReview.to_string(), "no_progress_review");
+    }
+
+    /// A walk whose answer to [`super::WalkPark::shares_park`] a case sets.
+    #[derive(Debug)]
+    struct Walk(bool);
+
+    impl super::WalkPark for Walk {
+        fn shares_park(&self, _run: htui_core::model::RunId) -> bool {
+            self.0
+        }
+    }
+
+    /// `RUN_4`, the fixture's live run, as read, with its snapshot; then parked by another
+    /// writer: the shape a gate park meets when a sibling, or a stranger, parked the run first.
+    async fn parked_by_another_writer(store: &MemStore) -> (Run, GraphSnapshot) {
+        use htui_core::model::RunStatus;
+        let run = store
+            .run(ids::RUN_4)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("RUN_4 exists");
+        let snapshot = serde_json::from_value(run.graph_snapshot.clone().expect("a graph run"))
+            .expect("the fixture snapshot is a `GraphSnapshot`");
+        assert!(
+            store
+                .transition_run(
+                    ids::RUN_4,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    epoch()
+                )
+                .await
+                .expect("RUN_4 exists"),
+            "RUN_4 is `running` in the fixture"
+        );
+        (run, snapshot)
+    }
+
+    /// The status of `RUN_4`'s row `id`.
+    async fn status_of_4(store: &MemStore, id: htui_core::model::StepId) -> StepStatus {
+        store
+            .run_steps(ids::RUN_4)
+            .await
+            .expect("RUN_4 exists")
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the row exists")
+            .status
+    }
+
+    /// MOD-138 M3 D3 (F6, T3 repair 1): a gate park over a run that already reads
+    /// `awaiting_approval`. Only a walk whose sibling may have parked it moves the step alone;
+    /// outside a walk, or in one with no sibling to have parked it, the run is another writer's
+    /// and plan D125's `StaleWrite` stands, the step unmoved.
+    #[tokio::test]
+    async fn a_park_over_a_run_another_writer_parked_is_stale_unless_a_sibling_may_have() {
+        use crate::command::{EngineError, Rest};
+        use htui_core::model::{Gate, RunStatus};
+
+        for (walk, parks) in [
+            (None, false),
+            (Some(Walk(false)), false),
+            (Some(Walk(true)), true),
+        ] {
+            let store = MemStore::demo();
+            let (run, snapshot) = parked_by_another_writer(&store).await;
+            let mut phase = snapshot.phases[0].clone();
+            phase.gate_effective = Gate::Always;
+            phase.retry_limit = 0;
+            let ctx = GateContext {
+                store: &store,
+                clock: &SystemClock,
+                run: &run,
+                snapshot: &snapshot,
+                user: ids::USER,
+                box_id: ids::BOX,
+                fence: StepFence::Unleased,
+                walk: walk.as_ref().map(|walk| walk as &dyn super::WalkPark),
+            };
+            let running = step_of(
+                &store,
+                ids::RUN_4,
+                (phase.position, 1, 0),
+                &phase.name,
+                &[StepStatus::Running],
+            )
+            .await;
+            let landed = super::apply(&ctx, &running, &phase, Settle::Ok { note: None }).await;
+            if parks {
+                assert!(
+                    matches!(
+                        landed,
+                        Ok(super::Landing::Rest(Rest {
+                            run: RunStatus::AwaitingApproval,
+                            ..
+                        }))
+                    ),
+                    "{landed:?}"
+                );
+                assert_eq!(
+                    status_of_4(&store, running.id).await,
+                    StepStatus::AwaitingApproval
+                );
+            } else {
+                assert!(
+                    matches!(
+                        &landed,
+                        Err(EngineError::StaleWrite { row, from, to, .. })
+                            if row == "the run" && from == "running" && to == "awaiting_approval"
+                    ),
+                    "{walk:?}: {landed:?}"
+                );
+                assert_eq!(status_of_4(&store, running.id).await, StepStatus::Running);
+            }
+        }
+    }
+
+    /// MOD-138 M3 D3 (F6, T3 repair 1), plan D125: an escalation over a run another writer
+    /// parked stops with `StaleWrite` outside a walk that shares the park, with no item move and
+    /// no note; inside one it blocks the item and writes its note.
+    #[tokio::test]
+    async fn an_escalation_over_a_run_another_writer_parked_is_stale_outside_a_walk() {
+        use crate::command::EngineError;
+        use htui_core::model::{EdgeKind, SnapshotEdge, Status};
+
+        for (walk, escalates) in [(None, false), (Some(Walk(true)), true)] {
+            let store = MemStore::demo();
+            let (run, snapshot) = parked_by_another_writer(&store).await;
+            let item_id = run.item_id.expect("RUN_4 has an item");
+            let target = snapshot.phases[0].clone();
+            let edge = SnapshotEdge {
+                from: snapshot.phases[1].name.clone(),
+                to: target.name.clone(),
+                kind: EdgeKind::Fails,
+                predicate: None,
+                loop_limit: Some(1),
+            };
+            let item = |store: &MemStore| {
+                let store = store.clone();
+                async move {
+                    store
+                        .item(item_id)
+                        .await
+                        .expect("MemStore never fails a read")
+                        .expect("the fixture holds the item")
+                        .status
+                }
+            };
+            let before = item(&store).await;
+            let notes = store
+                .notes(item_id)
+                .await
+                .expect("MemStore never fails a read")
+                .len();
+            let ctx = GateContext {
+                store: &store,
+                clock: &SystemClock,
+                run: &run,
+                snapshot: &snapshot,
+                user: ids::USER,
+                box_id: ids::BOX,
+                fence: StepFence::Unleased,
+                walk: walk.as_ref().map(|walk| walk as &dyn super::WalkPark),
+            };
+            let source = step_of(
+                &store,
+                ids::RUN_4,
+                (snapshot.phases[1].position, 1, 0),
+                &edge.from,
+                &[StepStatus::Running, StepStatus::Failed],
+            )
+            .await;
+            let escalated = super::escalate(
+                &ctx,
+                &source,
+                &target,
+                &edge,
+                1,
+                LoopStop::Exhausted,
+                epoch(),
+            )
+            .await;
+            let after = store
+                .notes(item_id)
+                .await
+                .expect("MemStore never fails a read")
+                .len();
+            if escalates {
+                assert!(
+                    matches!(escalated, Ok(LoopOutcome::Escalated { .. })),
+                    "{escalated:?}"
+                );
+                assert_eq!(after, notes + 1, "the escalation's note");
+                if before == Status::Open {
+                    assert_eq!(item(&store).await, Status::Blocked);
+                }
+            } else {
+                assert!(
+                    matches!(&escalated, Err(EngineError::StaleWrite { row, .. }) if row == "the run"),
+                    "{escalated:?}"
+                );
+                assert_eq!(after, notes, "no note after the refused move");
+                assert_eq!(item(&store).await, before, "no item move");
+            }
+        }
     }
 
     /// `RUN_3` as the demo fixture holds it, and its decoded snapshot.
@@ -2623,6 +2855,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let third = step(&store, 1, 2, &[]).await;
         let judge = step(&store, 1, -1, &[StepStatus::Running, StepStatus::Done]).await;
@@ -2659,6 +2892,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let live = step(&store, 2, 0, &[StepStatus::Running]).await;
         let failed = step(&store, 2, 1, &[StepStatus::Running, StepStatus::Failed]).await;
@@ -2711,6 +2945,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let settled = [StepStatus::Running, StepStatus::Done];
         let loser = step(&store, 2, 0, &settled).await;
@@ -2785,6 +3020,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -2830,6 +3066,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -2911,6 +3148,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         produce(&store, "review", Some(&first), "no tests").await;
@@ -2973,6 +3211,7 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
             fence: StepFence::Unleased,
+            walk: None,
         };
         let failed = step(&store, 2, 0, &[StepStatus::Running, StepStatus::Failed]).await;
         let refused = super::apply(

@@ -184,6 +184,7 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
         fence: StepFence::Unleased,
+        walk: None,
     };
     let outcome = edge_loop(
         &ctx,
@@ -247,6 +248,7 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
         fence: StepFence::Unleased,
+        walk: None,
     };
     let outcome = edge_loop(
         &ctx,
@@ -306,6 +308,7 @@ async fn a_sparse_snapshot_loops_to_the_phase_before_it_in_order() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
         fence: StepFence::Unleased,
+        walk: None,
     };
     let edge = review_edge(&snapshot);
     assert_eq!(
@@ -357,6 +360,7 @@ async fn a_loop_to_a_target_that_never_ran_is_no_loop_target() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
         fence: StepFence::Unleased,
+        walk: None,
     };
     let outcome = edge_loop(
         &ctx,
@@ -411,6 +415,7 @@ async fn an_escalation_on_a_run_another_writer_moved_is_a_stale_write() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
         fence: StepFence::Unleased,
+        walk: None,
     };
     let refused = edge_loop(
         &ctx,
