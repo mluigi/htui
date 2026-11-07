@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        159,
+        160,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -43,7 +43,8 @@ fn cases_len_is_pinned() {
          in-place node, a park draining its sibling, a sibling parking on a parked run, one answer of \
          two parks re-parking, a cut sibling, a park then an end, deferred cleanup, a loop on one branch, an owed loop \
          before its successor) 157, and T3 repair 1's two (cleanup deferred until a cut sibling \
-         settled, a terminal end cancelling a sibling row created beside it) 159"
+         settled, a terminal end cancelling a sibling row created beside it) 159, and T3 repair \
+         2's one (a rejection ending the run cancelling the other parked step) 160"
     );
 }
 

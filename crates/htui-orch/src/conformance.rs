@@ -838,6 +838,8 @@ pub const CASES: &[&str] = &[
     // MOD-138 M3 T3 repair 1 (blueprint §3.6 step 4, §3.10, A4).
     "a_terminal_branch_defers_cleanup_until_its_sibling_is_cut",
     "a_terminal_end_cancels_a_sibling_row_created_beside_it",
+    // MOD-138 M3 T3 repair 2 (blueprint §3.6 step 4 on the answer path).
+    "a_rejection_ending_the_run_cancels_the_other_parked_step",
 ];
 
 /// Run one case by name.
@@ -10717,6 +10719,9 @@ fn concurrency_case<'a, H: CaseHarness>(
         "a_terminal_end_cancels_a_sibling_row_created_beside_it" => Box::pin(
             a_terminal_end_cancels_a_sibling_row_created_beside_it(harness),
         ),
+        "a_rejection_ending_the_run_cancels_the_other_parked_step" => Box::pin(
+            a_rejection_ending_the_run_cancels_the_other_parked_step(harness),
+        ),
         "a_loop_owed_beside_its_successor_runs_first" => {
             Box::pin(a_loop_owed_beside_its_successor_runs_first(harness))
         }
@@ -10778,6 +10783,7 @@ async fn a_linear_graph_keeps_its_call_order<H: CaseHarness>(harness: &H) {
         "one node future at a time, in position order, cleanup once at the end"
     );
     assert_eq!(orch.live_sessions_high_water(), 1);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 T3: how long a concurrency case waits on held sessions before it calls the walk
@@ -10941,6 +10947,7 @@ async fn three_branches_under_a_cap_of_two_never_run_three<H: CaseHarness>(harne
             (3, 1, StepStatus::Done),
         ]
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 D1: a node whose `fan_out` (3) is above the cap (2) still runs, alone: its three
@@ -11002,6 +11009,7 @@ async fn a_fan_out_heavier_than_the_cap_runs_alone<H: CaseHarness>(harness: &H) 
         "{rest:?}"
     );
     assert_eq!(orch.live_sessions_high_water(), 3);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 D2: a join is not created until both predecessors landed. `plan`'s landing is held
@@ -11053,6 +11061,7 @@ async fn a_join_waits_for_both_predecessors_to_land<H: CaseHarness>(harness: &H)
     };
     assert!(first("reconcile 1/1/0") < first("prepare 3/1/0"), "{log:?}");
     assert!(first("reconcile 2/1/0") < first("prepare 3/1/0"), "{log:?}");
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 D5: two `worktree` branches into one repository both land, each its own merge, and
@@ -11243,6 +11252,7 @@ async fn a_park_on_one_branch_drains_the_other<H: CaseHarness>(harness: &H) {
     );
     assert!(latest_row(&steps, 3).is_none(), "nothing new was admitted");
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 D3 (V15): a sibling parking on a run its sibling already parked parks its step
@@ -11289,6 +11299,7 @@ async fn a_sibling_parking_on_a_parked_run_parks_its_step_only<H: CaseHarness>(h
             (3, 1, StepStatus::Done),
         ]
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 A6 (V20): after a drain the run rests on two parked steps. Answering one walks no
@@ -11331,6 +11342,7 @@ async fn one_answer_of_two_parks_re_parks_without_walking_on<H: CaseHarness>(har
         latest_row(&steps_of(&orch, run).await, 3).map(|step| step.status),
         Some(StepStatus::Done)
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// FEAT-3 on the diamond with `implement` failing for good: it writes no output document and
@@ -11387,6 +11399,7 @@ async fn a_node_ending_the_run_cuts_its_live_sibling<H: CaseHarness>(harness: &H
     );
     assert_eq!(orch.isolator().cleanups(), 1);
     assert_eq!(run_of(&orch, run).await.status, RunStatus::Failed);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 D3 (blueprint §3.6 step 4): a park and then an end. `plan` parks at its gate while
@@ -11440,6 +11453,7 @@ async fn a_park_then_an_end_cancels_the_parked_step<H: CaseHarness>(harness: &H)
         "{notes:?}"
     );
     assert_eq!(orch.isolator().cleanups(), 1);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 A4: a terminal path inside one node's future leaves the cleanup to the walk while
@@ -11487,6 +11501,7 @@ async fn a_terminal_branch_defers_cleanup_until_its_sibling_settles<H: CaseHarne
         Some("cleanup run"),
         "{log:?}"
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 A4 (blueprint §3.10, T3 repair 1): the cut half of the deferral. `implement` fails
@@ -11538,6 +11553,7 @@ async fn a_terminal_branch_defers_cleanup_until_its_sibling_is_cut<H: CaseHarnes
         Some("cleanup run"),
         "{log:?}"
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 (blueprint §3.6 step 4, T3 repair 1): no row waits on a finished run, even when
@@ -11600,6 +11616,74 @@ async fn a_terminal_end_cancels_a_sibling_row_created_beside_it<H: CaseHarness>(
         "{notes:?}"
     );
     assert_eq!(orch.isolator().cleanups(), 1);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
+}
+
+/// MOD-138 M3 (blueprint §3.6 step 4, T3 repair 2): a human's reject that ends the run is
+/// answered outside any walk, so `settle_walk` never sees it; the answer's tail cancels the rows
+/// the drain left waiting. On the diamond `plan` and `implement` both park at their gates; `plan`
+/// is rejected and has no loop edge, so the run fails at `plan`, and `implement`'s parked row is
+/// cancelled with a note naming `plan` rather than left waiting on a finished run.
+async fn a_rejection_ending_the_run_cancels_the_other_parked_step<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "{rest:?}");
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+            (2, 1, StepStatus::AwaitingApproval),
+        ],
+        "both branches parked"
+    );
+
+    let rest = answer_at(
+        &orch,
+        run,
+        1,
+        GateAnswer::Rejected {
+            note: "wrong plan".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.clone()),
+        (
+            RunStatus::Failed,
+            Some(1),
+            Some(RunFailure::Rejected {
+                phase: "plan".to_owned()
+            })
+        ),
+        "{rest:?}"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Failed);
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed),
+            (2, 1, StepStatus::Cancelled),
+        ],
+        "no row waits on a finished run"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "step `implement` attempt 1 cancelled: the run ended at `plan`"),
+        "{notes:?}"
+    );
+    assert_eq!(orch.isolator().cleanups(), 1);
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 (F2a): a loop on one branch while the other is live retires only its region.
@@ -11651,6 +11735,7 @@ async fn a_loop_on_one_branch_retires_only_its_region<H: CaseHarness>(harness: &
         shape.contains(&(1, 2, StepStatus::Done)) && shape.contains(&(3, 2, StepStatus::Done)),
         "{shape:?}"
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 /// MOD-138 M3 A2 (F2): on the chain `prd → plan → implement → review` with a back `asks_you`
@@ -11693,6 +11778,7 @@ async fn a_loop_owed_beside_its_successor_runs_first<H: CaseHarness>(harness: &H
         shape.contains(&(2, 2, StepStatus::AwaitingApproval)),
         "{shape:?}"
     );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
 #[cfg(test)]
@@ -11719,8 +11805,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            159,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            160,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -11782,7 +11868,8 @@ mod tests {
              an end cancelling the parked step, cleanup deferred until the sibling settled, a loop on one branch retiring only its region, and \
              an owed loop running before its successor), and T3 repair 1's two (cleanup deferred \
              until a cut sibling settled, and a terminal end cancelling a sibling row created \
-             beside it)"
+             beside it), and T3 repair 2's one (a rejection ending the run cancelling the other \
+             parked step)"
         );
     }
 

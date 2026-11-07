@@ -1384,6 +1384,12 @@ where
 
     /// What a human's rejection means: the review loop when the phase can loop, the end of the run
     /// when it cannot (ANA-2 `:577-578`, blueprint A-8).
+    ///
+    /// MOD-138 M3 (blueprint §3.6 step 4, T3 repair 2): a drain can leave the run parked on two
+    /// steps, and the answer to one is not a walk, so `settle_walk` never sees a rejection that
+    /// ends the run here (`finish_run(failed)`, or a loop with no target). This tail owes its
+    /// cut writes instead: every row still waiting is cancelled with a note naming the rejected
+    /// node. A linear run has no such row and writes nothing.
     async fn after_rejection(
         &self,
         run: &Run,
@@ -1393,7 +1399,13 @@ where
         now: DateTime<Utc>,
     ) -> Result<Rest, EngineError> {
         match self.rejection(run, snapshot, step, phase, now).await? {
-            Some(rest) => Ok(rest),
+            Some(rest) => {
+                if rest.run.is_terminal() {
+                    let row = self.run(run.id).await?;
+                    Box::pin(self.cancel_unsettled(&row, Some(step.position))).await?;
+                }
+                Ok(rest)
+            }
             None => self.run_to_rest(run.id).await,
         }
     }
