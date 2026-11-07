@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use htui_core::fixtures::ids;
@@ -2753,16 +2754,21 @@ async fn committed_worktree_step(
     name: &str,
     body: &str,
 ) -> (StepId, String, Vec<RunStepTree>) {
+    committed_worktree_step_in(fix, RunId::new(), name, body).await
+}
+
+/// [`committed_worktree_step`] as one step of `run`, so two calls give two steps of one run
+/// (MOD-138 M3 D5): two nodes of one walk branched from one base.
+async fn committed_worktree_step_in(
+    fix: &Fixture,
+    run: RunId,
+    name: &str,
+    body: &str,
+) -> (StepId, String, Vec<RunStepTree>) {
     let step = StepId::new();
     let prepared = fix
         .isolator
-        .prepare(
-            RunId::new(),
-            step,
-            &[fix.core.id],
-            Isolation::Worktree,
-            None,
-        )
+        .prepare(run, step, &[fix.core.id], Isolation::Worktree, None)
         .await
         .expect("the worktree mode prepares");
     let rows: Vec<RunStepTree> = prepared
@@ -3672,4 +3678,270 @@ async fn a_local_run_over_a_gitignored_env_file_writes_the_warning() {
         1,
         "{notes:?}"
     );
+}
+
+/// MOD-138 M3: how long a case lets a call that must *not* finish run before it reads it as
+/// waiting, and how long it lets a call that must finish take before it reads it as stuck.
+const STILL_WAITING: std::time::Duration = std::time::Duration::from_millis(200);
+const NEVER_STUCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `call`, counted in `live` while it is in flight, with the most ever in flight at once kept in
+/// `most`: the isolator's boundary as two concurrent node futures meet it.
+async fn counted<T>(live: &AtomicU32, most: &AtomicU32, call: impl Future<Output = T>) -> T {
+    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+    most.fetch_max(now, Ordering::SeqCst);
+    let out = call.await;
+    live.fetch_sub(1, Ordering::SeqCst);
+    out
+}
+
+/// The rows a prepared step holds, as the engine writes them before its session.
+fn rows_of(prepared: &Prepared) -> Vec<RunStepTree> {
+    prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect()
+}
+
+/// MOD-138 M3 D5: the per-repository reconcile lock ANA-33 §7.3 and §9 ask for is the isolator's
+/// own. Two `worktree` nodes of **one run** (a diamond's two arms), branched from one base, land
+/// concurrently — `tokio::join!`, both calls in flight at once at the isolator's boundary — and
+/// both land: two merges, the second on top of the first, each step answering its own, the
+/// primary clean. That is D70's admin lock at work: without it the second merge's post-condition
+/// (`[HEAD read, after]`) fails and the node parks with its merge on the primary. Repeated, so a
+/// lucky interleaving cannot pass it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_worktree_nodes_of_one_run_landing_concurrently_both_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (live, most) = (AtomicU32::new(0), AtomicU32::new(0));
+    for round in 0..10 {
+        let base = head_of(&git, &fix.core.path).await;
+        let (a, a_tip, a_rows) =
+            committed_worktree_step_in(&fix, run, &format!("a{round}.txt"), "node a\n").await;
+        let (b, b_tip, b_rows) =
+            committed_worktree_step_in(&fix, run, &format!("b{round}.txt"), "node b\n").await;
+        assert_eq!(
+            (&a_rows[0].base_ref, &b_rows[0].base_ref),
+            (&base, &base),
+            "round {round}: both nodes branch from one base"
+        );
+        let before = merges(&git, &fix.core.path).await;
+        most.store(0, Ordering::SeqCst);
+
+        let (first, second) = tokio::join!(
+            counted(&live, &most, fix.isolator.reconcile(a, &a_rows, &[])),
+            counted(&live, &most, fix.isolator.reconcile(b, &b_rows, &[])),
+        );
+        let first = first.unwrap_or_else(|err| panic!("round {round}: node a lands: {err}"));
+        let second = second.unwrap_or_else(|err| panic!("round {round}: node b lands: {err}"));
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            2,
+            "round {round}: both landings were in flight at once"
+        );
+
+        let merged = merges(&git, &fix.core.path).await;
+        assert_eq!(merged.len(), before.len() + 2, "round {round}: two merges");
+        assert_eq!(merged[2..], before[..], "round {round}: on top of the last");
+        let (top, under) = (&merged[0], &merged[1]);
+        assert_eq!(
+            top[1], under[0],
+            "round {round}: the second merge on top of the first"
+        );
+        assert_eq!(under[1], base, "round {round}: the first one on the base");
+        let merge_of = |tip: &str| {
+            merged[..2]
+                .iter()
+                .find(|merge| merge[2] == tip)
+                .map(|merge| merge[0].clone())
+                .unwrap_or_else(|| panic!("round {round}: a merge of {tip}: {merged:?}"))
+        };
+        assert_eq!(
+            first[0].after_hash.as_deref(),
+            Some(merge_of(&a_tip).as_str()),
+            "round {round}: node a answers its own merge"
+        );
+        assert_eq!(
+            second[0].after_hash.as_deref(),
+            Some(merge_of(&b_tip).as_str()),
+            "round {round}: node b answers its own merge"
+        );
+        assert_eq!(
+            (&first[0].before_hash, &second[0].before_hash),
+            (&base, &base),
+            "round {round}: each row keeps its base"
+        );
+        for name in [format!("a{round}.txt"), format!("b{round}.txt")] {
+            assert!(
+                fix.core.path.join(&name).is_file(),
+                "round {round}: {name} reached the primary"
+            );
+        }
+        assert_eq!(
+            porcelain_status(&git, &fix.core.path).await,
+            "",
+            "round {round}: the primary is clean"
+        );
+    }
+}
+
+/// MOD-138 M3 D4's reason, probed: `shared_serialized`'s `(box, repo)` guard (D43) spans a step's
+/// `prepare` to its own `capture` (blueprint A-1) and **not** its reconcile. Node A prepares
+/// in place and B's `prepare` waits; A captures and B's `prepare` goes through at once, with A
+/// not yet landed. A then lands in place while B's agent has uncommitted work in that same
+/// checkout: the reconcile takes no guard, waits on nothing and refuses nothing. And once B has
+/// committed, A's landing (a re-land, as recovery would make) refuses `primary_moved`, while the
+/// last lander, B, still lands (D6's in-place rule). So the isolator does not keep two in-place
+/// nodes apart; the scheduler has to (D4, blueprint A3).
+#[tokio::test]
+async fn a_shared_serialized_guard_is_released_at_capture_not_held_over_the_landing() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    let run = RunId::new();
+    let scope = [fix.core.id];
+    let (a, b) = (StepId::new(), StepId::new());
+
+    let a_rows = rows_of(
+        &fix.isolator
+            .prepare(run, a, &scope, Isolation::SharedSerialized, None)
+            .await
+            .expect("node a prepares in place"),
+    );
+    let b_prepare = fix
+        .isolator
+        .prepare(run, b, &scope, Isolation::SharedSerialized, None);
+    tokio::pin!(b_prepare);
+    assert!(
+        tokio::time::timeout(STILL_WAITING, b_prepare.as_mut())
+            .await
+            .is_err(),
+        "node b's prepare waits on the guard node a took at its prepare"
+    );
+
+    let a_tip = commit_file(&fix.core.path, "a.txt", "node a\n", "node a commits");
+    fix.isolator
+        .capture(a, &a_rows)
+        .await
+        .expect("node a captures");
+    let b_rows = rows_of(
+        &tokio::time::timeout(NEVER_STUCK, b_prepare)
+            .await
+            .expect("node a's capture released the guard: node b prepares before a lands")
+            .expect("node b prepares in place"),
+    );
+    assert_eq!(b_rows[0].base_ref, a_tip, "node b starts on node a's work");
+
+    // Node b's agent at work in the checkout: an uncommitted edit of a tracked file.
+    std::fs::write(fix.core.path.join("f"), "node b, mid-session\n").expect("node b edits");
+    let landed = tokio::time::timeout(NEVER_STUCK, fix.isolator.reconcile(a, &a_rows, &[]))
+        .await
+        .expect("node a's landing never waits on node b's guard")
+        .expect("node a lands in place under node b's live session: nothing refuses it");
+    assert_eq!(landed[0].after_hash.as_deref(), Some(a_tip.as_str()));
+    assert_eq!(head_of(&git, &fix.core.path).await, a_tip);
+    assert_eq!(
+        porcelain_status(&git, &fix.core.path).await,
+        " M f\n",
+        "node b's uncommitted work is still in the checkout node a landed in"
+    );
+
+    let b_tip = commit_file(&fix.core.path, "f", "node b\n", "node b commits");
+    fix.isolator
+        .capture(b, &b_rows)
+        .await
+        .expect("node b captures");
+    let err = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect_err("an earlier in-place lander re-landed after a later one refuses");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {b_tip}")
+    );
+    let b_landed = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the last in-place lander lands");
+    assert_eq!(b_landed[0].after_hash.as_deref(), Some(b_tip.as_str()));
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// MOD-138 M3 blueprint A3's evidence: an in-place tree is the primary checkout, and a `worktree`
+/// node lands by merging **into** that checkout. With an in-place node's agent mid-session (an
+/// uncommitted edit of a tracked file), the `worktree` node's landing refuses
+/// `dirty_primary_tree` — a park — and writes nothing: `HEAD` and the agent's edit are untouched.
+/// Once the in-place node has committed and captured, the same landing goes through, merged on
+/// top of the in-place node's commit. So the scheduler keeps an in-place node exclusive against
+/// every tree-touching node, of any mode.
+#[tokio::test]
+async fn a_worktree_landing_beside_a_dirty_in_place_checkout_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (worktree, worktree_tip, worktree_rows) =
+        committed_worktree_step_in(&fix, run, "w.txt", "worktree node\n").await;
+    let in_place = StepId::new();
+    let in_place_rows = rows_of(
+        &fix.isolator
+            .prepare(
+                run,
+                in_place,
+                &[fix.core.id],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the in-place node prepares on the primary checkout"),
+    );
+    assert_eq!(in_place_rows[0].base_ref, fix.core.head);
+
+    std::fs::write(fix.core.path.join("f"), "in-place node, mid-session\n")
+        .expect("the in-place node edits");
+    let err = fix
+        .isolator
+        .reconcile(worktree, &worktree_rows, &[])
+        .await
+        .expect_err("a landing into a checkout an agent is editing refuses");
+    assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the edited file"),
+        "in-place node, mid-session\n",
+        "the agent's edit is untouched"
+    );
+
+    let in_place_tip = commit_file(&fix.core.path, "f", "in-place node\n", "in place");
+    fix.isolator
+        .capture(in_place, &in_place_rows)
+        .await
+        .expect("the in-place node captures");
+    let landed = fix
+        .isolator
+        .reconcile(worktree, &worktree_rows, &[])
+        .await
+        .expect("after the in-place node, the worktree node lands");
+    let merge = head_of(&git, &fix.core.path).await;
+    assert_eq!(landed[0].after_hash.as_deref(), Some(merge.as_str()));
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        vec![vec![merge, in_place_tip, worktree_tip]],
+        "merged on top of the in-place node's commit"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
 }
