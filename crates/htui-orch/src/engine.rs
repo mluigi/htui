@@ -1382,15 +1382,17 @@ where
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
         let tail = async {
+            // MOD-138 M3 A10 (F12): another answered step a crash left unmerged (its command
+            // died between `answer_gate` and the unpark) lands first, each boxed (D10), before
+            // either tail: a looping rejection walks on too, and the join it creates would
+            // otherwise count as proof that member landed (A8). The first refusal parks the run
+            // again, the answer's own tail left to the next resume. A linear run has no member.
+            if let Some(rest) = Box::pin(self.land_other_frontiers(run, snapshot, step.id)).await? {
+                return Ok(rest);
+            }
             // The mapped outcome, not the human's verb: a declined `asks_you` reject is `done`.
             if outcome == GateOutcome::Rejected {
                 return self.after_rejection(run, snapshot, step, phase, now).await;
-            }
-            // MOD-138 M3 A10 (F12): another answered step a crash left unmerged (its command
-            // died between `answer_gate` and the unpark) lands first, each boxed (D10). The
-            // first refusal parks the run again. A linear run has no such member.
-            if let Some(rest) = Box::pin(self.land_other_frontiers(run, snapshot, step.id)).await? {
-                return Ok(rest);
             }
             // `answer_gate` moved the step `awaiting_approval -> done`
             // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
@@ -1405,7 +1407,8 @@ where
     }
 
     /// MOD-138 M3 A10 (blueprint §4.3): every [`recover::frontiers`] member of `run` but
-    /// `answered`, in topological order, reconciled before the answered step is. `Some(rest)` is
+    /// `answered`, in topological order, reconciled before the answer's tail runs: before the
+    /// answered step lands, or before a rejection's end or loop (T4 repair 1). `Some(rest)` is
     /// the first refusal's park; the members after it wait for the next answer or recovery.
     async fn land_other_frontiers(
         &self,
@@ -4230,7 +4233,9 @@ where
     /// MOD-37 R-31: a `Rest` at a `failed` + `rejected` step ([`crashed_rejection`]) is a
     /// rejection whose unpark a crash cut off. It is unparked the same way and its tail is
     /// `settle_failed`'s (plan D131), which is the rejection's own: the end of the run, or the
-    /// review loop. A rejection merges nothing, so no frontier is reconciled.
+    /// review loop. The rejected step merges nothing, but another answer a crash cut off beside
+    /// it may have left a winner unmerged (MOD-138 M3 A10, T4 repair 1), so the frontiers land
+    /// first, as `recover_run` orders them.
     async fn walk_resumed(&self, run: RunId) -> Result<Rest, EngineError> {
         let row = self.run(run).await?;
         self.walk_resumed_from(&row).await
@@ -4255,6 +4260,23 @@ where
                         RunStatus::Running,
                     ));
                 }
+                // MOD-138 M3 D6: every frontier member, in topological order, each boxed (D10);
+                // the first refusal parks the run again and the members after it wait. First,
+                // before a crashed rejection's tail too (A10, T4 repair 1): a loop walks on, and
+                // the join it creates would otherwise count as proof the member landed (A8).
+                let row = self.run(run).await?;
+                for winner in recover::frontiers(&snapshot, &steps) {
+                    let Some(done) = steps.iter().find(|step| step.id == winner) else {
+                        continue;
+                    };
+                    let siblings =
+                        Self::siblings(&group_at(&steps, done.position, done.attempt), winner);
+                    if let Some(rest) =
+                        Box::pin(self.reconcile_done_step(&row, done, &siblings)).await?
+                    {
+                        return Ok(rest);
+                    }
+                }
                 // MOD-37 R-31: the tail `answer_guarded` would have run, by plan D131's settle.
                 // Boxed: `settle_failed` holds `admit`'s and `edge_loop`'s futures, and this
                 // walk sits under `resume`, under `Unblock`. MOD-138 M3 T4: read from the first
@@ -4277,21 +4299,6 @@ where
                         Some(rest) => Ok(rest),
                         None => self.run_to_rest(run).await,
                     };
-                }
-                // MOD-138 M3 D6: every frontier member, in topological order, each boxed (D10);
-                // the first refusal parks the run again and the members after it wait.
-                let row = self.run(run).await?;
-                for winner in recover::frontiers(&snapshot, &steps) {
-                    let Some(done) = steps.iter().find(|step| step.id == winner) else {
-                        continue;
-                    };
-                    let siblings =
-                        Self::siblings(&group_at(&steps, done.position, done.attempt), winner);
-                    if let Some(rest) =
-                        Box::pin(self.reconcile_done_step(&row, done, &siblings)).await?
-                    {
-                        return Ok(rest);
-                    }
                 }
             }
         }

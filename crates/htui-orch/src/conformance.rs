@@ -534,15 +534,17 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
 ///
-/// **Eleven for MOD-138 M3 T4** (plan D6; blueprint A7-A10, and the hand-back twin of T3's
-/// repair 2): recovery among concurrent landings. Every done winner that may not have landed is
+/// **Thirteen for MOD-138 M3 T4** (plan D6; blueprint A7-A10, the hand-back twin of T3's
+/// repair 2, and T4 repair 1's two): recovery among concurrent landings. Every done winner that may not have landed is
 /// re-landed, in topological order, by the sweep, by a crash-cut unpark's resume and, before its
 /// own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered
 /// chain walked last, a done branch beside a still running one, an already landed branch
 /// (reconciled again), only the later of two in-place landings, and a loop's re-run target beside
 /// its side successor's older row. Every running row is adjudicated, and running branches
 /// recovered into parks park each without `StaleWrite`. A rejection handed back beside another
-/// parked step ends the run and cancels that step, as the in-process answer does.
+/// parked step ends the run and cancels that step, as the in-process answer does. And T4
+/// repair 1's two: a looping rejection, answered or resumed, lands a crashed answer's winner
+/// first.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -862,6 +864,8 @@ pub const CASES: &[&str] = &[
     "a_crash_cut_unpark_on_a_branching_run_lands_every_frontier",
     "answering_one_of_two_parks_lands_a_crashed_answers_winner",
     "a_rejection_handed_back_cancels_the_other_parked_step",
+    "a_looping_rejection_lands_a_crashed_answers_winner_first",
+    "a_resumed_looping_rejection_lands_a_crashed_answers_winner_first",
 ];
 
 /// Run one case by name.
@@ -11845,6 +11849,12 @@ fn concurrent_recovery_case<'a, H: CaseHarness>(
         "a_rejection_handed_back_cancels_the_other_parked_step" => Box::pin(
             a_rejection_handed_back_cancels_the_other_parked_step(harness),
         ),
+        "a_looping_rejection_lands_a_crashed_answers_winner_first" => Box::pin(
+            a_looping_rejection_lands_a_crashed_answers_winner_first(harness),
+        ),
+        "a_resumed_looping_rejection_lands_a_crashed_answers_winner_first" => {
+            Box::pin(a_resumed_looping_rejection_lands_a_crashed_answers_winner_first(harness))
+        }
         _ => return None,
     })
 }
@@ -12456,6 +12466,146 @@ async fn a_rejection_handed_back_cancels_the_other_parked_step<H: CaseHarness>(h
     assert_eq!(b.isolator().cleanups(), 1);
 }
 
+/// The diamond with every branch in its own worktree, `plan` gated `Always` and `implement`
+/// `OnFailure`, its first attempt settling `failed` (no output) and a `fails` edge looping it
+/// back over `prd` once. `start` parks on both branches; `plan`'s answer is then written and
+/// its unpark cut off by a crash (`plan` `done`, unmerged, the run still parked). Returns the
+/// run and `plan`'s row.
+async fn crashed_approval_beside_a_looping_park<O: Orchestrate>(orch: &O) -> (RunId, RunStep) {
+    feat_3_graph(
+        orch,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("prd", "implement", EdgeKind::Next, None, None),
+            ("plan", "review", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            ("implement", "prd", EdgeKind::Fails, None, Some(1)),
+        ],
+        |phase| {
+            phase.isolation = Some(Isolation::Worktree);
+            if phase.name == "plan" {
+                phase.gate = Gate::Always;
+            }
+            if phase.name == "implement" {
+                phase.gate = Gate::OnFailure;
+            }
+        },
+    )
+    .await;
+    orch.script("implement", 1, ScriptedStep::done_without_output());
+    let (run, rest) = start(orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "{rest:?}");
+    assert_eq!(
+        sorted_shape(orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+            (2, 1, StepStatus::AwaitingApproval),
+        ],
+        "both branches parked"
+    );
+    let plan = latest_row(&steps_of(orch, run).await, 1)
+        .expect("`plan` parked")
+        .clone();
+    assert!(
+        orch.store()
+            .answer_gate(plan.id, GateOutcome::Approved, None, orch.clock().now())
+            .await
+            .expect("MemStore takes the answer"),
+        "a command's answer, its unpark cut off by a crash"
+    );
+    (run, plan)
+}
+
+/// MOD-138 M3 A10 (F12), T4 repair 1: the crashed approval's winner lands before any tail that
+/// can walk, a looping rejection's included. `plan` was approved by a command that crashed
+/// before its unpark; a human rejects `implement`, whose `fails` edge loops it over `prd`. The
+/// answer lands `plan` first, so the join is created over a tree that has its work (else the
+/// join's row would count as proof that `plan` landed, A8, and nothing would ever land it).
+async fn a_looping_rejection_lands_a_crashed_answers_winner_first<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (run, plan) = crashed_approval_beside_a_looping_park(&orch).await;
+    let landed = orch.isolator().reconciles().len();
+
+    let rest = answer_at(
+        &orch,
+        run,
+        2,
+        GateAnswer::Rejected {
+            note: "redo".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_landed_before_the_join(&orch, run, &plan, landed).await;
+}
+
+/// The resumed twin of [`a_looping_rejection_lands_a_crashed_answers_winner_first`]: both
+/// answers were written and both unparks cut off. The resume lands `plan` before it finishes
+/// the crashed rejection (plan D131, R-31), as `recover_run` does: frontiers first.
+async fn a_resumed_looping_rejection_lands_a_crashed_answers_winner_first<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    let (run, plan) = crashed_approval_beside_a_looping_park(&orch).await;
+    let implement = latest_row(&steps_of(&orch, run).await, 2)
+        .expect("`implement` parked")
+        .clone();
+    assert!(
+        orch.store()
+            .answer_gate(
+                implement.id,
+                GateOutcome::Rejected,
+                Some("redo".to_owned()),
+                orch.clock().now()
+            )
+            .await
+            .expect("MemStore takes the answer"),
+        "the second command's rejection, its unpark cut off too"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    let landed = orch.isolator().reconciles().len();
+
+    walked_to_done(&orch, run).await;
+    assert_landed_before_the_join(&orch, run, &plan, landed).await;
+}
+
+/// The crashed approval's `plan` is the first reconcile after `landed`, the join's the last,
+/// and `plan` is reconciled once.
+async fn assert_landed_before_the_join<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    plan: &RunStep,
+    landed: usize,
+) {
+    let review = latest_row(&steps_of(orch, run).await, 3)
+        .expect("the join ran")
+        .clone();
+    let after = orch.isolator().reconciles()[landed..].to_vec();
+    assert_eq!(
+        after.first(),
+        Some(&(plan.id, Vec::new())),
+        "the crashed answer's winner lands first: {after:?}"
+    );
+    assert_eq!(
+        after.last(),
+        Some(&(review.id, Vec::new())),
+        "the join lands last: {after:?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(winner, _)| *winner == plan.id)
+            .count(),
+        1,
+        "{after:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -12480,8 +12630,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            171,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            173,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -12552,7 +12702,9 @@ mod tests {
              loop target re-landed beside an older side successor, and a crash-cut unpark on a \
              branching run landing every frontier member, and an answer to one of two parks \
              landing the other, crashed answer's winner first), and T4's hand-back twin of T3 \
-             repair 2 (a rejection handed back cancelling the other parked step)"
+             repair 2 (a rejection handed back cancelling the other parked step), and T4 repair \
+             1's two (a looping rejection landing a crashed answer's winner first, in process \
+             and resumed)"
         );
     }
 
