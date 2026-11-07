@@ -1947,6 +1947,10 @@ struct HoldState {
     keys: Vec<(String, i32)>,
     live: watch::Sender<usize>,
     released: watch::Sender<bool>,
+    /// How many held sessions were cancelled after reaching their hold (a cut reached them).
+    cancels: watch::Sender<usize>,
+    /// [`SessionHold::hold_cancels`]: a held session's cancel waits for the release.
+    hold_cancels: AtomicBool,
 }
 
 /// MOD-138 M3 T3 (F14): sessions held open before their first event, so a case can see them live
@@ -1969,9 +1973,23 @@ impl SessionHold {
         *self.0.live.borrow()
     }
 
-    /// Lets every held session, now and later, play its script.
+    /// Lets every held session, now and later, play its script, and lets a held cancel through.
     pub fn release(&self) {
         self.0.released.send_replace(true);
+    }
+
+    /// From now on the cancel of a session that reached its hold (a cut) waits for
+    /// [`release`](Self::release) before it drains, so a case can look at the walk while a cut
+    /// sibling is still in flight (T3 repair 1).
+    pub fn hold_cancels(&self) {
+        self.0.hold_cancels.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns once `n` sessions that reached their hold were cancelled.
+    pub async fn cancelled(&self, n: usize) {
+        let mut seen = self.0.cancels.subscribe();
+        // A closed channel cannot happen: `self` holds the sender.
+        let _ = seen.wait_for(|cancels| *cancels >= n).await;
     }
 }
 
@@ -2078,7 +2096,18 @@ impl AgentSession for CountedSession {
 
     fn cancel<'a>(&'a mut self, grace: std::time::Duration) -> DriverFuture<'a, ()> {
         self.cancelled = true;
-        self.inner.cancel(grace)
+        Box::pin(async move {
+            if let Some(hold) = self.hold.clone()
+                && self.arrived
+            {
+                hold.cancels.send_modify(|cancels| *cancels += 1);
+                if hold.hold_cancels.load(Ordering::SeqCst) {
+                    let mut released = hold.released.subscribe();
+                    let _ = released.wait_for(|released| *released).await;
+                }
+            }
+            self.inner.cancel(grace).await
+        })
     }
 }
 
@@ -2223,6 +2252,8 @@ impl FakeOrchestrator {
                 .collect(),
             live: watch::channel(0).0,
             released: watch::channel(false).0,
+            cancels: watch::channel(0).0,
+            hold_cancels: AtomicBool::new(false),
         });
         self.sessions
             .holds

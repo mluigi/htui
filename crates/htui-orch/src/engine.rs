@@ -787,6 +787,10 @@ struct WalkEnd {
     cut: bool,
     /// The run was read away from `running` with futures in flight (F21): admit nothing more.
     drained: bool,
+    /// More than one future was ever in flight at once, or the walk drained (T3 repair 1): a
+    /// terminal end may leave a sibling's unsettled row behind with nothing in flight to cut. A
+    /// linear walk never sets it.
+    concurrent: bool,
 }
 
 /// What one reading pass of [`Engine::run_to_rest`] answered (blueprint §3.4).
@@ -3626,6 +3630,7 @@ where
                                 )));
                             }
                             self.walks.set_in_flight(run, flights.len());
+                            end.concurrent |= flights.len() > 1;
                         }
                         Ok(Pass::Wait) => {}
                         Err(err) if !siblings => return Err(err),
@@ -3700,6 +3705,7 @@ where
             // more is admitted.
             _ => {
                 end.drained = true;
+                end.concurrent = true;
                 return Ok(Pass::Wait);
             }
         }
@@ -3805,9 +3811,11 @@ where
     /// 2. A cleanup a terminal path deferred (A4) runs.
     /// 3. A run cancel (the run's own control, not the walk's cut) raises `Cancelled`: I-6 writes
     ///    nothing, and `cancel_leased` owns the rows.
-    /// 4. The cut writes: when the run ended while siblings were live, or after a park, every
-    ///    unsettled row of the now-terminal run is `cancelled` with a note naming the node that
-    ///    ended it. A linear walk never reaches them.
+    /// 4. The cut writes: when the run (re-read) is terminal and the walk was cut, parked, or
+    ///    ever had two futures in flight or drained ([`WalkEnd::concurrent`], T3 repair 1), every
+    ///    unsettled row of the run is `cancelled` with a note naming the node that ended it. Keyed
+    ///    on the row, not on a terminal rest: a node that ends the run and then answers an error
+    ///    still leaves its cut siblings' rows to this step. A linear walk never reaches them.
     /// 5. The first terminal rest, else the first error, else the first park's rest, exactly as
     ///    its future answered it (A11). Later errors were logged and dropped.
     async fn settle_walk(&self, run: RunId, end: WalkEnd) -> Result<Rest, EngineError> {
@@ -3823,7 +3831,7 @@ where
         {
             return Err(end.cancelled.unwrap_or(EngineError::Cancelled { run }));
         }
-        if end.terminal.is_some() && (end.cut || end.park.is_some()) {
+        if end.cut || end.park.is_some() || end.concurrent {
             let row = self.run(run).await?;
             if row.status.is_terminal() {
                 Box::pin(self.cancel_unsettled(&row, end.ender)).await?;
@@ -23437,5 +23445,179 @@ mod queued_cancel {
             .await
             .expect("the item is free for a second run");
         assert!(matches!(again, CommandOutcome::Started { .. }), "{again:?}");
+    }
+}
+
+/// MOD-138 M3 T3 repair 1: [`Engine::settle_walk`]'s cut writes (blueprint §3.6 step 4), driven
+/// over a walk end the scheduler would hand it.
+#[cfg(test)]
+mod settle_walk_writes {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, StepStatus};
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::{Engine, SessionKey, WalkEnd};
+    use crate::command::{Command, CommandOutcome, EngineError};
+    use crate::fake::FakeOrchestrator;
+    use crate::isolate::Clock as _;
+
+    /// FEAT-3 started and parked at `prd`'s gate, then failed by hand: a terminal run over an
+    /// unsettled row, the state a node's terminal write leaves its live sibling in.
+    async fn failed_over_a_parked_row(orch: &FakeOrchestrator) -> htui_core::model::RunId {
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        let CommandOutcome::Started { run, .. } = orch
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: None,
+            })
+            .await
+            .expect("the item is open and the box admits the run")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            orch.steps(run)
+                .await
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>(),
+            [StepStatus::AwaitingApproval],
+            "`prd` parks at its gate"
+        );
+        orch.store
+            .finish_run(run, RunStatus::Failed, Some("boom"), orch.clock.now())
+            .await
+            .expect("a parked run can be finished");
+        run
+    }
+
+    async fn settle(
+        orch: &FakeOrchestrator,
+        run: htui_core::model::RunId,
+        end: WalkEnd,
+    ) -> Result<crate::command::Rest, EngineError> {
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
+        let engine = Engine::new(
+            super::fake_parts(orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        engine.settle_walk(run, end).await
+    }
+
+    /// A node ended the run and then answered an error (a write after its terminal one failed)
+    /// while a sibling was cut: the error is raised **and** the cut rows are still cancelled,
+    /// since the run (re-read) is terminal (§3.6 step 4 keys on the row, not on a terminal rest).
+    #[tokio::test]
+    async fn an_error_after_the_end_still_cancels_the_cut_rows() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_a_parked_row(&orch).await;
+        let settled = settle(
+            &orch,
+            run,
+            WalkEnd {
+                error: Some(EngineError::Stalled { run, passes: 1 }),
+                ender: Some(1),
+                cut: true,
+                ..WalkEnd::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(settled, Err(EngineError::Stalled { .. })),
+            "the error is raised: {settled:?}"
+        );
+        assert_eq!(
+            orch.steps(run)
+                .await
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>(),
+            [StepStatus::Cancelled],
+            "no row waits on a finished run"
+        );
+        let notes = orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.body == "step `prd` attempt 1 cancelled: the run ended at `plan`"),
+            "{notes:?}"
+        );
+    }
+
+    /// A linear walk (no cut, no park, never two futures in flight) writes nothing at its end,
+    /// whatever rows the run holds.
+    #[tokio::test]
+    async fn a_linear_end_writes_no_cut_rows() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_a_parked_row(&orch).await;
+        let settled = settle(
+            &orch,
+            run,
+            WalkEnd {
+                error: Some(EngineError::Stalled { run, passes: 1 }),
+                ender: Some(0),
+                ..WalkEnd::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(settled, Err(EngineError::Stalled { .. })),
+            "{settled:?}"
+        );
+        assert_eq!(
+            orch.steps(run)
+                .await
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>(),
+            [StepStatus::AwaitingApproval],
+            "a linear end writes no cut row"
+        );
+    }
+
+    /// A walk that had two futures in flight and ended the run with nothing else in flight still
+    /// cancels the rows left unsettled (the sibling's `pending` row its `Create` wrote).
+    #[tokio::test]
+    async fn a_concurrent_end_with_nothing_in_flight_cancels_the_unsettled_rows() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_a_parked_row(&orch).await;
+        let rest = crate::command::Rest {
+            run: RunStatus::Failed,
+            position: Some(1),
+            failure: None,
+        };
+        let settled = settle(
+            &orch,
+            run,
+            WalkEnd {
+                terminal: Some(rest.clone()),
+                ender: Some(1),
+                concurrent: true,
+                ..WalkEnd::default()
+            },
+        )
+        .await;
+        assert_eq!(settled.expect("the terminal rest is answered"), rest);
+        assert_eq!(
+            orch.steps(run)
+                .await
+                .iter()
+                .map(|step| step.status)
+                .collect::<Vec<_>>(),
+            [StepStatus::Cancelled]
+        );
     }
 }

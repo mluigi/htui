@@ -835,6 +835,9 @@ pub const CASES: &[&str] = &[
     "a_terminal_branch_defers_cleanup_until_its_sibling_settles",
     "a_loop_on_one_branch_retires_only_its_region",
     "a_loop_owed_beside_its_successor_runs_first",
+    // MOD-138 M3 T3 repair 1 (blueprint §3.6 step 4, §3.10, A4).
+    "a_terminal_branch_defers_cleanup_until_its_sibling_is_cut",
+    "a_terminal_end_cancels_a_sibling_row_created_beside_it",
 ];
 
 /// Run one case by name.
@@ -10708,6 +10711,12 @@ fn concurrency_case<'a, H: CaseHarness>(
         "a_loop_on_one_branch_retires_only_its_region" => {
             Box::pin(a_loop_on_one_branch_retires_only_its_region(harness))
         }
+        "a_terminal_branch_defers_cleanup_until_its_sibling_is_cut" => Box::pin(
+            a_terminal_branch_defers_cleanup_until_its_sibling_is_cut(harness),
+        ),
+        "a_terminal_end_cancels_a_sibling_row_created_beside_it" => Box::pin(
+            a_terminal_end_cancels_a_sibling_row_created_beside_it(harness),
+        ),
         "a_loop_owed_beside_its_successor_runs_first" => {
             Box::pin(a_loop_owed_beside_its_successor_runs_first(harness))
         }
@@ -11480,6 +11489,119 @@ async fn a_terminal_branch_defers_cleanup_until_its_sibling_settles<H: CaseHarne
     );
 }
 
+/// MOD-138 M3 A4 (blueprint §3.10, T3 repair 1): the cut half of the deferral. `implement` fails
+/// the run while `plan`'s session is live; the walk's cut reaches `plan`, whose cancel is held. While
+/// `plan` still drains, its row is `running` and nothing is cleaned up. Once it settles the walk
+/// cancels its row and cleans up, once and last.
+async fn a_terminal_branch_defers_cleanup_until_its_sibling_is_cut<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    diamond_with_a_failing_implement(&orch).await;
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+    plan.hold_cancels();
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+
+    let meddle = async {
+        within(plan.live(1), "plan live").await;
+        implement.release();
+        within(plan.cancelled(1), "the cut reaches `plan`").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(run_of(&orch, run).await.status, RunStatus::Failed);
+        assert_eq!(
+            latest_row(&steps_of(&orch, run).await, 1).map(|step| step.status),
+            Some(StepStatus::Running),
+            "`plan` is still draining its cut"
+        );
+        assert_eq!(
+            orch.isolator().cleanups(),
+            0,
+            "the run failed with `plan` still in flight: its trees stay"
+        );
+        plan.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the cut",
+    )
+    .await;
+    assert_eq!(rest.run, RunStatus::Failed, "{rest:?}");
+    assert_eq!(
+        latest_row(&steps_of(&orch, run).await, 1).map(|step| step.status),
+        Some(StepStatus::Cancelled)
+    );
+    assert_eq!(orch.isolator().cleanups(), 1, "once, when the walk drained");
+    let log = call_log_of(&orch, run).await;
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("cleanup run"),
+        "{log:?}"
+    );
+}
+
+/// MOD-138 M3 (blueprint §3.6 step 4, T3 repair 1): no row waits on a finished run, even when
+/// nothing else is in flight at the end. On the diamond, `plan` (`shared_serialized`) and
+/// `implement` (`worktree`) are both created; `implement`'s session is held back while `plan`'s
+/// in-place session runs (A3), and `plan` then fails the run alone. `implement`'s `pending` row,
+/// which a serial walk would never have created, is cancelled with a note naming `plan`.
+async fn a_terminal_end_cancels_a_sibling_row_created_beside_it<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        phase.isolation = Some(if phase.name == "plan" {
+            Isolation::SharedSerialized
+        } else {
+            Isolation::Worktree
+        });
+        if phase.name == "plan" {
+            phase.retry_limit = 0;
+        }
+    })
+    .await;
+    primary_repo(&orch).await;
+    orch.script("plan", 1, ScriptedStep::done_without_output());
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+
+    let release = async {
+        within(plan.live(1), "plan live").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        within(
+            until_steps(&orch, run, |steps| latest_row(steps, 2).is_some()),
+            "implement created",
+        )
+        .await;
+        plan.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), release) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(1)),
+        "{rest:?}"
+    );
+    let shape = sorted_shape(&orch, run).await;
+    assert_eq!(
+        shape,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed),
+            (2, 1, StepStatus::Cancelled),
+        ],
+        "no row waits on a finished run"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "step `implement` attempt 1 cancelled: the run ended at `plan`"),
+        "{notes:?}"
+    );
+    assert_eq!(orch.isolator().cleanups(), 1);
+}
+
 /// MOD-138 M3 (F2a): a loop on one branch while the other is live retires only its region.
 /// `review → plan` is `changes_requested` on the chain `prd → plan → review`, beside the sink
 /// `implement`, whose session is held live throughout; the loop re-runs `plan` and `review` and
@@ -11597,8 +11719,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            157,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            159,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -11658,7 +11780,9 @@ mod tests {
              in-place node, a park draining its sibling, a sibling parking on a parked run, one answer \
              of two parks re-parking, a node ending the run cutting its live sibling, a park then \
              an end cancelling the parked step, cleanup deferred until the sibling settled, a loop on one branch retiring only its region, and \
-             an owed loop running before its successor)"
+             an owed loop running before its successor), and T3 repair 1's two (cleanup deferred \
+             until a cut sibling settled, and a terminal end cancelling a sibling row created \
+             beside it)"
         );
     }
 
