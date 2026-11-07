@@ -380,7 +380,7 @@ pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
 /// forward-topological order (ties by position). It replaces [`frontier`]'s position rule once
 /// T4 converts its callers.
 ///
-/// - **Members.** The done winner ([`winner_at`]: latest attempt, `selected`, or index 0 when
+/// - **Members.** The done winner (`winner_at`: latest attempt, `selected`, or index 0 when
 ///   `fan_out = 1`) of each walked node.
 /// - **The successor rule (Q-1, A8).** A winner is dropped when some forward successor of its
 ///   node has a row (any `fanout_index`, the judge included) that is neither `superseded` nor
@@ -1790,7 +1790,9 @@ mod tests {
             "a tie keeps the member"
         );
 
-        // A non-member that finished later moved `HEAD` too.
+        // A non-member that finished later moved `HEAD` too. At `fan_out = 1` the landing rule
+        // drops `b` on its own here (`w` started after `b` finished); the fanned-out case below
+        // is where A9's non-member half alone decides.
         let mut snapshot = worktree(
             &[("a", 0), ("b", 1), ("z", 2), ("w", 3)],
             &[("a", "b", NEXT), ("z", "w", NEXT)],
@@ -1803,6 +1805,45 @@ mod tests {
             timed(&snapshot, "w", 1, StepStatus::Running, Some(10), None),
         ];
         assert!(frontiers(&snapshot, &rows).is_empty());
+
+        // A fanned-out in-place member lands at its selection, which no column stamps, so the
+        // landing rule leaves it alone: only A9 over every done winner, the non-member `z`
+        // included, drops `m`.
+        let mut snapshot = worktree(
+            &[("a", 0), ("m", 1), ("z", 2), ("w", 3)],
+            &[("a", "m", NEXT), ("z", "w", NEXT)],
+        );
+        snapshot.phases[1].isolation = Isolation::SharedSerialized;
+        snapshot.phases[1].fan_out = 2;
+        let fanned = |z_finished| {
+            let mut rows = vec![landed(&snapshot, "a", 0, 1)];
+            for index in 0..2 {
+                let mut candidate = landed(&snapshot, "m", 2, 5);
+                candidate.fanout_index = index;
+                candidate.selected = Some(index == 0);
+                rows.push(candidate);
+            }
+            rows.push(landed(&snapshot, "z", 0, z_finished));
+            rows.push(timed(
+                &snapshot,
+                "w",
+                1,
+                StepStatus::Running,
+                Some(10),
+                None,
+            ));
+            rows
+        };
+        let earlier = fanned(4);
+        assert_eq!(
+            frontiers(&snapshot, &earlier),
+            [earlier[1].id],
+            "`z` finished before `m`: `m` is kept, `w` started later notwithstanding"
+        );
+        assert!(
+            frontiers(&snapshot, &fanned(9)).is_empty(),
+            "non-member `z` finished after `m`, so `m` landed"
+        );
     }
 
     /// A hand-built graph (`walk.rs`'s builder), every node at `shared_serialized`.
