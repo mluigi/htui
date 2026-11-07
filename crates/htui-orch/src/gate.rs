@@ -527,6 +527,10 @@ async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// R-5, closing blueprint H-10). A step or run another writer moved first is
 /// [`EngineError::StaleWrite`], and nothing is written. The store's future is boxed so the
 /// Postgres transaction stays out of [`apply`]'s frame.
+///
+/// MOD-138 M3 D3 (V15, blueprint §3.7): a run a sibling node of the walk parked first is parked
+/// already, so only the step moves (`running -> awaiting_approval`); the store's `park_step`
+/// moves both or neither, so the move is made here. Its note was written before the park.
 async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
@@ -543,11 +547,21 @@ async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             ));
         }
         ParkOutcome::RunMoved => {
-            return Err(stale_run(
-                ctx.run.id,
-                RunStatus::Running,
-                RunStatus::AwaitingApproval,
-            ));
+            if !run_parked(ctx).await? {
+                return Err(stale_run(
+                    ctx.run.id,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                ));
+            }
+            move_step(
+                ctx,
+                step.id,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                ctx.clock.now(),
+            )
+            .await?;
         }
     }
     Ok(Landing::Rest(Rest {
@@ -856,18 +870,42 @@ pub(crate) async fn reject_step<S: htui_core::store::WorkerStore + ?Sized>(
     }
 }
 
-/// [`move_step`] for the run row.
-async fn move_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+/// MOD-138 M3 D3 (V15): whether the walk's run reads `awaiting_approval` now, which under a
+/// concurrent walk is a sibling's park.
+async fn run_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
-    from: RunStatus,
-    to: RunStatus,
+) -> Result<bool, EngineError> {
+    Ok(ctx
+        .store
+        .run(ctx.run.id)
+        .await?
+        .is_some_and(|run| run.status == RunStatus::AwaitingApproval))
+}
+
+/// MOD-138 M3 D3 (blueprint §3.7): the run `running -> awaiting_approval`, or already there
+/// because a sibling parked it first. Any other status is `stale_run`, as before.
+async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
-    if ctx.store.transition_run(ctx.run.id, from, to, now).await? {
-        Ok(())
-    } else {
-        Err(stale_run(ctx.run.id, from, to))
+    if ctx
+        .store
+        .transition_run(
+            ctx.run.id,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            now,
+        )
+        .await?
+        || run_parked(ctx).await?
+    {
+        return Ok(());
     }
+    Err(stale_run(
+        ctx.run.id,
+        RunStatus::Running,
+        RunStatus::AwaitingApproval,
+    ))
 }
 
 /// Re-reads one step row after a write moved it (plan D16: nothing is remembered across a write).
@@ -1328,8 +1366,8 @@ async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     now: DateTime<Utc>,
 ) -> Result<LoopOutcome, EngineError> {
     // Plan D125: a run another writer moved first stops the escalation, with no item move and no
-    // note after the refused move.
-    move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
+    // note after the refused move. MOD-138 M3 D3: a run a sibling parked first is parked.
+    park_the_run(ctx, now).await?;
     // MOD-144: blocking writes are `open -> blocked`; D17's `Ok(false)` still reads "already
     // moved".
     if edge.kind != EdgeKind::AsksYou {

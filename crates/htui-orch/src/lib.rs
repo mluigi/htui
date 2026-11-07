@@ -44,6 +44,7 @@ pub mod kill_point;
 pub mod overlap;
 pub mod promote;
 pub mod recover;
+mod schedule;
 pub mod secrets;
 pub mod select;
 pub mod status;

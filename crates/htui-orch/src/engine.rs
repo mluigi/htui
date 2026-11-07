@@ -75,6 +75,7 @@ use crate::isolate::{Clock, EnvFiles, FanoutSlot, Isolator, env_files};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
+use crate::schedule;
 use crate::secrets::RunSecrets;
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
@@ -539,6 +540,238 @@ where
     K: SessionSink + ?Sized,
 {
     parts: EngineParts<'a, S, G, I, V, C, A, K>,
+    /// MOD-138 M3 D3 (blueprint A5): the walks [`Engine::run_to_rest`] has open, by run.
+    walks: WalkScopes,
+}
+
+/// MOD-138 M3 D3 (blueprint §3.1, A4, A5): the state of every walk [`Engine::run_to_rest`] has
+/// open in this engine, by run. A `std` lock, never held across an `.await` (the [`DeadWalks`]
+/// shape).
+///
+/// Each walk has its own `watch` channel. Every session of the walk drives under it
+/// ([`Engine::session_control`]): the run's own cancel is copied in (cancel-once, at each read and
+/// whenever the scheduler wakes on it), and the walk's **cut** is sent on it when a node's future
+/// ends the run while siblings are live. Inside a future a cut is a cancel (I-6: nothing
+/// written); the scheduler writes the cut rows itself ([`Engine::settle_walk`]).
+#[derive(Debug, Default)]
+struct WalkScopes(std::sync::Mutex<BTreeMap<RunId, WalkScope>>);
+
+/// One open walk (blueprint §3.1).
+#[derive(Debug)]
+struct WalkScope {
+    /// The walk's control: the run's cancel forwarded into it, and the walk's own cut.
+    signal: watch::Sender<Signal>,
+    /// Node futures in flight; `cleanup_run` defers while this is above 1 (A4).
+    in_flight: usize,
+    /// A terminal path's cleanup was deferred while a sibling was live (A4).
+    cleanup_owed: bool,
+    /// A node future of the walk parked the run (D3).
+    parked: bool,
+}
+
+/// Removes its run's [`WalkScope`] on drop, the drop of a walk `heartbeaten` abandons included.
+/// A guard over a scope it did not open (a nested walk of the same run) removes nothing.
+struct ScopeGuard<'e> {
+    scopes: &'e WalkScopes,
+    run: RunId,
+    opened: bool,
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        if self.opened {
+            self.scopes.lock().remove(&self.run);
+        }
+    }
+}
+
+impl WalkScopes {
+    /// An empty registry; `const` so [`Engine::new`] stays a `const fn`.
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(BTreeMap::new()))
+    }
+
+    /// A poisoned lock is recovered: every change is one map operation.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RunId, WalkScope>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opens `run`'s scope for one walk. No walk of a run nests another in one engine; if one
+    /// did, it shares the outer scope and its guard removes nothing.
+    fn open(&self, run: RunId) -> ScopeGuard<'_> {
+        let mut scopes = self.lock();
+        let opened = !scopes.contains_key(&run);
+        debug_assert!(opened, "one walk per run per engine");
+        if opened {
+            scopes.insert(
+                run,
+                WalkScope {
+                    signal: watch::channel(Signal::Run).0,
+                    in_flight: 0,
+                    cleanup_owed: false,
+                    parked: false,
+                },
+            );
+        }
+        ScopeGuard {
+            scopes: self,
+            run,
+            opened,
+        }
+    }
+
+    /// The walk's control, when a walk of `run` is open.
+    fn control(&self, run: RunId) -> Option<Control> {
+        self.lock()
+            .get(&run)
+            .map(|scope| Control::new(scope.signal.subscribe()))
+    }
+
+    /// Copies a cancel on the run's own `control` into the walk's channel, once.
+    fn forward(&self, run: RunId, control: &Control) {
+        let signal = control.signal();
+        if signal.is_cancel() {
+            self.send_cancel(run, signal);
+        }
+    }
+
+    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once.
+    fn cut(&self, run: RunId) {
+        self.send_cancel(run, Signal::Cancel { grace: RELAY_GRACE });
+    }
+
+    fn send_cancel(&self, run: RunId, signal: Signal) {
+        if let Some(scope) = self.lock().get(&run) {
+            scope.signal.send_if_modified(|seen| {
+                if seen.is_cancel() {
+                    false
+                } else {
+                    *seen = signal;
+                    true
+                }
+            });
+        }
+    }
+
+    /// D3: a node future of `run`'s walk parked the run.
+    fn mark_parked(&self, run: RunId) {
+        if let Some(scope) = self.lock().get_mut(&run) {
+            scope.parked = true;
+        }
+    }
+
+    /// D3 (F6): whether a sibling of the caller's future may have parked `run`: a walk of it is
+    /// open with another future in flight, or one of its futures parked already.
+    fn shares_park(&self, run: RunId) -> bool {
+        self.lock()
+            .get(&run)
+            .is_some_and(|scope| scope.in_flight > 1 || scope.parked)
+    }
+
+    /// How many node futures of `run`'s walk are in flight.
+    fn set_in_flight(&self, run: RunId, in_flight: usize) {
+        if let Some(scope) = self.lock().get_mut(&run) {
+            scope.in_flight = in_flight;
+        }
+    }
+
+    /// A4: `true` when a walk of `run` has a sibling in flight beside the caller's future, which
+    /// owes the cleanup to the walk's end; `false` (cleanup now) otherwise, and any cleanup owed
+    /// is then this one.
+    fn defer_cleanup(&self, run: RunId) -> bool {
+        self.lock().get_mut(&run).is_some_and(|scope| {
+            scope.cleanup_owed = scope.in_flight > 1;
+            scope.cleanup_owed
+        })
+    }
+
+    /// Whether a deferred cleanup is still owed, clearing it.
+    fn take_cleanup_owed(&self, run: RunId) -> bool {
+        self.lock()
+            .get_mut(&run)
+            .is_some_and(|scope| core::mem::take(&mut scope.cleanup_owed))
+    }
+}
+
+/// How one walk ended so far (blueprint §3.4, §3.6, A11): the first of each kind, kept for
+/// [`Engine::settle_walk`].
+#[derive(Debug, Default)]
+struct WalkEnd {
+    /// The first rest that finished the run.
+    terminal: Option<Rest>,
+    /// The first park's rest, as its future answered it (A11).
+    park: Option<Rest>,
+    /// The first fenced error.
+    fenced: Option<EngineError>,
+    /// The first [`EngineError::Cancelled`].
+    cancelled: Option<EngineError>,
+    /// The first other error.
+    error: Option<EngineError>,
+    /// The position whose future ended the walk while siblings were live.
+    ender: Option<i32>,
+    /// The walk's cut was sent.
+    cut: bool,
+    /// The run was read away from `running` with futures in flight (F21): admit nothing more.
+    drained: bool,
+}
+
+/// What one reading pass of [`Engine::run_to_rest`] answered (blueprint §3.4).
+#[derive(Debug)]
+enum Pass {
+    /// Nothing in flight and every node done or skipped: finish the run.
+    Finished,
+    /// Nothing in flight; a `running` run over a parked step parks again (V20, A6).
+    RePark,
+    /// Nothing in flight; the run rests as `row` reads.
+    Rest(Run),
+    /// Push one future per admitted cursor, over the pass's reads.
+    Admit {
+        row: Run,
+        snapshot: Arc<GraphSnapshot>,
+        steps: Arc<[RunStep]>,
+        admitted: Vec<(Cursor, i32, schedule::Flight)>,
+    },
+    /// Nothing to admit while something is in flight.
+    Wait,
+}
+
+impl WalkEnd {
+    /// Whether the walk may admit more: nothing parked, ended, failed or drained it yet.
+    const fn admits(&self) -> bool {
+        self.terminal.is_none()
+            && self.park.is_none()
+            && self.fenced.is_none()
+            && self.cancelled.is_none()
+            && self.error.is_none()
+            && !self.drained
+    }
+
+    /// Records a future's error, the first of its kind kept (`group_error`'s classes).
+    fn error(&mut self, err: EngineError, run: RunId) {
+        let slot = if is_fenced(&err) {
+            &mut self.fenced
+        } else if matches!(err, EngineError::Cancelled { .. }) {
+            &mut self.cancelled
+        } else {
+            &mut self.error
+        };
+        if slot.is_none() {
+            *slot = Some(err);
+        } else {
+            tracing::warn!(%run, %err, "a further node's error is dropped; the first of its kind is raised");
+        }
+    }
+
+    /// Ends the walk at `position`: with siblings live, cut them (blueprint A5).
+    fn end_at(&mut self, position: Option<i32>, siblings: bool, walks: &WalkScopes, run: RunId) {
+        if siblings && !self.cut {
+            self.cut = true;
+            self.ender = position;
+            walks.cut(run);
+        }
+    }
 }
 
 /// What [`Engine::resume`] found (ANA-2 §12 criterion 3, `docs/ANA-2.md:2090`).
@@ -647,7 +880,26 @@ where
     /// The walk over one set of borrowed parts.
     #[must_use]
     pub const fn new(parts: EngineParts<'a, S, G, I, V, C, A, K>) -> Self {
-        Self { parts }
+        Self {
+            parts,
+            walks: WalkScopes::new(),
+        }
+    }
+
+    /// MOD-138 M3 D3 (blueprint §3.1): the control a session of `run` drives under: its open
+    /// walk's, with the run's own cancel copied in first, or the run's when no walk is open.
+    fn session_control(&self, run: RunId) -> Control {
+        let own = (self.parts.control)(run);
+        self.walks.forward(run, &own);
+        self.walks.control(run).unwrap_or(own)
+    }
+
+    /// Whether `control` (from [`Self::session_control`]) reads a cancel, the run's own copied in
+    /// first: a cancel that reached the run inside this future, with no yield for the scheduler
+    /// to forward it, is still seen.
+    fn cancel_read(&self, run: RunId, control: &Control) -> bool {
+        self.walks.forward(run, &(self.parts.control)(run));
+        control.signal().is_cancel()
     }
 
     // -- commands (ANA-2 §6.2, blueprint §5.2) ------------------------------------------------
@@ -3205,8 +3457,8 @@ where
         note: String,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-            .await?;
+        // MOD-138 M3 F6: a sibling may have parked the run first.
+        self.park_the_run(run.id, now).await?;
         if let Some(item) = run.item_id {
             self.note(item, note, Some(step.id), now).await?;
         }
@@ -3235,113 +3487,332 @@ where
     /// # Errors
     /// Every [`EngineError`].
     pub async fn run_to_rest(&self, run: RunId) -> Result<Rest, EngineError> {
-        for _ in 0..MAX_ITERATIONS {
-            let row = self.run(run).await?;
-            match row.status {
-                RunStatus::Running => {}
-                // A `queued` run has not been claimed, and claiming is `claim_run`'s (plan D6).
-                RunStatus::Queued => {
-                    return Err(EngineError::RunStatus {
+        let _scope = self.walks.open(run);
+        // The run's own control, watched for a cancel to forward into the walk (F18). One for the
+        // walk: a fresh lookup per wake would read a cancel already seen as a change again.
+        let mut watched = (self.parts.control)(run);
+        let mut flights: BTreeMap<i32, schedule::Flight> = BTreeMap::new();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        let mut end = WalkEnd::default();
+        let mut passes = 0_u32;
+        loop {
+            self.walks.forward(run, &watched);
+            self.walks.forward(run, &(self.parts.control)(run));
+            if end.admits() {
+                passes += 1;
+                let siblings = !flights.is_empty();
+                if passes > MAX_ITERATIONS {
+                    end.error(
+                        EngineError::Stalled {
+                            run,
+                            passes: MAX_ITERATIONS,
+                        },
                         run,
-                        status: row.status,
-                        expected: "running",
-                    });
-                }
-                // MOD-125 D2: a `stopped` run is at rest like a parked one; `resting` writes
-                // nothing and answers `Rest { run: Stopped, .. }`, which no caller cleans up.
-                RunStatus::AwaitingApproval
-                | RunStatus::Stopped
-                | RunStatus::Done
-                | RunStatus::Failed
-                | RunStatus::Cancelled => {
-                    return self.resting(&row).await;
+                    );
+                    end.end_at(None, siblings, &self.walks, run);
+                } else {
+                    // F17: a scheduler read that fails with futures in flight ends the walk like
+                    // a future's error: cut, await, raise.
+                    match Box::pin(self.pass(run, &flights, &mut end)).await {
+                        Ok(Pass::Finished) => {
+                            let now = self.now();
+                            self.parts
+                                .store
+                                .finish_run(run, RunStatus::Done, None, now)
+                                .await?;
+                            self.cleanup_run(run).await?;
+                            return Ok(Rest {
+                                run: RunStatus::Done,
+                                position: None,
+                                failure: None,
+                            });
+                        }
+                        // V20, A6: a `running` run over a parked step, nothing in flight.
+                        Ok(Pass::RePark) => {
+                            self.park_the_run(run, self.now()).await?;
+                            return self.resting(&self.run(run).await?).await;
+                        }
+                        Ok(Pass::Rest(row)) => return self.resting(&row).await,
+                        Ok(Pass::Admit {
+                            row,
+                            snapshot,
+                            steps,
+                            admitted,
+                        }) => {
+                            for (cursor, position, flight) in admitted {
+                                flights.insert(position, flight);
+                                // D10: every node future boxed at its push.
+                                in_flight.push(Box::pin(self.drive_node(
+                                    row.clone(),
+                                    Arc::clone(&snapshot),
+                                    Arc::clone(&steps),
+                                    cursor,
+                                    position,
+                                )));
+                            }
+                            self.walks.set_in_flight(run, flights.len());
+                        }
+                        Ok(Pass::Wait) => {}
+                        Err(err) if !siblings => return Err(err),
+                        Err(err) => {
+                            end.error(err, run);
+                            end.end_at(None, siblings, &self.walks, run);
+                        }
+                    }
                 }
             }
-
-            let snapshot = Self::snapshot_of(&row)?;
-            let steps = self.parts.store.run_steps(run).await?;
-            match cursor(&snapshot, &steps) {
-                Cursor::Finished => {
-                    let now = self.now();
-                    self.parts
-                        .store
-                        .finish_run(run, RunStatus::Done, None, now)
-                        .await?;
-                    self.cleanup_run(run).await?;
-                    return Ok(Rest {
-                        run: RunStatus::Done,
-                        position: None,
-                        failure: None,
-                    });
-                }
-                // Plan D131: a `failed` latest step under a `running` run is gate work a crash
-                // cut short, not a rest.
-                Cursor::Rest {
-                    step,
-                    status: StepStatus::Failed,
-                } => {
-                    let Some(step) = steps.into_iter().find(|candidate| candidate.id == step)
-                    else {
-                        continue;
-                    };
-                    if let Some(rest) = self.settle_failed(&row, &snapshot, &step).await? {
-                        return Ok(rest);
-                    }
-                }
-                Cursor::Rest { .. } => return self.resting(&row).await,
-                Cursor::Create { position, attempt } => {
-                    let phase = Self::phase_at(run, &snapshot, position)?;
-                    if let Some(rest) = self.admit(&row, &snapshot, &phase, attempt).await? {
-                        return Ok(rest);
-                    }
-                }
-                Cursor::Fan { position, attempt } => {
-                    let phase = Self::phase_at(run, &snapshot, position)?;
-                    if let Some(rest) = self.drive_group(&row, &snapshot, &phase, attempt).await? {
-                        return Ok(rest);
-                    }
-                }
-                Cursor::Select { position, attempt } => {
-                    let phase = Self::phase_at(run, &snapshot, position)?;
-                    if let Some(rest) = self.select_stage(&row, &snapshot, &phase, attempt).await? {
-                        return Ok(rest);
-                    }
-                }
-                Cursor::Run(step) => {
-                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
-                        continue;
-                    };
-                    let phase = Self::phase_at(run, &snapshot, step.position)?;
-                    if let Some(rest) = self.walk_step(&row, &snapshot, step, &phase).await? {
-                        return Ok(rest);
-                    }
-                }
-                // MOD-138 M2 D6, D7: writes the engine owes, which `ready` orders first (blueprint
-                // A6). No lifted graph yields either (the parity oracle in `walk.rs`). Both are
-                // boxed (D12): this frame sits under `settle_failed` and `walk_resumed_from`.
-                Cursor::Decide { step } => {
-                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
-                        continue;
-                    };
-                    if let Some(rest) = Box::pin(self.decide(&row, &snapshot, &step)).await? {
-                        return Ok(rest);
-                    }
-                }
-                Cursor::Loop { step, to } => {
-                    let Some(step) = steps.into_iter().find(|row| row.id == step) else {
-                        continue;
-                    };
-                    if let Some(rest) = Box::pin(self.loop_back(run, &snapshot, &step, &to)).await?
-                    {
-                        return Ok(rest);
+            if in_flight.is_empty() {
+                return Box::pin(self.settle_walk(run, end)).await;
+            }
+            tokio::select! {
+                biased;
+                // F18: a run cancel is forwarded at the loop's top; admission is unchanged.
+                () = watched.changed() => {}
+                Some((position, out)) = futures::StreamExt::next(&mut in_flight) => {
+                    flights.remove(&position);
+                    self.walks.set_in_flight(run, flights.len());
+                    let siblings = !flights.is_empty();
+                    match out {
+                        Ok(None) => {}
+                        Ok(Some(rest)) if rest.run.is_terminal() => {
+                            if end.terminal.is_none() {
+                                end.terminal = Some(rest);
+                                end.end_at(Some(position), siblings, &self.walks, run);
+                            } else {
+                                tracing::warn!(%run, position, ?rest, "a further terminal rest is dropped; the first ended the run");
+                            }
+                        }
+                        // D3: a park drains the walk; `admits` turns false.
+                        Ok(Some(rest)) => {
+                            self.walks.mark_parked(run);
+                            if end.park.is_none() {
+                                end.park = Some(rest);
+                            }
+                        }
+                        Err(err) => {
+                            end.error(err, run);
+                            end.end_at(Some(position), siblings, &self.walks, run);
+                        }
                     }
                 }
             }
         }
-        Err(EngineError::Stalled {
-            run,
-            passes: MAX_ITERATIONS,
-        })
+    }
+
+    /// One reading pass of [`Self::run_to_rest`] (blueprint §3.4): the run, its snapshot and its
+    /// steps, `ready_masked` over the positions in flight, and [`schedule::plan_pass`].
+    async fn pass(
+        &self,
+        run: RunId,
+        flights: &BTreeMap<i32, schedule::Flight>,
+        end: &mut WalkEnd,
+    ) -> Result<Pass, EngineError> {
+        let row = self.run(run).await?;
+        match row.status {
+            RunStatus::Running => {}
+            // A `queued` run has not been claimed, and claiming is `claim_run`'s (plan D6).
+            RunStatus::Queued if flights.is_empty() => {
+                return Err(EngineError::RunStatus {
+                    run,
+                    status: row.status,
+                    expected: "running",
+                });
+            }
+            // MOD-125 D2: a `stopped` run is at rest like a parked one; `resting` writes
+            // nothing and answers `Rest { run: Stopped, .. }`, which no caller cleans up.
+            _ if flights.is_empty() => return Ok(Pass::Rest(row)),
+            // F21: another writer moved the run under live futures; they run on, and nothing
+            // more is admitted.
+            _ => {
+                end.drained = true;
+                return Ok(Pass::Wait);
+            }
+        }
+        let snapshot = Arc::new(Self::snapshot_of(&row)?);
+        let steps: Arc<[RunStep]> = self.parts.store.run_steps(run).await?.into();
+        let cursors =
+            crate::walk::ready_masked(&snapshot, &steps, &flights.keys().copied().collect());
+        Ok(
+            match schedule::plan_pass(&snapshot, &steps, row.status, &cursors, flights) {
+                schedule::PassPlan::Admit(admitted) => Pass::Admit {
+                    row,
+                    snapshot,
+                    steps,
+                    admitted,
+                },
+                schedule::PassPlan::Wait => Pass::Wait,
+                schedule::PassPlan::Finished => Pass::Finished,
+                schedule::PassPlan::RePark => Pass::RePark,
+                schedule::PassPlan::Rest => Pass::Rest(row),
+            },
+        )
+    }
+
+    /// D1 (blueprint F1): one node's future, the unit `run_to_rest` keeps in flight. Its inputs
+    /// are owned, so it borrows `&self` only; every one is boxed at its push (D10).
+    async fn drive_node(
+        &self,
+        row: Run,
+        snapshot: Arc<GraphSnapshot>,
+        steps: Arc<[RunStep]>,
+        cursor: Cursor,
+        position: i32,
+    ) -> (i32, Result<Option<Rest>, EngineError>) {
+        (
+            position,
+            self.drive_cursor(&row, &snapshot, &steps, cursor).await,
+        )
+    }
+
+    /// D1: the serial walk's `match` arm for `cursor`, moved unchanged. A step the pass's rows do
+    /// not hold answers `Ok(None)`, the serial walk's `continue`: the next pass re-derives.
+    /// `Finished` and a non-`failed` `Rest` never reach here ([`schedule::plan_pass`] answers
+    /// them).
+    async fn drive_cursor(
+        &self,
+        row: &Run,
+        snapshot: &GraphSnapshot,
+        steps: &[RunStep],
+        cursor: Cursor,
+    ) -> Result<Option<Rest>, EngineError> {
+        let run = row.id;
+        let find = |step: StepId| steps.iter().find(|candidate| candidate.id == step).cloned();
+        match cursor {
+            // Plan D131: a `failed` latest step under a `running` run is gate work a crash
+            // cut short, not a rest.
+            Cursor::Rest {
+                step,
+                status: StepStatus::Failed,
+            } => match find(step) {
+                Some(step) => self.settle_failed(row, snapshot, &step).await,
+                None => Ok(None),
+            },
+            Cursor::Create { position, attempt } => {
+                let phase = Self::phase_at(run, snapshot, position)?;
+                self.admit(row, snapshot, &phase, attempt).await
+            }
+            Cursor::Fan { position, attempt } => {
+                let phase = Self::phase_at(run, snapshot, position)?;
+                self.drive_group(row, snapshot, &phase, attempt).await
+            }
+            Cursor::Select { position, attempt } => {
+                let phase = Self::phase_at(run, snapshot, position)?;
+                self.select_stage(row, snapshot, &phase, attempt).await
+            }
+            Cursor::Run(step) => match find(step) {
+                Some(step) => {
+                    let phase = Self::phase_at(run, snapshot, step.position)?;
+                    self.walk_step(row, snapshot, step, &phase).await
+                }
+                None => Ok(None),
+            },
+            // MOD-138 M2 D6, D7: writes the engine owes, which `ready` orders first (blueprint
+            // A6). No lifted graph yields either (the parity oracle in `walk.rs`). Both are
+            // boxed (D12): this frame sits under `settle_failed` and `walk_resumed_from`.
+            Cursor::Decide { step } => match find(step) {
+                Some(step) => Box::pin(self.decide(row, snapshot, &step)).await,
+                None => Ok(None),
+            },
+            Cursor::Loop { step, to } => match find(step) {
+                Some(step) => Box::pin(self.loop_back(run, snapshot, &step, &to)).await,
+                None => Ok(None),
+            },
+            Cursor::Rest { .. } | Cursor::Finished => {
+                debug_assert!(false, "plan_pass answers {cursor:?} itself");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Blueprint §3.6: how a walk ends once nothing is in flight and nothing more is admitted.
+    ///
+    /// 1. A fenced error is raised, nothing else written (`heartbeaten` makes it `LeaseLost`).
+    /// 2. A cleanup a terminal path deferred (A4) runs.
+    /// 3. A run cancel (the run's own control, not the walk's cut) raises `Cancelled`: I-6 writes
+    ///    nothing, and `cancel_leased` owns the rows.
+    /// 4. The cut writes: when the run ended while siblings were live, or after a park, every
+    ///    unsettled row of the now-terminal run is `cancelled` with a note naming the node that
+    ///    ended it. A linear walk never reaches them.
+    /// 5. The first terminal rest, else the first error, else the first park's rest, exactly as
+    ///    its future answered it (A11). Later errors were logged and dropped.
+    async fn settle_walk(&self, run: RunId, end: WalkEnd) -> Result<Rest, EngineError> {
+        if let Some(fenced) = end.fenced {
+            return Err(fenced);
+        }
+        if self.walks.take_cleanup_owed(run) {
+            self.cleanup_now(run).await?;
+        }
+        if end.terminal.is_none()
+            && end.cancelled.is_some()
+            && (self.parts.control)(run).signal().is_cancel()
+        {
+            return Err(end.cancelled.unwrap_or(EngineError::Cancelled { run }));
+        }
+        if end.terminal.is_some() && (end.cut || end.park.is_some()) {
+            let row = self.run(run).await?;
+            if row.status.is_terminal() {
+                Box::pin(self.cancel_unsettled(&row, end.ender)).await?;
+            }
+        }
+        if let Some(terminal) = end.terminal {
+            return Ok(terminal);
+        }
+        if let Some(err) = end.error.or(end.cancelled) {
+            return Err(err);
+        }
+        match end.park {
+            Some(park) => Ok(park),
+            None => self.resting(&self.run(run).await?).await,
+        }
+    }
+
+    /// Blueprint §3.6 step 4, `cancel_leased`'s loop narrowed to unsettled rows: every row of the
+    /// ended `run` at `pending`, `running` or `awaiting_approval` moves to `cancelled` (a row
+    /// another writer moved first is skipped), and each moved row gets one note naming the node
+    /// at `ender` that ended the run. A `failed` row keeps its failure.
+    async fn cancel_unsettled(&self, run: &Run, ender: Option<i32>) -> Result<(), EngineError> {
+        let snapshot = Self::snapshot_of(run)?;
+        let ender = ender
+            .and_then(|position| {
+                snapshot
+                    .phases
+                    .iter()
+                    .find(|phase| phase.position == position)
+            })
+            .map_or_else(
+                || "an earlier node".to_owned(),
+                |phase| format!("`{}`", phase.name),
+            );
+        let now = self.now();
+        for step in self.parts.store.run_steps(run.id).await? {
+            if !matches!(
+                step.status,
+                StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
+            ) {
+                continue;
+            }
+            if !self
+                .parts
+                .store
+                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .await?
+            {
+                continue;
+            }
+            if let Some(item) = run.item_id {
+                self.note(
+                    item,
+                    format!(
+                        "step `{}` attempt {} cancelled: the run ended at {ender}",
+                        step.phase_name, step.attempt
+                    ),
+                    Some(step.id),
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): what §4.9's sweep does before it advances a
@@ -3537,8 +4008,8 @@ where
         // `running` run. A run already parked is left as it is. The item is not written
         // (MOD-144): its state is derived from the run.
         let row = if row.status == RunStatus::Running {
-            self.move_run(row.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-                .await?;
+            // MOD-138 M3 F6: `row` may be stale under a concurrent walk (`decide`'s pass read).
+            self.park_the_run(row.id, now).await?;
             self.run(row.id).await?
         } else {
             row
@@ -5129,8 +5600,8 @@ where
         reason: &str,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-            .await?;
+        // MOD-138 M3 D3: a sibling may have parked the run first.
+        self.park_the_run(run.id, now).await?;
         if let Some(item) = run.item_id {
             let candidates = slot
                 .iter()
@@ -5952,8 +6423,8 @@ where
     /// (`gate.rs`'s `note_step`, blueprint H-9).
     async fn park_run(&self, run: &Run, step: &RunStep, reason: &str) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-            .await?;
+        // MOD-138 M3 D3: a sibling may have parked the run first.
+        self.park_the_run(run.id, now).await?;
         if let Some(item) = run.item_id {
             self.parts
                 .store
@@ -5996,6 +6467,16 @@ where
     /// # Errors
     /// The store's own refusals only. The isolator's are logged.
     pub async fn cleanup_run(&self, run: RunId) -> Result<(), EngineError> {
+        // MOD-138 M3 A4: `isolator.cleanup` removes every tree of the run, so a terminal path
+        // inside one node's future leaves it to the walk while a sibling is live.
+        if self.walks.defer_cleanup(run) {
+            return Ok(());
+        }
+        self.cleanup_now(run).await
+    }
+
+    /// [`Self::cleanup_run`]'s body: every step's trees handed to `isolator.cleanup`.
+    async fn cleanup_now(&self, run: RunId) -> Result<(), EngineError> {
         let steps = self.parts.store.run_steps(run).await?;
         let mut trees = Vec::new();
         for step in &steps {
@@ -6829,8 +7310,10 @@ where
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
         // MOD-42 D10, B-17: a cancel that reached the walk between sessions spawns nothing.
-        let mut control = (self.parts.control)(run.id);
-        if control.signal().is_cancel() {
+        // MOD-138 M3 D3: under an open walk the session drives on the walk's control, which also
+        // carries the walk's cut.
+        let mut control = self.session_control(run.id);
+        if self.cancel_read(run.id, &control) {
             return Err(EngineError::Cancelled { run: run.id });
         }
         // MOD-10 D12: the walk's secrets, resolved by this live path's entry (blueprint A-1) and
@@ -6850,7 +7333,7 @@ where
         if let Err(err) =
             Box::pin(self.check_env_files(run, step, &project, &cwd, &extra_dirs)).await
         {
-            if matches!(err, EngineError::EnvFiles { .. }) && control.signal().is_cancel() {
+            if matches!(err, EngineError::EnvFiles { .. }) && self.cancel_read(run.id, &control) {
                 return Err(EngineError::Cancelled { run: run.id });
             }
             return Err(err);
@@ -6967,10 +7450,13 @@ where
         // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
         // `forward_or_cut` feeds from the run's; without one, against the run's own, and no
         // step-local channel is made.
+        // MOD-138 M3 D3: a cancel that reached the run during `driver.start` is in the walk's
+        // control before `drive` first reads it.
+        let started_cancelled = self.cancel_read(run.id, &control);
         let mut timed = deadline.map(|until| {
             let (local, step_control) = control_channel();
             // A cancel that reached the run during `driver.start` is already the step's.
-            if control.signal().is_cancel() {
+            if started_cancelled {
                 local.send_replace(control.signal());
             }
             (until, local, step_control)
@@ -6999,7 +7485,7 @@ where
             // which settles as `DeadlineElapsed` (the `enforce_breach` shape, `record.rs`). The
             // run control is read again here, so a run cancel that landed during the cut's drain
             // still ends the walk as `Cancelled`.
-            Err(DriverError::Cancelled) if cut && !control.signal().is_cancel() => {
+            Err(DriverError::Cancelled) if cut && !self.cancel_read(run.id, &control) => {
                 tracing::warn!(run = %run.id, step = %step.id, "the step deadline cut the session");
                 Ok(Driven {
                     result: Ok(DoneEvent {
@@ -7180,6 +7666,30 @@ where
     }
 
     /// [`Self::move_step`] for the run row.
+    /// MOD-138 M3 D3 (blueprint §3.7, F6): the run `running -> awaiting_approval`, or already
+    /// there because a sibling parked it first. Any other status is `stale_run`, as before.
+    ///
+    /// Only a walk of this engine with a sibling live, or one that already parked, can have
+    /// parked it: outside one (a sweep's recovery, a command's window) a parked run is another
+    /// writer's, and plan D145's `StaleWrite` stands.
+    async fn park_the_run(&self, run: RunId, now: DateTime<Utc>) -> Result<(), EngineError> {
+        if self
+            .parts
+            .store
+            .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
+            .await?
+            || (self.walks.shares_park(run)
+                && self.run(run).await?.status == RunStatus::AwaitingApproval)
+        {
+            return Ok(());
+        }
+        Err(stale_run(
+            run,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+        ))
+    }
+
     async fn move_run(
         &self,
         run: RunId,

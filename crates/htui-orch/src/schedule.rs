@@ -1,0 +1,546 @@
+//! MOD-138 M3 (plan D1, D4; blueprint §3.3, A2, A3, A6): which of a pass's cursors the concurrent
+//! walk admits. Pure: the engine's `run_to_rest` reads the run, its rows and `ready_masked`, and
+//! asks [`plan_pass`] what to do with them.
+//!
+//! The rules, in order:
+//! 1. **Blocking rests (A6).** Nothing is admitted while any cursor is a `Rest` at
+//!    `awaiting_approval`, `running` or `stopped`: a parked step, or a session this walk does not
+//!    own. With nothing in flight the pass re-parks a `running` run over a parked step
+//!    ([`PassPlan::RePark`], V20) or rests ([`PassPlan::Rest`]).
+//! 2. `[Finished]` finishes the run once nothing is in flight.
+//! 3. Every other cursor is a candidate, in `ready` order, admitted when all of these hold:
+//!    - (a) its node is not taken already (F16: one future per node);
+//!    - (b) A2: its node is incomparable with every taken node (neither reaches the other over
+//!      forward edges), so a chain never has two futures in flight and a loop's region never
+//!      meets one (F2, F2a);
+//!    - (c) A3: an in-place (`local`, `shared_serialized`) tree-touching cursor runs alone among
+//!      the tree-touching ones, both ways, and (T1 verify) not while another node's `Select` is
+//!      owed: that selection lands first, so the in-place frontier rule sees its landing;
+//!    - (d) the weight cap: the taken weight plus its own is at most `max_parallel_sessions`
+//!      (`0` reads as `1`), or nothing is taken (a node heavier than the cap runs alone).
+//!
+//! **Linear parity by construction.** On a graph whose walked nodes are totally ordered by
+//! forward reachability, (b) admits at most one candidate per pass and none while one is in
+//! flight, and that candidate is `ready()[0]`, today's `cursor()`.
+
+use std::collections::BTreeMap;
+
+use htui_core::model::{GraphSnapshot, Isolation, RunStatus, RunStep, SnapshotPhase, StepStatus};
+
+use crate::status::{Cursor, position_of};
+use crate::walk::Graph;
+
+/// A future's admission facts, kept while it is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Flight {
+    /// The sessions it can start: `fan_out` for `Run`/`Create`/`Fan`, `1` for a judged `Select`,
+    /// else `0`.
+    pub weight: u32,
+    /// Whether it works in its node's trees: `Run`, `Fan` or `Select`.
+    pub touches: bool,
+    /// Whether its node's trees are the primary checkout (`local`, `shared_serialized`).
+    pub in_place: bool,
+}
+
+/// What one pass of the concurrent walk does (blueprint §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PassPlan {
+    /// Push these, in order: the cursor, its node's position, and its flight.
+    Admit(Vec<(Cursor, i32, Flight)>),
+    /// Nothing to admit; something is in flight.
+    Wait,
+    /// Nothing in flight and `ready == [Finished]`: finish the run `done`.
+    Finished,
+    /// Nothing in flight; the run is `running` over an `awaiting_approval` step (V20, A6).
+    RePark,
+    /// Nothing in flight; answer `resting` (a stray `running`/`stopped` row, or a parked step).
+    Rest,
+}
+
+/// Blueprint §3.3: the pass's answer over `cursors` (`ready_masked` over `in_flight`'s keys),
+/// the run's `status` and the futures `in_flight`, by node position.
+pub(crate) fn plan_pass(
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+    status: RunStatus,
+    cursors: &[Cursor],
+    in_flight: &BTreeMap<i32, Flight>,
+) -> PassPlan {
+    let idle = in_flight.is_empty();
+    // Rule 1 (A6): a parked step, or a session this walk does not own, admits nothing.
+    let blocking = |wanted: &[StepStatus]| {
+        cursors
+            .iter()
+            .any(|cursor| matches!(cursor, Cursor::Rest { status, .. } if wanted.contains(status)))
+    };
+    if blocking(&[
+        StepStatus::AwaitingApproval,
+        StepStatus::Running,
+        StepStatus::Stopped,
+    ]) {
+        return if !idle {
+            PassPlan::Wait
+        } else if status == RunStatus::Running && blocking(&[StepStatus::AwaitingApproval]) {
+            PassPlan::RePark
+        } else {
+            PassPlan::Rest
+        };
+    }
+    // Rule 2.
+    if matches!(cursors, [Cursor::Finished]) {
+        return if idle {
+            PassPlan::Finished
+        } else {
+            PassPlan::Wait
+        };
+    }
+
+    // Rule 3.
+    let graph = Graph::of(snapshot);
+    let cap = snapshot.settings.max_parallel_sessions.max(1);
+    let mut taken: Vec<(i32, Flight)> = in_flight
+        .iter()
+        .map(|(position, flight)| (*position, *flight))
+        .collect();
+    let mut admitted = Vec::new();
+    for cursor in cursors {
+        let Some((position, flight)) = candidate(snapshot, steps, cursor) else {
+            continue;
+        };
+        // (a) F16: one future per node.
+        if taken.iter().any(|(held, _)| *held == position) {
+            continue;
+        }
+        // (b) A2: incomparable with every taken node.
+        if !taken
+            .iter()
+            .all(|(held, _)| graph.concurrent(position, *held))
+        {
+            continue;
+        }
+        // (c) A3: an in-place tree is exclusive among the tree-touching futures, both ways.
+        if flight.touches
+            && taken
+                .iter()
+                .any(|(_, held)| held.touches && (flight.in_place || held.in_place))
+        {
+            continue;
+        }
+        // (c) T1 verify: an owed selection lands before an in-place node touches its trees.
+        if flight.touches
+            && flight.in_place
+            && cursors.iter().any(
+                |other| matches!(other, Cursor::Select { position: at, .. } if *at != position),
+            )
+        {
+            continue;
+        }
+        // (d) The weight cap; a node heavier than the cap runs alone.
+        let weight: u32 = taken.iter().map(|(_, held)| held.weight).sum();
+        if !taken.is_empty() && weight.saturating_add(flight.weight) > cap {
+            continue;
+        }
+        taken.push((position, flight));
+        admitted.push((cursor.clone(), position, flight));
+    }
+    match (admitted.is_empty(), idle) {
+        (false, _) => PassPlan::Admit(admitted),
+        (true, false) => PassPlan::Wait,
+        // Unreachable: the first candidate passes (a) to (d) against nothing taken. A pass with
+        // no candidate at all (every cursor names a row the pass does not hold) rests.
+        (true, true) => PassPlan::Rest,
+    }
+}
+
+/// `cursor`'s node position and flight, or `None` for a cursor no future runs (`Finished`, a
+/// non-`failed` `Rest`) or one whose step or phase the pass does not hold.
+fn candidate(
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+    cursor: &Cursor,
+) -> Option<(i32, Flight)> {
+    let position = position_of(cursor, steps)?;
+    let phase: &SnapshotPhase = snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.position == position)?;
+    let fan_out = u32::try_from(phase.fan_out.max(1)).unwrap_or(1);
+    let (weight, touches) = match cursor {
+        Cursor::Run(_) | Cursor::Fan { .. } => (fan_out, true),
+        Cursor::Create { .. } => (fan_out, false),
+        Cursor::Select { .. } => (u32::from(phase.judge.is_some()), true),
+        Cursor::Decide { .. }
+        | Cursor::Loop { .. }
+        | Cursor::Rest {
+            status: StepStatus::Failed,
+            ..
+        } => (0, false),
+        Cursor::Rest { .. } | Cursor::Finished => return None,
+    };
+    Some((
+        position,
+        Flight {
+            weight,
+            touches,
+            in_place: matches!(
+                phase.isolation,
+                Isolation::Local | Isolation::SharedSerialized
+            ),
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use htui_core::model::{
+        AgentId, GraphSnapshot, Isolation, RunStatus, SnapshotJudge, StepId, StepStatus,
+    };
+
+    use super::{Flight, PassPlan, plan_pass};
+    use crate::status::Cursor;
+    use crate::walk::tests::{NEXT, create, diamond, done, graph, row};
+
+    /// Three independent roots `a`, `b`, `c`, every one `worktree` with `fan_out` 1.
+    fn three() -> GraphSnapshot {
+        let mut snapshot = graph(&[("a", 0), ("b", 1), ("c", 2)], &[]);
+        for phase in &mut snapshot.phases {
+            phase.isolation = Isolation::Worktree;
+        }
+        snapshot
+    }
+
+    fn admitted(plan: &PassPlan) -> Vec<i32> {
+        match plan {
+            PassPlan::Admit(admitted) => {
+                admitted.iter().map(|(_, position, _)| *position).collect()
+            }
+            other => panic!("expected an admission, got {other:?}"),
+        }
+    }
+
+    fn flight(weight: u32, touches: bool, in_place: bool) -> Flight {
+        Flight {
+            weight,
+            touches,
+            in_place,
+        }
+    }
+
+    fn plan(snapshot: &GraphSnapshot, cursors: &[Cursor], in_flight: &[(i32, Flight)]) -> PassPlan {
+        plan_pass(
+            snapshot,
+            &[],
+            RunStatus::Running,
+            cursors,
+            &in_flight.iter().copied().collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    /// D1: every incomparable ready node is admitted up to the cap, in `ready` order.
+    #[test]
+    fn the_cap_bounds_the_admitted_weight() {
+        let mut snapshot = three();
+        snapshot.settings.max_parallel_sessions = 2;
+        let cursors = [create(0), create(1), create(2)];
+        assert_eq!(admitted(&plan(&snapshot, &cursors, &[])), [0, 1]);
+        assert_eq!(
+            plan(
+                &snapshot,
+                &cursors[2..],
+                &[(0, flight(1, true, false)), (1, flight(1, true, false))]
+            ),
+            PassPlan::Wait,
+            "two in flight fill a cap of two"
+        );
+        assert_eq!(
+            admitted(&plan(
+                &snapshot,
+                &cursors[2..],
+                &[(0, flight(1, true, false))]
+            )),
+            [2]
+        );
+    }
+
+    /// D1: a frozen cap of 0 behaves as 1.
+    #[test]
+    fn a_cap_of_zero_reads_as_one() {
+        let mut snapshot = three();
+        snapshot.settings.max_parallel_sessions = 0;
+        let cursors = [create(0), create(1)];
+        assert_eq!(admitted(&plan(&snapshot, &cursors, &[])), [0]);
+        assert_eq!(
+            plan(&snapshot, &cursors[1..], &[(0, flight(1, false, false))]),
+            PassPlan::Wait
+        );
+    }
+
+    /// D1: a node heavier than the cap runs alone, and nothing joins it.
+    #[test]
+    fn a_heavy_node_runs_alone() {
+        let mut snapshot = three();
+        snapshot.settings.max_parallel_sessions = 2;
+        snapshot.phases[0].fan_out = 3;
+        let cursors = [create(0), create(1)];
+        assert_eq!(admitted(&plan(&snapshot, &cursors, &[])), [0]);
+        assert_eq!(
+            plan(&snapshot, &cursors[1..], &[(0, flight(3, false, false))]),
+            PassPlan::Wait
+        );
+        assert_eq!(
+            plan(&snapshot, &cursors[..1], &[(1, flight(1, true, false))]),
+            PassPlan::Wait,
+            "beside `b` in flight, `a` would exceed the cap"
+        );
+    }
+
+    /// A3: an in-place tree-touching cursor excludes every tree-touching one, both ways; a
+    /// `Create` touches nothing and is not excluded.
+    #[test]
+    fn an_in_place_tree_is_exclusive_both_ways() {
+        let mut snapshot = three();
+        snapshot.phases[0].isolation = Isolation::SharedSerialized;
+        let a = row(&snapshot, "a", 1, StepStatus::Pending);
+        let b = row(&snapshot, "b", 1, StepStatus::Pending);
+        let steps = [a.clone(), b.clone()];
+        let at = |cursors: &[Cursor], in_flight: &[(i32, Flight)]| {
+            plan_pass(
+                &snapshot,
+                &steps,
+                RunStatus::Running,
+                cursors,
+                &in_flight.iter().copied().collect(),
+            )
+        };
+        assert_eq!(
+            admitted(&at(&[Cursor::Run(a.id), Cursor::Run(b.id)], &[])),
+            [0]
+        );
+        assert_eq!(
+            at(&[Cursor::Run(b.id)], &[(0, flight(1, true, true))]),
+            PassPlan::Wait,
+            "a worktree run waits on an in-place run"
+        );
+        assert_eq!(
+            at(&[Cursor::Run(a.id)], &[(1, flight(1, true, false))]),
+            PassPlan::Wait,
+            "an in-place run waits on a worktree run"
+        );
+        assert_eq!(
+            admitted(&at(
+                &[Cursor::Run(a.id), create(2)],
+                &[(1, flight(1, true, false))]
+            )),
+            [2],
+            "a `Create` touches no tree"
+        );
+        assert_eq!(
+            admitted(&at(&[Cursor::Run(b.id)], &[(0, flight(1, false, true))])),
+            [1],
+            "an in-place `Create` in flight excludes nothing"
+        );
+    }
+
+    /// T1 verify: an in-place node does not touch its trees while another node's selection is
+    /// owed; the selection is admitted instead.
+    #[test]
+    fn an_owed_selection_lands_before_an_in_place_node() {
+        let mut snapshot = three();
+        snapshot.phases[0].isolation = Isolation::SharedSerialized;
+        snapshot.phases[1].fan_out = 2;
+        let a = row(&snapshot, "a", 1, StepStatus::Pending);
+        let select = Cursor::Select {
+            position: 1,
+            attempt: 1,
+        };
+        assert_eq!(
+            admitted(&plan_pass(
+                &snapshot,
+                std::slice::from_ref(&a),
+                RunStatus::Running,
+                &[Cursor::Run(a.id), select.clone()],
+                &BTreeMap::new(),
+            )),
+            [1]
+        );
+        assert_eq!(
+            admitted(&plan_pass(
+                &snapshot,
+                std::slice::from_ref(&a),
+                RunStatus::Running,
+                &[Cursor::Run(a.id), create(2)],
+                &BTreeMap::new(),
+            )),
+            [0, 2],
+            "with no selection owed the in-place run goes first"
+        );
+    }
+
+    /// A2: a candidate comparable with a taken node waits; F16: one future per node.
+    #[test]
+    fn comparable_nodes_and_one_future_per_node() {
+        let snapshot = diamond();
+        let a = done(&snapshot, "a");
+        let b = row(&snapshot, "b", 1, StepStatus::Pending);
+        let steps = [a.clone(), b.clone()];
+        let at = |cursors: &[Cursor], in_flight: &[(i32, Flight)]| {
+            plan_pass(
+                &snapshot,
+                &steps,
+                RunStatus::Running,
+                cursors,
+                &in_flight.iter().copied().collect(),
+            )
+        };
+        // `a` reaches `d`: a `Decide` owed on `a` beside `d`'s `Create`.
+        assert_eq!(
+            admitted(&at(&[Cursor::Decide { step: a.id }, create(3)], &[])),
+            [0],
+            "`d` follows `a`"
+        );
+        assert_eq!(
+            admitted(&at(&[Cursor::Run(b.id), create(2)], &[])),
+            [1, 2],
+            "`b` and `c` are incomparable"
+        );
+        assert_eq!(
+            admitted(&at(
+                &[
+                    Cursor::Decide { step: a.id },
+                    Cursor::Loop {
+                        step: a.id,
+                        to: "b".to_owned()
+                    }
+                ],
+                &[]
+            )),
+            [0],
+            "one candidate per node"
+        );
+        assert_eq!(
+            at(&[create(3)], &[(1, flight(1, true, false))]),
+            PassPlan::Wait,
+            "`d` waits on `b` in flight"
+        );
+    }
+
+    /// A chain admits one future at a time: the first cursor, as the serial walk did.
+    #[test]
+    fn a_chain_admits_one_at_a_time() {
+        let snapshot = graph(&[("a", 0), ("b", 1)], &[("a", "b", NEXT)]);
+        let a = done(&snapshot, "a");
+        assert_eq!(
+            admitted(&plan_pass(
+                &snapshot,
+                std::slice::from_ref(&a),
+                RunStatus::Running,
+                &[
+                    Cursor::Loop {
+                        step: a.id,
+                        to: "a".to_owned()
+                    },
+                    create(1)
+                ],
+                &BTreeMap::new(),
+            )),
+            [0],
+            "F2: the owed loop runs first and `b` waits"
+        );
+    }
+
+    /// Rules 1, 2 and 4: the three no-admission answers.
+    #[test]
+    fn the_no_admission_answers() {
+        let snapshot = three();
+        let parked = Cursor::Rest {
+            step: StepId::new(),
+            status: StepStatus::AwaitingApproval,
+        };
+        let running = Cursor::Rest {
+            step: StepId::new(),
+            status: StepStatus::Running,
+        };
+        let busy = [(1, flight(1, true, false))];
+        assert_eq!(
+            plan(&snapshot, &[parked.clone(), create(2)], &[]),
+            PassPlan::RePark
+        );
+        assert_eq!(
+            plan_pass(
+                &snapshot,
+                &[],
+                RunStatus::AwaitingApproval,
+                std::slice::from_ref(&parked),
+                &BTreeMap::new()
+            ),
+            PassPlan::Rest,
+            "a parked run is not parked again"
+        );
+        assert_eq!(plan(&snapshot, &[parked, create(2)], &busy), PassPlan::Wait);
+        assert_eq!(
+            plan(&snapshot, std::slice::from_ref(&running), &[]),
+            PassPlan::Rest
+        );
+        assert_eq!(plan(&snapshot, &[running], &busy), PassPlan::Wait);
+        assert_eq!(
+            plan(&snapshot, &[Cursor::Finished], &[]),
+            PassPlan::Finished
+        );
+        assert_eq!(
+            plan(&snapshot, &[], &busy),
+            PassPlan::Wait,
+            "a masked pass waits"
+        );
+        assert_eq!(plan(&snapshot, &[], &[]), PassPlan::Rest);
+    }
+
+    /// The weights: `fan_out` for a node's sessions, `1` for a judged selection, `0` for writes.
+    #[test]
+    fn the_weights() {
+        let mut snapshot = three();
+        snapshot.phases[0].fan_out = 3;
+        snapshot.phases[0].judge = Some(SnapshotJudge {
+            agent_id: AgentId::new(),
+            agent_name: "judge".to_owned(),
+            model: None,
+            template: None,
+        });
+        let a = done(&snapshot, "a");
+        let weight = |cursor: Cursor| match plan_pass(
+            &snapshot,
+            std::slice::from_ref(&a),
+            RunStatus::Running,
+            &[cursor],
+            &BTreeMap::new(),
+        ) {
+            PassPlan::Admit(admitted) => admitted[0].2.weight,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(weight(create(0)), 3);
+        assert_eq!(
+            weight(Cursor::Fan {
+                position: 0,
+                attempt: 1
+            }),
+            3
+        );
+        assert_eq!(
+            weight(Cursor::Select {
+                position: 0,
+                attempt: 1
+            }),
+            1
+        );
+        assert_eq!(weight(Cursor::Decide { step: a.id }), 0);
+        assert_eq!(
+            weight(Cursor::Rest {
+                step: a.id,
+                status: StepStatus::Failed
+            }),
+            0
+        );
+        assert_eq!(weight(create(1)), 1);
+    }
+}
