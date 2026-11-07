@@ -1,14 +1,16 @@
 //! The concepts index behind the TUI's search (MOD-64 D230-D232, D237, D238).
 //!
 //! `SearchConcepts` loads an embedding model and calls Qdrant; `IndexConcepts` reads every item of
-//! the scope. Neither may run in the store worker's serial loop (`R-NF-3`): [`ConceptsRuntime`]
-//! serves both on tasks of their own, the way `AgentRuntime::preview` serves a preview, and each
-//! task sends its own reply. The index is an object-safe [`ConceptIndex`]: [`QdrantIndex`] in
+//! the scope; `ProbeQdrant` (MOD-160 D9) asks Qdrant, which may take its 3 s bound when it is
+//! down. None may run in the store worker's serial loop (`R-NF-3`): [`ConceptsRuntime`] serves
+//! them on tasks of their own, the way `AgentRuntime::preview` serves a preview, and each task
+//! sends its own reply. The index is an object-safe [`ConceptIndex`]: [`QdrantIndex`] in
 //! production, `MemIndex` in tests.
 
 use std::collections::HashMap;
 use std::mem::Discriminant;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -17,11 +19,13 @@ use futures::future::{BoxFuture, Shared};
 use htui_core::model::Scope;
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
 use htui_core::store::{MemStore, StoreError};
-use htui_store::embed::RtenEmbedder;
+use htui_store::embed::{DENSE_DIM, RtenEmbedder};
 use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::secret::{KeyHost, QdrantEnv, QdrantKeyError};
-use htui_store::vector::{Hit, QdrantStore, SearchQuery, VectorStore as _};
+use htui_store::vector::{
+    self, COLLECTION, ExistingCollection, Hit, Probe, QdrantStore, SearchQuery, VectorStore as _,
+};
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{Backend, PgStore, secret};
 use tokio::sync::mpsc;
@@ -33,8 +37,8 @@ use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, St
 /// What both requests answer when nothing serves them: the test harness without a runtime (D231).
 pub const NOT_AVAILABLE: &str = "concepts search is not available";
 
-/// The two `StoreRequest::name`s this module serves, in that order (D241).
-pub const REQUEST_NAMES: [&str; 2] = ["search_concepts", "index_concepts"];
+/// The three `StoreRequest::name`s this module serves, in that order (D241, MOD-160 D9).
+pub const REQUEST_NAMES: [&str; 3] = ["search_concepts", "index_concepts", "probe_qdrant"];
 
 /// One concepts answer, its error inside (D232, blueprint D242): a Qdrant failure is the overlay's
 /// to show and never becomes `StoreReply::Failed`, which the shell also puts on the status line.
@@ -62,6 +66,20 @@ pub trait ConceptIndex: Send + Sync {
     /// MOD-158 D6: the store the `qdrant_url` row is read through from now on (`None`: offline,
     /// `--demo`, or not connected yet). An index that reads no settings ignores it.
     fn publish(&self, _store: Option<Arc<dyn UrlRow>>) {}
+    /// MOD-160 D5: whether `search_concepts` is offered to a session opened now. Read once per
+    /// session at `McpHost::open`, on whatever thread opens it (the store loop for a chat), so it
+    /// awaits nothing. An index that reads no settings is always offered.
+    fn offered(&self) -> bool {
+        true
+    }
+    /// MOD-160 D5: this process wrote or cleared the `qdrant_url` row; the offer is read again.
+    fn url_changed(&self) {}
+    /// MOD-160 D9: a model-free look at the Qdrant this index searches, for Settings › Qdrant and
+    /// the TUI's launch notice. `None`: nothing was probed (offline, or an index that reads no
+    /// settings).
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(async { None })
+    }
 }
 
 /// "Postgres is not connected" for the Qdrant URL (MOD-158 D6): no store is published (offline,
@@ -237,9 +255,68 @@ pub(crate) async fn resolve_settings(
     Ok(QdrantSettings { url, api_key })
 }
 
+/// MOD-160 D5: how old a known offer may be before [`QdrantSource::offered`] asks again.
+pub(crate) const OFFER_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// MOD-160 D5: whether a Qdrant URL resolves, as last read. Shared with the spawned reads (`Arc`),
+/// so a read needs no `&QdrantSource`.
+#[derive(Debug, Default)]
+struct Configured {
+    /// `None` until first known; `tokio::time::Instant`, so a paused clock ages it.
+    known: Mutex<Option<(bool, tokio::time::Instant)>>,
+    /// One staleness re-read at a time (`offered()`'s single flight). A drop guard in the task
+    /// clears it, so an aborted task cannot leave it set.
+    reading: AtomicBool,
+    /// Bumped by `publish` and `reread`. A read records only if no bump happened since it began,
+    /// so a read of the old store never overwrites the new store's answer.
+    generation: AtomicU64,
+}
+
+impl Configured {
+    /// Known at once, with no read.
+    fn known(configured: bool) -> Self {
+        Self {
+            known: Mutex::new(Some((configured, tokio::time::Instant::now()))),
+            ..Self::default()
+        }
+    }
+
+    /// The generation a read starting now belongs to.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// A new store or a new row: every read begun before is out of date. Under the `known` lock,
+    /// so no read can check the old generation and then record after the bump.
+    fn bump(&self) -> u64 {
+        let _known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Records `configured` for a read begun under `generation`, unless a bump came since.
+    fn record(&self, generation: u64, configured: bool) {
+        let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.generation.load(Ordering::SeqCst) == generation {
+            *known = Some((configured, tokio::time::Instant::now()));
+        }
+    }
+}
+
+/// Clears [`Configured::reading`] when the staleness read ends, however it ends.
+struct Reading(Arc<Configured>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.reading.store(false, Ordering::SeqCst);
+    }
+}
+
 /// MOD-158 D6: one process's source of Qdrant settings. The slot holds the current store (`None`
 /// offline, under `--demo`, or before a connect); every read takes an `Arc` clone and drops the
 /// lock before any `.await`, and a publish is a pointer swap with no `.await` (`R-NF-3`).
+///
+/// MOD-160 D5: it also caches whether a URL resolves ([`Self::offered`]), refreshed by spawned
+/// reads and by every resolution already in flight, never awaited by a reader.
 pub struct QdrantSource {
     /// `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY`, as this process read them.
     env: QdrantEnv,
@@ -249,6 +326,8 @@ pub struct QdrantSource {
     key: RwLock<KeySource>,
     /// The keyring read of the key.
     keyring: KeyringRead,
+    /// Whether a URL resolves, as last read (D5).
+    configured: Arc<Configured>,
 }
 
 impl core::fmt::Debug for QdrantSource {
@@ -284,11 +363,16 @@ impl QdrantSource {
                 Err(why) => tracing::warn!("{}", env_url_unusable(why)),
             }
         }
+        // D5: the override wins over every row, so its verdict is known without a read.
+        let configured = env.url.as_deref().map_or_else(Configured::default, |text| {
+            Configured::known(QdrantUrl::parse(text).is_ok())
+        });
         Self {
             env,
             store: RwLock::new(None),
             key: RwLock::new(key),
             keyring: secret::get_qdrant_api_key,
+            configured: Arc::new(configured),
         }
     }
 
@@ -311,9 +395,90 @@ impl QdrantSource {
         &self.env
     }
 
-    /// The store the row is read through from now on.
+    /// The store the row is read through from now on, then the offer (MOD-160 D5): `None` records
+    /// at once with no task (the override's verdict, else `false`: offline, `--demo`); `Some`
+    /// starts one read of the new store.
     pub fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
+        let read = store.is_some();
         *self.store.write().unwrap_or_else(PoisonError::into_inner) = store;
+        let generation = self.configured.bump();
+        if read {
+            self.spawn_read(true);
+        } else {
+            let verdict = self
+                .env
+                .url
+                .as_deref()
+                .is_some_and(|text| QdrantUrl::parse(text).is_ok());
+            self.configured.record(generation, verdict);
+        }
+    }
+
+    /// MOD-160 D5: this process wrote or cleared the URL row: the offer is read again, now.
+    pub fn reread(&self) {
+        self.configured.bump();
+        self.spawn_read(true);
+    }
+
+    /// MOD-160 D5: whether a Qdrant URL resolves, as last read; never awaited. Unknown answers
+    /// `false` and starts a read. Older than [`OFFER_STALE_AFTER`], it answers the old value and
+    /// starts at most one read.
+    #[must_use]
+    pub fn offered(&self) -> bool {
+        let known = *self
+            .configured
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match known {
+            None => {
+                self.spawn_read(false);
+                false
+            }
+            Some((offered, at)) => {
+                if at.elapsed() >= OFFER_STALE_AFTER {
+                    self.spawn_read(false);
+                }
+                offered
+            }
+        }
+    }
+
+    /// The read behind `publish`, `reread` and `offered`, on a task of its own: the URL alone
+    /// (never the key), over the current store, recorded under the generation it began in. With
+    /// no runtime it starts nothing and the flag stays as it was. Unforced, it is the single
+    /// flight's: none starts while another runs.
+    fn spawn_read(&self, forced: bool) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let guard = if forced {
+            None
+        } else if self
+            .configured
+            .reading
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(Reading(Arc::clone(&self.configured)))
+        } else {
+            return;
+        };
+        let generation = self.configured.generation();
+        let env = QdrantEnv {
+            url: self.env.url.clone(),
+            api_key: None,
+        };
+        let store = self.current();
+        let configured = Arc::clone(&self.configured);
+        runtime.spawn(async move {
+            let _guard = guard;
+            let resolved = resolve_url(&env, store.as_deref()).await;
+            if let Err(why) = &resolved {
+                tracing::debug!(%why, "search_concepts is not offered");
+            }
+            configured.record(generation, resolved.is_ok());
+        });
     }
 
     /// Where the key comes from from now on (`htui worker`: [`KeySource::Headless`]).
@@ -334,22 +499,29 @@ impl QdrantSource {
     /// # Errors
     /// [`Unresolved`]: no URL, offline, an unusable override or row, or an unreadable row.
     pub async fn url(&self) -> Result<QdrantUrl, Unresolved> {
+        let generation = self.configured.generation();
         let store = self.current();
-        resolve_url(&self.env, store.as_deref()).await
+        let url = resolve_url(&self.env, store.as_deref()).await;
+        self.configured.record(generation, url.is_ok());
+        url
     }
 
     /// D3 and D4, read now: a URL or key changed since the last call applies to this one.
     ///
     /// # Errors
     /// [`Unresolved`].
+    ///
+    /// MOD-160 D5: the URL's verdict is recorded as soon as it is known, before the key: a URL
+    /// that resolves is configured even when the key cannot be read.
     pub async fn settings(&self) -> Result<QdrantSettings, Unresolved> {
-        let store = self.current();
         let key = self
             .key
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        resolve_settings(&self.env, store.as_deref(), &key, self.keyring).await
+        let url = self.url().await?;
+        let api_key = resolve_key(&self.env, &key, self.keyring).await?;
+        Ok(QdrantSettings { url, api_key })
     }
 }
 
@@ -380,10 +552,21 @@ pub struct QdrantIndex {
     load: Mutex<Option<Load>>,
     /// What loads the model.
     loader: Loader,
-    /// The last connection made, for the settings it was made with (review 3).
+    /// The last connection made, for the settings it was made with (review 3), and how (D4).
     connections: Connections<QdrantStore<RtenEmbedder>>,
     /// Where the settings come from (MOD-158 D6).
     source: Arc<QdrantSource>,
+    /// The collection searched and synced: [`COLLECTION`], or a test's throwaway one (P-10).
+    collection: String,
+}
+
+/// How a cached store was made (MOD-160 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// `QdrantStore::connect`: the collection ensured (payload indexes, stamp, MOD-144 rebuild).
+    Ensured,
+    /// `ExistingCollection::open` (D2): read-only; never serves a sync.
+    ReadOnly,
 }
 
 /// One cached connection, keyed by the URL and key it was made with (review 3).
@@ -391,9 +574,28 @@ pub struct QdrantIndex {
 /// `QdrantStore::connect` is a round trip and five waited payload-index writes, too much to pay per
 /// search. The lock is never held across an `await`: two requests that miss together both connect,
 /// and the later `put` wins, which costs one spare connection and nothing else.
+///
+/// MOD-160 D4: the slot records how its store was made. A search opens an existing collection
+/// read-only and never creates one (D2), so its store has none of what `ensure_collection` does; a
+/// sync relies on that, so it takes only an ensured store and otherwise connects.
 struct Connections<T> {
-    /// The settings and the connection made with them.
-    slot: Mutex<Option<(QdrantSettings, Arc<T>)>>,
+    /// The settings, how the connection was made, and the connection.
+    slot: Mutex<Option<Cached<T>>>,
+}
+
+/// What [`Connections`] holds.
+struct Cached<T> {
+    /// The settings the connection was made with.
+    settings: QdrantSettings,
+    /// How (D4).
+    made: Made,
+    /// The connection.
+    connection: Arc<T>,
+}
+
+/// Whether `a` and `b` name the same URL and key.
+fn same_settings(a: &QdrantSettings, b: &QdrantSettings) -> bool {
+    a.url == b.url && a.api_key.as_deref() == b.api_key.as_deref()
 }
 
 impl<T> Default for Connections<T> {
@@ -405,20 +607,31 @@ impl<T> Default for Connections<T> {
 }
 
 impl<T> Connections<T> {
-    /// The cached connection, when it was made with `settings`' URL and key.
-    fn get(&self, settings: &QdrantSettings) -> Option<Arc<T>> {
+    /// The cached connection for `settings`' URL and key that `need` accepts: `ReadOnly` takes
+    /// either kind, `Ensured` only an ensured one (D4).
+    fn get(&self, settings: &QdrantSettings, need: Made) -> Option<Arc<T>> {
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         slot.as_ref()
-            .filter(|(made_for, _)| {
-                made_for.url == settings.url
-                    && made_for.api_key.as_deref() == settings.api_key.as_deref()
-            })
-            .map(|(_, connection)| Arc::clone(connection))
+            .filter(|cached| same_settings(&cached.settings, settings))
+            .filter(|cached| need == Made::ReadOnly || cached.made == Made::Ensured)
+            .map(|cached| Arc::clone(&cached.connection))
     }
 
-    /// Caches `connection` as the one for `settings`.
-    fn put(&self, settings: QdrantSettings, connection: Arc<T>) {
-        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((settings, connection));
+    /// Caches `connection` as the one for `settings`. A `ReadOnly` put never replaces an `Ensured`
+    /// connection for the same settings: a search racing an index run keeps the better one.
+    fn put(&self, settings: QdrantSettings, made: Made, connection: Arc<T>) {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let keeps_better = made == Made::ReadOnly
+            && slot.as_ref().is_some_and(|cached| {
+                cached.made == Made::Ensured && same_settings(&cached.settings, &settings)
+            });
+        if !keeps_better {
+            *slot = Some(Cached {
+                settings,
+                made,
+                connection,
+            });
+        }
     }
 
     /// The settings stopped resolving (no URL, offline, an unusable setting): no connection, and
@@ -444,7 +657,7 @@ impl<T> Connections<T> {
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if slot
             .as_ref()
-            .is_some_and(|(_, cached)| Arc::ptr_eq(cached, connection))
+            .is_some_and(|cached| Arc::ptr_eq(&cached.connection, connection))
         {
             *slot = None;
         }
@@ -488,6 +701,16 @@ impl QdrantIndex {
                 QdrantEnv::default(),
                 KeySource::Interactive,
             )),
+            collection: COLLECTION.to_owned(),
+        }
+    }
+
+    /// The same index over the collection `name` (MOD-160 P-10: a live test's throwaway one).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the live tests' seam"))]
+    pub(crate) fn with_collection(self, name: &str) -> Self {
+        Self {
+            collection: name.to_owned(),
+            ..self
         }
     }
 
@@ -531,21 +754,49 @@ impl QdrantIndex {
 
     /// Qdrant at `settings`, over the shared model: the cached connection when it was made with
     /// the same URL and key, else a new one, cached (review 3). The worker's index job opens its
-    /// store here, so a changed URL or key reconnects it too (MOD-158 D7).
+    /// store here, so a changed URL or key reconnects it too (MOD-158 D7). It creates the
+    /// collection when there is none, so only a sync connects (MOD-160 D2), and only an ensured
+    /// store serves it (D4): a read-only one cached by a search is replaced.
     pub(crate) async fn connect(
         &self,
         settings: QdrantSettings,
     ) -> Result<Arc<QdrantStore<RtenEmbedder>>, String> {
-        if let Some(store) = self.connections.get(&settings) {
+        if let Some(store) = self.connections.get(&settings, Made::Ensured) {
             return Ok(store);
         }
         let embedder = self.embedder().await?;
-        let store = QdrantStore::connect(&settings, embedder)
+        let store = QdrantStore::connect_to(&settings, embedder, &self.collection)
             .await
             .map(Arc::new)
-            .map_err(|e| format!("{:#}", crate::concepts::qdrant_refusal(e)))?;
-        self.connections.put(settings, Arc::clone(&store));
+            .map_err(refusal)?;
+        self.connections
+            .put(settings, Made::Ensured, Arc::clone(&store));
         Ok(store)
+    }
+
+    /// MOD-160 D2, a search's store: Qdrant and the collection first, then the embedder check
+    /// without the model (D3), then the shared model, then the store, cached read-only (D4).
+    /// `Ok(None)` when the collection does not exist: an empty index, with nothing created, cached
+    /// or loaded.
+    async fn open_read_only(
+        &self,
+        settings: QdrantSettings,
+    ) -> Result<Option<Arc<QdrantStore<RtenEmbedder>>>, String> {
+        let Some(found) = ExistingCollection::find_in(&settings, &self.collection)
+            .await
+            .map_err(refusal)?
+        else {
+            return Ok(None);
+        };
+        found
+            .check(&model::identity(), DENSE_DIM)
+            .await
+            .map_err(refusal)?;
+        let embedder = self.embedder().await?;
+        let store = found.open(embedder).await.map(Arc::new).map_err(refusal)?;
+        self.connections
+            .put(settings, Made::ReadOnly, Arc::clone(&store));
+        Ok(Some(store))
     }
 
     /// The worker's index job's `forget` (MOD-158 R1, B-L1): `Some(store)` after a failed sync on
@@ -565,15 +816,28 @@ impl QdrantIndex {
     }
 }
 
+/// A failed Qdrant call as the error a user reads ([`crate::concepts::qdrant_refusal`]).
+fn refusal(err: StoreError) -> String {
+    format!("{:#}", crate::concepts::qdrant_refusal(err))
+}
+
 // Settings before the model, in both: a box with no URL fails in microseconds without downloading
-// anything. Any failure drops the connection it used, so the next request reconnects: telling a
-// dropped connection from a refused query would mean parsing the client's errors, and a spare
-// reconnect after a refusal costs what every request cost before the cache (review 3).
+// anything. A search then asks Qdrant and the collection before the model too, and never creates
+// one (MOD-160 D2); a sync connects, which does. Any failure drops the connection it used, so the
+// next request reconnects: telling a dropped connection from a refused query would mean parsing the
+// client's errors, and a spare reconnect after a refusal costs what every request cost before the
+// cache (review 3).
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
             let settings = self.settings().await?;
-            let store = self.connect(settings).await?;
+            let store = match self.connections.get(&settings, Made::ReadOnly) {
+                Some(store) => store,
+                None => match self.open_read_only(settings).await? {
+                    Some(store) => store,
+                    None => return Ok(Vec::new()),
+                },
+            };
             store.search(&query).await.map_err(|e| {
                 self.connections.forget(&store);
                 e.to_string()
@@ -594,6 +858,18 @@ impl ConceptIndex for QdrantIndex {
 
     fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
         self.source.publish(store);
+    }
+
+    fn offered(&self) -> bool {
+        self.source.offered()
+    }
+
+    fn url_changed(&self) {
+        self.source.reread();
+    }
+
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(check_qdrant(&self.source, &self.collection))
     }
 }
 
@@ -619,17 +895,122 @@ pub fn shared_qdrant() -> Arc<QdrantIndex> {
     Arc::clone(SHARED.get_or_init(|| Arc::new(QdrantIndex::new())))
 }
 
+/// MOD-160 D9: what one model-free look at this process's Qdrant says. The worker's start line,
+/// Settings › Qdrant and the TUI's launch notice (both through `StoreRequest::ProbeQdrant`) all
+/// read it, so every surface says the same states in the same words. No variant carries the API
+/// key: each sentence is an [`Unresolved`] sentence or a [`Probe`]'s, and neither ever holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QdrantCheck {
+    /// No URL, or an unusable one: [`Unresolved`]'s sentence.
+    NotConfigured(String),
+    /// Unreachable, or an embedder mismatch: the probe's sentence.
+    Unavailable(String),
+    /// The `qdrant_url` row or this box's key could not be read, so Qdrant was never contacted:
+    /// [`Unresolved`]'s sentence (MOD-160 R1: never said to be unreachable).
+    Unreadable(String),
+    /// Refused while this box has a key: the sentence.
+    KeyRefused(String),
+    /// Refused, and no key from any source.
+    NoKey(String),
+    /// Answered without any key (Q4): an info line, not a warning.
+    Keyless,
+    /// Answered with a key, or nothing to say.
+    Ready,
+}
+
+impl QdrantCheck {
+    /// The verdict on `resolved` settings and the `probe` made with them: `None` when nothing was
+    /// probed (offline, or no probe). An empty Qdrant (`NoCollection`) is no warning: the index is
+    /// built by the next sync.
+    pub(crate) fn of(
+        resolved: Result<&QdrantSettings, &Unresolved>,
+        probe: Option<&Probe>,
+    ) -> Option<Self> {
+        let settings = match resolved {
+            Err(why @ (Unresolved::NoUrl | Unresolved::Unusable(_))) => {
+                return Some(Self::NotConfigured(why.sentence()));
+            }
+            Err(Unresolved::Offline) => return None,
+            Err(why @ (Unresolved::Read(_) | Unresolved::Key(_))) => {
+                return Some(Self::Unreadable(why.sentence()));
+            }
+            Ok(settings) => settings,
+        };
+        let keyed = settings.api_key.is_some();
+        Some(match probe? {
+            Probe::Ready | Probe::NoCollection if keyed => Self::Ready,
+            Probe::Ready | Probe::NoCollection => Self::Keyless,
+            Probe::Unreachable(sentence) | Probe::Mismatch(sentence) => {
+                Self::Unavailable(sentence.clone())
+            }
+            Probe::Refused(sentence) if keyed => Self::KeyRefused(sentence.clone()),
+            Probe::Refused(sentence) => Self::NoKey(sentence.clone()),
+        })
+    }
+
+    /// The warning state in words; `None` for [`Self::Keyless`] and [`Self::Ready`].
+    #[must_use]
+    pub const fn state(&self) -> Option<&'static str> {
+        match self {
+            Self::NotConfigured(_) => Some("no Qdrant is configured"),
+            Self::Unavailable(_) => Some("Qdrant is unreachable or refuses the collection"),
+            Self::Unreadable(_) => Some("this box cannot read the Qdrant settings"),
+            Self::KeyRefused(_) => Some("the Qdrant refused this box's API key"),
+            Self::NoKey(_) => Some("this box lacks the Qdrant API key"),
+            Self::Keyless | Self::Ready => None,
+        }
+    }
+
+    /// `"{state}: {cause}"` for the five warnings; `None` for [`Self::Keyless`] and
+    /// [`Self::Ready`].
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        let (Self::NotConfigured(cause)
+        | Self::Unavailable(cause)
+        | Self::Unreadable(cause)
+        | Self::KeyRefused(cause)
+        | Self::NoKey(cause)) = self
+        else {
+            return None;
+        };
+        self.state().map(|state| format!("{state}: {cause}"))
+    }
+
+    /// The info line (Q4), for [`Self::Keyless`] only.
+    #[must_use]
+    pub const fn info(&self) -> Option<&'static str> {
+        match self {
+            Self::Keyless => Some("this Qdrant answers without an API key"),
+            _ => None,
+        }
+    }
+}
+
+/// MOD-160 D9: `source`'s settings, then [`vector::probe`] of `collection` when they resolve. Loads
+/// no model, creates nothing, and is bounded by `vector::PROBE_TIMEOUT`. `None` when nothing was
+/// probed (offline).
+pub(crate) async fn check_qdrant(source: &QdrantSource, collection: &str) -> Option<QdrantCheck> {
+    let resolved = source.settings().await;
+    let probe = match &resolved {
+        Ok(settings) => Some(vector::probe(settings, collection).await),
+        Err(_) => None,
+    };
+    QdrantCheck::of(resolved.as_ref(), probe.as_ref())
+}
+
 /// A [`ConceptIndex`] over `MemVectorStore` (D230): ranks by shared terms, needs no model. It can be
 /// told to fail every call, and to wait before answering, for the error and supersede cases.
 #[cfg(any(test, feature = "testkit"))]
 #[derive(Debug, Default)]
 pub struct MemIndex {
     /// The fake the calls go to.
-    store: htui_store::vector::MemVectorStore,
+    store: vector::MemVectorStore,
     /// What every call answers instead, when set.
     failure: Option<String>,
     /// How long every call sleeps first, when set.
     delay: Option<Duration>,
+    /// What a probe answers (MOD-160 D9); `None`: nothing probed.
+    check: Option<QdrantCheck>,
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -658,9 +1039,18 @@ impl MemIndex {
         }
     }
 
+    /// A probe answers `check` (after the delay; the failure does not apply to it).
+    #[must_use]
+    pub fn with_check(self, check: QdrantCheck) -> Self {
+        Self {
+            check: Some(check),
+            ..self
+        }
+    }
+
     /// The fake store, for assertions.
     #[must_use]
-    pub const fn store(&self) -> &htui_store::vector::MemVectorStore {
+    pub const fn store(&self) -> &vector::MemVectorStore {
         &self.store
     }
 
@@ -700,6 +1090,14 @@ impl ConceptIndex for MemIndex {
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn check(&self) -> BoxFuture<'_, Option<QdrantCheck>> {
+        Box::pin(async move {
+            // The wait applies; a configured failure is a search's or a sync's, not a probe's.
+            let _ = self.pause().await;
+            self.check.clone()
+        })
+    }
 }
 
 /// What [`ConceptsRuntime::serve`] decided (the `RunServed` shape, blueprint D243).
@@ -711,10 +1109,11 @@ pub enum ConceptsServed {
     Deferred,
 }
 
-/// Serves `SearchConcepts` and `IndexConcepts` on tasks of their own, inside the store worker's
-/// loop beside `AgentRuntime` and `RunRuntime` (D231). One task per `(origin, request kind)`: a
-/// newer request of the same kind from the same view aborts the older one, whose answer the shell
-/// would drop anyway. A search never aborts an index run: they are different kinds.
+/// Serves `SearchConcepts`, `IndexConcepts` and `ProbeQdrant` on tasks of their own, inside the
+/// store worker's loop beside `AgentRuntime` and `RunRuntime` (D231). One task per
+/// `(origin, request kind)`: a newer request of the same kind from the same view aborts the older
+/// one, whose answer the shell would drop anyway. A search never aborts an index run: they are
+/// different kinds.
 pub struct ConceptsRuntime {
     /// The index every task searches and writes.
     index: Arc<dyn ConceptIndex>,
@@ -807,6 +1206,12 @@ impl ConceptsRuntime {
             .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
     }
 
+    /// MOD-160 D5: the loop wrote or cleared the `qdrant_url` row (or tried): the index reads its
+    /// offer again. Awaits nothing.
+    pub fn url_changed(&self) {
+        self.index.url_changed();
+    }
+
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
     ///
     /// Not `async`: the two things it does are a `match` and a `tokio::spawn`, so the worker's
@@ -864,7 +1269,17 @@ impl ConceptsRuntime {
                     });
                 })
             }
-            // The loop routes only the two above here; the two runtimes' rule for anything else.
+            // MOD-160 D9: a model-free look at Qdrant, bounded by the probe's 3 s, on its own task
+            // like the two above. Its answer is never `Failed`: "nothing probed" is `None`.
+            StoreRequest::ProbeQdrant => tokio::spawn(async move {
+                let check = index.check().await;
+                let _ = replies.send(ReplyEnvelope {
+                    seq,
+                    origin,
+                    reply: StoreReply::QdrantProbe(check),
+                });
+            }),
+            // The loop routes only the three above here; the two runtimes' rule for anything else.
             other => {
                 return ConceptsServed::Reply(StoreReply::Failed {
                     request: other.name(),
@@ -1242,6 +1657,75 @@ mod tests {
             REQUEST_NAMES[1],
             StoreRequest::IndexConcepts { scope }.name()
         );
+        assert_eq!(REQUEST_NAMES[2], StoreRequest::ProbeQdrant.name());
+        assert!(
+            !StoreRequest::ProbeQdrant.is_qdrant(),
+            "the probe is served off the loop, never by `qdrant_settings_info` (P-7)"
+        );
+    }
+
+    /// MOD-160 D9: a probe is a task of the runtime, answered in its own variant and never
+    /// `Failed`; an index that cannot look answers "nothing probed".
+    #[tokio::test]
+    async fn a_probe_is_a_concepts_reply_task_and_never_failed() {
+        let (backend, _) = platform().await;
+        let check = QdrantCheck::NoKey("qdrant: access refused".to_owned());
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new().with_check(check.clone())));
+        let replies = serve_one(
+            &mut runtime,
+            &backend,
+            &envelope(7, StoreRequest::ProbeQdrant),
+        )
+        .await;
+        let [reply] = replies.as_slice() else {
+            panic!("one answer: {replies:?}")
+        };
+        assert_eq!((reply.seq, &reply.origin), (7, &PROBE));
+        assert!(
+            matches!(&reply.reply, StoreReply::QdrantProbe(Some(said)) if *said == check),
+            "{:?}",
+            reply.reply
+        );
+
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new()));
+        let replies = serve_one(
+            &mut runtime,
+            &backend,
+            &envelope(8, StoreRequest::ProbeQdrant),
+        )
+        .await;
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [ReplyEnvelope {
+                    seq: 8,
+                    reply: StoreReply::QdrantProbe(None),
+                    ..
+                }]
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// MOD-160 D9: the production index's probe of a closed port answers "unavailable", within
+    /// the probe's bound, and loads no model.
+    #[tokio::test]
+    async fn a_qdrant_index_probe_of_a_closed_port_is_unavailable() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads)).with_source(Arc::new(source(
+            Some("http://127.0.0.1:1"),
+            None,
+            no_key,
+        )));
+        let check = tokio::time::timeout(Duration::from_secs(10), index.check())
+            .await
+            .expect("the probe is bounded");
+        assert!(
+            matches!(check, Some(QdrantCheck::Unavailable(_))),
+            "{check:?}"
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "a probe caches nothing");
     }
 
     /// A source over `env_url` and `env_key`, its keyring answering `keyring`, nothing published.
@@ -1458,9 +1942,273 @@ mod tests {
         assert!(!shown.contains("line-key"), "{shown}");
     }
 
-    /// An index that records what is published to it.
+    /// A `qdrant_url` row that counts its reads, waits `delay` (paused clock) before each answer,
+    /// and answers a stored URL while `present`, else no row.
+    struct CountingRow {
+        /// The row behind it, set to a usable URL.
+        store: MemStore,
+        /// Whether the row is there.
+        present: AtomicBool,
+        /// How many reads began.
+        reads: AtomicUsize,
+        /// How long each read waits.
+        delay: Duration,
+    }
+
+    impl CountingRow {
+        async fn new(present: bool, delay: Duration) -> Arc<Self> {
+            let store = MemStore::new();
+            set_row(&store, "http://row:6334").await;
+            Arc::new(Self {
+                store,
+                present: AtomicBool::new(present),
+                reads: AtomicUsize::new(0),
+                delay,
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn set_present(&self, present: bool) {
+            self.present.store(present, Ordering::SeqCst);
+        }
+    }
+
+    impl UrlRow for CountingRow {
+        fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                if self.present.load(Ordering::SeqCst) {
+                    UrlRow::qdrant_url(&self.store).await
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+    }
+
+    /// Lets every spawned read that is due finish (a paused clock advances on its own).
+    async fn settle_reads() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// The flag as last recorded, without starting a read.
+    fn known(source: &QdrantSource) -> Option<bool> {
+        source
+            .configured
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|(offered, _)| offered)
+    }
+
+    /// A current-thread runtime on a paused clock: what is published before `block_on` is
+    /// published with no runtime, so it starts no read.
+    fn paused_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a runtime")
+    }
+
+    /// MOD-160 D5: unknown is "not offered", and asks once however often it is asked.
+    #[test]
+    fn an_unknown_offer_is_false_and_starts_one_read() {
+        let runtime = paused_runtime();
+        let row = runtime.block_on(CountingRow::new(true, Duration::from_secs(1)));
+        let source = source(None, None, no_key);
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        assert_eq!(known(&source), None, "no runtime, no read");
+        runtime.block_on(async {
+            for _ in 0..3 {
+                assert!(!source.offered(), "unknown is not offered");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(row.reads(), 1, "one read for every unknown answer");
+            assert!(source.offered(), "the row resolves");
+            assert_eq!(row.reads(), 1, "a fresh answer starts nothing");
+        });
+    }
+
+    /// MOD-160 D5: a publish starts the read, so the first session after it knows.
+    #[tokio::test(start_paused = true)]
+    async fn a_url_row_is_offered_after_the_read() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert_eq!(known(&source), Some(true));
+        assert!(source.offered());
+        assert_eq!(row.reads(), 1);
+    }
+
+    /// MOD-160 D5: offline and no row are not offered; a `None` publish needs no read.
+    #[tokio::test(start_paused = true)]
+    async fn no_url_and_offline_are_not_offered() {
+        let source = source(None, None, no_key);
+        source.publish(None);
+        assert_eq!(
+            known(&source),
+            Some(false),
+            "recorded at once, with no task"
+        );
+        assert!(!source.offered());
+
+        let row = CountingRow::new(false, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        for _ in 0..3 {
+            assert!(!source.offered(), "no row is not offered");
+        }
+        settle_reads().await;
+        assert_eq!(row.reads(), 1, "the publish's read, and no other");
+    }
+
+    /// MOD-160 D5: `HTUI_QDRANT_URL` wins over every row, so its verdict is known at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_override_is_known_without_a_read() {
+        let usable = source(Some("http://env:6334"), None, no_key);
+        assert_eq!(known(&usable), Some(true), "known before any read");
+        assert!(usable.offered());
+        let row = CountingRow::new(false, Duration::ZERO).await;
+        usable.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert!(usable.offered(), "the row is never read over the override");
+        assert_eq!(row.reads(), 0);
+
+        let unusable = source(Some("http://u:SENTINEL@env:6334"), None, no_key);
+        assert_eq!(known(&unusable), Some(false));
+        unusable.publish(None);
+        assert!(
+            !unusable.offered(),
+            "offline changes nothing for an override"
+        );
+    }
+
+    /// MOD-160 D5: an answer older than 30 s is still answered, and read again once, however many
+    /// sessions open meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_answer_is_used_and_read_again_once() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::from_secs(1)).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(source.offered());
+        assert_eq!(row.reads(), 1);
+
+        row.set_present(false);
+        tokio::time::sleep(OFFER_STALE_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            assert!(source.offered(), "the old answer, while the read runs");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(row.reads(), 2, "one re-read");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!source.offered(), "the re-read's answer");
+        assert_eq!(row.reads(), 2, "a fresh answer starts nothing");
+    }
+
+    /// MOD-160 D5: a slow read of the old store lands after the new store's answer, and is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_the_old_store_never_overwrites_the_new_one() {
+        let source = source(None, None, no_key);
+        let old = CountingRow::new(true, Duration::from_secs(5)).await;
+        let new = CountingRow::new(false, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&old) as Arc<dyn UrlRow>));
+        tokio::task::yield_now().await;
+        source.publish(Some(Arc::clone(&new) as Arc<dyn UrlRow>));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!((old.reads(), new.reads()), (1, 1));
+        assert_eq!(known(&source), Some(false), "the new store's answer stands");
+    }
+
+    /// MOD-160 D5: an in-process URL write or clear re-reads at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_reread_after_a_write_picks_up_a_cleared_row() {
+        let source = source(None, None, no_key);
+        let row = CountingRow::new(true, Duration::ZERO).await;
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        settle_reads().await;
+        assert!(source.offered());
+
+        row.set_present(false);
+        source.reread();
+        settle_reads().await;
+        assert_eq!(row.reads(), 2);
+        assert!(!source.offered(), "the cleared row");
+    }
+
+    /// MOD-160 D5: every settings resolution records the flag, a search's included, before the
+    /// key and whatever Qdrant answers.
+    #[test]
+    fn a_search_records_the_offer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let row = runtime.block_on(async {
+            let row = CountingRow::new(true, Duration::ZERO).await;
+            set_row(&row.store, "http://127.0.0.1:1").await;
+            row
+        });
+        fn broken() -> htui_core::store::Result<Option<String>> {
+            Err(StoreError::Backend("no Secret Service".into()))
+        }
+        let source = Arc::new(source(None, None, no_key));
+        source.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::clone(&source));
+        runtime.block_on(async {
+            let why = index.search(any_query()).await.expect_err("port 1");
+            assert!(why.starts_with("cannot reach Qdrant"), "{why}");
+        });
+        assert_eq!(known(&source), Some(true), "recorded by the search itself");
+        assert_eq!(row.reads(), 1);
+
+        // A URL that resolves is configured even when the key cannot be read.
+        let keyless = Arc::new(
+            QdrantSource::new(QdrantEnv::default(), KeySource::Interactive).with_keyring(broken),
+        );
+        keyless.publish(Some(Arc::clone(&row) as Arc<dyn UrlRow>));
+        runtime.block_on(async {
+            assert!(keyless.settings().await.is_err(), "the key cannot be read");
+        });
+        assert_eq!(known(&keyless), Some(true));
+    }
+
+    /// MOD-160 D5: the runtime hands a URL write to its index.
+    #[test]
+    fn the_runtime_forwards_a_url_change() {
+        let index = Arc::new(Recording::default());
+        let runtime = ConceptsRuntime::new(index.clone());
+        runtime.url_changed();
+        runtime.url_changed();
+        assert_eq!(index.1.load(Ordering::SeqCst), 2);
+    }
+
+    /// MOD-160 D5: the production index answers the offer from its source.
+    #[tokio::test(start_paused = true)]
+    async fn the_qdrant_index_offers_from_its_source() {
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::new(source(None, None, no_key)));
+        ConceptIndex::publish(&index, None);
+        assert!(!ConceptIndex::offered(&index));
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::new(source(Some("http://env:6334"), None, no_key)));
+        assert!(ConceptIndex::offered(&index));
+        assert!(
+            ConceptIndex::offered(&MemIndex::new()),
+            "an index without settings is offered"
+        );
+    }
+
+    /// An index that records what is published to it, and counts the URL changes it is told.
     #[derive(Default)]
-    struct Recording(Mutex<Vec<bool>>);
+    struct Recording(Mutex<Vec<bool>>, AtomicUsize);
 
     impl ConceptIndex for Recording {
         fn search(&self, _: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
@@ -1474,6 +2222,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(store.is_some());
+        }
+        fn url_changed(&self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1643,6 +2394,259 @@ mod tests {
         );
     }
 
+    /// A loader that counts its calls and never finishes: a test that sees a load fails its count.
+    fn counting(
+        loads: &Arc<AtomicUsize>,
+    ) -> impl Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync + 'static {
+        let loads = Arc::clone(loads);
+        move || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A query over one project, so the runtime would not answer it empty itself.
+    fn any_query() -> SearchQuery {
+        concepts::query(
+            "anything",
+            vec![htui_core::model::ProjectId::new()],
+            false,
+            10,
+        )
+    }
+
+    /// Whether the index caches no connection.
+    fn nothing_cached(index: &QdrantIndex) -> bool {
+        index
+            .connections
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// MOD-160 D2: a search asks Qdrant before the model, so a Qdrant that is down costs no
+    /// 133 MB download and caches nothing.
+    #[tokio::test]
+    async fn a_search_against_an_unreachable_qdrant_loads_no_model() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads)).with_source(Arc::new(source(
+            Some("http://127.0.0.1:1"),
+            None,
+            no_key,
+        )));
+
+        let why = index
+            .search(any_query())
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(why.starts_with("cannot reach Qdrant"), "{why}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "nothing is cached");
+    }
+
+    /// `HTUI_TEST_QDRANT_URL` (never `HTUI_QDRANT_*`, blueprint P-13), or the skip line.
+    fn test_qdrant() -> Option<String> {
+        let Ok(url) = std::env::var("HTUI_TEST_QDRANT_URL") else {
+            eprintln!("skipped: HTUI_TEST_QDRANT_URL not set");
+            return None;
+        };
+        Some(url)
+    }
+
+    /// A collection name no other test uses.
+    fn fresh_collection() -> String {
+        format!("htui_test_{}", uuid::Uuid::now_v7().simple())
+    }
+
+    /// MOD-160 D2 (live): a TUI search of a collection that does not exist answers no hits, creates
+    /// nothing and loads no model.
+    #[tokio::test]
+    async fn a_tui_search_against_an_empty_qdrant_creates_no_collection_and_loads_nothing() {
+        let Some(url) = test_qdrant() else {
+            return;
+        };
+        let fresh = fresh_collection();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads))
+            .with_source(Arc::new(source(Some(&url), None, no_key)))
+            .with_collection(&fresh);
+
+        let hits = index
+            .search(any_query())
+            .await
+            .expect("an empty index is not a failure");
+        assert!(hits.is_empty(), "{hits:?}");
+        let found = ExistingCollection::find_in(&settings(&url, None), &fresh)
+            .await
+            .expect("Qdrant answers");
+        assert!(found.is_none(), "the search created the collection");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+        assert!(nothing_cached(&index), "nothing is cached");
+    }
+
+    /// MOD-160 D3 (live): a collection another embedder wrote is refused before the model loads.
+    #[tokio::test]
+    async fn a_tui_search_of_another_embedders_collection_is_refused_before_the_model() {
+        let Some(url) = test_qdrant() else {
+            return;
+        };
+        let fresh = fresh_collection();
+        let created = QdrantStore::connect_to(
+            &settings(&url, None),
+            htui_store::embed::HashEmbedder::new(DENSE_DIM),
+            &fresh,
+        )
+        .await
+        .expect("Qdrant answers");
+        let loads = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader(counting(&loads))
+            .with_source(Arc::new(source(Some(&url), None, no_key)))
+            .with_collection(&fresh);
+
+        let searched = index.search(any_query()).await;
+        created.drop_collection().await.expect("drop");
+        let why = searched.expect_err("another embedder's collection");
+        assert!(why.contains(vector::EMBEDDER_MISMATCH), "{why}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "no model was loaded");
+    }
+
+    /// MOD-160 D9: every warning state, the info line, and what says nothing.
+    #[test]
+    fn qdrant_check_names_each_state() {
+        let keyless = settings("http://qdrant:6334", None);
+        let keyed = settings("http://qdrant:6334", Some("key"));
+        let unusable = Unresolved::Unusable("the `qdrant_url` setting is not a usable URL".into());
+        let read = Unresolved::Read(StoreError::Unreachable("refused".into()));
+        let key = Unresolved::Key(QdrantKeyError::Keyring("no Secret Service".into()));
+        let check = QdrantCheck::of;
+
+        assert_eq!(
+            check(Err(&Unresolved::NoUrl), None),
+            Some(QdrantCheck::NotConfigured(
+                concepts::NO_QDRANT_URL.to_owned()
+            ))
+        );
+        assert_eq!(
+            check(Err(&unusable), None),
+            Some(QdrantCheck::NotConfigured(unusable.sentence()))
+        );
+        assert_eq!(
+            check(Err(&Unresolved::Offline), None),
+            None,
+            "nothing probed"
+        );
+        // R1 (review gate): the row or this box's keyring unreadable never contacted Qdrant, so it
+        // is never said to be unreachable.
+        for why in [&read, &key] {
+            let unreadable = check(Err(why), None).expect("a warning");
+            assert_eq!(unreadable, QdrantCheck::Unreadable(why.sentence()));
+            assert!(
+                !unreadable
+                    .state()
+                    .unwrap_or_default()
+                    .contains("unreachable"),
+                "{unreadable:?}"
+            );
+        }
+
+        for probe in [Probe::Ready, Probe::NoCollection] {
+            assert_eq!(
+                check(Ok(&keyless), Some(&probe)),
+                Some(QdrantCheck::Keyless)
+            );
+            assert_eq!(check(Ok(&keyed), Some(&probe)), Some(QdrantCheck::Ready));
+        }
+        for probe in [
+            Probe::Unreachable("cannot reach".into()),
+            Probe::Mismatch("qdrant: embedder mismatch: other".into()),
+        ] {
+            let (Probe::Unreachable(sentence) | Probe::Mismatch(sentence)) = &probe else {
+                unreachable!()
+            };
+            for settings in [&keyless, &keyed] {
+                assert_eq!(
+                    check(Ok(settings), Some(&probe)),
+                    Some(QdrantCheck::Unavailable(sentence.clone()))
+                );
+            }
+        }
+        let refused = Probe::Refused("qdrant: access refused".into());
+        assert_eq!(
+            check(Ok(&keyed), Some(&refused)),
+            Some(QdrantCheck::KeyRefused("qdrant: access refused".into()))
+        );
+        assert_eq!(
+            check(Ok(&keyless), Some(&refused)),
+            Some(QdrantCheck::NoKey("qdrant: access refused".into()))
+        );
+        assert_eq!(check(Ok(&keyed), None), None, "nothing probed");
+
+        let cases = [
+            (
+                QdrantCheck::NotConfigured("why".into()),
+                "no Qdrant is configured",
+            ),
+            (
+                QdrantCheck::Unavailable("why".into()),
+                "Qdrant is unreachable or refuses the collection",
+            ),
+            (
+                QdrantCheck::Unreadable("why".into()),
+                "this box cannot read the Qdrant settings",
+            ),
+            (
+                QdrantCheck::KeyRefused("why".into()),
+                "the Qdrant refused this box's API key",
+            ),
+            (
+                QdrantCheck::NoKey("why".into()),
+                "this box lacks the Qdrant API key",
+            ),
+        ];
+        for (check, state) in cases {
+            assert_eq!(check.state(), Some(state), "{check:?}");
+            assert_eq!(check.warning(), Some(format!("{state}: why")), "{check:?}");
+            assert_eq!(check.info(), None, "{check:?}");
+        }
+        assert_eq!(
+            QdrantCheck::Keyless.info(),
+            Some("this Qdrant answers without an API key")
+        );
+        for quiet in [QdrantCheck::Keyless, QdrantCheck::Ready] {
+            assert_eq!(quiet.state(), None, "{quiet:?}");
+            assert_eq!(quiet.warning(), None, "{quiet:?}");
+        }
+        assert_eq!(QdrantCheck::Ready.info(), None);
+    }
+
+    /// MOD-160 D9: a check of a Qdrant that is down says so, and never says the key.
+    #[tokio::test]
+    async fn a_check_never_says_the_key() {
+        let source = source(Some("http://127.0.0.1:1"), Some("KEY-SENTINEL"), no_key);
+        let check = check_qdrant(&source, COLLECTION)
+            .await
+            .expect("settings resolve, so Qdrant is probed");
+        assert!(matches!(check, QdrantCheck::Unavailable(_)), "{check:?}");
+        let said = [
+            format!("{check:?}"),
+            check.warning().unwrap_or_default(),
+            check.state().unwrap_or_default().to_owned(),
+        ];
+        for line in said {
+            assert!(!line.contains("KEY-SENTINEL"), "{line}");
+        }
+        assert!(
+            check_qdrant(&source_offline(), COLLECTION).await.is_none(),
+            "offline: nothing probed"
+        );
+    }
+
+    /// No override, nothing published: offline.
+    fn source_offline() -> QdrantSource {
+        source(None, None, no_key)
+    }
+
     /// MOD-11 T7, H-26: the TUI's concepts runtime and the MCP adapter search one index, so the
     /// process loads one embedding model.
     #[test]
@@ -1674,14 +2678,14 @@ mod tests {
         let connections = Connections::<u32>::default();
         let made_for = settings("http://qdrant:6334", Some("key"));
         assert!(
-            connections.get(&made_for).is_none(),
+            connections.get(&made_for, Made::ReadOnly).is_none(),
             "nothing connected yet"
         );
 
         let first = Arc::new(1);
-        connections.put(made_for.clone(), Arc::clone(&first));
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&first));
         let reused = connections
-            .get(&made_for)
+            .get(&made_for, Made::Ensured)
             .expect("the same settings reuse it");
         assert!(Arc::ptr_eq(&reused, &first));
         for moved in [
@@ -1689,21 +2693,64 @@ mod tests {
             settings("http://qdrant:6334", None),
             settings("http://elsewhere:6334", Some("key")),
         ] {
-            assert!(connections.get(&moved).is_none(), "{moved:?}");
+            for need in [Made::Ensured, Made::ReadOnly] {
+                assert!(connections.get(&moved, need).is_none(), "{moved:?}");
+            }
         }
 
         // An error on a connection another request has already replaced leaves the new one.
         let second = Arc::new(2);
-        connections.put(made_for.clone(), Arc::clone(&second));
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&second));
         connections.forget(&first);
-        let kept = connections.get(&made_for).expect("the replacement stays");
+        let kept = connections
+            .get(&made_for, Made::Ensured)
+            .expect("the replacement stays");
         assert!(Arc::ptr_eq(&kept, &second));
 
         connections.forget(&second);
         assert!(
-            connections.get(&made_for).is_none(),
+            connections.get(&made_for, Made::ReadOnly).is_none(),
             "after an error the next request reconnects"
         );
+    }
+
+    /// MOD-160 D4: a store a search opened read-only (no payload indexes, no stamp, no MOD-144
+    /// rebuild) serves later searches but never a sync, and never displaces an ensured one.
+    #[test]
+    fn a_read_only_connection_never_serves_a_sync() {
+        let connections = Connections::<u32>::default();
+        let made_for = settings("http://qdrant:6334", None);
+
+        let read_only = Arc::new(1);
+        connections.put(made_for.clone(), Made::ReadOnly, Arc::clone(&read_only));
+        let searched = connections
+            .get(&made_for, Made::ReadOnly)
+            .expect("a search takes it");
+        assert!(Arc::ptr_eq(&searched, &read_only));
+        assert!(
+            connections.get(&made_for, Made::Ensured).is_none(),
+            "a sync connects instead"
+        );
+
+        let ensured = Arc::new(2);
+        connections.put(made_for.clone(), Made::Ensured, Arc::clone(&ensured));
+        for need in [Made::Ensured, Made::ReadOnly] {
+            let served = connections.get(&made_for, need).expect("an ensured store");
+            assert!(Arc::ptr_eq(&served, &ensured), "{need:?}");
+        }
+
+        // A search that opened read-only while an index run connected keeps the better one.
+        connections.put(made_for.clone(), Made::ReadOnly, Arc::new(3));
+        let kept = connections
+            .get(&made_for, Made::Ensured)
+            .expect("the ensured store stays");
+        assert!(Arc::ptr_eq(&kept, &ensured));
+
+        // A read-only store for other settings replaces it: the slot holds one connection.
+        let elsewhere = settings("http://elsewhere:6334", None);
+        connections.put(elsewhere.clone(), Made::ReadOnly, Arc::new(4));
+        assert!(connections.get(&made_for, Made::ReadOnly).is_none());
+        assert!(connections.get(&elsewhere, Made::ReadOnly).is_some());
     }
 
     /// MOD-158 R1 (B-L6): an unusable `HTUI_QDRANT_URL` is a `warn` line, never its value; a
@@ -1759,11 +2806,17 @@ mod tests {
     fn unresolved_settings_drop_the_cached_connection() {
         let connections = Connections::<u32>::default();
         let made_for = settings("http://qdrant:6334", Some("key"));
-        connections.put(made_for.clone(), Arc::new(1));
+        connections.put(made_for.clone(), Made::Ensured, Arc::new(1));
         assert!(connections.resolved(Ok(made_for.clone())).is_ok());
-        assert!(connections.get(&made_for).is_some(), "resolving keeps it");
-        for why in [Unresolved::NoUrl, Unresolved::Offline] {
-            connections.put(made_for.clone(), Arc::new(2));
+        assert!(
+            connections.get(&made_for, Made::Ensured).is_some(),
+            "resolving keeps it"
+        );
+        for (why, made) in [
+            (Unresolved::NoUrl, Made::Ensured),
+            (Unresolved::Offline, Made::ReadOnly),
+        ] {
+            connections.put(made_for.clone(), made, Arc::new(2));
             assert!(connections.resolved(Err(why)).is_err());
             assert!(
                 connections

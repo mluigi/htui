@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/concepts_search.rs
+expression: frame
+---
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           2 waiting ·  F1  keys
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
+│ ▾ htui (8)                                          ││Data model, box registry and sync topology │
+│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
+│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
+│ ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮ │
+│ │scope all projects · decisions off                                                            │ │
+│ │query postgres store cache                                                                    │a│
+│ │                                                                                              │ │
+│ │qdrant: query: connection refused — Settings › Qdrant                                         │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │knowledge search unavailable — Ctrl+e why                                                     │ │
+│ │                                                                                              │ │
+│ ╰ Enter search/open · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Ctrl+e why · Esc close ─╯ │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯

@@ -243,12 +243,45 @@ pub fn stored_url_unusable(why: QdrantUrlError) -> String {
     )
 }
 
+/// MOD-160 D1: what every knowledge-search surface says when the search cannot answer: no URL, an
+/// unusable one, the setting or the key unreadable, Qdrant unreachable or refusing the key, an
+/// embedder mismatch, or the model failing. An empty index is not "unavailable".
+pub const KNOWLEDGE_SEARCH_UNAVAILABLE: &str = "knowledge search unavailable";
+
+/// MOD-160 D1: the sentence, then its cause after a colon (CLI, MCP, logs). A blank cause is the
+/// sentence alone.
+#[must_use]
+pub fn unavailable(cause: &str) -> String {
+    let cause = cause.trim();
+    if cause.is_empty() {
+        KNOWLEDGE_SEARCH_UNAVAILABLE.to_owned()
+    } else {
+        format!("{KNOWLEDGE_SEARCH_UNAVAILABLE}: {cause}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn refused(text: &str) -> QdrantUrlError {
         QdrantUrl::parse(text).expect_err(text)
+    }
+
+    #[test]
+    fn unavailable_puts_the_cause_after_the_sentence() {
+        assert_eq!(
+            unavailable("no Qdrant URL is set"),
+            "knowledge search unavailable: no Qdrant URL is set"
+        );
+        assert!(unavailable("x").starts_with(KNOWLEDGE_SEARCH_UNAVAILABLE));
+    }
+
+    #[test]
+    fn a_blank_cause_is_the_sentence_alone() {
+        assert_eq!(unavailable(""), KNOWLEDGE_SEARCH_UNAVAILABLE);
+        assert_eq!(unavailable("  \n"), KNOWLEDGE_SEARCH_UNAVAILABLE);
+        assert_eq!(KNOWLEDGE_SEARCH_UNAVAILABLE, "knowledge search unavailable");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use htui_core::fixtures::ids;
@@ -32,6 +33,8 @@ struct Recording {
     queries: Mutex<Vec<ConceptQuery>>,
     /// What every search answers.
     answer: Result<Vec<ConceptHit>, String>,
+    /// MOD-160 D5: whether a session opened now is offered the tool.
+    offered: AtomicBool,
 }
 
 impl Recording {
@@ -39,7 +42,12 @@ impl Recording {
         Arc::new(Self {
             queries: Mutex::new(Vec::new()),
             answer,
+            offered: AtomicBool::new(true),
         })
+    }
+
+    fn set_offered(&self, offered: bool) {
+        self.offered.store(offered, Ordering::SeqCst);
     }
 
     fn empty() -> Arc<Self> {
@@ -65,6 +73,10 @@ impl ConceptSearch for Recording {
             .push(query);
         let answer = self.answer.clone();
         Box::pin(async move { answer })
+    }
+
+    fn offered(&self) -> bool {
+        self.offered.load(Ordering::SeqCst)
     }
 }
 
@@ -266,7 +278,78 @@ async fn an_unavailable_index_is_is_error_with_its_cause() {
         .call("search_concepts", json!({"query": "anything"}))
         .await
         .expect("a call");
-    assert_eq!(refused(&answer), format!("search unavailable: {cause}"));
+    assert_eq!(
+        refused(&answer),
+        format!("knowledge search unavailable: {cause}")
+    );
+    assert_eq!(index.queries().len(), 1);
+}
+
+/// MOD-160 D5: a search the host holds but does not offer at `open` (no Qdrant URL resolves) is
+/// neither advertised nor callable in that session: the host refuses the name with -32602.
+#[tokio::test]
+async fn a_search_not_offered_at_open_is_not_advertised_and_a_call_is_unknown() {
+    let index = Recording::empty();
+    index.set_offered(false);
+    let host = host(Some(Arc::clone(&index)));
+    for scope in [phase_scope(ids::PROJECT_HTUI), fresh_chat_scope()] {
+        let (lease, mut client) = open(&host, scope).await;
+        assert!(
+            !lease.tools.iter().any(|name| name == "search_concepts"),
+            "{:?}",
+            lease.tools
+        );
+        let names = client.tool_names().await.expect("tools/list");
+        assert!(
+            !names.iter().any(|name| name == "search_concepts"),
+            "{names:?}"
+        );
+        let answer = client
+            .request(
+                "tools/call",
+                json!({"name": "search_concepts", "arguments": {"query": "anything"}}),
+            )
+            .await
+            .expect("an answer");
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+        assert_eq!(answer["error"]["message"], "unknown tool: search_concepts");
+    }
+    assert!(index.queries().is_empty(), "a refused call never searches");
+}
+
+/// MOD-160 D5: the offer is read once per session, at `open`: a URL set later is offered to the
+/// next session without a restart, and a session keeps what it was offered.
+#[tokio::test]
+async fn the_offer_is_read_per_session() {
+    let index = Recording::empty();
+    index.set_offered(false);
+    let host = host(Some(Arc::clone(&index)));
+    let (_before, mut unoffered) = open(&host, phase_scope(ids::PROJECT_HTUI)).await;
+
+    index.set_offered(true);
+    let (_after, mut offered) = open(&host, phase_scope(ids::PROJECT_HTUI)).await;
+    let names = offered.tool_names().await.expect("tools/list");
+    assert!(
+        names.iter().any(|name| name == "search_concepts"),
+        "{names:?}"
+    );
+    ok(&offered
+        .call("search_concepts", json!({"query": "anything"}))
+        .await
+        .expect("a call"));
+
+    let names = unoffered.tool_names().await.expect("tools/list");
+    assert!(
+        !names.iter().any(|name| name == "search_concepts"),
+        "the earlier session keeps what it was offered: {names:?}"
+    );
+
+    index.set_offered(false);
+    let names = offered.tool_names().await.expect("tools/list");
+    assert!(
+        names.iter().any(|name| name == "search_concepts"),
+        "an offered session keeps the tool: {names:?}"
+    );
     assert_eq!(index.queries().len(), 1);
 }
 

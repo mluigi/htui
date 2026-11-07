@@ -578,10 +578,11 @@ fn search_inputs(
 }
 
 /// Why no Qdrant settings resolved, as the search's [`Failure`]: `no_qdrant_url`,
-/// `qdrant_url_unusable`, the row read's own failure, or `keyring_unreadable` for the key.
+/// `qdrant_url_unusable`, the row read's own failure, or `keyring_unreadable` for the key. The
+/// message says the search is unavailable first (MOD-160 D8); the code and the exit are the cause's.
 fn unresolved_failure(why: concepts_worker::Unresolved) -> Failure {
     use concepts_worker::Unresolved;
-    match why {
+    unavailable_failure(match why {
         Unresolved::NoUrl => Failure::refused(ErrorCode::NoQdrantUrl, NO_QDRANT_URL),
         Unresolved::Unusable(sentence) => Failure::refused(ErrorCode::QdrantUrlUnusable, sentence),
         Unresolved::Read(err) => Failure::from_read(&err),
@@ -590,7 +591,14 @@ fn unresolved_failure(why: concepts_worker::Unresolved) -> Failure {
         Unresolved::Offline => Failure::from_read(&StoreError::Unreachable(
             concepts_worker::URL_OFFLINE.to_owned(),
         )),
-    }
+    })
+}
+
+/// MOD-160 D8: `failure`, its message now [`htui_core::qdrant::unavailable`]'s: "knowledge search
+/// unavailable: " and then today's sentence. `store` and `code` (so the exit) are unchanged.
+fn unavailable_failure(mut failure: Failure) -> Failure {
+    failure.error.message = htui_core::qdrant::unavailable(&failure.error.message);
+    failure
 }
 
 /// `--search-items` over `ctx`, with the model from `load` (review R1 M4). Never fails: a failure
@@ -714,7 +722,9 @@ where
     }
     let embedder = match load().await {
         Ok(embedder) => embedder,
-        Err(err) => return IndexAnswer::Failed(format!("{err:#}")),
+        Err(err) => {
+            return IndexAnswer::Failed(htui_core::qdrant::unavailable(&format!("{err:#}")));
+        }
     };
     let store = match found.open(embedder).await {
         Ok(store) => store,
@@ -729,16 +739,18 @@ where
 /// A failed open or search (review R1 M2): a query the model failed on is the model's failure
 /// (`model_unavailable`); a refused API key and an embedder mismatch are refusals
 /// (`qdrant_refused`, `embedder_mismatch`); anything else "cannot reach Qdrant"
-/// (`qdrant_refusal`'s sentences).
+/// (`qdrant_refusal`'s sentences). Every sentence says the search is unavailable first (MOD-160
+/// D8).
 fn index_refusal(err: StoreError) -> IndexAnswer {
+    use htui_core::qdrant::unavailable;
     if is_query_embed_failure(&err) {
-        return IndexAnswer::Failed(format!(
+        return IndexAnswer::Failed(unavailable(&format!(
             "{:#}",
             anyhow::Error::new(err).context("the embedding model failed on the query")
-        ));
+        )));
     }
     let (mismatch, refused) = (is_embedder_mismatch(&err), is_qdrant_refused(&err));
-    let sentence = format!("{:#}", qdrant_refusal(err));
+    let sentence = unavailable(&format!("{:#}", qdrant_refusal(err)));
     if refused {
         IndexAnswer::AccessRefused(sentence)
     } else if mismatch {
@@ -1037,7 +1049,146 @@ mod tests {
         )) else {
             panic!("a Qdrant that does not answer is offline");
         };
-        assert!(sentence.starts_with("cannot reach Qdrant: "), "{sentence}");
+        assert!(
+            sentence.starts_with("knowledge search unavailable: cannot reach Qdrant: "),
+            "{sentence}"
+        );
+    }
+
+    /// MOD-160 D8: every index refusal a search answers says the sentence first, then today's
+    /// cause after a colon; the kind (and so the code and the exit) is unchanged.
+    #[test]
+    fn index_refusal_says_knowledge_search_unavailable_first() {
+        use htui_store::vector::{EMBEDDER_MISMATCH, QDRANT_REFUSED, QUERY_EMBED_FAILED};
+        const SENTENCE: &str = "knowledge search unavailable: ";
+        let refused = index_refusal(StoreError::Backend(format!(
+            "{QDRANT_REFUSED}: collection exists: Invalid api-key"
+        )));
+        let IndexAnswer::AccessRefused(message) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(message.starts_with(SENTENCE), "{message}");
+        assert!(message.contains(QDRANT_REFUSED), "{message}");
+
+        let failed = index_refusal(StoreError::Backend(format!(
+            "{QUERY_EMBED_FAILED}: backend error: the session failed"
+        )));
+        let IndexAnswer::Failed(message) = &failed else {
+            panic!("{failed:?}");
+        };
+        assert!(
+            message.starts_with(&format!(
+                "{SENTENCE}the embedding model failed on the query: "
+            )),
+            "{message}"
+        );
+
+        let mismatch = index_refusal(StoreError::Backend(format!(
+            "{EMBEDDER_MISMATCH}: collection `c` holds vectors from hash/384"
+        )));
+        let IndexAnswer::Refused(message) = &mismatch else {
+            panic!("{mismatch:?}");
+        };
+        assert!(message.starts_with(SENTENCE), "{message}");
+        assert!(message.contains(EMBEDDER_MISMATCH), "{message}");
+
+        let offline = index_refusal(StoreError::Backend(
+            "qdrant: collection exists: transport error".into(),
+        ));
+        let IndexAnswer::Offline(message) = &offline else {
+            panic!("{offline:?}");
+        };
+        assert_eq!(
+            message,
+            "knowledge search unavailable: cannot reach Qdrant: store backend error: qdrant: \
+             collection exists: transport error"
+        );
+    }
+
+    /// MOD-160 D8: a search whose Qdrant settings do not resolve keeps its code, its `store` and
+    /// so its exit, and says the sentence first, then today's cause.
+    #[test]
+    fn unresolved_failures_keep_their_code_and_say_unavailable() {
+        use crate::state_cmd::StoreState;
+        use concepts_worker::Unresolved;
+        use htui_store::secret::QdrantKeyError;
+        let cases = [
+            (
+                Unresolved::NoUrl,
+                StoreState::Refused,
+                ErrorCode::NoQdrantUrl,
+                NO_QDRANT_URL.to_owned(),
+            ),
+            (
+                Unresolved::Unusable("HTUI_QDRANT_URL is not a URL".into()),
+                StoreState::Refused,
+                ErrorCode::QdrantUrlUnusable,
+                "HTUI_QDRANT_URL is not a URL".to_owned(),
+            ),
+            (
+                Unresolved::Read(StoreError::Unreachable("refused".into())),
+                StoreState::Offline,
+                ErrorCode::Unreachable,
+                "cannot reach Postgres: ".to_owned(),
+            ),
+            (
+                Unresolved::Read(StoreError::Backend("the row is odd".into())),
+                StoreState::Error,
+                ErrorCode::ReadFailed,
+                String::new(),
+            ),
+            (
+                Unresolved::Key(QdrantKeyError::Keyring("locked".into())),
+                StoreState::Refused,
+                ErrorCode::KeyringUnreadable,
+                "the Qdrant API key could not be read from the OS keyring: locked".to_owned(),
+            ),
+            (
+                Unresolved::Offline,
+                StoreState::Offline,
+                ErrorCode::Unreachable,
+                "cannot reach Postgres: ".to_owned(),
+            ),
+        ];
+        for (why, store, code, cause) in cases {
+            let shown = format!("{why:?}");
+            let failure = unresolved_failure(why);
+            assert_eq!(failure.store, store, "{shown}");
+            assert_eq!(failure.error.code, code, "{shown}");
+            let message = &failure.error.message;
+            assert!(
+                message.starts_with(&format!("knowledge search unavailable: {cause}")),
+                "{shown}: {message}"
+            );
+            assert_eq!(
+                message.matches("knowledge search unavailable").count(),
+                1,
+                "{message}"
+            );
+        }
+    }
+
+    /// MOD-160 D8: a Qdrant that does not answer is `offline` (exit 3), says the sentence first,
+    /// and loads no model.
+    #[tokio::test]
+    async fn search_index_against_a_closed_port_is_offline_unavailable_and_loads_nothing() {
+        use htui_store::embed::HashEmbedder;
+        let settings = QdrantSettings::new(
+            htui_core::qdrant::QdrantUrl::parse("http://127.0.0.1:1").expect("a valid URL"),
+            None,
+        );
+        let query = query("closed items", vec![ProjectId(Uuid::nil())], false, 5);
+        let load = || -> std::future::Ready<anyhow::Result<HashEmbedder>> {
+            panic!("no model for a Qdrant that does not answer")
+        };
+        let answer = search_index(&settings, "c", &query, load).await;
+        let IndexAnswer::Offline(message) = &answer else {
+            panic!("a closed port is offline: {answer:?}");
+        };
+        assert!(
+            message.starts_with("knowledge search unavailable: cannot reach Qdrant: "),
+            "{message}"
+        );
     }
 
     /// `--index-items` and the worker say the same: a refused key is not "cannot reach".
@@ -1524,12 +1675,12 @@ mod tests {
             assert!(job.await.expect_err("aborted").is_cancelled());
         }
 
-        /// MOD-11 H-26: the job takes its model from the index `search_concepts` searches, so a
-        /// worker that indexes and serves the tool loads the 133 MB model once, not twice.
+        /// MOD-11 H-26: the index job and every search take the model from one load slot on the
+        /// index `search_concepts` searches, so a worker that indexes and serves the tool loads the
+        /// 133 MB model once, not twice. The second taker waits on the slot directly (MOD-160
+        /// P-1): a search asks Qdrant before the model, and this one's Qdrant is a closed port.
         #[tokio::test]
         async fn the_index_job_and_the_search_share_one_model_load() {
-            use crate::concepts_worker::ConceptIndex as _;
-
             let loads = Arc::new(AtomicUsize::new(0));
             let settings = concepts_worker::QdrantSource::new(
                 QdrantEnv::new(Some("http://127.0.0.1:1".to_owned()), None),
@@ -1557,12 +1708,12 @@ mod tests {
             .await
             .expect("the job loads its model through the index");
 
-            let search = index.search(query("anything", vec![ProjectId::new()], false, 10));
+            let model = index.embedder();
             assert!(
-                tokio::time::timeout(Duration::from_millis(500), search)
+                tokio::time::timeout(Duration::from_millis(500), model)
                     .await
                     .is_err(),
-                "the search waits on the job's load"
+                "a search's model waits on the job's load"
             );
             assert_eq!(loads.load(Ordering::SeqCst), 1, "one model for both");
             job.abort();

@@ -515,6 +515,7 @@ pub const CONCEPTS_QUERY: Stack<'static> = Stack::new(&[
             Act::ConceptsReindex,
             Act::ConceptsUp,
             Act::ConceptsDown,
+            Act::ConceptsWhy,
         ],
     ),
     FIELD,
@@ -1440,6 +1441,7 @@ mod tests {
             [Act::ConceptsUp, Act::FieldLineUp]
         );
         assert_eq!(resolve(CONCEPTS_QUERY, "ctrl-c"), [Act::Quit]);
+        assert_eq!(resolve(CONCEPTS_QUERY, "ctrl-e"), [Act::ConceptsWhy]);
         let capital =
             KeyChord::from_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::CONTROL));
         assert_eq!(

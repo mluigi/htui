@@ -87,7 +87,26 @@ impl Ran {
     fn error_code(&self) -> &str {
         self.document["error"]["code"].as_str().unwrap_or_default()
     }
+
+    /// The JSON `error.message`, after checking the human line (`StateExit`'s, which `main`
+    /// prints) says the same.
+    fn message(&self) -> &str {
+        let message = self.document["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        let human = match &self.exit {
+            Ok(()) => "",
+            Err(StateExit::Offline(line) | StateExit::Refused(line) | StateExit::Failed(line)) => {
+                line.as_str()
+            }
+        };
+        assert_eq!(human, message, "the human line is the JSON message");
+        message
+    }
 }
+
+/// MOD-160 D8: what an unavailable search's message starts with.
+const UNAVAILABLE: &str = "knowledge search unavailable: ";
 
 /// `answer`, then `emit --json` into a buffer: exactly what `state_cmd::run` writes to stdout.
 async fn ran(
@@ -585,9 +604,8 @@ async fn a_search_without_a_qdrant_url_is_refused() {
     assert_eq!(run.code(), 2, "{}", run.pretty());
     assert_eq!(run.document["store"], "refused");
     assert_eq!(run.error_code(), "no_qdrant_url");
-    let message = run.document["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
+    let message = run.message();
+    assert!(message.starts_with(UNAVAILABLE), "{message}");
     assert!(message.contains("htui --set-qdrant-url"), "{message}");
     assert_eq!(loads.count(), 0);
     db.drop_db().await;
@@ -636,6 +654,11 @@ async fn a_search_reads_the_url_row() {
     assert_eq!(run.code(), 3, "{}", run.pretty());
     assert_eq!(run.document["store"], "online");
     assert_eq!(run.error_code(), "qdrant_unreachable");
+    let message = run.message();
+    assert!(
+        message.starts_with(&format!("{UNAVAILABLE}cannot reach Qdrant: ")),
+        "{message}"
+    );
     db.drop_db().await;
 }
 
@@ -692,9 +715,8 @@ async fn a_malformed_row_is_qdrant_url_unusable() {
     .await;
     assert_eq!(run.code(), 2, "{}", run.pretty());
     assert_eq!(run.error_code(), "qdrant_url_unusable");
-    let message = run.document["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
+    let message = run.message();
+    assert!(message.starts_with(UNAVAILABLE), "{message}");
     assert!(message.contains("`qdrant_url`"), "{message}");
 
     let run = searched(
@@ -706,11 +728,13 @@ async fn a_malformed_row_is_qdrant_url_unusable() {
         &loads,
     )
     .await;
+    assert_eq!(run.code(), 2, "{}", run.pretty());
     assert_eq!(run.error_code(), "qdrant_url_unusable");
-    let message = run.document["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.starts_with("HTUI_QDRANT_URL "), "{message}");
+    let message = run.message();
+    assert!(
+        message.starts_with(&format!("{UNAVAILABLE}HTUI_QDRANT_URL ")),
+        "{message}"
+    );
     assert_eq!(loads.count(), 0);
     db.drop_db().await;
 }
@@ -736,6 +760,11 @@ async fn a_search_with_qdrant_down_is_offline_and_loads_no_model() {
     assert_eq!(run.document["store"], "online");
     assert_eq!(run.document["index"], "offline");
     assert_eq!(run.error_code(), "qdrant_unreachable");
+    let message = run.message();
+    assert!(
+        message.starts_with(&format!("{UNAVAILABLE}cannot reach Qdrant: ")),
+        "{message}"
+    );
     assert!(
         matches!(run.exit, Err(StateExit::Offline(_))),
         "{:?}",
@@ -810,6 +839,7 @@ async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
     assert_eq!(run.code(), 0, "{}", run.pretty());
     assert_eq!(run.document["index"], "empty");
     assert_eq!(run.document["hits"], serde_json::json!([]));
+    assert_eq!(run.message(), "", "empty is no failure: {}", run.pretty());
     assert_eq!(loads.count(), 0, "no model for a missing index");
     let exists =
         QdrantStore::open_existing_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
@@ -958,6 +988,8 @@ async fn a_search_over_an_index_answers_in_scope() {
         assert_eq!(document["store"], "online");
         assert_eq!(document["index"], "error");
         assert_eq!(document["error"]["code"], "model_unavailable", "{document}");
+        let message = document["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with(UNAVAILABLE), "{message}");
     }
     db.drop_db().await;
 }

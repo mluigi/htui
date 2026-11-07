@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Utc};
 use htui::app::{Action, Handled};
+use htui::concepts_worker::QdrantCheck;
 use htui::qdrant_settings_info::{
     OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState, old_entry_kept,
 };
@@ -139,8 +140,8 @@ fn flattened(frame: &str) -> String {
     frame.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The store requests the section sent since the queue was last drained.
-fn requests_of(bench: &SectionBench) -> Vec<StoreRequest> {
+/// Every store request the section sent since the queue was last drained, its probes included.
+fn sent_by(bench: &SectionBench) -> Vec<StoreRequest> {
     bench
         .drained()
         .into_iter()
@@ -149,6 +150,23 @@ fn requests_of(bench: &SectionBench) -> Vec<StoreRequest> {
             _ => None,
         })
         .collect()
+}
+
+/// The store requests the section sent since the queue was last drained, but the Qdrant probe a
+/// snapshot asks for (MOD-160 P-11): the probe cases below assert it themselves.
+fn requests_of(bench: &SectionBench) -> Vec<StoreRequest> {
+    sent_by(bench)
+        .into_iter()
+        .filter(|request| !matches!(request, StoreRequest::ProbeQdrant))
+        .collect()
+}
+
+/// How many Qdrant probes the section sent since the queue was last drained.
+fn probes_of(bench: &SectionBench) -> usize {
+    sent_by(bench)
+        .iter()
+        .filter(|request| matches!(request, StoreRequest::ProbeQdrant))
+        .count()
 }
 
 /// Both rows of a set URL and a stored key: the URL itself, the key by its presence only.
@@ -1278,4 +1296,389 @@ async fn the_scroll_names_the_form_rows_it_measures() {
     assert_eq!((rows.x, rows.y, rows.width), (0, 0, 100), "{rows:?}");
     assert!(span.total < 30, "the form's own lines, unpadded: {span:?}");
     assert_eq!(span.offset, 0, "{span:?}");
+}
+
+// ---- MOD-160 D9: the probe's warning and info rows -----------------------------------------------
+
+/// The key the probe cases' snapshots stand for: never in a check, so never drawn.
+const KEY_SENTINEL: &str = "KEY-SENTINEL";
+
+/// What a probe of each state answers, its sentence a fixture in the shape the probe writes.
+fn no_url() -> QdrantCheck {
+    QdrantCheck::NotConfigured(
+        "no Qdrant URL is set; set one in Settings > Qdrant or with `htui --set-qdrant-url`"
+            .to_owned(),
+    )
+}
+
+fn unreachable() -> QdrantCheck {
+    QdrantCheck::Unavailable(
+        "cannot reach Qdrant at https://qdrant.example:6334: connection refused".to_owned(),
+    )
+}
+
+fn mismatch() -> QdrantCheck {
+    QdrantCheck::Unavailable(
+        "qdrant: embedder mismatch: the collection was written by another embedder".to_owned(),
+    )
+}
+
+fn settings_unreadable() -> QdrantCheck {
+    QdrantCheck::Unreadable(
+        "the keyring cannot be read: no Secret Service provider is running".to_owned(),
+    )
+}
+
+fn key_refused() -> QdrantCheck {
+    QdrantCheck::KeyRefused("qdrant: access refused: the API key was not accepted".to_owned())
+}
+
+fn no_key() -> QdrantCheck {
+    QdrantCheck::NoKey("qdrant: access refused: an API key is required".to_owned())
+}
+
+/// The section over `snapshot` with `check` delivered as its probe's answer.
+async fn probed(
+    snapshot: QdrantSnapshot,
+    check: Option<QdrantCheck>,
+) -> (SectionBench, QdrantSection) {
+    let (bench, mut section) = bench_with(snapshot).await;
+    bench.reply(&mut section, &StoreReply::QdrantProbe(check));
+    let _ = bench.drained();
+    (bench, section)
+}
+
+/// D9: the section's snapshot asks for one probe, and the same snapshot again asks for none; a
+/// snapshot that moved (the key cleared) asks again.
+#[tokio::test]
+async fn a_snapshot_asks_for_one_probe() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert!(
+        matches!(sent_by(&bench).as_slice(), [StoreRequest::ProbeQdrant]),
+        "one probe for the snapshot"
+    );
+}
+
+#[tokio::test]
+async fn the_same_snapshot_does_not_ask_again() {
+    let (bench, mut section) = bench_with(stored()).await;
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert_eq!(probes_of(&bench), 0, "nothing moved, nothing probed");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            key_state: QdrantState::NotStored,
+            ..stored()
+        }),
+    );
+    assert_eq!(probes_of(&bench), 1, "the key moved: probed again");
+}
+
+/// D9, "on its reload key": `r` reads the section again, and that snapshot probes again even
+/// though nothing moved.
+#[tokio::test]
+async fn r_probes_again() {
+    let (bench, mut section) = bench_with(stored()).await;
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(sent_by(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "the read first"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert!(
+        matches!(sent_by(&bench).as_slice(), [StoreRequest::ProbeQdrant]),
+        "then the probe"
+    );
+}
+
+/// D9: offline and `--demo` send no probe (the URL row already says why), and a probe answered
+/// before the store went offline draws nothing over its row.
+#[tokio::test]
+async fn offline_and_demo_send_no_probe() {
+    for snapshot in [
+        snapshot(UrlRowState::Offline, QdrantState::Stored),
+        QdrantSnapshot::not_applicable(),
+    ] {
+        let bench = SectionBench::new().await;
+        let mut section = QdrantSection::new();
+        bench.reply(&mut section, &StoreReply::Qdrant(snapshot.clone()));
+        assert_eq!(probes_of(&bench), 0, "{snapshot:?}");
+    }
+
+    let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(snapshot(UrlRowState::Offline, QdrantState::Stored)),
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("knowledge search"), "{frame}");
+}
+
+/// D9: each warning state draws its row, `knowledge search unavailable: <state>: <cause>`, under
+/// the rows, in the theme's warning style.
+#[tokio::test]
+async fn each_warning_state_draws_its_row() {
+    let cases = [
+        ("probe_no_url", empty(), no_url(), "no Qdrant is configured"),
+        (
+            "probe_unreachable",
+            stored(),
+            unreachable(),
+            "Qdrant is unreachable or refuses the collection",
+        ),
+        (
+            "probe_mismatch",
+            stored(),
+            mismatch(),
+            "Qdrant is unreachable or refuses the collection",
+        ),
+        (
+            "probe_unreadable",
+            unreadable(),
+            settings_unreadable(),
+            "this box cannot read the Qdrant settings",
+        ),
+        (
+            "probe_key_refused",
+            stored(),
+            key_refused(),
+            "the Qdrant refused this box's API key",
+        ),
+        (
+            "probe_no_key",
+            snapshot(
+                UrlRowState::Set {
+                    url: url(SUMMARY),
+                    token: token(),
+                },
+                QdrantState::NotStored,
+            ),
+            no_key(),
+            "this box lacks the Qdrant API key",
+        ),
+    ];
+    for (name, snapshot, check, state) in cases {
+        let (bench, section) = probed(snapshot, Some(check.clone())).await;
+        let frame = frame_of(&bench, &section);
+        let warning = check.warning().expect("a warning state");
+        assert!(warning.starts_with(state), "{warning}");
+        assert!(
+            flattened(&frame).contains(&format!("knowledge search unavailable: {warning}")),
+            "{name}: {frame}"
+        );
+        let buffer = drawn(&bench, &section);
+        let y = line_of(&buffer, "knowledge search unavailable");
+        assert_eq!(
+            buffer[(0, y)].fg,
+            Theme::default().warning.fg.unwrap_or(Color::Reset),
+            "{name}: the warning style"
+        );
+        insta::assert_snapshot!(name, frame);
+    }
+}
+
+/// Q4: a Qdrant that answers without a key is said, as information, never as a warning.
+#[tokio::test]
+async fn a_keyless_qdrant_draws_an_info_line() {
+    let keyless = snapshot(
+        UrlRowState::Set {
+            url: url(SUMMARY),
+            token: token(),
+        },
+        QdrantState::NotStored,
+    );
+    let (bench, section) = probed(keyless, Some(QdrantCheck::Keyless)).await;
+    let frame = frame_of(&bench, &section);
+    assert!(
+        frame.contains("this Qdrant answers without an API key"),
+        "{frame}"
+    );
+    assert!(!frame.contains("knowledge search unavailable"), "{frame}");
+    let buffer = drawn(&bench, &section);
+    let y = line_of(&buffer, "this Qdrant answers without an API key");
+    assert_eq!(
+        buffer[(0, y)].fg,
+        Theme::default().dim.fg.unwrap_or(Color::Reset),
+        "the info style"
+    );
+    insta::assert_snapshot!("probe_keyless_info", frame);
+}
+
+/// D9: a ready Qdrant, or nothing probed, draws no row at all: the frame is the one without a
+/// probe.
+#[tokio::test]
+async fn ready_draws_no_row() {
+    let (bench, plain) = bench_with(stored()).await;
+    let before = frame_of(&bench, &plain);
+    for check in [Some(QdrantCheck::Ready), None] {
+        let (bench, section) = probed(stored(), check.clone()).await;
+        assert_eq!(frame_of(&bench, &section), before, "{check:?}");
+    }
+}
+
+/// D9: a probe that has not answered yet for a snapshot that moved draws nothing: the old answer
+/// was about the settings before.
+#[tokio::test]
+async fn a_moved_snapshot_drops_the_old_answer() {
+    let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            key_state: QdrantState::NotStored,
+            ..stored()
+        }),
+    );
+    assert_eq!(probes_of(&bench), 1, "probed again");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("knowledge search"), "{frame}");
+}
+
+/// D9: a compare-and-set miss installs a fresh snapshot too, and one whose URL another box moved
+/// drops the old URL's answer and asks for one probe: the old warning never stands under the
+/// new URL's row.
+#[tokio::test]
+async fn a_stale_snapshot_whose_url_moved_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+    bench.key(&mut section, "e");
+    typed(&bench, &mut section, "https://mine.example:6334");
+    bench.key(&mut section, "Enter");
+    let _ = sent_by(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::QdrantStale(Box::new(snapshot(
+            UrlRowState::Set {
+                url: url(OTHER),
+                token: later(),
+            },
+            QdrantState::Stored,
+        ))),
+    );
+    assert!(
+        matches!(sent_by(&bench).as_slice(), [StoreRequest::ProbeQdrant]),
+        "one probe for the stale snapshot"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains(OTHER), "the row now: {frame}");
+    assert!(!frame.contains("knowledge search"), "{frame}");
+}
+
+/// D9: a key write answers with a fresh snapshot read, and that snapshot probes again even
+/// when it reads the same as before (one stored key replaced by another): the refused key's
+/// warning never stays on screen beside the new key's "stored".
+#[tokio::test]
+async fn a_key_written_over_a_refused_one_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(key_refused())).await;
+    bench.key(&mut section, "j");
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    typed(&bench, &mut section, "a-new-key");
+    bench.key(&mut section, "Enter");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::SetQdrantApiKey(_)]
+        ),
+        "the key is stored"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert_eq!(probes_of(&bench), 1, "the new key's snapshot probes again");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("knowledge search"), "{frame}");
+    assert!(!frame.contains("refused this box's API key"), "{frame}");
+}
+
+/// D9: a refused key write may have landed before its follow-up read failed, so the re-read
+/// it sends probes again even when it reads the same as before.
+#[tokio::test]
+async fn a_refused_key_write_re_read_probes_again() {
+    let (bench, mut section) = probed(stored(), Some(key_refused())).await;
+    bench.key(&mut section, "j");
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    typed(&bench, &mut section, "a-new-key");
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_qdrant_api_key",
+            message: "the keyring is locked".to_owned(),
+        },
+    );
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "a failed write reads the section again"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert_eq!(probes_of(&bench), 1, "the re-read probes again");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("refused this box's API key"), "{frame}");
+}
+
+/// No probe row ever draws a key: a key typed and stored just before the probe answers is
+/// nowhere in the frame or the section's `Debug`, whatever the probe said.
+#[tokio::test]
+async fn no_probe_line_renders_a_key() {
+    for check in [
+        no_url(),
+        unreachable(),
+        mismatch(),
+        settings_unreadable(),
+        key_refused(),
+        no_key(),
+        QdrantCheck::Keyless,
+        QdrantCheck::Ready,
+    ] {
+        let (bench, mut section) = bench_with(snapshot(
+            UrlRowState::Set {
+                url: url(SUMMARY),
+                token: token(),
+            },
+            QdrantState::NotStored,
+        ))
+        .await;
+        bench.key(&mut section, "j");
+        assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+        typed(&bench, &mut section, KEY_SENTINEL);
+        bench.key(&mut section, "Enter");
+        assert!(
+            matches!(
+                requests_of(&bench).as_slice(),
+                [StoreRequest::SetQdrantApiKey(_)]
+            ),
+            "the key is stored"
+        );
+        bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+        assert_eq!(probes_of(&bench), 1, "the stored key's snapshot probes");
+        bench.reply(&mut section, &StoreReply::QdrantProbe(Some(check.clone())));
+        let frame = frame_of(&bench, &section);
+        assert!(!frame.contains(KEY_SENTINEL), "{check:?}: {frame}");
+        assert!(!format!("{section:?}").contains(KEY_SENTINEL), "{check:?}");
+        assert!(!format!("{check:?}").contains(KEY_SENTINEL), "{check:?}");
+    }
+}
+
+/// D9: an outage forgets what the last probe was sent for, so the store coming back with the
+/// same URL, override and key probes again: the pre-outage answer ("unreachable") is never drawn
+/// under a Qdrant that may answer now, and nothing is drawn until the new probe answers.
+#[tokio::test]
+async fn the_same_snapshot_after_an_outage_probes_again() {
+    for outage in [
+        snapshot(UrlRowState::Offline, QdrantState::Stored),
+        QdrantSnapshot::not_applicable(),
+    ] {
+        let (bench, mut section) = probed(stored(), Some(unreachable())).await;
+        bench.reply(&mut section, &StoreReply::Qdrant(outage.clone()));
+        assert_eq!(probes_of(&bench), 0, "{outage:?}: no probe while offline");
+
+        bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+        assert_eq!(
+            probes_of(&bench),
+            1,
+            "{outage:?}: back online, probed again"
+        );
+        let frame = flattened(&frame_of(&bench, &section));
+        assert!(!frame.contains("knowledge search"), "{outage:?}: {frame}");
+    }
 }

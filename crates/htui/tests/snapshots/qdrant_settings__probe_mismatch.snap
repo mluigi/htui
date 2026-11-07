@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+▌URL       https://qdrant.example:6334 · for every box
+ API key   •••••••• stored
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+knowledge search unavailable: Qdrant is unreachable or refuses the collection: qdrant: embedder
+mismatch: the collection was written by another embedder

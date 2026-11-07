@@ -20,6 +20,7 @@
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope};
+use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_store::vector::{Hit, Owner, PointType, QUERY_EMBED_FAILED, SearchQuery};
 use htui_store::vector_sync::SyncReport;
 use ratatui::Frame;
@@ -107,6 +108,17 @@ pub fn changed(submit: Option<&str>) -> String {
     }
 }
 
+/// A failed search's status row (MOD-160 D7): the one sentence every search surface says, then
+/// the why key in force, `why` being `ConceptsWhy`'s label through `CONCEPTS_QUERY`; none bound,
+/// the sentence alone. The cause is one key away, on the why row.
+#[must_use]
+pub fn unavailable_status(why: Option<&str>) -> String {
+    match why {
+        Some(why) => format!("{KNOWLEDGE_SEARCH_UNAVAILABLE} \u{2014} {why} why"),
+        None => KNOWLEDGE_SEARCH_UNAVAILABLE.to_owned(),
+    }
+}
+
 /// Where a missing or unreachable index is fixed (MOD-115 M4 E6, MOD-83).
 const QDRANT_PLACE: &str = "Settings \u{203a} Qdrant";
 
@@ -126,6 +138,18 @@ const HINT: HintSpec = &[
     Hint::One(Act::ConceptsDecisions, "decisions"),
     Hint::One(Act::ConceptsProject, "scope"),
     Hint::One(Act::ConceptsReindex, "index"),
+    Hint::One(Act::OverlayClose, "close"),
+];
+
+/// [`HINT`] while a failed search's cause is there to show (MOD-160 D7): the why key joins it
+/// before `close`. A failed search clears the hits, so the cursor's `move` has nothing to move and
+/// gives way: the row stays whole on the border at 100 columns (L-E Q5, MOD-160 R-3).
+const HINT_WHY: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "search/open"),
+    Hint::One(Act::ConceptsDecisions, "decisions"),
+    Hint::One(Act::ConceptsProject, "scope"),
+    Hint::One(Act::ConceptsReindex, "index"),
+    Hint::One(Act::ConceptsWhy, "why"),
     Hint::One(Act::OverlayClose, "close"),
 ];
 
@@ -152,6 +176,8 @@ pub struct ConceptsSearch {
     cursor: usize,
     /// The last search's own error, drawn in the box (D232).
     error: Option<String>,
+    /// The why row is open: the search's cause, with where it is fixed (MOD-160 D7).
+    why: bool,
     /// A refusal that sent nothing: no projects, no query.
     notice: Option<&'static str>,
     /// The `Ctrl+R` line (D237).
@@ -247,6 +273,7 @@ impl ConceptsSearch {
                 self.hits.clear();
                 self.cursor = 0;
                 self.error = None;
+                self.why = false;
                 self.notice = None;
                 ctx.request(StoreRequest::SearchConcepts(query));
             }
@@ -281,8 +308,10 @@ impl ConceptsSearch {
         if let Some(notice) = self.notice {
             return (notice.to_owned(), theme.dim);
         }
-        if let Some(error) = &self.error {
-            return (with_place(error), theme.error);
+        if self.error.is_some() {
+            // MOD-160 D7: the sentence, the cause one key away (the why row).
+            let why = keys.label(views::CONCEPTS_QUERY, Act::ConceptsWhy);
+            return (unavailable_status(why.as_deref()), theme.error);
         }
         if self.searching {
             let text = if self.answered { SEARCHING } else { LOADING };
@@ -371,6 +400,12 @@ impl Overlay for ConceptsSearch {
                     self.cursor += 1;
                 }
             }
+            // MOD-160 D7: the why row opens and closes only while there is a cause.
+            Some(Act::ConceptsWhy) => {
+                if self.error.is_some() {
+                    self.why = !self.why;
+                }
+            }
             _ => return Handled::Pass,
         }
         Handled::Consumed
@@ -400,6 +435,7 @@ impl Overlay for ConceptsSearch {
                         self.hits.clone_from(hits);
                         self.cursor = 0;
                         self.error = None;
+                        self.why = false;
                     }
                     Err(message) => {
                         self.hits.clear();
@@ -421,7 +457,8 @@ impl Overlay for ConceptsSearch {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let content_w = MAX_WIDTH - CHROME;
-        let hint = ctx.keys().hint(views::CONCEPTS_QUERY, HINT);
+        let spec = if self.error.is_some() { HINT_WHY } else { HINT };
+        let hint = ctx.keys().hint(views::CONCEPTS_QUERY, spec);
         // `Fit` keeps the margin round the box, so the header row stays uncovered (MOD-82); on a
         // screen too short for every hit row, the hit rows give way.
         let content = Modal::new(TITLE)
@@ -458,27 +495,30 @@ impl Overlay for ConceptsSearch {
         );
         frame.render_widget(Paragraph::new(Line::from(spans)), query);
 
-        let (mut status_text, status_style) = self.status(ctx.scope, theme, ctx.keys());
+        let (status_text, status_style) = self.status(ctx.scope, theme, ctx.keys());
         let (mut index_text, index_style) = self.index_line(theme);
         if self.hits.is_empty() {
-            // Review 8: an error too wide for its row is drawn whole in the empty hit rows, search
-            // first, and its own row is left blank rather than repeating the start of it.
             let cells = usize::from(content.width);
-            let status_is_error = self.notice.is_none() && self.error.is_some();
-            let index_is_error = matches!(self.index, IndexLine::Failed(_));
             let mut lines: Vec<Line<'static>> = Vec::new();
-            for (is_error, text, style) in [
-                (status_is_error, &mut status_text, status_style),
-                (index_is_error, &mut index_text, index_style),
-            ] {
-                if is_error && cell_width(text) > cells {
-                    lines.extend(
-                        wrap(text, cells)
-                            .into_iter()
-                            .map(|wrapped| Line::styled(wrapped, style)),
-                    );
-                    text.clear();
-                }
+            // MOD-160 D7: the why row, first in the empty hit rows: the search's cause with where
+            // it is fixed, whole, wrapped at grapheme boundaries (a failed search clears the hits).
+            if let Some(error) = self.error.as_deref().filter(|_| self.why) {
+                lines.extend(
+                    wrap(&with_place(error), cells)
+                        .into_iter()
+                        .map(|wrapped| Line::styled(wrapped, theme.error)),
+                );
+            }
+            // Review 8: an index run's error too wide for its row is drawn whole in the empty hit
+            // rows, after the why row, and its own row is left blank rather than repeating the
+            // start of it. The search's status row is the short sentence, never too wide.
+            if matches!(self.index, IndexLine::Failed(_)) && cell_width(&index_text) > cells {
+                lines.extend(
+                    wrap(&index_text, cells)
+                        .into_iter()
+                        .map(|wrapped| Line::styled(wrapped, index_style)),
+                );
+                index_text.clear();
             }
             frame.render_widget(Paragraph::new(lines), hits);
         } else {
@@ -832,6 +872,41 @@ mod tests {
         );
     }
 
+    /// Types `text`, presses `Enter` and fails the one search it sent with `error`; the search
+    /// sent.
+    fn failed(
+        bench: &Bench,
+        search: &mut ConceptsSearch,
+        text: &str,
+        error: &str,
+    ) -> Vec<SearchQuery> {
+        bench.typed(search, text);
+        bench.code(search, KeyCode::Enter);
+        let sent = searches(bench);
+        assert_eq!(sent.len(), 1, "one search per Enter: {sent:?}");
+        bench.reply(
+            search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Err(error.to_owned()),
+            },
+        );
+        sent
+    }
+
+    /// The row of `frame` that draws `text`.
+    fn row_of(frame: &str, text: &str) -> Option<usize> {
+        frame.lines().position(|line| line.contains(text))
+    }
+
+    /// The box's bottom border, where its keys ride.
+    fn border(frame: &str) -> &str {
+        frame
+            .lines()
+            .find(|line| line.contains('\u{2570}'))
+            .expect("a rounded box")
+    }
+
     #[test]
     fn an_empty_scope_sends_nothing_and_says_so() {
         let bench = Bench::empty();
@@ -1054,16 +1129,13 @@ mod tests {
     fn a_failed_search_lets_enter_retry() {
         let bench = Bench::platform();
         let mut search = ConceptsSearch::new();
-        bench.typed(&mut search, "tui");
-        bench.code(&mut search, KeyCode::Enter);
-        let sent = searches(&bench);
-        bench.reply(
-            &mut search,
-            ConceptsReply::Hits {
-                query: sent[0].clone(),
-                outcome: Err("cannot reach Qdrant: refused".to_owned()),
-            },
+        let sent = failed(&bench, &mut search, "tui", "cannot reach Qdrant: refused");
+        let frame = bench.render(&search);
+        assert!(
+            frame.contains(&unavailable_status(Some("Ctrl+e"))),
+            "{frame}"
         );
+        bench.ctrl(&mut search, 'e');
         assert!(
             bench
                 .render(&search)
@@ -1072,6 +1144,202 @@ mod tests {
 
         bench.code(&mut search, KeyCode::Enter);
         assert_eq!(searches(&bench), sent, "the same search, again");
+    }
+
+    /// MOD-160 D7: a failed search says the one sentence on its status row, in the error style,
+    /// and names the why key in force; the cause waits behind it.
+    #[test]
+    fn a_failed_search_says_unavailable_and_names_the_why_key() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        failed(
+            &bench,
+            &mut search,
+            "tui",
+            "qdrant: query: connection refused",
+        );
+        assert_eq!(
+            unavailable_status(Some("Ctrl+e")),
+            "knowledge search unavailable \u{2014} Ctrl+e why"
+        );
+        let frame = bench.render(&search);
+        assert!(
+            frame.contains("knowledge search unavailable \u{2014} Ctrl+e why"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("connection refused"),
+            "the cause waits behind the key: {frame}"
+        );
+        let (text, style) = search.status(&bench.scope, &bench.theme, &bench.keys);
+        assert_eq!(text, unavailable_status(Some("Ctrl+e")));
+        assert_eq!(style, bench.theme.error);
+    }
+
+    /// MOD-160 D7: the why key opens the cause, with where it is fixed, on the first hit row in
+    /// the error style, and closes it again; it types nothing.
+    #[test]
+    fn the_why_key_toggles_the_cause_with_its_place() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        failed(
+            &bench,
+            &mut search,
+            "tui",
+            "qdrant: query: connection refused",
+        );
+        assert_eq!(bench.ctrl(&mut search, 'e'), Handled::Consumed);
+        let cause = "qdrant: query: connection refused \u{2014} Settings \u{203a} Qdrant";
+        let frame = bench.render(&search);
+        let at = row_of(&frame, cause).unwrap_or_else(|| panic!("the cause:\n{frame}"));
+        let query = row_of(&frame, "query tui").expect("the query row");
+        assert_eq!(at, query + 2, "the first hit row:\n{frame}");
+        assert!(
+            frame.contains(&unavailable_status(Some("Ctrl+e"))),
+            "the status row keeps the sentence: {frame}"
+        );
+        assert_eq!(search.field.text(), Some("tui"), "the key typed nothing");
+        let buffer = bench.buffer(&search, 100, 30);
+        let y = u16::try_from(at).expect("a short frame");
+        let x = (0..buffer.area.width)
+            .find(|x| buffer[(*x, y)].symbol() == "q")
+            .expect("the cause's first cell");
+        assert_eq!(buffer[(x, y)].fg, bench.theme.error.fg.expect("a colour"));
+
+        assert_eq!(bench.ctrl(&mut search, 'e'), Handled::Consumed);
+        let frame = bench.render(&search);
+        assert!(
+            !frame.contains("connection refused"),
+            "closed again: {frame}"
+        );
+        assert!(
+            frame.contains(&unavailable_status(Some("Ctrl+e"))),
+            "{frame}"
+        );
+    }
+
+    /// MOD-160 D7: with no cause the why key is consumed and changes nothing, before a search and
+    /// over hits.
+    #[test]
+    fn the_why_key_without_a_cause_changes_nothing() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "tui");
+        let before = bench.render(&search);
+        assert_eq!(bench.ctrl(&mut search, 'e'), Handled::Consumed);
+        assert!(!search.why);
+        assert_eq!(bench.render(&search), before);
+        assert!(bench.emit.is_empty());
+
+        let mut search = ConceptsSearch::new();
+        searched(&bench, &mut search, "tui", vec![item_hit()]);
+        let before = bench.render(&search);
+        assert_eq!(bench.ctrl(&mut search, 'e'), Handled::Consumed);
+        assert!(!search.why);
+        assert_eq!(bench.render(&search), before);
+    }
+
+    /// MOD-160 D7: `Enter` that sends closes the why row, so a retry that fails again starts
+    /// closed; a search that answers closes it too.
+    #[test]
+    fn a_new_search_closes_the_why_row() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        failed(&bench, &mut search, "tui", "qdrant: refused");
+        bench.ctrl(&mut search, 'e');
+        assert!(search.why);
+        bench.code(&mut search, KeyCode::Enter);
+        assert!(!search.why, "a retry closes it");
+        let sent = searches(&bench);
+        assert_eq!(sent.len(), 1);
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Err("qdrant: refused".to_owned()),
+            },
+        );
+        let frame = bench.render(&search);
+        assert!(!frame.contains("qdrant: refused"), "{frame}");
+        assert!(
+            frame.contains(&unavailable_status(Some("Ctrl+e"))),
+            "{frame}"
+        );
+
+        bench.code(&mut search, KeyCode::Enter);
+        let sent = searches(&bench);
+        search.why = true;
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Ok(vec![item_hit()]),
+            },
+        );
+        assert!(!search.why, "an answer closes it");
+    }
+
+    /// MOD-160 D7, R-3: the border names the why key only while there is a cause, and the row
+    /// still fits a 100-column frame whole, `Esc close` last.
+    #[test]
+    fn the_border_names_why_only_while_there_is_a_cause() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        let frame = bench.render(&search);
+        assert!(!border(&frame).contains("why"), "{frame}");
+
+        failed(&bench, &mut search, "tui", "qdrant: refused");
+        let frame = bench.render(&search);
+        let row = border(&frame);
+        assert!(row.contains("Ctrl+e why \u{b7} Esc close"), "{row}");
+        assert!(!row.contains('\u{2026}'), "not cut: {row}");
+
+        bench.code(&mut search, KeyCode::Enter);
+        let sent = searches(&bench);
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Ok(vec![item_hit()]),
+            },
+        );
+        let frame = bench.render(&search);
+        let row = border(&frame);
+        assert!(!row.contains("why"), "{row}");
+        assert!(row.contains("\u{2191}/\u{2193} move"), "{row}");
+    }
+
+    /// MOD-160 D7: with the why key unbound the status row is the sentence alone, the border
+    /// does not name it, and no chord opens the cause.
+    #[test]
+    fn an_unbound_why_key_leaves_the_sentence_alone() {
+        let mut bench = Bench::platform();
+        bench.keys =
+            crate::keys::load_str("version = 1\n[concepts]\nwhy = []\n").expect("the keys load");
+        let mut search = ConceptsSearch::new();
+        failed(&bench, &mut search, "tui", "qdrant: refused");
+        assert_eq!(unavailable_status(None), KNOWLEDGE_SEARCH_UNAVAILABLE);
+        let frame = bench.render(&search);
+        let status = frame
+            .lines()
+            .find(|line| line.contains(KNOWLEDGE_SEARCH_UNAVAILABLE))
+            .unwrap_or_else(|| panic!("the sentence:\n{frame}"));
+        assert!(!status.contains('\u{2014}'), "{status}");
+        assert!(!border(&frame).contains("why"), "{frame}");
+        bench.ctrl(&mut search, 'e');
+        assert!(!bench.render(&search).contains("qdrant: refused"));
+    }
+
+    /// MOD-160 D1: an empty index is not unavailable: it still says no matches.
+    #[test]
+    fn an_empty_index_still_says_no_matches() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        searched(&bench, &mut search, "tui", Vec::new());
+        let frame = bench.render(&search);
+        assert!(frame.contains(&no_matches(Some("Ctrl+r"))), "{frame}");
+        assert!(!frame.contains(KNOWLEDGE_SEARCH_UNAVAILABLE), "{frame}");
+        assert!(!border(&frame).contains("why"), "{frame}");
     }
 
     #[test]
@@ -1184,16 +1452,15 @@ mod tests {
         ];
 
         let mut search = ConceptsSearch::new();
-        bench.typed(&mut search, "tui");
-        bench.code(&mut search, KeyCode::Enter);
-        let sent = searches(&bench);
-        bench.reply(
-            &mut search,
-            ConceptsReply::Hits {
-                query: sent[0].clone(),
-                outcome: Err(long.clone()),
-            },
+        failed(&bench, &mut search, "tui", &long);
+        let frame = bench.render(&search);
+        assert_eq!(
+            frame.matches("cannot reach Qdrant").count(),
+            0,
+            "behind the why key: {frame}"
         );
+        // MOD-160 D7: the why row draws the cause with its place, wrapped the same way.
+        bench.ctrl(&mut search, 'e');
         let frame = bench.render(&search);
         let lines: Vec<&str> = frame.lines().collect();
         let first = lines
@@ -1201,10 +1468,18 @@ mod tests {
             .position(|line| line.contains(&rows[0]))
             .unwrap_or_else(|| panic!("the error's first row:\n{frame}"));
         assert!(lines[first + 1].contains(&rows[1]), "{frame}");
+        assert!(
+            lines[first + 1].contains("end \u{2014} Settings \u{203a} Qdrant"),
+            "{frame}"
+        );
         assert_eq!(
             frame.matches("cannot reach Qdrant").count(),
             1,
             "drawn once: {frame}"
+        );
+        assert!(
+            frame.contains(&unavailable_status(Some("Ctrl+e"))),
+            "{frame}"
         );
 
         let mut search = ConceptsSearch::new();
@@ -1240,6 +1515,19 @@ mod tests {
             .position(|line| line.contains("Esc close"))
             .expect("the hint");
         assert_eq!(at + 1, hint, "the index row, just above the hint:\n{frame}");
+
+        // MOD-160 D7: a search's short cause opens on the first hit row; the sentence keeps the
+        // status row, just above the index row.
+        let mut search = ConceptsSearch::new();
+        failed(&bench, &mut search, "tui", "qdrant: query: refused");
+        bench.ctrl(&mut search, 'e');
+        let frame = bench.render(&search);
+        let cause = row_of(&frame, "qdrant: query: refused").expect("drawn");
+        let query = row_of(&frame, "query tui").expect("the query row");
+        assert_eq!(cause, query + 2, "the first hit row:\n{frame}");
+        let status = row_of(&frame, KNOWLEDGE_SEARCH_UNAVAILABLE).expect("the sentence");
+        let hint = row_of(&frame, "Esc close").expect("the hint");
+        assert_eq!(status + 2, hint, "the status row:\n{frame}");
     }
 
     #[test]
@@ -1419,6 +1707,24 @@ mod tests {
                 "{qdrant}"
             );
         }
+
+        // MOD-160 D7: the why row draws the cause with its origin's place.
+        let bench = Bench::platform();
+        for (error, place) in [
+            (
+                "store unreachable: connection refused",
+                "Settings \u{203a} Connection",
+            ),
+            (download, "check the network"),
+            ("qdrant: query: refused", "Settings \u{203a} Qdrant"),
+        ] {
+            let mut search = ConceptsSearch::new();
+            failed(&bench, &mut search, "tui", error);
+            assert!(!bench.render(&search).contains(place), "{error}");
+            bench.ctrl(&mut search, 'e');
+            let frame = bench.render(&search);
+            assert!(frame.contains(place), "{error}: {frame}");
+        }
     }
 
     /// MOD-115 M4 E6 (MOD-83): an error names where it is fixed, once.
@@ -1443,6 +1749,7 @@ mod tests {
                 outcome: Err("cannot reach Qdrant: refused".to_owned()),
             },
         );
+        bench.ctrl(&mut search, 'e');
         assert!(
             bench
                 .render(&search)

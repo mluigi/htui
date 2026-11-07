@@ -309,6 +309,16 @@ A failure before the index is asked (no DSN, Postgres unreachable, no Qdrant URL
 project) is a [failure document](#failure-documents) with `"kind": "search"`, and has no `index`,
 `query` or `decisions`.
 
+A search that cannot be answered because of Qdrant says so first: its `error.message` (and the
+line on standard error) starts with `knowledge search unavailable: `, followed by the cause, for
+example `knowledge search unavailable: cannot reach Qdrant: …`. That is every `index` failure
+(`offline`, `refused`, `error`), and every failure to read the Qdrant settings after the connect:
+`no_qdrant_url`, `qdrant_url_unusable`, `keyring_unreadable` for the Qdrant API key, and an
+`unreachable` or `read_failed` while reading the `qdrant_url` setting. `empty` is not a failure
+and has no message. A failure before the Qdrant settings are read (no DSN, `box.toml`, the connect)
+and a scope refusal keep their own sentence. The prefix changes no `error.code`, `store` or exit
+code; a program reads `error.code`, never the message.
+
 ## Failure documents
 
 When there is no answer, the document is the envelope and one `error` object:
@@ -360,7 +370,9 @@ The checks run in this order, and the first one that fails decides the document:
   `no_qdrant_url`. Before MOD-158 the URL was checked first; a script that told "no URL" from "no
   Postgres" by the order should read `error.code`. The model is loaded only when there is a
   collection to search, so a Qdrant that does not answer, refuses the API key or holds no index is
-  answered without it.
+  answered without it. Every failure to read the Qdrant URL or API key, and every index failure,
+  has a `message` that starts with `knowledge search unavailable: `; a scope refusal keeps its own
+  sentence (see [`search`](#search)).
 
 ## Exit codes
 
@@ -374,8 +386,9 @@ The checks run in this order, and the first one that fails decides the document:
 An offline store is reported as offline: htui never answers from its local cache here, so a
 document is never stale data presented as live.
 
-`--search-items` without `--json` uses the same exit codes, with the same sentences on standard
-error as before. Earlier versions exited 1 for every failure.
+`--search-items` without `--json` uses the same exit codes, and prints the document's
+`error.message` on standard error: `knowledge search unavailable: <cause>` for a search Qdrant
+could not answer. Earlier versions exited 1 for every failure.
 
 ## When there is no document
 

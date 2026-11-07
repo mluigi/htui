@@ -993,6 +993,11 @@ pub enum StoreRequest {
         /// The workspace and the projects to index.
         scope: Scope,
     },
+    /// MOD-160 D9: a model-free look at this process's Qdrant, served by
+    /// `concepts_worker::ConceptsRuntime` on a task of its own (`R-NF-3`), never on the loop.
+    /// Answered with [`StoreReply::QdrantProbe`]. Not one of `qdrant_settings_info`'s requests
+    /// ([`Self::is_qdrant`] is `false`): those are served on the loop.
+    ProbeQdrant,
     /// Plan D154: one orchestrator command or read, served by `run_worker::RunRuntime` on its own
     /// task (`R-NF-3`). Answered once at this `seq`, possibly hours later (R-41).
     Orch(crate::run_worker::OrchRequest),
@@ -1235,6 +1240,16 @@ impl StoreRequest {
         crate::qdrant_settings_info::REQUEST_NAMES.contains(&self.name())
     }
 
+    /// MOD-160 D5: whether this request writes or clears the database-wide `qdrant_url` row, after
+    /// which the loop tells the concepts index to read its `search_concepts` offer again.
+    #[must_use]
+    pub const fn changes_qdrant_url(&self) -> bool {
+        matches!(
+            self,
+            Self::SetQdrantUrl { .. } | Self::ClearQdrantUrl { .. } | Self::AdoptOldQdrantUrl
+        )
+    }
+
     /// Stable name of the request, used in [`StoreReply::Failed`] and in logs.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -1363,9 +1378,11 @@ impl StoreRequest {
             Self::CheckSecretScope { .. } => "check_secret_scope",
             Self::SetProjectSecretScope { .. } => "set_project_secret_scope",
             Self::SecretsTree(..) => "secrets_tree",
-            // The two of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241).
+            // The three of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241,
+            // MOD-160 D9).
             Self::SearchConcepts(_) => "search_concepts",
             Self::IndexConcepts { .. } => "index_concepts",
+            Self::ProbeQdrant => "probe_qdrant",
             // Blueprint D209: one name per verb, `run_worker::ORCH_NAMES`.
             Self::Orch(request) => request.name(),
             Self::RunStream { .. } => "run_stream",
@@ -1628,6 +1645,10 @@ pub enum StoreReply {
     /// The answer to [`StoreRequest::QdrantOldUrlCheck`]: whether this box's keyring holds the
     /// retired Qdrant URL (MOD-158 R1, C-M2).
     QdrantOldUrl(bool),
+    /// The answer to [`StoreRequest::ProbeQdrant`] (MOD-160 D9): what a model-free look at this
+    /// process's Qdrant says. `None` when nothing was probed: offline, no concepts runtime (the
+    /// harness), or `--demo`. Carries no key: each sentence is a settings or a probe sentence.
+    QdrantProbe(Option<concepts_worker::QdrantCheck>),
     /// Answer to [`StoreRequest::SearchConcepts`] and [`StoreRequest::IndexConcepts`] (MOD-64 D232):
     /// the outcome carries its own error, so a Qdrant failure stays in the search overlay and never
     /// reaches the status line the way a [`StoreReply::Failed`] does.
@@ -2409,6 +2430,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::IndexConcepts { .. } => StoreReply::Concepts(Box::new(
             ConceptsReply::Indexed(Err(concepts_worker::NOT_AVAILABLE.to_owned())),
         )),
+        // MOD-160 D9: with no runtime there is no index to look through; nothing was probed.
+        StoreRequest::ProbeQdrant => StoreReply::QdrantProbe(None),
         // Blueprint D183 (F-C, F-P): the three orchestrator reads need no runtime. A shell with
         // none — the test harness — gets a subscription acknowledgement, the verdicts with no live
         // chat, and the document, so no view renders a status-line error for asking.
@@ -3269,8 +3292,11 @@ pub(crate) fn spawn_with_concepts(
                         }
                         // MOD-64 D231: a search loads a model and calls Qdrant, an index run reads
                         // every item: both are tasks of the concepts runtime, and
-                        // `Deferred => continue` is the whole of `R-NF-3`.
-                        StoreRequest::SearchConcepts(_) | StoreRequest::IndexConcepts { .. } => {
+                        // `Deferred => continue` is the whole of `R-NF-3`. A Qdrant probe
+                        // (MOD-160 D9) may wait the probe's 3 s bound on a dead Qdrant: the same.
+                        StoreRequest::SearchConcepts(_)
+                        | StoreRequest::IndexConcepts { .. }
+                        | StoreRequest::ProbeQdrant => {
                             match concepts.serve(&backend, &tx, &envelope) {
                                 ConceptsServed::Reply(reply) => reply,
                                 ConceptsServed::Deferred => continue,
@@ -3310,6 +3336,12 @@ pub(crate) fn spawn_with_concepts(
                             // the pre-M4 path: the heartbeat fence, then adoption.
                             if let Some(err) = lost_the_store(&served) {
                                 let _ = go_offline(&mut backend, &mut refresher, &mut health, err);
+                            }
+                            // MOD-160 D5 (blueprint P-2): a URL write or clear, whatever it
+                            // answered (a stale or refused one says the row may have moved), has
+                            // the index re-read its offer: one cheap read, spawned, never awaited.
+                            if other.changes_qdrant_url() {
+                                concepts.url_changed();
                             }
                             match served {
                                 Ok(reply) => reply,
@@ -3781,6 +3813,169 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// MOD-160 D9 (blueprint P-8): the loop hands a Qdrant probe to the concepts runtime and
+    /// answers the next request while the probe still runs. The fake index waits a (paused-clock)
+    /// second first: had the loop probed inline, `BoxInfo` would be answered second.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_answers_while_a_qdrant_probe_runs() {
+        let check = concepts_worker::QdrantCheck::Unavailable("cannot reach Qdrant".to_owned());
+        let index = concepts_worker::MemIndex::new()
+            .delayed(std::time::Duration::from_secs(1))
+            .with_check(check.clone());
+        let (tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rx) = mpsc::unbounded_channel();
+        let _worker = spawn_with_concepts(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(Arc::new(index)),
+            None,
+        );
+        for (seq, request) in [(1, StoreRequest::ProbeQdrant), (2, StoreRequest::BoxInfo)] {
+            tx.send(RequestEnvelope {
+                seq,
+                origin: Origin::App,
+                request,
+            })
+            .expect("the worker is alive");
+        }
+
+        let first = rx.recv().await.expect("the worker answers");
+        assert_eq!(first.seq, 2, "BoxInfo is answered while the probe runs");
+        assert!(
+            matches!(first.reply, StoreReply::BoxInfo(_)),
+            "{:?}",
+            first.reply
+        );
+        let second = rx.recv().await.expect("the probe answers");
+        assert_eq!(second.seq, 1);
+        assert!(
+            matches!(&second.reply, StoreReply::QdrantProbe(Some(said)) if *said == check),
+            "{:?}",
+            second.reply
+        );
+    }
+
+    /// MOD-160 D9: without a concepts runtime (the harness, `--demo`) a probe answers "nothing
+    /// probed", never `Failed`.
+    #[tokio::test]
+    async fn without_a_runtime_a_probe_answers_nothing_probed() {
+        let reply = serve(&demo(), &StoreRequest::ProbeQdrant).await;
+        assert!(matches!(reply, StoreReply::QdrantProbe(None)), "{reply:?}");
+    }
+
+    /// An index that counts the URL changes the loop tells it (MOD-160 D5).
+    #[derive(Default)]
+    struct UrlChanges(std::sync::atomic::AtomicUsize);
+
+    impl UrlChanges {
+        fn seen(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl concepts_worker::ConceptIndex for UrlChanges {
+        fn search(
+            &self,
+            _: SearchQuery,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(
+            &self,
+            _: Backend,
+            _: Scope,
+        ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn url_changed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// MOD-160 D5 (blueprint P-2): every URL write or clear the loop serves tells the concepts
+    /// index to read its offer again, whatever the write answered (here `--demo` refuses each);
+    /// any other request does not.
+    #[tokio::test]
+    async fn a_qdrant_url_write_tells_the_index_to_reread() {
+        let index = Arc::new(UrlChanges::default());
+        let (tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rx) = mpsc::unbounded_channel();
+        let _worker = spawn_with_concepts(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(index.clone()),
+            None,
+        );
+        let url = htui_core::qdrant::QdrantUrl::parse("http://qdrant:6334").expect("a URL");
+
+        let reply = round_trip(
+            &tx,
+            &mut rx,
+            StoreRequest::SetQdrantUrl {
+                url,
+                expected: None,
+            },
+        )
+        .await;
+        let StoreReply::Failed { message, .. } = &reply else {
+            panic!("`--demo` refuses the write: {reply:?}")
+        };
+        assert_eq!(message, secrets_settings::DEMO_SESSION);
+        assert_eq!(index.seen(), 1);
+        for request in [
+            StoreRequest::QdrantInfo,
+            StoreRequest::BoxInfo,
+            StoreRequest::ClearQdrantApiKey,
+        ] {
+            round_trip(&tx, &mut rx, request).await;
+        }
+        assert_eq!(index.seen(), 1, "only a URL write re-reads");
+        round_trip(
+            &tx,
+            &mut rx,
+            StoreRequest::ClearQdrantUrl {
+                expected: Utc::now(),
+            },
+        )
+        .await;
+        round_trip(&tx, &mut rx, StoreRequest::AdoptOldQdrantUrl).await;
+        assert_eq!(index.seen(), 3);
+    }
+
+    /// MOD-160 D5: the requests that move the `qdrant_url` row, and only those.
+    #[test]
+    fn exactly_the_url_writes_change_the_qdrant_url() {
+        let url = htui_core::qdrant::QdrantUrl::parse("http://qdrant:6334").expect("a URL");
+        for request in [
+            StoreRequest::SetQdrantUrl {
+                url,
+                expected: None,
+            },
+            StoreRequest::ClearQdrantUrl {
+                expected: Utc::now(),
+            },
+            StoreRequest::AdoptOldQdrantUrl,
+        ] {
+            assert!(request.changes_qdrant_url(), "{request:?}");
+        }
+        for request in [
+            StoreRequest::QdrantInfo,
+            StoreRequest::ClearQdrantApiKey,
+            StoreRequest::DiscardOldQdrantUrl,
+            StoreRequest::QdrantOldUrlCheck,
+            StoreRequest::BoxInfo,
+        ] {
+            assert!(!request.changes_qdrant_url(), "{request:?}");
+        }
     }
 
     /// An index that records whether each publish handed it a store (MOD-158 D6).

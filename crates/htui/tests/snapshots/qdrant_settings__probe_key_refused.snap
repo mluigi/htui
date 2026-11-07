@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+▌URL       https://qdrant.example:6334 · for every box
+ API key   •••••••• stored
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+knowledge search unavailable: the Qdrant refused this box's API key: qdrant: access refused: the API
+key was not accepted

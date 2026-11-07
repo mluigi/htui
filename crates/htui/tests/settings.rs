@@ -5743,12 +5743,15 @@ fn qdrant_stored() -> QdrantSnapshot {
     }
 }
 
-/// The store requests a section sent since the queue was last drained.
+/// The store requests a section sent since the queue was last drained, but the Qdrant probe the
+/// Qdrant section asks for after each snapshot (MOD-160 P-11): `tests/qdrant_settings.rs` asserts
+/// that one.
 fn requests_of(bench: &SectionBench) -> Vec<StoreRequest> {
     bench
         .drained()
         .into_iter()
         .filter_map(|action| match action {
+            Action::Store(StoreRequest::ProbeQdrant) => None,
             Action::Store(request) => Some(request),
             _ => None,
         })

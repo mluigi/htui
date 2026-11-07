@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+▌URL       https://qdrant.example:6334 · for every box
+ API key   not stored
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+this Qdrant answers without an API key

@@ -4,6 +4,7 @@
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
+use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_orch::Command;
 
 use crate::app::action::{
@@ -11,6 +12,7 @@ use crate::app::action::{
     TabAction,
 };
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
+use crate::concepts_worker::QdrantCheck;
 use crate::connection::DsnState;
 use crate::logging::LoggingPrefs;
 use crate::run_worker::OrchRequest;
@@ -297,6 +299,7 @@ impl App {
             self.dirty = true;
         }
         self.say_qdrant_offer();
+        self.say_qdrant_warning();
         if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
@@ -524,6 +527,13 @@ impl App {
                 below_target,
             } => {
                 self.top_bar.store = label.clone();
+                // MOD-160 D9 (blueprint P-12): the launch's Qdrant probe, once the store is first
+                // online: `App::start` runs while it is still `connecting`, when the URL row
+                // cannot be read and a probe would say nothing. Off the loop, never blocking.
+                if label == "online" && self.qdrant_offer_check && !self.qdrant_probe_sent {
+                    self.qdrant_probe_sent = true;
+                    self.dispatch(Origin::App, StoreRequest::ProbeQdrant);
+                }
                 if migrations_pending.is_some_and(|n| n > 0) {
                     self.offer_migration_prompt();
                 }
@@ -569,6 +579,16 @@ impl App {
         if self.qdrant_offer_pending && self.status.is_none() {
             self.qdrant_offer_pending = false;
             self.status = Some(QDRANT_OFFER_NOTICE.to_owned());
+            self.dirty = true;
+        }
+    }
+
+    /// Says the launch's knowledge-search warning (MOD-160 D9) once the status line is free.
+    fn say_qdrant_warning(&mut self) {
+        if self.status.is_none()
+            && let Some(said) = self.qdrant_warning_pending.take()
+        {
+            self.status = Some(said);
             self.dirty = true;
         }
     }
@@ -651,6 +671,22 @@ impl App {
             self.qdrant_offer_noted = true;
             self.qdrant_offer_pending = true;
             self.say_qdrant_offer();
+        }
+
+        // MOD-160 D9: the launch's probe found knowledge search unavailable. Said once per launch,
+        // the state and where to look (the cause is Settings › Qdrant's row), and like the offer
+        // it never displaces a notice already on the line. Ready, keyless (an info line, the
+        // section's alone) and nothing probed say nothing. No modal, nothing blocked.
+        if let StoreReply::QdrantProbe(check) = reply
+            && !self.qdrant_warning_noted
+        {
+            self.qdrant_warning_noted = true;
+            if let Some(state) = check.as_ref().and_then(QdrantCheck::state) {
+                self.qdrant_warning_pending = Some(format!(
+                    "{KNOWLEDGE_SEARCH_UNAVAILABLE}: {state} \u{2014} Settings \u{203a} Qdrant"
+                ));
+                self.say_qdrant_warning();
+            }
         }
     }
 }
@@ -1330,6 +1366,169 @@ mod tests {
         app.update(Action::Tick);
         app.update(Action::Reply(qdrant_reply(seq, true)));
         assert_eq!(app.status, None, "said once per launch");
+    }
+
+    /// The `seq` of every Qdrant probe on the wire, each the shell's own (MOD-160 D9).
+    fn probe_seqs(rx: &mut UnboundedReceiver<RequestEnvelope>) -> Vec<u64> {
+        let mut found = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope.request, StoreRequest::ProbeQdrant) {
+                assert_eq!(envelope.origin, Origin::App, "the shell's own probe");
+                found.push(envelope.seq);
+            }
+        }
+        found
+    }
+
+    /// The probe's answer addressed to the shell.
+    fn probe_reply(seq: u64, check: Option<QdrantCheck>) -> ReplyEnvelope {
+        ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::QdrantProbe(check),
+        }
+    }
+
+    /// A shell after `register_all`'s flag and `start`, its launch requests drained.
+    fn launched() -> (App, UnboundedReceiver<RequestEnvelope>) {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        assert!(probe_seqs(&mut rx).is_empty(), "start probes nothing yet");
+        (app, rx)
+    }
+
+    /// MOD-160 D9, blueprint P-12: the launch probe waits for the store to be online (a probe
+    /// while `connecting` would resolve nothing), and is sent once per launch, not on every
+    /// `StoreState` re-read nor after a reconnect.
+    #[test]
+    fn the_qdrant_probe_is_sent_once_when_the_store_is_first_online() {
+        let (mut app, mut rx) = launched();
+        app.update(Action::Reply(store_state("connecting", None)));
+        assert!(probe_seqs(&mut rx).is_empty(), "not while connecting");
+
+        app.update(Action::Reply(store_state("online", None)));
+        assert_eq!(probe_seqs(&mut rx).len(), 1, "once the store is online");
+
+        for label in ["online", "offline \u{b7} 3s", "online"] {
+            app.update(Action::Reply(store_state(label, None)));
+        }
+        assert!(probe_seqs(&mut rx).is_empty(), "once per launch");
+    }
+
+    /// MOD-160 D9 (P-12, MOD-158 P-6): a shell `register_all` never ran on (every test harness)
+    /// sends no launch probe.
+    #[test]
+    fn no_probe_without_register_all() {
+        let (mut app, mut rx, _seen) = shell();
+        app.start();
+        app.update(Action::Reply(store_state("online", None)));
+        assert!(probe_seqs(&mut rx).is_empty(), "{:?}", app.status);
+    }
+
+    /// MOD-160 D9: a warning state is said once on the status line, naming the state and where to
+    /// look, never its cause's key; it never displaces an earlier notice: it waits for the line to
+    /// clear, as the old-URL offer does.
+    #[test]
+    fn a_warning_is_said_once_and_never_over_an_earlier_notice() {
+        let (mut app, mut rx) = launched();
+        app.update(Action::Reply(store_state("online", None)));
+        let [seq] = probe_seqs(&mut rx)[..] else {
+            panic!("one probe")
+        };
+        let said = "knowledge search unavailable: this box lacks the Qdrant API key \
+                    \u{2014} Settings \u{203a} Qdrant";
+
+        app.note_below_target("9.9.9");
+        let below = app.status.clone().expect("the below-target warning");
+        let check = QdrantCheck::NoKey("qdrant: access refused".to_owned());
+        app.update(Action::Reply(probe_reply(seq, Some(check.clone()))));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(below.as_str()),
+            "the warning stays"
+        );
+        app.update(Action::Tick);
+        assert_eq!(app.status.as_deref(), Some(below.as_str()), "still busy");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the key clears the warning");
+        app.update(Action::Tick);
+        assert_eq!(app.status.as_deref(), Some(said), "then the probe's");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.update(Action::Tick);
+        app.update(Action::Reply(probe_reply(seq, Some(check))));
+        app.update(Action::Tick);
+        assert_eq!(app.status, None, "said once per launch");
+    }
+
+    /// MOD-160 D9: a free status line says the warning at once.
+    #[test]
+    fn a_warning_on_a_free_line_is_said_at_once() {
+        let (mut app, mut rx) = launched();
+        app.update(Action::Reply(store_state("online", None)));
+        let [seq] = probe_seqs(&mut rx)[..] else {
+            panic!("one probe")
+        };
+        app.update(Action::Reply(probe_reply(
+            seq,
+            Some(QdrantCheck::NotConfigured(
+                "no Qdrant URL is set".to_owned(),
+            )),
+        )));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "knowledge search unavailable: no Qdrant is configured \u{2014} Settings \u{203a} \
+                 Qdrant"
+            )
+        );
+    }
+
+    /// MOD-160 R1 (review gate): settings this box cannot read (the `qdrant_url` row, or its
+    /// keyring) never reached Qdrant, so the notice says so and never calls Qdrant unreachable;
+    /// the cause stays Settings › Qdrant's row.
+    #[test]
+    fn unreadable_settings_are_never_said_unreachable() {
+        let (mut app, mut rx) = launched();
+        app.update(Action::Reply(store_state("online", None)));
+        let [seq] = probe_seqs(&mut rx)[..] else {
+            panic!("one probe")
+        };
+        app.update(Action::Reply(probe_reply(
+            seq,
+            Some(QdrantCheck::Unreadable(
+                "the keyring cannot be read: no Secret Service".to_owned(),
+            )),
+        )));
+        let said = app.status.clone().expect("the notice");
+        assert_eq!(
+            said,
+            "knowledge search unavailable: this box cannot read the Qdrant settings \u{2014} \
+             Settings \u{203a} Qdrant"
+        );
+        assert!(!said.contains("unreachable"), "{said}");
+        assert!(
+            !said.contains("Secret Service"),
+            "the cause is the row's: {said}"
+        );
+    }
+
+    /// MOD-160 D9, Q4: a ready Qdrant, a keyless one (an info line, Settings' alone) and nothing
+    /// probed (offline, no runtime) say nothing at launch.
+    #[test]
+    fn ready_keyless_and_nothing_probed_say_nothing() {
+        for check in [Some(QdrantCheck::Ready), Some(QdrantCheck::Keyless), None] {
+            let (mut app, mut rx) = launched();
+            app.update(Action::Reply(store_state("online", None)));
+            let [seq] = probe_seqs(&mut rx)[..] else {
+                panic!("one probe")
+            };
+            app.update(Action::Reply(probe_reply(seq, check.clone())));
+            app.update(Action::Tick);
+            assert_eq!(app.status, None, "{check:?}");
+        }
     }
 
     /// MOD-4 plan D165: the promotion is asked for on the chat-driving tab's behalf, so its replies

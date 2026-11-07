@@ -18,7 +18,7 @@ use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
     DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY, PointType,
-    QdrantStore, SPARSE, SearchQuery, VectorStore as _, is_embedder_mismatch,
+    Probe, QdrantStore, SPARSE, SearchQuery, VectorStore as _, is_embedder_mismatch, probe_with,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -896,5 +896,247 @@ async fn open_existing_never_drops_an_old_payload_schema() {
         payload,
         Some(serde_json::json!(PAYLOAD_SCHEMA - 1)),
         "nothing was stamped"
+    );
+}
+
+// MOD-160 D3: `ExistingCollection::check`, `open`'s embedder check before any embedder exists.
+
+fn settings(url: &str) -> QdrantSettings {
+    QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(url).expect("valid URL"),
+        None,
+    )
+}
+
+/// `check` on the collection `name` against `mine` of width `dim`; `None` when no such collection
+/// is found. It never panics, so a caller drops its collection before it asserts.
+async fn check(
+    url: &str,
+    name: &str,
+    mine: &EmbedderIdentity,
+    dim: usize,
+) -> Option<Result<(), StoreError>> {
+    match ExistingCollection::find_in(&settings(url), name).await {
+        Ok(Some(found)) => Some(found.check(mine, dim).await),
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    }
+}
+
+#[tokio::test]
+async fn check_refuses_another_width_before_any_embedder() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let built = connect(&url, HashEmbedder::new(8), &name)
+        .await
+        .expect("Qdrant answers");
+    let checked = check(&url, &name, &EmbedderIdentity::hash(DENSE_DIM), DENSE_DIM).await;
+    built.drop_collection().await.expect("drop");
+    let err = checked
+        .expect("the collection exists")
+        .expect_err("another width is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
+    assert!(err.contains("8-wide"), "{err}");
+    assert!(err.contains(&format!("{DENSE_DIM}-wide")), "{err}");
+}
+
+#[tokio::test]
+async fn check_refuses_another_embedder() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let other = EmbedderIdentity {
+        model: "test/other".into(),
+        ..EmbedderIdentity::hash(DENSE_DIM)
+    };
+    let checked = check(&url, &name, &other, DENSE_DIM).await;
+    let client = raw(&url);
+    let stored = stored_identity(&client, &name).await;
+    built.drop_collection().await.expect("drop");
+    let err = checked
+        .expect("the collection exists")
+        .expect_err("another embedder is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
+    assert!(err.contains("hash/384"), "{err}");
+    assert!(err.contains("test/other/384"), "{err}");
+    assert_eq!(
+        stored,
+        Some(EmbedderIdentity::hash(DENSE_DIM)),
+        "left as it was"
+    );
+}
+
+/// `connect` would stamp it and build its payload indexes; `check` reads only.
+#[tokio::test]
+async fn check_passes_an_unstamped_collection_and_writes_nothing() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let other = std::collections::HashMap::from([("other".to_owned(), serde_json::json!("kept"))]);
+    create_unstamped(&client, &name, DENSE_DIM as u64, Some(other)).await;
+    let checked = check(&url, &name, &EmbedderIdentity::hash(DENSE_DIM), DENSE_DIM).await;
+    let identity = stored_identity(&client, &name).await;
+    let payload = stored_payload_schema(&client, &name).await;
+    let info = client
+        .collection_info(&name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result");
+    client.delete_collection(&name).await.expect("drop");
+    checked
+        .expect("the collection exists")
+        .expect("an unstamped collection of the right width passes");
+    assert_eq!(identity, None, "no stamp is written");
+    assert_eq!(payload, None, "no payload layout is written");
+    assert_eq!(info.payload_schema.len(), 0, "no payload index is created");
+    let kept = info
+        .config
+        .expect("a config")
+        .metadata
+        .remove("other")
+        .map(serde_json::Value::from);
+    assert_eq!(
+        kept,
+        Some(serde_json::json!("kept")),
+        "the metadata is unchanged"
+    );
+}
+
+/// `connect` would drop and recreate it (MOD-144 Decision B); `check` passes it and drops nothing.
+#[tokio::test]
+async fn check_passes_an_older_payload_stamp_and_drops_nothing() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    Indexer::sync(&MemStore::demo(), &scope(), &built)
+        .await
+        .expect("sync");
+    let filled = point_count(&client, &name).await;
+    stamp_payload_schema(&client, &name, PAYLOAD_SCHEMA - 1).await;
+
+    let checked = check(&url, &name, &EmbedderIdentity::hash(DENSE_DIM), DENSE_DIM).await;
+    let kept = point_count(&client, &name).await;
+    let payload = stored_payload_schema(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+
+    checked
+        .expect("the collection exists")
+        .expect("an older payload stamp passes read-only");
+    assert!(filled > 0, "control: the sync wrote points");
+    assert_eq!(kept, filled, "nothing was dropped");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!(PAYLOAD_SCHEMA - 1)),
+        "nothing was stamped"
+    );
+}
+
+// MOD-160 D9: `probe`, the model-free look at Qdrant behind every warning.
+
+#[tokio::test]
+async fn probe_of_a_missing_collection_is_no_collection_and_creates_none() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let probed = probe_with(
+        &settings(&url),
+        &name,
+        &EmbedderIdentity::hash(DENSE_DIM),
+        DENSE_DIM,
+    )
+    .await;
+    let exists = raw(&url)
+        .collection_exists(&name)
+        .await
+        .expect("collection exists");
+    if exists {
+        raw(&url).delete_collection(&name).await.expect("drop");
+    }
+    assert_eq!(probed, Probe::NoCollection);
+    assert!(!exists, "the probe created nothing");
+}
+
+#[tokio::test]
+async fn probe_of_a_matching_collection_is_ready() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let probed = probe_with(
+        &settings(&url),
+        &name,
+        &HashEmbedder::new(DENSE_DIM).identity(),
+        DENSE_DIM,
+    )
+    .await;
+    built.drop_collection().await.expect("drop");
+    assert_eq!(probed, Probe::Ready);
+}
+
+/// A key no request header can carry, against a Qdrant that answers: qdrant-client's interceptor
+/// would echo it ("Malformed API key or token: <the key>"); the probe refuses it unechoed.
+#[tokio::test]
+async fn probe_with_a_malformed_key_is_refused_and_never_echoes_it() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url).expect("valid URL"),
+        Some("SENTINEL-KEY-\u{1}".to_owned()),
+    );
+    let probed = probe_with(
+        &settings,
+        &fresh_name(),
+        &EmbedderIdentity::hash(DENSE_DIM),
+        DENSE_DIM,
+    )
+    .await;
+    let Probe::Refused(sentence) = &probed else {
+        panic!("a malformed key is refused: {probed:?}");
+    };
+    assert!(!sentence.contains("SENTINEL"), "{sentence}");
+}
+
+/// The pinned model's identity against a `HashEmbedder` collection: a mismatch, told without
+/// loading (or downloading) the model.
+#[cfg(feature = "local-embed")]
+#[tokio::test]
+async fn probe_of_another_embedders_collection_is_mismatch() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let probed = htui_store::vector::probe(&settings(&url), &name).await;
+    built.drop_collection().await.expect("drop");
+    let Probe::Mismatch(sentence) = &probed else {
+        panic!("another embedder's collection is a mismatch: {probed:?}");
+    };
+    assert!(sentence.contains("hash/384"), "{sentence}");
+    assert!(
+        sentence.contains(&format!("collection `{name}`")),
+        "{sentence}"
     );
 }

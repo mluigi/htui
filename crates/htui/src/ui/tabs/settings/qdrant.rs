@@ -13,18 +13,24 @@
 //! line of the focused row; the last outcome is a kit notice line under the form. Every sentence
 //! that names a key reads it from the keys in force (MD-A, C5), and the acts resolve from
 //! [`Ctx::pressed`].
+//!
+//! Under the rows, MOD-160 D9's probe row: each snapshot that moved (and each `r`) asks for one
+//! [`StoreRequest::ProbeQdrant`], a model-free look at the Qdrant this process uses, served off
+//! the store loop; a warning state draws one row in the theme's warning style, a Qdrant that
+//! answers without a key an info line. Offline and `--demo` ask nothing: the URL row says why.
 
 use std::borrow::Cow;
 use std::cell::Cell;
 
 use htui_core::model::Scope;
-use htui_core::qdrant::QdrantUrl;
+use htui_core::qdrant::{QdrantUrl, QdrantUrlError};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
+use crate::concepts_worker::QdrantCheck;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::qdrant_settings_info::{
     NO_OLD_URL, OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState,
@@ -164,7 +170,7 @@ fn asks_again(reload: Option<&str>) -> String {
 
 /// `HTUI_QDRANT_URL` in force, under the URL row (MOD-158 D3, D9). `why` is the shipped
 /// [`QdrantUrlError`](htui_core::qdrant::QdrantUrlError) sentence (blueprint P-20).
-fn url_override(found: &Result<QdrantUrl, htui_core::qdrant::QdrantUrlError>) -> String {
+fn url_override(found: &Result<QdrantUrl, QdrantUrlError>) -> String {
     match found {
         Ok(url) => format!(
             "HTUI_QDRANT_URL={url} is in force in this process, which does not use this setting"
@@ -334,6 +340,14 @@ impl Notice {
     }
 }
 
+/// The snapshot fields a probe was sent for (MOD-160 D9): the URL row, the override and the key.
+/// The same three again ask for no second probe; any of them moving asks for one.
+type ProbedFor = (
+    UrlRowState,
+    Option<Result<QdrantUrl, QdrantUrlError>>,
+    QdrantState,
+);
+
 /// Qdrant section of Settings tab
 pub struct QdrantSection {
     mode: Mode,
@@ -350,6 +364,12 @@ pub struct QdrantSection {
     /// scrollbar (MOD-115 M3 D-11), the notice rows under it counted; `None` while the refusal
     /// stands in for the rows.
     scroll: Cell<Option<ScrollSpan>>,
+    /// The last probe's answer (MOD-160 D9); `None` until it answers, or when nothing was probed.
+    probe: Option<QdrantCheck>,
+    /// What the last probe was sent for; `None` before the first, after `r`, after a snapshot
+    /// that is not probed (offline, `--demo`), and once a write is answered or refused: a written
+    /// key reads the same (`Stored`) as the one it replaced.
+    probed_for: Option<ProbedFor>,
 }
 
 impl std::fmt::Debug for QdrantSection {
@@ -380,6 +400,8 @@ impl QdrantSection {
             opened_for_empty: false,
             cursor: 0,
             scroll: Cell::new(None),
+            probe: None,
+            probed_for: None,
         }
     }
 
@@ -737,6 +759,8 @@ impl QdrantSection {
                 // sets no `busy`, like the Connection section's `r`.
                 Act::Reload => {
                     self.read_out = true;
+                    // MOD-160 D9, "on its reload key": the read's snapshot probes again.
+                    self.probed_for = None;
                     ctx.request(StoreRequest::QdrantInfo);
                     return Handled::Consumed;
                 }
@@ -904,6 +928,52 @@ impl QdrantSection {
             .collect()
     }
 
+    /// MOD-160 D9: the probe's row under the form: a warning in `theme.warning`, the keyless info
+    /// line in `theme.dim`, nothing for a ready Qdrant or no answer. Nothing either while the read
+    /// is refused or the URL row cannot be read here (offline, `--demo`): the answer, if any, was
+    /// about settings no longer on screen. A check carries no key, so neither does the row.
+    fn probe_lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        if self.unavailable.is_some() || !matches!(self.url_row(), Some(row) if probes(row)) {
+            return Vec::new();
+        }
+        let Some(check) = &self.probe else {
+            return Vec::new();
+        };
+        let (text, style) = match (check.warning(), check.info()) {
+            (Some(warning), _) => (htui_core::qdrant::unavailable(&warning), theme.warning),
+            (None, Some(info)) => (info.to_owned(), theme.dim),
+            (None, None) => return Vec::new(),
+        };
+        wrapped(&text, usize::from(width).max(1))
+            .into_iter()
+            .map(|line| Line::styled(line, style))
+            .collect()
+    }
+
+    /// MOD-160 D9: after a snapshot (a read's or a compare-and-set miss's), one probe for what it
+    /// shows, unless the last probe was sent for the same URL row, override and key. The old
+    /// answer is dropped with it: it was about the settings before. A snapshot that is not probed
+    /// (offline, `--demo`) forgets both, so the first online snapshot after it probes again even
+    /// when it reads as before: the pre-outage answer may no longer hold.
+    fn probe_for(&mut self, snapshot: &QdrantSnapshot, ctx: &Ctx<'_>) {
+        if !probes(&snapshot.url) {
+            self.probed_for = None;
+            self.probe = None;
+            return;
+        }
+        let now = (
+            snapshot.url.clone(),
+            snapshot.url_override.clone(),
+            snapshot.key_state.clone(),
+        );
+        if self.probed_for.as_ref() == Some(&now) {
+            return;
+        }
+        self.probed_for = Some(now);
+        self.probe = None;
+        ctx.request(StoreRequest::ProbeQdrant);
+    }
+
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match self.mode {
             Mode::EditingUrl(_) => HINT_EDITING,
@@ -978,6 +1048,11 @@ impl QdrantSection {
             self.busy.take()
         };
         self.take(snapshot);
+        // MOD-160 D9: a write's snapshot probes again even when it reads as before, since one
+        // stored key replaced by another reads `Stored` both times.
+        if write.is_some() {
+            self.probed_for = None;
+        }
 
         let said = match write {
             Some("set_qdrant_url") => Some(URL_SET),
@@ -1033,12 +1108,20 @@ impl QdrantSection {
             self.busy = None;
             self.refuse(message.to_owned());
             self.read_out = true;
+            // It may have landed before its follow-up read failed: the re-read probes again.
+            self.probed_for = None;
             ctx.request(StoreRequest::QdrantInfo);
         } else if request == "qdrant_info" {
             self.read_out = false;
             self.unavailable = Some(message.to_owned());
         }
     }
+}
+
+/// MOD-160 D9: whether a snapshot with this URL row is probed. Offline the settings cannot resolve
+/// and `--demo` has no Qdrant: the row says why, and a probe would say nothing more.
+const fn probes(row: &UrlRowState) -> bool {
+    !matches!(row, UrlRowState::Offline | UrlRowState::NotApplicable)
 }
 
 /// What a second write is told while the first is still out, in words (no request name).
@@ -1112,8 +1195,16 @@ impl SettingsSection for QdrantSection {
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::Qdrant(snapshot) => self.on_snapshot(snapshot),
-            StoreReply::QdrantStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::Qdrant(snapshot) => {
+                self.on_snapshot(snapshot);
+                self.probe_for(snapshot, ctx);
+            }
+            // A miss installs a fresh snapshot too, perhaps another box's URL: probe for it.
+            StoreReply::QdrantStale(snapshot) => {
+                self.on_stale(snapshot);
+                self.probe_for(snapshot, ctx);
+            }
+            StoreReply::QdrantProbe(check) => self.probe.clone_from(check),
             StoreReply::Failed { request, message } => self.on_failed(request, message, ctx),
             _ => {}
         }
@@ -1132,8 +1223,10 @@ impl SettingsSection for QdrantSection {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let said = self.notice_lines(area.width, theme);
-        let [rows, notice_area] = Layout::vertical([
+        let probe = self.probe_lines(area.width, theme);
+        let [rows, probe_area, notice_area] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(u16::try_from(probe.len()).unwrap_or(u16::MAX)),
             Constraint::Length(u16::try_from(said.len()).unwrap_or(u16::MAX)),
         ])
         .areas(area);
@@ -1169,6 +1262,9 @@ impl SettingsSection for QdrantSection {
                 self.scroll
                     .set(Some(ScrollSpan::new(total, offset).rows(rows)));
             }
+        }
+        if !probe.is_empty() {
+            frame.render_widget(Paragraph::new(probe), probe_area);
         }
         if !said.is_empty() {
             frame.render_widget(Paragraph::new(said), notice_area);

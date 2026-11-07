@@ -52,6 +52,10 @@ impl ConceptSearch for McpSearch {
             Ok(hits.into_iter().map(concept_hit).collect())
         })
     }
+
+    fn offered(&self) -> bool {
+        self.0.offered()
+    }
 }
 
 /// The index's name for a tool's type.
@@ -85,8 +89,10 @@ fn concept_hit(hit: Hit) -> ConceptHit {
 }
 
 /// The production concept search for `htui_mcp::McpHost::with_search`: an [`McpSearch`] over the
-/// process-wide index. Always `Some` in this build; a box without Qdrant gets `search unavailable:
-/// <why>` from the tool, the way the TUI's search overlay shows it (R-STO-8).
+/// process-wide index. Always `Some` in this build, in the TUI and in `htui worker` alike; the tool
+/// is offered per session while a URL resolves (MOD-160 D5), and a search that cannot answer
+/// (Qdrant down, the model unavailable) gets `knowledge search unavailable: <why>` from the tool
+/// (R-STO-8, MOD-160 D6).
 #[must_use]
 pub fn production() -> Option<Arc<dyn ConceptSearch>> {
     Some(Arc::new(McpSearch::new(shared_index())))
@@ -310,6 +316,36 @@ mod tests {
             search.search(query(ProjectId::new())).await,
             Err("qdrant: query: refused".to_owned())
         );
+    }
+
+    /// An index that reads settings and resolves none: it offers nothing.
+    struct Unoffered;
+
+    impl crate::concepts_worker::ConceptIndex for Unoffered {
+        fn search(
+            &self,
+            _: htui_store::vector::SearchQuery,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(
+            &self,
+            _: htui_store::Backend,
+            _: htui_core::model::Scope,
+        ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
+        {
+            Box::pin(async { Ok(htui_store::vector_sync::SyncReport::default()) })
+        }
+        fn offered(&self) -> bool {
+            false
+        }
+    }
+
+    /// MOD-160 D5: the adapter offers the tool exactly when its index does.
+    #[test]
+    fn the_adapter_forwards_the_offer() {
+        assert!(!McpSearch::new(Arc::new(Unoffered)).offered());
+        assert!(McpSearch::new(Arc::new(MemIndex::new())).offered());
     }
 
     #[test]

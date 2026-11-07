@@ -74,7 +74,8 @@ impl<H: htui_core::store::WorkerHost> Drop for Inner<H> {
 
 /// What the `with_*` builders set.
 struct Config {
-    /// D12: `None` leaves `search_concepts` unadvertised.
+    /// D12: `None` leaves `search_concepts` unadvertised; MOD-160 D5: so does a search whose
+    /// `offered()` is false when a session opens.
     search: Option<Arc<dyn ConceptSearch>>,
     /// The absolute binary the agent starts as `<binary> mcp`.
     binary: PathBuf,
@@ -96,7 +97,7 @@ pub(crate) struct Session<S> {
     /// drops (D7). `Served::call` races every call against it, so an in-flight call ends with its
     /// session.
     pub(crate) cancel: CancellationToken,
-    /// D12: the concept index, when the host has one.
+    /// D12: the concept index, when the host has one and offered it at `open` (MOD-160 D5).
     pub(crate) search: Option<Arc<dyn ConceptSearch>>,
     /// I-5: the host's scrubber.
     pub(crate) scrubber: Arc<dyn Scrubber>,
@@ -411,17 +412,20 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
         };
         let (binary, session) = {
             let config = lock(&self.inner.config);
+            // MOD-160 D5: the offer is read once, now; `offered()` takes only its own lock and
+            // awaits nothing (`R-NF-3`). A session not offered the tool holds no index at all.
+            let search = config.search.clone().filter(|search| search.offered());
             let session = Session {
                 scope,
                 store,
                 ask,
                 cancel: CancellationToken::new(),
-                search: config.search.clone(),
+                caps: HostCaps {
+                    search: search.is_some(),
+                },
+                search,
                 scrubber: Arc::clone(&config.scrubber),
                 clock: Arc::clone(&config.clock),
-                caps: HostCaps {
-                    search: config.search.is_some(),
-                },
                 command_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             };
             (config.binary.clone(), Arc::new(session))
