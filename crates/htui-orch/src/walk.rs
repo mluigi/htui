@@ -336,13 +336,72 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
+    /// The walked phase at `position`: the first in `(position, index)` order; `None` for a
+    /// palette node or a position the snapshot does not hold.
+    fn at(&self, position: i32) -> Option<usize> {
+        self.walked
+            .iter()
+            .copied()
+            .find(|&i| self.snapshot.phases[i].position == position)
+    }
+
+    /// M3 A2: positions `a` and `b` (non-palette, known) can be live together: neither reaches
+    /// the other over forward edges. `false` for `a == b` and for an unknown position. The
+    /// relation D7 calls "can be live together".
+    #[must_use]
+    pub fn concurrent(&self, a: i32, b: i32) -> bool {
+        if a == b {
+            return false;
+        }
+        let (Some(a), Some(b)) = (self.at(a), self.at(b)) else {
+            return false;
+        };
+        !Self::closure(a, &self.successors)[b] && !Self::closure(b, &self.successors)[a]
+    }
+
+    /// M3 D6: the walked positions in forward-topological order, ties by `(position, index)`; on
+    /// a forward cycle, position order.
+    #[must_use]
+    pub fn order(&self) -> Vec<i32> {
+        self.topo
+            .as_ref()
+            .unwrap_or(&self.walked)
+            .iter()
+            .map(|&i| self.snapshot.phases[i].position)
+            .collect()
+    }
+
+    /// M3 D6: the forward successor positions of `position`, in edge order, each once. Empty for
+    /// a palette node or an unknown position.
+    #[must_use]
+    pub fn forward_successors(&self, position: i32) -> Vec<i32> {
+        let Some(node) = self.at(position) else {
+            return Vec::new();
+        };
+        let mut successors = Vec::new();
+        for &successor in &self.successors[node] {
+            let position = self.snapshot.phases[successor].position;
+            if !successors.contains(&position) {
+                successors.push(position);
+            }
+        }
+        successors
+    }
+
     /// Each walked node's [`Reach`], by phase index, in topological order; `None` on a forward
     /// cycle. A palette node stays `Waiting` and is never read.
-    fn reach(&self, states: &[Option<NodeState<'_>>]) -> Option<Vec<Reach>> {
+    ///
+    /// M3 D2: a `masked` node (in flight) is `Waiting` before its rows are read, so each of its
+    /// out-edges is `Unresolved` through [`edge_state`]'s last arm. It is not left to its in-edges:
+    /// a node computed from them could read `Skipped` and decline its out-edges. A mask shorter
+    /// than `states` masks nothing past its end.
+    fn reach(&self, states: &[Option<NodeState<'_>>], masked: &[bool]) -> Option<Vec<Reach>> {
         let order = self.topo.as_ref()?;
         let mut reach = vec![Reach::Waiting; states.len()];
         for &node in order {
-            reach[node] = if let Some(NodeState::Done(_)) = states[node] {
+            reach[node] = if masked.get(node).copied().unwrap_or(false) {
+                Reach::Waiting
+            } else if let Some(NodeState::Done(_)) = states[node] {
                 Reach::Done
             } else {
                 let mut any = false;
@@ -448,18 +507,54 @@ fn edge_state(edge: &SnapshotEdge, source: Reach, state: Option<&NodeState<'_>>)
 /// - Fallback, reachable only on a forward cycle (the validator refuses one, so only on a
 ///   hand-built snapshot): the first walked node in position order that is not done, read as
 ///   reached. That is the pre-M2 position rule, and it keeps `ready` total.
+///
+/// `ready(s, st)` is [`ready_masked`] over an empty set.
 #[must_use]
 pub fn ready(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<Cursor> {
-    let graph = Graph::of(snapshot);
-    let phases = &snapshot.phases;
-    let states: Vec<Option<NodeState<'_>>> = phases
+    ready_masked(snapshot, steps, &BTreeSet::new())
+}
+
+/// Every walked node's [`NodeState`], by phase index; `None` for a palette node.
+fn states<'s>(snapshot: &GraphSnapshot, steps: &'s [RunStep]) -> Vec<Option<NodeState<'s>>> {
+    snapshot
+        .phases
         .iter()
         .map(|phase| (!phase.palette).then(|| node_state(phase, steps)))
+        .collect()
+}
+
+/// MOD-138 M3 D2 (A1): [`ready`] with every node at a position in `in_flight` read as live and
+/// unresolved, whatever its rows say: no cursor for it, its forward out-edges `Unresolved`, and
+/// no `Decide`/`Loop` owed for it. `ready(s, st) == ready_masked(s, st, &BTreeSet::new())`.
+///
+/// A node's row turns `done` inside its future and its landing comes after, so without the mask
+/// a join whose other predecessor finished in that window would be created on a tree that lacks
+/// the first predecessor's work.
+///
+/// Under a non-empty mask the answer may be **empty**: everything open waits on an in-flight node.
+/// `[Finished]` never appears under one, since a masked node is never done. On a forward cycle
+/// the position rule stops at its first open node, and a masked node is open: a masked first
+/// node yields nothing. A position naming no walked node masks nothing.
+#[must_use]
+pub fn ready_masked(
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+    in_flight: &BTreeSet<i32>,
+) -> Vec<Cursor> {
+    let graph = Graph::of(snapshot);
+    let phases = &snapshot.phases;
+    let states = states(snapshot, steps);
+    let masked: Vec<bool> = phases
+        .iter()
+        .map(|phase| !phase.palette && in_flight.contains(&phase.position))
         .collect();
 
     let mut decide = Vec::new();
     let mut loops = Vec::new();
     for &node in &graph.walked {
+        if masked[node] {
+            continue;
+        }
         let Some(NodeState::Done(winner)) = states[node] else {
             continue;
         };
@@ -479,12 +574,15 @@ pub fn ready(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<Cursor> {
         }
     }
 
-    let reach = graph.reach(&states);
+    let reach = graph.reach(&states, &masked);
     let open = |node: usize| match &reach {
         Some(reach) => matches!(reach[node], Reach::Reached | Reach::Waiting),
-        None => !matches!(states[node], Some(NodeState::Done(_))),
+        None => masked[node] || !matches!(states[node], Some(NodeState::Done(_))),
     };
     let cursor_of = |node: usize| {
+        if masked[node] {
+            return None;
+        }
         states[node]
             .as_ref()
             .and_then(|state| state.cursor(phases[node].position))
@@ -507,6 +605,10 @@ pub fn ready(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<Cursor> {
                 .find(|&&node| open(node))
                 .and_then(|&node| cursor_of(node)),
         ),
+    }
+    if ready.is_empty() && masked.contains(&true) {
+        // M3 D2: everything open waits on an in-flight node.
+        return ready;
     }
     if ready.is_empty() {
         // Unreachable on an acyclic graph (an open node's earliest open ancestor is reached or
@@ -549,21 +651,95 @@ pub fn loop_budget_left(snapshot: &GraphSnapshot, steps: &[RunStep], edge: &Snap
 /// the pre-M2 rule. A forward input is still mandatory, and a loop's back-edge input is absent
 /// exactly when it has not run yet; its absence is recorded in the trim record's notes.
 ///
+/// MOD-138 M3 D11 (Q-4): a kind is optional too when at least one non-palette node that produces
+/// it reaches `phase` over forward edges, and every such producer is [`Reach::Skipped`] in
+/// [`ready`]'s state pass over `steps`: a join behind a declined `if` never gets that input. On
+/// a forward cycle (no reach) this second rule never applies. With no producer at all the kind
+/// stays required.
+///
 /// A `phase` the snapshot does not name (a fan-out judge, whose `input_kinds` are empty anyway)
 /// reaches nothing, so all its kinds are required.
 #[must_use]
-pub fn required_inputs(phase: &SnapshotPhase, snapshot: &GraphSnapshot) -> Vec<String> {
-    let reachable = Graph::of(snapshot).reachable_from(&phase.name);
+pub fn required_inputs(
+    phase: &SnapshotPhase,
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+) -> Vec<String> {
+    input_needs(phase, snapshot, steps)
+        .into_iter()
+        .filter_map(|(kind, need)| (need == InputNeed::Required).then_some(kind))
+        .collect()
+}
+
+/// Why `phase` needs (or may go without) one of its `input_kinds` (T1 repair 1), so a missing
+/// document's note names the rule that made it optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputNeed {
+    /// Required: a missing document refuses a strict spec.
+    Required,
+    /// Optional because a node reachable from this one produces it (M2 D9): not run yet.
+    Later,
+    /// Optional because every upstream producer is skipped behind a declined `if` (M3 D11).
+    SkippedUpstream,
+}
+
+/// Each of `phase`'s `input_kinds`, in order, with its [`InputNeed`] under
+/// [`required_inputs`]' two rules; the later-producer rule wins when both apply.
+#[must_use]
+pub fn input_needs(
+    phase: &SnapshotPhase,
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+) -> Vec<(String, InputNeed)> {
+    let graph = Graph::of(snapshot);
+    let reachable = graph.reachable_from(&phase.name);
+    let upstream: Vec<usize> = graph
+        .index(&phase.name)
+        .map(|node| {
+            let ancestors = Graph::closure(node, &graph.predecessors);
+            graph
+                .walked
+                .iter()
+                .copied()
+                .filter(|&i| i != node && ancestors[i])
+                .collect()
+        })
+        .unwrap_or_default();
+    let reach = if upstream.is_empty() {
+        None
+    } else {
+        graph.reach(&states(snapshot, steps), &[])
+    };
+    let skipped_upstream = |kind: &str| {
+        let Some(reach) = &reach else {
+            return false;
+        };
+        let mut producers = upstream
+            .iter()
+            .filter(|&&i| snapshot.phases[i].output_kind == kind)
+            .peekable();
+        producers.peek().is_some() && producers.all(|&i| reach[i] == Reach::Skipped)
+    };
     phase
         .input_kinds
         .iter()
-        .filter(|kind| !reachable.iter().any(|later| later.output_kind == **kind))
-        .cloned()
+        .map(|kind| {
+            let need = if reachable.iter().any(|later| later.output_kind == *kind) {
+                InputNeed::Later
+            } else if skipped_upstream(kind) {
+                InputNeed::SkippedUpstream
+            } else {
+                InputNeed::Required
+            };
+            (kind.clone(), need)
+        })
         .collect()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::BTreeSet;
+
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
         EdgeKind, EdgePredicate, GateOutcome, GraphSnapshot, RunStep, SnapshotEdge, SnapshotPhase,
@@ -571,11 +747,11 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{Graph, ready, required_inputs};
+    use super::{Graph, InputNeed, input_needs, ready, ready_masked, required_inputs};
     use crate::status::Cursor;
 
     /// `RUN_1`'s snapshot and its first step, the shapes every node and row here is cloned from.
-    pub(super) fn fixture() -> (GraphSnapshot, RunStep) {
+    pub(crate) fn fixture() -> (GraphSnapshot, RunStep) {
         let data = demo_data();
         let run = data
             .runs
@@ -597,7 +773,7 @@ mod tests {
     }
 
     /// A `fan_out = 1` node `name` at `position`, producing `name`, with one retry.
-    pub(super) fn node(template: &SnapshotPhase, name: &str, position: i32) -> SnapshotPhase {
+    pub(crate) fn node(template: &SnapshotPhase, name: &str, position: i32) -> SnapshotPhase {
         let mut phase = template.clone();
         phase.name = name.to_owned();
         phase.position = position;
@@ -620,7 +796,7 @@ mod tests {
     }
 
     /// A v2 snapshot of `nodes` (`(name, position)`) and `edges`.
-    fn graph(nodes: &[(&str, i32)], edges: &[(&str, &str, EdgeKind)]) -> GraphSnapshot {
+    pub(crate) fn graph(nodes: &[(&str, i32)], edges: &[(&str, &str, EdgeKind)]) -> GraphSnapshot {
         let (mut snapshot, _) = fixture();
         let template = snapshot.phases[0].clone();
         snapshot.v = GraphSnapshot::V;
@@ -636,7 +812,12 @@ mod tests {
     }
 
     /// One `fanout_index 0` row of node `name`.
-    fn row(snapshot: &GraphSnapshot, name: &str, attempt: i32, status: StepStatus) -> RunStep {
+    pub(crate) fn row(
+        snapshot: &GraphSnapshot,
+        name: &str,
+        attempt: i32,
+        status: StepStatus,
+    ) -> RunStep {
         let (_, mut row) = fixture();
         let phase = snapshot
             .phases
@@ -656,23 +837,23 @@ mod tests {
         row
     }
 
-    fn done(snapshot: &GraphSnapshot, name: &str) -> RunStep {
+    pub(crate) fn done(snapshot: &GraphSnapshot, name: &str) -> RunStep {
         row(snapshot, name, 1, StepStatus::Done)
     }
 
-    fn create(position: i32) -> Cursor {
+    pub(crate) fn create(position: i32) -> Cursor {
         Cursor::Create {
             position,
             attempt: 1,
         }
     }
 
-    const NEXT: EdgeKind = EdgeKind::Next;
-    const IF: EdgeKind = EdgeKind::If;
-    const ASKS: EdgeKind = EdgeKind::AsksYou;
+    pub(crate) const NEXT: EdgeKind = EdgeKind::Next;
+    pub(crate) const IF: EdgeKind = EdgeKind::If;
+    pub(crate) const ASKS: EdgeKind = EdgeKind::AsksYou;
 
     /// The diamond `a → {b, c} → d`, every edge `next`.
-    fn diamond() -> GraphSnapshot {
+    pub(crate) fn diamond() -> GraphSnapshot {
         graph(
             &[("a", 0), ("b", 1), ("c", 2), ("d", 3)],
             &[
@@ -1103,19 +1284,19 @@ mod tests {
         let b = snapshot.phases[1].clone();
         let a = snapshot.phases[0].clone();
         assert_eq!(
-            required_inputs(&b, &snapshot),
+            required_inputs(&b, &snapshot, &[]),
             ["a", "c"],
             "`c` sits at a later position but `b` does not reach it; `d` it does"
         );
         assert_eq!(
-            required_inputs(&a, &snapshot),
+            required_inputs(&a, &snapshot, &[]),
             ["x"],
             "every reachable node's kind is optional"
         );
         let mut stranger = a;
         stranger.name = "judge".to_owned();
         assert_eq!(
-            required_inputs(&stranger, &snapshot),
+            required_inputs(&stranger, &snapshot, &[]),
             ["b", "c", "x"],
             "a phase the snapshot does not name reaches nothing"
         );
@@ -1159,7 +1340,7 @@ mod tests {
                         .cloned()
                         .collect();
                     assert_eq!(
-                        required_inputs(phase, &snapshot),
+                        required_inputs(phase, &snapshot, &[]),
                         by_position,
                         "{} v{v} `{}`",
                         kind.name,
@@ -1180,6 +1361,261 @@ mod tests {
         assert_eq!(ready(&snapshot, std::slice::from_ref(&a)), [create(1)]);
         let b = done(&snapshot, "b");
         assert_eq!(ready(&snapshot, &[a, b]), [Cursor::Finished]);
+    }
+
+    /// `in_flight` as positions.
+    fn mask(positions: &[i32]) -> BTreeSet<i32> {
+        positions.iter().copied().collect()
+    }
+
+    /// M3 D2: a join whose predecessor is in flight waits, even once that predecessor's row reads
+    /// `done` (its landing comes after the row turns done, inside its future).
+    #[test]
+    fn a_masked_predecessor_holds_its_join() {
+        let snapshot = diamond();
+        let a = done(&snapshot, "a");
+        let b = done(&snapshot, "b");
+        let c = done(&snapshot, "c");
+        let rows = [a.clone(), b.clone(), c];
+        assert_eq!(
+            ready(&snapshot, &rows),
+            [create(3)],
+            "unmasked, `d` is reached"
+        );
+        assert!(
+            ready_masked(&snapshot, &rows, &mask(&[1])).is_empty(),
+            "`b` in flight: `d` waits, and nothing else is open"
+        );
+        assert!(ready_masked(&snapshot, &rows, &mask(&[2])).is_empty());
+        assert_eq!(
+            ready_masked(&snapshot, &[a, b], &mask(&[1])),
+            [create(2)],
+            "the other arm is still offered beside an in-flight `b`"
+        );
+    }
+
+    /// M3 D2: a masked node yields no cursor, owes no `Decide` or `Loop`, and resolves none of its
+    /// out-edges: its successors neither run nor read as skipped.
+    #[test]
+    fn a_masked_node_yields_no_cursor_and_resolves_no_out_edge() {
+        let chain = graph(&[("a", 0), ("b", 1)], &[("a", "b", NEXT)]);
+        assert!(ready_masked(&chain, &[], &mask(&[0])).is_empty());
+        let running = row(&chain, "a", 1, StepStatus::Running);
+        assert!(ready_masked(&chain, &[running], &mask(&[0])).is_empty());
+        let a = done(&chain, "a");
+        assert!(
+            ready_masked(&chain, std::slice::from_ref(&a), &mask(&[0])).is_empty(),
+            "a done but unlanded `a` does not reach `b`"
+        );
+
+        let undecided = graph(&[("a", 0), ("b", 1)], &[("a", "b", IF)]);
+        let a = done(&undecided, "a");
+        assert_eq!(
+            ready(&undecided, std::slice::from_ref(&a)),
+            [Cursor::Decide { step: a.id }]
+        );
+        assert!(
+            ready_masked(&undecided, &[a], &mask(&[0])).is_empty(),
+            "no `Decide` is owed for an in-flight node"
+        );
+
+        let snapshot = back_asks();
+        let t = done(&snapshot, "t");
+        let mut s = done(&snapshot, "s");
+        s.gate_outcome = Some(GateOutcome::Approved);
+        assert!(
+            ready_masked(&snapshot, &[t, s], &mask(&[1])).is_empty(),
+            "no `Loop` is owed for an in-flight node, and `u` waits on it"
+        );
+
+        let declined = graph(&[("a", 0), ("b", 1), ("x", 2)], &[("a", "b", IF)]);
+        let mut a = done(&declined, "a");
+        a.branch = Some(json!({ "b": false }));
+        let x = done(&declined, "x");
+        assert_eq!(
+            ready(&declined, &[a.clone(), x.clone()]),
+            [Cursor::Finished]
+        );
+        assert!(
+            ready_masked(&declined, &[a, x], &mask(&[0])).is_empty(),
+            "`b` is not skipped behind an in-flight `a`, and `Finished` never appears under a mask"
+        );
+    }
+
+    /// M3 D2: an empty mask, or one naming no walked node, is `ready`.
+    #[test]
+    fn an_empty_mask_is_ready() {
+        let snapshot = diamond();
+        let a = done(&snapshot, "a");
+        let b = done(&snapshot, "b");
+        let c = row(&snapshot, "c", 1, StepStatus::Running);
+        let sets: [Vec<RunStep>; 4] = [
+            vec![],
+            vec![a.clone()],
+            vec![a.clone(), b.clone()],
+            vec![a, b, c],
+        ];
+        for rows in &sets {
+            assert_eq!(
+                ready_masked(&snapshot, rows, &BTreeSet::new()),
+                ready(&snapshot, rows)
+            );
+            assert_eq!(
+                ready_masked(&snapshot, rows, &mask(&[99])),
+                ready(&snapshot, rows)
+            );
+        }
+        let mut palette = graph(&[("a", 0), ("p", 1)], &[]);
+        palette.phases[1].palette = true;
+        assert_eq!(
+            ready_masked(&palette, &[], &mask(&[1])),
+            ready(&palette, &[])
+        );
+    }
+
+    /// M3 D2 on a forward cycle (hand-built): the position rule stops at a masked node.
+    #[test]
+    fn a_forward_cycle_stops_at_a_masked_node() {
+        let snapshot = graph(&[("a", 0), ("b", 1)], &[("a", "b", NEXT), ("b", "a", NEXT)]);
+        let a = done(&snapshot, "a");
+        assert_eq!(ready(&snapshot, std::slice::from_ref(&a)), [create(1)]);
+        assert!(ready_masked(&snapshot, &[a], &mask(&[0])).is_empty());
+    }
+
+    /// M3 A2: two nodes can be live together when neither reaches the other forward.
+    #[test]
+    fn concurrent_is_mutual_unreachability() {
+        let snapshot = diamond();
+        let graph = Graph::of(&snapshot);
+        assert!(graph.concurrent(1, 2), "the two arms");
+        assert!(graph.concurrent(2, 1));
+        assert!(!graph.concurrent(0, 3), "a reaches d");
+        assert!(
+            !graph.concurrent(3, 1),
+            "b reaches d, a back edge does not count"
+        );
+        assert!(!graph.concurrent(1, 1), "a node with itself");
+        assert!(!graph.concurrent(1, 99), "an unknown position");
+        let mut palette = super::tests::graph(&[("a", 0), ("p", 1)], &[]);
+        palette.phases[1].palette = true;
+        assert!(
+            !Graph::of(&palette).concurrent(0, 1),
+            "a palette node is never walked"
+        );
+    }
+
+    /// M3 D6: forward-topological order by position, ties by position; forward successors only.
+    #[test]
+    fn order_and_forward_successors_read_the_forward_edges() {
+        let snapshot = diamond();
+        let graph = Graph::of(&snapshot);
+        assert_eq!(graph.order(), [0, 1, 2, 3]);
+        assert_eq!(graph.forward_successors(0), [1, 2]);
+        assert_eq!(
+            graph.forward_successors(3),
+            [] as [i32; 0],
+            "a back edge is not forward"
+        );
+        assert_eq!(graph.forward_successors(99), [] as [i32; 0]);
+        let reversed = super::tests::graph(
+            &[("c", 0), ("b", 1), ("a", 2)],
+            &[("a", "b", NEXT), ("b", "c", NEXT)],
+        );
+        assert_eq!(Graph::of(&reversed).order(), [2, 1, 0]);
+        let cycle =
+            super::tests::graph(&[("a", 0), ("b", 1)], &[("a", "b", NEXT), ("b", "a", NEXT)]);
+        assert_eq!(
+            Graph::of(&cycle).order(),
+            [0, 1],
+            "a forward cycle: position order"
+        );
+    }
+
+    /// M3 D11 (Q-4): a required kind is optional when every upstream producer is skipped behind
+    /// a declined `if`; a second producer that ran keeps it required; no producer keeps it
+    /// required.
+    #[test]
+    fn required_inputs_behind_a_declined_if() {
+        let mut snapshot = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+            ],
+        );
+        snapshot.phases[3].input_kinds = vec!["b".into(), "c".into(), "x".into()];
+        let d = snapshot.phases[3].clone();
+        assert_eq!(required_inputs(&d, &snapshot, &[]), ["b", "c", "x"]);
+        let mut a = done(&snapshot, "a");
+        a.branch = Some(json!({ "b": false }));
+        let c = done(&snapshot, "c");
+        assert_eq!(
+            required_inputs(&d, &snapshot, &[a.clone(), c.clone()]),
+            ["c", "x"],
+            "`b` is skipped, so its kind is optional; `x` has no producer at all"
+        );
+        a.branch = Some(json!({ "b": true }));
+        assert_eq!(
+            required_inputs(&d, &snapshot, &[a.clone(), c.clone()]),
+            ["b", "c", "x"],
+            "a taken `if` keeps `b` required"
+        );
+
+        // A second producer of `b`, upstream of `d`, that ran.
+        let mut snapshot = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3), ("e", 4)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("a", "e", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+                ("e", "d", NEXT),
+            ],
+        );
+        snapshot.phases[4].output_kind = "b".into();
+        snapshot.phases[3].input_kinds = vec!["b".into()];
+        let d = snapshot.phases[3].clone();
+        let mut a = done(&snapshot, "a");
+        a.branch = Some(json!({ "b": false }));
+        let e = done(&snapshot, "e");
+        assert_eq!(
+            required_inputs(&d, &snapshot, &[a, e]),
+            ["b"],
+            "`e` produces `b` and was not skipped"
+        );
+    }
+
+    /// D11 (T1 repair 1): `input_needs` says why each listed kind is optional, so `phase_spec`'s
+    /// note names the right rule: a later producer (M2 D9) or skipped upstream producers.
+    #[test]
+    fn input_needs_tells_a_later_producer_from_a_skipped_one() {
+        let mut snapshot = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3), ("e", 4)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+                ("d", "e", NEXT),
+            ],
+        );
+        snapshot.phases[3].input_kinds = vec!["b".into(), "c".into(), "e".into(), "x".into()];
+        let d = snapshot.phases[3].clone();
+        let mut a = done(&snapshot, "a");
+        a.branch = Some(json!({ "b": false }));
+        let c = done(&snapshot, "c");
+        assert_eq!(
+            input_needs(&d, &snapshot, &[a, c]),
+            [
+                ("b".to_owned(), InputNeed::SkippedUpstream),
+                ("c".to_owned(), InputNeed::Required),
+                ("e".to_owned(), InputNeed::Later),
+                ("x".to_owned(), InputNeed::Required),
+            ]
+        );
     }
 
     /// D2: palette nodes are not walked, so they never hold the run open.

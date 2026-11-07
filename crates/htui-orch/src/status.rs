@@ -340,6 +340,10 @@ pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunS
 
 /// Where the walk is: the first of [`crate::walk::ready`] (MOD-138 M2 D2).
 ///
+/// MOD-138 M3: on a branching graph `ready` can hold several cursors and the concurrent walk
+/// takes them all (through [`crate::walk::ready_masked`]); this first one stays the display and
+/// recovery reading, and [`run_resumable`] reads every cursor where a resume is decided.
+///
 /// `ready` orders the owed writes ([`Cursor::Decide`], [`Cursor::Loop`]) first, then every reached
 /// node's cursor in position order, so on a lifted linear graph this is exactly the pre-M2 scan
 /// (blueprint §2.1): the first position whose latest step is not `done` decides.
@@ -476,6 +480,38 @@ pub fn resumable(cursor: &Cursor, steps: &[RunStep]) -> bool {
     resumable_park(cursor) || crashed_rejection(cursor, steps).is_some()
 }
 
+/// MOD-138 M3 (A1): the position a cursor stands on, the key the concurrent walk holds a node
+/// by. `Create`/`Fan`/`Select` carry it; `Run`/`Rest`/`Decide`/`Loop` read their step's row.
+/// `None` for `Finished` and for a step `steps` does not hold.
+#[must_use]
+pub fn position_of(cursor: &Cursor, steps: &[RunStep]) -> Option<i32> {
+    let step = match cursor {
+        Cursor::Create { position, .. }
+        | Cursor::Fan { position, .. }
+        | Cursor::Select { position, .. } => return Some(*position),
+        Cursor::Run(step)
+        | Cursor::Rest { step, .. }
+        | Cursor::Decide { step }
+        | Cursor::Loop { step, .. } => step,
+        Cursor::Finished => return None,
+    };
+    steps
+        .iter()
+        .find(|row| row.id == *step)
+        .map(|row| row.position)
+}
+
+/// MOD-138 M3 A6: whether a parked run is one a resume may walk on from: [`crate::walk::ready`]
+/// is non-empty and **every** cursor of it is [`resumable`] (a [`resumable_park`] or a
+/// [`crashed_rejection`]). A sibling's owed `Decide` sorts first, so the first cursor alone could
+/// read resumable over a step still waiting on a human. On a linear graph `ready` holds one node
+/// cursor, so this is `resumable(&cursor(..), steps)`.
+#[must_use]
+pub fn run_resumable(snapshot: &GraphSnapshot, steps: &[RunStep]) -> bool {
+    let ready = crate::walk::ready(snapshot, steps);
+    !ready.is_empty() && ready.iter().all(|cursor| resumable(cursor, steps))
+}
+
 /// Plan D59 for one fanned-out position; `None` when the slot is complete and the walk goes on.
 ///
 /// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
@@ -539,8 +575,9 @@ mod tests {
 
     use crate::status::{
         Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
-        next_attempt, resumable, resumable_park, winner_at,
+        next_attempt, position_of, resumable, resumable_park, run_resumable, winner_at,
     };
+    use crate::walk::tests::{diamond, done, row};
 
     /// The four `RUN_1` steps, the one `RUN_2` step, or whatever the fixture holds for a run.
     fn steps_of(run: htui_core::model::RunId) -> Vec<RunStep> {
@@ -560,6 +597,117 @@ mod tests {
             .expect("the fixture holds RUN_1");
         serde_json::from_value(run.graph_snapshot.expect("RUN_1 carries a snapshot"))
             .expect("the fixture snapshot is a `GraphSnapshot`")
+    }
+
+    /// MOD-138 M3 (A1): a cursor's position, carried by it or read from its step's row.
+    #[test]
+    fn position_of_reads_the_cursor_or_its_row() {
+        let snapshot = diamond();
+        let b = row(&snapshot, "b", 1, StepStatus::Pending);
+        let c = done(&snapshot, "c");
+        let steps = [b.clone(), c.clone()];
+        let at = |cursor: Cursor| position_of(&cursor, &steps);
+        assert_eq!(
+            at(Cursor::Create {
+                position: 3,
+                attempt: 1
+            }),
+            Some(3)
+        );
+        assert_eq!(
+            at(Cursor::Fan {
+                position: 2,
+                attempt: 1
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            at(Cursor::Select {
+                position: 1,
+                attempt: 2
+            }),
+            Some(1)
+        );
+        assert_eq!(at(Cursor::Run(b.id)), Some(1));
+        assert_eq!(
+            at(Cursor::Rest {
+                step: b.id,
+                status: StepStatus::Pending
+            }),
+            Some(1)
+        );
+        assert_eq!(at(Cursor::Decide { step: c.id }), Some(2));
+        assert_eq!(
+            at(Cursor::Loop {
+                step: c.id,
+                to: "a".to_owned()
+            }),
+            Some(2)
+        );
+        assert_eq!(at(Cursor::Finished), None);
+        assert_eq!(at(Cursor::Run(StepId::new())), None, "a step the rows lack");
+    }
+
+    /// MOD-138 M3 A6: on a linear graph `run_resumable` is the first cursor's `resumable`.
+    #[test]
+    fn run_resumable_on_a_linear_graph_is_the_first_cursors() {
+        let snapshot = snapshot();
+        let steps = steps_of(ids::RUN_1);
+        for len in 0..=steps.len() {
+            for status in [
+                StepStatus::Pending,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                StepStatus::Failed,
+                StepStatus::Done,
+                StepStatus::Superseded,
+            ] {
+                for outcome in [None, Some(GateOutcome::Rejected)] {
+                    let mut rows = steps[..len].to_vec();
+                    if let Some(last) = rows.last_mut() {
+                        last.status = status;
+                        last.gate_outcome = outcome;
+                    }
+                    assert_eq!(
+                        run_resumable(&snapshot, &rows),
+                        resumable(&cursor(&snapshot, &rows), &rows),
+                        "{len} rows, the last {status} {outcome:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// MOD-138 M3 A6: a run is resumable only when every cursor of `ready` is.
+    #[test]
+    fn run_resumable_needs_every_cursor_resumable() {
+        let snapshot = diamond();
+        let a = done(&snapshot, "a");
+        let parked = row(&snapshot, "b", 1, StepStatus::AwaitingApproval);
+        assert!(
+            !run_resumable(&snapshot, &[a.clone(), parked.clone()]),
+            "`b` waits on a human beside `c`'s `Create`"
+        );
+        assert!(
+            resumable(
+                &Cursor::Create {
+                    position: 2,
+                    attempt: 1
+                },
+                &[]
+            ),
+            "the other cursor alone would read resumable"
+        );
+        let b = done(&snapshot, "b");
+        assert!(run_resumable(&snapshot, &[a.clone(), b]));
+        let mut rejected = row(&snapshot, "b", 1, StepStatus::Failed);
+        rejected.gate_outcome = Some(GateOutcome::Rejected);
+        assert!(
+            run_resumable(&snapshot, &[a.clone(), rejected.clone()]),
+            "a crashed rejection beside a `Create`"
+        );
+        let running = row(&snapshot, "c", 1, StepStatus::Running);
+        assert!(!run_resumable(&snapshot, &[a, rejected, running]));
     }
 
     /// MOD-138 M2 D7: a `fails` or `asks_you` loop's escalation names the kind, both ends and the
