@@ -136,13 +136,16 @@ Decisions taken at the PRD gate (maintainer, 2026-10-27):
 |---|---|---|---|---|
 | 1 | Snapshot v2, the validator and the lift | New runs freeze a v2 snapshot (nodes, edges, bounds; divide expansion frozen, divide and subgraph refused) and are pinned to it; v1 runs read through the lift and behave as today; one validator refuses bad graphs at save and at resolve; items and kinds may use workspace and library graphs. The walk itself still runs one node at a time in order | complete (2026-11-03, `d114f91f`; record `docs/decisions/mod/mod-138-decisions.md`) | `.claude/plans/mod-138-m1-snapshot-v2.plan.md` |
 | 2 | The readiness walker | `ready()` replaces `cursor`: joins, derived skips, `if` predicates, `asks_you` parks answered through the gate, per-edge loops with region retirement, limits and no-progress, graph-aware `required_inputs`; the `is_review` name rule is gone. Driven one ready node at a time | complete (2026-11-05, `ac4e2cd5`; record `docs/decisions/mod/mod-138-decisions.md`) | `.claude/plans/mod-138-m2-readiness-walker.plan.md` |
-| 3 | Concurrent nodes | Every ready node runs at once up to `max_parallel_sessions`, each per-node future boxed; landings into one repo serialised by a reconcile lock; `local` isolation on two nodes that can be live together refused at resolve; crash recovery finds the frontier among concurrent landings (owed from M2: graph-aware frontier, `last_output_kind`, mixed `asks_you` edges) | pending | — |
+| 3 | Concurrent nodes | Every ready node runs at once up to `max_parallel_sessions`, each per-node future boxed; landings into one repo serialised by a reconcile lock; `local` isolation on two nodes that can be live together refused at resolve; crash recovery finds the frontier among concurrent landings (owed from M2: graph-aware frontier, `last_output_kind`, mixed `asks_you` edges) | in-progress | `.claude/plans/mod-138-m3-concurrent-nodes.plan.md` |
 
 ## Open Questions
 
-- [ ] Recovery frontier: is an explicit `run_step.reconciled_at` (migration `0024`, and a cache mirror
+- [x] Recovery frontier: is an explicit `run_step.reconciled_at` (migration `0024`, and a cache mirror
   if the column must be read offline) needed, or can the frontier be derived from existing rows once
-  nodes land concurrently? ANA-33 §7.7 leaves this to the plan. TBD — settle in M3's `/plan`.
+  nodes land concurrently? ANA-33 §7.7 leaves this to the plan. **Settled in M3 (Q-1, maintainer
+  2026-11-07):** derived, no column: a done winner is on the frontier when no forward successor has a
+  non-retired row (the walk creates a successor only after its predecessor landed); re-landing is
+  idempotent (H-3).
 - [x] Where the new bounds live: `max_parallel_sessions` (default 4) and the other v2 bounds as
   `app_setting` rows like `max_agents_per_run` (a seed or migration), or code defaults until a
   Settings surface exists. **Settled in M1 (D13):** read from `app_setting` like `max_fan_out`, code
