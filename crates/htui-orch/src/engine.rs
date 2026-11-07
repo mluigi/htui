@@ -3206,7 +3206,8 @@ where
     ///    ([`Self::cancel_unsettled`]) and that end is the answer. Otherwise the first park is.
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
     ///    completes the park. A rejection handed back beside it (`Tails::HandBack`) is finished
-    ///    first, as the in-process answer's tail finishes it: an end cancels the waiting rows.
+    ///    first, as the in-process answer's tail finishes it: an end cancels the waiting rows,
+    ///    and a loop that resumed is walked ([`Next::Walk`]) before anything re-parks.
     /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
     ///    (D131, [`Self::settle_failed`]).
     ///
@@ -3256,14 +3257,16 @@ where
             return Ok(next);
         }
 
-        let mut row = self.run(run.id).await?;
-        let mut steps = self.parts.store.run_steps(run.id).await?;
+        let row = self.run(run.id).await?;
+        let steps = self.parts.store.run_steps(run.id).await?;
         // MOD-138 M3 T4 (T3 repair 2's hand-back twin): a rejection a `worker` box's answer
         // handed back while a sibling's step still waits. The in-process tail finishes it
         // (`after_rejection`) before anything re-parks, so this does too, before D96: a
         // rejection that ends the run cancels the waiting rows with the cut's note, and a loop
-        // walks on to D96's re-park over the other step. A linear run never has a waiting row
-        // beside its rejected one, and D131 below finishes that as ever.
+        // that resumed is the walk's (T4 repair 2), as the tail's `run_to_rest`: the walk runs
+        // the loop target and re-parks over the other step (A6), where D96 would re-park over an
+        // unwalked loop. A linear run never has a waiting row beside its rejected one, and D131
+        // below finishes that as ever.
         if row.status == RunStatus::Running
             && steps
                 .iter()
@@ -3280,10 +3283,7 @@ where
                     return Ok(Next::Finished(rest));
                 }
                 Some(rest) => return Ok(Self::landed(rest)),
-                None => {
-                    row = self.run(run.id).await?;
-                    steps = self.parts.store.run_steps(run.id).await?;
-                }
+                None => return Ok(Next::Walk),
             }
         }
         if row.status == RunStatus::Running

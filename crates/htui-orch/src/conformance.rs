@@ -866,6 +866,8 @@ pub const CASES: &[&str] = &[
     "a_rejection_handed_back_cancels_the_other_parked_step",
     "a_looping_rejection_lands_a_crashed_answers_winner_first",
     "a_resumed_looping_rejection_lands_a_crashed_answers_winner_first",
+    // MOD-138 M3 T4 repair 2: the looping twin of the hand-back above.
+    "a_looping_rejection_handed_back_walks_its_loop_as_in_process",
 ];
 
 /// Run one case by name.
@@ -11855,6 +11857,9 @@ fn concurrent_recovery_case<'a, H: CaseHarness>(
         "a_resumed_looping_rejection_lands_a_crashed_answers_winner_first" => {
             Box::pin(a_resumed_looping_rejection_lands_a_crashed_answers_winner_first(harness))
         }
+        "a_looping_rejection_handed_back_walks_its_loop_as_in_process" => {
+            Box::pin(a_looping_rejection_handed_back_walks_its_loop_as_in_process(harness))
+        }
         _ => return None,
     })
 }
@@ -12466,6 +12471,105 @@ async fn a_rejection_handed_back_cancels_the_other_parked_step<H: CaseHarness>(h
     assert_eq!(b.isolator().cleanups(), 1);
 }
 
+/// The diamond with `plan` and `implement` both gated `Always` and a `fails` edge looping `plan`
+/// back over `prd` once. `start` parks on both branches; answers the run.
+async fn parked_on_a_looping_diamond<O: Orchestrate>(orch: &O) -> RunId {
+    feat_3_graph(
+        orch,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("prd", "implement", EdgeKind::Next, None, None),
+            ("plan", "review", EdgeKind::Next, None, None),
+            ("implement", "review", EdgeKind::Next, None, None),
+            ("plan", "prd", EdgeKind::Fails, None, Some(1)),
+        ],
+        |phase| {
+            if phase.name == "plan" || phase.name == "implement" {
+                phase.gate = Gate::Always;
+            }
+        },
+    )
+    .await;
+    let (run, rest) = start(orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "{rest:?}");
+    assert_eq!(
+        sorted_shape(orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+            (2, 1, StepStatus::AwaitingApproval),
+        ],
+        "both branches parked"
+    );
+    run
+}
+
+/// MOD-138 M3 T4 repair 2, the looping twin of
+/// [`a_rejection_handed_back_cancels_the_other_parked_step`]: `plan`'s rejection loops it over
+/// `prd` while `implement` still waits. In process the answer's tail walks the loop target before
+/// it re-parks (A6); handed back on a `worker` box, the adopter walks it too rather than
+/// re-parking over the unwalked loop (D96). Both rest where they rest and write the same rows,
+/// then and after `implement`'s approval.
+async fn a_looping_rejection_handed_back_walks_its_loop_as_in_process<H: CaseHarness>(harness: &H) {
+    let rejected = || GateAnswer::Rejected {
+        note: "wrong plan".to_owned(),
+    };
+    let control = harness.fresh();
+    let c_run = parked_on_a_looping_diamond(&control).await;
+    let c_landed = control.isolator().reconciles().len();
+    let expected = answer_at(&control, c_run, 1, rejected()).await;
+    assert_eq!(
+        (expected.run, expected.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the loop target walked, and the run re-parked on `implement`: {expected:?}"
+    );
+    assert_eq!(
+        sorted_shape(&control, c_run).await,
+        [
+            (0, 1, StepStatus::Superseded),
+            (0, 2, StepStatus::Done),
+            (1, 1, StepStatus::Cancelled),
+            (2, 1, StepStatus::AwaitingApproval),
+        ],
+        "the loop re-ran `prd` before the re-park"
+    );
+
+    let a = harness.fresh();
+    let run = parked_on_a_looping_diamond(&a).await;
+    a.set_tails(Tails::HandBack);
+    let rest = answer_at(&a, run, 1, rejected()).await;
+    assert_handed_back(&a, run, &rest).await;
+
+    let b = a.restarted();
+    let Resume::Walked(rest) = adopted(&b, run).await else {
+        panic!("the live graph did not move, so the adopter walks its snapshot");
+    };
+    assert_eq!(
+        rest, expected,
+        "the adopter rests where the in-process tail does"
+    );
+    assert_eq!(
+        sorted_shape(&b, run).await,
+        sorted_shape(&control, c_run).await,
+        "and writes the same rows: the loop target ran"
+    );
+    assert_eq!(
+        b.isolator().reconciles().len(),
+        control.isolator().reconciles().len() - c_landed,
+        "the loop target landed once on each side"
+    );
+    assert_eq!(run_of(&b, run).await.status, RunStatus::AwaitingApproval);
+
+    let expected = answer_at(&control, c_run, 2, GateAnswer::Approved).await;
+    let rest = answer_at(&b, run, 2, GateAnswer::Approved).await;
+    assert_eq!(rest, expected, "{rest:?}");
+    assert_eq!(
+        sorted_shape(&b, run).await,
+        sorted_shape(&control, c_run).await,
+        "the approval converges on the same rows"
+    );
+}
+
 /// The diamond with every branch in its own worktree, `plan` gated `Always` and `implement`
 /// `OnFailure`, its first attempt settling `failed` (no output) and a `fails` edge looping it
 /// back over `prd` once. `start` parks on both branches; `plan`'s answer is then written and
@@ -12630,8 +12734,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            173,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            174,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -12704,7 +12808,8 @@ mod tests {
              landing the other, crashed answer's winner first), and T4's hand-back twin of T3 \
              repair 2 (a rejection handed back cancelling the other parked step), and T4 repair \
              1's two (a looping rejection landing a crashed answer's winner first, in process \
-             and resumed)"
+             and resumed), and T4 repair 2's one (a looping rejection handed back walking its \
+             loop as in process)"
         );
     }
 
