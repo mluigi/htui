@@ -67,8 +67,9 @@ use crate::store::traits::{
     withdrawn_requirement_cited,
 };
 use crate::store::traits::{
-    branch_is_not_an_object_of_booleans, forward_edges_form_a_cycle, graph_not_usable,
-    if_predicate_outside_the_closed_set, loop_edge_runs_forward, workspace_graph_is_held,
+    back_asks_you_beside_another_asks_you, branch_is_not_an_object_of_booleans,
+    forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
+    loop_edge_runs_forward, workspace_graph_is_held,
 };
 use crate::store::traits::{
     divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
@@ -322,6 +323,8 @@ pub const CASES: &[&str] = &[
     "record_branch_first_write_wins",
     "record_branch_refuses_a_step_not_done",
     "record_branch_refuses_a_stale_fence",
+    // MOD-138 M3: W5, a back `asks_you` beside another `asks_you` (plan D8, Q-3)
+    "replace_graph_refuses_a_back_asks_you_beside_another_asks_you",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1028,6 +1031,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "record_branch_refuses_a_stale_fence" => {
             Box::pin(record_branch_refuses_a_stale_fence(store)).await
+        }
+        "replace_graph_refuses_a_back_asks_you_beside_another_asks_you" => {
+            Box::pin(replace_graph_refuses_a_back_asks_you_beside_another_asks_you(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -23610,6 +23616,65 @@ async fn replace_graph_refuses_an_if_predicate_outside_the_closed_set<S: WriteSt
     assert!(
         answer.edges.contains(&written.edges[last]),
         "{CASE}: a closed-set predicate is stored as given"
+    );
+}
+
+/// MOD-138 M3 D8 (W5, Q-3): a node with a back `asks_you` edge beside a forward one, and one with
+/// two back ones, is refused at save naming the node; nothing is written. Left with its single
+/// back edge, the body is applied and stored as given.
+async fn replace_graph_refuses_a_back_asks_you_beside_another_asks_you<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_a_back_asks_you_beside_another_asks_you";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "asking", &["plan", "build", "review", "docs"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let (plan, build, review, docs) = (phases[0].id, phases[1].id, phases[2].id, phases[3].id);
+    let chain = vec![
+        graph_edge(graph, plan, build, EdgeKind::Next),
+        graph_edge(graph, build, review, EdgeKind::Next),
+    ];
+    let back = graph_edge(graph, review, plan, EdgeKind::AsksYou);
+    for (other, shape) in [
+        (
+            graph_edge(graph, review, docs, EdgeKind::AsksYou),
+            "forward plus back",
+        ),
+        (
+            graph_edge(graph, review, build, EdgeKind::AsksYou),
+            "back plus back",
+        ),
+    ] {
+        let mut written = before.clone();
+        written.edges.clone_from(&chain);
+        written.edges.push(back.clone());
+        written.edges.push(other);
+        constraint_exactly(
+            CASE,
+            store
+                .replace_graph(graph, before.graph.revision, written)
+                .await,
+            &back_asks_you_beside_another_asks_you("review", graph),
+            shape,
+        );
+        assert_eq!(
+            body_now(CASE, store, graph).await,
+            before,
+            "{CASE}: {shape}: nothing written, the revision unchanged"
+        );
+    }
+
+    let mut written = before.clone();
+    written.edges.clone_from(&chain);
+    written.edges.push(back.clone());
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        answer.edges.contains(&back),
+        "{CASE}: a single back `asks_you` edge is stored as given"
     );
 }
 

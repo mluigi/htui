@@ -29,8 +29,8 @@ use htui_core::model::{
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
-    check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
-    graph_body_topology_refusal, graph_body_walk_refusal, references_no_row, walk_refusal,
+    check_attachment, edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
+    graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
 
@@ -277,9 +277,9 @@ pub enum ResolveError {
     /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, the fanned-out node with an
-        /// `asks_you` or `fails` edge (blueprint A7), or the node with a back `asks_you` edge
-        /// beside another `asks_you` edge (R1, E1).
+        /// The node refused: the divide phase, the palette phase, or the fanned-out node with an
+        /// `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
+        /// the shared validator (W5), so it is an [`ResolveError::InvalidGraph`].
         node: String,
         /// Why.
         reason: NotRunnable,
@@ -304,15 +304,6 @@ pub enum NotRunnable {
     /// lifted D6(c): authored edges otherwise resolve.)
     #[error("a fanned-out node's `asks_you` or `fails` edge runs from MOD-138 M3")]
     FanOutEdge,
-    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
-    /// edges, at least one of them back (forward plus back, or back plus back). `ready()` takes
-    /// only the first back edge with budget and the loop retires the source, so a forward target
-    /// would never start while the loop has budget and approve could not take every edge (plan
-    /// Q-B). M3 (or MOD-141) lifts it.
-    #[error(
-        "a node with a back `asks_you` edge beside another `asks_you` edge runs from MOD-138 M3"
-    )]
-    MixedAsksYou,
 }
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the **typed** phase slice (plan D9).
@@ -547,13 +538,6 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         }
         Err(err) => return Err(err),
     }
-    // R1 (E1): a back `asks_you` edge beside another `asks_you` edge cannot run yet.
-    if let Err(refusal) = mixed_asks_you_refusal(&phases, &edges) {
-        return Ok(Resolution::Refused {
-            phases: unexpanded,
-            refusal,
-        });
-    }
     if let Err(refusal) = not_yet_runnable(&phases) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
@@ -712,60 +696,6 @@ fn fan_out_edge_refusal(
             return Err(ResolveError::NotYetRunnable {
                 node: phase.name.clone(),
                 reason: NotRunnable::FanOutEdge,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// R1 (E1, maintainer decision 2026-11-05), run after [`fan_out_edge_refusal`]: the first walked
-/// node in position order with two or more outgoing `asks_you` edges, at least one of them back,
-/// is [`NotRunnable::MixedAsksYou`]. Forward and back are [`forward_mask`]'s classification, the
-/// walker's own; an edge with a palette end or an unknown key is left out, as the walk leaves it
-/// out. `ready()` takes only the first back edge with budget and the loop retires the source, so
-/// on that shape approve could not take every edge (plan Q-B) until M3 (or MOD-141) runs it.
-fn mixed_asks_you_refusal(
-    phases: &[SnapshotPhase],
-    edges: &[SnapshotEdge],
-) -> std::result::Result<(), ResolveError> {
-    let nodes: Vec<WalkNode<'_>> = phases
-        .iter()
-        .map(|phase| WalkNode {
-            name: &phase.name,
-            palette: phase.palette,
-        })
-        .collect();
-    let index = |key: &str| {
-        phases
-            .iter()
-            .position(|phase| phase.name == key && !phase.palette)
-    };
-    let walk: Vec<WalkEdge> = edges
-        .iter()
-        .filter_map(|edge| {
-            Some(WalkEdge {
-                from: index(&edge.from)?,
-                to: index(&edge.to)?,
-                kind: edge.kind,
-            })
-        })
-        .collect();
-    let mask = forward_mask(&nodes, &walk);
-    let mut walked: Vec<usize> = (0..phases.len())
-        .filter(|&node| !phases[node].palette)
-        .collect();
-    walked.sort_by_key(|&node| (phases[node].position, node));
-    for node in walked {
-        let asks: Vec<bool> = walk
-            .iter()
-            .zip(&mask)
-            .filter(|(edge, _)| edge.from == node && edge.kind == EdgeKind::AsksYou)
-            .map(|(_, &forward)| forward)
-            .collect();
-        if asks.len() >= 2 && asks.contains(&false) {
-            return Err(ResolveError::NotYetRunnable {
-                node: phases[node].name.clone(),
-                reason: NotRunnable::MixedAsksYou,
             });
         }
     }
@@ -1766,6 +1696,7 @@ mod tests {
         EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
         SnapshotSource, SourceHow, default_snapshot_edges,
     };
+    use htui_core::store::traits::back_asks_you_beside_another_asks_you;
     use htui_core::store::{
         MemStore, ReadStore, StoreError, UpdateOutcome, forward_edges_form_a_cycle,
         glob_names_unknown_repo, graph_body_walk_refusal, negative_position, references_no_row,
@@ -1779,7 +1710,7 @@ mod tests {
         ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunMode,
         SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
         effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
-        resolve, topology_v2,
+        resolve, snapshot_walk_refusal, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -5200,57 +5131,137 @@ question and not a test fix. Decide the version bump first, then paste the new d
         edges: &[(&str, &str)],
     ) -> std::result::Result<Resolved, ResolveError> {
         let store = MemStore::demo();
-        replace_feature(&store, |body| {
-            let id = |name: &str| {
-                body.nodes
-                    .iter()
-                    .find(|node| node.phase.name == name)
-                    .map(|node| node.phase.id)
-                    .expect("the feature graph has the phase")
-            };
-            let ends: Vec<(PhaseId, PhaseId)> =
-                edges.iter().map(|(from, to)| (id(from), id(to))).collect();
-            for (from, to) in ends {
-                body.edges.push(StepGraphEdge {
-                    id: EdgeId::new(),
-                    graph_id: ids::GRAPH_HTUI_FEAT,
-                    from,
-                    to,
-                    kind: EdgeKind::AsksYou,
-                    predicate: None,
-                    loop_limit: None,
-                });
-            }
-        })
-        .await;
+        replace_feature(&store, |body| with_asks_you(body, edges)).await;
         resolve_feat(&store, &TestSource::claude(&store)).await
     }
 
-    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
-    /// edges, one of them back, cannot run yet. `ready()` takes only the first open back edge and
-    /// the loop retires the source, so approve could never take every edge (plan Q-B). Forward
-    /// plus back, and back plus back, are both refused, naming the node.
+    /// `asks_you` edges `(from, to)` (no `loop_limit`) on the seeded feature graph's edges.
+    fn with_asks_you(body: &mut GraphBody, edges: &[(&str, &str)]) {
+        let id = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .expect("the feature graph has the phase")
+        };
+        let ends: Vec<(PhaseId, PhaseId)> =
+            edges.iter().map(|(from, to)| (id(from), id(to))).collect();
+        for (from, to) in ends {
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from,
+                to,
+                kind: EdgeKind::AsksYou,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+    }
+
+    /// The two mixed shapes of MOD-138 M3 D8 (W5) on the feature graph, with the node each names:
+    /// forward plus back, and back plus back.
+    const MIXED_ASKS_YOU: [(&str, [(&str, &str); 2]); 2] = [
+        ("plan", [("plan", "review"), ("plan", "prd")]),
+        ("review", [("review", "plan"), ("review", "prd")]),
+    ];
+
+    /// MOD-138 M3 D8 (W5, Q-3; was R1's resolve-only `MixedAsksYou`): a node with two or more
+    /// outgoing `asks_you` edges, one of them back, is refused at save for good, naming the node.
+    /// One answer cannot take every edge: the back edge loops and retires the node. Nothing is
+    /// written.
     #[tokio::test]
     async fn a_node_with_a_back_asks_you_beside_another_asks_you_is_refused() {
-        for (node, edges) in [
-            ("plan", [("plan", "review"), ("plan", "prd")]),
-            ("review", [("review", "plan"), ("review", "prd")]),
-        ] {
-            let error = resolve_with_asks_you(&edges)
+        for (node, edges) in MIXED_ASKS_YOU {
+            let store = MemStore::demo();
+            let before = store
+                .graph_body(ids::GRAPH_HTUI_FEAT)
                 .await
-                .expect_err("a mixed `asks_you` node cannot run yet");
+                .expect("MemStore never fails a read")
+                .expect("the seeded feature graph is there");
+            let mut body = before.clone();
+            with_asks_you(&mut body, &edges);
+            let outcome = store
+                .replace_graph(ids::GRAPH_HTUI_FEAT, before.graph.revision, body)
+                .await;
+            let sentence = back_asks_you_beside_another_asks_you(node, ids::GRAPH_HTUI_FEAT);
+            assert!(
+                matches!(&outcome, Err(StoreError::Constraint(said)) if *said == sentence),
+                "{edges:?}: {outcome:?}"
+            );
+            let after = store
+                .graph_body(ids::GRAPH_HTUI_FEAT)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the seeded feature graph is there");
+            assert_eq!(after, before, "{edges:?}: nothing written");
+        }
+    }
+
+    /// MOD-138 M3 D8: a live graph holding the mixed shape (planted under `replace_graph`) is
+    /// refused at resolve as an invalid graph with the store's sentence, no longer as a graph
+    /// that cannot run yet.
+    #[tokio::test]
+    async fn a_live_mixed_asks_you_graph_is_refused_as_invalid() {
+        for (node, edges) in MIXED_ASKS_YOU {
+            let store = store_with(|data| {
+                for (from, to) in edges {
+                    let (from, to) = (feature_phase(data, from), feature_phase(data, to));
+                    data.edges.push(StepGraphEdge {
+                        id: EdgeId::new(),
+                        graph_id: ids::GRAPH_HTUI_FEAT,
+                        from,
+                        to,
+                        kind: EdgeKind::AsksYou,
+                        predicate: None,
+                        loop_limit: None,
+                    });
+                }
+            });
+            let error = resolve_feat(&store, &TestSource::claude(&store))
+                .await
+                .expect_err("a mixed `asks_you` node is refused");
             assert_eq!(
                 error,
-                ResolveError::NotYetRunnable {
-                    node: node.to_owned(),
-                    reason: NotRunnable::MixedAsksYou,
+                ResolveError::InvalidGraph {
+                    graph: "feature".to_owned(),
+                    reason: back_asks_you_beside_another_asks_you(node, ids::GRAPH_HTUI_FEAT),
                 },
                 "{edges:?}"
             );
-            let sentence = error.to_string();
-            assert!(sentence.contains(&format!("`{node}`")), "{sentence}");
-            assert!(sentence.contains("MOD-138 M3"), "{sentence}");
         }
+    }
+
+    /// MOD-138 M3 D8 (V8): W5 lives in `walk_refusal`, so resolve's post-expansion check refuses
+    /// a divide-expanded graph whose integrate node keeps the mixed shape.
+    #[tokio::test]
+    async fn a_divide_expanded_mixed_asks_you_is_refused_after_expansion() {
+        let (mut phases, mut edges) = feature_phases_and_edges().await;
+        phases[2].divide = Some(SnapshotDivide {
+            max_parts: Some(2),
+            ..SnapshotDivide::default()
+        });
+        for to in ["plan", "review"] {
+            edges.push(SnapshotEdge {
+                from: "implement".to_owned(),
+                to: to.to_owned(),
+                kind: EdgeKind::AsksYou,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+        let (phases, edges) = expand_divide("feature", phases, edges).expect("no key is taken");
+        assert!(
+            phases.iter().any(|phase| phase.name == "implement:plan"),
+            "expanded"
+        );
+        assert_eq!(
+            snapshot_walk_refusal(ids::GRAPH_HTUI_FEAT, &phases, &edges),
+            Some(back_asks_you_beside_another_asks_you(
+                "implement",
+                ids::GRAPH_HTUI_FEAT
+            ))
+        );
     }
 
     /// R1 (E1): the shapes the `asks_you` stop can answer still resolve: two forward `asks_you`
