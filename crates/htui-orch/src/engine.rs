@@ -6253,7 +6253,10 @@ where
             .store
             .resolve_inputs(item, run.id, &phase.input_kinds)
             .await?;
-        let required = crate::walk::required_inputs(phase, snapshot);
+        // MOD-138 M3 D11: a kind whose every upstream producer is skipped behind a declined `if`
+        // is optional, which reads the run's rows (V18); one read, so the callers are unchanged.
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let required = crate::walk::required_inputs(phase, snapshot, &steps);
         let mut documents = Vec::with_capacity(resolved.len());
         let mut notes = Vec::new();
         for input in resolved {
@@ -8277,7 +8280,7 @@ mod tests {
             .expect("the seeded `feature` graph has one");
         assert_eq!(implement.input_kinds, ["plan", "review"]);
         assert_eq!(
-            required_inputs(implement, &snapshot),
+            required_inputs(implement, &snapshot, &[]),
             ["plan"],
             "`review` is the loop's back edge and cannot exist on attempt 1 (plan D21)"
         );
@@ -8288,7 +8291,7 @@ mod tests {
             .find(|phase| phase.name == "review")
             .expect("the seeded `feature` graph has one");
         assert_eq!(
-            required_inputs(review, &snapshot),
+            required_inputs(review, &snapshot, &[]),
             ["implement"],
             "nothing later produces `implement`, so it is required"
         );
