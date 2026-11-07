@@ -534,9 +534,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
 ///
-/// **Nine for MOD-138 M3 T4** (plan D6; blueprint A7, A8, A9): recovery among concurrent
-/// landings. Every done winner that may not have landed is re-landed, in topological order, by
-/// the sweep and by a crash-cut unpark's resume: two unlanded branches, two answered parks, the node a reordered chain walked last, a done branch beside a still
+/// **Ten for MOD-138 M3 T4** (plan D6; blueprint A7-A10): recovery among concurrent landings.
+/// Every done winner that may not have landed is re-landed, in topological order, by the sweep,
+/// by a crash-cut unpark's resume and, before its own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered chain walked last, a done branch beside a still
 /// running one, an already landed branch (idempotently), only the later of two in-place
 /// landings, and a loop's re-run target beside its side successor's older row; every running row
 /// is adjudicated, and running branches recovered into parks park each without `StaleWrite`.
@@ -857,6 +857,7 @@ pub const CASES: &[&str] = &[
     "running_branches_recovered_into_parks_park_each",
     "a_re_run_loop_target_is_re_landed_beside_an_older_side_successor",
     "a_crash_cut_unpark_on_a_branching_run_lands_every_frontier",
+    "answering_one_of_two_parks_lands_a_crashed_answers_winner",
 ];
 
 /// Run one case by name.
@@ -11834,6 +11835,9 @@ fn concurrent_recovery_case<'a, H: CaseHarness>(
         "a_crash_cut_unpark_on_a_branching_run_lands_every_frontier" => Box::pin(
             a_crash_cut_unpark_on_a_branching_run_lands_every_frontier(harness),
         ),
+        "answering_one_of_two_parks_lands_a_crashed_answers_winner" => Box::pin(
+            answering_one_of_two_parks_lands_a_crashed_answers_winner(harness),
+        ),
         _ => return None,
     })
 }
@@ -12344,6 +12348,52 @@ async fn a_crash_cut_unpark_on_a_branching_run_lands_every_frontier<H: CaseHarne
     );
 }
 
+/// MOD-138 M3 A10 (F12): both branches of the diamond parked at their gates; a command answered
+/// `plan` and crashed before its unpark (`plan` `done`, unmerged, the run still parked). A human
+/// then answers `implement`: the answer lands `plan` first, then `implement`, and only then does
+/// the walk create the join.
+async fn answering_one_of_two_parks_lands_a_crashed_answers_winner<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    worktree_diamond(&orch, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "{rest:?}");
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` parked").clone();
+    let implement = latest_row(&steps, 2).expect("`implement` parked").clone();
+    assert!(
+        orch.store()
+            .answer_gate(plan.id, GateOutcome::Approved, None, orch.clock().now())
+            .await
+            .expect("MemStore takes the answer"),
+        "a command's answer, its unpark cut off by a crash"
+    );
+    let landed = orch.isolator().reconciles().len();
+
+    let rest = answer_at(&orch, run, 2, GateAnswer::Approved).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let review = latest_row(&steps_of(&orch, run).await, 3)
+        .expect("the join ran")
+        .clone();
+    assert_eq!(
+        orch.isolator().reconciles()[landed..],
+        [
+            (plan.id, Vec::new()),
+            (implement.id, Vec::new()),
+            (review.id, Vec::new())
+        ],
+        "the crashed answer's winner lands before the answered one, and both before the join"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -12368,8 +12418,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            169,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 9: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            170,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -12432,13 +12482,14 @@ mod tests {
              an owed loop running before its successor), and T3 repair 1's two (cleanup deferred \
              until a cut sibling settled, and a terminal end cancelling a sibling row created \
              beside it), and T3 repair 2's one (a rejection ending the run cancelling the other \
-             parked step), and MOD-138 M3 T4's nine recovery cases (plan D6, blueprint A7-A9: two \
+             parked step), and MOD-138 M3 T4's ten recovery cases (plan D6, blueprint A7-A9: two \
              unlanded branches landed in order, a reordered chain landing the node walked last, a \
              done branch landed beside a running one, an already landed branch re-landed \
              idempotently, only the later of two shared_serialized landings re-landed, two running \
              branches both adjudicated, running branches recovered into a park each, and a re-run \
              loop target re-landed beside an older side successor, and a crash-cut unpark on a \
-             branching run landing every frontier member)"
+             branching run landing every frontier member, and an answer to one of two parks \
+             landing the other, crashed answer's winner first)"
         );
     }
 

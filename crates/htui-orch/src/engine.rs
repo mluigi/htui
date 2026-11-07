@@ -1386,6 +1386,12 @@ where
             if outcome == GateOutcome::Rejected {
                 return self.after_rejection(run, snapshot, step, phase, now).await;
             }
+            // MOD-138 M3 A10 (F12): another answered step a crash left unmerged (its command
+            // died between `answer_gate` and the unpark) lands first, each boxed (D10). The
+            // first refusal parks the run again. A linear run has no such member.
+            if let Some(rest) = Box::pin(self.land_other_frontiers(run, snapshot, step.id)).await? {
+                return Ok(rest);
+            }
             // `answer_gate` moved the step `awaiting_approval -> done`
             // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
             // reaches `done`". A refusal parks the run again, with the reason on the item.
@@ -1396,6 +1402,31 @@ where
             }
         };
         self.walk_leased(run.id, until, tail).await
+    }
+
+    /// MOD-138 M3 A10 (blueprint §4.3): every [`recover::frontiers`] member of `run` but
+    /// `answered`, in topological order, reconciled before the answered step is. `Some(rest)` is
+    /// the first refusal's park; the members after it wait for the next answer or recovery.
+    async fn land_other_frontiers(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        answered: StepId,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        for winner in recover::frontiers(snapshot, &steps) {
+            if winner == answered {
+                continue;
+            }
+            let Some(done) = steps.iter().find(|step| step.id == winner) else {
+                continue;
+            };
+            let siblings = Self::siblings(&group_at(&steps, done.position, done.attempt), winner);
+            if let Some(rest) = Box::pin(self.reconcile_done_step(run, done, &siblings)).await? {
+                return Ok(Some(rest));
+            }
+        }
+        Ok(None)
     }
 
     /// What a human's rejection means: the review loop when the phase can loop, the end of the run
