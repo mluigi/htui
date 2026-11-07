@@ -405,8 +405,9 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 pub(crate) enum Resolution {
     /// The graph resolved: what [`resolve`] returns.
     Resolved(Box<Resolved>),
-    /// A D6 or D9 refusal raised once the phases were built: a [`ResolveError::NotYetRunnable`]
-    /// or a [`ResolveError::InvalidGraph`]. `phases` are the live phases in position order,
+    /// A D6, D9 or M3 D7 refusal raised once the phases were built: a
+    /// [`ResolveError::NotYetRunnable`], a [`ResolveError::InvalidGraph`] or a
+    /// [`ResolveError::LocalConcurrent`]. `phases` are the live phases in position order,
     /// before any `divide` expansion (MOD-138 D11), which is the shape a v1 run is compared on.
     Refused {
         /// The live phases, as built.
@@ -416,11 +417,12 @@ pub(crate) enum Resolution {
     },
 }
 
-/// [`resolve`], with its D6 and D9 refusals (blueprint A6) handed back beside the live phases
-/// built before them, so a v1 run's resume can compare those phases on the v1 digest. Every other
-/// error is [`resolve`]'s, in its order. The shared validator's refusal of the stored body comes
-/// before the phases are built, so it is held while they are; a phase that then fails to build
-/// raises the validator's refusal, as [`resolve`] always has, with no phases to compare.
+/// [`resolve`], with its D6 and D9 refusals (blueprint A6) and M3 D7's `local` refusal handed
+/// back beside the live phases built before them, so a v1 run's resume can compare those phases
+/// on the v1 digest. Every other error is [`resolve`]'s, in its order. The shared validator's
+/// refusal of the stored body comes before the phases are built, so it is held while they are; a
+/// phase that then fails to build raises the validator's refusal, as [`resolve`] always has, with
+/// no phases to compare.
 ///
 /// # Errors
 /// As [`resolve`], less the refusals carried by [`Resolution::Refused`].
@@ -561,7 +563,14 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         });
     }
 
-    local_concurrent_refusal(&phases, &edges)?;
+    // M3 D7: carried like D6's, so a v1 run walking a `local` graph M2 resolved is still compared
+    // on its phases at resume, and walks on while they match.
+    if let Err(refusal) = local_concurrent_refusal(&phases, &edges) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal,
+        });
+    }
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
@@ -5444,6 +5453,45 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 first: "plan".to_owned(),
                 second: "implement".to_owned(),
             }
+        );
+    }
+
+    /// D7, blueprint A6: `resolve_or_refused` hands `LocalConcurrent` back beside the live
+    /// phases it built, unexpanded and in position order, so a v1 run's resume compares them on
+    /// the v1 digest and walks on when they match, as it did before M3 refused a `local` diamond.
+    #[tokio::test]
+    async fn local_concurrent_carries_the_live_phases() {
+        let store = store_with_settings(json!({"default_isolation": "local"}));
+        replace_feature(&store, |body| diamond(body, &[])).await;
+        let item = feat_1(&store).await;
+        let resolution = super::resolve_or_refused(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("D7 refuses the graph once its phases are built");
+        let super::Resolution::Refused { phases, refusal } = resolution else {
+            panic!("a `local` project's diamond is refused");
+        };
+        assert_eq!(
+            refusal,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+        let names: Vec<(i32, &str)> = phases
+            .iter()
+            .map(|phase| (phase.position, phase.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [(0, "prd"), (1, "plan"), (2, "implement"), (3, "review")]
         );
     }
 
