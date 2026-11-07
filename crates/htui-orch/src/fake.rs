@@ -146,8 +146,8 @@ pub struct FakeIsolator {
     releases: Mutex<u32>,
     /// Blueprint F-A: the 1-based [`reconcile`](Isolator::reconcile) call that never returns, and
     /// the signal it raises first; with a resume signal (plan D145), the call that waits for it
-    /// instead. One-shot.
-    reconcile_stall: Mutex<Option<ReconcileStall>>,
+    /// instead. One-shot each; MOD-138 M3 T4: several may be pending at once, one per call.
+    reconcile_stall: Mutex<Vec<ReconcileStall>>,
     /// Where `prepare` roots its trees, when a case points it at a real directory (MOD-7
     /// milestone 4); `None` keeps `FAKE_TREE_ROOT/<run>/<step>`.
     tree_root: Mutex<Option<PathBuf>>,
@@ -480,16 +480,17 @@ impl FakeIsolator {
     /// `running` with an unmerged winner. The case drops the walk once the signal fires
     /// (`conformance::until_stalled`).
     ///
+    /// MOD-138 M3 T4: stalls add up, so a concurrent walk can leave two winners unmerged.
+    ///
     /// # Panics
     /// When a lock is poisoned, which no case does.
     #[must_use]
     pub fn stall_nth_reconcile(&self, n: u32) -> Arc<Notify> {
         let notify = Arc::new(Notify::new());
-        *self
-            .reconcile_stall
+        self.reconcile_stall
             .lock()
-            .expect("no panic holds the fake isolator's lock") =
-            Some((n, Arc::clone(&notify), None));
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&notify), None));
         notify
     }
 
@@ -505,27 +506,25 @@ impl FakeIsolator {
     #[must_use]
     pub fn pause_nth_reconcile(&self, n: u32) -> (Arc<Notify>, Arc<Notify>) {
         let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        *self
-            .reconcile_stall
+        self.reconcile_stall
             .lock()
-            .expect("no panic holds the fake isolator's lock") =
-            Some((n, Arc::clone(&reached), Some(Arc::clone(&resume))));
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&reached), Some(Arc::clone(&resume))));
         (reached, resume)
     }
 
     /// The stall's signal and, for a pause, its resume, when `call` is the stalled one, taking
     /// them (one-shot).
     fn reconcile_stall_at(&self, call: usize) -> Option<(Arc<Notify>, Option<Arc<Notify>>)> {
-        let mut stall = self
+        let mut stalls = self
             .reconcile_stall
             .lock()
             .expect("no panic holds the fake isolator's lock");
-        match stall.as_ref() {
-            Some((n, _, _)) if usize::try_from(*n).is_ok_and(|n| n == call) => {
-                stall.take().map(|(_, notify, resume)| (notify, resume))
-            }
-            _ => None,
-        }
+        let at = stalls
+            .iter()
+            .position(|(n, _, _)| usize::try_from(*n).is_ok_and(|n| n == call))?;
+        let (_, notify, resume) = stalls.remove(at);
+        Some((notify, resume))
     }
 
     /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
@@ -3901,6 +3900,48 @@ mod tests {
                 (third, Vec::new())
             ]
         );
+    }
+
+    /// MOD-138 M3 T4: two stalls are pending at once, each on its own call, and the call
+    /// between them answers.
+    #[tokio::test]
+    async fn two_reconcile_stalls_stall_their_own_calls() {
+        use futures::FutureExt as _;
+
+        let isolator = FakeIsolator::new();
+        let (two, four) = (
+            isolator.stall_nth_reconcile(2),
+            isolator.stall_nth_reconcile(4),
+        );
+        let steps = [StepId::new(), StepId::new(), StepId::new(), StepId::new()];
+        assert!(
+            isolator
+                .reconcile(steps[0], &[], &[])
+                .now_or_never()
+                .is_some()
+        );
+        let mut second = isolator.reconcile(steps[1], &[], &[]);
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "the second stalls"
+        );
+        assert!(
+            isolator
+                .reconcile(steps[2], &[], &[])
+                .now_or_never()
+                .is_some()
+        );
+        let mut fourth = isolator.reconcile(steps[3], &[], &[]);
+        assert!(
+            fourth.as_mut().now_or_never().is_none(),
+            "the fourth stalls"
+        );
+        two.notified().now_or_never().expect("the second signalled");
+        four.notified()
+            .now_or_never()
+            .expect("the fourth signalled");
+        drop((second, fourth));
+        assert_eq!(isolator.reconciles().len(), 4);
     }
 
     /// MOD-138 M3 T3 (F14): with `interleave_reconciles` two landings are in progress at once

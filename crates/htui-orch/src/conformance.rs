@@ -533,6 +533,13 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// cuts its live sibling, an end after a park cancels the parked step, and the cleanup waits for
 /// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
+///
+/// **Eight for MOD-138 M3 T4** (plan D6; blueprint A7, A8, A9): recovery among concurrent
+/// landings. Every done winner that may not have landed is re-landed, in topological order: two
+/// unlanded branches, the node a reordered chain walked last, a done branch beside a still
+/// running one, an already landed branch (idempotently), only the later of two in-place
+/// landings, and a loop's re-run target beside its side successor's older row; every running row
+/// is adjudicated, and running branches recovered into parks park each without `StaleWrite`.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -840,6 +847,15 @@ pub const CASES: &[&str] = &[
     "a_terminal_end_cancels_a_sibling_row_created_beside_it",
     // MOD-138 M3 T3 repair 2 (blueprint §3.6 step 4 on the answer path).
     "a_rejection_ending_the_run_cancels_the_other_parked_step",
+    // MOD-138 M3 T4 (plan D6; blueprint A7, A8, A9): recovery among concurrent landings.
+    "a_crash_with_two_unlanded_branches_lands_both_in_order",
+    "a_crash_on_a_reordered_chain_lands_the_node_walked_last",
+    "a_crash_beside_a_running_branch_lands_the_done_one",
+    "re_landing_an_already_landed_branch_is_idempotent",
+    "of_two_shared_serialized_landings_only_the_later_is_re_landed",
+    "a_crash_with_two_running_branches_adjudicates_both",
+    "running_branches_recovered_into_parks_park_each",
+    "a_re_run_loop_target_is_re_landed_beside_an_older_side_successor",
 ];
 
 /// Run one case by name.
@@ -874,6 +890,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| graph_walker_case(name, harness))
         .or_else(|| branch_case(name, harness))
         .or_else(|| concurrency_case(name, harness))
+        .or_else(|| concurrent_recovery_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -11781,6 +11798,503 @@ async fn a_loop_owed_beside_its_successor_runs_first<H: CaseHarness>(harness: &H
     assert_eq!(orch.isolator().in_place_overlaps(), 0);
 }
 
+// -- MOD-138 M3 T4: recovery among concurrent landings (plan D6; blueprint A7-A10) -------------
+
+/// MOD-138 M3 T4's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn concurrent_recovery_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_crash_with_two_unlanded_branches_lands_both_in_order" => Box::pin(
+            a_crash_with_two_unlanded_branches_lands_both_in_order(harness),
+        ),
+        "a_crash_on_a_reordered_chain_lands_the_node_walked_last" => Box::pin(
+            a_crash_on_a_reordered_chain_lands_the_node_walked_last(harness),
+        ),
+        "a_crash_beside_a_running_branch_lands_the_done_one" => {
+            Box::pin(a_crash_beside_a_running_branch_lands_the_done_one(harness))
+        }
+        "re_landing_an_already_landed_branch_is_idempotent" => {
+            Box::pin(re_landing_an_already_landed_branch_is_idempotent(harness))
+        }
+        "of_two_shared_serialized_landings_only_the_later_is_re_landed" => {
+            Box::pin(of_two_shared_serialized_landings_only_the_later_is_re_landed(harness))
+        }
+        "a_crash_with_two_running_branches_adjudicates_both" => {
+            Box::pin(a_crash_with_two_running_branches_adjudicates_both(harness))
+        }
+        "running_branches_recovered_into_parks_park_each" => {
+            Box::pin(running_branches_recovered_into_parks_park_each(harness))
+        }
+        "a_re_run_loop_target_is_re_landed_beside_an_older_side_successor" => {
+            Box::pin(a_re_run_loop_target_is_re_landed_beside_an_older_side_successor(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// A process killed mid-walk with several node futures stalled (MOD-138 M3 T4): `StartRun` on
+/// `item` is polled until every signal in `stalled` fired, then dropped, and the run it left
+/// `running` is handed back. A `within` bound, since a serial walk would never stall them all.
+///
+/// # Panics
+/// When the walk finishes instead of stalling, or leaves no `running` run on the item.
+async fn crash_on_all<O: Orchestrate>(orch: &O, item: ItemId, stalled: &[Arc<Notify>]) -> RunId {
+    let every = async {
+        for signal in stalled {
+            signal.notified().await;
+        }
+    };
+    let walk = orch.dispatch(Command::StartRun {
+        item,
+        mode: RunMode::Manual,
+        repo_scope: None,
+        workspace: None,
+    });
+    match within(
+        futures::future::select(Box::pin(walk), Box::pin(every)),
+        "every stall",
+    )
+    .await
+    {
+        Either::Left(_) => panic!("the walk finished instead of stalling"),
+        Either::Right(((), walk)) => drop(walk),
+    }
+    orch.store()
+        .runs(item)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the crash left the run `running`")
+        .id
+}
+
+/// The adopter walks `run` on to `done`.
+async fn walked_to_done<O: Orchestrate>(orch: &O, run: RunId) {
+    let resumed = orch.resume(run).await.expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::Done,
+                ..
+            })
+        ),
+        "{resumed:?}"
+    );
+}
+
+/// `orch.sweep()` adopts exactly `run`, and answers its `Next`.
+async fn adopted_next<O: Orchestrate>(orch: &O, run: RunId) -> Next {
+    let adopted = orch.sweep().await.expect("the sweep adopts");
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert_eq!(adopted[0].run, run);
+    adopted[0].next.clone()
+}
+
+/// The diamond with both branches `worktree`, so nothing serialises them (A3).
+async fn worktree_diamond<O: Orchestrate>(orch: &O, mutate: impl Fn(&mut StepGraphPhase)) {
+    feat_3_graph(orch, DIAMOND, |phase| {
+        phase.isolation = Some(Isolation::Worktree);
+        mutate(phase);
+    })
+    .await;
+}
+
+/// MOD-138 M3 D6 (Q-1): both branches of the diamond are `done` and neither merged when the
+/// process dies (each landing stalled inside its reconcile). The adopter lands both, in
+/// topological order, and the walk goes on to the join.
+async fn a_crash_with_two_unlanded_branches_lands_both_in_order<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    worktree_diamond(&orch, |_| {}).await;
+    // `prd`'s landing is the first reconcile; the branches' are the second and third.
+    let stalls = [
+        orch.isolator().stall_nth_reconcile(2),
+        orch.isolator().stall_nth_reconcile(3),
+    ];
+    let run = crash_on_all(&orch, ids::HTUI_FEAT_3, &stalls).await;
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran").clone();
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+    assert_eq!(
+        (plan.status, implement.status),
+        (StepStatus::Done, StepStatus::Done)
+    );
+    assert!(latest_row(&steps, 3).is_none(), "the join waits");
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(plan.id, Vec::new()), (implement.id, Vec::new())],
+        "both branches land, in topological order"
+    );
+    walked_to_done(&other, run).await;
+    assert_eq!(
+        latest_row(&steps_of(&other, run).await, 3).map(|step| step.status),
+        Some(StepStatus::Done)
+    );
+}
+
+/// MOD-138 M3 D6 (the M2 Q-C gap): on the chain `prd → implement → plan → review` the walk
+/// finishes `plan` (position 1) after `implement` (position 2). A crash inside `plan`'s landing
+/// is recovered by landing `plan`, the node walked last, not `implement`, the highest position.
+async fn a_crash_on_a_reordered_chain_lands_the_node_walked_last<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(
+        &orch,
+        &[
+            ("prd", "implement", EdgeKind::Next, None, None),
+            ("implement", "plan", EdgeKind::Next, None, None),
+            ("plan", "review", EdgeKind::Next, None, None),
+        ],
+        |_| {},
+    )
+    .await;
+    // `prd`, `implement`, then `plan`: its landing is the third reconcile.
+    let stalled = orch.isolator().stall_nth_reconcile(3);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran").clone();
+    assert_eq!(plan.status, StepStatus::Done);
+    assert_eq!(
+        orch.isolator().reconciles().last(),
+        Some(&(plan.id, Vec::new())),
+        "the stalled landing is `plan`'s"
+    );
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(plan.id, Vec::new())],
+        "the node walked last lands, and only it"
+    );
+    walked_to_done(&other, run).await;
+}
+
+/// MOD-138 M3 D6 (A-3 per node): `plan` is `done` and unlanded while `implement`'s session is
+/// still live when the process dies. The adopter lands `plan` and adjudicates `implement` as
+/// ever (its document landed, so it is re-settled and lands too); the global "no running step"
+/// guard no longer skips the done branch.
+async fn a_crash_beside_a_running_branch_lands_the_done_one<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    worktree_diamond(&orch, |_| {}).await;
+    // `implement` never reaches its landing, so `plan`'s is the second reconcile.
+    let stalls = [
+        orch.isolator().stall_nth_reconcile(2),
+        orch.stall_after_done("implement", 1, None, true),
+    ];
+    let run = crash_on_all(&orch, ids::HTUI_FEAT_3, &stalls).await;
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran").clone();
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+    assert_eq!(
+        (plan.status, implement.status),
+        (StepStatus::Done, StepStatus::Running)
+    );
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(plan.id, Vec::new()), (implement.id, Vec::new())],
+        "the done branch lands first, then the adjudicated one"
+    );
+    assert_eq!(
+        step_at(&other, run, 2, 1).await.status,
+        StepStatus::Done,
+        "D91: re-settled and passed"
+    );
+    walked_to_done(&other, run).await;
+}
+
+/// MOD-138 M3 D6 (Q-1): a branch that already landed but whose successor has no row yet is on
+/// the frontier, and its re-landing is idempotent. `implement` lands before `plan`'s session is
+/// let go; `plan`'s landing then stalls. The adopter lands `plan` and re-lands `implement`,
+/// which merges nothing new: its recorded commits stand as they were.
+async fn re_landing_an_already_landed_branch_is_idempotent<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    worktree_diamond(&orch, |_| {}).await;
+    primary_repo(&orch).await;
+    let plan_session = orch.hold_sessions(&[("plan", 1)]);
+    // `prd`, `implement`, then `plan`: its landing is the third reconcile.
+    let stalled = [orch.isolator().stall_nth_reconcile(3)];
+    let release = async {
+        within(plan_session.live(1), "plan live").await;
+        within(
+            async {
+                while orch.isolator().reconciles().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            },
+            "implement landed",
+        )
+        .await;
+        plan_session.release();
+    };
+    let (run, ()) = tokio::join!(crash_on_all(&orch, ids::HTUI_FEAT_3, &stalled), release);
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran").clone();
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+    assert_eq!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .filter(|(winner, _)| *winner == implement.id)
+            .count(),
+        1,
+        "`implement` landed before the crash"
+    );
+    let landed = orch
+        .store()
+        .step_commits(implement.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(
+        landed.iter().all(|row| row.after_hash.is_some()) && !landed.is_empty(),
+        "{landed:?}"
+    );
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(plan.id, Vec::new()), (implement.id, Vec::new())],
+        "the landed sink-to-be is re-landed beside the unlanded one"
+    );
+    assert_eq!(
+        other
+            .store()
+            .step_commits(implement.id)
+            .await
+            .expect("MemStore never fails a read"),
+        landed,
+        "the re-landing merged nothing new"
+    );
+    walked_to_done(&other, run).await;
+}
+
+/// MOD-138 M3 D6 (V5(e), A9): two `shared_serialized` branches land one after the other (A3).
+/// A crash inside the second's landing re-lands only it: the first landed before the second
+/// started, and re-landing it in place would refuse `primary_moved`.
+async fn of_two_shared_serialized_landings_only_the_later_is_re_landed<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" || phase.name == "implement" {
+            phase.isolation = Some(Isolation::SharedSerialized);
+        }
+    })
+    .await;
+    // A9's ties keep a member: each session ends a minute after it started.
+    orch.advance_after_done(TimeDelta::minutes(1));
+    // `prd`, `plan`, then `implement` (A3 serialises the in-place branches).
+    let stalled = orch.isolator().stall_nth_reconcile(3);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let steps = steps_of(&orch, run).await;
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+    assert_eq!(
+        orch.isolator().reconciles().last(),
+        Some(&(implement.id, Vec::new())),
+        "the stalled landing is the later in-place branch's"
+    );
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Done)
+    );
+
+    let other = orch.restarted();
+    assert_eq!(
+        adopted_next(&other, run).await,
+        Next::Walk,
+        "no `primary_moved` park"
+    );
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(implement.id, Vec::new())],
+        "only the later in-place landing is re-landed"
+    );
+    walked_to_done(&other, run).await;
+}
+
+/// MOD-138 M3 A7 (F9): two sessions are live when the process dies. The adopter adjudicates
+/// both: `plan` re-settles and parks at its gate, and that park no longer ends the recovery,
+/// so `implement` re-settles and lands as well.
+async fn a_crash_with_two_running_branches_adjudicates_both<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    worktree_diamond(&orch, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    let stalls = [
+        orch.stall_after_done("plan", 1, None, true),
+        orch.stall_after_done("implement", 1, None, true),
+    ];
+    let run = crash_on_all(&orch, ids::HTUI_FEAT_3, &stalls).await;
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Running),
+            (2, 1, StepStatus::Running),
+        ]
+    );
+
+    let other = orch.restarted();
+    assert_eq!(
+        adopted_next(&other, run).await,
+        Next::Parked(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(1),
+            failure: None,
+        }),
+        "the first park is the recovery's answer"
+    );
+    assert_eq!(
+        sorted_shape(&other, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+            (2, 1, StepStatus::Done),
+        ],
+        "every running row adjudicated"
+    );
+    let implement = step_at(&other, run, 2, 1).await;
+    assert_eq!(other.isolator().reconciles(), [(implement.id, Vec::new())]);
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+
+    let rest = answer_at(&other, run, 1, GateAnswer::Approved).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+}
+
+/// MOD-138 M3 A7 (T3 verify carry-over): three sessions are live when the process dies, and
+/// each one's recovery parks. `plan` and `implement` wrote no document and have no retry left
+/// (D94's park, twice through the engine), and `review` re-settles and parks at its gate on
+/// the run already parked (the gate's park). The recovery's own parks never meet `StaleWrite`.
+async fn running_branches_recovered_into_parks_park_each<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, FAN_OF_THREE, |phase| match phase.name.as_str() {
+        "plan" | "implement" => phase.retry_limit = 0,
+        "review" => phase.gate = Gate::Always,
+        _ => {}
+    })
+    .await;
+    let stalls = [
+        orch.stall_after_done("plan", 1, None, false),
+        orch.stall_after_done("implement", 1, None, false),
+        orch.stall_after_done("review", 1, None, true),
+    ];
+    let run = crash_on_all(&orch, ids::HTUI_FEAT_3, &stalls).await;
+    let steps = steps_of(&orch, run).await;
+    let plan = latest_row(&steps, 1).expect("`plan` ran").clone();
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+
+    let other = orch.restarted();
+    assert_eq!(
+        adopted_next(&other, run).await,
+        Next::Parked(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(1),
+            failure: Some(RunFailure::Interrupted {
+                phase: "plan".to_owned(),
+                reset: true,
+            }),
+        }),
+        "the first park is the recovery's answer"
+    );
+    assert_eq!(
+        sorted_shape(&other, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed),
+            (2, 1, StepStatus::Failed),
+            (3, 1, StepStatus::AwaitingApproval),
+        ],
+        "every running row adjudicated into its park"
+    );
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    for step in [&plan, &implement] {
+        let spent = format!("interrupted: retry budget spent: step {}", step.id);
+        assert!(
+            notes.iter().any(|body| body.starts_with(&spent)),
+            "{spent}\n{notes:?}"
+        );
+    }
+}
+
+/// MOD-138 M3 A8 (F10): a loop whose region holds `plan` but not its side successor
+/// `implement` re-runs `plan` and leaves `implement`'s older row. On `prd → plan → {review,
+/// implement}` with `review → plan` a `changes_requested` edge, `review` asks for changes once;
+/// `plan` attempt 2 finishes after `implement` started, and the process dies inside its landing.
+/// `implement`'s older row proves nothing, so the adopter re-lands `plan` attempt 2 (and the sink
+/// `implement`, idempotently) rather than walking on over a tree without it.
+async fn a_re_run_loop_target_is_re_landed_beside_an_older_side_successor<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    feat_3_graph(
+        &orch,
+        &[
+            ("prd", "plan", EdgeKind::Next, None, None),
+            ("plan", "review", EdgeKind::Next, None, None),
+            ("plan", "implement", EdgeKind::Next, None, None),
+            ("review", "plan", EdgeKind::ChangesRequested, None, Some(1)),
+        ],
+        |phase| phase.isolation = Some(Isolation::Worktree),
+    )
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    // A8 reads `started_at` against `finished_at`: every session ends a minute after it started.
+    orch.advance_after_done(TimeDelta::minutes(1));
+    // `prd`, `plan` 1 and `implement` land; `review` 1 is retired by its loop and lands nothing
+    // (plan D135); `plan` attempt 2's landing is the fourth.
+    let stalled = orch.isolator().stall_nth_reconcile(4);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let steps = steps_of(&orch, run).await;
+    let plan = at(&steps, 1, 2).clone();
+    let implement = at(&steps, 2, 1).clone();
+    assert_eq!(
+        (plan.status, implement.status),
+        (StepStatus::Done, StepStatus::Done)
+    );
+    assert_eq!(
+        orch.isolator().reconciles().last(),
+        Some(&(plan.id, Vec::new())),
+        "the stalled landing is `plan` attempt 2's"
+    );
+    assert!(
+        implement.started_at < plan.finished_at,
+        "`implement`'s row is older than the re-run winner"
+    );
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(plan.id, Vec::new()), (implement.id, Vec::new())],
+        "the re-run winner lands; the sink re-lands, idempotently"
+    );
+    walked_to_done(&other, run).await;
+    assert_eq!(step_at(&other, run, 3, 2).await.status, StepStatus::Done);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -11805,8 +12319,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            160,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            168,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 8: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -11869,7 +12383,12 @@ mod tests {
              an owed loop running before its successor), and T3 repair 1's two (cleanup deferred \
              until a cut sibling settled, and a terminal end cancelling a sibling row created \
              beside it), and T3 repair 2's one (a rejection ending the run cancelling the other \
-             parked step)"
+             parked step), and MOD-138 M3 T4's eight recovery cases (plan D6, blueprint A7-A9: two \
+             unlanded branches landed in order, a reordered chain landing the node walked last, a \
+             done branch landed beside a running one, an already landed branch re-landed \
+             idempotently, only the later of two shared_serialized landings re-landed, two running \
+             branches both adjudicated, running branches recovered into a park each, and a re-run \
+             loop target re-landed beside an older side successor)"
         );
     }
 

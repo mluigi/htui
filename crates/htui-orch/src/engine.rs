@@ -607,9 +607,25 @@ impl WalkScopes {
     /// Opens `run`'s scope for one walk. No walk of a run nests another in one engine; if one
     /// did, it shares the outer scope and its guard removes nothing.
     fn open(&self, run: RunId) -> ScopeGuard<'_> {
+        let guard = self.open_shared(run);
+        debug_assert!(guard.opened, "one walk per run per engine");
+        guard
+    }
+
+    /// MOD-138 M3 T4 (A7, T3's narrowed §3.7): `run`'s scope for one recovery
+    /// ([`Engine::recover_run`]), which drives no session. Its one use is [`Self::mark_parked`]
+    /// once the recovery itself parked the run, so that the recovery's own later parks find the
+    /// run it parked and are tolerated, while a run another writer parked first is still
+    /// `StaleWrite` (plan D145). A scope a walk already holds is shared and left in place.
+    fn open_recovery(&self, run: RunId) -> ScopeGuard<'_> {
+        self.open_shared(run)
+    }
+
+    /// [`Self::open`] without its assertion: a scope already open is shared, and its guard
+    /// removes nothing.
+    fn open_shared(&self, run: RunId) -> ScopeGuard<'_> {
         let mut scopes = self.lock();
         let opened = !scopes.contains_key(&run);
-        debug_assert!(opened, "one walk per run per engine");
         if opened {
             scopes.insert(
                 run,
@@ -3141,11 +3157,19 @@ where
 
     /// Plan D117: one adopted run's adjudication, in blueprint A-3's order.
     ///
-    /// 1. **The frontier first** (D97, A-3), over the rows as adopted and only when no step is
-    ///    `running`: a live row after the winner already makes it `None`, so the frontier exists
-    ///    exactly when there is nothing to adjudicate, and a re-settled winner is never merged
-    ///    twice.
-    /// 2. Every `running` step in `(position, attempt, fanout_index)` order (D90-D95).
+    /// 1. **The frontiers first** (MOD-138 M3 D6, Q-1), over the rows as adopted: every done
+    ///    winner that may not have landed ([`recover::frontiers`]), in topological order, each
+    ///    re-reconciled (boxed, D10). A-3 is per node: a successor row that started after the
+    ///    winner finished, a `running` one included, keeps it off, so a re-settled winner is never
+    ///    merged twice. The first refusal parks the run and the members after it wait for the
+    ///    next recovery.
+    /// 2. Every `running` step in `(position, attempt, fanout_index)` order (D90-D95). M3 A7:
+    ///    with concurrent nodes several rows can be live at the crash, so a park no longer ends
+    ///    the adjudication: the first park is kept and the next row is adjudicated over the run
+    ///    the recovery parked (its own parks are tolerated, [`WalkScopes::open_recovery`]; a run
+    ///    another writer parked is still `StaleWrite`, plan D145). An outcome that ends the run
+    ///    stops it: every row still unsettled is cancelled with the cut's note
+    ///    ([`Self::cancel_unsettled`]) and that end is the answer. Otherwise the first park is.
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
     ///    completes the park.
     /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
@@ -3157,14 +3181,18 @@ where
         let snapshot = Self::snapshot_of(run)?;
         let item = Self::item_of(run)?;
         let steps = self.parts.store.run_steps(run.id).await?;
+        let _scope = self.walks.open_recovery(run.id);
+        let mut parked: Option<Next> = None;
 
-        if !steps.iter().any(|step| step.status == StepStatus::Running)
-            && let Some(winner) = recover::frontier(&snapshot, &steps)
-            && let Some(row) = steps.iter().find(|step| step.id == winner)
-        {
+        for winner in recover::frontiers(&snapshot, &steps) {
+            let Some(row) = steps.iter().find(|step| step.id == winner) else {
+                continue;
+            };
             let siblings = Self::siblings(&group_at(&steps, row.position, row.attempt), winner);
-            if let Some(rest) = self.reconcile_done_step(run, row, &siblings).await? {
-                return Ok(Next::Parked(rest));
+            if let Some(rest) = Box::pin(self.reconcile_done_step(run, row, &siblings)).await? {
+                self.walks.mark_parked(run.id);
+                parked = Some(Next::Parked(rest));
+                break;
             }
         }
 
@@ -3173,12 +3201,24 @@ where
             .filter(|step| step.status == StepStatus::Running)
         {
             let phase = Self::phase_at(run.id, &snapshot, step.position)?;
-            if let Some(next) = self
+            match self
                 .recover_step(run, &snapshot, &phase, item, step)
                 .await?
             {
-                return Ok(next);
+                None => {}
+                Some(Next::Finished(rest)) => {
+                    let row = self.run(run.id).await?;
+                    Box::pin(self.cancel_unsettled(&row, Some(step.position))).await?;
+                    return Ok(Next::Finished(rest));
+                }
+                Some(next) => {
+                    self.walks.mark_parked(run.id);
+                    parked.get_or_insert(next);
+                }
             }
+        }
+        if let Some(next) = parked {
+            return Ok(next);
         }
 
         let row = self.run(run.id).await?;
@@ -7775,9 +7815,10 @@ where
     /// parked it: outside one (a sweep's recovery, a command's window) a parked run is another
     /// writer's, and plan D145's `StaleWrite` stands. This narrows §3.7's unconditional
     /// tolerance (`a_stale_write_mid_sweep_writes_no_note` pins D145). The gate twin reads the
-    /// same rule through [`GateContext::walk`]. **T4 (A7) owes its own allowance**: `recover_run`
-    /// opens no walk, so a second `park_interrupted` in one recovery still meets `StaleWrite`
-    /// until the recovery records its own first park.
+    /// same rule through [`GateContext::walk`]. A recovery (T4, A7) opens a scope of its own
+    /// ([`WalkScopes::open_recovery`]) and marks it parked once it parked the run, so its own
+    /// later parks, through the engine or the gate, are tolerated and another writer's still
+    /// is not.
     async fn park_the_run(&self, run: RunId, now: DateTime<Utc>) -> Result<(), EngineError> {
         if self
             .parts

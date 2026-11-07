@@ -386,9 +386,17 @@ pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
 ///   node has a row (any `fanout_index`, the judge included) that is neither `superseded` nor
 ///   `cancelled` and whose `started_at` is at or after the winner's `finished_at`. The walk
 ///   creates a successor only once its predecessor's future, landing included, returned, so such
-///   a row proves the landing. An unstarted `pending` row proves nothing, nor does an older row a
-///   loop left outside its region: the winner re-lands, which is idempotent (`merge_of`). A
-///   `running` successor drops only its own predecessor (A-3 per node).
+///   a row proves the landing. An unstarted `pending` row proves nothing on its own, nor does an
+///   older row a loop left outside its region: the winner re-lands, which is idempotent
+///   (`merge_of`). A `running` successor drops only its own predecessor (A-3 per node).
+/// - **A retried successor (T4, A8 narrowed).** A `pending` successor row beside another row of
+///   that node, retired ones included, that started at or after the winner's `finished_at`
+///   proves the landing too: that earlier attempt could start only once the winner landed, and a
+///   human's retry (or the review loop) then retired it and admitted the `pending` one. This is
+///   the position rule's reading of a live row after the winner, which the pre-M3 hand-back
+///   retry pins (`a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter`). Retired rows
+///   alone still prove nothing: under a frozen clock a loop's cancelled row ties with the re-run
+///   winner it predates.
 /// - **The in-place rule (A9).** A member whose phase is `local` or `shared_serialized` is kept
 ///   only when no done winner of the run, in any mode and member or not, has a later
 ///   `finished_at`: a later landing moved `HEAD`, so the earlier in-place node landed, and
@@ -418,11 +426,14 @@ pub fn frontiers(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Vec<StepId> {
         .collect();
     let proves = |successor: i32, winner: &RunStep| {
         let finished = winner.finished_at.unwrap_or(DateTime::<Utc>::MIN_UTC);
-        steps.iter().any(|row| {
-            row.position == successor
-                && !matches!(row.status, StepStatus::Superseded | StepStatus::Cancelled)
-                && row.started_at.is_some_and(|started| started >= finished)
-        })
+        let rows = || steps.iter().filter(|row| row.position == successor);
+        let started_after =
+            |row: &&RunStep| row.started_at.is_some_and(|started| started >= finished);
+        rows().any(|row| {
+            !matches!(row.status, StepStatus::Superseded | StepStatus::Cancelled)
+                && started_after(&row)
+        }) || (rows().any(|row| row.status == StepStatus::Pending)
+            && rows().any(|row| started_after(&row)))
     };
     let landed_later = |winner: &RunStep| {
         winners
@@ -1759,6 +1770,25 @@ mod tests {
         let a = landed(&snapshot, "a", 0, 1);
         let b = timed(&snapshot, "b", 1, StepStatus::Pending, None, None);
         assert_eq!(frontiers(&snapshot, &[a.clone(), b]), [a.id]);
+    }
+
+    /// A8 narrowed (T4): a `pending` retry of a successor proves its predecessor when an earlier
+    /// attempt of that successor started after the predecessor finished, retired or not; an
+    /// earlier attempt that started before (a loop's older row) proves nothing.
+    #[test]
+    fn a_pending_retry_proves_its_predecessor_through_its_earlier_attempt() {
+        let snapshot = worktree(&[("a", 0), ("b", 1)], &[("a", "b", NEXT)]);
+        let a = landed(&snapshot, "a", 0, 1);
+        let retry = timed(&snapshot, "b", 2, StepStatus::Pending, None, None);
+        let after = timed(&snapshot, "b", 1, StepStatus::Superseded, Some(1), None);
+        assert!(frontiers(&snapshot, &[a.clone(), after.clone(), retry.clone()]).is_empty());
+        let before = timed(&snapshot, "b", 1, StepStatus::Superseded, Some(0), None);
+        assert_eq!(frontiers(&snapshot, &[a.clone(), before, retry]), [a.id]);
+        assert_eq!(
+            frontiers(&snapshot, &[a.clone(), after]),
+            [a.id],
+            "a retired row alone proves nothing"
+        );
     }
 
     /// A9: an in-place member is kept only when no done winner of the run finished later, in any
