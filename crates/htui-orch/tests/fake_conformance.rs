@@ -46,7 +46,7 @@ fn cases_len_is_pinned() {
          settled, a terminal end cancelling a sibling row created beside it) 159, and T3 repair \
          2's one (a rejection ending the run cancelling the other parked step) 160, and MOD-138 M3 \
          T4's ten recovery cases (plan D6, blueprint A7-A9: two unlanded branches, a reordered \
-         chain, a done branch beside a running one, an idempotent re-landing, the later of two \
+         chain, a done branch beside a running one, an already landed branch re-landed, the later of two \
          in-place landings, two running branches adjudicated, running branches parked each, a \
          re-run loop target beside an older side successor, a crash-cut unpark on a branching \
          run, an answer landing the other crashed answer's winner first) 170, and \

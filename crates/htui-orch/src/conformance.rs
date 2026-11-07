@@ -539,7 +539,7 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// re-landed, in topological order, by the sweep, by a crash-cut unpark's resume and, before its
 /// own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered
 /// chain walked last, a done branch beside a still running one, an already landed branch
-/// (idempotently), only the later of two in-place landings, and a loop's re-run target beside
+/// (reconciled again), only the later of two in-place landings, and a loop's re-run target beside
 /// its side successor's older row. Every running row is adjudicated, and running branches
 /// recovered into parks park each without `StaleWrite`. A rejection handed back beside another
 /// parked step ends the run and cancels that step, as the in-process answer does.
@@ -854,7 +854,7 @@ pub const CASES: &[&str] = &[
     "a_crash_with_two_unlanded_branches_lands_both_in_order",
     "a_crash_on_a_reordered_chain_lands_the_node_walked_last",
     "a_crash_beside_a_running_branch_lands_the_done_one",
-    "re_landing_an_already_landed_branch_is_idempotent",
+    "a_landed_branch_without_a_successor_row_is_re_landed",
     "of_two_shared_serialized_landings_only_the_later_is_re_landed",
     "a_crash_with_two_running_branches_adjudicates_both",
     "running_branches_recovered_into_parks_park_each",
@@ -11821,9 +11821,9 @@ fn concurrent_recovery_case<'a, H: CaseHarness>(
         "a_crash_beside_a_running_branch_lands_the_done_one" => {
             Box::pin(a_crash_beside_a_running_branch_lands_the_done_one(harness))
         }
-        "re_landing_an_already_landed_branch_is_idempotent" => {
-            Box::pin(re_landing_an_already_landed_branch_is_idempotent(harness))
-        }
+        "a_landed_branch_without_a_successor_row_is_re_landed" => Box::pin(
+            a_landed_branch_without_a_successor_row_is_re_landed(harness),
+        ),
         "of_two_shared_serialized_landings_only_the_later_is_re_landed" => {
             Box::pin(of_two_shared_serialized_landings_only_the_later_is_re_landed(harness))
         }
@@ -12026,11 +12026,12 @@ async fn a_crash_beside_a_running_branch_lands_the_done_one<H: CaseHarness>(harn
     walked_to_done(&other, run).await;
 }
 
-/// MOD-138 M3 D6 (Q-1): a branch that already landed but whose successor has no row yet is on
-/// the frontier, and its re-landing is idempotent. `implement` lands before `plan`'s session is
-/// let go; `plan`'s landing then stalls. The adopter lands `plan` and re-lands `implement`,
-/// which merges nothing new: its recorded commits stand as they were.
-async fn re_landing_an_already_landed_branch_is_idempotent<H: CaseHarness>(harness: &H) {
+/// MOD-138 M3 D6 (Q-1, A8): a branch that already landed but whose successor has no row yet is
+/// on the frontier, so recovery reconciles it again. `implement` lands before `plan`'s session
+/// is let go; `plan`'s landing then stalls. The adopter lands `plan` and re-lands `implement`,
+/// and the walk still reaches `done`. That the re-landing merges nothing is the real isolator's
+/// (`merge_of`, H-3): the fake has no merge to count, so this case does not claim it.
+async fn a_landed_branch_without_a_successor_row_is_re_landed<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     worktree_diamond(&orch, |_| {}).await;
     primary_repo(&orch).await;
@@ -12079,15 +12080,6 @@ async fn re_landing_an_already_landed_branch_is_idempotent<H: CaseHarness>(harne
         other.isolator().reconciles(),
         [(plan.id, Vec::new()), (implement.id, Vec::new())],
         "the landed sink-to-be is re-landed beside the unlanded one"
-    );
-    assert_eq!(
-        other
-            .store()
-            .step_commits(implement.id)
-            .await
-            .expect("MemStore never fails a read"),
-        landed,
-        "the re-landing merged nothing new"
     );
     walked_to_done(&other, run).await;
 }
@@ -12554,8 +12546,8 @@ mod tests {
              beside it), and T3 repair 2's one (a rejection ending the run cancelling the other \
              parked step), and MOD-138 M3 T4's ten recovery cases (plan D6, blueprint A7-A9: two \
              unlanded branches landed in order, a reordered chain landing the node walked last, a \
-             done branch landed beside a running one, an already landed branch re-landed \
-             idempotently, only the later of two shared_serialized landings re-landed, two running \
+             done branch landed beside a running one, an already landed branch reconciled \
+             again, only the later of two shared_serialized landings re-landed, two running \
              branches both adjudicated, running branches recovered into a park each, and a re-run \
              loop target re-landed beside an older side successor, and a crash-cut unpark on a \
              branching run landing every frontier member, and an answer to one of two parks \
