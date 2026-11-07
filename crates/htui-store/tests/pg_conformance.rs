@@ -47,15 +47,16 @@ use htui_store::testkit as common;
 /// and MOD-144's nine item-status cases (plan "The rules", blueprint §T1.5) make it 228,
 /// and MOD-144 R1's `block_if_idle` case (M1) makes it 229,
 /// and MOD-138 M2's closed-`if`-set case (plan D4, W4) makes it 230,
-/// and MOD-138 M2's three `record_branch` cases (plan D5, Q-A) make it 233.
-const EXPECTED_CASES: usize = 233;
+/// and MOD-138 M2's three `record_branch` cases (plan D5, Q-A) make it 233,
+/// and MOD-138 M3's W5 mixed-`asks_you` case (plan D8, Q-3) makes it 234.
+const EXPECTED_CASES: usize = 234;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (233 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (234 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -63,7 +64,8 @@ fn case_list_matches_mem_store() {
          ten memory cases, MOD-138 M1's four walk-validator and five per-row default-edge \
          cases, three for D12's usable graphs and the review round's kept-kind-graph case, and \
          MOD-144's nine item-status cases and its R1 `block_if_idle` case, and MOD-138 M2's \
-         closed-`if`-set case and three `record_branch` cases)"
+         closed-`if`-set case and three `record_branch` cases, and MOD-138 M3's W5 \
+         mixed-`asks_you` case)"
     );
 }
 

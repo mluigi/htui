@@ -3246,6 +3246,19 @@ pub fn loop_edge_runs_forward(kind: EdgeKind, from: &str, to: &str, graph: StepG
     )
 }
 
+/// MOD-138 M3 D8 (W5, Q-3): node `phase` has two or more outgoing `asks_you` edges and at least
+/// one of them is a back edge (forward plus back, or back plus back). One answer cannot take every
+/// edge: the back edge loops and retires the node, so the other is never taken. Refused for good,
+/// at save and at resolve; the author splits the node.
+#[must_use]
+pub fn back_asks_you_beside_another_asks_you(phase: &str, graph: StepGraphId) -> String {
+    format!(
+        "phase `{phase}` in graph `{graph}` has a back `asks_you` edge beside another `asks_you` \
+         edge; one answer cannot take both, so a back `asks_you` edge must be its node's only \
+         `asks_you` edge: split the node"
+    )
+}
+
 /// MOD-138 A3 (D12): `delete_workspace` would cascade a graph that a kind (`holder` =
 /// `item_kind PREFIX`) or an item (`item KEY`) of project `project` (its slug) names; neither
 /// reference cascades, so the delete is refused before it writes anything.

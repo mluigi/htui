@@ -208,6 +208,22 @@ pub enum ResolveError {
         /// `step_graph_phase.fan_out`.
         fan_out: i32,
     },
+    /// MOD-138 M3 D7: two non-palette nodes that can be live together (neither reaches the other
+    /// over forward edges, [`forward_mask`]'s classification) both resolve to `local`, the
+    /// maintainer's one working tree. The first pair in position order. Every phase resolves to
+    /// `phase.isolation.unwrap_or(default_isolation)`, so a per-phase `worktree` override on
+    /// either node is the remedy, a `local` project's included.
+    #[error(
+        "phases `{first}` and `{second}` are both `local` and can run at the same time (neither \
+         reaches the other over forward edges), and `local` shares one working tree; set \
+         `worktree` isolation on one of them (MOD-138 M3 D7)"
+    )]
+    LocalConcurrent {
+        /// The earlier node's key, by position.
+        first: String,
+        /// The later node's key.
+        second: String,
+    },
     /// Plan D64 (OQ-5): a `review` phase cannot fan out, because the loop's gate reads one review
     /// verdict and a group's review would need a judge of reviews nothing defines. MOD-138 M2 D10
     /// widens it from the name to the rule: any node that reads its verdict (an outgoing
@@ -277,9 +293,9 @@ pub enum ResolveError {
     /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, the fanned-out node with an
-        /// `asks_you` or `fails` edge (blueprint A7), or the node with a back `asks_you` edge
-        /// beside another `asks_you` edge (R1, E1).
+        /// The node refused: the divide phase, the palette phase, or the fanned-out node with an
+        /// `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
+        /// the shared validator (W5), so it is an [`ResolveError::InvalidGraph`].
         node: String,
         /// Why.
         reason: NotRunnable,
@@ -304,15 +320,6 @@ pub enum NotRunnable {
     /// lifted D6(c): authored edges otherwise resolve.)
     #[error("a fanned-out node's `asks_you` or `fails` edge runs from MOD-138 M3")]
     FanOutEdge,
-    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
-    /// edges, at least one of them back (forward plus back, or back plus back). `ready()` takes
-    /// only the first back edge with budget and the loop retires the source, so a forward target
-    /// would never start while the loop has budget and approve could not take every edge (plan
-    /// Q-B). M3 (or MOD-141) lifts it.
-    #[error(
-        "a node with a back `asks_you` edge beside another `asks_you` edge runs from MOD-138 M3"
-    )]
-    MixedAsksYou,
 }
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the **typed** phase slice (plan D9).
@@ -398,8 +405,9 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 pub(crate) enum Resolution {
     /// The graph resolved: what [`resolve`] returns.
     Resolved(Box<Resolved>),
-    /// A D6 or D9 refusal raised once the phases were built: a [`ResolveError::NotYetRunnable`]
-    /// or a [`ResolveError::InvalidGraph`]. `phases` are the live phases in position order,
+    /// A D6, D9 or M3 D7 refusal raised once the phases were built: a
+    /// [`ResolveError::NotYetRunnable`], a [`ResolveError::InvalidGraph`] or a
+    /// [`ResolveError::LocalConcurrent`]. `phases` are the live phases in position order,
     /// before any `divide` expansion (MOD-138 D11), which is the shape a v1 run is compared on.
     Refused {
         /// The live phases, as built.
@@ -409,11 +417,12 @@ pub(crate) enum Resolution {
     },
 }
 
-/// [`resolve`], with its D6 and D9 refusals (blueprint A6) handed back beside the live phases
-/// built before them, so a v1 run's resume can compare those phases on the v1 digest. Every other
-/// error is [`resolve`]'s, in its order. The shared validator's refusal of the stored body comes
-/// before the phases are built, so it is held while they are; a phase that then fails to build
-/// raises the validator's refusal, as [`resolve`] always has, with no phases to compare.
+/// [`resolve`], with its D6 and D9 refusals (blueprint A6) and M3 D7's `local` refusal handed
+/// back beside the live phases built before them, so a v1 run's resume can compare those phases
+/// on the v1 digest. Every other error is [`resolve`]'s, in its order. The shared validator's
+/// refusal of the stored body comes before the phases are built, so it is held while they are; a
+/// phase that then fails to build raises the validator's refusal, as [`resolve`] always has, with
+/// no phases to compare.
 ///
 /// # Errors
 /// As [`resolve`], less the refusals carried by [`Resolution::Refused`].
@@ -547,14 +556,16 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         }
         Err(err) => return Err(err),
     }
-    // R1 (E1): a back `asks_you` edge beside another `asks_you` edge cannot run yet.
-    if let Err(refusal) = mixed_asks_you_refusal(&phases, &edges) {
+    if let Err(refusal) = not_yet_runnable(&phases) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
             refusal,
         });
     }
-    if let Err(refusal) = not_yet_runnable(&phases) {
+
+    // M3 D7: carried like D6's, so a v1 run walking a `local` graph M2 resolved is still compared
+    // on its phases at resume, and walks on while they match.
+    if let Err(refusal) = local_concurrent_refusal(&phases, &edges) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
             refusal,
@@ -718,16 +729,24 @@ fn fan_out_edge_refusal(
     Ok(())
 }
 
-/// R1 (E1, maintainer decision 2026-11-05), run after [`fan_out_edge_refusal`]: the first walked
-/// node in position order with two or more outgoing `asks_you` edges, at least one of them back,
-/// is [`NotRunnable::MixedAsksYou`]. Forward and back are [`forward_mask`]'s classification, the
-/// walker's own; an edge with a palette end or an unknown key is left out, as the walk leaves it
-/// out. `ready()` takes only the first back edge with budget and the loop retires the source, so
-/// on that shape approve could not take every edge (plan Q-B) until M3 (or MOD-141) runs it.
-fn mixed_asks_you_refusal(
+/// MOD-138 M3 D7, once the expansion passed the walk checks (so the forward edges are acyclic):
+/// the first pair, in position order, of non-palette nodes that both resolved to
+/// [`Isolation::Local`] and that neither reaches the other over forward edges (`next`, `if`, a
+/// forward `asks_you`: [`forward_mask`], the walker's own split) is
+/// [`ResolveError::LocalConcurrent`]. Such nodes can be live together, and `local` is one
+/// working tree. The reachability is built here over the snapshot's node keys; an edge naming a
+/// palette node or an unknown key is left out, as the walk leaves it out.
+fn local_concurrent_refusal(
     phases: &[SnapshotPhase],
     edges: &[SnapshotEdge],
 ) -> std::result::Result<(), ResolveError> {
+    let mut local: Vec<usize> = (0..phases.len())
+        .filter(|&node| !phases[node].palette && phases[node].isolation == Isolation::Local)
+        .collect();
+    if local.len() < 2 {
+        return Ok(());
+    }
+    local.sort_by_key(|&node| (phases[node].position, node));
     let nodes: Vec<WalkNode<'_>> = phases
         .iter()
         .map(|phase| WalkNode {
@@ -735,11 +754,7 @@ fn mixed_asks_you_refusal(
             palette: phase.palette,
         })
         .collect();
-    let index = |key: &str| {
-        phases
-            .iter()
-            .position(|phase| phase.name == key && !phase.palette)
-    };
+    let index = |key: &str| phases.iter().position(|phase| phase.name == key);
     let walk: Vec<WalkEdge> = edges
         .iter()
         .filter_map(|edge| {
@@ -750,23 +765,40 @@ fn mixed_asks_you_refusal(
             })
         })
         .collect();
-    let mask = forward_mask(&nodes, &walk);
-    let mut walked: Vec<usize> = (0..phases.len())
-        .filter(|&node| !phases[node].palette)
+    let mut forward = vec![Vec::new(); phases.len()];
+    for (edge, _) in walk
+        .iter()
+        .zip(forward_mask(&nodes, &walk))
+        .filter(|(_, forward)| *forward)
+    {
+        forward[edge.from].push(edge.to);
+    }
+    // Every node each `local` node reaches over forward edges, itself included.
+    let reached: Vec<Vec<bool>> = local
+        .iter()
+        .map(|&from| {
+            let mut seen = vec![false; phases.len()];
+            let mut queue = vec![from];
+            seen[from] = true;
+            while let Some(at) = queue.pop() {
+                for &next in &forward[at] {
+                    if !seen[next] {
+                        seen[next] = true;
+                        queue.push(next);
+                    }
+                }
+            }
+            seen
+        })
         .collect();
-    walked.sort_by_key(|&node| (phases[node].position, node));
-    for node in walked {
-        let asks: Vec<bool> = walk
-            .iter()
-            .zip(&mask)
-            .filter(|(edge, _)| edge.from == node && edge.kind == EdgeKind::AsksYou)
-            .map(|(_, &forward)| forward)
-            .collect();
-        if asks.len() >= 2 && asks.contains(&false) {
-            return Err(ResolveError::NotYetRunnable {
-                node: phases[node].name.clone(),
-                reason: NotRunnable::MixedAsksYou,
-            });
+    for (i, &first) in local.iter().enumerate() {
+        for (j, &second) in local.iter().enumerate().skip(i + 1) {
+            if !reached[i][second] && !reached[j][first] {
+                return Err(ResolveError::LocalConcurrent {
+                    first: phases[first].name.clone(),
+                    second: phases[second].name.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -1766,6 +1798,7 @@ mod tests {
         EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
         SnapshotSource, SourceHow, default_snapshot_edges,
     };
+    use htui_core::store::traits::back_asks_you_beside_another_asks_you;
     use htui_core::store::{
         MemStore, ReadStore, StoreError, UpdateOutcome, forward_edges_form_a_cycle,
         glob_names_unknown_repo, graph_body_walk_refusal, negative_position, references_no_row,
@@ -1779,7 +1812,7 @@ mod tests {
         ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunMode,
         SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
         effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
-        resolve, topology_v2,
+        resolve, snapshot_walk_refusal, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -5200,56 +5233,321 @@ question and not a test fix. Decide the version bump first, then paste the new d
         edges: &[(&str, &str)],
     ) -> std::result::Result<Resolved, ResolveError> {
         let store = MemStore::demo();
-        replace_feature(&store, |body| {
-            let id = |name: &str| {
-                body.nodes
-                    .iter()
-                    .find(|node| node.phase.name == name)
-                    .map(|node| node.phase.id)
-                    .expect("the feature graph has the phase")
-            };
-            let ends: Vec<(PhaseId, PhaseId)> =
-                edges.iter().map(|(from, to)| (id(from), id(to))).collect();
-            for (from, to) in ends {
-                body.edges.push(StepGraphEdge {
-                    id: EdgeId::new(),
-                    graph_id: ids::GRAPH_HTUI_FEAT,
-                    from,
-                    to,
-                    kind: EdgeKind::AsksYou,
-                    predicate: None,
-                    loop_limit: None,
-                });
-            }
-        })
-        .await;
+        replace_feature(&store, |body| with_asks_you(body, edges)).await;
         resolve_feat(&store, &TestSource::claude(&store)).await
     }
 
-    /// R1 (E1, maintainer decision 2026-11-05): a node with two or more outgoing `asks_you`
-    /// edges, one of them back, cannot run yet. `ready()` takes only the first open back edge and
-    /// the loop retires the source, so approve could never take every edge (plan Q-B). Forward
-    /// plus back, and back plus back, are both refused, naming the node.
+    /// `asks_you` edges `(from, to)` (no `loop_limit`) on the seeded feature graph's edges.
+    fn with_asks_you(body: &mut GraphBody, edges: &[(&str, &str)]) {
+        let id = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .expect("the feature graph has the phase")
+        };
+        let ends: Vec<(PhaseId, PhaseId)> =
+            edges.iter().map(|(from, to)| (id(from), id(to))).collect();
+        for (from, to) in ends {
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from,
+                to,
+                kind: EdgeKind::AsksYou,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+    }
+
+    /// The two mixed shapes of MOD-138 M3 D8 (W5) on the feature graph, with the node each names:
+    /// forward plus back, and back plus back.
+    const MIXED_ASKS_YOU: [(&str, [(&str, &str); 2]); 2] = [
+        ("plan", [("plan", "review"), ("plan", "prd")]),
+        ("review", [("review", "plan"), ("review", "prd")]),
+    ];
+
+    /// MOD-138 M3 D8 (W5, Q-3; was R1's resolve-only `MixedAsksYou`): a node with two or more
+    /// outgoing `asks_you` edges, one of them back, is refused at save for good, naming the node.
+    /// One answer cannot take every edge: the back edge loops and retires the node. Nothing is
+    /// written.
     #[tokio::test]
     async fn a_node_with_a_back_asks_you_beside_another_asks_you_is_refused() {
-        for (node, edges) in [
-            ("plan", [("plan", "review"), ("plan", "prd")]),
-            ("review", [("review", "plan"), ("review", "prd")]),
-        ] {
-            let error = resolve_with_asks_you(&edges)
+        for (node, edges) in MIXED_ASKS_YOU {
+            let store = MemStore::demo();
+            let before = store
+                .graph_body(ids::GRAPH_HTUI_FEAT)
                 .await
-                .expect_err("a mixed `asks_you` node cannot run yet");
+                .expect("MemStore never fails a read")
+                .expect("the seeded feature graph is there");
+            let mut body = before.clone();
+            with_asks_you(&mut body, &edges);
+            let outcome = store
+                .replace_graph(ids::GRAPH_HTUI_FEAT, before.graph.revision, body)
+                .await;
+            let sentence = back_asks_you_beside_another_asks_you(node, ids::GRAPH_HTUI_FEAT);
+            assert!(
+                matches!(&outcome, Err(StoreError::Constraint(said)) if *said == sentence),
+                "{edges:?}: {outcome:?}"
+            );
+            let after = store
+                .graph_body(ids::GRAPH_HTUI_FEAT)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the seeded feature graph is there");
+            assert_eq!(after, before, "{edges:?}: nothing written");
+        }
+    }
+
+    /// MOD-138 M3 D8: a live graph holding the mixed shape (planted under `replace_graph`) is
+    /// refused at resolve as an invalid graph with the store's sentence, no longer as a graph
+    /// that cannot run yet.
+    #[tokio::test]
+    async fn a_live_mixed_asks_you_graph_is_refused_as_invalid() {
+        for (node, edges) in MIXED_ASKS_YOU {
+            let store = store_with(|data| {
+                for (from, to) in edges {
+                    let (from, to) = (feature_phase(data, from), feature_phase(data, to));
+                    data.edges.push(StepGraphEdge {
+                        id: EdgeId::new(),
+                        graph_id: ids::GRAPH_HTUI_FEAT,
+                        from,
+                        to,
+                        kind: EdgeKind::AsksYou,
+                        predicate: None,
+                        loop_limit: None,
+                    });
+                }
+            });
+            let error = resolve_feat(&store, &TestSource::claude(&store))
+                .await
+                .expect_err("a mixed `asks_you` node is refused");
             assert_eq!(
                 error,
-                ResolveError::NotYetRunnable {
-                    node: node.to_owned(),
-                    reason: NotRunnable::MixedAsksYou,
+                ResolveError::InvalidGraph {
+                    graph: "feature".to_owned(),
+                    reason: back_asks_you_beside_another_asks_you(node, ids::GRAPH_HTUI_FEAT),
                 },
                 "{edges:?}"
             );
-            let sentence = error.to_string();
-            assert!(sentence.contains(&format!("`{node}`")), "{sentence}");
-            assert!(sentence.contains("MOD-138 M3"), "{sentence}");
+        }
+    }
+
+    /// MOD-138 M3 D8 (V8): W5 lives in `walk_refusal`, so resolve's post-expansion check refuses
+    /// a divide-expanded graph whose integrate node keeps the mixed shape.
+    #[tokio::test]
+    async fn a_divide_expanded_mixed_asks_you_is_refused_after_expansion() {
+        let (mut phases, mut edges) = feature_phases_and_edges().await;
+        phases[2].divide = Some(SnapshotDivide {
+            max_parts: Some(2),
+            ..SnapshotDivide::default()
+        });
+        for to in ["plan", "review"] {
+            edges.push(SnapshotEdge {
+                from: "implement".to_owned(),
+                to: to.to_owned(),
+                kind: EdgeKind::AsksYou,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+        let (phases, edges) = expand_divide("feature", phases, edges).expect("no key is taken");
+        assert!(
+            phases.iter().any(|phase| phase.name == "implement:plan"),
+            "expanded"
+        );
+        assert_eq!(
+            snapshot_walk_refusal(ids::GRAPH_HTUI_FEAT, &phases, &edges),
+            Some(back_asks_you_beside_another_asks_you(
+                "implement",
+                ids::GRAPH_HTUI_FEAT
+            ))
+        );
+    }
+
+    // ---- MOD-138 M3 D7: `local` on two nodes that can be live together ----
+
+    /// The feature graph as a diamond, `prd → {plan, implement} → review` over `next` edges (its
+    /// review loop kept), with `isolation` set per named node.
+    fn diamond(body: &mut GraphBody, isolation: &[(&str, Isolation)]) {
+        let id = |name: &str| {
+            body.nodes
+                .iter()
+                .find(|node| node.phase.name == name)
+                .map(|node| node.phase.id)
+                .expect("the feature graph has the phase")
+        };
+        let next: Vec<(PhaseId, PhaseId)> = [
+            ("prd", "plan"),
+            ("prd", "implement"),
+            ("plan", "review"),
+            ("implement", "review"),
+        ]
+        .iter()
+        .map(|(from, to)| (id(from), id(to)))
+        .collect();
+        body.edges.retain(|edge| edge.kind != EdgeKind::Next);
+        for (from, to) in next {
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from,
+                to,
+                kind: EdgeKind::Next,
+                predicate: None,
+                loop_limit: None,
+            });
+        }
+        for (name, mode) in isolation {
+            for node in &mut body.nodes {
+                if node.phase.name == *name {
+                    node.phase.isolation = Some(*mode);
+                }
+            }
+        }
+    }
+
+    /// The feature graph under `settings`, made a diamond with `isolation`, resolved for FEAT-1.
+    async fn resolve_diamond(
+        settings: Value,
+        isolation: &[(&str, Isolation)],
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let store = store_with_settings(settings);
+        replace_feature(&store, |body| diamond(body, isolation)).await;
+        resolve_feat(&store, &TestSource::claude(&store)).await
+    }
+
+    /// D7: `local` on a diamond's two arms, which neither reaches the other over forward edges,
+    /// is refused naming both nodes (first pair in position order) and the per-phase `worktree`
+    /// remedy.
+    #[tokio::test]
+    async fn local_on_a_diamonds_two_arms_is_refused() {
+        let error = resolve_diamond(
+            json!({}),
+            &[("plan", Isolation::Local), ("implement", Isolation::Local)],
+        )
+        .await
+        .expect_err("two `local` nodes that can be live together");
+        assert_eq!(
+            error,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "phases `plan` and `implement` are both `local` and can run at the same time (neither \
+             reaches the other over forward edges), and `local` shares one working tree; set \
+             `worktree` isolation on one of them (MOD-138 M3 D7)"
+        );
+
+        // A `local` project: every node is `local`, and the arms are still the first pair.
+        let error = resolve_diamond(json!({"default_isolation": "local"}), &[])
+            .await
+            .expect_err("a `local` project's diamond");
+        assert_eq!(
+            error,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+    }
+
+    /// D7, blueprint A6: `resolve_or_refused` hands `LocalConcurrent` back beside the live
+    /// phases it built, unexpanded and in position order, so a v1 run's resume compares them on
+    /// the v1 digest and walks on when they match, as it did before M3 refused a `local` diamond.
+    #[tokio::test]
+    async fn local_concurrent_carries_the_live_phases() {
+        let store = store_with_settings(json!({"default_isolation": "local"}));
+        replace_feature(&store, |body| diamond(body, &[])).await;
+        let item = feat_1(&store).await;
+        let resolution = super::resolve_or_refused(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("D7 refuses the graph once its phases are built");
+        let super::Resolution::Refused { phases, refusal } = resolution else {
+            panic!("a `local` project's diamond is refused");
+        };
+        assert_eq!(
+            refusal,
+            ResolveError::LocalConcurrent {
+                first: "plan".to_owned(),
+                second: "implement".to_owned(),
+            }
+        );
+        let names: Vec<(i32, &str)> = phases
+            .iter()
+            .map(|phase| (phase.position, phase.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [(0, "prd"), (1, "plan"), (2, "implement"), (3, "review")]
+        );
+    }
+
+    /// D7's remedy and its edges: a `local` project resolves its chain, and its diamond once one
+    /// arm says `worktree`; a diamond in `worktree`, or in `shared_serialized` on both arms,
+    /// resolves; one `local` arm beside a `worktree` one resolves.
+    #[tokio::test]
+    async fn local_on_a_chain_or_off_the_diamonds_arms_resolves() {
+        let store = store_with_settings(json!({"default_isolation": "local"}));
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a `local` chain is one node at a time")
+            .snapshot;
+        assert!(
+            snapshot
+                .phases
+                .iter()
+                .all(|phase| phase.isolation == Isolation::Local),
+            "{:?}",
+            snapshot.phases
+        );
+
+        for (settings, isolation, what) in [
+            (
+                json!({"default_isolation": "local"}),
+                &[("implement", Isolation::Worktree)][..],
+                "a `local` project, one arm `worktree`",
+            ),
+            (json!({}), &[][..], "the default `worktree`"),
+            (
+                json!({}),
+                &[
+                    ("plan", Isolation::SharedSerialized),
+                    ("implement", Isolation::SharedSerialized),
+                ][..],
+                "`shared_serialized` on both arms",
+            ),
+            (
+                json!({}),
+                &[("plan", Isolation::Local)][..],
+                "one `local` arm",
+            ),
+        ] {
+            let snapshot = resolve_diamond(settings, isolation)
+                .await
+                .unwrap_or_else(|error| panic!("{what} resolves: {error}"))
+                .snapshot;
+            assert_eq!(
+                snapshot
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::Next)
+                    .count(),
+                4,
+                "{what}: the diamond is frozen"
+            );
         }
     }
 

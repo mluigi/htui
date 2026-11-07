@@ -11,13 +11,13 @@ use crate::model::{
 use crate::prompt::template::TemplateRole;
 use crate::seed::{default_edge_plan, default_edges};
 use crate::store::traits::{
-    already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
-    edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
-    fan_out_below_one, forward_edges_form_a_cycle, if_predicate_outside_the_closed_set,
-    loop_edge_runs_forward, max_parts_below_one, palette_phase_has_edges, parts_off_divide,
-    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken,
-    phase_token_budget_refusal, reserved_phase_name, retry_limit_negative, row_names_another_graph,
-    row_names_another_phase, split_fan_out_mismatch,
+    already_exists, back_asks_you_beside_another_asks_you, divide_columns_off_divide,
+    edge_endpoint_outside_graph, edge_is_taken, edge_loop_limit_negative, edge_loops_to_itself,
+    edge_needs_loop_limit, edge_predicate_mismatch, fan_out_below_one, forward_edges_form_a_cycle,
+    if_predicate_outside_the_closed_set, loop_edge_runs_forward, max_parts_below_one,
+    palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_part_key_is_taken,
+    phase_position_is_taken, phase_token_budget_refusal, reserved_phase_name, retry_limit_negative,
+    row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
@@ -333,6 +333,10 @@ pub struct WalkEdge {
 ///   re-entered node round to it again).
 /// - W3: per edge in slice order, a `changes_requested` or `fails` edge must be a back edge: its
 ///   target reaches its source over the forward edges, else [`loop_edge_runs_forward`].
+/// - W5 (MOD-138 M3 D8, Q-3): per node in slice order, two or more outgoing `asks_you` edges with
+///   at least one of them back, [`back_asks_you_beside_another_asks_you`]. It sits here rather
+///   than in [`graph_body_walk_refusal`] so resolve's post-expansion check, which calls this
+///   directly, refuses it too; it therefore fires before the wrapper's W4.
 ///
 /// "Every cycle is closed by a `changes_requested`, `fails` or `asks_you` edge" is a
 /// consequence: with the forward edges acyclic, every cycle holds a non-forward edge, and the
@@ -366,6 +370,35 @@ pub fn walk_refusal(
         .map(|edge| {
             loop_edge_runs_forward(edge.kind, nodes[edge.from].name, nodes[edge.to].name, graph)
         })
+        .or_else(|| mixed_asks_you_refusal(graph, nodes, edges, &mask))
+}
+
+/// MOD-138 M3 D8 (W5), after W1 to W3: the first counted node in slice order with two or more
+/// outgoing `asks_you` edges, at least one of them back by `mask` ([`forward_mask`]). One answer
+/// cannot take both: the back edge loops and retires the node, so the other is never taken. An
+/// edge on a palette node, or naming an index outside `nodes`, is not counted.
+fn mixed_asks_you_refusal(
+    graph: StepGraphId,
+    nodes: &[WalkNode<'_>],
+    edges: &[WalkEdge],
+    mask: &[bool],
+) -> Option<String> {
+    let counted = |end: usize| nodes.get(end).is_some_and(|node| !node.palette);
+    (0..nodes.len())
+        .filter(|&node| counted(node))
+        .find(|&node| {
+            let (asks, back) = edges
+                .iter()
+                .zip(mask)
+                .filter(|(edge, _)| {
+                    edge.from == node && edge.kind == EdgeKind::AsksYou && counted(edge.to)
+                })
+                .fold((0_usize, false), |(asks, back), (_, &forward)| {
+                    (asks + 1, back || !forward)
+                });
+            asks >= 2 && back
+        })
+        .map(|node| back_asks_you_beside_another_asks_you(nodes[node].name, graph))
 }
 
 /// MOD-138 M2 D2: per edge, whether it is forward: `next`, `if`, and an `asks_you` whose target
@@ -474,9 +507,10 @@ fn first_cycle(next: &[Vec<usize>]) -> Option<Vec<usize>> {
 
 /// MOD-138 D9 over a body: nodes in body order, edges in body order, by phase name; an edge
 /// naming a phase the body lacks is skipped (rule (a) of [`graph_body_topology_refusal`] refuses
-/// it first). Then MOD-138 M2's W4: an `if` predicate outside the closed set. Both stores'
-/// `replace_graph` call it straight after the topology rules, resolve reads a live graph through
-/// it, and `htui_orch::graph::override_graph` pre-checks a clone with it.
+/// it first); W5 (MOD-138 M3 D8) is part of that walk. Then MOD-138 M2's W4: an `if` predicate
+/// outside the closed set. Both stores' `replace_graph` call it straight after the topology
+/// rules, resolve reads a live graph through it, and `htui_orch::graph::override_graph`
+/// pre-checks a clone with it.
 #[must_use]
 pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<String> {
     let index: HashMap<PhaseId, usize> = body
@@ -655,8 +689,9 @@ mod tests {
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
     use crate::store::traits::{
-        fan_out_below_one, forward_edges_form_a_cycle, if_predicate_outside_the_closed_set,
-        loop_edge_runs_forward, phase_token_budget_refusal, retry_limit_negative,
+        back_asks_you_beside_another_asks_you, fan_out_below_one, forward_edges_form_a_cycle,
+        if_predicate_outside_the_closed_set, loop_edge_runs_forward, phase_token_budget_refusal,
+        retry_limit_negative,
     };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
@@ -1738,6 +1773,137 @@ mod tests {
                 "review",
                 graph
             ))
+        );
+        body.edges.pop();
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(if_predicate_outside_the_closed_set(
+                "plan",
+                "review",
+                graph,
+                &PredicateError::BadValue {
+                    key: "verify",
+                    want: "\"passed\" or \"failed\""
+                }
+                .to_string(),
+            ))
+        );
+    }
+
+    // ---- MOD-138 M3: W5, a back `asks_you` beside another `asks_you` (plan D8, Q-3) ----
+
+    /// D8 (W5): a node with a back `asks_you` edge beside a forward one, or beside a second back
+    /// one, is refused naming the node.
+    #[test]
+    fn w5_a_back_asks_you_beside_another_asks_you_is_refused() {
+        let (graph, mut body) = bare(&["a", "b", "c"]);
+        let (a, b, c) = (id_of(&body, "a"), id_of(&body, "b"), id_of(&body, "c"));
+        let chain = vec![
+            edge(graph, a, b, EdgeKind::Next),
+            edge(graph, b, c, EdgeKind::Next),
+        ];
+        for (node, asks) in [("b", [(b, a), (b, c)]), ("c", [(c, a), (c, b)])] {
+            body.edges.clone_from(&chain);
+            body.edges.extend(
+                asks.iter()
+                    .map(|&(from, to)| edge(graph, from, to, EdgeKind::AsksYou)),
+            );
+            assert_eq!(
+                graph_body_walk_refusal(graph, &body),
+                Some(back_asks_you_beside_another_asks_you(node, graph)),
+                "{node}: forward plus back, then back plus back"
+            );
+        }
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body).as_deref(),
+            Some(
+                format!(
+                    "phase `c` in graph `{graph}` has a back `asks_you` edge beside another \
+                     `asks_you` edge; one answer cannot take both, so a back `asks_you` edge \
+                     must be its node's only `asks_you` edge: split the node"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// W5 leaves alone what the `asks_you` stop answers: two forward `asks_you` edges out of one
+    /// node, and a single back one.
+    #[test]
+    fn w5_forward_asks_you_edges_or_a_single_back_one_pass() {
+        let (graph, mut body) = bare(&["a", "b", "c"]);
+        let (a, b, c) = (id_of(&body, "a"), id_of(&body, "b"), id_of(&body, "c"));
+        body.edges = vec![
+            edge(graph, a, b, EdgeKind::AsksYou),
+            edge(graph, a, c, EdgeKind::AsksYou),
+        ];
+        assert_eq!(graph_body_walk_refusal(graph, &body), None, "two forward");
+        body.edges = vec![
+            edge(graph, a, b, EdgeKind::Next),
+            edge(graph, b, c, EdgeKind::Next),
+            edge(graph, c, a, EdgeKind::AsksYou),
+        ];
+        assert_eq!(graph_body_walk_refusal(graph, &body), None, "one back");
+    }
+
+    /// W5 counts no `asks_you` edge on a palette node or past the slice, as the walk counts none.
+    #[test]
+    fn w5_skips_palette_and_stray_asks_you_edges() {
+        let walk_node = |name, palette| WalkNode { name, palette };
+        let nodes = [
+            walk_node("a", false),
+            walk_node("b", false),
+            walk_node("p", true),
+        ];
+        let walk_edge = |from, to, kind| WalkEdge { from, to, kind };
+        let edges = [
+            walk_edge(0, 1, EdgeKind::Next),
+            walk_edge(1, 0, EdgeKind::AsksYou),
+            walk_edge(1, 2, EdgeKind::AsksYou),
+            walk_edge(1, 9, EdgeKind::AsksYou),
+        ];
+        let graph = StepGraphId::new();
+        assert_eq!(walk_refusal(graph, &nodes, &edges), None);
+        let mut mixed = edges.to_vec();
+        mixed.push(walk_edge(1, 0, EdgeKind::AsksYou));
+        assert_eq!(
+            walk_refusal(graph, &nodes, &mixed),
+            Some(back_asks_you_beside_another_asks_you("b", graph)),
+            "two back edges to one target still count twice"
+        );
+    }
+
+    /// W5 fires after W1 to W3 and before W4: a forward `fails` is named first; once mended, the
+    /// mixed node; once split, the `if` predicate.
+    #[test]
+    fn w5_fires_after_the_loop_rules_and_before_w4() {
+        let (graph, mut body) = body();
+        let (plan, implement, review) = (
+            id_of(&body, "plan"),
+            id_of(&body, "implement"),
+            id_of(&body, "review"),
+        );
+        let mut guarded = edge(graph, plan, review, EdgeKind::If);
+        guarded.predicate = Some(EdgePredicate(serde_json::json!({"verify": "maybe"})));
+        body.edges.push(guarded);
+        body.edges
+            .push(edge(graph, review, plan, EdgeKind::AsksYou));
+        body.edges
+            .push(edge(graph, review, implement, EdgeKind::AsksYou));
+        body.edges.push(edge(graph, plan, review, EdgeKind::Fails));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(loop_edge_runs_forward(
+                EdgeKind::Fails,
+                "plan",
+                "review",
+                graph
+            ))
+        );
+        body.edges.pop();
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(back_asks_you_beside_another_asks_you("review", graph))
         );
         body.edges.pop();
         assert_eq!(
