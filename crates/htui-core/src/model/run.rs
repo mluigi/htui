@@ -650,23 +650,41 @@ impl GraphSnapshot {
             .any(|edge| edge.from == node && edge.kind == EdgeKind::ChangesRequested)
     }
 
-    /// MOD-144 (ANA-35 §7.1 `default_for`): the `output_kind` of the snapshot's highest-`position`
-    /// phase, read from `phases[]` alone so any `v` decodes; `None` without phases. A phase with
-    /// no readable `position` or `output_kind` is skipped.
+    /// MOD-144 (ANA-35 §7.1 `default_for`): the `output_kind` of the snapshot's last phase, read
+    /// from the raw JSON so any `v` decodes; `None` without phases. A phase with no readable
+    /// `position` or `output_kind` is skipped.
+    ///
+    /// MOD-138 M3 D9: "last" follows the graph. With an `edges` array it is the highest-`position`
+    /// non-palette **sink**, a phase with no forward out-edge ([`forward_mask`] over the decoded
+    /// edges, so a back edge does not count). Without edges (a v1 blob), or when no sink has a
+    /// readable kind, it is the highest `position`, as before. An edge whose ends or kind do not
+    /// decode is left out.
+    ///
+    /// [`forward_mask`]: crate::store::forward_mask
     #[must_use]
     pub fn last_output_kind(snapshot: &Value) -> Option<String> {
-        snapshot
-            .get("phases")?
-            .as_array()?
-            .iter()
-            .filter_map(|phase| {
-                Some((
-                    phase.get("position")?.as_i64()?,
-                    phase.get("output_kind")?.as_str()?,
-                ))
-            })
-            .max_by_key(|(position, _)| *position)
-            .map(|(_, kind)| kind.to_owned())
+        let phases = snapshot.get("phases")?.as_array()?;
+        let highest = |keep: &dyn Fn(usize) -> bool| {
+            phases
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| keep(*index))
+                .filter_map(|(_, phase)| {
+                    Some((
+                        phase.get("position")?.as_i64()?,
+                        phase.get("output_kind")?.as_str()?,
+                    ))
+                })
+                .max_by_key(|(position, _)| *position)
+                .map(|(_, kind)| kind.to_owned())
+        };
+        if let Some(edges) = snapshot.get("edges").and_then(Value::as_array) {
+            let sinks = raw_sinks(phases, edges);
+            if let Some(kind) = highest(&|index| sinks[index]) {
+                return Some(kind);
+            }
+        }
+        highest(&|_| true)
     }
 
     /// MOD-26 D12, I-4: the frozen persona `phase` names. `Ok(None)` for a persona-less phase;
@@ -693,6 +711,47 @@ impl GraphSnapshot {
                 persona: name.to_owned(),
             })
     }
+}
+
+/// MOD-138 M3 D9: per raw phase, whether it is a non-palette sink: no forward out-edge per
+/// [`crate::store::forward_mask`] over the raw edges that decode (both keys name a phase, the
+/// first holding it; the kind parses).
+fn raw_sinks(phases: &[Value], edges: &[Value]) -> Vec<bool> {
+    use crate::store::{WalkEdge, WalkNode, forward_mask};
+
+    let names: Vec<Option<&str>> = phases
+        .iter()
+        .map(|phase| phase.get("name").and_then(Value::as_str))
+        .collect();
+    let nodes: Vec<WalkNode<'_>> = phases
+        .iter()
+        .zip(&names)
+        .map(|(phase, name)| WalkNode {
+            name: name.unwrap_or_default(),
+            palette: phase
+                .get("palette")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect();
+    let index = |key: &str| names.iter().position(|name| *name == Some(key));
+    let walk_edges: Vec<WalkEdge> = edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: index(edge.get("from")?.as_str()?)?,
+                to: index(edge.get("to")?.as_str()?)?,
+                kind: serde_json::from_value(edge.get("kind")?.clone()).ok()?,
+            })
+        })
+        .collect();
+    let mut sinks: Vec<bool> = nodes.iter().map(|node| !node.palette).collect();
+    for (edge, forward) in walk_edges.iter().zip(forward_mask(&nodes, &walk_edges)) {
+        if forward {
+            sinks[edge.from] = false;
+        }
+    }
+    sinks
 }
 
 /// The `step_graph` half of a [`GraphSnapshot`].
@@ -1565,6 +1624,76 @@ mod tests {
         assert_eq!(
             GraphSnapshot::last_output_kind(&json!({"phases": [{"position": 0}]})),
             None
+        );
+    }
+
+    /// MOD-138 M3 D9: with an `edges` array, the highest-position non-palette sink (no forward
+    /// out-edge, per `forward_mask`); a back edge does not make a node a source.
+    #[test]
+    fn last_output_kind_reads_the_graphs_sink() {
+        use super::GraphSnapshot;
+        let mut diamond = json!({
+            "v": 2,
+            "phases": [
+                {"position": 0, "name": "a", "output_kind": "plan"},
+                {"position": 1, "name": "d", "output_kind": "verdict"},
+                {"position": 2, "name": "b", "output_kind": "code"},
+                {"position": 3, "name": "c", "output_kind": "docs"},
+                {"position": 4, "name": "p", "output_kind": "note", "palette": true},
+            ],
+            "edges": [
+                {"from": "a", "to": "b", "kind": "next"},
+                {"from": "a", "to": "c", "kind": "next"},
+                {"from": "b", "to": "d", "kind": "next"},
+                {"from": "c", "to": "d", "kind": "next"},
+                {"from": "d", "to": "b", "kind": "changes_requested", "loop_limit": 2},
+            ]
+        });
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&diamond).as_deref(),
+            Some("verdict"),
+            "the join is the one sink, below the arms' positions; the palette node is no sink"
+        );
+        diamond.as_object_mut().expect("an object").remove("edges");
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&diamond).as_deref(),
+            Some("note"),
+            "without edges: the highest position, as before"
+        );
+
+        let branch = json!({
+            "v": 2,
+            "phases": [
+                {"position": 0, "name": "a", "output_kind": "plan"},
+                {"position": 1, "name": "b", "output_kind": "code"},
+                {"position": 2, "name": "c", "output_kind": "docs"},
+                {"position": 3, "name": "x", "output_kind": "notes"},
+            ],
+            "edges": [
+                {"from": "a", "to": "b", "kind": "if"},
+                {"from": "a", "to": "c", "kind": "if"},
+                {"from": "c", "to": "a", "kind": "asks_you"},
+                {"from": "x", "to": "b", "kind": "next"},
+            ]
+        });
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&branch).as_deref(),
+            Some("docs"),
+            "two sinks, `b` and `c`: the higher; `c`'s back `asks_you` is not forward, and `x` is a source"
+        );
+
+        let unreadable = json!({
+            "v": 2,
+            "phases": [
+                {"position": 0, "name": "a", "output_kind": "plan"},
+                {"position": 1, "name": "b"},
+            ],
+            "edges": [{"from": "a", "to": "b", "kind": "next"}]
+        });
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&unreadable).as_deref(),
+            Some("plan"),
+            "no sink with a readable kind: the highest position that has one"
         );
     }
 
