@@ -27464,6 +27464,29 @@ async fn user_slug_cannot_start_with_at<S: WriteStore>(store: &S) {
         ("@platform", "Cross-project work"),
         "{CASE}: a scope row's other columns are editable"
     );
+    let titled = applied(
+        CASE,
+        store
+            .update_project(
+                ids::PROJECT_SCOPE_PLATFORM,
+                named.updated_at,
+                ProjectPatch {
+                    name: Some("Platform scope".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            titled.slug.as_str(),
+            titled.name.as_str(),
+            titled.description.as_str()
+        ),
+        ("@platform", "Platform scope", "Cross-project work"),
+        "{CASE}: a name-only patch on the scope row applies"
+    );
 }
 
 /// MOD-147 D5: a scope row is seeded with one kind, `WS`, whose project-scoped graph is `plan`
