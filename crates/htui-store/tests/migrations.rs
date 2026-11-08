@@ -6602,7 +6602,16 @@ async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
         .expect("apply 0001 through 0025");
     let pool = &db.pool;
     let user = insert_user(pool, "mod147").await;
-    let shop = insert_workspace(pool, user, "shop").await;
+    // `shop` gets a name that differs from its slug, so the name check tells them apart.
+    let shop = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO workspace (id, slug, name, created_by) VALUES ($1, 'shop', 'Shop Floor', $2)",
+    )
+    .bind(shop)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("insert workspace `shop`");
     let lab = insert_workspace(pool, user, "lab").await;
     MIGRATOR.run(pool).await.expect("apply 0026");
 
@@ -6611,7 +6620,8 @@ async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
             .seed_if_empty_as("mod147")
             .await
             .unwrap_or_else(|err| panic!("the {pass} bootstrap pass: {err}"));
-        for (workspace, slug) in [(shop, "shop"), (lab, "lab")] {
+        for (workspace, slug, workspace_name) in [(shop, "shop", "Shop Floor"), (lab, "lab", "lab")]
+        {
             let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
                 "SELECT id, slug, name, type FROM project WHERE owner_workspace_id = $1",
             )
@@ -6627,7 +6637,7 @@ async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
             let (scope, scope_slug, name, project_type) = rows[0].clone();
             assert_eq!(
                 (scope_slug.as_str(), name.as_str(), project_type.as_str()),
-                (format!("@{slug}").as_str(), slug, "workspace"),
+                (format!("@{slug}").as_str(), workspace_name, "workspace"),
                 "{pass} pass: `@<slug>`, the workspace's name, type `workspace`"
             );
             let kinds: Vec<String> =
