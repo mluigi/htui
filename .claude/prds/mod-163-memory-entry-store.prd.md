@@ -119,8 +119,8 @@ Decisions taken at the PRD gate (maintainer, 2026-10-20):
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Entry store | Project memory entries can be written, edited, retired and listed with version history, scrubbed and compare-and-set, on every store backend | complete | `.claude/plans/mod-163-m1-entry-store.plan.md` |
-| 2 | Prompt section | Every phase step prompt of a project carries its active entries from a run-start snapshot, capped, trimmed in rank, recorded in `trim_record` v5; no-memory prompts unchanged | pending | — |
-| 3 | TUI pane and switch | The maintainer lists, writes, edits and retires a project's entries from Settings, and sets the capture switch at app and project level | pending | — |
+| 2 | Prompt section | Every phase step prompt of a project carries its active entries from a run-start snapshot, capped, trimmed in rank, recorded in `trim_record` v5; no-memory prompts unchanged | in-progress | `.claude/plans/mod-163-m2-m3-prompt-section-and-pane.plan.md` |
+| 3 | TUI pane and switch | The maintainer lists, writes, edits and retires a project's entries from Settings, and sets the capture switch at app and project level | in-progress | `.claude/plans/mod-163-m2-m3-prompt-section-and-pane.plan.md` |
 
 ## Open Questions
 
