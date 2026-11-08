@@ -534,8 +534,8 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// the drain; a loop on one branch retires only
 /// its region; and an owed loop runs before its comparable successor.
 ///
-/// **Thirteen for MOD-138 M3 T4** (plan D6; blueprint A7-A10, the hand-back twin of T3's
-/// repair 2, and T4 repair 1's two): recovery among concurrent landings. Every done winner that may not have landed is
+/// **Fourteen for MOD-138 M3 T4** (plan D6; blueprint A7-A10, the hand-back twin of T3's
+/// repair 2, T4 repair 1's two and T4 repair 2's one): recovery among concurrent landings. Every done winner that may not have landed is
 /// re-landed, in topological order, by the sweep, by a crash-cut unpark's resume and, before its
 /// own step, by an answer (A10): two unlanded branches, two answered parks, the node a reordered
 /// chain walked last, a done branch beside a still running one, an already landed branch
@@ -544,12 +544,15 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// recovered into parks park each without `StaleWrite`. A rejection handed back beside another
 /// parked step ends the run and cancels that step, as the in-process answer does. And T4
 /// repair 1's two: a looping rejection, answered or resumed, lands a crashed answer's winner
-/// first.
+/// first. And T4 repair 2's one: a looping rejection handed back walks its loop as the in-process
+/// answer does.
 ///
-/// **Five for MOD-138 M3 R1's input order** (review finding 1, maintainer 2026-11-08, "order by
-/// inputs"): a node listing a kind an incomparable node produces waits for that producer to
-/// finish, whichever position is lower; a two-way pair runs the lower position first, a cycle of
-/// waits its lowest once nothing else can run, and a skipped producer leaves the kind optional.
+/// **Six for MOD-138 M3 R1** (the review's findings, maintainer 2026-11-08). Five for finding 1's
+/// input order ("order by inputs"): a node listing a kind an incomparable node produces waits for
+/// that producer to finish, whichever position is lower; a two-way pair runs the lower position
+/// first, a cycle of waits its lowest once nothing else can run, and a skipped producer leaves the
+/// kind optional. And finding 6's one: a rejection handed back beside an A7 recovery's
+/// interrupted park ends the run as the in-process answer does.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -881,6 +884,9 @@ pub const CASES: &[&str] = &[
     "a_two_way_input_pair_runs_the_lower_position_first",
     "a_cycle_of_input_waits_runs_its_lowest_position_first",
     "a_skipped_producer_leaves_its_kind_optional",
+    // MOD-138 M3 R1 (review finding 6, T4's leftover): the hand-back twin of a rejection beside
+    // an A7 recovery park ends the run as the in-process answer does.
+    "a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_process",
 ];
 
 /// Run one case by name.
@@ -12747,6 +12753,13 @@ fn review_fix_case<'a, H: CaseHarness>(
         "a_skipped_producer_leaves_its_kind_optional" => {
             Box::pin(a_skipped_producer_leaves_its_kind_optional(harness))
         }
+        "a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_process" => {
+            Box::pin(
+                a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_process(
+                    harness,
+                ),
+            )
+        }
         _ => return None,
     })
 }
@@ -12950,6 +12963,94 @@ async fn a_skipped_producer_leaves_its_kind_optional<H: CaseHarness>(harness: &H
     );
 }
 
+/// The diamond with `plan` out of retries and `implement` gated `always`, crashed with both
+/// sessions live (each stalled after its `done`, only `implement` with its document) and adopted
+/// by a second process: A7 parks the run over `plan`'s interrupted row (D94) and `implement`
+/// re-settles into its gate's park. Returns the adopter and the run.
+async fn parked_beside_an_interrupted_branch<O: Orchestrate>(orch: &O) -> (O, RunId) {
+    feat_3_graph(orch, DIAMOND, |phase| match phase.name.as_str() {
+        "plan" => phase.retry_limit = 0,
+        "implement" => phase.gate = Gate::Always,
+        _ => {}
+    })
+    .await;
+    let stalls = [
+        orch.stall_after_done("plan", 1, None, false),
+        orch.stall_after_done("implement", 1, None, true),
+    ];
+    let run = crash_on_all(orch, ids::HTUI_FEAT_3, &stalls).await;
+    let other = orch.restarted();
+    assert!(
+        matches!(
+            adopted_next(&other, run).await,
+            Next::Parked(Rest {
+                failure: Some(RunFailure::Interrupted { .. }),
+                position: Some(1),
+                ..
+            })
+        ),
+        "A7 parks over `plan`'s interrupted row"
+    );
+    assert_eq!(
+        sorted_shape(&other, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed),
+            (2, 1, StepStatus::AwaitingApproval),
+        ],
+        "`implement` parked at its gate beside the interrupted `plan`"
+    );
+    (other, run)
+}
+
+/// MOD-138 M3 R1 (T4 leftover, review finding 6): the hand-back twin of a rejection beside an
+/// A7 recovery park. `implement`'s gate is rejected (no loop edge) while `plan`'s interrupted row
+/// keeps the run parked. In process the answer's tail fails the run at `implement`; handed back
+/// on a `worker` box, the adopter's `recover_run` now finishes the rejection too, rather than
+/// reading D131's lowest `failed` row (`plan`'s) and re-parking on it.
+async fn a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_process<
+    H: CaseHarness,
+>(
+    harness: &H,
+) {
+    let rejected = || GateAnswer::Rejected {
+        note: "wrong implementation".to_owned(),
+    };
+    let (control, c_run) = parked_beside_an_interrupted_branch(&harness.fresh()).await;
+    let expected = answer_at(&control, c_run, 2, rejected()).await;
+    assert_eq!(
+        (expected.run, expected.position, expected.failure.clone()),
+        (
+            RunStatus::Failed,
+            Some(2),
+            Some(RunFailure::Rejected {
+                phase: "implement".to_owned()
+            })
+        ),
+        "in process the rejection ends the run"
+    );
+
+    let (a, run) = parked_beside_an_interrupted_branch(&harness.fresh()).await;
+    a.set_tails(Tails::HandBack);
+    let rest = answer_at(&a, run, 2, rejected()).await;
+    assert_handed_back(&a, run, &rest).await;
+
+    let b = a.restarted();
+    let Resume::Walked(rest) = adopted(&b, run).await else {
+        panic!("the live graph did not move, so the adopter walks its snapshot");
+    };
+    assert_eq!(
+        rest, expected,
+        "the adopter ends the run where the in-process tail does"
+    );
+    assert_eq!(run_of(&b, run).await.status, RunStatus::Failed);
+    assert_eq!(
+        sorted_shape(&b, run).await,
+        sorted_shape(&control, c_run).await,
+        "and writes the same rows"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -12974,8 +13075,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            179,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            180,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -13051,7 +13152,8 @@ mod tests {
              and resumed), and T4 repair 2's one (a looping rejection handed back walking its \
              loop as in process), and MOD-138 M3 R1's five input-order cases (review finding 1: \
              a consumer waiting for an incomparable producer, the reversed direction, a two-way \
-             pair, a cycle of waits, and a skipped producer)"
+             pair, a cycle of waits, and a skipped producer), and R1's finding-6 one (a \
+             rejection handed back beside an interrupted park ending the run as in process)"
         );
     }
 

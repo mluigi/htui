@@ -3331,7 +3331,8 @@ where
     ///    stops it: every row still unsettled is cancelled with the cut's note
     ///    ([`Self::cancel_unsettled`]) and that end is the answer. Otherwise the first park is.
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
-    ///    completes the park. A rejection handed back beside it (`Tails::HandBack`) is finished
+    ///    completes the park. A rejection handed back beside it, or beside an A7 recovery's
+    ///    interrupted park (R1), (`Tails::HandBack`) is finished
     ///    first, as the in-process answer's tail finishes it: an end cancels the waiting rows,
     ///    and a loop that resumed is walked ([`Next::Walk`]) before anything re-parks.
     /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
@@ -3393,11 +3394,29 @@ where
         // the loop target and re-parks over the other step (A6), where D96 would re-park over an
         // unwalked loop. A linear run never has a waiting row beside its rejected one, and D131
         // below finishes that as ever.
+        //
+        // MOD-138 M3 R1 (review finding 6): a waiting step is also an A7 recovery's park, the
+        // latest row of a reached node `failed` as interrupted (D94, D93) with no gate answer.
+        // Otherwise D131 below reads the lower-position interrupted row first and re-parks on it,
+        // where the in-process answer ends the run.
+        let ready = crate::walk::ready(&snapshot, &steps);
+        let interrupted_park = |at: &Cursor| {
+            matches!(at, Cursor::Rest { step, status: StepStatus::Failed }
+            if steps.iter().any(|row| {
+                row.id == *step
+                    && row.gate_outcome.is_none()
+                    && row
+                        .gate_note
+                        .as_deref()
+                        .is_some_and(|note| note.starts_with(INTERRUPTED))
+            }))
+        };
         if row.status == RunStatus::Running
-            && steps
+            && (steps
                 .iter()
                 .any(|step| step.status == StepStatus::AwaitingApproval)
-            && let Some(rejected) = crate::walk::ready(&snapshot, &steps)
+                || ready.iter().any(interrupted_park))
+            && let Some(rejected) = ready
                 .iter()
                 .find_map(|at| crashed_rejection(at, &steps))
                 .cloned()
