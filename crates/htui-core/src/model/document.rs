@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::ids::{DocumentId, ItemId, StepId, UserId};
+use crate::model::ids::{DocumentId, ItemId, ProjectId, StepId, UserId};
 
 /// A row of `document` (§5.5), body included.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +23,51 @@ pub struct Document {
     pub body: String,
     /// `document.produced_by_step_id`; `None` means written by hand.
     pub produced_by_step_id: Option<StepId>,
+    /// `document.created_by`.
+    pub created_by: UserId,
+    /// `document.created_at`.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A `document` row a project — or a workspace's scope row — owns: `item_id IS NULL` (MOD-147 D2,
+/// ANA-35 §7.5). Body included; versions are per `(project, kind)`. [`Document`] stays item-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnerDocument {
+    /// `document.id`.
+    pub id: DocumentId,
+    /// `document.project_id`: the owner.
+    pub project_id: ProjectId,
+    /// `document.kind`, e.g. `goals`.
+    pub kind: String,
+    /// `document.version`, per `(project, kind)` among the owner's documents.
+    pub version: i32,
+    /// `document.title`.
+    pub title: String,
+    /// `document.body`.
+    pub body: String,
+    /// `document.produced_by_step_id`; `None` for every row M1 writes.
+    pub produced_by_step_id: Option<StepId>,
+    /// `document.created_by`.
+    pub created_by: UserId,
+    /// `document.created_at`.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::write_owner_document`]: everything but `version`, which
+/// the store allocates under the owner's row lock, and `produced_by_step_id`, which is always `NULL`
+/// (a person writes an owner document, ANA-35 §7.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewOwnerDocument {
+    /// `document.id`, minted client-side as a UUIDv7.
+    pub id: DocumentId,
+    /// `document.project_id`: the owner.
+    pub project_id: ProjectId,
+    /// `document.kind`.
+    pub kind: String,
+    /// `document.title`.
+    pub title: String,
+    /// `document.body`.
+    pub body: String,
     /// `document.created_by`.
     pub created_by: UserId,
     /// `document.created_at`.

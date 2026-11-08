@@ -117,13 +117,15 @@ pub use box_::{
     BoxTool, DECLARED_TAG_MAX, DEFAULT_MAX_CONCURRENT_ITEMS, Executor, OsFamily, ProbedTool,
     canonical_declared_tags, declared_tags_from_text, is_declared_tag,
 };
-pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
+pub use document::{
+    Document, DocumentHead, NewDocument, NewOwnerDocument, OwnerDocument, ResolvedInput,
+};
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hand_written::HandWrittenError;
 pub use hierarchy::{
     NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, ProjectType, Repo,
-    RepoBoxPath, RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject,
-    WorkspaceSummary,
+    RepoBoxPath, RepoPatch, WORKSPACES_DIR, Workspace, WorkspaceBoxPath, WorkspacePatch,
+    WorkspaceProject, WorkspaceSummary, workspace_folder,
 };
 pub use ids::{
     AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, MemoryEntryId,

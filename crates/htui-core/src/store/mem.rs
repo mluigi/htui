@@ -55,6 +55,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
+use crate::model::{NewOwnerDocument, OwnerDocument};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
@@ -90,6 +91,10 @@ use crate::store::traits::{
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     workspace_graph_is_held,
+};
+use crate::store::traits::{
+    project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
+    scope_row_slug_is_fixed, workspace_has_live_run,
 };
 use uuid::Uuid;
 
@@ -284,6 +289,9 @@ struct State {
     notes: Vec<Note>,
     /// `document`, bodies included.
     documents: Vec<Document>,
+    /// MOD-147 D2: the `document` rows with `item_id IS NULL`, a project's (or a scope row's)
+    /// own, kept apart from `documents` so no item-document reader can meet one.
+    owner_documents: Vec<OwnerDocument>,
     /// `run`.
     runs: HashMap<RunId, Run>,
     /// `run_step`.
@@ -434,6 +442,7 @@ impl MemStore {
             links: data.links,
             notes: data.notes,
             documents: data.documents,
+            owner_documents: Vec::new(),
             runs: data.runs.into_iter().map(|row| (row.id, row)).collect(),
             steps: data.steps.into_iter().map(|row| (row.id, row)).collect(),
             step_trees: BTreeMap::new(),
@@ -3160,6 +3169,7 @@ impl State {
             name: new.name,
             description: new.description,
             project_type: seed::DEFAULT_PROJECT_TYPE.to_owned(),
+            owner_workspace_id: None,
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
@@ -7220,10 +7230,17 @@ impl State {
         rows
     }
 
+    /// Whether any `document` row, item or owner (MOD-147 D2), has `id`: the one primary key
+    /// both kinds share on Postgres.
+    fn document_id_taken(&self, id: DocumentId) -> bool {
+        self.documents.iter().any(|row| row.id == id)
+            || self.owner_documents.iter().any(|row| row.id == id)
+    }
+
     /// The document at `max(version) + 1` for its `(item, kind)` (plan D6).
     fn write_document(&mut self, new: NewDocument) -> Result<Document> {
         self.require_item(new.item_id)?;
-        if self.documents.iter().any(|row| row.id == new.id) {
+        if self.document_id_taken(new.id) {
             return Err(StoreError::Constraint(already_exists("document", new.id)));
         }
         self.require_user(new.created_by, "document.created_by")?;
@@ -7257,6 +7274,67 @@ impl State {
         };
         self.documents.push(row.clone());
         Ok(row)
+    }
+
+    /// MOD-147 D2: an owner document at `max(version) + 1` for its `(project, kind)` among the
+    /// project's owner documents; item documents never move the count. Validate, then push.
+    fn write_owner_document(&mut self, new: NewOwnerDocument) -> Result<OwnerDocument> {
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: new.project_id.to_string(),
+            });
+        }
+        if self.document_id_taken(new.id) {
+            return Err(StoreError::Constraint(already_exists("document", new.id)));
+        }
+        self.require_user(new.created_by, "document.created_by")?;
+        let version = self
+            .owner_documents
+            .iter()
+            .filter(|row| row.project_id == new.project_id && row.kind == new.kind)
+            .map(|row| row.version)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = OwnerDocument {
+            id: new.id,
+            project_id: new.project_id,
+            kind: new.kind,
+            version,
+            title: new.title,
+            body: new.body,
+            produced_by_step_id: None,
+            created_by: new.created_by,
+            created_at: new.created_at,
+        };
+        self.owner_documents.push(row.clone());
+        Ok(row)
+    }
+
+    /// MOD-147 D2: the project's owner documents in `(kind bytes, version)` order.
+    fn owner_document_rows(&self, project: ProjectId) -> Vec<OwnerDocument> {
+        let mut rows: Vec<OwnerDocument> = self
+            .owner_documents
+            .iter()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.kind
+                .as_bytes()
+                .cmp(right.kind.as_bytes())
+                .then(left.version.cmp(&right.version))
+        });
+        rows
+    }
+
+    /// MOD-147 D1: the workspace's scope row, the one project it owns.
+    fn scope_row_of(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+        self.projects
+            .values()
+            .find(|row| row.owner_workspace_id == Some(workspace))
+            .map(|row| row.id)
     }
 
     /// MOD-37 M5: the step's opening, replacing any earlier one; the step's `updated_at` moves.
@@ -9467,6 +9545,14 @@ impl ReadStore for MemStore {
     async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
         Ok(Some(self.read(|state| state.memory_revision_rows(id))))
     }
+
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        Ok(self.read(|state| state.scope_row_of(workspace)))
+    }
+
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
+        Ok(self.read(|state| state.owner_document_rows(project)))
+    }
 }
 
 impl WriteStore for MemStore {
@@ -10160,6 +10246,10 @@ impl WriteStore for MemStore {
 
     async fn write_document(&self, new: NewDocument) -> Result<Document> {
         self.write(|state| state.write_document(new))
+    }
+
+    async fn write_owner_document(&self, new: NewOwnerDocument) -> Result<OwnerDocument> {
+        self.write(|state| state.write_owner_document(new))
     }
 
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {

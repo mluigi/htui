@@ -166,6 +166,45 @@ pub const KINDS: [KindSeed; 5] = [
     },
 ];
 
+/// MOD-147 D5: the one kind a workspace's scope row is seeded with — `plan` (soft gate) then
+/// `review` (hard gate), reusing the `plan` and `review` templates until MOD-148 adds the workspace
+/// `plan` body. Not in [`KINDS`]: a user project never gets it. Its default edges are one `next`
+/// (plan → review) and one `changes_requested` (review → plan, `loop_limit` 1: no `implement`, so
+/// the rule falls back to the previous phase).
+pub const WORKSPACE_KIND: KindSeed = KindSeed {
+    prefix: "WS",
+    name: "workspace",
+    description: "Work that spans the workspace's projects",
+    phases: &[
+        PhaseSeed {
+            name: "plan",
+            input_kinds: &[],
+            gate_hard: false,
+        },
+        PhaseSeed {
+            name: "review",
+            input_kinds: &["plan"],
+            gate_hard: true,
+        },
+    ],
+};
+
+/// `project.type` of every scope row: MOD-146's built-in `workspace` (`selectable: false`).
+pub const SCOPE_ROW_TYPE: &str = "workspace";
+
+/// MOD-147 D3: `@<workspace slug>`, the scope row's slug. `@` is reserved: no user slug starts
+/// with it.
+#[must_use]
+pub fn scope_row_slug(workspace_slug: &str) -> String {
+    format!("@{workspace_slug}")
+}
+
+/// MOD-147 D3: whether `slug` has the scope-row form.
+#[must_use]
+pub fn is_scope_row_slug(slug: &str) -> bool {
+    slug.starts_with('@')
+}
+
 /// Phases across all of [`KINDS`]: fifteen. The fixture's per-project phase id stride.
 pub const PHASES_PER_PROJECT: usize = {
     let mut total = 0;
@@ -932,6 +971,85 @@ mod tests {
             (next, loops),
             (10, 4),
             "fifteen phases in five graphs, four reviews"
+        );
+    }
+
+    /// MOD-147 D5: a scope row's one kind, `WS`: `plan` (soft gate) then `review` (hard gate),
+    /// both with a shipped body, linked by one `next` and one `changes_requested` back to `plan`
+    /// (no `implement`, so the rule falls back to the previous phase) at `retry_limit` 1.
+    #[test]
+    fn the_workspace_kind_is_plan_then_a_hard_review() {
+        use super::WORKSPACE_KIND;
+
+        assert!(ItemKind::prefix_is_valid(WORKSPACE_KIND.prefix));
+        assert_eq!(
+            (WORKSPACE_KIND.prefix, WORKSPACE_KIND.name),
+            ("WS", "workspace")
+        );
+        assert!(
+            KINDS
+                .iter()
+                .all(|kind| kind.prefix != WORKSPACE_KIND.prefix),
+            "a user project never gets the WS kind"
+        );
+        assert_eq!(
+            WORKSPACE_KIND.phases,
+            &[
+                PhaseSeed {
+                    name: "plan",
+                    input_kinds: &[],
+                    gate_hard: false,
+                },
+                PhaseSeed {
+                    name: "review",
+                    input_kinds: &["plan"],
+                    gate_hard: true,
+                },
+            ]
+        );
+        for phase in WORKSPACE_KIND.phases {
+            assert!(body_of(phase.name).is_some(), "`{}` has a body", phase.name);
+        }
+        let graph = StepGraphId::new();
+        let phases: Vec<StepGraphPhase> = WORKSPACE_KIND
+            .phases
+            .iter()
+            .zip(0..)
+            .map(|(seed, position)| phase_row(PhaseId::new(), graph, position, seed, Utc::now()))
+            .collect();
+        let edges = default_edges(&phases, EdgeId::new);
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| (edge.from, edge.to, edge.kind, edge.loop_limit))
+                .collect::<Vec<_>>(),
+            [
+                (phases[0].id, phases[1].id, EdgeKind::Next, None),
+                (
+                    phases[1].id,
+                    phases[0].id,
+                    EdgeKind::ChangesRequested,
+                    Some(1)
+                ),
+            ],
+            "plan -> review, and review loops back to plan once"
+        );
+    }
+
+    /// MOD-147 D3: a scope row's slug is `@<workspace slug>`, the one form no user slug takes.
+    #[test]
+    fn scope_row_slug_is_at_slug() {
+        use super::{SCOPE_ROW_TYPE, is_scope_row_slug, scope_row_slug};
+
+        assert_eq!(scope_row_slug("platform"), "@platform");
+        assert!(is_scope_row_slug(&scope_row_slug("platform")));
+        assert!(!is_scope_row_slug("platform"));
+        assert!(!is_scope_row_slug("plat@form"));
+        assert!(
+            PROJECT_TYPES
+                .iter()
+                .any(|builtin| builtin.slug == SCOPE_ROW_TYPE && !builtin.selectable),
+            "the scope row's type is the hidden built-in"
         );
     }
 

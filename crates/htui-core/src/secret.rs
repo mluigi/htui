@@ -1410,6 +1410,7 @@ mod tests {
             name: "P".to_owned(),
             description: String::new(),
             project_type: crate::seed::DEFAULT_PROJECT_TYPE.to_owned(),
+            owner_workspace_id: None,
             secret_provider: provider.map(str::to_owned),
             secret_scope: scope.map(str::to_owned),
             settings: serde_json::json!({}),
