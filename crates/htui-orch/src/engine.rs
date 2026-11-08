@@ -561,7 +561,7 @@ struct WalkScopes(std::sync::Mutex<BTreeMap<RunId, WalkScope>>);
 struct WalkScope {
     /// The walk's control: the run's cancel forwarded into it, and the walk's own cut.
     signal: watch::Sender<Signal>,
-    /// Node futures in flight; `cleanup_run` defers while this is above 1 (A4).
+    /// Node futures in flight; `cleanup_walk` defers while this is above 1 (A4).
     in_flight: usize,
     /// A terminal path's cleanup was deferred while a sibling was live (A4).
     cleanup_owed: bool,
@@ -707,6 +707,11 @@ impl WalkScopes {
             scope.cleanup_owed = scope.in_flight > 1;
             scope.cleanup_owed
         })
+    }
+
+    /// Whether a walk (or a recovery) of `run` is open in this engine.
+    fn is_open(&self, run: RunId) -> bool {
+        self.lock().contains_key(&run)
     }
 
     /// Whether a deferred cleanup is still owed, clearing it.
@@ -1557,7 +1562,7 @@ where
                     now,
                 )
                 .await?;
-            self.cleanup_run(run.id).await?;
+            self.cleanup_walk(run.id).await?;
             return Ok(Some(Rest {
                 run: RunStatus::Failed,
                 position: Some(step.position),
@@ -1591,7 +1596,7 @@ where
                 failure: Some(gate::loop_failure(edge, attempts)),
             })),
             LoopOutcome::NoTarget => {
-                self.cleanup_run(run.id).await?;
+                self.cleanup_walk(run.id).await?;
                 Ok(Some(Rest {
                     run: RunStatus::Failed,
                     position: Some(step.position),
@@ -2563,7 +2568,7 @@ where
         {
             return Ok(None);
         }
-        self.cleanup_run(row.id).await?;
+        self.cleanup_walk(row.id).await?;
         Ok(Some(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -2599,7 +2604,7 @@ where
                 .store
                 .finish_run(run, RunStatus::Cancelled, None, now)
                 .await?;
-            self.cleanup_run(run).await
+            self.cleanup_walk(run).await
         };
         self.leased_window(run, window).await?;
         // MOD-70 review M-3: under the lease still held, before it goes back.
@@ -3518,7 +3523,7 @@ where
             }
             Landing::Rest(rest) => {
                 if rest.run.is_terminal() {
-                    self.cleanup_run(run.id).await?;
+                    self.cleanup_walk(run.id).await?;
                 }
                 Ok(Some(Self::landed(rest)))
             }
@@ -3694,7 +3699,7 @@ where
             .store
             .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
-        self.cleanup_run(run.id).await?;
+        self.cleanup_walk(run.id).await?;
         Ok(Some(Rest {
             run: RunStatus::Failed,
             position: Some(step.position),
@@ -3777,7 +3782,7 @@ where
                                 .store
                                 .finish_run(run, RunStatus::Done, None, now)
                                 .await?;
-                            self.cleanup_run(run).await?;
+                            self.cleanup_walk(run).await?;
                             return Ok(Rest {
                                 run: RunStatus::Done,
                                 position: None,
@@ -3995,24 +4000,47 @@ where
     ///    still leaves its cut siblings' rows to this step. A linear walk never reaches them.
     /// 5. The first terminal rest, else the first error, else the first park's rest, exactly as
     ///    its future answered it (A11). Later errors were logged and dropped.
+    ///
+    /// MOD-138 M3 R1 (review finding 3): steps 2 and 4 are best-effort. A store error in the owed
+    /// cleanup's reads does not stop the cut writes, and one cut write's error does not stop the
+    /// next ([`Self::cancel_unsettled`]); each is warned, and the first is raised once both ran.
+    /// Rows a failure still strands under the terminal run are settled by the manual `Cleanup`
+    /// retry ([`Self::cleanup_run`], R-25).
     async fn settle_walk(&self, run: RunId, end: WalkEnd) -> Result<Rest, EngineError> {
         if let Some(fenced) = end.fenced {
             return Err(fenced);
         }
-        if self.walks.take_cleanup_owed(run) {
-            self.cleanup_now(run).await?;
+        let mut failed: Option<EngineError> = None;
+        if self.walks.take_cleanup_owed(run)
+            && let Err(err) = self.cleanup_now(run).await
+        {
+            tracing::warn!(%run, %err, "the walk's owed cleanup failed; the cut writes still run, and the manual Cleanup retries both (R-25)");
+            failed = Some(err);
         }
         if end.terminal.is_none()
             && end.cancelled.is_some()
             && (self.parts.control)(run).signal().is_cancel()
         {
-            return Err(end.cancelled.unwrap_or(EngineError::Cancelled { run }));
+            return Err(failed
+                .or(end.cancelled)
+                .unwrap_or(EngineError::Cancelled { run }));
         }
         if end.cut || end.park.is_some() || end.concurrent {
-            let row = self.run(run).await?;
-            if row.status.is_terminal() {
-                Box::pin(self.cancel_unsettled(&row, end.ender)).await?;
+            match self.run(run).await {
+                Ok(row) if row.status.is_terminal() => {
+                    if let Err(err) = Box::pin(self.cancel_unsettled(&row, end.ender)).await {
+                        failed.get_or_insert(err);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%run, %err, "the cut could not read its run; the manual Cleanup settles its rows (R-25)");
+                    failed.get_or_insert(err);
+                }
             }
+        }
+        if let Some(err) = failed {
+            return Err(err);
         }
         if let Some(terminal) = end.terminal {
             return Ok(terminal);
@@ -4030,6 +4058,10 @@ where
     /// ended `run` at `pending`, `running` or `awaiting_approval` moves to `cancelled` (a row
     /// another writer moved first is skipped), and each moved row gets one note naming the node
     /// at `ender` that ended the run. A `failed` row keeps its failure.
+    ///
+    /// MOD-138 M3 R1 (review finding 3): best-effort past its one read. A row whose move or note
+    /// fails is warned and the loop goes on, so one store error strands no other row; the first
+    /// error is raised after the loop, and the manual `Cleanup` ([`Self::cleanup_run`]) retries.
     async fn cancel_unsettled(&self, run: &Run, ender: Option<i32>) -> Result<(), EngineError> {
         let snapshot = Self::snapshot_of(run)?;
         let ender = ender
@@ -4044,6 +4076,7 @@ where
                 |phase| format!("`{}`", phase.name),
             );
         let now = self.now();
+        let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
             if !matches!(
                 step.status,
@@ -4051,28 +4084,39 @@ where
             ) {
                 continue;
             }
-            if !self
+            match self
                 .parts
                 .store
                 .transition_step(step.id, step.status, StepStatus::Cancelled, now)
-                .await?
+                .await
             {
-                continue;
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    let err = EngineError::from(err);
+                    tracing::warn!(run = %run.id, step = %step.id, %err, "a cut row was not cancelled; the manual Cleanup retries it (R-25)");
+                    failed.get_or_insert(err);
+                    continue;
+                }
             }
-            if let Some(item) = run.item_id {
-                self.note(
-                    item,
-                    format!(
-                        "step `{}` attempt {} cancelled: the run ended at {ender}",
-                        step.phase_name, step.attempt
-                    ),
-                    Some(step.id),
-                    now,
-                )
-                .await?;
+            if let Some(item) = run.item_id
+                && let Err(err) = self
+                    .note(
+                        item,
+                        format!(
+                            "step `{}` attempt {} cancelled: the run ended at {ender}",
+                            step.phase_name, step.attempt
+                        ),
+                        Some(step.id),
+                        now,
+                    )
+                    .await
+            {
+                tracing::warn!(run = %run.id, step = %step.id, %err, "a cut row's note was not written");
+                failed.get_or_insert(err);
             }
         }
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): what §4.9's sweep does before it advances a
@@ -4545,7 +4589,7 @@ where
             .store
             .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
-        self.cleanup_run(run.id).await?;
+        self.cleanup_walk(run.id).await?;
         Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -4909,7 +4953,7 @@ where
                 // budget and `edge_loop`'s `NoTarget` — and holds no isolator, so the cleanup
                 // that owes it is here (plan D36). A park is not terminal and is not cleaned up.
                 if rest.run.is_terminal() {
-                    self.cleanup_run(run.id).await?;
+                    self.cleanup_walk(run.id).await?;
                 }
                 Ok(Some(rest))
             }
@@ -5084,7 +5128,7 @@ where
         // walk's hard failures pass through — stage 3's missing input and any error escaping the
         // region where a step is live. Putting it here rather than at the two call sites is what
         // makes "every" true.
-        self.cleanup_run(run.id).await?;
+        self.cleanup_walk(run.id).await?;
         Ok(true)
     }
 
@@ -5386,7 +5430,7 @@ where
                 .store
                 .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                 .await?;
-            self.cleanup_run(run.id).await?;
+            self.cleanup_walk(run.id).await?;
         }
         Ok(Rest {
             run: RunStatus::Failed,
@@ -5413,7 +5457,7 @@ where
                 self.now(),
             )
             .await?;
-        self.cleanup_run(run.id).await?;
+        self.cleanup_walk(run.id).await?;
         Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -5805,7 +5849,7 @@ where
                     .store
                     .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                     .await?;
-                self.cleanup_run(run.id).await?;
+                self.cleanup_walk(run.id).await?;
                 Ok(Some(Rest {
                     run: RunStatus::Failed,
                     position: Some(phase.position),
@@ -6623,7 +6667,7 @@ where
                     .store
                     .finish_run(run.id, RunStatus::Failed, Some(&reason), self.now())
                     .await?;
-                self.cleanup_run(run.id).await?;
+                self.cleanup_walk(run.id).await?;
             }
         }
         Ok(Rest {
@@ -6745,13 +6789,37 @@ where
     /// request is that retry (R-25, MOD-4 plan D177, admitted by
     /// [`crate::command::cleanup_enabled`]).
     ///
-    /// `pub` because `htui`'s `run_worker` calls it directly for a run the worker did not end.
+    /// `pub` because `htui`'s `run_worker` calls it directly for a run the worker did not end:
+    /// the manual `Cleanup` request (R-25). MOD-138 M3 R1 (review finding 3): that retry also
+    /// settles the rows, so a store error that stranded a `pending`, `running` or
+    /// `awaiting_approval` row under the terminal run (the walk's cut writes, or a recovery's) is
+    /// retried by the same request a human already uses for the trees. Each such row moves to
+    /// `cancelled` with the cut's note ([`Self::cancel_unsettled`], best-effort), and then the
+    /// trees are cleaned up as ever. A run a walk of this engine holds open is only cleaned up
+    /// (deferred beside a live sibling, A4): its rows are the walk's.
     ///
     /// # Errors
-    /// The store's own refusals only. The isolator's are logged.
+    /// The store's own refusals only, the first one once both halves ran. The isolator's are
+    /// logged.
     pub async fn cleanup_run(&self, run: RunId) -> Result<(), EngineError> {
-        // MOD-138 M3 A4: `isolator.cleanup` removes every tree of the run, so a terminal path
-        // inside one node's future leaves it to the walk while a sibling is live.
+        if self.walks.is_open(run) {
+            return self.cleanup_walk(run).await;
+        }
+        let row = self.run(run).await?;
+        let settled = if row.status.is_terminal() {
+            Box::pin(self.cancel_unsettled(&row, None)).await
+        } else {
+            Ok(())
+        };
+        let cleaned = self.cleanup_walk(run).await;
+        settled.and(cleaned)
+    }
+
+    /// The cleanup every terminal path inside the engine owes (plan D36): MOD-138 M3 A4 defers it
+    /// while a sibling is in flight, since `isolator.cleanup` removes every tree of the run and a
+    /// terminal path inside one node's future would remove a live sibling's; the walk runs it
+    /// once it drains ([`Self::settle_walk`]). Otherwise [`Self::cleanup_now`].
+    async fn cleanup_walk(&self, run: RunId) -> Result<(), EngineError> {
         if self.walks.defer_cleanup(run) {
             return Ok(());
         }
@@ -6867,7 +6935,7 @@ where
             .store
             .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
-        self.cleanup_run(run.id).await
+        self.cleanup_walk(run.id).await
     }
 
     /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`. The excerpt pass runs
@@ -23766,6 +23834,106 @@ mod settle_walk_writes {
                 .iter()
                 .any(|note| note.body == "step `prd` attempt 1 cancelled: the run ended at `plan`"),
             "{notes:?}"
+        );
+    }
+
+    /// [`failed_over_a_parked_row`] with a second unsettled row: `plan`'s `pending` attempt 1, as
+    /// a sibling's `Create` leaves it.
+    async fn failed_over_two_unsettled_rows(orch: &FakeOrchestrator) -> htui_core::model::RunId {
+        let run = failed_over_a_parked_row(orch).await;
+        orch.store
+            .create_step(htui_core::model::NewRunStep {
+                id: htui_core::model::StepId::new(),
+                run_id: run,
+                position: 1,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "plan".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("a pending row under the ended run");
+        run
+    }
+
+    /// An engine over `$orch`'s parts, bound to `$engine`.
+    macro_rules! with_engine {
+        ($orch:expr, $engine:ident) => {
+            let graphs = $orch.graphs();
+            let driver =
+                |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
+            let scrubber = crate::secrets::RunSecrets::new($orch.secret_source());
+            let $engine = Engine::new(
+                super::fake_parts(&$orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+        };
+    }
+
+    fn statuses(steps: &[htui_core::model::RunStep]) -> Vec<StepStatus> {
+        steps.iter().map(|step| step.status).collect()
+    }
+
+    /// MOD-138 M3 R1 (review finding 3): the cut writes are best-effort. A store error on one
+    /// row's note (here every note: the run row names an item the store does not hold) is raised
+    /// after the loop, and every unsettled row is still cancelled rather than stranded under the
+    /// terminal run.
+    #[tokio::test]
+    async fn a_failed_cut_write_does_not_strand_the_next_row() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_two_unsettled_rows(&orch).await;
+        with_engine!(orch, engine);
+        let mut forged = engine.run(run).await.expect("the run reads");
+        forged.item_id = Some(htui_core::model::ItemId::new());
+        let cut = engine.cancel_unsettled(&forged, Some(2)).await;
+        assert!(
+            matches!(cut, Err(EngineError::Store(_))),
+            "the first note's error is raised: {cut:?}"
+        );
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::Cancelled, StepStatus::Cancelled],
+            "the loop went on past the failed write"
+        );
+    }
+
+    /// MOD-138 M3 R1 (review finding 3, R-25): the manual `Cleanup` of a terminal run settles the
+    /// rows a failed cut left behind, with the cut's note, and cleans up the trees once.
+    #[tokio::test]
+    async fn a_cleanup_retry_settles_the_rows_a_failed_cut_left() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_two_unsettled_rows(&orch).await;
+        with_engine!(orch, engine);
+        engine.cleanup_run(run).await.expect("the retry succeeds");
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::Cancelled, StepStatus::Cancelled]
+        );
+        let notes = orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        for phase in ["prd", "plan"] {
+            let body =
+                format!("step `{phase}` attempt 1 cancelled: the run ended at an earlier node");
+            assert!(
+                notes.iter().any(|note| note.body == body),
+                "{body}\n{notes:?}"
+            );
+        }
+        assert_eq!(orch.isolator.cleanups(), 1);
+
+        engine
+            .cleanup_run(run)
+            .await
+            .expect("a second retry succeeds");
+        assert_eq!(
+            orch.isolator.cleanups(),
+            2,
+            "the trees are retried; no row is left to settle"
         );
     }
 

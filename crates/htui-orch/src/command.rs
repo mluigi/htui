@@ -1304,6 +1304,9 @@ pub fn close_out_enabled<'a>(
 
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
 ///
+/// MOD-138 M3 R1 (review finding 3): the retry ([`crate::Engine::cleanup_run`]) also settles the
+/// rows a failed cut write stranded under the terminal run, so the one request covers both.
+///
 /// # Errors
 /// [`EngineError::NotTerminal`] for a `queued`, `running`, `awaiting_approval` or `stopped` run
 /// (a stopped run keeps its trees, MOD-125 D2).
