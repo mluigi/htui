@@ -2914,6 +2914,38 @@ async fn on_run_served(
     }
 }
 
+/// The projects the cache refresher follows for an `Items` read of `scope` (plan D9): the scope's
+/// own, then the workspace's scope row (MOD-147 D1), which joins no workspace and so is never in
+/// `scope.project_ids`.
+///
+/// The row is looked up once per workspace and remembered in `scope_rows`: a workspace's scope row
+/// never changes. `Ok(None)` is not remembered (an offline mirror may not hold the row yet, or the
+/// workspace is the nil startup scope), and a failed lookup is logged and skipped, so the read the
+/// user asked for still follows its projects.
+async fn refresher_projects(
+    backend: &Backend,
+    scope: &Scope,
+    scope_rows: &mut BTreeMap<WorkspaceId, ProjectId>,
+) -> Vec<ProjectId> {
+    let mut ids = scope.project_ids.clone();
+    let row = match scope_rows.get(&scope.workspace_id) {
+        Some(row) => Some(*row),
+        None => match backend.scope_project(scope.workspace_id).await {
+            Ok(Some(row)) => {
+                scope_rows.insert(scope.workspace_id, row);
+                Some(row)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "the workspace's scope row was not read; the refresher follows its projects alone");
+                None
+            }
+        },
+    };
+    ids.extend(row.filter(|row| !ids.contains(row)));
+    ids
+}
+
 /// [`spawn_with`] over a chosen [`RunRuntime`] too (plan D153): the orchestrator's runtime lives
 /// inside this loop beside the chat one, for the same reason.
 ///
@@ -3010,6 +3042,8 @@ pub(crate) fn spawn_with_concepts(
             tokio::time::interval_at(tokio::time::Instant::now() + box_heartbeat, box_heartbeat);
         box_beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut beat: Option<tokio::task::JoinHandle<()>> = None;
+        // MOD-147 D1: each workspace's scope row, once a read has named it ([`refresher_projects`]).
+        let mut scope_rows: BTreeMap<WorkspaceId, ProjectId> = BTreeMap::new();
 
         loop {
             // MOD-11 B-2 (H-10): the backend this iteration serves is the one a tool session
@@ -3033,8 +3067,16 @@ pub(crate) fn spawn_with_concepts(
                     // Publish the scope so the refresher follows what the user is looking at
                     // (plan D9). On every `Items` request, not only on a change: the send is a
                     // pointer swap and a missed update mirrors the wrong project.
+                    // MOD-147 D1: with the workspace's scope row, so its kinds, items and owner
+                    // documents are mirrored too; `Scope` itself never carries it.
                     if let StoreRequest::Items { scope, .. } = &envelope.request {
-                        projects.send_replace(scope.project_ids.clone());
+                        projects.send_replace(
+                            refresher_projects(&backend, scope, &mut scope_rows).await,
+                        );
+                    }
+                    // A deleted workspace's scope row went with it; forget it.
+                    if let StoreRequest::DeleteWorkspace(id) = &envelope.request {
+                        scope_rows.remove(id);
                     }
 
                     let reply = match &envelope.request {
