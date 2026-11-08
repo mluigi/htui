@@ -150,6 +150,12 @@ pub enum MemFault {
     /// [`WriteStore::lease_holds`] (MOD-78 D5): a read, so `command_run` can tell a store blip
     /// from a lost lease.
     LeaseHolds,
+    /// [`WriteStore::transition_step`] of the one step named (MOD-138 M3 R1): a write that fails
+    /// for one row while its siblings' moves go through.
+    TransitionStep(StepId),
+    /// [`ReadStore::step_trees`] (MOD-138 M3 R1): a read the run-terminal cleanup makes and the
+    /// cut writes do not.
+    StepTrees,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -9391,6 +9397,8 @@ impl ReadStore for MemStore {
     }
 
     async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::StepTrees)?;
         Ok(self.read(|state| state.step_tree_rows(step)))
     }
 
@@ -10079,6 +10087,8 @@ impl WriteStore for MemStore {
         to: StepStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::TransitionStep(step))?;
         let now = self.now();
         self.write(|state| state.transition_step(step, from, to, at, now))
     }

@@ -4145,19 +4145,22 @@ where
     /// MOD-138 M3 R1 (review finding 3): best-effort past its one read. A row whose move or note
     /// fails is warned and the loop goes on, so one store error strands no other row; the first
     /// error is raised after the loop, and the manual `Cleanup` ([`Self::cleanup_run`]) retries.
+    /// The snapshot only names the ender: one that does not decode (or no `ender` at all, the
+    /// manual `Cleanup`'s case) names "an earlier node", and refuses nothing.
     async fn cancel_unsettled(&self, run: &Run, ender: Option<i32>) -> Result<(), EngineError> {
-        let snapshot = Self::snapshot_of(run)?;
         let ender = ender
-            .and_then(|position| {
-                snapshot
+            .and_then(|position| match Self::snapshot_of(run) {
+                Ok(snapshot) => snapshot
                     .phases
-                    .iter()
+                    .into_iter()
                     .find(|phase| phase.position == position)
+                    .map(|phase| phase.name),
+                Err(err) => {
+                    tracing::warn!(run = %run.id, %err, "the cut cannot read the run's snapshot to name its ender");
+                    None
+                }
             })
-            .map_or_else(
-                || "an earlier node".to_owned(),
-                |phase| format!("`{}`", phase.name),
-            );
+            .map_or_else(|| "an earlier node".to_owned(), |name| format!("`{name}`"));
         let now = self.now();
         let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
@@ -23816,8 +23819,9 @@ mod queued_cancel {
 #[cfg(test)]
 mod settle_walk_writes {
     use htui_core::fixtures::ids;
-    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, StepStatus};
-    use htui_core::store::{ReadStore as _, WriteStore as _};
+    use htui_core::model::{GraphSnapshot, RunMode, RunStatus, SnapshotCandidate, StepStatus};
+    use htui_core::store::mem::MemFault;
+    use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 
     use super::{Engine, SessionKey, WalkEnd};
     use crate::command::{Command, CommandOutcome, EngineError};
@@ -24018,6 +24022,167 @@ mod settle_walk_writes {
             2,
             "the trees are retried; no row is left to settle"
         );
+    }
+
+    /// MOD-138 M3 R1 (review finding 3, repair 1): one row's failed move strands no other row.
+    /// `prd`'s `transition_step` answers `Unreachable`; `plan`'s row is still cancelled, the error
+    /// is raised after the loop, and the manual `Cleanup` then settles `prd`'s row.
+    #[tokio::test]
+    async fn a_failed_cut_move_does_not_strand_the_next_row() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_two_unsettled_rows(&orch).await;
+        with_engine!(orch, engine);
+        let prd = orch.steps(run).await[0].id;
+        orch.store.set_fault(MemFault::TransitionStep(prd), true);
+        let row = engine.run(run).await.expect("the run reads");
+        let cut = engine.cancel_unsettled(&row, Some(1)).await;
+        assert!(
+            matches!(cut, Err(EngineError::Store(StoreError::Unreachable(_)))),
+            "the failed move is raised: {cut:?}"
+        );
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::AwaitingApproval, StepStatus::Cancelled],
+            "the loop went on past the failed move"
+        );
+        orch.store.set_fault(MemFault::TransitionStep(prd), false);
+        engine.cleanup_run(run).await.expect("the retry succeeds");
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::Cancelled, StepStatus::Cancelled]
+        );
+    }
+
+    /// MOD-138 M3 R1 (review finding 3(a), repair 1): the cut writes do not depend on the owed
+    /// cleanup's reads. A walk deferred its cleanup beside a live sibling (A4), and the cleanup's
+    /// `step_trees` read fails at the walk's end: the unsettled row is still cancelled, and the
+    /// read's error is raised once the cut ran.
+    #[tokio::test]
+    async fn a_failed_owed_cleanup_still_cancels_the_cut_rows() {
+        let orch = FakeOrchestrator::demo();
+        let run = failed_over_a_parked_row(&orch).await;
+        with_engine!(orch, engine);
+        let _scope = engine.walks.open(run);
+        engine.walks.set_in_flight(run, 2);
+        assert!(engine.walks.defer_cleanup(run), "the cleanup is owed");
+        orch.store.set_fault(MemFault::StepTrees, true);
+        let settled = engine
+            .settle_walk(
+                run,
+                WalkEnd {
+                    terminal: Some(crate::command::Rest {
+                        run: RunStatus::Failed,
+                        position: Some(1),
+                        failure: None,
+                    }),
+                    ender: Some(1),
+                    concurrent: true,
+                    ..WalkEnd::default()
+                },
+            )
+            .await;
+        orch.store.set_fault(MemFault::StepTrees, false);
+        assert!(
+            matches!(settled, Err(EngineError::Store(StoreError::Unreachable(_)))),
+            "the cleanup's read error is raised: {settled:?}"
+        );
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::Cancelled],
+            "the cut ran although the cleanup failed"
+        );
+        assert_eq!(
+            orch.isolator.cleanups(),
+            0,
+            "the cleanup never reached the isolator"
+        );
+    }
+
+    /// MOD-138 M3 R1 (review finding 3, repair 1): the manual `Cleanup` of a terminal run whose
+    /// snapshot does not decode still settles its rows and answers `Ok`; the snapshot only names
+    /// the ender, and a cut that cannot read it names "an earlier node".
+    #[tokio::test]
+    async fn a_cleanup_retry_needs_no_readable_snapshot() {
+        let orch = FakeOrchestrator::demo();
+        let parked = failed_over_a_parked_row(&orch).await;
+        let mut snapshot: GraphSnapshot = serde_json::from_value(
+            orch.run(parked)
+                .await
+                .graph_snapshot
+                .expect("the walk wrote a snapshot"),
+        )
+        .expect("the engine wrote a `GraphSnapshot`");
+        snapshot.v = 99;
+        let run = htui_core::model::RunId::new();
+        orch.store
+            .create_run(htui_core::model::NewRun {
+                workspace_id: None,
+                id: run,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: orch.user(),
+                graph_snapshot: snapshot,
+                repo_scope: Vec::new(),
+                queued_at: orch.clock.now(),
+                batch_id: None,
+            })
+            .await
+            .expect("MemStore creates the run");
+        orch.store
+            .finish_run(run, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("a queued run is cancellable");
+        with_engine!(orch, engine);
+        engine
+            .cleanup_run(run)
+            .await
+            .expect("a run with no row to settle is cleaned up");
+        let pending = |phase: &str, position: i32| htui_core::model::NewRunStep {
+            id: htui_core::model::StepId::new(),
+            run_id: run,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: phase.to_owned(),
+            agent_id: None,
+            model: None,
+        };
+        orch.store
+            .create_step(pending("prd", 0))
+            .await
+            .expect("a pending row under the ended run");
+        engine
+            .cleanup_run(run)
+            .await
+            .expect("the retry settles the row without the snapshot");
+        orch.store
+            .create_step(pending("plan", 1))
+            .await
+            .expect("a second pending row");
+        let row = engine.run(run).await.expect("the run reads");
+        engine
+            .cancel_unsettled(&row, Some(1))
+            .await
+            .expect("a named ender over an unreadable snapshot falls back");
+        assert_eq!(
+            statuses(&orch.steps(run).await),
+            [StepStatus::Cancelled, StepStatus::Cancelled]
+        );
+        let notes = orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        for phase in ["prd", "plan"] {
+            let body =
+                format!("step `{phase}` attempt 1 cancelled: the run ended at an earlier node");
+            assert!(
+                notes.iter().any(|note| note.body == body),
+                "{body}\n{notes:?}"
+            );
+        }
     }
 
     /// A linear walk (no cut, no park, never two futures in flight) writes nothing at its end,
