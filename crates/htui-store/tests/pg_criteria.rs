@@ -13056,6 +13056,27 @@ async fn workspaces_and_projects_never_list_a_scope_row() {
         [ids::PROJECT_HTUI, ids::PROJECT_AGY],
         "Platform's members, and nothing else"
     );
+    // Asked about the scope row directly, `projects` still answers members only: it reads
+    // through `workspace_project`, and the scope row is never a member.
+    let asked = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![
+            ids::PROJECT_HTUI,
+            ids::PROJECT_AGY,
+            ids::PROJECT_SCOPE_PLATFORM,
+        ],
+    };
+    assert_eq!(
+        db.store
+            .projects(&asked)
+            .await
+            .expect("projects")
+            .iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "a scope naming the scope row still lists Platform's members only"
+    );
     for (workspace, scope) in [
         (ids::WORKSPACE_PLATFORM, ids::PROJECT_SCOPE_PLATFORM),
         (ids::WORKSPACE_GRAPHICS, ids::PROJECT_SCOPE_GRAPHICS),

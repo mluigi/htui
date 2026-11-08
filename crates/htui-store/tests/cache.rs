@@ -3222,6 +3222,24 @@ async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
         "the mirror's workspaces() lists no scope row: {:?}",
         platform.projects
     );
+    let asked = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY, scope],
+    };
+    let listed = cache.projects(&asked).await.expect("cache projects");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "the mirror's projects() over a scope naming the scope row lists members only"
+    );
+    assert_eq!(
+        listed,
+        db.store.projects(&asked).await.expect("pg projects"),
+        "the two backends list a scope's projects alike"
+    );
 
     teardown(db, &[&cache]).await;
 }
