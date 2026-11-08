@@ -554,7 +554,14 @@ where
 /// ends the run while siblings are live. Inside a future a cut is a cancel (I-6: nothing
 /// written); the scheduler writes the cut rows itself ([`Engine::settle_walk`]).
 #[derive(Debug, Default)]
-struct WalkScopes(std::sync::Mutex<BTreeMap<RunId, WalkScope>>);
+struct WalkScopes {
+    /// The open walks, by run.
+    scopes: std::sync::Mutex<BTreeMap<RunId, WalkScope>>,
+    /// MOD-138 M3 R1 (review finding 5): how many scopes were closed with a deferred cleanup
+    /// still owed (a walk `heartbeaten` abandoned, or one that raised before it drained), each
+    /// warned with the manual `Cleanup` retry (R-25) named.
+    owed_dropped: std::sync::atomic::AtomicU32,
+}
 
 /// One open walk (blueprint §3.1).
 #[derive(Debug)]
@@ -579,8 +586,14 @@ struct ScopeGuard<'e> {
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        if self.opened {
-            self.scopes.lock().remove(&self.run);
+        if self.opened && self.scopes.close(self.run) {
+            // MOD-138 M3 R1 (review finding 5): a cleanup A4 deferred was never run. Nothing
+            // retries a terminal run's cleanup on its own; the manual `Cleanup` does (R-25).
+            tracing::warn!(
+                run = %self.run,
+                "a walk ended with its run's deferred cleanup still owed: the run's trees stay \
+                 until the manual Cleanup retries it (R-25)"
+            );
         }
     }
 }
@@ -594,14 +607,37 @@ impl gate::WalkPark for WalkScopes {
 impl WalkScopes {
     /// An empty registry; `const` so [`Engine::new`] stays a `const fn`.
     const fn new() -> Self {
-        Self(std::sync::Mutex::new(BTreeMap::new()))
+        Self {
+            scopes: std::sync::Mutex::new(BTreeMap::new()),
+            owed_dropped: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
     /// A poisoned lock is recovered: every change is one map operation.
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RunId, WalkScope>> {
-        self.0
+        self.scopes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Removes `run`'s scope ([`ScopeGuard`]'s drop); whether a deferred cleanup was still owed
+    /// (R1, review finding 5), which is then counted in `owed_dropped`.
+    fn close(&self, run: RunId) -> bool {
+        let owed = self
+            .lock()
+            .remove(&run)
+            .is_some_and(|scope| scope.cleanup_owed);
+        if owed {
+            self.owed_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        owed
+    }
+
+    /// How many scopes were closed with a cleanup owed.
+    #[cfg(test)]
+    fn owed_dropped(&self) -> u32 {
+        self.owed_dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Opens `run`'s scope for one walk. No walk of a run nests another in one engine; if one
@@ -808,6 +844,34 @@ mod walk_scopes {
             "a further terminal rest is dropped"
         );
         assert_eq!(end.ender, Some(1));
+    }
+
+    /// MOD-138 M3 R1 (review finding 5): a scope dropped with a deferred cleanup still owed (the
+    /// walk `heartbeaten`'s `Expired` arm abandons) is observed on the drop path, and warned; one
+    /// whose cleanup was taken, or never owed, is not.
+    #[test]
+    fn a_scope_dropped_with_its_cleanup_owed_is_observed() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let guard = scopes.open(run);
+        scopes.set_in_flight(run, 2);
+        assert!(scopes.defer_cleanup(run));
+        drop(guard);
+        assert_eq!(
+            scopes.owed_dropped(),
+            1,
+            "the abandoned walk owed a cleanup"
+        );
+        assert!(scopes.control(run).is_none(), "the scope is gone");
+
+        let guard = scopes.open(run);
+        scopes.set_in_flight(run, 2);
+        assert!(scopes.defer_cleanup(run));
+        assert!(scopes.take_cleanup_owed(run), "the walk drained and ran it");
+        drop(guard);
+        let alone = scopes.open(RunId::new());
+        drop(alone);
+        assert_eq!(scopes.owed_dropped(), 1, "nothing more was owed");
     }
 
     /// A4: the cleanup is deferred only beside a sibling, and owed once.
