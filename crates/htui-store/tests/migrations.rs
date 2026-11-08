@@ -4892,7 +4892,6 @@ async fn the_0005_migration_drops_the_hostname_key_and_adds_three_columns() {
 
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn load_demo_round_trips_a_count_per_table() {
     let Some(mut db) = common::fresh_db().await else {
         return;
@@ -4940,8 +4939,8 @@ async fn load_demo_round_trips_a_count_per_table() {
 
     assert_eq!(
         data.edges.len(),
-        42,
-        "fourteen default edges per project (MOD-137 D9)"
+        46,
+        "fourteen default edges per project (MOD-137 D9), two per scope row (MOD-147 D5)"
     );
     let expected: [(&str, usize); 27] = [
         ("app_user", data.users.len()),
@@ -5086,7 +5085,6 @@ fn db_fingerprint_is_stable_and_credential_free() {
 /// decode. T2 leans on both, so T1 proves them.
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn the_core_sqlx_derives_decode_against_text_and_uuid_columns() {
     use htui_core::model::{ItemId, Status};
 
@@ -5114,7 +5112,6 @@ async fn the_core_sqlx_derives_decode_against_text_and_uuid_columns() {
 /// `resumed`, `handoff` and `resume_failed`, and `NULL`; anything else trips its CHECK.
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn the_opening_column_admits_three_values_and_null() {
     use htui_core::fixtures::ids;
 
@@ -5156,7 +5153,6 @@ async fn the_opening_column_admits_three_values_and_null() {
 /// any other shape.
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn the_branch_column_admits_an_object_of_booleans_and_null() {
     use htui_core::fixtures::ids;
 
@@ -5479,7 +5475,6 @@ async fn a_batch_closes_with_its_reason_and_only_with_it() {
 /// `delete_project` remove a project whose items are queued.
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn a_queue_entry_goes_with_its_item() {
     use htui_core::fixtures::ids;
     use htui_core::store::WriteStore;
@@ -5515,7 +5510,6 @@ async fn a_queue_entry_goes_with_its_item() {
 /// key, so a second entry for the same item is refused on another box as well as on the same one.
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn an_item_is_queued_on_at_most_one_box() {
     use htui_core::fixtures::ids;
 
@@ -5562,7 +5556,6 @@ async fn an_item_is_queued_on_at_most_one_box() {
 /// MOD-12 plan D7: `run.batch_id` names an existing `queue_batch` or nothing (`fk_run_batch`).
 #[cfg(feature = "demo")]
 #[tokio::test]
-#[ignore = "MOD-147 T3: demo loader writes document.project_id"]
 async fn a_run_names_only_an_existing_batch() {
     use htui_core::fixtures::ids;
 
@@ -6592,4 +6585,74 @@ async fn cache_0009_applies_over_a_populated_0008_mirror() {
     }
 
     pool.close().await;
+}
+
+/// MOD-147 (blueprint T3.10): 0026 writes no scope row, so the bootstrap gives every workspace
+/// that predates it one — `@<slug>`, type `workspace`, owned by the workspace, seeded with the one
+/// `WS` kind and the ten templates — and a second pass adds nothing. Staged at v25, as on a real
+/// box, with two workspaces written before the migration.
+#[tokio::test]
+async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(25, &db.pool)
+        .await
+        .expect("apply 0001 through 0025");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod147").await;
+    let shop = insert_workspace(pool, user, "shop").await;
+    let lab = insert_workspace(pool, user, "lab").await;
+    MIGRATOR.run(pool).await.expect("apply 0026");
+
+    for pass in ["first", "second"] {
+        db.store
+            .seed_if_empty_as("mod147")
+            .await
+            .unwrap_or_else(|err| panic!("the {pass} bootstrap pass: {err}"));
+        for (workspace, slug) in [(shop, "shop"), (lab, "lab")] {
+            let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
+                "SELECT id, slug, name, type FROM project WHERE owner_workspace_id = $1",
+            )
+            .bind(workspace)
+            .fetch_all(pool)
+            .await
+            .expect("read the scope rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "{pass} pass: workspace `{slug}` has exactly one scope row"
+            );
+            let (scope, scope_slug, name, project_type) = rows[0].clone();
+            assert_eq!(
+                (scope_slug.as_str(), name.as_str(), project_type.as_str()),
+                (format!("@{slug}").as_str(), slug, "workspace"),
+                "{pass} pass: `@<slug>`, the workspace's name, type `workspace`"
+            );
+            let kinds: Vec<String> =
+                sqlx::query_scalar("SELECT prefix FROM item_kind WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_all(pool)
+                    .await
+                    .expect("read the scope row's kinds");
+            assert_eq!(kinds, ["WS"], "{pass} pass: one `WS` kind");
+            let templates: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM prompt_template WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count the scope row's templates");
+            assert_eq!(templates, 10, "{pass} pass: the ten default templates");
+            let members: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM workspace_project WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count the scope row's memberships");
+            assert_eq!(members, 0, "{pass} pass: a scope row joins no workspace");
+        }
+    }
+
+    db.drop_db().await;
 }
