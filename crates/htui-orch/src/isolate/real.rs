@@ -1115,7 +1115,8 @@ impl GixIsolator {
     /// label never moved past the base (blueprint A-2).
     ///
     /// Three refusals stand between the tip and the merge: no usable `git`, a dirty primary
-    /// (ANA-2 `:978-979`), and a primary that moved off the base's line. A primary that moved
+    /// (ANA-2 `:978-979`), and a primary that moved off the base's line. The landed merge (below)
+    /// is looked for before the dirty check (MOD-138 M3 R1), since answering it writes nothing. A primary that moved
     /// *ahead* — the base is an ancestor of `HEAD`, as when another run on disjoint paths merged
     /// first (plan D136, rule P) — is merged into on top of its `HEAD`; a real conflict is
     /// [`git::merge_conflict`]'s refusal like any other. Before that, blueprint H-3's crash
@@ -1156,16 +1157,16 @@ impl GixIsolator {
         // in between fails the post-condition, the run parks, and the next reconcile finds the
         // landed merge through `merge_of`.
         let _admin = self.admin_guard(tree.repo_id).await;
-        let read = local.clone();
-        if blocking(move || git::is_dirty(&read)).await? {
-            return Err(IsolateError::Refused(dirty_primary_tree()));
-        }
         #[cfg(test)]
         self.probe_reconcile_admin(tree.repo_id);
         let read = local.clone();
         let head = blocking(move || git::head(&read)).await?;
+        // D136: the merge this step would make may be `HEAD`, or lie under a later run's.
+        // MOD-138 M3 R1 (review finding 4): looked for before the clean check, so the idempotent
+        // re-land of a landed winner (`recover::frontiers`' A8 rule, beside a `pending`, unstarted
+        // successor) answers its merge over a dirty primary and writes nothing, rather than
+        // parking the run on `dirty_primary_tree`.
         if head != tree.base_ref {
-            // D136: the merge this step would make may be `HEAD`, or lie under a later run's.
             let (read, at, base, tip) = (
                 local.clone(),
                 head.clone(),
@@ -1175,6 +1176,12 @@ impl GixIsolator {
             if let Some(merge) = blocking(move || git::merge_of(&read, &at, &base, &tip)).await? {
                 return Ok(Some(merge));
             }
+        }
+        let read = local.clone();
+        if blocking(move || git::is_dirty(&read)).await? {
+            return Err(IsolateError::Refused(dirty_primary_tree()));
+        }
+        if head != tree.base_ref {
             let (read, at, base) = (local.clone(), head.clone(), tree.base_ref.clone());
             if !blocking(move || git::is_ancestor(&read, &base, &at)).await? {
                 return Err(IsolateError::Refused(primary_moved(&head)));

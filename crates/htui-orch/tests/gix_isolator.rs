@@ -3945,3 +3945,65 @@ async fn a_worktree_landing_beside_a_dirty_in_place_checkout_refuses() {
     );
     assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
 }
+
+/// MOD-138 M3 R1 (review finding 4): `recover::frontiers`' A8 rule re-lands an already landed
+/// winner when its successor is `pending` and unstarted (a crash between `create_step` and the
+/// start). That re-land is idempotent through `merge_of`, and it must stay so over a dirty primary
+/// (an in-place agent's edit, say): the landed merge is found and answered before the clean
+/// check, so the run does not park on `dirty_primary_tree`, and nothing is written. A step that
+/// never landed still refuses the dirty primary.
+#[tokio::test]
+async fn a_landed_step_re_lands_over_a_dirty_primary_and_a_fresh_one_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (landed, _, landed_rows) = committed_worktree_step_in(&fix, run, "a.txt", "landed\n").await;
+    let (fresh, _, fresh_rows) = committed_worktree_step_in(&fix, run, "b.txt", "fresh\n").await;
+    let first = fix
+        .isolator
+        .reconcile(landed, &landed_rows, &[])
+        .await
+        .expect("the first landing merges");
+    let (head, merged) = (
+        head_of(&git, &fix.core.path).await,
+        merges(&git, &fix.core.path).await,
+    );
+
+    std::fs::write(fix.core.path.join("f"), "an edit in the primary\n")
+        .expect("the primary is dirtied");
+    let again = fix
+        .isolator
+        .reconcile(landed, &landed_rows, &[])
+        .await
+        .expect("the re-land finds its merge before the clean check");
+    assert_eq!(again, first, "the same merge commit, answered again");
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        merged,
+        "no second merge"
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "HEAD did not move"
+    );
+
+    let err = fix
+        .isolator
+        .reconcile(fresh, &fresh_rows, &[])
+        .await
+        .expect_err("a step that never landed refuses the dirty primary");
+    assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "nothing was merged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the edited file"),
+        "an edit in the primary\n",
+        "the edit is untouched"
+    );
+}
