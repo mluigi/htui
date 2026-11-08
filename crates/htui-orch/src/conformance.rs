@@ -545,6 +545,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// parked step ends the run and cancels that step, as the in-process answer does. And T4
 /// repair 1's two: a looping rejection, answered or resumed, lands a crashed answer's winner
 /// first.
+///
+/// **Five for MOD-138 M3 R1's input order** (review finding 1, maintainer 2026-11-08, "order by
+/// inputs"): a node listing a kind an incomparable node produces waits for that producer to
+/// finish, whichever position is lower; a two-way pair runs the lower position first, a cycle of
+/// waits its lowest once nothing else can run, and a skipped producer leaves the kind optional.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -868,6 +873,14 @@ pub const CASES: &[&str] = &[
     "a_resumed_looping_rejection_lands_a_crashed_answers_winner_first",
     // MOD-138 M3 T4 repair 2: the looping twin of the hand-back above.
     "a_looping_rejection_handed_back_walks_its_loop_as_in_process",
+    // MOD-138 M3 R1 (review finding 1, "order by inputs"): a node listing a kind an incomparable
+    // node produces waits for it, either way round; a two-way pair runs the lower position first,
+    // a cycle of waits its lowest, and a skipped producer leaves the kind optional.
+    "a_consumer_waits_for_an_incomparable_producer_of_its_input",
+    "a_lower_position_waits_for_a_higher_siblings_input",
+    "a_two_way_input_pair_runs_the_lower_position_first",
+    "a_cycle_of_input_waits_runs_its_lowest_position_first",
+    "a_skipped_producer_leaves_its_kind_optional",
 ];
 
 /// Run one case by name.
@@ -903,6 +916,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| branch_case(name, harness))
         .or_else(|| concurrency_case(name, harness))
         .or_else(|| concurrent_recovery_case(name, harness))
+        .or_else(|| review_fix_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -12710,6 +12724,232 @@ async fn assert_landed_before_the_join<O: Orchestrate>(
     );
 }
 
+// -- MOD-138 M3 R1: review fixes (maintainer decisions, 2026-11-08) ----------------------------
+
+/// MOD-138 M3 R1's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn review_fix_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_consumer_waits_for_an_incomparable_producer_of_its_input" => Box::pin(
+            a_consumer_waits_for_an_incomparable_producer_of_its_input(harness),
+        ),
+        "a_lower_position_waits_for_a_higher_siblings_input" => {
+            Box::pin(a_lower_position_waits_for_a_higher_siblings_input(harness))
+        }
+        "a_two_way_input_pair_runs_the_lower_position_first" => {
+            Box::pin(a_two_way_input_pair_runs_the_lower_position_first(harness))
+        }
+        "a_cycle_of_input_waits_runs_its_lowest_position_first" => Box::pin(
+            a_cycle_of_input_waits_runs_its_lowest_position_first(harness),
+        ),
+        "a_skipped_producer_leaves_its_kind_optional" => {
+            Box::pin(a_skipped_producer_leaves_its_kind_optional(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// Scripts each FEAT-3 phase in `phases` to finish with a document naming it and this case, so a
+/// prompt that carries it read this run's document and not an older run's.
+fn script_marked<O: Orchestrate>(orch: &O, phases: &[&str]) {
+    for phase in phases {
+        orch.script(phase, 1, ScriptedStep::done_with_output(&marked(phase)));
+    }
+}
+
+/// The body [`script_marked`] gives `phase`'s document.
+fn marked(phase: &str) -> String {
+    format!("R1 `{phase}` of this run")
+}
+
+/// Holds `held`'s session until `waiting` is shown to have no row, then releases it: the case's
+/// half of a `join` with the walk.
+async fn hold_until_shown_waiting<O: Orchestrate>(
+    orch: &O,
+    hold: &SessionHold,
+    held: &str,
+    waiting: i32,
+) {
+    within(hold.live(1), held).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let run = feat_3_run(orch).await.expect("the run exists");
+    let steps = steps_of(orch, run).await;
+    assert!(
+        latest_row(&steps, waiting).is_none(),
+        "position {waiting} waits while `{held}` runs: {steps:?}"
+    );
+    hold.release();
+}
+
+/// Asserts that `log` lands `before` (a `position/attempt/index`) ahead of preparing `after`.
+fn lands_before(log: &[String], before: &str, after: &str) {
+    let first = |entry: &str| {
+        log.iter()
+            .position(|call| call == entry)
+            .unwrap_or_else(|| panic!("{entry} in {log:?}"))
+    };
+    assert!(
+        first(&format!("reconcile {before}")) < first(&format!("prepare {after}")),
+        "{before} lands before {after} starts: {log:?}"
+    );
+}
+
+/// MOD-138 M3 R1 ("order by inputs", review finding 1): the diamond `prd → {plan, implement} →
+/// review` over FEAT-3's seeded `input_kinds`, kept: `implement` lists `plan`, which the
+/// incomparable `plan` produces. A2 alone admitted both, and `implement`'s stage 3 failed the
+/// run `missing_input`. Now `implement` waits (no row) while `plan`'s session is held, `plan`
+/// lands before `implement` starts, every stage 3 reads this run's documents, and the run ends
+/// `done`.
+async fn a_consumer_waits_for_an_incomparable_producer_of_its_input<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    author_edges(&orch, ids::HTUI_FEAT_3, DIAMOND).await;
+    primary_repo(&orch).await;
+    script_marked(&orch, &["prd", "plan", "implement"]);
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+
+    let ((run, rest), ()) = tokio::join!(
+        start(&orch, ids::HTUI_FEAT_3),
+        hold_until_shown_waiting(&orch, &plan, "plan", 2)
+    );
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    lands_before(&call_log_of(&orch, run).await, "1/1/0", "2/1/0");
+    let steps = steps_of(&orch, run).await;
+    for (position, reads) in [(1, "prd"), (2, "plan"), (3, "implement")] {
+        let prompt = prompt_text(&orch, at(&steps, position, 1).id).await;
+        assert!(
+            prompt.contains(&marked(reads)),
+            "position {position} read this run's `{reads}`:\n{prompt}"
+        );
+    }
+}
+
+/// MOD-138 M3 R1, the reversed direction: `plan` (position 1) lists the kind of its higher
+/// sibling `implement` (2), so `plan` waits for `implement` and reads its document.
+async fn a_lower_position_waits_for_a_higher_siblings_input<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" {
+            phase.input_kinds = vec!["implement".to_owned()];
+        }
+    })
+    .await;
+    primary_repo(&orch).await;
+    script_marked(&orch, &["implement"]);
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+
+    let ((run, rest), ()) = tokio::join!(
+        start(&orch, ids::HTUI_FEAT_3),
+        hold_until_shown_waiting(&orch, &implement, "implement", 1)
+    );
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    lands_before(&call_log_of(&orch, run).await, "2/1/0", "1/1/0");
+    let steps = steps_of(&orch, run).await;
+    let prompt = prompt_text(&orch, at(&steps, 1, 1).id).await;
+    assert!(prompt.contains(&marked("implement")), "{prompt}");
+}
+
+/// MOD-138 M3 R1, two-way: `plan` and `implement` each list the other's kind. The lower position
+/// (`plan`) goes first, M2's order, with `implement`'s kind optional on its attempt; `implement`
+/// waits for it and reads its document. Before R1 `plan` failed the run `missing_input`.
+async fn a_two_way_input_pair_runs_the_lower_position_first<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| match phase.name.as_str() {
+        "plan" => phase.input_kinds = vec!["implement".to_owned()],
+        "implement" => phase.input_kinds = vec!["plan".to_owned()],
+        _ => {}
+    })
+    .await;
+    primary_repo(&orch).await;
+    script_marked(&orch, &["plan"]);
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+
+    let ((run, rest), ()) = tokio::join!(
+        start(&orch, ids::HTUI_FEAT_3),
+        hold_until_shown_waiting(&orch, &plan, "plan", 2)
+    );
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    lands_before(&call_log_of(&orch, run).await, "1/1/0", "2/1/0");
+    let steps = steps_of(&orch, run).await;
+    let prompt = prompt_text(&orch, at(&steps, 2, 1).id).await;
+    assert!(prompt.contains(&marked("plan")), "{prompt}");
+}
+
+/// MOD-138 M3 R1, no deadlock: on `prd → {plan, implement, review}` `plan` lists `implement`'s
+/// kind, `implement` `review`'s and `review` `plan`'s, a cycle of waits among incomparable nodes.
+/// With nothing admissible and nothing in flight the lowest position (`plan`) runs alone, its
+/// input optional; then `review` (it waited for `plan`), then `implement`. No graph is refused.
+async fn a_cycle_of_input_waits_runs_its_lowest_position_first<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, FAN_OF_THREE, |phase| match phase.name.as_str() {
+        "plan" => phase.input_kinds = vec!["implement".to_owned()],
+        "implement" => phase.input_kinds = vec!["review".to_owned()],
+        "review" => phase.input_kinds = vec!["plan".to_owned()],
+        _ => {}
+    })
+    .await;
+    primary_repo(&orch).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    let log = call_log_of(&orch, run).await;
+    lands_before(&log, "1/1/0", "3/1/0");
+    lands_before(&log, "3/1/0", "2/1/0");
+    assert_eq!(orch.live_sessions_high_water(), 1, "one at a time: {log:?}");
+}
+
+/// MOD-138 M3 R1 with D11: on the diamond the `if` takes `plan` and declines `implement`, and
+/// `plan` lists `implement`'s kind. A skipped producer orders nothing and leaves its kind
+/// optional, so `plan` runs and the run ends `done` with no `implement` row.
+async fn a_skipped_producer_leaves_its_kind_optional<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        phase.input_kinds.clear();
+        if phase.name == "plan" {
+            phase.input_kinds = vec!["implement".to_owned()];
+        }
+    })
+    .await;
+    let prefix = item_of(&orch, ids::HTUI_FEAT_3).await.key_prefix;
+    feat_3_diamond(&orch, &serde_json::json!({ "item_kind": prefix })).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.failure.clone()),
+        (RunStatus::Done, None),
+        "{rest:?}"
+    );
+    assert_eq!(
+        sorted_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (3, 1, StepStatus::Done),
+        ],
+        "`implement` is skipped and never gets a row"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -12734,8 +12974,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            174,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            179,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -12809,7 +13049,9 @@ mod tests {
              repair 2 (a rejection handed back cancelling the other parked step), and T4 repair \
              1's two (a looping rejection landing a crashed answer's winner first, in process \
              and resumed), and T4 repair 2's one (a looping rejection handed back walking its \
-             loop as in process)"
+             loop as in process), and MOD-138 M3 R1's five input-order cases (review finding 1: \
+             a consumer waiting for an incomparable producer, the reversed direction, a two-way \
+             pair, a cycle of waits, and a skipped producer)"
         );
     }
 

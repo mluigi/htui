@@ -7001,6 +7001,13 @@ where
                      it is optional (MOD-138 M3 D11)",
                     input.kind
                 )),
+                // MOD-138 M3 R1: an incomparable producer that has not finished; the input order
+                // let this node go first (a two-way pair's lower position, or a broken cycle).
+                (None, InputNeed::Concurrent) => notes.push(format!(
+                    "input `{}`'s producer runs beside this node and has not finished; \
+                     it is optional on this attempt (MOD-138 M3 R1)",
+                    input.kind
+                )),
             }
         }
 

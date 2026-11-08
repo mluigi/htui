@@ -16,7 +16,7 @@
 //! edge ([`GraphSnapshot::reads_verdict`]), never because of what it is called.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use htui_core::model::{
     EdgeKind, GateOutcome, GraphSnapshot, RunStep, SnapshotEdge, SnapshotPhase, StepStatus,
@@ -388,6 +388,34 @@ impl<'a> Graph<'a> {
         successors
     }
 
+    /// MOD-138 M3 R1 ("order by inputs", maintainer 2026-11-08): the walked nodes incomparable
+    /// with `node` (neither reaches the other over forward edges) whose `output_kind` it lists in
+    /// `input_kinds`, as phase indices in `(position, index)` order. A kind some node reachable
+    /// from `node` produces is M2 D9's [`InputNeed::Later`] and is left out: it orders nothing.
+    fn input_producers(&self, node: usize) -> Vec<usize> {
+        let phases = &self.snapshot.phases;
+        let phase = &phases[node];
+        if phase.palette || phase.input_kinds.is_empty() {
+            return Vec::new();
+        }
+        let after = Self::closure(node, &self.successors);
+        let before = Self::closure(node, &self.predecessors);
+        let later = |kind: &str| {
+            self.walked
+                .iter()
+                .any(|&i| i != node && after[i] && phases[i].output_kind == kind)
+        };
+        self.walked
+            .iter()
+            .copied()
+            .filter(|&p| !after[p] && !before[p])
+            .filter(|&p| {
+                let kind = &phases[p].output_kind;
+                phase.input_kinds.contains(kind) && !later(kind)
+            })
+            .collect()
+    }
+
     /// Each walked node's [`Reach`], by phase index, in topological order; `None` on a forward
     /// cycle. A palette node stays `Waiting` and is never read.
     ///
@@ -679,12 +707,24 @@ pub enum InputNeed {
     Required,
     /// Optional because a node reachable from this one produces it (M2 D9): not run yet.
     Later,
-    /// Optional because every upstream producer is skipped behind a declined `if` (M3 D11).
+    /// Optional because every upstream producer is skipped behind a declined `if` (M3 D11), or
+    /// (M3 R1) every producer upstream of it or incomparable with it is skipped.
     SkippedUpstream,
+    /// MOD-138 M3 R1: optional because an incomparable producer has not finished while this node
+    /// already runs. The scheduler orders a node after such a producer ([`input_waits`]), so this
+    /// is a two-way pair's lower position, or the node a cycle of such waits was broken at.
+    Concurrent,
 }
 
 /// Each of `phase`'s `input_kinds`, in order, with its [`InputNeed`] under
-/// [`required_inputs`]' two rules; the later-producer rule wins when both apply.
+/// [`required_inputs`]' rules; the later-producer rule wins, then the concurrent one (R1), then
+/// the skipped one.
+///
+/// MOD-138 M3 R1 ("order by inputs"): a kind produced by a node incomparable with `phase` (see
+/// [`input_waits`]) is [`InputNeed::Concurrent`] while `phase` itself runs (its node holds a live
+/// row) and such a producer has not finished; before `phase` runs, and once every such producer
+/// finished, it is required as ever, and this run's document is the one resolved. A skipped
+/// incomparable producer counts with the upstream ones of D11.
 #[must_use]
 pub fn input_needs(
     phase: &SnapshotPhase,
@@ -693,8 +733,8 @@ pub fn input_needs(
 ) -> Vec<(String, InputNeed)> {
     let graph = Graph::of(snapshot);
     let reachable = graph.reachable_from(&phase.name);
-    let upstream: Vec<usize> = graph
-        .index(&phase.name)
+    let node = graph.index(&phase.name);
+    let upstream: Vec<usize> = node
         .map(|node| {
             let ancestors = Graph::closure(node, &graph.predecessors);
             graph
@@ -705,10 +745,14 @@ pub fn input_needs(
                 .collect()
         })
         .unwrap_or_default();
-    let reach = if upstream.is_empty() {
+    let beside = node
+        .map(|node| graph.input_producers(node))
+        .unwrap_or_default();
+    let states = states(snapshot, steps);
+    let reach = if upstream.is_empty() && beside.is_empty() {
         None
     } else {
-        graph.reach(&states(snapshot, steps), &[])
+        graph.reach(&states, &[])
     };
     let skipped_upstream = |kind: &str| {
         let Some(reach) = &reach else {
@@ -716,9 +760,18 @@ pub fn input_needs(
         };
         let mut producers = upstream
             .iter()
+            .chain(&beside)
             .filter(|&&i| snapshot.phases[i].output_kind == kind)
             .peekable();
         producers.peek().is_some() && producers.all(|&i| reach[i] == Reach::Skipped)
+    };
+    let running = node.is_some_and(|node| matches!(states[node], Some(NodeState::Live(_))));
+    let concurrent = |kind: &str| {
+        running
+            && beside.iter().any(|&p| {
+                snapshot.phases[p].output_kind == kind
+                    && unfinished(p, &states, reach.as_deref(), &[])
+            })
     };
     phase
         .input_kinds
@@ -726,6 +779,8 @@ pub fn input_needs(
         .map(|kind| {
             let need = if reachable.iter().any(|later| later.output_kind == *kind) {
                 InputNeed::Later
+            } else if concurrent(kind) {
+                InputNeed::Concurrent
             } else if skipped_upstream(kind) {
                 InputNeed::SkippedUpstream
             } else {
@@ -736,9 +791,81 @@ pub fn input_needs(
         .collect()
 }
 
+/// MOD-138 M3 R1: whether the node at phase index `p` has not finished: in flight (`masked`), or
+/// neither done nor skipped. On a forward cycle (no `reach`) nothing reads as skipped.
+fn unfinished(
+    p: usize,
+    states: &[Option<NodeState<'_>>],
+    reach: Option<&[Reach]>,
+    masked: &[bool],
+) -> bool {
+    masked.get(p).copied().unwrap_or(false)
+        || (!matches!(states[p], Some(NodeState::Done(_)))
+            && reach.is_none_or(|reach| reach[p] != Reach::Skipped))
+}
+
+/// MOD-138 M3 R1 ("order by inputs", maintainer 2026-11-08): the producers each walked node waits
+/// for now, by position, nodes that wait for none left out.
+///
+/// A node `X` waits for a node `P` when `P` is incomparable with `X` (neither reaches the other
+/// over forward edges, so A2 would admit both at once), `X` lists `P`'s `output_kind` in its
+/// `input_kinds` (a kind no node reachable from `X` produces: that one is M2 D9's `Later`), and
+/// `P` has not finished: it is in flight (a position in `in_flight`, its landing included), or it
+/// is neither done nor skipped. A skipped producer (a declined `if`, an `asks_you` not taken) waits
+/// for nothing, and the kind is then optional (D11's [`InputNeed::SkippedUpstream`]).
+///
+/// Two-way, when `P` waits for `X` by the same rule, the lower position goes first (M2's order):
+/// only the higher one waits. A longer cycle of waits is broken by [`crate::schedule::plan_pass`]
+/// once nothing is admissible and nothing in flight, at the lowest-position candidate. A chain has
+/// no incomparable pair, so a linear graph waits for nothing.
+#[must_use]
+pub(crate) fn input_waits(
+    snapshot: &GraphSnapshot,
+    steps: &[RunStep],
+    in_flight: &BTreeSet<i32>,
+) -> BTreeMap<i32, Vec<i32>> {
+    let graph = Graph::of(snapshot);
+    let phases = &snapshot.phases;
+    let producers: Vec<Vec<usize>> = (0..phases.len())
+        .map(|node| {
+            if phases[node].palette {
+                Vec::new()
+            } else {
+                graph.input_producers(node)
+            }
+        })
+        .collect();
+    let mut waits = BTreeMap::new();
+    if producers.iter().all(Vec::is_empty) {
+        return waits;
+    }
+    let states = states(snapshot, steps);
+    let masked: Vec<bool> = phases
+        .iter()
+        .map(|phase| !phase.palette && in_flight.contains(&phase.position))
+        .collect();
+    let reach = graph.reach(&states, &masked);
+    for &node in &graph.walked {
+        let on: Vec<i32> = producers[node]
+            .iter()
+            .copied()
+            .filter(|&p| {
+                // Two-way: the lower position goes first.
+                !(producers[p].contains(&node) && phases[node].position < phases[p].position)
+            })
+            .filter(|&p| unfinished(p, &states, reach.as_deref(), &masked))
+            .map(|p| phases[p].position)
+            .collect();
+        if !on.is_empty() {
+            waits.insert(phases[node].position, on);
+        }
+    }
+    waits
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
@@ -747,7 +874,7 @@ pub(crate) mod tests {
     };
     use serde_json::json;
 
-    use super::{Graph, InputNeed, input_needs, ready, ready_masked, required_inputs};
+    use super::{Graph, InputNeed, input_needs, input_waits, ready, ready_masked, required_inputs};
     use crate::status::Cursor;
 
     /// `RUN_1`'s snapshot and its first step, the shapes every node and row here is cloned from.
@@ -1615,6 +1742,149 @@ pub(crate) mod tests {
                 ("e".to_owned(), InputNeed::Later),
                 ("x".to_owned(), InputNeed::Required),
             ]
+        );
+    }
+
+    /// MOD-138 M3 R1 ("order by inputs"): a node listing a kind an incomparable node produces
+    /// waits for that producer while it is unfinished (in flight, or neither done nor skipped);
+    /// a two-way pair puts the lower position first; a kind a reachable node produces is M2
+    /// D9's `Later` and orders nothing.
+    #[test]
+    fn input_waits_order_a_consumer_after_an_incomparable_producer() {
+        let base = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3)],
+            &[
+                ("a", "b", NEXT),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+            ],
+        );
+        let a = done(&base, "a");
+        let waits = |snapshot: &GraphSnapshot, steps: &[RunStep], in_flight: &[i32]| {
+            input_waits(snapshot, steps, &mask(in_flight))
+        };
+
+        let mut snapshot = base.clone();
+        snapshot.phases[2].input_kinds = vec!["b".into(), "d".into()];
+        let steps = [a.clone()];
+        assert_eq!(
+            waits(&snapshot, &steps, &[]),
+            BTreeMap::from([(2, vec![1])]),
+            "`c` waits for `b`; `d` is reachable from `c`, so it orders nothing"
+        );
+        assert_eq!(
+            waits(&snapshot, &steps, &[1]),
+            BTreeMap::from([(2, vec![1])]),
+            "in flight is unfinished"
+        );
+        let b = done(&snapshot, "b");
+        assert_eq!(
+            waits(&snapshot, &[a.clone(), b.clone()], &[1]),
+            BTreeMap::from([(2, vec![1])]),
+            "a done row still in flight (its landing) is unfinished"
+        );
+        assert!(waits(&snapshot, &[a.clone(), b], &[]).is_empty());
+
+        let mut reversed = base.clone();
+        reversed.phases[1].input_kinds = vec!["c".into()];
+        assert_eq!(
+            waits(&reversed, &steps, &[]),
+            BTreeMap::from([(1, vec![2])]),
+            "a lower position waits for a higher sibling's kind too"
+        );
+
+        let mut mutual = base.clone();
+        mutual.phases[1].input_kinds = vec!["c".into()];
+        mutual.phases[2].input_kinds = vec!["b".into()];
+        assert_eq!(
+            waits(&mutual, &steps, &[]),
+            BTreeMap::from([(2, vec![1])]),
+            "two-way: the lower position goes first"
+        );
+
+        let mut skipped = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+            ],
+        );
+        skipped.phases[2].input_kinds = vec!["b".into()];
+        let mut decided = done(&skipped, "a");
+        decided.branch = Some(json!({ "b": false }));
+        assert!(
+            waits(&skipped, std::slice::from_ref(&decided), &[]).is_empty(),
+            "a skipped producer orders nothing"
+        );
+        decided.branch = None;
+        assert_eq!(
+            waits(&skipped, &[decided], &[]),
+            BTreeMap::from([(2, vec![1])]),
+            "an undecided `if` leaves the producer unfinished"
+        );
+    }
+
+    /// MOD-138 M3 R1: a kind an incomparable, unfinished producer makes is optional for a node
+    /// that already runs (the order let it go first: a two-way pair's lower position, or a cycle
+    /// broken at its lowest); before the node runs, and once the producer is done, it is required.
+    /// A skipped incomparable producer leaves it optional as D11's skipped upstream one does.
+    #[test]
+    fn input_needs_reads_an_unfinished_incomparable_producer_as_optional_once_running() {
+        let mut snapshot = graph(
+            &[("a", 0), ("b", 1), ("c", 2), ("d", 3)],
+            &[
+                ("a", "b", IF),
+                ("a", "c", NEXT),
+                ("b", "d", NEXT),
+                ("c", "d", NEXT),
+            ],
+        );
+        snapshot.phases[2].input_kinds = vec!["b".into()];
+        let c = snapshot.phases[2].clone();
+        let mut a = done(&snapshot, "a");
+        a.branch = Some(json!({ "b": true }));
+        let running = row(&snapshot, "c", 1, StepStatus::Running);
+        assert_eq!(
+            input_needs(&c, &snapshot, std::slice::from_ref(&a)),
+            [("b".to_owned(), InputNeed::Required)],
+            "`c` has not run: the scheduler holds it until `b` finishes"
+        );
+        assert_eq!(
+            input_needs(&c, &snapshot, &[a.clone(), running.clone()]),
+            [("b".to_owned(), InputNeed::Concurrent)]
+        );
+        assert_eq!(
+            input_needs(
+                &c,
+                &snapshot,
+                &[
+                    a.clone(),
+                    row(&snapshot, "b", 1, StepStatus::Running),
+                    running.clone()
+                ]
+            ),
+            [("b".to_owned(), InputNeed::Concurrent)]
+        );
+        assert_eq!(
+            input_needs(
+                &c,
+                &snapshot,
+                &[a.clone(), done(&snapshot, "b"), running.clone()]
+            ),
+            [("b".to_owned(), InputNeed::Required)],
+            "a done producer's document is this run's"
+        );
+        a.branch = Some(json!({ "b": false }));
+        assert_eq!(
+            input_needs(&c, &snapshot, std::slice::from_ref(&a)),
+            [("b".to_owned(), InputNeed::SkippedUpstream)]
+        );
+        assert_eq!(
+            required_inputs(&c, &snapshot, &[a, running]),
+            Vec::<String>::new()
         );
     }
 

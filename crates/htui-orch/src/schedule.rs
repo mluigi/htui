@@ -17,11 +17,22 @@
 //!      the tree-touching ones, both ways, and (T1 verify) not while another node's `Select` is
 //!      owed: that selection lands first, so the in-place frontier rule sees its landing;
 //!    - (d) the weight cap: the taken weight plus its own is at most `max_parallel_sessions`
-//!      (`0` reads as `1`), or nothing is taken (a node heavier than the cap runs alone).
+//!      (`0` reads as `1`), or nothing is taken (a node heavier than the cap runs alone);
+//!    - (e) R1, "order by inputs" (maintainer, 2026-11-08): a cursor that starts sessions
+//!      (`Create`, `Run`, `Fan`) waits while its node lists a kind that an incomparable,
+//!      unfinished node produces ([`crate::walk::input_waits`]: in flight, or neither done nor
+//!      skipped; two-way, the lower position goes first). Without it (b) would admit both, and
+//!      the consumer's stage 3 would meet `MissingInput` or read an older run's document.
+//!
+//!    **No deadlock (R1).** When nothing is in flight and nothing was admitted, but a candidate
+//!    passed (a) to (d) and waits only on (e), the waits form a cycle among incomparable
+//!    nodes: the lowest-position such candidate is admitted alone. Its stage 3 reads the kind as
+//!    optional ([`crate::walk::InputNeed::Concurrent`]). No graph is refused for such a cycle.
 //!
 //! **Linear parity by construction.** On a graph whose walked nodes are totally ordered by
 //! forward reachability, (b) admits at most one candidate per pass and none while one is in
-//! flight, and that candidate is `ready()[0]`, today's `cursor()`.
+//! flight, and that candidate is `ready()[0]`, today's `cursor()`. A chain has no incomparable
+//! pair, so (e) and its fallback never apply.
 
 use std::collections::BTreeMap;
 
@@ -103,6 +114,9 @@ pub(crate) fn plan_pass(
         .map(|(position, flight)| (*position, *flight))
         .collect();
     let mut admitted = Vec::new();
+    // (e) R1: the producers each node waits for, read once per pass.
+    let waits = crate::walk::input_waits(snapshot, steps, &in_flight.keys().copied().collect());
+    let mut held = Vec::new();
     for cursor in cursors {
         let Some((position, flight)) = candidate(snapshot, steps, cursor) else {
             continue;
@@ -140,15 +154,29 @@ pub(crate) fn plan_pass(
         if !taken.is_empty() && weight.saturating_add(flight.weight) > cap {
             continue;
         }
+        // (e) R1: a node that starts sessions waits for the incomparable producers of its inputs.
+        if matches!(
+            cursor,
+            Cursor::Create { .. } | Cursor::Run(_) | Cursor::Fan { .. }
+        ) && waits.contains_key(&position)
+        {
+            held.push((cursor.clone(), position, flight));
+            continue;
+        }
         taken.push((position, flight));
         admitted.push((cursor.clone(), position, flight));
     }
     match (admitted.is_empty(), idle) {
         (false, _) => PassPlan::Admit(admitted),
         (true, false) => PassPlan::Wait,
-        // Unreachable: the first candidate passes (a) to (d) against nothing taken. A pass with
-        // no candidate at all (every cursor names a row the pass does not hold) rests.
-        (true, true) => PassPlan::Rest,
+        // Rule 3's fallback (R1): every candidate waits on (e) with nothing in flight, so the waits form a
+        // cycle; the lowest position goes first. It passed (a) to (d) against nothing taken.
+        (true, true) => held
+            .into_iter()
+            .min_by_key(|(_, position, _)| *position)
+            .map_or(PassPlan::Rest, |first| PassPlan::Admit(vec![first])),
+        // Otherwise unreachable: the first candidate passes (a) to (d) against nothing taken. A
+        // pass with no candidate at all (every cursor names a row the pass does not hold) rests.
     }
 }
 
@@ -195,7 +223,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use htui_core::model::{
-        AgentId, GraphSnapshot, Isolation, RunStatus, SnapshotJudge, StepId, StepStatus,
+        AgentId, GraphSnapshot, Isolation, RunStatus, RunStep, SnapshotJudge, StepId, StepStatus,
     };
 
     use super::{Flight, PassPlan, plan_pass};
@@ -447,6 +475,105 @@ mod tests {
             )),
             [0],
             "F2: the owed loop runs first and `b` waits"
+        );
+    }
+
+    /// R1 (e): a consumer waits for an incomparable producer of its inputs until it finished; the
+    /// reversed direction waits too; a two-way pair puts the lower position first.
+    #[test]
+    fn a_consumer_waits_for_its_incomparable_producer() {
+        let base = diamond();
+        let a = done(&base, "a");
+        let steps = [a.clone()];
+        let at = |snapshot: &GraphSnapshot,
+                  steps: &[RunStep],
+                  cursors: &[Cursor],
+                  in_flight: &[(i32, Flight)]| {
+            plan_pass(
+                snapshot,
+                steps,
+                RunStatus::Running,
+                cursors,
+                &in_flight.iter().copied().collect(),
+            )
+        };
+        let mut snapshot = base.clone();
+        snapshot.phases[2].input_kinds = vec!["b".into()];
+        assert_eq!(
+            admitted(&at(&snapshot, &steps, &[create(1), create(2)], &[])),
+            [1],
+            "`c` lists `b`'s kind"
+        );
+        assert_eq!(
+            at(
+                &snapshot,
+                &steps,
+                &[create(2)],
+                &[(1, flight(1, true, false))]
+            ),
+            PassPlan::Wait,
+            "`b` in flight is unfinished"
+        );
+        let b = done(&snapshot, "b");
+        assert_eq!(
+            admitted(&at(&snapshot, &[a.clone(), b], &[create(2)], &[])),
+            [2],
+            "once `b` is done `c` runs"
+        );
+
+        let mut reversed = base.clone();
+        reversed.phases[1].input_kinds = vec!["c".into()];
+        assert_eq!(
+            admitted(&at(&reversed, &steps, &[create(1), create(2)], &[])),
+            [2]
+        );
+
+        let mut mutual = base;
+        mutual.phases[1].input_kinds = vec!["c".into()];
+        mutual.phases[2].input_kinds = vec!["b".into()];
+        assert_eq!(
+            admitted(&at(&mutual, &steps, &[create(1), create(2)], &[])),
+            [1],
+            "two-way: the lower position goes first"
+        );
+        assert_eq!(
+            admitted(&at(
+                &mutual,
+                &steps,
+                &[Cursor::Decide { step: a.id }, create(2)],
+                &[]
+            )),
+            [0],
+            "a write the engine owes never waits on inputs"
+        );
+    }
+
+    /// R1, rule 3's fallback: a cycle of input waits among incomparable nodes admits its lowest position
+    /// alone once nothing is in flight, and then orders the rest after it.
+    #[test]
+    fn a_cycle_of_input_waits_admits_its_lowest_position() {
+        let mut snapshot = three();
+        snapshot.phases[0].input_kinds = vec!["b".into()];
+        snapshot.phases[1].input_kinds = vec!["c".into()];
+        snapshot.phases[2].input_kinds = vec!["a".into()];
+        let cursors = [create(0), create(1), create(2)];
+        assert_eq!(admitted(&plan(&snapshot, &cursors, &[])), [0]);
+        assert_eq!(
+            plan(&snapshot, &cursors[1..], &[(0, flight(1, true, false))]),
+            PassPlan::Wait,
+            "`c` waits for `a` in flight, `b` for `c`"
+        );
+        let a = done(&snapshot, "a");
+        assert_eq!(
+            admitted(&plan_pass(
+                &snapshot,
+                std::slice::from_ref(&a),
+                RunStatus::Running,
+                &cursors[1..],
+                &BTreeMap::new(),
+            )),
+            [2],
+            "then `c`, and `b` after it"
         );
     }
 
