@@ -1109,6 +1109,25 @@ impl ReadStore for Backend {
         }
     }
 
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        match self {
+            Self::Memory(store) => store.scope_project(workspace).await,
+            Self::Online { pg, .. } => pg.scope_project(workspace).await,
+            Self::Offline { cache, .. } => cache.scope_project(workspace).await,
+        }
+    }
+
+    async fn owner_documents(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<htui_core::model::OwnerDocument>> {
+        match self {
+            Self::Memory(store) => store.owner_documents(project).await,
+            Self::Online { pg, .. } => pg.owner_documents(project).await,
+            Self::Offline { cache, .. } => cache.owner_documents(project).await,
+        }
+    }
+
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         match self {
             Self::Memory(store) => store.item_requirements(item).await,

@@ -693,6 +693,7 @@ const PROJECT_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
     "type",
+    "owner_workspace_id",
 ];
 
 async fn refresh_project(
@@ -704,7 +705,7 @@ async fn refresh_project(
 ) -> Result<Batch> {
     let rows = sqlx::query!(
         "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, \
-                created_at, updated_at, type AS project_type \
+                created_at, updated_at, type AS project_type, owner_workspace_id \
            FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -728,6 +729,7 @@ async fn refresh_project(
             .bind(ts_bind(row.created_at))
             .bind(ts_bind(row.updated_at))
             .bind(&row.project_type)
+            .bind(row.owner_workspace_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
@@ -1046,6 +1048,7 @@ async fn refresh_item_note(
 
 const DOCUMENT_COLUMNS: &[&str] = &[
     "id",
+    "project_id",
     "item_id",
     "kind",
     "version",
@@ -1065,10 +1068,10 @@ async fn refresh_document(
 ) -> Result<Batch> {
     // Append-only, so the cursor is `created_at` rather than `updated_at` (§6.2).
     let rows = sqlx::query!(
-        "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
-                created_at \
+        "SELECT id, project_id, item_id, kind, version, title, body, produced_by_step_id, \
+                created_by, created_at \
            FROM document \
-          WHERE item_id IN (SELECT id FROM item WHERE project_id = $1) AND created_at > $2 \
+          WHERE project_id = $1 AND created_at > $2 \
           ORDER BY created_at",
         project.as_uuid(),
         since,
@@ -1082,7 +1085,8 @@ async fn refresh_document(
     for row in &rows {
         sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
             .bind(row.id.to_string())
-            .bind(row.item_id.to_string())
+            .bind(row.project_id.to_string())
+            .bind(row.item_id.map(|id| id.to_string()))
             .bind(&row.kind)
             .bind(i64::from(row.version))
             .bind(&row.title)

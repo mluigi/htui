@@ -143,7 +143,11 @@ async fn a_pass_mirrors_the_demo_projects() {
         return;
     };
     let cache = open_cache(&db).await;
-    let report = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+    // MOD-147 D1: the two workspaces' scope rows are projects too, and the store worker adds a
+    // workspace's to the projects it hands the refresher, so "everything" names all five.
+    let mut everything = all_projects();
+    everything.extend([ids::PROJECT_SCOPE_PLATFORM, ids::PROJECT_SCOPE_GRAPHICS]);
+    let report = run_pass(&db.pool, &cache, &everything, &settings(&db, 20))
         .await
         .expect("one pass");
 
@@ -3183,15 +3187,13 @@ async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
         None,
         "an owner document is never an item document"
     );
-    let kinds = cache.item_kinds(scope).await.expect("cache item_kinds");
-    assert_eq!(
-        kinds
-            .iter()
-            .map(|kind| kind.prefix.as_str())
-            .collect::<Vec<_>>(),
-        ["WS"],
-        "the scope row's one kind is mirrored"
-    );
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM item_kind WHERE project_id = ?")
+            .bind(scope.as_uuid().to_string())
+            .fetch_all(cache.pool())
+            .await
+            .expect("read the mirrored kinds");
+    assert_eq!(kinds, ["WS"], "the scope row's one kind is mirrored");
     let scope_items = Scope {
         workspace_id: ids::WORKSPACE_PLATFORM,
         project_ids: vec![scope],

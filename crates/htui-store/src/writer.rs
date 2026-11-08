@@ -346,6 +346,23 @@ impl ReadStore for Writer {
             Self::Online(pg) => pg.memory_revisions(id).await,
         }
     }
+
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        match self {
+            Self::Memory(store) => store.scope_project(workspace).await,
+            Self::Online(pg) => pg.scope_project(workspace).await,
+        }
+    }
+
+    async fn owner_documents(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<htui_core::model::OwnerDocument>> {
+        match self {
+            Self::Memory(store) => store.owner_documents(project).await,
+            Self::Online(pg) => pg.owner_documents(project).await,
+        }
+    }
 }
 
 impl WriteStore for Writer {
@@ -1262,6 +1279,16 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.write_document(new).await,
             Self::Online(pg) => pg.write_document(new).await,
+        }
+    }
+
+    async fn write_owner_document(
+        &self,
+        new: htui_core::model::NewOwnerDocument,
+    ) -> Result<htui_core::model::OwnerDocument> {
+        match self {
+            Self::Memory(store) => store.write_owner_document(new).await,
+            Self::Online(pg) => pg.write_owner_document(new).await,
         }
     }
 

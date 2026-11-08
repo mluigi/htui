@@ -537,8 +537,9 @@ pub async fn seed_mirror(cache: &CacheStore, demo: &DemoData) -> Result<()> {
     for project in &demo.projects {
         sqlx::query(
             "INSERT INTO project (id, slug, name, description, secret_provider, secret_scope, \
-                                  settings, created_by, created_at, updated_at, type) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  settings, created_by, created_at, updated_at, type, \
+                                  owner_workspace_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(project.id.to_string())
         .bind(&project.slug)
@@ -551,6 +552,7 @@ pub async fn seed_mirror(cache: &CacheStore, demo: &DemoData) -> Result<()> {
         .bind(ts_bind(project.created_at))
         .bind(ts_bind(project.updated_at))
         .bind(&project.project_type)
+        .bind(project.owner_workspace_id.map(|id| id.to_string()))
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx)?;
