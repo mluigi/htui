@@ -720,9 +720,9 @@ impl WalkScopes {
 #[cfg(test)]
 mod walk_scopes {
     use htui_agent::record::{Control, RELAY_GRACE, Signal, control_channel};
-    use htui_core::model::RunId;
+    use htui_core::model::{RunId, RunStatus};
 
-    use super::WalkScopes;
+    use super::{EngineError, Rest, WalkEnd, WalkScopes};
 
     /// The scope lives as long as its guard; a run with no open walk has no walk control.
     #[test]
@@ -766,6 +766,43 @@ mod walk_scopes {
                 .map(|control: Control| control.signal()),
             Some(Signal::Cancel { grace: RELAY_GRACE })
         );
+    }
+
+    /// MOD-138 M3 R1 (review finding 2): a sibling's error that returns before the real ender's
+    /// terminal rest does not name the cut notes' ender; the terminal rest does. A terminal rest
+    /// first keeps its position against a later error, and a second terminal rest is handed back.
+    #[test]
+    fn a_terminal_rest_names_the_ender_over_an_earlier_error() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let _guard = scopes.open(run);
+        let failed = || Rest {
+            run: RunStatus::Failed,
+            position: Some(1),
+            failure: None,
+        };
+        let mut end = WalkEnd::default();
+        end.error(EngineError::Stalled { run, passes: 1 }, run);
+        end.end_at(Some(2), true, &scopes, run);
+        assert_eq!(end.ender, Some(2));
+        assert!(
+            end.terminal_at(failed(), 1, true, &scopes, run).is_none(),
+            "the first terminal rest is kept"
+        );
+        assert_eq!(end.ender, Some(1), "the terminal rest's node ended the run");
+        assert!(end.cut);
+
+        let mut end = WalkEnd::default();
+        assert!(end.terminal_at(failed(), 1, true, &scopes, run).is_none());
+        end.error(EngineError::Stalled { run, passes: 1 }, run);
+        end.end_at(Some(2), false, &scopes, run);
+        assert_eq!(end.ender, Some(1), "a later error names nothing");
+        assert_eq!(
+            end.terminal_at(failed(), 3, false, &scopes, run),
+            Some(failed()),
+            "a further terminal rest is dropped"
+        );
+        assert_eq!(end.ender, Some(1));
     }
 
     /// A4: the cleanup is deferred only beside a sibling, and owed once.
@@ -862,8 +899,28 @@ impl WalkEnd {
         }
     }
 
-    /// Ends the walk at `position`, which names the ender in the cut notes: with siblings live,
-    /// cut them (blueprint A5).
+    /// Records a node future's terminal rest from `position`; a second one is handed back, the
+    /// first having ended the run. R1 (review finding 2): the terminal rest names the ender even
+    /// when a sibling's error (a stale write, say) came back first and named its own node.
+    fn terminal_at(
+        &mut self,
+        rest: Rest,
+        position: i32,
+        siblings: bool,
+        walks: &WalkScopes,
+        run: RunId,
+    ) -> Option<Rest> {
+        if self.terminal.is_some() {
+            return Some(rest);
+        }
+        self.terminal = Some(rest);
+        self.ender = Some(position);
+        self.end_at(Some(position), siblings, walks, run);
+        None
+    }
+
+    /// Ends the walk at `position`, which names the ender in the cut notes unless one is named
+    /// already: with siblings live, cut them (blueprint A5).
     fn end_at(&mut self, position: Option<i32>, siblings: bool, walks: &WalkScopes, run: RunId) {
         if self.ender.is_none() {
             self.ender = position;
@@ -3776,10 +3833,9 @@ where
                     match out {
                         Ok(None) => {}
                         Ok(Some(rest)) if rest.run.is_terminal() => {
-                            if end.terminal.is_none() {
-                                end.terminal = Some(rest);
-                                end.end_at(Some(position), siblings, &self.walks, run);
-                            } else {
+                            if let Some(rest) =
+                                end.terminal_at(rest, position, siblings, &self.walks, run)
+                            {
                                 tracing::warn!(%run, position, ?rest, "a further terminal rest is dropped; the first ended the run");
                             }
                         }
