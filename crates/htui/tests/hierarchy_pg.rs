@@ -26,13 +26,14 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use htui::hierarchy::{HierarchySnapshot, InferOutcome, InferReport};
+use htui::hierarchy::{HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui_core::fixtures::ids;
 use htui_core::model::RepoId;
-use htui_core::store::WriteStore as _;
+use htui_core::store::{DeleteTarget, ReadStore as _, WriteStore as _};
 use htui_orch::infer::MatchedBy;
 use htui_orch::isolate::git::testkit::repo_with_one_commit;
+use htui_store::cache::refresh::{RefreshSettings, run_pass};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 
 /// A real repository at `root/rel`, with `remote` as its `origin` when given.
@@ -235,6 +236,92 @@ async fn inference_writes_one_row_and_keeps_a_manual_one_on_postgres() {
             .expect("the server answers"),
         docs_rows,
         "and leaves the manual row as it was"
+    );
+
+    cache.close().await;
+    db.drop_db().await;
+}
+
+/// MOD-147 A1: a workspace delete takes its scope row and everything the row owns, and those are
+/// per-project mirror tables that no refresh pass ever empties. So the delete rebuilds the mirror
+/// as a project delete does, and the mirror stops serving the scope row, its `WS` kind and the
+/// workspace's `scope_project`.
+#[tokio::test]
+async fn a_workspace_delete_rebuilds_the_mirror_its_scope_row_was_in() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let mirror = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(mirror.path(), "hierarchy-pg", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let backend = Backend::Online {
+        pg: db.store.clone(),
+        cache: cache.clone(),
+    };
+    let settings = RefreshSettings {
+        this_box: db.store.this_box(),
+        ..RefreshSettings::default()
+    };
+    run_pass(
+        &db.pool,
+        &cache,
+        &[ids::PROJECT_VULKAN, ids::PROJECT_SCOPE_GRAPHICS],
+        &settings,
+    )
+    .await
+    .expect("a pass over the graphics scope");
+    assert_eq!(
+        cache
+            .scope_project(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect("the mirror answers"),
+        Some(ids::PROJECT_SCOPE_GRAPHICS),
+        "the pass mirrored the scope row"
+    );
+    assert!(
+        cache
+            .project(ids::PROJECT_SCOPE_GRAPHICS)
+            .await
+            .expect("the mirror answers")
+            .is_some()
+    );
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::DeleteWorkspace(ids::WORKSPACE_GRAPHICS),
+    )
+    .await;
+    let StoreReply::Deleted {
+        target,
+        reach,
+        mirror: after,
+    } = reply
+    else {
+        panic!("a delete answers what it took: {reply:?}");
+    };
+    assert_eq!(target, DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS));
+    assert_eq!(
+        reach.item_kinds, 1,
+        "the scope row's `WS` kind went with it"
+    );
+    assert_eq!(after, MirrorAfterDelete::Rebuilt);
+
+    assert!(
+        cache
+            .project(ids::PROJECT_SCOPE_GRAPHICS)
+            .await
+            .expect("the mirror answers")
+            .is_none(),
+        "the mirror no longer serves the deleted scope row"
+    );
+    assert_eq!(
+        cache
+            .scope_project(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect("the mirror answers"),
+        None,
+        "nor names it the deleted workspace's scope row"
     );
 
     cache.close().await;

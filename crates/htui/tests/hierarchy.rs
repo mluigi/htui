@@ -775,10 +775,10 @@ async fn delete_reach_equals_deleted_reach() {
     );
 }
 
-/// A workspace delete takes its links and its box paths and **not** its projects (M1 D4), and it
-/// needs no rebuild: the two tables it touches are full-table replaced on every refresh pass. Its
+/// A workspace delete takes its links and its box paths and **not** its projects (M1 D4). Its
 /// scope row goes with it, counted (MOD-147 A1): the `WS` kind, its graph, two phases and the ten
-/// templates.
+/// templates. That makes it a project delete as far as the mirror goes, so it rebuilds one like
+/// `DeleteProject` does; on a memory backend there is none.
 #[tokio::test]
 async fn delete_workspace_keeps_its_projects() {
     let store = MemStore::demo();
@@ -804,7 +804,7 @@ async fn delete_workspace_keeps_its_projects() {
     assert_eq!(reach.step_graphs, 1);
     assert_eq!(reach.phases, 2);
     assert_eq!(reach.prompt_templates, 10);
-    assert_eq!(mirror, MirrorAfterDelete::NotNeeded);
+    assert_eq!(mirror, MirrorAfterDelete::NoMirror);
 
     let after = serve(&backend, &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await;
     assert!(
@@ -1732,7 +1732,7 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
                 workspace_links: 1,
                 ..DeleteReach::default()
             }),
-            mirror: MirrorAfterDelete::NotNeeded,
+            mirror: MirrorAfterDelete::Rebuilt,
         },
     );
     let asked = bench.drained();
@@ -3823,12 +3823,12 @@ async fn a_delete_counts_in_words() {
                 workspace_links: 1,
                 ..DeleteReach::default()
             }),
-            mirror: MirrorAfterDelete::NotNeeded,
+            mirror: MirrorAfterDelete::Rebuilt,
         },
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("deleted `graphics`: 1 row across 1 table; no rebuild needed"),
+        frame.contains("deleted `graphics`: 1 row across 1 table; mirror rebuilt"),
         "{frame}"
     );
 }
