@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use htui_core::model::OwnerDocument;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -306,7 +307,7 @@ impl ReadStore for PgStore {
             DocumentHead,
             r#"
             SELECT id                  AS "id: htui_core::model::DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -522,7 +523,7 @@ impl ReadStore for PgStore {
             Document,
             r#"
             SELECT id                  AS "id: DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -530,7 +531,7 @@ impl ReadStore for PgStore {
                    produced_by_step_id AS "produced_by_step_id: StepId",
                    created_by          AS "created_by: htui_core::model::UserId",
                    created_at
-              FROM document WHERE id = $1
+              FROM document WHERE id = $1 AND item_id IS NOT NULL
             "#,
             id.as_uuid(),
         )
@@ -553,7 +554,7 @@ impl ReadStore for PgStore {
             r#"
             SELECT DISTINCT ON (kind)
                    id                  AS "id: DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -689,6 +690,7 @@ impl ReadStore for PgStore {
                    name,
                    description,
                    type            AS project_type,
+                   owner_workspace_id AS "owner_workspace_id: WorkspaceId",
                    secret_provider,
                    secret_scope,
                    settings,
@@ -1154,6 +1156,37 @@ impl ReadStore for PgStore {
         .fetch_all(&self.pool)
         .await
         .map(Some)
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-147 D1: the workspace's scope row, by `owner_workspace_id` (unique).
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        crate::pg::write::scope_row_id(&self.pool, workspace).await
+    }
+
+    /// MOD-147 D2: the project's owner documents (`item_id IS NULL`), bodies included, in
+    /// `(kind bytes, version)` order — `COLLATE "C"`, as `MemStore` and the mirror sort bytes.
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
+        sqlx::query_as!(
+            OwnerDocument,
+            r#"
+            SELECT id                  AS "id: DocumentId",
+                   project_id          AS "project_id: ProjectId",
+                   kind,
+                   version,
+                   title,
+                   body,
+                   produced_by_step_id AS "produced_by_step_id: StepId",
+                   created_by          AS "created_by: UserId",
+                   created_at
+              FROM document
+             WHERE project_id = $1 AND item_id IS NULL
+             ORDER BY kind COLLATE "C", version
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
         .map_err(map_sqlx)
     }
 
@@ -2872,7 +2905,7 @@ impl PgStore {
             r#"
             SELECT workspace_id AS "workspace_id: WorkspaceId",
                    box_id       AS "box_id: BoxId",
-                   root_path,
+                   folder_path,
                    updated_at
               FROM workspace_box_path
              WHERE workspace_id = $1

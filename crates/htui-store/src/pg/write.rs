@@ -31,22 +31,22 @@ use htui_core::model::{
     Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
     ItemRevision, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision,
     MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
-    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission,
-    PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch,
-    ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags, missing_tags_failure,
-    moved_order, overlaps, scope_of,
+    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
+    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
+    ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -81,6 +81,10 @@ use htui_core::store::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     phase_row_refusal, workspace_graph_is_held,
+};
+use htui_core::store::{
+    project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
+    workspace_has_live_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -396,12 +400,13 @@ async fn insert_document(conn: &mut PgConnection, new: NewDocument) -> Result<Do
     sqlx::query_as!(
         Document,
         r#"
-        INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id,
-                              created_by, created_at)
-        SELECT $1, $2, $3, COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
+        INSERT INTO document (id, project_id, item_id, kind, version, title, body,
+                              produced_by_step_id, created_by, created_at)
+        SELECT $1, (SELECT project_id FROM item WHERE id = $2), $2, $3,
+               COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
           FROM document WHERE item_id = $2 AND kind = $3
         RETURNING id                  AS "id: htui_core::model::DocumentId",
-                  item_id             AS "item_id: ItemId",
+                  item_id             AS "item_id!: ItemId",
                   kind,
                   version,
                   title,
@@ -500,18 +505,88 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
         "#,
         id.as_uuid(),
     )
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(map_sqlx)?;
-
-    Ok(counted.map(|row| DeleteReach {
+    let Some(row) = counted else {
+        return Ok(None);
+    };
+    let own = DeleteReach {
         workspace_links: rows(row.links),
         workspace_box_paths: rows(row.paths),
         step_graphs: rows(row.graphs),
         phases: rows(row.phases),
         phase_agents: rows(row.agents),
         ..DeleteReach::default()
-    }))
+    };
+
+    // MOD-147 A1: the scope row goes with the workspace (`fk_project_owner_workspace ... ON
+    // DELETE CASCADE`), so its whole project reach is counted in, field by field.
+    let scope = match scope_row_id(&mut *conn, id).await? {
+        Some(scope) => project_reach(conn, scope).await?.unwrap_or_default(),
+        None => DeleteReach::default(),
+    };
+    Ok(Some(own + scope))
+}
+
+/// MOD-147 D1: the workspace's scope row, the one `project` whose `owner_workspace_id` it is;
+/// `None` for an unknown workspace (or one the bootstrap has not reached yet).
+pub(crate) async fn scope_row_id<'e, E: PgExecutor<'e>>(
+    executor: E,
+    workspace: WorkspaceId,
+) -> Result<Option<ProjectId>> {
+    sqlx::query_scalar!(
+        r#"SELECT id AS "id: ProjectId" FROM project WHERE owner_workspace_id = $1"#,
+        workspace.as_uuid(),
+    )
+    .fetch_optional(executor)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-147 D7: the workspace's scope row and its `WS` seed, on `conn`'s transaction — `@<slug>`,
+/// type `workspace`, named after the workspace, owned by it. `Ok(None)` when the workspace already
+/// has one (`ON CONFLICT (owner_workspace_id) DO NOTHING`), which is what keeps the bootstrap's
+/// top-up idempotent; the seed is written only beside a row this call inserted.
+///
+/// # Errors
+///
+/// [`StoreError::Constraint`] when `@<slug>` is taken by another row (`23505` on
+/// `project_slug_key`) or `created_by` names no user (`23503`); whatever else the driver reports.
+pub(crate) async fn insert_scope_row(
+    conn: &mut PgConnection,
+    workspace: WorkspaceId,
+    workspace_slug: &str,
+    name: &str,
+    created_by: UserId,
+) -> Result<Option<ProjectId>> {
+    let inserted = sqlx::query_scalar!(
+        r#"
+        INSERT INTO project (id, slug, name, description, created_by, type, owner_workspace_id)
+        VALUES ($1, $2, $3, '', $4, $5, $6)
+        ON CONFLICT (owner_workspace_id) DO NOTHING
+        RETURNING id AS "id: ProjectId"
+        "#,
+        ProjectId::new().as_uuid(),
+        seed::scope_row_slug(workspace_slug),
+        name,
+        created_by.as_uuid(),
+        seed::SCOPE_ROW_TYPE,
+        workspace.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    if let Some(id) = inserted {
+        seed_project(
+            conn,
+            id,
+            created_by,
+            std::slice::from_ref(&seed::WORKSPACE_KIND),
+        )
+        .await?;
+    }
+    Ok(inserted)
 }
 
 /// What a project delete reaches, in one statement of scalar subqueries over `0001_init.sql`'s
@@ -578,8 +653,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                (SELECT count(*) FROM item_link
                  WHERE from_item_id IN (SELECT id FROM i)
                     OR to_item_id   IN (SELECT id FROM i))                    AS "links!",
-               (SELECT count(*) FROM document
-                 WHERE item_id IN (SELECT id FROM i))                         AS "documents!",
+               (SELECT count(*) FROM document WHERE project_id = $1)          AS "documents!",
                (SELECT count(*) FROM requirement_spec WHERE project_id = $1)  AS "requirement_specs!",
                (SELECT count(*) FROM ra)                                      AS "requirement_areas!",
                (SELECT count(*) FROM requirement_key_counter
@@ -2945,13 +3019,16 @@ impl WriteStore for PgStore {
     // workspace
 
     /// One `INSERT ... RETURNING`; the row comes back with the server's `now()`, not the caller's.
+    /// Its scope row (`@<slug>`, the `WS` seed) is inserted in the same transaction (MOD-147 D7),
+    /// so a refused create writes neither.
     ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when `slug` is taken (`23505`) or `created_by` names no
     /// `app_user` row (`23503`, which is what the nil UUID does).
     async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
-        sqlx::query_as!(
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query_as!(
             Workspace,
             r#"
             INSERT INTO workspace (id, slug, name, description, created_by)
@@ -2970,9 +3047,13 @@ impl WriteStore for PgStore {
             new.description,
             new.created_by.as_uuid(),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?;
+        // MOD-147 D7: the scope row and its seed in the workspace's own transaction.
+        insert_scope_row(&mut tx, row.id, &row.slug, &row.name, row.created_by).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
     /// The compare-and-set of D3 with `COALESCE` patch semantics, exactly as
@@ -2993,6 +3074,8 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: WorkspacePatch,
     ) -> Result<CasOutcome<Workspace>> {
+        let renames = patch.slug.is_some() || patch.name.is_some();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let updated = sqlx::query_as!(
             Workspace,
             r#"
@@ -3015,13 +3098,31 @@ impl WriteStore for PgStore {
             patch.name,
             patch.description,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
 
         match updated {
-            Some(row) => Ok(CasOutcome::Applied(row)),
-            None => cas_miss(self.workspace_row(id).await?, "workspace", id),
+            Some(row) => {
+                // MOD-147 D7: a slug or name edit renames the scope row in the same transaction.
+                if renames {
+                    sqlx::query!(
+                        "UPDATE project SET slug = $2, name = $3 WHERE owner_workspace_id = $1",
+                        id.as_uuid(),
+                        seed::scope_row_slug(&row.slug),
+                        row.name,
+                    )
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                }
+                tx.commit().await.map_err(map_sqlx)?;
+                Ok(CasOutcome::Applied(row))
+            }
+            None => {
+                drop(tx);
+                cas_miss(self.workspace_row(id).await?, "workspace", id)
+            }
         }
     }
 
@@ -3044,6 +3145,18 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`] when either id names no row (`23503`).
     async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()> {
+        // MOD-147 D4: a scope row joins no workspace. Race-free as a pre-read: a row's
+        // `owner_workspace_id` is never updated.
+        let scope = sqlx::query_scalar!(
+            "SELECT slug FROM project WHERE id = $1 AND owner_workspace_id IS NOT NULL",
+            link.project_id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(slug) = scope {
+            return Err(StoreError::Constraint(scope_row_joins_no_workspace(&slug)));
+        }
         sqlx::query!(
             "INSERT INTO workspace_project (workspace_id, project_id, position) \
              VALUES ($1, $2, $3) \
@@ -3106,12 +3219,12 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] when either id names no row (`23503`).
     async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
         sqlx::query!(
-            "INSERT INTO workspace_box_path (workspace_id, box_id, root_path) \
+            "INSERT INTO workspace_box_path (workspace_id, box_id, folder_path) \
              VALUES ($1, $2, $3) \
-             ON CONFLICT (workspace_id, box_id) DO UPDATE SET root_path = EXCLUDED.root_path",
+             ON CONFLICT (workspace_id, box_id) DO UPDATE SET folder_path = EXCLUDED.folder_path",
             path.workspace_id.as_uuid(),
             path.box_id.as_uuid(),
-            path.root_path,
+            path.folder_path,
         )
         .execute(&self.pool)
         .await
@@ -3145,6 +3258,10 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] when `slug` is taken (`23505`) or `created_by` names no
     /// `app_user` row (`23503`) — both on the first statement, before any seed row.
     async fn create_project(&self, new: NewProject) -> Result<Project> {
+        // MOD-147 D3: `@` is a scope row's, judged before anything is written.
+        if let Some(refusal) = project_slug_refusal(&new.slug) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let created = sqlx::query_as!(
@@ -3157,6 +3274,7 @@ impl WriteStore for PgStore {
                       name,
                       description,
                       type            AS project_type,
+                      owner_workspace_id AS "owner_workspace_id: WorkspaceId",
                       secret_provider,
                       secret_scope,
                       settings,
@@ -3174,7 +3292,7 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)?;
 
-        seed_project(&mut tx, created.id, created.created_by).await?;
+        seed_project(&mut tx, created.id, created.created_by, &seed::KINDS).await?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(created)
@@ -3195,6 +3313,11 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: ProjectPatch,
     ) -> Result<CasOutcome<Project>> {
+        // MOD-147 D3: a `@` slug is refused before anything is read, as on create. A slug patch on
+        // a scope row is `chk_project_scope_slug`'s (`23514`).
+        if let Some(refusal) = patch.slug.as_deref().and_then(project_slug_refusal) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let (secret_set, secret_provider, secret_scope) = match &patch.secret {
             None => (false, None, None),
             Some(None) => (true, None, None),
@@ -3219,6 +3342,7 @@ impl WriteStore for PgStore {
                       name,
                       description,
                       type            AS project_type,
+                      owner_workspace_id AS "owner_workspace_id: WorkspaceId",
                       secret_provider,
                       secret_scope,
                       settings,
@@ -5862,7 +5986,8 @@ impl WriteStore for PgStore {
     }
 
     /// Counts inside the transaction, then lets the cascade do the deleting
-    /// (`0001_init.sql:162,174`). Projects survive it.
+    /// (`0001_init.sql:162,174`). Member projects survive it; the workspace's scope row and all it
+    /// owns go with it, counted (MOD-147 A1), and a live run of the scope row refuses the delete.
     ///
     /// Up to `DELETE_ATTEMPTS` tries, because the transaction runs at `REPEATABLE READ` and a link
     /// or a box path committed under it raises `40001` rather than slipping past the count (review
@@ -7786,6 +7911,64 @@ impl WriteStore for PgStore {
         Ok(written)
     }
 
+    /// MOD-147 D2: the owner document at `max(version) + 1` for its `(project, kind)` among the
+    /// project's owner documents, allocated under the project's row lock as
+    /// [`write_document`](WriteStore::write_document) allocates under the item's. `FOR NO KEY
+    /// UPDATE` serialises two owner-document writers without blocking a concurrent `mint_item`'s
+    /// `FOR KEY SHARE` on the same row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "project" }`; [`StoreError::Constraint`] on a duplicate
+    /// id (`23505`, any document) or a `created_by` that names no row (`23503`).
+    async fn write_owner_document(&self, new: NewOwnerDocument) -> Result<OwnerDocument> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        sqlx::query_scalar!(
+            "SELECT 1 FROM project WHERE id = $1 FOR NO KEY UPDATE",
+            new.project_id.as_uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "project",
+            id: new.project_id.to_string(),
+        })?;
+
+        let written = sqlx::query_as!(
+            OwnerDocument,
+            r#"
+            INSERT INTO document (id, project_id, item_id, kind, version, title, body,
+                                  produced_by_step_id, created_by, created_at)
+            SELECT $1, $2, NULL, $3, COALESCE(MAX(version), 0) + 1, $4, $5, NULL, $6, $7
+              FROM document WHERE project_id = $2 AND item_id IS NULL AND kind = $3
+            RETURNING id                  AS "id: htui_core::model::DocumentId",
+                      project_id          AS "project_id: ProjectId",
+                      kind,
+                      version,
+                      title,
+                      body,
+                      produced_by_step_id AS "produced_by_step_id: StepId",
+                      created_by          AS "created_by: UserId",
+                      created_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.kind,
+            new.title,
+            new.body,
+            new.created_by.as_uuid(),
+            new.created_at,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(written)
+    }
+
     /// §4.8's promotion, one transaction (plan D6): the step and its run are lifted to
     /// `awaiting_approval` together, so no reader sees a gated step under a running run; the
     /// item's `needs you` is derived from the run (MOD-144).
@@ -9589,11 +9772,12 @@ async fn seed_project(
     tx: &mut PgConnection,
     project_id: ProjectId,
     created_by: UserId,
+    kinds: &[seed::KindSeed],
 ) -> Result<()> {
     // For the row constructors only; every timestamp column takes the server's clock.
     let now = Utc::now();
 
-    for (position, kind) in seed::KINDS.iter().enumerate() {
+    for (position, kind) in kinds.iter().enumerate() {
         let graph = seed::graph_row(StepGraphId::new(), project_id, kind, now);
         sqlx::query!(
             "INSERT INTO step_graph (id, project_id, name, description) VALUES ($1, $2, $3, $4)",
@@ -9939,6 +10123,34 @@ impl PgStore {
                 &held.project,
             )));
         }
+        // MOD-147 A1: a live run of the scope row refuses; everything else the scope row owns
+        // cascades with the workspace (`fk_project_owner_workspace`), counted in `reach`.
+        let live = sqlx::query_scalar!(
+            r#"
+            SELECT count(*) AS "live!"
+              FROM run r JOIN project p ON p.id = r.project_id
+             WHERE p.owner_workspace_id = $1
+               AND r.status IN ('queued', 'running', 'awaiting_approval')
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if live > 0 {
+            let slug =
+                sqlx::query_scalar!("SELECT slug FROM workspace WHERE id = $1", id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+            return Err(StoreError::Constraint(workspace_has_live_run(
+                &slug,
+                rows(live),
+            )));
+        }
+        if let Some(scope) = scope_row_id(&mut *tx, id).await? {
+            release_repo_references(&mut tx, scope).await?;
+        }
         match sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await
@@ -9960,6 +10172,21 @@ impl PgStore {
     /// `DELETE` can raise the serialization failure, which is why only it is matched on.
     async fn delete_project_once(&self, id: ProjectId) -> Result<Option<DeleteReach>> {
         let mut tx = begin_repeatable_read(&self.pool).await?;
+
+        // MOD-147 A2: a scope row goes with its workspace, never alone; refused before any write.
+        // `owner_workspace_id` is never updated, so the read cannot go stale under the delete.
+        let scope = sqlx::query_scalar!(
+            "SELECT slug FROM project WHERE id = $1 AND owner_workspace_id IS NOT NULL",
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(slug) = scope {
+            return Err(StoreError::Constraint(
+                scope_row_is_deleted_with_its_workspace(&slug),
+            ));
+        }
 
         let Some(reach) = project_reach(&mut tx, id).await? else {
             return Err(StoreError::NotFound {

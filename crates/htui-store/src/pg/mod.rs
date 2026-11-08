@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use htui_core::model::agent::seed_rows;
-use htui_core::model::{BoxId, OsFamily, UserId};
+use htui_core::model::{BoxId, OsFamily, UserId, WorkspaceId};
 use htui_core::store::{Result, StoreError};
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -552,6 +552,35 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+        }
+
+        // MOD-147 D7: every workspace without a scope row gets one, with its `WS` seed. 0026
+        // writes none (the seed is code), so this is how a workspace from before it gains one;
+        // inside the `app_user`-locked transaction, so two first connects cannot both insert, and
+        // `insert_scope_row`'s `ON CONFLICT (owner_workspace_id) DO NOTHING` keeps it idempotent.
+        let unscoped = sqlx::query!(
+            r#"
+            SELECT w.id         AS "id: WorkspaceId",
+                   w.slug,
+                   w.name,
+                   w.created_by AS "created_by: UserId"
+              FROM workspace w
+             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.owner_workspace_id = w.id)
+             ORDER BY w.id
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        for workspace in unscoped {
+            write::insert_scope_row(
+                &mut tx,
+                workspace.id,
+                &workspace.slug,
+                &workspace.name,
+                workspace.created_by,
+            )
+            .await?;
         }
 
         // The oldest row, not `WHERE name = $1`: this box's OS user name is how an empty database

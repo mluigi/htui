@@ -114,8 +114,8 @@ impl PgStore {
         for row in &data.projects {
             sqlx::query!(
                 "INSERT INTO project (id, slug, name, description, secret_provider, secret_scope, \
-                 settings, created_by, created_at, updated_at, type) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 settings, created_by, created_at, updated_at, type, owner_workspace_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 row.id.as_uuid(),
                 row.slug,
                 row.name,
@@ -127,6 +127,7 @@ impl PgStore {
                 row.created_at,
                 row.updated_at,
                 row.project_type,
+                row.owner_workspace_id.map(WorkspaceId::as_uuid),
             )
             .execute(&mut *tx)
             .await
@@ -678,9 +679,10 @@ impl PgStore {
 
         for row in &data.documents {
             sqlx::query!(
-                "INSERT INTO document (id, item_id, kind, version, title, body, \
+                "INSERT INTO document (id, project_id, item_id, kind, version, title, body, \
                  produced_by_step_id, created_by, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 VALUES ($1, (SELECT project_id FROM item WHERE id = $2), $2, $3, $4, $5, $6, $7, \
+                 $8, $9)",
                 DocumentId::as_uuid(row.id),
                 ItemId::as_uuid(row.item_id),
                 row.kind,
