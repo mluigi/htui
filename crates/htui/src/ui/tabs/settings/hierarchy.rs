@@ -1025,7 +1025,6 @@ impl HierarchySection {
         let mirror = match mirror {
             MirrorAfterDelete::Rebuilt => "mirror rebuilt".to_owned(),
             MirrorAfterDelete::NoMirror => "no mirror".to_owned(),
-            MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
             MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
         };
         let rows = plural(usize::try_from(rows).unwrap_or(usize::MAX), "row", "rows");

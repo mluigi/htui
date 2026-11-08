@@ -78,9 +78,6 @@ pub enum MirrorAfterDelete {
     Rebuilt,
     /// There is no mirror on this backend (`Backend::Memory`).
     NoMirror,
-    /// A workspace delete: `workspace` and `workspace_project` are full-table replaced on every
-    /// refresh pass, so nothing stale can survive one.
-    NotNeeded,
     /// The rebuild failed; the delete still happened.
     Failed(String),
 }
@@ -446,29 +443,23 @@ pub async fn serve_with_home(
         StoreRequest::DeleteReach(target) => Ok(StoreReply::DeleteReach(
             writer.delete_reach(*target).await?.map(Box::new),
         )),
-        StoreRequest::DeleteWorkspace(id) => Ok(StoreReply::Deleted {
-            target: DeleteTarget::Workspace(*id),
-            reach: Box::new(writer.delete_workspace(*id).await?),
-            // `workspace` and `workspace_project` are full-table replaced on every refresh pass,
-            // so the mirror cannot serve a workspace this just removed (D10).
-            mirror: MirrorAfterDelete::NotNeeded,
-        }),
+        StoreRequest::DeleteWorkspace(id) => {
+            let reach = writer.delete_workspace(*id).await?;
+            // The workspace takes its scope row with it (MOD-147 A1): a project, with its kinds,
+            // templates, items and documents, all in per-project mirror tables that no refresh
+            // pass empties. So the mirror is rebuilt exactly as for `DeleteProject` (D10).
+            Ok(StoreReply::Deleted {
+                target: DeleteTarget::Workspace(*id),
+                reach: Box::new(reach),
+                mirror: rebuild_mirror(backend).await,
+            })
+        }
         StoreRequest::DeleteProject(id) => {
             let reach = writer.delete_project(*id).await?;
-            // The rows are gone before this line, so a failed rebuild is reported *inside* a
-            // successful reply rather than turning the delete into a `Failed` that claims nothing
-            // happened.
-            let mirror = match backend.cache() {
-                Some(cache) => match cache.rebuild().await {
-                    Ok(()) => MirrorAfterDelete::Rebuilt,
-                    Err(err) => MirrorAfterDelete::Failed(err.to_string()),
-                },
-                None => MirrorAfterDelete::NoMirror,
-            };
             Ok(StoreReply::Deleted {
                 target: DeleteTarget::Project(*id),
                 reach: Box::new(reach),
-                mirror,
+                mirror: rebuild_mirror(backend).await,
             })
         }
         StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box, home).await,
@@ -554,6 +545,20 @@ async fn canonical(path: &str) -> Result<String> {
             "`{typed}` resolves to a path that is not valid UTF-8"
         ))
     })
+}
+
+/// Rebuilds the mirror after a delete whose rows the refresher cannot drop (D10).
+///
+/// The rows are gone before this runs, so a failed rebuild is reported *inside* a successful
+/// reply rather than turning the delete into a `Failed` that claims nothing happened.
+async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
+    match backend.cache() {
+        Some(cache) => match cache.rebuild().await {
+            Ok(()) => MirrorAfterDelete::Rebuilt,
+            Err(err) => MirrorAfterDelete::Failed(err.to_string()),
+        },
+        None => MirrorAfterDelete::NoMirror,
+    }
 }
 
 /// Which workspace a project belongs to.
