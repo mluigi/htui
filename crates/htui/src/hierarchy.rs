@@ -14,7 +14,7 @@ use chrono::Utc;
 use htui_core::model::{
     BoxId, NewProject, NewRepo, NewWorkspace, Project, ProjectId, ProjectPatch, ProjectRef, Repo,
     RepoBoxPath, RepoId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
-    WorkspaceSummary,
+    WorkspaceSummary, workspace_folder,
 };
 use htui_core::root_path::canonical_root;
 use htui_core::store::{
@@ -39,7 +39,9 @@ use crate::ui::kit::label::plural;
 pub struct HierarchySnapshot {
     /// The workspace row itself; `updated_at` is the CAS token an editor opens on.
     pub workspace: Workspace,
-    /// This box's root path for the workspace, when a row exists. Other boxes' rows are dropped.
+    /// This box's `workspace_box_path` row for the workspace, when one exists (MOD-147 D8: its
+    /// `folder_path`). Other boxes' rows are dropped. With none, the folder defaults to
+    /// `<home>/workspaces/<slug>` ([`workspace_root`]).
     pub folder_path: Option<WorkspaceBoxPath>,
     /// The workspace's projects, ordered by `workspace_project.position`.
     pub projects: Vec<ProjectEntry>,
@@ -163,6 +165,19 @@ impl HierarchySnapshot {
                 })
                 .collect(),
         }
+    }
+}
+
+/// MOD-147 D8: this box's folder for the tree's workspace — the row's `folder_path`, else
+/// `<home>/workspaces/<slug>`; `None` only with no row and no home. Not canonicalised: the caller
+/// resolves it (a row through `canonical`'s guard, as it was stored).
+#[must_use]
+pub fn workspace_root(tree: &HierarchySnapshot, home: Option<&Path>) -> Option<PathBuf> {
+    let row = tree.folder_path.as_ref();
+    match (row, home) {
+        (_, Some(home)) => Some(workspace_folder(&tree.workspace.slug, row, home)),
+        (Some(row), None) => Some(PathBuf::from(&row.folder_path)),
+        (None, None) => None,
     }
 }
 
@@ -548,24 +563,37 @@ async fn canonical(path: &str) -> Result<String> {
 /// `ProjectRef`s. A project linked into two workspaces resolves to the first by name; the section
 /// always passes the scope's own workspace for the requests where that would be visible, so the
 /// ambiguity only ever picks which tree a reply re-reads.
+///
+/// A workspace's scope row joins no workspace (MOD-147), so it is in no `ProjectRef` list: with no
+/// membership match, the project's own `owner_workspace_id` answers (D9).
 async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<WorkspaceId> {
-    backend
+    let member = backend
         .workspaces()
         .await?
         .into_iter()
         .find(|summary| summary.projects.iter().any(|row| row.project_id == project))
-        .map(|summary| summary.workspace_id)
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "workspace_project",
-            id: project.to_string(),
-        })
+        .map(|summary| summary.workspace_id);
+    let owner = match member {
+        Some(ws) => Some(ws),
+        None => backend
+            .project(project)
+            .await?
+            .and_then(|row| row.owner_workspace_id),
+    };
+    owner.ok_or_else(|| StoreError::NotFound {
+        entity: "workspace_project",
+        id: project.to_string(),
+    })
 }
 
 /// `InferRepoPaths` (MOD-7 milestone 4, PRD D5, plan D114, D116, D124): this box's filesystem,
 /// this box's rows, this workspace only.
 ///
 /// The box first, then the tree, then this box's root, canonicalised (a legacy link row walks its
-/// target). With no root, the answer is `root: None` and nothing is walked. With every repo
+/// target): the row's `folder_path`, else the default `<home>/workspaces/<slug>` (MOD-147 D8,
+/// [`workspace_root`]). With no root — no row and no home, or a default folder that does not
+/// resolve — the answer is `root: None` and nothing is walked; a *row* that no longer resolves is
+/// still refused. With every repo
 /// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
 /// then per repo without a row, in tree order: `choose` against the paths already held on this
 /// box (each row as stored and as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
@@ -576,23 +604,38 @@ async fn infer(
     writer: &Writer,
     ws: WorkspaceId,
     this_box: Option<BoxId>,
-    _home: Option<&Path>,
+    home: Option<&Path>,
 ) -> Result<StoreReply> {
     let box_id = box_id(this_box)?;
     let tree = fresh_tree(writer, ws, this_box).await?;
-    let Some(root_row) = &tree.folder_path else {
-        return Ok(StoreReply::RepoPathsInferred {
-            tree: Box::new(tree),
-            report: InferReport {
-                root: None,
-                truncated: false,
-                repos: Vec::new(),
-            },
-        });
+    let no_root = |tree: HierarchySnapshot| StoreReply::RepoPathsInferred {
+        tree: Box::new(tree),
+        report: InferReport {
+            root: None,
+            truncated: false,
+            repos: Vec::new(),
+        },
     };
-    // A root that no longer resolves is a `Constraint`, which the status line reads as
-    // `infer_repo_paths: constraint violated: …`.
-    let root = canonical(&root_row.folder_path).await?;
+    let root = match &tree.folder_path {
+        // A root that no longer resolves is a `Constraint`, which the status line reads as
+        // `infer_repo_paths: constraint violated: …`.
+        Some(row) => canonical(&row.folder_path).await?,
+        // MOD-147 D8: the default folder. Absent (or not a usable directory) is the ordinary
+        // state of a box rather than an error: nothing is walked.
+        None => {
+            let Some(folder) = workspace_root(&tree, home) else {
+                return Ok(no_root(tree));
+            };
+            let Some(folder) = folder.to_str() else {
+                return Ok(no_root(tree));
+            };
+            match canonical(folder).await {
+                Ok(root) => root,
+                Err(StoreError::Constraint(_)) => return Ok(no_root(tree)),
+                Err(err) => return Err(err),
+            }
+        }
+    };
 
     let entries: Vec<&RepoEntry> = tree
         .projects
@@ -847,12 +890,17 @@ mod tests {
 
     use chrono::Utc;
     use htui_core::fixtures::ids;
-    use htui_core::model::{BoxId, RepoBoxPath};
+    use std::path::{Path, PathBuf};
+
+    use htui_core::model::{BoxId, RepoBoxPath, WorkspaceBoxPath};
     use htui_core::store::{DeleteReach, MemStore, StoreError, WriteStore};
     use htui_orch::infer::Checkout;
     use htui_store::Backend;
 
-    use super::{InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals};
+    use super::{
+        InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals, snapshot,
+        workspace_root,
+    };
     use crate::store_worker::{StoreRequest, serve};
 
     /// A path write on a box with no row is refused by name rather than stored under a nil id.
@@ -940,6 +988,36 @@ mod tests {
             vec![typed.as_str()],
             "the manual row is untouched"
         );
+    }
+
+    /// MOD-147 D8: this box's row wins; without one the folder is `<home>/workspaces/<slug>`, and
+    /// with neither there is none.
+    #[tokio::test]
+    async fn workspace_root_prefers_the_row_then_the_default_under_home() {
+        let store = MemStore::demo();
+        let mut tree = snapshot(&store, ids::WORKSPACE_GRAPHICS, Some(ids::BOX))
+            .await
+            .expect("the store answers")
+            .expect("the demo has Graphics");
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            workspace_root(&tree, Some(home)),
+            Some(PathBuf::from("/home/someone/workspaces/graphics"))
+        );
+        assert_eq!(workspace_root(&tree, None), None);
+
+        tree.folder_path = Some(WorkspaceBoxPath {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            box_id: ids::BOX,
+            folder_path: "/srv/graphics".to_owned(),
+            updated_at: Utc::now(),
+        });
+        for home in [Some(home), None] {
+            assert_eq!(
+                workspace_root(&tree, home),
+                Some(PathBuf::from("/srv/graphics"))
+            );
+        }
     }
 
     /// Zeros are dropped and what is left reads in the struct's field order, not in the order the
