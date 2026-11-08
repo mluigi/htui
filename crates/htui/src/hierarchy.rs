@@ -40,7 +40,7 @@ pub struct HierarchySnapshot {
     /// The workspace row itself; `updated_at` is the CAS token an editor opens on.
     pub workspace: Workspace,
     /// This box's root path for the workspace, when a row exists. Other boxes' rows are dropped.
-    pub root_path: Option<WorkspaceBoxPath>,
+    pub folder_path: Option<WorkspaceBoxPath>,
     /// The workspace's projects, ordered by `workspace_project.position`.
     pub projects: Vec<ProjectEntry>,
 }
@@ -184,7 +184,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
     let Some(workspace) = store.workspace(ws).await? else {
         return Ok(None);
     };
-    let root_path = store
+    let folder_path = store
         .workspace_box_paths(ws)
         .await?
         .into_iter()
@@ -213,7 +213,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 
     Ok(Some(HierarchySnapshot {
         workspace,
-        root_path,
+        folder_path,
         projects,
     }))
 }
@@ -233,6 +233,20 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 /// the hierarchy variants below here, so it is unreachable from the shell, and a caller that
 /// reached it anyway is better told which request it sent than killed.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
+    serve_with_home(backend, request, dirs::home_dir().as_deref()).await
+}
+
+/// [`serve`] with the home directory a test chooses (MOD-147 V10), so no test reads the real
+/// `~/workspaces`; `serve` passes `dirs::home_dir()`. Only `InferRepoPaths` reads it, for the
+/// default workspace folder (D8).
+///
+/// # Errors
+/// As [`serve`].
+pub async fn serve_with_home(
+    backend: &Backend,
+    request: &StoreRequest,
+    home: Option<&Path>,
+) -> Result<StoreReply> {
     let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
@@ -278,12 +292,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // whatever the path says — paying `canonical`'s `spawn_blocking` stat to answer with
             // the *path's* refusal would both cost a blocking call and name the wrong problem.
             let box_id = box_id(this_box)?;
-            let root_path = canonical(path).await?;
+            let folder_path = canonical(path).await?;
             writer
                 .upsert_workspace_box_path(&WorkspaceBoxPath {
                     workspace_id: *id,
                     box_id,
-                    root_path,
+                    folder_path,
                     // The store's trigger stamps the column; nothing here sets `updated_at` by
                     // hand, and the value passed in is overwritten on both backends.
                     updated_at: Utc::now(),
@@ -442,7 +456,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 mirror,
             })
         }
-        StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box).await,
+        StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box, home).await,
         other => Err(StoreError::Backend(format!(
             "not a hierarchy request: {}",
             other.name()
@@ -562,10 +576,11 @@ async fn infer(
     writer: &Writer,
     ws: WorkspaceId,
     this_box: Option<BoxId>,
+    _home: Option<&Path>,
 ) -> Result<StoreReply> {
     let box_id = box_id(this_box)?;
     let tree = fresh_tree(writer, ws, this_box).await?;
-    let Some(root_row) = &tree.root_path else {
+    let Some(root_row) = &tree.folder_path else {
         return Ok(StoreReply::RepoPathsInferred {
             tree: Box::new(tree),
             report: InferReport {
@@ -577,7 +592,7 @@ async fn infer(
     };
     // A root that no longer resolves is a `Constraint`, which the status line reads as
     // `infer_repo_paths: constraint violated: …`.
-    let root = canonical(&root_row.root_path).await?;
+    let root = canonical(&root_row.folder_path).await?;
 
     let entries: Vec<&RepoEntry> = tree
         .projects

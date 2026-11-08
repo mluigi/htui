@@ -4863,9 +4863,33 @@ mod tests {
         assert!(matches!(reply, StoreReply::Items(_)));
         assert_eq!(
             *scope_rx.borrow(),
-            scope.project_ids,
-            "the refresher follows what the user is looking at (plan D9)"
+            vec![
+                ids::PROJECT_HTUI,
+                ids::PROJECT_AGY,
+                ids::PROJECT_SCOPE_PLATFORM
+            ],
+            "the refresher follows what the user is looking at (plan D9), and the workspace's \
+             scope row with it (MOD-147 D1)"
         );
+
+        // A workspace with no scope row (none yet in the mirror, or none at all) publishes its
+        // projects alone; a later read asks again rather than remembering the absence.
+        let rowless = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let reply = round_trip(
+            &req_tx,
+            &mut rep_rx,
+            StoreRequest::Items {
+                scope: rowless.clone(),
+                filter: ItemFilter::default(),
+                ready_here: false,
+            },
+        )
+        .await;
+        assert!(matches!(reply, StoreReply::Items(_)));
+        assert_eq!(*scope_rx.borrow(), rowless.project_ids);
 
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");

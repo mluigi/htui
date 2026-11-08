@@ -454,9 +454,9 @@ impl HierarchySection {
                     snapshot.workspace.name,
                     snapshot.workspace.slug,
                     snapshot
-                        .root_path
+                        .folder_path
                         .as_ref()
-                        .map_or("unset", |path| path.root_path.as_str())
+                        .map_or("unset", |path| path.folder_path.as_str())
                 )),
                 Row::Project { index } => group(
                     snapshot
@@ -818,9 +818,9 @@ impl HierarchySection {
             return;
         };
         let workspace_root = snapshot
-            .root_path
+            .folder_path
             .as_ref()
-            .map(|path| path.root_path.as_str());
+            .map(|path| path.folder_path.as_str());
         let (target, title, stored, fallback) = match row {
             Row::Workspace => (
                 PathTarget::WorkspaceRoot(snapshot.workspace.id),
@@ -1300,7 +1300,7 @@ impl HierarchySection {
         // Only with a root on this box: without one the answer could only be "no root". The
         // `stored as …` notice set above stays on screen until the inference answers, and is
         // carried in front of its report.
-        if follow && snapshot.root_path.is_some() {
+        if follow && snapshot.folder_path.is_some() {
             self.carried = self.notice.clone();
             self.send(StoreRequest::InferRepoPaths(snapshot.workspace.id), ctx);
         }
@@ -1322,9 +1322,9 @@ impl HierarchySection {
         };
         let stored = match *target {
             PathTarget::WorkspaceRoot(_) if request == "set_workspace_root" => snapshot
-                .root_path
+                .folder_path
                 .as_ref()
-                .map(|path| path.root_path.clone())?,
+                .map(|path| path.folder_path.clone())?,
             PathTarget::RepoPath { id, .. } if request == "set_repo_path" => snapshot
                 .projects
                 .iter()
