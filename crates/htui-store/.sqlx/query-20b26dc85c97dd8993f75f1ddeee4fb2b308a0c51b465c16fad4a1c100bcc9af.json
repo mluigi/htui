@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE project SET slug = $2, name = $3 WHERE owner_workspace_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "20b26dc85c97dd8993f75f1ddeee4fb2b308a0c51b465c16fad4a1c100bcc9af"
+}

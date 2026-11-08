@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT workspace_id AS \"workspace_id: WorkspaceId\",\n                   box_id       AS \"box_id: BoxId\",\n                   root_path,\n                   updated_at\n              FROM workspace_box_path\n             WHERE workspace_id = $1\n             ORDER BY box_id\n            ",
+  "query": "\n            SELECT workspace_id AS \"workspace_id: WorkspaceId\",\n                   box_id       AS \"box_id: BoxId\",\n                   folder_path,\n                   updated_at\n              FROM workspace_box_path\n             WHERE workspace_id = $1\n             ORDER BY box_id\n            ",
   "describe": {
     "columns": [
       {
@@ -27,12 +27,12 @@
       },
       {
         "ordinal": 2,
-        "name": "root_path",
+        "name": "folder_path",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "workspace_box_path",
-            "name": "root_path"
+            "name": "folder_path"
           }
         }
       },
@@ -60,5 +60,5 @@
       false
     ]
   },
-  "hash": "dc6417df123b6942ac0ed5340dd99cb9e0508b0b0e16df1d01d8e719604854b5"
+  "hash": "53020f2b80131b25ddc3f45aa6ac76df341d62d2a0687d207a0ebe4c75aba86c"
 }

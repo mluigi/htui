@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO project (id, slug, name, description, created_by)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      type            AS project_type,\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
+  "query": "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, created_at, updated_at, type AS project_type, owner_workspace_id FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: ProjectId",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -49,17 +49,6 @@
       },
       {
         "ordinal": 4,
-        "name": "project_type",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "project",
-            "name": "type"
-          }
-        }
-      },
-      {
-        "ordinal": 5,
         "name": "secret_provider",
         "type_info": "Text",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "secret_scope",
         "type_info": "Text",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "settings",
         "type_info": "Jsonb",
         "origin": {
@@ -92,8 +81,8 @@
         }
       },
       {
-        "ordinal": 8,
-        "name": "created_by: htui_core::model::UserId",
+        "ordinal": 7,
+        "name": "created_by",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -123,15 +112,34 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 10,
+        "name": "project_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "type"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "owner_workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "owner_workspace_id"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Uuid"
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -139,14 +147,15 @@
       false,
       false,
       false,
-      false,
       true,
       true,
       false,
       false,
       false,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "0e2eb023a4991ec4bf5dc5944eb4ac1f822c9bc28f94728f1e5a9168b85b6f20"
+  "hash": "4682bb349956046c477106b98e20ae9125c978c86aa581d584863dfae1f37718"
 }
