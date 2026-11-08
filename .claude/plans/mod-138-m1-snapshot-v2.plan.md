@@ -12,7 +12,7 @@ findings fixed). Final gate (`scripts/gate.sh`, sandbox, on `d114f91f`/`07465b01
 (no SIGABRT), migrations, workflow-docs, plugin passed; test step 6966 passed, failures only outside MOD-138: the
 sandbox Qdrant timeouts (`qdrant_live` 14, `qdrant_worker` 1, `state_cli_pg` 1) and two htui-agent timing tests
 (`cli_driver` cancel-drain, `launch` interrupt) that pass alone. Host Postgres gate on the merged tree owed.
-Record: `docs/decisions/mod/mod-138-decisions.md`.
+Record: `docs/decisions/mod/mod-138.md`.
 Previously: CONFIRMED 2026-10-27; blueprint `.claude/plans/mod-138-m1-snapshot-v2.blueprint.md` (`c3daa9c5`).
 Blueprint amendments **A1-A4 accepted by the maintainer 2026-10-28** and binding over the text below:
 A1 `split` is a derived accessor, not a snapshot field; A2 T1→T2→T3→T4 serial on the primary tree (the lift and

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-138](docs/decisions/mod/mod-138.md)** - Snapshot v2 and the graph walker (done, 2026-11-08)
 - **[MOD-160](docs/decisions/mod/mod-160.md)** - Knowledge search fails open cheaply and says so (done, 2026-11-06)
 - **[MOD-115](docs/decisions/mod/mod-115.md)** - TUI shell: header, panes, layouts, history, widget kit (done, 2026-11-03)
 - **[MOD-85](docs/decisions/mod/mod-85.md)** - Remaining accent (cyan) uses that do not mean focus or selection (done, 2026-11-03)

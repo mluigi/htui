@@ -4,7 +4,7 @@
 **Selected Milestone**: 2 — The readiness walker
 **Requirements**: `R-ORCH-1`, `R-ORCH-2` (asks_you park), `R-ORCH-3` (per-edge loop target), `R-ORCH-11`.
 **Design**: `docs/ANA-33.md` §7.3 (and §7.7 for what M2 does *not* change); M1 record
-`docs/decisions/mod/mod-138-decisions.md`.
+`docs/decisions/mod/mod-138.md`.
 **Complexity**: Large. The walk itself changes, so every engine path is affected. Adds one store verb,
 one migration and one cache migration. Linear graphs must walk exactly as before.
 **Routing**: PRD path (continuing), ultracode for implement and review (maintainer, 2026-11-05).
@@ -21,7 +21,7 @@ retires target first, source last. A7 resolve refuses a fan-out node with an `as
 `asks_you` escalation does not block the item. Pins after M2: orch `CASES` 139, store 233.
 
 **Landed 2026-11-05** (T1-T5 and review round R1 on `hr/MOD-138`; record in
-`docs/decisions/mod/mod-138-decisions.md`). Later amendments: **A10** (T5 verify): a reject declines only the
+`docs/decisions/mod/mod-138.md`). Later amendments: **A10** (T5 verify): a reject declines only the
 `asks_you` stop after an ok settle (`gate::stopped_to_ask`); a reject of a failed park on an `asks_you` node takes its
 own gate's path (D8), pinned by a 13th T5 case, so **orch `CASES` is 140**, store 233. **A11** (review, maintainer
 2026-11-05): Q-B's "every `asks_you` edge is taken" cannot hold while a back edge has budget (the loop retires the

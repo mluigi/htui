@@ -14,7 +14,14 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-06):** **MOD-160 is done** (`docs/decisions/mod/mod-160.md`): knowledge search
+**Current status (2026-11-08):** **MOD-138 is done** (`docs/decisions/mod/mod-138.md`): snapshot v2
+and the graph walker. Runs freeze a v2 snapshot (nodes, edges, bounds) and are pinned to it, with v1 runs read
+through a lift; one validator refuses bad graphs at save and at resolve; `ready()` walks joins, derived skips,
+the closed `if` set, `asks_you` stops and per-edge loops; every ready node now runs at once up to
+`max_parallel_sessions` (incomparable nodes only, in-place trees never overlapping, a node waiting for a sibling
+that makes one of its inputs), a park drains its siblings and an end cuts them, landings into one repo are
+serialised, and crash recovery lands every frontier. MOD-139 is unblocked; MOD-143 waits only on ANA-35 and
+ANA-34. **MOD-160 is done** (`docs/decisions/mod/mod-160.md`): knowledge search
 fails open cheaply. The TUI and MCP search ask Qdrant and the existing collection, and check the embedder,
 before loading the model, and never create a collection; every surface says "knowledge search unavailable"
 (`htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE`) with its cause one key away (`concepts.why`, `ctrl-e`) or
@@ -27,15 +34,8 @@ API key comes from `HTUI_QDRANT_API_KEY`, the keyring, or for a worker `--qdrant
 `htui-qdrant-key` credential `htui provision` now encrypts; `HTUI_QDRANT_API_KEY` is removed from every
 process htui starts; settings resolve per search and per index cycle (`concepts_worker::resolve_settings`),
 so a change needs no restart; the old per-box keyring URL is offered once in Settings. MOD-159 is unblocked
-except its coverage parts. **MOD-115 is done** (`docs/decisions/mod/mod-115.md`): the TUI
-shell and its widget kit. Every view draws only through `ui/kit` (a guard over all of `src` holds it):
-one-row header, rounded panes with sub-tab chips in the top border and the focused pane's hints in the
-bottom one, per-tab layouts saved per machine, history, the leave dialog, every key configurable, a
-glyph and a word for every status, errors that name where to fix them. It closed **MOD-81, MOD-82,
-MOD-83 and MOD-85** with it (their write-ups name what landed); MOD-81's 160-column list cap and the
-Prompt wrap moved to MOD-119. The redesign items blocked on it (MOD-116..124, MOD-127, MOD-141) are
-unblocked on that score.
-Earlier completions, ANA-38 back to the 2026-10-14
+except its coverage parts.
+Earlier completions, MOD-115 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -1073,35 +1073,6 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_s
   starts with a spike on loading mods per run under isolation, which is unverified. Then extend `R-SKL-4` import so
   a Claude Code plugin yields one bundle with skill, command, sub-agent, hook, MCP and mod parts. Blocked on
   MOD-127 and MOD-128.
-- [ ] **MOD-138 - Snapshot v2 and the graph walker** (from ANA-33, `docs/ANA-33.md` §7.2, §7.3, §7.7, §10).
-  `R-ORCH-1`, `R-ORCH-2`, `R-ORCH-3`, `R-ORCH-4`, `R-ORCH-11`. `GraphSnapshot` v2 (nodes, edges, bounds; a divided
-  node expanded into `<name>:plan` and `<name>`) and its resolve; the v1 lift in `snapshot_of` (v1 runs keep today's
-  live-topology park); pinned resume for v2 (digests recompute, no live-graph compare). The walker: `ready()` replacing
-  `status::cursor`, concurrent driving under `max_parallel_sessions`, all-joins and derived skip propagation, the
-  closed `if` predicate set, `asks_you` parks, per-edge loop targets with region retirement, limits and the
-  no-progress test; graph-aware `required_inputs` and recovery frontier; a per-repo reconcile lock. A shared pure
-  validator used by save and resolve. Box every per-node future (stack depth, §9). MOD-137's storage is in
-  (`docs/decisions/mod/mod-137.md`): edges, scope and `revision` are stored, `seed::default_edges` is the
-  rule the v1 lift reuses, and `replace_graph` calls the shared validator once it exists. Owed here from
-  MOD-137 D4: items and kinds may name a workspace or library graph (`check_graph`, the kind's same-project
-  rule), with `template_name` resolved in the run's project. Not blocked.
-  **Phase M1 landed (`hr/MOD-138` `d114f91f`, 2026-11-03):** snapshot v2 (edges by node key, bounds, source,
-  scope and revision; v2 `topology` over typed phases and edges), the v1 lift in `snapshot_of`, pinned resume
-  (`Resume::SnapshotTampered`; a v1 run on a refused live graph compares phases only, A6), the shared walk
-  validator in `replace_graph`, the override clone and resolve, per-row phase writers keeping default edges (palette
-  phases outside, A5) and migration `0023`, resolve refusing divide, palette and non-default edges until M2, and
-  workspace and library graphs for kinds and items (`usable_graphs`; `delete_workspace` refuses a held graph; a
-  kind's graph checked only when changed, A7). The walk is still the position cursor. Record:
-  `docs/decisions/mod/mod-138-decisions.md`. Next, per `.claude/prds/mod-138-snapshot-v2-graph-walker.prd.md`: M2
-  the readiness walker (lifts the non-default-edge refusal), M3 concurrent nodes.
-  **Phase M2 landed (`hr/MOD-138` `ac4e2cd5`, 2026-11-05):** the readiness walker (`walk.rs` `ready()`: joins,
-  derived skips, topological order; a parity oracle pins every lifted linear graph to the old position scan), the
-  closed `if` set decided once into `run_step.branch` (migration `0025`, cache `0008`, `record_branch`), loops over
-  `changes_requested`/`fails`/back `asks_you` edges with region retirement (the review-name rule is gone), `asks_you`
-  stops (approve takes, reject and accept decline), resolve running authored edges. Owed to M3: the graph-aware
-  recovery frontier (a graph whose forward order differs from position order can re-reconcile the wrong step),
-  `last_output_kind`, and mixed `asks_you` edges (resolve refuses a back `asks_you` beside another until then); to
-  M3/MOD-141, `required_inputs` for a join behind a declined `if`. Record: `docs/decisions/mod/mod-138-decisions.md`.
 - [ ] **MOD-139 - Divided fan-out runtime: planner, parts, integrate** (from ANA-33, `docs/ANA-33.md` §7.4, §7.5,
   §7.7, §7.8, §7.11, §10). `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`. Migration: `run_step.role`,
   `parent_step_id` and `node_key`; `run_plan` (append-only); a cache mirror migration for both (the next free
@@ -1114,7 +1085,8 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_s
   admission (`max_agents_per_run` counts planned sessions); `fan_out_only` meaning live siblings; the `role = 'stage'`
   rows at -3..-1 that MOD-126 and MOD-132 need. From MOD-138 M1: lift resolve's `NotYetRunnable` divide refusal
   (the expansion is already frozen) and reserve the `:plan` suffix in phase names at save time (resolve refuses a
-  collision today). Blocked on MOD-138.
+  collision today). MOD-138 is done (`docs/decisions/mod/mod-138.md`): the walker runs concurrent nodes and its
+  recovery finds every frontier; parts and integrate plug into `schedule::plan_pass` and `recover::frontiers`.
 - [ ] **MOD-140 - The planner's MCP tools and run-time changes** (from ANA-33, `docs/ANA-33.md` §7.6, §10). `R-MCP-2`,
   `R-MCP-1`, `R-ID-6`, `R-ORCH-1`. `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced
   `run_plan` proposal writer in the `write_step_document` style; the `ToolScope` role and plan scope set in
@@ -1146,7 +1118,7 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_s
   item_id)`. The `subgraph` node with a frozen child snapshot and an item source (planner-named existing items, or
   ANA-35's `parent` children); one ordinary child run per item through the normal claim, capped by `max_child_runs`;
   done when every child is done, a failed child fails the node; the parent releases its per-box slot while it waits;
-  idempotent recovery; depth 1. Blocked on MOD-138, ANA-35 (the run waiting state and the `parent` link) and ANA-34
+  idempotent recovery; depth 1. MOD-138 is done (`docs/decisions/mod/mod-138.md`). Blocked on ANA-35 (the run waiting state and the `parent` link) and ANA-34
   (child integration).
 
 ### Deferred backlog
@@ -1220,6 +1192,6 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_s
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 81 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 80 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

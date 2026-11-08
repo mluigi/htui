@@ -4,11 +4,12 @@
 **Selected Milestone**: 3 — Concurrent nodes
 **Requirements**: `R-ORCH-1`, `R-ORCH-4`, `R-ORCH-11`.
 **Design**: `docs/ANA-33.md` §7.3 ("Parallel nodes reconcile on their own"), §7.7 (frontier), §7.8, §9 (stack depth,
-parallel landings); M1/M2 record `docs/decisions/mod/mod-138-decisions.md`; M2 plan's owed items (A11, A12, Q-C, D9 gap).
+parallel landings); M1/M2 record `docs/decisions/mod/mod-138.md`; M2 plan's owed items (A11, A12, Q-C, D9 gap).
 **Complexity**: Large. The engine's driving loop changes from one node at a time to a set of in-flight nodes. No
 migration (Q-1). Linear graphs must walk exactly as before.
 **Routing**: PRD path (continuing), ultracode for implement and review (maintainer, 2026-11-07).
-**Status**: CONFIRMED 2026-11-07 (maintainer). Fact-checked: 23 claims, 8 amended.
+**Status**: COMPLETE 2026-11-08 (`hr/MOD-138` `055ea1d7`; record `docs/decisions/mod/mod-138.md`, which also lists the
+review round R1 and the input-order rule the maintainer added after review). CONFIRMED 2026-11-07 (maintainer). Fact-checked: 23 claims, 8 amended.
 Blueprint `.claude/plans/mod-138-m3-concurrent-nodes.blueprint.md` (findings F1-F23). Blueprint amendments **A1-A12
 accepted by the maintainer 2026-11-07**, binding over the text below; under A3, D7 (`local` on concurrent nodes
 refused at resolve) is kept. In short: A1 nodes keyed by position, owned `drive_node` futures; A2 a node is admitted
