@@ -3895,20 +3895,51 @@ mod tests {
         );
     }
 
-    /// MOD-147 M1 R1 (M2): `delete_workspace_once`'s scope-row live-run count spells the same
-    /// list, quoted and comma-spaced, so a status added to `RunStatus::is_active` fails here
-    /// before a stopped run's workspace can be deleted under it.
-    #[test]
-    fn delete_workspace_live_literal_matches_run_status() {
+    /// The `r.status IN (...)` filter `LIVE_RUN_STATUSES` spells: quoted, comma-spaced.
+    fn live_status_filter() -> String {
         let literal = LIVE_RUN_STATUSES
             .iter()
             .map(|status| format!("'{status}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let needle = format!("r.status IN ({literal})");
+        format!("r.status IN ({literal})")
+    }
+
+    /// Whether `delete_workspace_once`'s body in `src` counts live runs with `filter`. Only
+    /// the method's own body counts: the queue_batch drain in `write.rs` spells the same filter.
+    fn delete_workspace_once_counts(src: &str, filter: &str) -> bool {
+        let start = src
+            .find("async fn delete_workspace_once(")
+            .expect("`delete_workspace_once` is in write.rs");
+        let body = &src[start..];
+        // The method's closing brace is the first one back at the impl's 4-space indent.
+        let end = body
+            .find("\n    }\n")
+            .expect("`delete_workspace_once` closes");
+        body[..end].contains(filter)
+    }
+
+    /// MOD-147 M1 R1 (M2): `delete_workspace_once`'s scope-row live-run count spells the same
+    /// list, quoted and comma-spaced, so a status added to `RunStatus::is_active` fails here
+    /// before a stopped run's workspace can be deleted under it.
+    #[test]
+    fn delete_workspace_live_literal_matches_run_status() {
+        let filter = live_status_filter();
+        let src = include_str!("write.rs");
         assert!(
-            include_str!("write.rs").contains(&needle),
-            "`delete_workspace_once` must count runs with `{needle}`"
+            delete_workspace_once_counts(src, &filter),
+            "`delete_workspace_once` must count runs with `{filter}`"
+        );
+        // Negative control: the same filter elsewhere in `write.rs` (the queue_batch drain)
+        // must not satisfy the check once `delete_workspace_once`'s own list drifts.
+        let start = src
+            .find("async fn delete_workspace_once(")
+            .expect("`delete_workspace_once` is in write.rs");
+        let drifted_body = src[start..].replacen(&filter, "r.status IN ('queued')", 1);
+        let drifted = format!("{}{drifted_body}", &src[..start]);
+        assert!(
+            !delete_workspace_once_counts(&drifted, &filter),
+            "a drifted `delete_workspace_once` list must fail the check"
         );
     }
 
