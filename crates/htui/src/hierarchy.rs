@@ -166,13 +166,14 @@ impl HierarchySnapshot {
 }
 
 /// MOD-147 D8: this box's folder for the tree's workspace — the row's `folder_path`, else
-/// `<home>/workspaces/<slug>`; `None` only with no row and no home. Not canonicalised: the caller
+/// `<home>/workspaces/<slug>`; `None` with no row and no home, or with no row and a slug that is
+/// not one plain name ([`workspace_folder`], MOD-147 M1 R1). Not canonicalised: the caller
 /// resolves it (a row through `canonical`'s guard, as it was stored).
 #[must_use]
 pub fn workspace_root(tree: &HierarchySnapshot, home: Option<&Path>) -> Option<PathBuf> {
     let row = tree.folder_path.as_ref();
     match (row, home) {
-        (_, Some(home)) => Some(workspace_folder(&tree.workspace.slug, row, home)),
+        (_, Some(home)) => workspace_folder(&tree.workspace.slug, row, home),
         (Some(row), None) => Some(PathBuf::from(&row.folder_path)),
         (None, None) => None,
     }
@@ -596,8 +597,8 @@ async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<Workspace
 ///
 /// The box first, then the tree, then this box's root, canonicalised (a legacy link row walks its
 /// target): the row's `folder_path`, else the default `<home>/workspaces/<slug>` (MOD-147 D8,
-/// [`workspace_root`]). With no root — no row and no home, or a default folder that does not
-/// resolve — the answer is `root: None` and nothing is walked; a *row* that no longer resolves is
+/// [`workspace_root`]). With no root — no row and no home, no row and a slug that is not one plain
+/// name, or a default folder that does not resolve — the answer is `root: None` and nothing is walked; a *row* that no longer resolves is
 /// still refused. With every repo
 /// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
 /// then per repo without a row, in tree order: `choose` against the paths already held on this

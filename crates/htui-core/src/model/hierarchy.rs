@@ -261,11 +261,26 @@ pub const WORKSPACES_DIR: &str = "workspaces";
 /// MOD-147 D8: workspace `slug`'s folder on one box — `row.folder_path` when the box has a
 /// `workspace_box_path` row, else `<home>/workspaces/<slug>`. Pure: no I/O, no canonicalisation;
 /// the caller resolves `home` (htui reads `dirs::home_dir()`) and canonicalises the answer.
+///
+/// `None` when there is no row and `slug` is not exactly one plain name (MOD-147 M1 R1): slugs
+/// are free text, and under `Path::join` an absolute slug (`/`, `/srv`) replaces the base, `..`
+/// climbs out of it and a separator nests below it, so none of them may name a folder to walk.
 #[must_use]
-pub fn workspace_folder(slug: &str, row: Option<&WorkspaceBoxPath>, home: &Path) -> PathBuf {
+pub fn workspace_folder(
+    slug: &str,
+    row: Option<&WorkspaceBoxPath>,
+    home: &Path,
+) -> Option<PathBuf> {
     match row {
-        Some(row) => PathBuf::from(&row.folder_path),
-        None => home.join(WORKSPACES_DIR).join(slug),
+        Some(row) => Some(PathBuf::from(&row.folder_path)),
+        None => {
+            let mut parts = Path::new(slug).components();
+            let one_name = matches!(
+                (parts.next(), parts.next()),
+                (Some(std::path::Component::Normal(name)), None) if name == slug
+            );
+            one_name.then(|| home.join(WORKSPACES_DIR).join(slug))
+        }
     }
 }
 
