@@ -12,8 +12,9 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 63 methods: 15 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`), 7 [`WriteStore`] reads, 26 writes,
-//! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
+//! `WorkerStore` is 63 methods: 15 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`), 7
+//! [`WriteStore`] reads, 26 writes, `write_document`, MOD-42's three command methods, MOD-11's
+//! four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
 //! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; MOD-144 R1 adds the write
 //! `block_if_idle`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
