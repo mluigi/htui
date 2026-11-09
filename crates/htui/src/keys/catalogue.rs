@@ -47,8 +47,8 @@ use Context::{
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
     Field, Form, Global, History, Layout, Leave, List, Logs, Overlay, Pane, Picker, Queue,
     Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy,
-    SettingsKinds, SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach,
-    SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
+    SettingsKinds, SettingsMemory, SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills,
+    SkillsAttach, SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -102,6 +102,9 @@ pub enum Context {
     SettingsProjectTypes,
     /// `[settings.logging]`: the Logging section (no own action; overrides only; MOD-122 B1).
     SettingsLogging,
+    /// `[settings.memory]`: the memory pane a project row opens in Settings › Hierarchy (MOD-163
+    /// D22).
+    SettingsMemory,
     /// `[concepts]`: the concepts search overlay.
     Concepts,
     /// `[switcher]`: the workspace switcher overlay.
@@ -197,6 +200,7 @@ impl Context {
         Self::SettingsQueue,
         Self::SettingsProjectTypes,
         Self::SettingsLogging,
+        Self::SettingsMemory,
         Self::Concepts,
         Self::Switcher,
         Self::Migration,
@@ -254,6 +258,7 @@ impl Context {
             Self::SettingsQueue => "settings.queue",
             Self::SettingsProjectTypes => "settings.project_types",
             Self::SettingsLogging => "settings.logging",
+            Self::SettingsMemory => "settings.memory",
             Self::Concepts => "concepts",
             Self::Switcher => "switcher",
             Self::Migration => "migration",
@@ -313,6 +318,7 @@ impl Context {
             Self::SettingsQueue => "Queue",
             Self::SettingsProjectTypes => "Project types",
             Self::SettingsLogging => "Logging",
+            Self::SettingsMemory => "Memory",
             Self::Concepts => "Search concepts",
             Self::Switcher => "Workspaces",
             Self::Migration => "Schema",
@@ -367,6 +373,7 @@ impl Context {
                 | Self::SettingsQueue
                 | Self::SettingsProjectTypes
                 | Self::SettingsLogging
+                | Self::SettingsMemory
                 | Self::Concepts
                 | Self::Switcher
                 | Self::Migration
@@ -850,6 +857,16 @@ pub enum Act {
     LogsFollow,
     /// `logs.bottom`: the newest line, following again (MOD-122 D4).
     LogsBottom,
+    /// `settings.hierarchy.memory`: open the selected project's memory pane (MOD-163 D20).
+    HierarchyMemory,
+    /// `settings.memory.body`: edit the selected memory entry's body (MOD-163 D22).
+    MemoryBody,
+    /// `settings.memory.all`: list every state, not only the live entries (D20's toggle).
+    MemoryAll,
+    /// `settings.memory.clash_edit`: the subject question's "edit it" (MOD-163 D21).
+    MemoryClashEdit,
+    /// `settings.memory.clash_replace`: the subject question's "replace it" (M1 D4).
+    MemoryClashReplace,
 }
 
 impl Act {
@@ -1331,6 +1348,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["i"],
         "infer paths",
     ),
+    // MOD-163 D20: a project row opens its memory pane.
+    row(
+        Act::HierarchyMemory,
+        SettingsHierarchy,
+        "memory",
+        &["m"],
+        "memory",
+    ),
     // [settings.kinds]
     // kinds.rs:1460.
     row(
@@ -1437,6 +1462,24 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [settings.secrets]
     // secrets.rs:1416.
     row(Act::SecretsCheck, SettingsSecrets, "check", &["t"], "check"),
+    // [settings.memory]: the Hierarchy memory pane's own acts (MOD-163 D22); its new, edit,
+    // retire, back, save and y/n are the common ones, as the Personas section's are.
+    row(Act::MemoryBody, SettingsMemory, "body", &["b"], "edit body"),
+    row(Act::MemoryAll, SettingsMemory, "all", &["a"], "all states"),
+    row(
+        Act::MemoryClashEdit,
+        SettingsMemory,
+        "clash_edit",
+        &["e"],
+        "edit it",
+    ),
+    row(
+        Act::MemoryClashReplace,
+        SettingsMemory,
+        "clash_replace",
+        &["r"],
+        "replace it",
+    ),
     // [concepts]: all in capture, the query field types every printable chord.
     // concepts_search.rs:295.
     capture_row(
@@ -2260,6 +2303,9 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     (SettingsSecrets, Act::FormPrevField, &["up"]),
     // queue.rs:617: `Enter` edits too.
     (Context::SettingsQueue, Act::Edit, &["enter"]),
+    // MOD-163 D22: the memory form moves on `Down`/`Up`, as every Settings form does.
+    (SettingsMemory, Act::FormNextField, &["down"]),
+    (SettingsMemory, Act::FormPrevField, &["up"]),
     // migration_prompt.rs:92, :97: the capitals answer too.
     (Context::Migration, Act::ConfirmYes, &["Y"]),
     (Context::Migration, Act::ConfirmNo, &["N"]),
@@ -2403,42 +2449,43 @@ mod tests {
             Context::SettingsQueue => 18,
             Context::SettingsProjectTypes => 19,
             Context::SettingsLogging => 20,
-            Context::Concepts => 21,
-            Context::Switcher => 22,
-            Context::Migration => 23,
-            Context::Waiting => 24,
-            Context::Skills => 25,
-            Context::SkillsLibrary => 26,
-            Context::SkillsTemplates => 27,
-            Context::SkillsAttach => 28,
-            Context::SkillsHelp => 29,
-            Context::Requirements => 30,
-            Context::Backlog => 31,
-            Context::BacklogBody => 32,
-            Context::BacklogRuns => 33,
-            Context::BacklogGraph => 34,
-            Context::BacklogDocs => 35,
-            Context::BacklogNotes => 36,
-            Context::BacklogPrompt => 37,
-            Context::BacklogReqs => 38,
-            Context::BacklogFilter => 39,
-            Context::BacklogItem => 40,
-            Context::Chat => 41,
-            Context::Logs => 42,
-            Context::Queue => 43,
-            Context::Picker => 44,
-            Context::Layout => 45,
-            Context::History => 46,
-            Context::Leave => 47,
-            Context::Field => 48,
-            Context::Choice => 49,
-            Context::Answer => 50,
+            Context::SettingsMemory => 21,
+            Context::Concepts => 22,
+            Context::Switcher => 23,
+            Context::Migration => 24,
+            Context::Waiting => 25,
+            Context::Skills => 26,
+            Context::SkillsLibrary => 27,
+            Context::SkillsTemplates => 28,
+            Context::SkillsAttach => 29,
+            Context::SkillsHelp => 30,
+            Context::Requirements => 31,
+            Context::Backlog => 32,
+            Context::BacklogBody => 33,
+            Context::BacklogRuns => 34,
+            Context::BacklogGraph => 35,
+            Context::BacklogDocs => 36,
+            Context::BacklogNotes => 37,
+            Context::BacklogPrompt => 38,
+            Context::BacklogReqs => 39,
+            Context::BacklogFilter => 40,
+            Context::BacklogItem => 41,
+            Context::Chat => 42,
+            Context::Logs => 43,
+            Context::Queue => 44,
+            Context::Picker => 45,
+            Context::Layout => 46,
+            Context::History => 47,
+            Context::Leave => 48,
+            Context::Field => 49,
+            Context::Choice => 50,
+            Context::Answer => 51,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 51);
+        assert_eq!(Context::ALL.len(), 52);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -2695,6 +2742,11 @@ mod tests {
         Act::LogsFollow,
         Act::LogsBottom,
         Act::ConceptsWhy,
+        Act::HierarchyMemory,
+        Act::MemoryBody,
+        Act::MemoryAll,
+        Act::MemoryClashEdit,
+        Act::MemoryClashReplace,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2918,6 +2970,11 @@ mod tests {
             Act::LogsFollow => 214,
             Act::LogsBottom => 215,
             Act::ConceptsWhy => 216,
+            Act::HierarchyMemory => 217,
+            Act::MemoryBody => 218,
+            Act::MemoryAll => 219,
+            Act::MemoryClashEdit => 220,
+            Act::MemoryClashReplace => 221,
         }
     }
 
@@ -2951,7 +3008,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 217);
+        assert_eq!(CATALOGUE.len(), 222);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3263,6 +3320,7 @@ mod tests {
                 "Project types",
             ),
             (Context::SettingsLogging, "settings.logging", "Logging"),
+            (Context::SettingsMemory, "settings.memory", "Memory"),
             (Context::Concepts, "concepts", "Search concepts"),
             (Context::Switcher, "switcher", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
@@ -3312,6 +3370,8 @@ mod tests {
         );
         // MOD-122 B1: the Logging section is a view, as every section is.
         assert!(Context::SettingsLogging.is_view() && !Context::SettingsLogging.is_shared());
+        // MOD-163 D22: the Hierarchy memory pane is a view.
+        assert!(Context::SettingsMemory.is_view() && !Context::SettingsMemory.is_shared());
         // MOD-67 M4 §3.1: `skills` is shared (Library and Templates inherit it), the rest views.
         assert!(Context::Skills.is_shared() && !Context::Skills.is_view());
         for context in [

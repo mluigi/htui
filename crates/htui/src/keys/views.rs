@@ -270,6 +270,7 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
             Act::HierarchyPrimary,
             Act::HierarchyChoosePath,
             Act::HierarchyInfer,
+            Act::HierarchyMemory,
         ],
     ),
     SETTINGS,
@@ -300,6 +301,58 @@ pub const HIERARCHY_DELETE_COUNTING: Stack<'static> = Stack::new(&[
 /// Settings > Hierarchy, the delete warning.
 pub const HIERARCHY_DELETE_WARN: Stack<'static> =
     Stack::new(&[Layer::view(Context::SettingsHierarchy, &[]), CONFIRM, MODAL]);
+
+/// Settings > Hierarchy > Memory, the list (MOD-163 D22). The pane captures input, so no
+/// `SETTINGS` layer: sections do not cycle while it is open.
+pub const MEMORY_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsMemory, &[Act::MemoryBody, Act::MemoryAll]),
+    Layer::only(
+        Context::Common,
+        &[Act::New, Act::Edit, Act::Delete, Act::Back],
+    ),
+    LIST,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Memory, the form: kind (a choice) and subject (a text field).
+pub const MEMORY_EDIT: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsMemory, &[]),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Memory, the body editor.
+pub const MEMORY_BODY: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsMemory, &[]),
+    FIELD,
+    FORM_SAVE,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Memory, the retire question (asking and in flight).
+pub const MEMORY_RETIRE: Stack<'static> =
+    Stack::new(&[Layer::view(Context::SettingsMemory, &[]), CONFIRM, MODAL]);
+
+/// Settings > Hierarchy > Memory, a new entry's subject question: edit the holder, replace it,
+/// or back (the `ITEM_DIVERGENCE` shape).
+pub const MEMORY_CLASH: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::SettingsMemory,
+        &[Act::MemoryClashEdit, Act::MemoryClashReplace],
+    ),
+    BACK,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Memory, an amend's subject question (MOD-163 O-1): only "edit it" and
+/// back; replacing is offered for a new entry's clash alone.
+pub const MEMORY_CLASH_AMEND: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsMemory, &[Act::MemoryClashEdit]),
+    BACK,
+    MODAL,
+]);
 
 /// Settings > Kinds, browsing the kinds.
 pub const KINDS_BROWSE: Stack<'static> = Stack::new(&[
@@ -1125,6 +1178,7 @@ mod tests {
         source!("ui/tabs/settings/boxes.rs"),
         source!("ui/tabs/settings/connection.rs"),
         source!("ui/tabs/settings/hierarchy.rs"),
+        source!("ui/tabs/settings/memory.rs"),
         source!("ui/tabs/settings/kinds.rs"),
         source!("ui/tabs/settings/personas.rs"),
         source!("ui/tabs/settings/prompt.rs"),
@@ -1228,6 +1282,12 @@ mod tests {
         HIERARCHY_EDITOR,
         HIERARCHY_DELETE_COUNTING,
         HIERARCHY_DELETE_WARN,
+        MEMORY_BROWSE,
+        MEMORY_EDIT,
+        MEMORY_BODY,
+        MEMORY_RETIRE,
+        MEMORY_CLASH,
+        MEMORY_CLASH_AMEND,
         KINDS_BROWSE,
         KINDS_EDITOR,
         KINDS_CONFIRM,
@@ -1454,6 +1514,27 @@ mod tests {
         );
         assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
         assert_eq!(resolve(SWITCHER, "2"), []);
+        // MOD-163 D22: the Hierarchy memory pane; `e` is the clash's own act there, the common
+        // edit in the list, and the pane captures input so `h` cycles no section.
+        assert_eq!(resolve(HIERARCHY_BROWSE, "m"), [Act::HierarchyMemory]);
+        assert_eq!(resolve(MEMORY_CLASH, "e"), [Act::MemoryClashEdit]);
+        assert_eq!(resolve(MEMORY_CLASH, "r"), [Act::MemoryClashReplace]);
+        assert_eq!(resolve(MEMORY_CLASH, "esc"), [Act::Back]);
+        assert_eq!(resolve(MEMORY_CLASH_AMEND, "e"), [Act::MemoryClashEdit]);
+        assert_eq!(resolve(MEMORY_CLASH_AMEND, "r"), []);
+        assert_eq!(resolve(MEMORY_BROWSE, "e"), [Act::Edit]);
+        assert_eq!(resolve(MEMORY_BROWSE, "b"), [Act::MemoryBody]);
+        assert_eq!(resolve(MEMORY_BROWSE, "a"), [Act::MemoryAll]);
+        assert_eq!(resolve(MEMORY_BROWSE, "d"), [Act::Delete]);
+        assert_eq!(resolve(MEMORY_BROWSE, "esc"), [Act::Back]);
+        assert_eq!(resolve(MEMORY_BROWSE, "h"), []);
+        assert_eq!(resolve(MEMORY_BROWSE, "q"), []);
+        assert_eq!(resolve(MEMORY_BODY, "ctrl-s"), [Act::FormSave]);
+        assert_eq!(
+            resolve(MEMORY_EDIT, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(MEMORY_RETIRE, "y"), [Act::ConfirmYes]);
         // MOD-115 M2 D6: the leave dialog (it replaced the quit question).
         assert_eq!(resolve(LEAVE, "enter"), [Act::LeaveConfirm]);
         assert_eq!(resolve(LEAVE, "ctrl-c"), [Act::LeaveConfirm]);
@@ -1827,6 +1908,8 @@ mod tests {
                 "CAPTURE",
                 "AGENTS_FORM",
                 "HIERARCHY_EDITOR",
+                "MEMORY_EDIT",
+                "MEMORY_BODY",
                 "KINDS_EDITOR",
                 "BOXES_EDITOR",
                 "PERSONAS_FORM",
@@ -1924,8 +2007,9 @@ mod tests {
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
         // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
-        // Settings > Logging's the 77th, D4: the Logs tab's the 78th.
-        assert_eq!(views.len(), 78);
+        // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
+        // Hierarchy memory pane's six, 84.
+        assert_eq!(views.len(), 84);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

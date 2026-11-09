@@ -333,6 +333,17 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the leave dialog", views::LEAVE),
     // MOD-122 D4: the Logs tab, appended so every first-reported phrase is unchanged.
     ("in Logs", views::LOGS_BROWSE),
+    // MOD-163 D22: the Hierarchy memory pane, appended so every first-reported phrase is
+    // unchanged; O-1 adds the amend clash's own question.
+    ("in Settings > Hierarchy > Memory", views::MEMORY_BROWSE),
+    ("in the Memory form", views::MEMORY_EDIT),
+    ("in the Memory body editor", views::MEMORY_BODY),
+    ("in the Memory retire question", views::MEMORY_RETIRE),
+    ("in the Memory subject question", views::MEMORY_CLASH),
+    (
+        "in the Memory subject question (amend)",
+        views::MEMORY_CLASH_AMEND,
+    ),
 ];
 
 impl Keys {
@@ -425,7 +436,7 @@ mod tests {
         );
         // MOD-115 M2 T6: the quit question's entry went with it; MOD-122 D5 adds Settings >
         // Logging's before it.
-        assert_eq!(DECLARED.len(), 85);
+        assert_eq!(DECLARED.len(), 91);
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
         assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));

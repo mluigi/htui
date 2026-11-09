@@ -28,6 +28,7 @@ pub mod keys;
 pub mod logging;
 pub mod mcp_cmd;
 pub mod mcp_search;
+pub mod memory;
 pub mod persona_import;
 pub mod persona_settings;
 pub mod preview;
