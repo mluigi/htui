@@ -2919,15 +2919,19 @@ async fn on_run_served(
 /// `scope.project_ids`.
 ///
 /// The row is looked up once per workspace and remembered in `scope_rows`: a workspace's scope row
-/// never changes. `Ok(None)` is not remembered (an offline mirror may not hold the row yet, or the
-/// workspace is the nil startup scope), and a failed lookup is logged and skipped, so the read the
-/// user asked for still follows its projects.
+/// never changes. The nil startup scope (`WorkspaceId::default()`, before any workspace is chosen)
+/// is not looked up at all, so it costs no round trip per read (MOD-147 M1 R1). `Ok(None)` is not
+/// remembered (an offline mirror may not hold the row yet), and a failed lookup is logged and
+/// skipped, so the read the user asked for still follows its projects.
 async fn refresher_projects(
     backend: &Backend,
     scope: &Scope,
     scope_rows: &mut BTreeMap<WorkspaceId, ProjectId>,
 ) -> Vec<ProjectId> {
     let mut ids = scope.project_ids.clone();
+    if scope.workspace_id.as_uuid().is_nil() {
+        return ids;
+    }
     let row = match scope_rows.get(&scope.workspace_id) {
         Some(row) => Some(*row),
         None => match backend.scope_project(scope.workspace_id).await {
