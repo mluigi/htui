@@ -42,7 +42,7 @@ use ratatui::widgets::Paragraph;
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
     resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_excerpt_caps,
-    resolve_hops, resolve_max_skill_tokens,
+    resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
 };
 use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
@@ -1019,7 +1019,7 @@ impl SettingsSection for PromptSection {
                 NextStep(&reads_again(reload.as_deref())),
                 theme,
             ),
-            // There is no empty case below this one: the `App` group is always the registry's ten.
+            // There is no empty case below this one: the `App` group is always the registry's eleven.
             (None, Some(snapshot)) => {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
@@ -1054,16 +1054,22 @@ fn present_source(project_value: Option<&Value>, app_holds: bool) -> BudgetSourc
     }
 }
 
-/// A [`SettingKind::Boolean`] row's effective column, from its resolver's answer `on` and the row's
-/// own stored value.
+/// A [`SettingKind::Boolean`] row's effective column, from its resolver's answer `on`, the row's
+/// own stored value and the `app_setting` row's. The source is the first rung whose value the
+/// resolver would read — a project boolean, then an App boolean (MOD-163 D19) — else the
+/// default; a non-boolean on either rung falls through and is not named (MOD-33 review L5).
 ///
-/// Project rung only, so there is no `app_setting` rung to name when it is unset (D276); `number`
-/// is `None`, the fraction key's precedent, so D13's clamp line never reads a switch. The source is
-/// `project` only when the resolver would read the stored value: a non-boolean falls through to
-/// the default, so labelling it `project` would name a rung that answered nothing (MOD-33 review L5).
-fn switch(on: bool, project_value: Option<&Value>) -> (String, Option<i64>, &'static str) {
+/// A project-only switch (D276) passes `None` for `app_value`, so it never names the App rung.
+/// `number` is `None`, the fraction key's precedent, so D13's clamp line never reads a switch.
+fn switch(
+    on: bool,
+    project_value: Option<&Value>,
+    app_value: Option<&Value>,
+) -> (String, Option<i64>, &'static str) {
     let source = if project_value.and_then(Value::as_bool).is_some() {
         BudgetSource::Project
+    } else if app_value.and_then(Value::as_bool).is_some() {
+        BudgetSource::AppSetting
     } else {
         BudgetSource::AppSettingDefault
     };
@@ -1091,10 +1097,24 @@ fn effective(
     let present = label::setting_source(present_source(project_value, app.contains_key(key.key())));
     let mut notes = Vec::new();
     let (text, number, source) = match key {
-        // The two project-only switches (MOD-89 D4, MOD-33 D267): one row shape, each its own
-        // resolver.
-        SettingKey::AllowEnvFiles => switch(resolve_allow_env_files(project), project_value),
-        SettingKey::BoxHostname => switch(resolve_box_hostname(project), project_value),
+        // The three switches (MOD-89 D4, MOD-33 D267, MOD-163 D19): one row shape, each its own
+        // resolver. The two project-only keys never hold an `app_setting` row, so their App
+        // value is always `None` and they never name that rung.
+        SettingKey::AllowEnvFiles => switch(
+            resolve_allow_env_files(project),
+            project_value,
+            app.get(key.key()),
+        ),
+        SettingKey::BoxHostname => switch(
+            resolve_box_hostname(project),
+            project_value,
+            app.get(key.key()),
+        ),
+        SettingKey::MemoryCapture => switch(
+            resolve_memory_capture(project, app),
+            project_value,
+            app.get(key.key()),
+        ),
         // The one key that records its own provenance: the reader's answer is the label (D5).
         SettingKey::TokenBudget => {
             let budget = resolve_budget(None, project, app);
@@ -1548,6 +1568,59 @@ mod tests {
                 "D13's clamp arithmetic never reads a switch"
             );
         }
+    }
+
+    /// MOD-163 D19: `memory_capture` is the first switch an App row may hold, so the source column
+    /// names that rung — on the App row itself and on a project row that inherits it — rather
+    /// than `default`; a project boolean still beats it.
+    #[test]
+    fn a_switch_names_the_app_rung_when_the_app_row_holds_it() {
+        let key = SettingKey::MemoryCapture;
+        let app_setting = label::setting_source(BudgetSource::AppSetting);
+        let off = BTreeMap::from([(key.key().to_owned(), json!(false))]);
+        let empty = Value::Object(serde_json::Map::new());
+        let held = blob(key, json!(true));
+
+        let app_row = effective(key, None, None, &off);
+        assert_eq!(
+            (app_row.text.as_str(), app_row.source),
+            (SWITCH_OFF, app_setting)
+        );
+        let inherits = effective(key, Some(&empty), None, &off);
+        assert_eq!(
+            (inherits.text.as_str(), inherits.source),
+            (SWITCH_OFF, app_setting),
+            "a project row with no value of its own names the App rung that answered"
+        );
+        let overrides = effective(key, Some(&held), held.get(key.key()), &off);
+        assert_eq!(
+            (overrides.text.as_str(), overrides.source),
+            (SWITCH_ON, PROJECT)
+        );
+        let unset = effective(key, None, None, &BTreeMap::new());
+        assert_eq!((unset.text.as_str(), unset.source), (SWITCH_ON, DEFAULT));
+        assert_eq!(
+            unset.number, None,
+            "D13's clamp arithmetic never reads a switch"
+        );
+
+        assert_eq!(
+            switch(false, None, Some(&json!(false))),
+            (SWITCH_OFF.to_owned(), None, app_setting)
+        );
+        assert_eq!(
+            switch(true, Some(&json!(true)), Some(&json!(false))),
+            (SWITCH_ON.to_owned(), None, PROJECT)
+        );
+        assert_eq!(
+            switch(true, None, Some(&json!("no"))),
+            (SWITCH_ON.to_owned(), None, DEFAULT),
+            "a non-boolean App row falls through and is not named"
+        );
+        assert_eq!(
+            switch(true, None, None),
+            (SWITCH_ON.to_owned(), None, DEFAULT)
+        );
     }
 
     /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
