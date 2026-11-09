@@ -1,4 +1,4 @@
-//! The prompt preview: nine store reads, one `assemble()`, and no write at all (plan D102, D103).
+//! The prompt preview: ten store reads, one `assemble()`, and no write at all (plan D102, D103).
 //!
 //! This is the milestone's reason to exist. MOD-4's stage 3 will build a [`PromptSpec`] from a
 //! `run_step` and hand it to [`assemble`]; the preview builds **the same type** and hands it to
@@ -11,6 +11,8 @@
 //! `repo_box_path` rows, the rung a run reads before its trees exist, and the pass is
 //! `htui_agent::excerpt::step_pass`, the engine's own. Since MOD-9 milestone 5 the same pass
 //! builds the `glob` file set, so a glob attachment fires here over that checkout (MOD-9 D124).
+//! Since MOD-163 M2 the memory section is the engine's `select` over the project's live `Active`
+//! entries, a declared stand-in for the snapshot a run freezes at `StartRun` (D18).
 //!
 //! **It writes nothing.** No `set_step_prompt`, no `prompt` event, no run. That is correctness
 //! rather than caution: `set_step_prompt` writes *a step's* audit row and a preview has no step.
@@ -28,11 +30,11 @@
 //! four missing tables; `htui` is an online-only program and says so in one sentence.
 
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_core::model::{ItemId, PromptScope, RepoId, Scope, StepFiles};
+use htui_core::model::{ItemId, MemoryState, PromptScope, RepoId, Scope, StepFiles};
 use htui_core::prompt::excerpt::ExcerptSet;
 use htui_core::prompt::{
-    AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, PromptSpec, TemplateRef, TemplateRole,
-    TokenEstimator, assemble, settings,
+    AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, MEMORY_TOKEN_CAP, PromptSpec, TemplateRef,
+    TemplateRole, TokenEstimator, assemble, select_memory, settings,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
@@ -62,7 +64,7 @@ const RESERVED: [&str; 2] = ["judge", "handoff"];
 /// than a spelling, and so the sub-tab can render them without re-deriving the list: the risk the
 /// plan records against this task is that the preview drifts from what a run assembles, and a
 /// stand-in nobody can see is exactly how that happens.
-pub const STAND_INS: [&str; 8] = [
+pub const STAND_INS: [&str; 9] = [
     TEMPLATE_NOTE,
     DOCUMENTS_NOTE,
     SUMMARY_NOTE,
@@ -71,6 +73,7 @@ pub const STAND_INS: [&str; 8] = [
     COMMAND_QUEUE_NOTE,
     ATTEMPT_NOTE,
     EXCERPTS_NOTE,
+    MEMORY_NOTE,
 ];
 
 /// The template is picked by name and pinned to its latest version, standing in for a phase row.
@@ -109,6 +112,11 @@ const ATTEMPT_NOTE: &str = "preview: attempt 1, so verify_failure and previous_d
 /// ANA-5 §12 criterion 12, as the preview meets it (plan D103; MOD-7 milestone 4 D120).
 const EXCERPTS_NOTE: &str = "preview: no run exists, so no run_step_tree row; roots come from this \
                              box's repo_box_path rows, else no_path";
+/// MOD-163 D18: the preview's memory is a live stand-in for a run-start snapshot.
+const MEMORY_NOTE: &str = "preview: memory is selected now from the project's active entries; a \
+                           run freezes its own at StartRun";
+/// MOD-163 D18: a memory read that is not available here (the offline mirror) previews no memory.
+const MEMORY_OFFLINE_NOTE: &str = "memory not available offline";
 
 /// What the Prompt sub-tab receives: one reply per request, the assembler's verdict either way.
 ///
@@ -143,7 +151,8 @@ pub fn offline_refusal() -> &'static str {
 /// walk, the box and the skills. Nine reads, every one of them the same read MOD-4 will make, and
 /// three fields filled by [`STAND_INS`] instead of by a `run_step`. Two more since MOD-7 milestone
 /// 4: the project's repos and this box's `repo_box_path` rows, the roots the excerpt pass reads
-/// (plan D120).
+/// (plan D120). A tenth since MOD-163 M2: the project's live `Active` memory entries, selected
+/// under the cap by the engine's own `select` (D18).
 ///
 /// Returns a whole [`PromptPreview`] rather than a bare [`PromptSpec`] because both halves of the
 /// answer are things the pane renders: a project with no template row is not an error, and neither
@@ -258,6 +267,19 @@ pub async fn build(
             }
         };
     let skills = backend.bound_skills(row.project_id, phase).await?;
+    // MOD-163 D18: what a run started now would freeze — the same `select`, over the project's
+    // live `Active` entries. Read after the templates, so an offline arm still refuses with the
+    // prompt sentence first; a `None` ("not available here") previews no memory and says so.
+    let memory = match backend
+        .memory_entries(row.project_id, Some(vec![MemoryState::Active]))
+        .await?
+    {
+        Some(entries) => select_memory(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT),
+        None => {
+            notes.push(MEMORY_OFFLINE_NOTE.to_owned());
+            None
+        }
+    };
     // MOD-7 milestone 4 (plan D120): ANA-5 §4.5 step 1's "otherwise the project's repos". A
     // preview has no run, so no `run_step_tree` row: each root is this box's `repo_box_path` row,
     // else `no_path`. Read after every other read, so an offline arm still refuses with the prompt
@@ -296,7 +318,8 @@ pub async fn build(
         skills,
         // MOD-26 D13: the preview renders no persona frame.
         persona: None,
-        memory: None,
+        // MOD-163 D18: the live stand-in for the run's frozen memory (`MEMORY_NOTE`).
+        memory,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
