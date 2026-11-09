@@ -296,6 +296,7 @@ pub async fn build(
         skills,
         // MOD-26 D13: the preview renders no persona frame.
         persona: None,
+        memory: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,

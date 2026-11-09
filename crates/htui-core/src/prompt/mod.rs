@@ -58,6 +58,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
+use crate::model::memory::SnapshotMemory;
 use crate::model::persona::SnapshotPersona;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
@@ -113,6 +114,11 @@ pub struct PromptSpec {
     /// the template body. `None` — every judge, handoff and preview spec and every persona-less
     /// phase — renders exactly as before (I-7).
     pub persona: Option<PersonaBlock>,
+    /// MOD-163 D14/D18: the run's frozen memory, rendered as the internal `memory` section after
+    /// the persona and before the body. `None` for every judge, handoff, preview-without-entries
+    /// and fixture spec, and for a run started before MOD-163; renders exactly as before (I-7).
+    /// Rendered only for a Phase spec (blueprint P-5).
+    pub memory: Option<SnapshotMemory>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's

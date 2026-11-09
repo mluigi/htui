@@ -1482,6 +1482,7 @@ fn demo_graph_snapshot() -> Value {
         },
         scope: None,
         personas: Vec::new(),
+        memory: None,
     })
     .expect("a literal this module owns serialises")
 }

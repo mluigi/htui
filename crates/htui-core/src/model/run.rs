@@ -586,7 +586,7 @@ pub struct GraphSnapshot {
     pub source: Option<SnapshotSource>,
     /// `sha256:…` digest of the topology. v1: `graph::topology` over the canonical `phases[]`;
     /// v2: `graph::topology_v2` over `phases[]` and `edges[]` (MOD-138 D3). The envelope (`v`,
-    /// `graph`, `source`, `mode`, `settings`, `scope`, `personas`) is outside both.
+    /// `graph`, `source`, `mode`, `settings`, `scope`, `personas`, `memory`) is outside both.
     pub topology: String,
     /// `run.mode`, repeated so the snapshot is self-contained.
     pub mode: RunMode,
@@ -610,6 +610,12 @@ pub struct GraphSnapshot {
     /// I-3) and [`GraphSnapshot::V`] is not bumped; absent from the JSON when empty (B-10).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub personas: Vec<crate::model::persona::SnapshotPersona>,
+    /// MOD-163 D11: the project's active memory entries at `StartRun`, selected under
+    /// `MEMORY_TOKEN_CAP` and frozen with their text. **Not** hashed by `topology` and
+    /// [`GraphSnapshot::V`] is not bumped; absent from the JSON when `None`; `None` on every
+    /// snapshot written before MOD-163, which renders no memory section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::model::memory::SnapshotMemory>,
 }
 
 impl GraphSnapshot {
@@ -1983,6 +1989,7 @@ mod tests {
             },
             scope: None,
             personas,
+            memory: None,
         }
     }
 
@@ -2016,6 +2023,41 @@ mod tests {
 
         let back: super::SnapshotPhase = serde_json::from_str(&text).expect("decodes");
         assert_eq!(back, phase);
+    }
+
+    /// MOD-163 D11: a pre-MOD-163 snapshot has no `memory` key and decodes as `None`; a `None`
+    /// snapshot writes no key; a frozen memory round-trips and leaves `phases` and `edges` (the
+    /// only inputs `topology_v2` hashes) as they were.
+    #[test]
+    fn a_snapshot_without_memory_decodes_as_none_and_writes_no_key() {
+        use crate::model::memory::{MemoryKind, MemorySource, SnapshotMemory, SnapshotMemoryEntry};
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let value = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(value.get("memory").is_none(), "{value}");
+        let back: super::GraphSnapshot = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(back.memory, None);
+
+        let mut with = snapshot.clone();
+        with.memory = Some(SnapshotMemory {
+            estimator: "chars-v2".to_owned(),
+            total: 1,
+            entries: vec![SnapshotMemoryEntry {
+                id: crate::model::MemoryEntryId::from_uuid(uuid::Uuid::from_u128(1)),
+                version: 1,
+                kind: MemoryKind::Fact,
+                subject: "Build cache".to_owned(),
+                body: "Clear target/.".to_owned(),
+                source: MemorySource::Person,
+            }],
+        });
+        let value = serde_json::to_value(&with).expect("encodes");
+        assert_eq!(value["memory"]["total"], 1, "{value}");
+        let back: super::GraphSnapshot = serde_json::from_value(value).expect("decodes");
+        assert_eq!(back, with);
+        assert_eq!(
+            (&back.phases, &back.edges),
+            (&snapshot.phases, &snapshot.edges)
+        );
     }
 
     #[test]

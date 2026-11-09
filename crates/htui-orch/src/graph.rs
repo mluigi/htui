@@ -326,10 +326,10 @@ pub enum NotRunnable {
 ///
 /// ANA-2 defines the hash as "over the canonical serialisation of `phases[]`" (`:1479`) and never
 /// defines "canonical", so this is where it is defined: the envelope (`v`, `graph`, `mode`,
-/// `settings`, `scope`, `personas`) is excluded, field order is [`SnapshotPhase`]'s declaration
-/// order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped when `None`, so
-/// a persona-less phase serialises exactly as before and only a bound phase's digest names its
-/// persona. Any other field added to `SnapshotPhase` changes every digest and is a
+/// `settings`, `scope`, `personas`, `memory`) is excluded, field order is [`SnapshotPhase`]'s
+/// declaration order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped
+/// when `None`, so a persona-less phase serialises exactly as before and only a bound phase's
+/// digest names its persona. Any other field added to `SnapshotPhase` changes every digest and is a
 /// `GraphSnapshot::V` question.
 ///
 /// **Never route this through `serde_json::Value`.** `serde_json`'s `preserve_order` feature is
@@ -623,6 +623,7 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         settings,
         scope: Some(scope),
         personas,
+        memory: None,
     };
 
     Ok(Resolution::Resolved(Box::new(Resolved {
@@ -814,7 +815,7 @@ const PLAN_SUFFIX: &str = ":plan";
 ///
 /// The rules of [`topology`] hold: never through `serde_json::Value` (finding 4; a predicate is
 /// key-sorted by its own serialiser, F5), and the envelope (`v`, `graph`, `source`, `mode`,
-/// `settings`, `scope`, `personas`) is outside it.
+/// `settings`, `scope`, `personas`, `memory`) is outside it.
 ///
 /// # Errors
 /// [`ResolveError::Store`] carrying the serialiser's own sentence, as [`topology`].

@@ -1054,6 +1054,7 @@ fn bare_snapshot() -> GraphSnapshot {
         },
         scope: None,
         personas: Vec::new(),
+        memory: None,
         source: None,
         edges: Vec::new(),
     }
