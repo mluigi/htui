@@ -307,7 +307,7 @@ mod tests {
         let home = Path::new("/home/someone");
         assert_eq!(
             workspace_folder("graphics", None, home),
-            PathBuf::from("/home/someone/workspaces/graphics")
+            Some(PathBuf::from("/home/someone/workspaces/graphics"))
         );
         let row = WorkspaceBoxPath {
             workspace_id: WorkspaceId::new(),
@@ -317,7 +317,29 @@ mod tests {
         };
         assert_eq!(
             workspace_folder("graphics", Some(&row), home),
-            PathBuf::from("/srv/graphics")
+            Some(PathBuf::from("/srv/graphics"))
+        );
+    }
+
+    /// MOD-147 M1 R1: a workspace slug is free text, but only one plain name becomes a default
+    /// folder. An absolute slug would replace `<home>/workspaces` under `Path::join`, `..` would
+    /// climb out of it and a separator would nest; each answers `None` (infer walks nothing). A
+    /// row's `folder_path` still wins whatever the slug.
+    #[test]
+    fn workspace_folder_refuses_a_slug_that_is_not_one_name() {
+        let home = Path::new("/home/someone");
+        for slug in ["/", "/srv", "../x", "..", ".", "a/b", "a/", "./a", ""] {
+            assert_eq!(workspace_folder(slug, None, home), None, "slug {slug:?}");
+        }
+        let row = WorkspaceBoxPath {
+            workspace_id: WorkspaceId::new(),
+            box_id: BoxId::new(),
+            folder_path: "/srv/graphics".to_owned(),
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        assert_eq!(
+            workspace_folder("../x", Some(&row), home),
+            Some(PathBuf::from("/srv/graphics"))
         );
     }
 

@@ -1011,6 +1011,12 @@ mod tests {
         );
         assert_eq!(workspace_root(&tree, None), None);
 
+        // R1 M1: a slug that is not one plain name never becomes a folder — no escape from
+        // `<home>/workspaces`, and `infer` then walks nothing.
+        let slug = std::mem::replace(&mut tree.workspace.slug, "../escape".to_owned());
+        assert_eq!(workspace_root(&tree, Some(home)), None);
+        tree.workspace.slug = slug;
+
         tree.folder_path = Some(WorkspaceBoxPath {
             workspace_id: ids::WORKSPACE_GRAPHICS,
             box_id: ids::BOX,
