@@ -230,23 +230,55 @@ async fn m_on_a_project_row_opens_the_pane_and_reads_its_live_entries() {
     );
 }
 
-#[tokio::test]
-async fn m_on_the_workspace_row_says_pick_a_project() {
+/// `m` on the row `down` steps below the workspace row of `tree`, the cursor row naming `name`: no
+/// request, the tree keeps the keys, and the notice says to pick a project.
+async fn m_refuses_off_a_project_row(tree: &StoreReply, down: usize, name: &str) {
     let bench = SectionBench::new().await;
     let mut section = HierarchySection::new().with_home(Some("/home/x"));
-    let tree = serve(
-        &Backend::memory(MemStore::demo()),
-        &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS),
-    )
-    .await;
-    bench.reply(&mut section, &tree);
+    bench.reply(&mut section, tree);
+    for _ in 0..down {
+        bench.key(&mut section, "j");
+    }
     let _ = bench.drained();
+    let before = frame(&bench, &section);
+    assert!(
+        before
+            .lines()
+            .any(|line| line.contains('\u{258c}') && line.contains(name)),
+        "the cursor is on {name}: {before}"
+    );
 
     bench.key(&mut section, "m");
 
-    assert!(requests(&bench).is_empty());
-    assert_eq!(section.key_stack(), Some(views::HIERARCHY_BROWSE));
-    assert!(shows(&frame(&bench, &section), PICK_A_PROJECT));
+    let sent = requests(&bench);
+    assert!(sent.is_empty(), "{name}: {sent:?}");
+    assert_eq!(section.key_stack(), Some(views::HIERARCHY_BROWSE), "{name}");
+    assert!(
+        shows(&frame(&bench, &section), PICK_A_PROJECT),
+        "{name}: {}",
+        frame(&bench, &section)
+    );
+}
+
+#[tokio::test]
+async fn m_on_the_workspace_or_a_repo_row_says_pick_a_project() {
+    let backend = Backend::memory(MemStore::demo());
+    let tree = serve(&backend, &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await;
+    m_refuses_off_a_project_row(&tree, 0, "Graphics (graphics)").await;
+
+    // The demo seeds no repo: one under `vulkan-tutorials` puts a repo row below the project's.
+    let tree = serve(
+        &backend,
+        &StoreRequest::CreateRepo {
+            project: ids::PROJECT_VULKAN,
+            name: "core".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: false,
+        },
+    )
+    .await;
+    m_refuses_off_a_project_row(&tree, 2, "core").await;
 }
 
 #[tokio::test]
