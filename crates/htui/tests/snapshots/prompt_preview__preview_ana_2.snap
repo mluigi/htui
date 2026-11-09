@@ -29,6 +29,6 @@ Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                     ││          preview: command_queue exposure …│
 │                                                     ││          preview: attempt 1, so verify_fa…│
 │                                                     ││          preview: no run exists, so no ru…│
+│                                                     ││          preview: memory is selected now …│
 │                                                     ││          preview: no phase of this item's…│
-│                                                     ││────────────────────────────────────────   │
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
