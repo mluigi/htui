@@ -3342,7 +3342,9 @@ pub fn scope_row_joins_no_workspace(slug: &str) -> String {
 
 /// MOD-147 A1: `delete_workspace` while `runs` (≥ 1) of its scope row's runs are live
 /// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
-/// Everything else the scope row owns cascades and is counted.
+/// Everything else the scope row owns cascades and is counted. The advice is "finish or cancel",
+/// never "stop": a `stopped` run is live too, so stopping cannot clear the refusal (a stopped run
+/// is resumed first, then finishes or is cancelled).
 #[must_use]
 pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3351,8 +3353,8 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
         ("runs", "them")
     };
     format!(
-        "workspace `{workspace}` has {runs} live {noun}; stop {pronoun} before deleting the \
-         workspace"
+        "workspace `{workspace}` has {runs} live {noun}; finish or cancel {pronoun} before \
+         deleting the workspace"
     )
 }
 
@@ -4088,16 +4090,18 @@ mod tests {
         }
     }
 
-    /// MOD-147 A1: the refusal counts the live runs, `1 live run` / `2 live runs`.
+    /// MOD-147 A1: the refusal counts the live runs, `1 live run` / `2 live runs`, and never
+    /// says "stop": a `stopped` run is live too (R1 M2), so stopping it cannot clear the refusal.
     #[test]
     fn workspace_has_live_run_counts_runs() {
         assert_eq!(
             workspace_has_live_run("shop", 1),
-            "workspace `shop` has 1 live run; stop it before deleting the workspace"
+            "workspace `shop` has 1 live run; finish or cancel it before deleting the workspace"
         );
         assert_eq!(
             workspace_has_live_run("shop", 3),
-            "workspace `shop` has 3 live runs; stop them before deleting the workspace"
+            "workspace `shop` has 3 live runs; finish or cancel them before deleting the \
+             workspace"
         );
     }
 

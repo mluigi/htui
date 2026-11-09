@@ -31,7 +31,8 @@ dry-run on an in-memory SQLite built from cache 0001-0008 with rows in `project`
   revisions, links, memory…), field-wise summed. The report equals the act (PRD D13). Both stores.
 - `delete_workspace` is **refused only while a scope-row run is live** (queued, running,
   awaiting_approval or stopped — `RunStatus::is_active`, maintainer 2026-11-09, R1 M2), with the sentence `workspace_has_live_run(workspace_slug, n)` → "workspace `shop` has
-  1 live run; stop it before deleting the workspace" (`n` singular/plural). Items, documents and finished runs
+  1 live run; finish or cancel it before deleting the workspace" (`n` singular/plural; R1 repair 2 dropped the
+  original "stop it": a stopped run is live too, so stopping cannot clear the refusal). Items, documents and finished runs
   no longer refuse; they cascade and are counted.
 - So **`workspace_owns_work` is not written**; T2.3 adds `workspace_has_live_run` instead (unit test
   `workspace_has_live_run_counts_runs`). T2.5 MemStore `delete_workspace`: held-graph check, then the live-run
