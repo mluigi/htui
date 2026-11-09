@@ -2751,7 +2751,8 @@ mod tests {
 
     /// The fixture record **is** `prompt::fixtures::demo_trim_record()`, byte for byte but for `v`
     /// and `undigested` (MOD-9 D118: written before `0008`, it stays `v 2`; the assembler writes
-    /// `v 4`, whose `undigested` the literal predates, MOD-33 D270).
+    /// `v 5`; `undigested` (v 4) postdates the literal, MOD-33 D270, and v 5's `memory` is absent
+    /// from a memory-less record, MOD-163 D17).
     ///
     /// It is spelled out as a literal rather than computed because `crate::fixtures` is the
     /// `demo` feature and `crate::prompt::fixtures` is `test-support`, and the `htui` binary
