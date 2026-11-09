@@ -33,6 +33,7 @@ pub mod digest;
 pub mod edit_help;
 pub mod estimate;
 pub mod excerpt;
+pub mod memory;
 pub mod render;
 pub mod settings;
 pub mod template;
@@ -44,6 +45,7 @@ pub mod fixtures;
 pub use defaults::{COMMAND_QUEUE_TEXT, DEFAULT_TEMPLATES, body_of};
 pub use estimate::TokenEstimator;
 pub use excerpt::ExcerptSet;
+pub use memory::{MEMORY_PREAMBLE, MEMORY_TOKEN_CAP, select as select_memory};
 pub use settings::{
     Budget, BudgetSource, DEFAULTS, Defaults, Rungs, SPECS, SettingKey, SettingKind, SettingSpec,
     rung_refusal, validate,

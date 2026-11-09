@@ -28,6 +28,7 @@
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
+use crate::model::memory::SnapshotMemoryEntry;
 use crate::model::skill::BoundSkill;
 use crate::model::{EventKind, SessionEvent};
 use crate::prompt::defaults::COMMAND_QUEUE_TEXT;
@@ -655,6 +656,28 @@ pub fn persona(block: &PersonaBlock) -> Rendered {
         name: SectionName::Persona,
         attrs: vec![("persona", attr(&block.name))],
         content: content_of(&block.body),
+    }
+}
+
+/// MOD-163 D15: one `<entry kind="…" subject="…" source="…" trust="…">` block, the `<skill>`
+/// shape one level down: one LF each side of the body ([`content_of`]), `</entry>` closing. The
+/// subject goes through [`attr`]; `<`/`>` stay (rule 4), so a body holding `</entry>` or
+/// `</section>` is inert. Ids and versions are never rendered.
+#[must_use]
+pub fn memory_entry_block(entry: &SnapshotMemoryEntry) -> String {
+    let open = format!(
+        "<entry kind=\"{}\" subject=\"{}\" source=\"{}\" trust=\"{}\">",
+        entry.kind.as_str(),
+        attr(&entry.subject),
+        entry.source.as_str(),
+        entry.source.trust()
+    );
+    let body = content_of(&entry.body);
+    // A `MemoryBody` is never empty; the guard keeps the pure function total (as `skills`).
+    if body.is_empty() {
+        format!("{open}\n</entry>")
+    } else {
+        format!("{open}\n{body}\n</entry>")
     }
 }
 
