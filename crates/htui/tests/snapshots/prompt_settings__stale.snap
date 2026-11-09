@@ -10,6 +10,7 @@ expression: frame
    excerpt_max_scan_files         unset | 20000 (default) files
    excerpt_provider_deadline_ms   unset | 1500 (default) ms
    max_skill_tokens               unset | 20000 (default) tokens
+   memory_capture                 unset | on (default) on/off
    prompt_reserve_fraction        unset | 10% (0.1) (default) fraction
    prompt_upstream_hops           unset | 2 (default) hops
 ▌  token_budget                   7000
@@ -19,10 +20,9 @@ expression: frame
  project Vulkan Tutorials
    allow_env_files                unset | off (default) on/off
    box_hostname                   unset | on (default) on/off
+   memory_capture                 unset | on (default) on/off
    prompt_upstream_hops           unset | 2 (default) hops
    token_budget                   120000 | 120000 (project) tokens
-
-
 
 
 
