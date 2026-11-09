@@ -27853,8 +27853,11 @@ async fn workspace_rename_renames_its_scope_row<S: WriteStore>(store: &S) {
     );
 }
 
-/// MOD-147 A1: a live run of the scope row refuses the workspace delete, naming the count, and
-/// nothing goes; once the run is finished the delete goes through and counts it.
+/// MOD-147 A1 (R1 M2): a live run of the scope row — `queued`, `running`, `awaiting_approval` or
+/// `stopped`, exactly [`RunStatus::is_active`] — refuses the workspace delete, naming the count,
+/// and nothing goes; a finished run (`done`, `failed`, `cancelled`) does not refuse, and goes with
+/// the workspace, counted. Every status of [`RunStatus::ALL`] is walked, so the case also pins
+/// each store's live set (Postgres spells it as a SQL literal) to `is_active`.
 async fn workspace_delete_refuses_while_a_scope_row_run_is_live<S: WriteStore>(store: &S) {
     const CASE: &str = "workspace_delete_refuses_while_a_scope_row_run_is_live";
     let workspace = store
@@ -27867,58 +27870,99 @@ async fn workspace_delete_refuses_while_a_scope_row_run_is_live<S: WriteStore>(s
         .mint_item(new_item(scope, kind, "spans the workspace"))
         .await
         .expect(CASE);
-    let run = store
-        .create_run(new_run(scope, item.id, Vec::new()))
-        .await
-        .expect(CASE)
-        .id;
+    let item_id = item.id;
+    let at = seam_clock();
+    // One run at a time (an item holds one live run): walk it to `to` from `queued`.
+    let run_to = |to: RunStatus| async move {
+        let run = store
+            .create_run(new_run(scope, item_id, Vec::new()))
+            .await
+            .unwrap_or_else(|error| panic!("{CASE}: a run to {to} is created: {error}"))
+            .id;
+        let walk: &[(RunStatus, RunStatus)] = match to {
+            RunStatus::Queued | RunStatus::Failed | RunStatus::Cancelled => &[],
+            RunStatus::Running | RunStatus::Done => &[(RunStatus::Queued, RunStatus::Running)],
+            RunStatus::AwaitingApproval => &[
+                (RunStatus::Queued, RunStatus::Running),
+                (RunStatus::Running, RunStatus::AwaitingApproval),
+            ],
+            RunStatus::Stopped => &[
+                (RunStatus::Queued, RunStatus::Running),
+                (RunStatus::Running, RunStatus::Stopped),
+            ],
+        };
+        for &(from, next) in walk {
+            assert!(
+                store.transition_run(run, from, next, at).await.expect(CASE),
+                "{CASE}: run {from} -> {next}"
+            );
+        }
+        if to.is_terminal() {
+            let failure = matches!(to, RunStatus::Failed).then_some("boom");
+            store.finish_run(run, to, failure, at).await.expect(CASE);
+        }
+        run
+    };
     let reach = store
         .delete_reach(DeleteTarget::Workspace(workspace.id))
         .await
         .expect(CASE)
         .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
 
-    assert_eq!(
-        store.delete_workspace(workspace.id).await,
-        Err(StoreError::Constraint(workspace_has_live_run("busy", 1))),
-        "{CASE}: a queued run refuses"
-    );
-    assert!(
-        store.workspace(workspace.id).await.expect(CASE).is_some(),
-        "{CASE}: the workspace is still there"
-    );
-    assert_eq!(
-        store.scope_project(workspace.id).await.expect(CASE),
-        Some(scope),
-        "{CASE}: and its scope row"
-    );
-    assert!(
-        store.item(item.id).await.expect(CASE).is_some(),
-        "{CASE}: and its item"
-    );
-    assert_eq!(
+    let mut runs = Vec::new();
+    for live in RunStatus::ALL.iter().copied().filter(|status| status.is_active()) {
+        let run = run_to(live).await;
+        runs.push(run);
+        assert_eq!(
+            store.delete_workspace(workspace.id).await,
+            Err(StoreError::Constraint(workspace_has_live_run("busy", 1))),
+            "{CASE}: a {live} run refuses"
+        );
+        assert!(
+            store.workspace(workspace.id).await.expect(CASE).is_some(),
+            "{CASE}: the workspace is still there under a {live} run"
+        );
+        assert_eq!(
+            store.scope_project(workspace.id).await.expect(CASE),
+            Some(scope),
+            "{CASE}: and its scope row"
+        );
+        assert!(
+            store.item(item.id).await.expect(CASE).is_some(),
+            "{CASE}: and its item"
+        );
+        assert_eq!(
+            store
+                .delete_reach(DeleteTarget::Workspace(workspace.id))
+                .await
+                .expect(CASE)
+                .map(|now| (now.items, now.runs)),
+            Some((reach.items, runs.len() as u64)),
+            "{CASE}: nothing was deleted under a {live} run"
+        );
         store
-            .delete_reach(DeleteTarget::Workspace(workspace.id))
+            .finish_run(run, RunStatus::Cancelled, None, at)
             .await
-            .expect(CASE),
-        Some(reach),
-        "{CASE}: nothing was deleted"
-    );
+            .expect(CASE);
+    }
+    // The finished statuses: none of them refuses, so all of them are in place before the one
+    // delete that goes through.
+    for finished in RunStatus::ALL.iter().copied().filter(|status| status.is_terminal()) {
+        runs.push(run_to(finished).await);
+    }
 
-    store
-        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
-        .await
-        .expect(CASE);
     let done = store.delete_workspace(workspace.id).await.expect(CASE);
     assert_eq!(
         (done.items, done.runs),
-        (1, 1),
-        "{CASE}: the finished run and its item went with the workspace"
+        (1, runs.len() as u64),
+        "{CASE}: the finished runs and their item went with the workspace"
     );
-    assert!(
-        store.run(run).await.expect(CASE).is_none(),
-        "{CASE}: the run is gone"
-    );
+    for run in runs {
+        assert!(
+            store.run(run).await.expect(CASE).is_none(),
+            "{CASE}: run {run} is gone"
+        );
+    }
 }
 
 /// MOD-147 A1: a workspace delete takes its scope row and everything the scope row owns, counted
