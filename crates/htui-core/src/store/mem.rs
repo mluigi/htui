@@ -5672,7 +5672,8 @@ impl State {
         if let Some(held) = self.workspace_graph_holder(&graphs) {
             return Err(StoreError::Constraint(held));
         }
-        // MOD-147 A1: a live run of the scope row refuses; everything else it owns goes with it,
+        // MOD-147 A1: a live run of the scope row (`RunStatus::is_active`: queued, running,
+        // awaiting_approval or stopped, R1 M2) refuses; everything else it owns goes with it,
         // counted. The scope row and its rows go first, by `remove_project` (A2's refusal is for
         // a scope row deleted alone).
         let scope = self.scope_row_of(id);
@@ -5680,13 +5681,7 @@ impl State {
             let live = self
                 .runs
                 .values()
-                .filter(|run| {
-                    run.project_id == scope
-                        && matches!(
-                            run.status,
-                            RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval
-                        )
-                })
+                .filter(|run| run.project_id == scope && run.status.is_active())
                 .count();
             if live > 0 {
                 let slug = &self.workspaces[&id].slug;

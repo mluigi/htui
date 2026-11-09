@@ -10124,13 +10124,15 @@ impl PgStore {
             )));
         }
         // MOD-147 A1: a live run of the scope row refuses; everything else the scope row owns
-        // cascades with the workspace (`fk_project_owner_workspace`), counted in `reach`.
+        // cascades with the workspace (`fk_project_owner_workspace`), counted in `reach`. The
+        // `status IN (...)` is the live set (`RunStatus::is_active`, read.rs `LIVE_RUN_STATUSES`,
+        // R1 M2); `workspace_delete_refuses_while_a_scope_row_run_is_live` walks every status.
         let live = sqlx::query_scalar!(
             r#"
             SELECT count(*) AS "live!"
               FROM run r JOIN project p ON p.id = r.project_id
              WHERE p.owner_workspace_id = $1
-               AND r.status IN ('queued', 'running', 'awaiting_approval')
+               AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped')
             "#,
             id.as_uuid(),
         )

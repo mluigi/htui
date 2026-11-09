@@ -1451,7 +1451,8 @@ pub trait WriteStore: ReadStore {
     /// `step_graph_id` names one of its graphs, naming the first holder in (graph name bytes,
     /// holder bytes, project slug bytes) order;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
-    /// ([`workspace_has_live_run`], MOD-147 A1) while a run of its scope row is live. Nothing is
+    /// ([`workspace_has_live_run`], MOD-147 A1) while a run of its scope row is live
+    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped). Nothing is
     /// deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
@@ -3339,8 +3340,9 @@ pub fn scope_row_joins_no_workspace(slug: &str) -> String {
     format!("project `{slug}` is a workspace's own scope row and joins no workspace")
 }
 
-/// MOD-147 A1: `delete_workspace` while `runs` (≥ 1) of its scope row's runs are live (`queued`,
-/// `running`, `awaiting_approval`). Everything else the scope row owns cascades and is counted.
+/// MOD-147 A1: `delete_workspace` while `runs` (≥ 1) of its scope row's runs are live
+/// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
+/// Everything else the scope row owns cascades and is counted.
 #[must_use]
 pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {

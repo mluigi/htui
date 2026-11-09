@@ -49,8 +49,8 @@ use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow,
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
 /// The `status IN (...)` list of a live run (MOD-125 D2, MOD-144 Δ2) that `waiting_candidates`,
-/// `create_run`, `close_out` and 0024's `uq_run_item_live` spell out, because `query!` needs a
-/// literal and cannot read a Rust constant.
+/// `create_run`, `close_out`, `delete_workspace_once` (MOD-147 A1) and 0024's `uq_run_item_live`
+/// spell out, because `query!` needs a literal and cannot read a Rust constant.
 ///
 /// Test-only: the query text is the real definition, and
 /// `live_runs_literal_matches_run_status` is what keeps it honest against
@@ -3892,6 +3892,23 @@ mod tests {
             LIVE_RUN_STATUSES.to_vec(),
             "the `status IN (...)` literal of `waiting_candidates` and `RunStatus::is_active` must \
              agree"
+        );
+    }
+
+    /// MOD-147 M1 R1 (M2): `delete_workspace_once`'s scope-row live-run count spells the same
+    /// list, quoted and comma-spaced, so a status added to `RunStatus::is_active` fails here
+    /// before a stopped run's workspace can be deleted under it.
+    #[test]
+    fn delete_workspace_live_literal_matches_run_status() {
+        let literal = LIVE_RUN_STATUSES
+            .iter()
+            .map(|status| format!("'{status}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let needle = format!("r.status IN ({literal})");
+        assert!(
+            include_str!("write.rs").contains(&needle),
+            "`delete_workspace_once` must count runs with `{needle}`"
         );
     }
 
