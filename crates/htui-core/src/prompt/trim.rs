@@ -343,6 +343,8 @@ fn span_tokens(est: TokenEstimator, rendered: &Rendered, weight: i64) -> i64 {
 pub(crate) enum TrimStep {
     /// Rank 1: budget-derived rather than budget-trimmed, so it goes first.
     Excerpts,
+    /// Phase rank 1b (MOD-163 D16): whole memory entries from the tail, then the section.
+    Memory,
     /// Rank 2: §4.3's depth ladder.
     Upstream,
     /// Rank 2: full diff, then the stat, then the section.
@@ -368,11 +370,13 @@ pub(crate) enum TrimStep {
 /// The phase order is `R-PRM-3`'s list read backwards, with `verify_failure` placed before the
 /// document group and the group before `item` (blueprint P-3, following §5.1's worked example
 /// rather than §4.4's row text — the two disagree and the example is the one with arithmetic in
-/// it). The two role orders are §4.4's own two-entry orders.
+/// it). MOD-163 D16 puts project memory after the excerpts and before upstream (ANA-5 §4.4 as
+/// amended 2026-10-20). The two role orders are §4.4's own two-entry orders.
 pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
     match role {
         TemplateRole::Phase => &[
             TrimStep::Excerpts,
+            TrimStep::Memory,
             TrimStep::Upstream,
             TrimStep::PreviousDiff,
             TrimStep::VerifyFailure,
@@ -610,6 +614,7 @@ impl<'a> Trimmer<'a> {
             }
             match step {
                 TrimStep::Excerpts => self.trim_excerpts(),
+                TrimStep::Memory => self.trim_memory(),
                 TrimStep::Upstream => self.trim_upstream(),
                 TrimStep::PreviousDiff => self.trim_diff(&SectionName::PreviousDiff),
                 TrimStep::DiffSoFar => self.trim_diff(&SectionName::DiffSoFar),
@@ -764,6 +769,47 @@ impl<'a> Trimmer<'a> {
         self.entries[index].record.dropped = Some(
             removed.max(u32::try_from(self.inputs.spec.excerpts.files.len()).unwrap_or(u32::MAX)),
         );
+        self.drop_section(index);
+    }
+
+    /// MOD-163 D16: whole entries off the **tail** (the oldest kept), re-rendering the left-out
+    /// line after each; the last one takes the section and its separator with it.
+    ///
+    /// Renders from `self.inputs.spec.memory`, the **masked** spec, so a re-render cannot bring an
+    /// unmasked byte back (review C-1); every rung is a prefix of the scanned full section plus a
+    /// line that changes only its digits. The counters go in before the render, as in
+    /// [`Trimmer::trim_upstream`] (L-1).
+    fn trim_memory(&mut self) {
+        let Some(index) = self.live_index(&SectionName::Memory) else {
+            return;
+        };
+        let Some(memory) = self.inputs.spec.memory.as_ref() else {
+            return;
+        };
+        let mut removed = self.entries[index].record.dropped.unwrap_or(0);
+        loop {
+            let Source::Memory(kept) = &mut self.entries[index].source else {
+                return;
+            };
+            if *kept == 0 {
+                break;
+            }
+            *kept -= 1;
+            let kept = *kept;
+            removed += 1;
+            self.entries[index].record.dropped = Some(removed);
+            self.mark(index, TrimStrategy::Dropped);
+            // `render::memory` rebuilds the left-out line: "k of total" with the new k.
+            let Some(rendered) = render::memory(memory, kept) else {
+                break;
+            };
+            self.entries[index].rendered = rendered;
+            self.re_estimate(index);
+            if self.deficit() <= 0 {
+                return;
+            }
+        }
+        // Nothing left: tokens_after 0, strategy dropped, trimmed; the separator goes with it.
         self.drop_section(index);
     }
 
@@ -1203,6 +1249,7 @@ mod tests {
             trim_order(TemplateRole::Phase),
             &[
                 TrimStep::Excerpts,
+                TrimStep::Memory,
                 TrimStep::Upstream,
                 TrimStep::PreviousDiff,
                 TrimStep::VerifyFailure,

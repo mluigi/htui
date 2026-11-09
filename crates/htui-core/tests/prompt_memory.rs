@@ -15,8 +15,9 @@ use htui_core::model::{MemoryEntry, MemoryEntryId, MemoryKind, MemoryState};
 use htui_core::prompt::memory::{MEMORY_PREAMBLE, MEMORY_TOKEN_CAP, left_out_line, select};
 use htui_core::prompt::render::{self, memory_entry_block};
 use htui_core::prompt::{
-    AssembleError, AssembledPrompt, MEMORY_SEPARATOR, PersonaBlock, Placeholder, PromptSpec,
-    Section, SectionName, TemplateError, TemplateRole, TokenEstimator, assemble, fixtures, parse,
+    AssembleError, AssembledPrompt, Budget, BudgetSource, ExcerptSet, MEMORY_SEPARATOR,
+    PersonaBlock, Placeholder, PromptSpec, Section, SectionName, TemplateError, TemplateRole,
+    TokenEstimator, TrimStrategy, assemble, fixtures, parse,
 };
 use htui_core::scrub::MinimalScrubber;
 use uuid::Uuid;
@@ -52,6 +53,17 @@ fn spec() -> PromptSpec {
     let mut spec = fixtures::phase_implement_attempt2();
     spec.memory = Some(fixtures::memory_two_of_three());
     spec
+}
+
+/// `spec` at `target` tokens with no reserve, so the test's arithmetic is the target's.
+fn at_target(spec: &PromptSpec, target: i64) -> PromptSpec {
+    let mut out = spec.clone();
+    out.budget = Budget {
+        tokens: target,
+        source: BudgetSource::Project,
+        reserve_bp: 0,
+    };
+    out
 }
 
 /// The record's row named `name`, if the section rendered.
@@ -481,4 +493,118 @@ fn a_memory_body_is_scrubbed_like_a_persona() {
     };
     assert_eq!(section, "memory");
     assert!(!error.to_string().contains("do-not-print-me"));
+}
+
+// -- the trim (D16; blueprint P-2) ------------------------------------------------------------------
+
+/// The worked example with no excerpts, so the first trim step with anything to take is memory's.
+fn trimmable() -> PromptSpec {
+    let mut spec = spec();
+    spec.excerpts = ExcerptSet::default();
+    spec
+}
+
+/// What `spec` costs untrimmed.
+fn full_cost(spec: &PromptSpec) -> i64 {
+    ok(&at_target(spec, i64::MAX / 4)).trim.estimated_after
+}
+
+#[test]
+fn a_memory_section_is_trimmed_after_excerpts_and_before_upstream() {
+    let bare = trimmable();
+    let prompt = ok(&at_target(&bare, full_cost(&bare) - 10));
+    for name in [
+        SectionName::Upstream,
+        SectionName::Documents("plan".to_owned()),
+        SectionName::PreviousDiff,
+        SectionName::VerifyFailure,
+        SectionName::Item,
+    ] {
+        let row = row(&prompt, &name).unwrap_or_else(|| panic!("{name} renders"));
+        assert_eq!(row.strategy, TrimStrategy::None, "{name} is untouched");
+    }
+    let memory = memory_row(&prompt).expect("the memory row");
+    assert_eq!(memory.dropped, Some(1), "{memory:?}");
+    assert_eq!(memory.strategy, TrimStrategy::Dropped);
+    assert!(memory.trimmed);
+    assert_eq!(memory.tokens_before, 219);
+    assert_eq!(
+        memory.tokens_after, 153,
+        "blueprint §T1.9: re-measured with the new line"
+    );
+    assert!(
+        prompt
+            .text
+            .contains("</entry>\n1 of 3 project memory entries shown.\n</section>\n\n"),
+        "{}",
+        prompt.text
+    );
+    assert!(
+        prompt.text.contains("Build cache"),
+        "the newest entry stays"
+    );
+    assert!(
+        !prompt.text.contains("thiserror"),
+        "the oldest kept entry went first"
+    );
+
+    // With excerpts the excerpts go first: memory is untouched while a file can still go.
+    let with_excerpts = spec();
+    let prompt = ok(&at_target(&with_excerpts, full_cost(&with_excerpts) - 10));
+    assert_eq!(
+        row(&prompt, &SectionName::Excerpts)
+            .expect("excerpts")
+            .strategy,
+        TrimStrategy::Dropped
+    );
+    assert_eq!(
+        memory_row(&prompt).expect("memory").strategy,
+        TrimStrategy::None
+    );
+}
+
+#[test]
+fn a_tighter_budget_drops_the_section_and_its_separator() {
+    let spec = trimmable();
+    let target = full_cost(&spec) - 219;
+    let prompt = ok(&at_target(&spec, target));
+    let memory = memory_row(&prompt).expect("the row stays (P-2)");
+    assert_eq!(
+        (
+            memory.tokens_after,
+            memory.dropped,
+            memory.trimmed,
+            memory.strategy
+        ),
+        (0, Some(2), true, TrimStrategy::Dropped)
+    );
+    assert_eq!(
+        row(&prompt, &SectionName::Upstream)
+            .expect("upstream")
+            .strategy,
+        TrimStrategy::None,
+        "dropping the memory section was enough"
+    );
+    assert!(!prompt.text.contains("name=\"memory\""));
+    let mut plain = spec.clone();
+    plain.memory = None;
+    let plain = ok(&at_target(&plain, i64::MAX / 4));
+    assert_eq!(
+        prompt.text, plain.text,
+        "no section and no leading blank line: the memory-less bytes"
+    );
+    assert_eq!(
+        prompt.trim.estimated_after,
+        prompt
+            .trim
+            .sections
+            .iter()
+            .map(|row| row.tokens_after)
+            .sum::<i64>()
+    );
+    assert_eq!(
+        prompt.trim.estimated_after, plain.trim.estimated_after,
+        "the dropped separator left `estimated_after` with the sent bytes only"
+    );
+    assert!(prompt.trim.estimated_after <= target);
 }
