@@ -23,6 +23,7 @@ use core::cell::Cell;
 use crossterm::event::KeyEvent;
 use htui_core::model::{
     MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, ProjectId,
+    memory_subject_key,
 };
 use htui_core::scrub::MinimalScrubber;
 use ratatui::Frame;
@@ -78,7 +79,22 @@ const NOT_READ_NEXT: &str = "the entries appear once the store answers";
 /// The retire question: `` retire `{subject}`? ``.
 #[must_use]
 pub fn retire_question(subject: &str) -> String {
-    format!("retire `{}`?", subject.escape_debug())
+    format!("retire `{}`?", quoted(subject))
+}
+
+/// A subject as a sentence quotes it: verbatim, but for its control characters, which are
+/// escaped (`\n`, `\u{1b}`) so none of them reaches the terminal (review R4-4).
+fn quoted(subject: &str) -> String {
+    subject
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_debug().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The Browse keys over a readable list with rows: `j/k select · n new · e edit · b body · d
@@ -528,6 +544,27 @@ impl MemoryPane {
         self.cursor = self.cursor.min(self.rows().len().saturating_sub(1));
     }
 
+    /// After a new list: the cursor follows `keep` to its row, else stays where it was, clamped
+    /// (review R4-2: the cursor follows ids, not indices).
+    fn reselect(&mut self, keep: Option<MemoryEntryId>) {
+        if let Some(index) = keep.and_then(|id| self.rows().iter().position(|entry| entry.id == id))
+        {
+            self.cursor = index;
+        }
+        self.clamp();
+    }
+
+    /// Whether the open form, editor or question is about entry `id`.
+    fn targets(&self, id: MemoryEntryId) -> bool {
+        match &self.mode {
+            Mode::Editing(form) => form.target.id() == Some(id),
+            Mode::Body(editor) => editor.target.id() == Some(id),
+            Mode::Retiring { id: asked, .. } => *asked == id,
+            Mode::Clash { existing, .. } => existing.id == id,
+            Mode::Browse => false,
+        }
+    }
+
     fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(request.name());
         ctx.request(request);
@@ -536,7 +573,7 @@ impl MemoryPane {
     /// Why a write key is refused now, if it is: the memory cannot be written, or a write is in
     /// flight.
     fn write_refusal(&self) -> Option<String> {
-        if self.offline || (self.read && self.entries.is_none()) {
+        if self.offline {
             return Some(MEMORY_NEEDS_THE_DATABASE.to_owned());
         }
         if let Some(why) = &self.refused {
@@ -605,7 +642,7 @@ impl MemoryPane {
         if !row.state.is_live() {
             self.notice = Some(Notice::Error(format!(
                 "`{}` is {}: only a live entry is written",
-                row.subject.escape_debug(),
+                quoted(&row.subject),
                 row.state.as_str()
             )));
             return;
@@ -619,18 +656,13 @@ impl MemoryPane {
                     return;
                 }
             },
-            Act::Delete => {
-                let question = retire_question(&row.subject);
-                let mode = Mode::Retiring {
-                    id: row.id,
-                    subject: row.subject.clone(),
-                    expected: row.version,
-                    in_flight: false,
-                };
-                self.mode = mode;
-                self.notice = Some(Notice::Info(question));
-                return;
-            }
+            // The question is drawn from the mode (review R4-3), not from the notice.
+            Act::Delete => Mode::Retiring {
+                id: row.id,
+                subject: row.subject.clone(),
+                expected: row.version,
+                in_flight: false,
+            },
             _ => return,
         };
         self.mode = mode;
@@ -983,6 +1015,7 @@ impl MemoryPane {
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Memory { project, entries } if *project == self.project => {
+                let keep = self.selected().map(|entry| entry.id);
                 self.read = true;
                 self.refused = None;
                 match entries {
@@ -995,7 +1028,7 @@ impl MemoryPane {
                         self.offline = true;
                     }
                 }
-                self.clamp();
+                self.reselect(keep);
             }
             StoreReply::MemoryWritten {
                 project,
@@ -1014,12 +1047,7 @@ impl MemoryPane {
                         self.read = true;
                         self.offline = false;
                         self.refused = None;
-                        if let Some(index) =
-                            entries.iter().position(|entry| entry.id == written.entry())
-                        {
-                            self.cursor = index;
-                        }
-                        self.clamp();
+                        self.reselect(Some(written.entry()));
                         self.notice = Some(Notice::Info(self.landed(*written, asked)));
                     }
                     Err(why) => {
@@ -1036,15 +1064,22 @@ impl MemoryPane {
                 entries,
             } if *project == self.project => {
                 self.busy = None;
+                // The cursor follows the entry the open edit is about, else the one it was on.
+                let keep = if self.targets(head.id) {
+                    Some(head.id)
+                } else {
+                    self.selected().map(|entry| entry.id)
+                };
                 self.entries = Some(entries.clone());
                 self.read = true;
-                self.clamp();
+                self.reselect(keep);
                 self.on_stale(head, ctx.keys());
             }
             StoreReply::MemorySubjectTaken { project, existing } if *project == self.project => {
                 self.busy = None;
                 match core::mem::take(&mut self.mode) {
-                    Mode::Body(editor) => {
+                    // A replace met another holder: the question names that one now.
+                    Mode::Body(editor) | Mode::Clash { editor, .. } => {
                         self.mode = Mode::Clash {
                             existing: Box::new(existing.clone()),
                             editor,
@@ -1080,7 +1115,7 @@ impl MemoryPane {
             .find(|entry| entry.id == written.entry())
             .map(|entry| entry.subject.clone())
             .or(asked)
-            .map(|subject| subject.escape_debug().to_string());
+            .map(|subject| quoted(&subject));
         let verb = match written {
             MemoryWrite::Created { .. } | MemoryWrite::Amended { .. } => "saved",
             MemoryWrite::Retired { .. } => "retired",
@@ -1096,14 +1131,7 @@ impl MemoryPane {
     /// while the entry is live; a closed entry ends the edit.
     fn on_stale(&mut self, head: &MemoryEntry, keys: &Keys) {
         let live = head.state.is_live();
-        let editing = match &self.mode {
-            Mode::Editing(form) => form.target.id() == Some(head.id),
-            Mode::Body(editor) => editor.target.id() == Some(head.id),
-            Mode::Retiring { id, .. } => *id == head.id,
-            Mode::Clash { existing, .. } => existing.id == head.id,
-            Mode::Browse => false,
-        };
-        if !editing {
+        if !self.targets(head.id) {
             self.notice = Some(Notice::Error(
                 "changed elsewhere; nothing was written".to_owned(),
             ));
@@ -1116,6 +1144,18 @@ impl MemoryPane {
                 _ => self.mode = Mode::Browse,
             }
             self.notice = Some(Notice::Error(CLOSED_ELSEWHERE.to_owned()));
+            return;
+        }
+        // The holder of the subject was renamed elsewhere (review R4-1): the subject is free, so
+        // the draft goes back to its editor, whose save writes it as it was meant.
+        if let Mode::Clash { editor, .. } = &self.mode
+            && memory_subject_key(&head.subject) != memory_subject_key(editor.subject.as_str())
+        {
+            if let Mode::Clash { editor, .. } = core::mem::take(&mut self.mode) {
+                self.mode = Mode::Body(editor);
+            }
+            let save = keys.label(views::MEMORY_BODY, Act::FormSave);
+            self.notice = Some(Notice::Info(subject_free(save.as_deref())));
             return;
         }
         let retry = match &mut self.mode {
@@ -1284,20 +1324,33 @@ impl MemoryPane {
         self.scroll.set(Some(ScrollSpan::new(total, offset)));
     }
 
-    /// The notice row's lines, wrapped.
+    /// The notice row's lines, wrapped: the retire question first while it is open, drawn from
+    /// the mode so an in-flight clear, a failed write or a stale answer cannot take it away
+    /// (review R4-3), then the notice.
     fn notice_lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let width = usize::from(width).max(1);
+        let mut lines = Vec::new();
+        if let Mode::Retiring { subject, .. } = &self.mode {
+            lines.extend(
+                wrapped(&retire_question(subject), width)
+                    .into_iter()
+                    .map(|line| notice(&line, Tone::Info, theme)),
+            );
+        }
         let Some(said) = &self.notice else {
-            return Vec::new();
+            return lines;
         };
         let tone = match said {
             Notice::Error(_) => Tone::Error,
             Notice::Info(text) if is_error(text) => Tone::Error,
             Notice::Info(_) => Tone::Info,
         };
-        wrapped(said.text(), usize::from(width).max(1))
-            .into_iter()
-            .map(|line| notice(&line, tone, theme))
-            .collect()
+        lines.extend(
+            wrapped(said.text(), width)
+                .into_iter()
+                .map(|line| notice(&line, tone, theme)),
+        );
+        lines
     }
 }
 
@@ -1389,6 +1442,15 @@ fn unsaved(cancel: Option<&str>) -> String {
     match cancel {
         Some(cancel) => format!("unsaved changes \u{2014} {cancel} again discards"),
         None => "unsaved changes \u{2014} cancel again to discard".to_owned(),
+    }
+}
+
+/// A clash whose holder changed its subject elsewhere: `save` is `form.save`'s label through
+/// `MEMORY_BODY`.
+fn subject_free(save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!("the subject is free now; {save} saves"),
+        None => "the subject is free now; save to write it".to_owned(),
     }
 }
 

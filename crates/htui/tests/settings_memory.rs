@@ -6,12 +6,13 @@
 use chrono::{DateTime, TimeZone as _, Utc};
 use htui::app::Action;
 use htui::keys::{load_str, views};
-use htui::memory::MemoryWrite;
+use htui::memory::{MemoryWrite, READ_NAME};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::hierarchy::PICK_A_PROJECT;
 use htui::ui::tabs::settings::memory::{
-    CLASH_QUESTION, CLASH_QUESTION_AMEND, MEMORY_NEEDS_THE_DATABASE, UNCHANGED,
+    CLASH_QUESTION, CLASH_QUESTION_AMEND, CLOSED_ELSEWHERE, MEMORY_NEEDS_THE_DATABASE, UNAVAILABLE,
+    UNCHANGED,
 };
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
@@ -113,24 +114,31 @@ fn every() -> Vec<MemoryEntry> {
 /// A bench whose Hierarchy section holds the demo tree, the cursor on `vulkan-tutorials`, its
 /// memory pane open and answered with `entries`.
 async fn opened(entries: Option<Vec<MemoryEntry>>) -> (SectionBench, HierarchySection) {
-    let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new().with_home(Some("/home/x"));
-    let tree = serve(
+    answered(&StoreReply::Memory {
+        project: ids::PROJECT_VULKAN,
+        entries,
+    })
+    .await
+}
+
+/// The demo tree's reply to `Hierarchy(WORKSPACE_GRAPHICS)`.
+async fn demo_tree() -> StoreReply {
+    serve(
         &Backend::memory(MemStore::demo()),
         &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS),
     )
-    .await;
-    bench.reply(&mut section, &tree);
+    .await
+}
+
+/// As [`opened`], the pane's read answered with `first`.
+async fn answered(first: &StoreReply) -> (SectionBench, HierarchySection) {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new().with_home(Some("/home/x"));
+    bench.reply(&mut section, &demo_tree().await);
     bench.key(&mut section, "j");
     bench.key(&mut section, "m");
     let _ = bench.drained();
-    bench.reply(
-        &mut section,
-        &StoreReply::Memory {
-            project: ids::PROJECT_VULKAN,
-            entries,
-        },
-    );
+    bench.reply(&mut section, first);
     (bench, section)
 }
 
@@ -804,4 +812,386 @@ async fn retire_and_replace_are_refused_in_place_once_the_reread_answers_offline
     bench.key(&mut section, "r");
     assert!(requests(&bench).is_empty(), "r sends nothing offline");
     assert!(shows(&frame(&bench, &section), MEMORY_NEEDS_THE_DATABASE));
+}
+
+/// The list row drawn under the cursor (`▌`).
+fn cursor_row(frame: &str) -> &str {
+    frame
+        .lines()
+        .find(|line| line.starts_with('\u{258c}'))
+        .unwrap_or_default()
+}
+
+/// How many times the frame holds `sentence`, wrapped or not.
+fn count(frame: &str, sentence: &str) -> usize {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat(frame).matches(&flat(sentence)).count()
+}
+
+/// Review R4-1: a stale holder whose subject no longer folds to the draft's has freed it. The
+/// question ends, the draft goes back to its editor, and `Ctrl+S` there creates.
+#[tokio::test]
+async fn a_clash_whose_holder_was_renamed_frees_the_subject() {
+    let (bench, mut section) = clashed().await;
+    bench.key(&mut section, "r");
+    let _ = bench.drained();
+
+    let mut head = live()[0].clone();
+    head.subject = "Old build cache".to_owned();
+    head.version = 3;
+    let mut fresh = live();
+    fresh[0] = head.clone();
+    bench.reply(
+        &mut section,
+        &StoreReply::MemoryStale {
+            project: ids::PROJECT_VULKAN,
+            head,
+            entries: fresh,
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert_eq!(section.key_stack(), Some(views::MEMORY_BODY), "{shown}");
+    assert!(shows(&shown, "Mine."), "the draft is kept: {shown}");
+    assert!(shows(&shown, "the subject is free now"), "{shown}");
+    assert!(shows(&shown, "Ctrl+s saves"), "{shown}");
+    bench.key(&mut section, "r");
+    assert!(
+        requests(&bench).is_empty(),
+        "r types; it supersedes nothing"
+    );
+    bench.key(&mut section, "ctrl-s");
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [StoreRequest::CreateMemoryEntry { subject, .. }] if subject.as_str() == "build cache"
+        ),
+        "{sent:?}"
+    );
+}
+
+/// A clash answered again while its question is open names the new holder.
+#[tokio::test]
+async fn a_second_clash_names_the_new_holder() {
+    let (bench, mut section) = clashed().await;
+    bench.key(&mut section, "r");
+    let _ = bench.drained();
+    let mut holder = live()[0].clone();
+    holder.id = MemoryEntryId::from_uuid(Uuid::from_u128(9));
+    holder.version = 5;
+    bench.reply(
+        &mut section,
+        &StoreReply::MemorySubjectTaken {
+            project: ids::PROJECT_VULKAN,
+            existing: holder.clone(),
+        },
+    );
+
+    assert_eq!(section.key_stack(), Some(views::MEMORY_CLASH));
+    bench.key(&mut section, "r");
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [StoreRequest::SupersedeMemoryEntry { old, expected: 5, .. }] if *old == holder.id
+        ),
+        "{sent:?}"
+    );
+}
+
+/// Review R4-2 and R4-3: a stale retire whose entry moved to another row follows it there, and
+/// the question still names it; `y` retires it under the head's version.
+#[tokio::test]
+async fn a_stale_retire_follows_its_entry_to_its_new_row() {
+    let (bench, mut section) = opened(Some(live())).await;
+    keys(&bench, &mut section, &["j", "j", "d", "y"]);
+    let _ = bench.drained();
+
+    let mut head = live()[2].clone();
+    head.version = 2;
+    head.updated_at = at(9);
+    let fresh = vec![head.clone(), live()[0].clone(), live()[1].clone()];
+    bench.reply(
+        &mut section,
+        &StoreReply::MemoryStale {
+            project: ids::PROJECT_VULKAN,
+            head: head.clone(),
+            entries: fresh,
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert!(cursor_row(&shown).contains("Shader dir"), "{shown}");
+    assert!(shows(&shown, "retire `Shader dir`?"), "{shown}");
+    assert!(shows(&shown, "changed elsewhere"), "{shown}");
+    bench.key(&mut section, "y");
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [StoreRequest::RetireMemoryEntry { id, expected: 2, .. }] if *id == head.id
+        ),
+        "{sent:?}"
+    );
+}
+
+/// Review R4-2: a re-read keeps the cursor on the entry it was on, wherever that entry now is.
+#[tokio::test]
+async fn an_all_toggle_reread_keeps_the_highlighted_entry() {
+    let (bench, mut section) = opened(Some(live())).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "a");
+    let mut retired = every()[3].clone();
+    retired.updated_at = at(9);
+    let mut all = vec![retired];
+    all.extend(live());
+    bench.reply(
+        &mut section,
+        &StoreReply::Memory {
+            project: ids::PROJECT_VULKAN,
+            entries: Some(all),
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert!(cursor_row(&shown).contains("Error crates"), "{shown}");
+}
+
+/// Review R4-3: the retire question is drawn from the question itself, so a failed write leaves
+/// it asking, and it is drawn once.
+#[tokio::test]
+async fn a_failed_retire_still_asks() {
+    let (bench, mut section) = opened(Some(live())).await;
+    keys(&bench, &mut section, &["j", "d"]);
+    assert_eq!(
+        count(&frame(&bench, &section), "retire `Error crates`?"),
+        1,
+        "asked once"
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+    assert!(
+        shows(&frame(&bench, &section), "retire `Error crates`?"),
+        "in flight"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "retire_memory_entry",
+            message: "connection closed".to_owned(),
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert_eq!(section.key_stack(), Some(views::MEMORY_RETIRE));
+    assert_eq!(count(&shown, "retire `Error crates`?"), 1, "{shown}");
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests(&bench).as_slice(),
+            [StoreRequest::RetireMemoryEntry { .. }]
+        ),
+        "asked again, answered again"
+    );
+}
+
+/// Review R4-4: a subject is quoted verbatim, only its control characters escaped.
+#[tokio::test]
+async fn a_subject_reads_verbatim_with_its_control_characters_escaped() {
+    let quoted = entry(
+        7,
+        MemoryKind::Fact,
+        "Don't \"x\"",
+        "Quotes.",
+        MemoryState::Active,
+        1,
+        6,
+    );
+    let broken = entry(
+        8,
+        MemoryKind::Fact,
+        "two\nlines",
+        "A break.",
+        MemoryState::Active,
+        1,
+        5,
+    );
+    let (bench, mut section) = opened(Some(vec![quoted.clone(), broken])).await;
+
+    bench.key(&mut section, "d");
+    let shown = frame(&bench, &section);
+    assert!(shows(&shown, "retire `Don't \"x\"`?"), "{shown}");
+    keys(&bench, &mut section, &["esc", "j", "d"]);
+    let shown = frame(&bench, &section);
+    assert!(shows(&shown, "retire `two\\nlines`?"), "{shown}");
+
+    keys(&bench, &mut section, &["esc", "k", "d", "y"]);
+    bench.reply(
+        &mut section,
+        &StoreReply::MemoryWritten {
+            project: ids::PROJECT_VULKAN,
+            written: MemoryWrite::Retired { id: quoted.id },
+            entries: Ok(Vec::new()),
+        },
+    );
+    let shown = frame(&bench, &section);
+    assert!(shows(&shown, "retired `Don't \"x\"`"), "{shown}");
+}
+
+/// Review R4-6 and R4-5: a refused first read draws the refusal, and a write key says the same,
+/// not that memory needs the database.
+#[tokio::test]
+async fn a_refused_read_shows_unavailable_and_refuses_writes_as_such() {
+    let (bench, mut section) = answered(&StoreReply::Failed {
+        request: READ_NAME,
+        message: "pool timed out".to_owned(),
+    })
+    .await;
+
+    assert!(shows(
+        &frame(&bench, &section),
+        &format!("{UNAVAILABLE}: pool timed out")
+    ));
+    bench.key(&mut section, "n");
+    let shown = frame(&bench, &section);
+    assert!(requests(&bench).is_empty());
+    assert_eq!(section.key_stack(), Some(views::MEMORY_BROWSE));
+    assert_eq!(
+        count(&shown, UNAVAILABLE),
+        2,
+        "the pane and the notice: {shown}"
+    );
+    assert!(!shows(&shown, MEMORY_NEEDS_THE_DATABASE), "{shown}");
+}
+
+/// Review R4-5: a tree that no longer holds the pane's project closes the pane.
+#[tokio::test]
+async fn the_pane_closes_when_its_project_leaves_the_tree() {
+    let (bench, mut section) = opened(Some(live())).await;
+    let StoreReply::Hierarchy(Some(mut tree)) = demo_tree().await else {
+        panic!("the demo tree reads");
+    };
+    tree.projects
+        .retain(|entry| entry.project.id != ids::PROJECT_VULKAN);
+
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(tree)));
+
+    assert_eq!(section.key_stack(), Some(views::HIERARCHY_BROWSE));
+    let shown = frame(&bench, &section);
+    assert!(
+        shows(&shown, "the project is gone; its memory pane closed"),
+        "{shown}"
+    );
+}
+
+/// Review R4-5: a failed write frees the pane for the next one; the editor keeps its text.
+#[tokio::test]
+async fn a_failed_write_frees_the_pane() {
+    let (bench, mut section) = opened(Some(live())).await;
+    create(&bench, &mut section, "Vulkan SDK", "Install it.");
+    assert_eq!(requests(&bench).len(), 1);
+    bench.key(&mut section, "ctrl-s");
+    assert!(requests(&bench).is_empty(), "one write at a time");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "create_memory_entry",
+            message: "connection closed".to_owned(),
+        },
+    );
+
+    assert_eq!(section.key_stack(), Some(views::MEMORY_BODY));
+    assert!(shows(&frame(&bench, &section), "Install it."));
+    bench.key(&mut section, "ctrl-s");
+    assert!(
+        matches!(
+            requests(&bench).as_slice(),
+            [StoreRequest::CreateMemoryEntry { .. }]
+        ),
+        "free again"
+    );
+}
+
+/// Review R4-5: a landed write whose re-read failed keeps the list it had and says both.
+#[tokio::test]
+async fn a_written_reply_whose_reread_failed_keeps_the_list() {
+    let (bench, mut section) = opened(Some(live())).await;
+    create(&bench, &mut section, "Vulkan SDK", "Install it.");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::MemoryWritten {
+            project: ids::PROJECT_VULKAN,
+            written: MemoryWrite::Created {
+                id: MemoryEntryId::from_uuid(Uuid::from_u128(9)),
+            },
+            entries: Err("pool closed".to_owned()),
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert_eq!(section.key_stack(), Some(views::MEMORY_BROWSE));
+    assert!(shows(&shown, "Build cache"), "the list is kept: {shown}");
+    assert!(
+        shows(&shown, "saved \u{b7} the list was not re-read: pool closed"),
+        "{shown}"
+    );
+}
+
+/// Review R4-5: a stale answer whose entry closed elsewhere ends the edit.
+#[tokio::test]
+async fn a_stale_reply_whose_head_closed_returns_to_browse() {
+    for state in [MemoryState::Retired, MemoryState::Superseded] {
+        let (bench, mut section) = opened(Some(live())).await;
+        keys(&bench, &mut section, &["e", "enter"]);
+        type_text(&bench, &mut section, " Mine.");
+        bench.key(&mut section, "ctrl-s");
+        let _ = bench.drained();
+
+        let mut head = live()[0].clone();
+        head.state = state;
+        head.version = 3;
+        bench.reply(
+            &mut section,
+            &StoreReply::MemoryStale {
+                project: ids::PROJECT_VULKAN,
+                head,
+                entries: live()[1..].to_vec(),
+            },
+        );
+
+        let shown = frame(&bench, &section);
+        assert_eq!(section.key_stack(), Some(views::MEMORY_BROWSE), "{state:?}");
+        assert!(shows(&shown, CLOSED_ELSEWHERE), "{state:?}: {shown}");
+    }
+}
+
+/// Review R4-5: every mode draws at 40 columns without a panic.
+#[tokio::test]
+async fn the_pane_renders_at_width_40() {
+    let narrow = |bench: &SectionBench, section: &HierarchySection| {
+        let shown = bench.render_section(section, 40);
+        assert!(shown.contains("memory"), "{shown}");
+    };
+    let (bench, mut section) = opened(Some(live())).await;
+    narrow(&bench, &section);
+    bench.key(&mut section, "d");
+    narrow(&bench, &section);
+    keys(&bench, &mut section, &["esc", "n"]);
+    narrow(&bench, &section);
+    type_text(
+        &bench,
+        &mut section,
+        "A subject long enough to wrap twice at forty",
+    );
+    bench.key(&mut section, "enter");
+    narrow(&bench, &section);
+    let (bench, section) = clashed().await;
+    narrow(&bench, &section);
+    let (bench, section) = opened(None).await;
+    narrow(&bench, &section);
 }
