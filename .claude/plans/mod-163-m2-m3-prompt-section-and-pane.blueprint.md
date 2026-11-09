@@ -612,6 +612,7 @@ Count pins:
   };
   ```
   The literal changes `memory: None` (T1) to `memory`. The module and `build` docs gain "ten reads". `the_stand_in_list_is_the_one_the_notes_are_built_from` (~:430) needs no edit.
+  *Amended 2026-11-09 (review R1, R2-1, R2-4):* `MEMORY_OFFLINE_NOTE` and its `None` arm were removed as unreachable (an offline backend refuses earlier, at `prompt_templates`); `None` is no memory, `.and_then(|entries| select_memory(..))` as in `graph::frozen_memory` (plan D18 amendment). The read counts left the module and `build` docs, which disagreed.
 - `htui/tests/prompt_preview.rs`, new test `the_preview_selects_the_memory_a_run_would_freeze`. On a `Backend::memory(MemStore::demo())`, create two active entries and one retired for the item's project. The preview's `trim.memory.shown` ids equal `select_memory(&store.memory_entries(project, Some(vec![Active])), MEMORY_TOKEN_CAP, DEFAULT).entries` ids, and its notes contain `MEMORY_NOTE`. `the_preview_declares_its_stand_ins` covers the 9th note automatically.
 - Snapshots that move (P-11): `backlog__detail_prompt.snap`, `prompt_preview__preview_ana_2.snap`, `prompt_preview__preview_feat_1.snap`. Each gains one note line. Review by hand.
 
