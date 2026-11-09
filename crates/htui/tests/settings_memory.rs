@@ -774,3 +774,34 @@ async fn an_end_to_end_create_lands_through_the_worker() {
     assert_eq!(harness.app().status, None, "nothing failed");
     assert!(harness.render().contains("saved `Shaders`"));
 }
+
+/// T4 verify finding (repair by the main thread): a re-read that answers offline while the retire
+/// question or a new entry's clash question is open refuses `y` and `r` in place, as every other
+/// write key does (blueprint §T4.4: "Writes are refused in place, nothing sent").
+#[tokio::test]
+async fn retire_and_replace_are_refused_in_place_once_the_reread_answers_offline() {
+    let (bench, mut section) = opened(Some(live())).await;
+    keys(&bench, &mut section, &["j", "d"]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Memory {
+            project: ids::PROJECT_VULKAN,
+            entries: None,
+        },
+    );
+    bench.key(&mut section, "y");
+    assert!(requests(&bench).is_empty(), "y sends nothing offline");
+    assert!(shows(&frame(&bench, &section), MEMORY_NEEDS_THE_DATABASE));
+
+    let (bench, mut section) = clashed().await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Memory {
+            project: ids::PROJECT_VULKAN,
+            entries: None,
+        },
+    );
+    bench.key(&mut section, "r");
+    assert!(requests(&bench).is_empty(), "r sends nothing offline");
+    assert!(shows(&frame(&bench, &section), MEMORY_NEEDS_THE_DATABASE));
+}

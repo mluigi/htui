@@ -850,6 +850,9 @@ impl MemoryPane {
         let stack = views::MEMORY_RETIRE;
         let chord = ctx.pressed(&key);
         let (project, all) = (self.project, self.all);
+        // Taken before the mode is borrowed: a re-read that answered offline while the question
+        // was open refuses `y` in place, as every other write key is (blueprint §T4.4).
+        let refusal = self.write_refusal();
         let Mode::Retiring {
             id,
             expected,
@@ -862,6 +865,10 @@ impl MemoryPane {
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes | Act::ConfirmNo) if *in_flight => Handled::Consumed,
             Some(Act::ConfirmYes) => {
+                if let Some(why) = refusal {
+                    self.notice = Some(Notice::Error(why));
+                    return Handled::Consumed;
+                }
                 *in_flight = true;
                 let request = StoreRequest::RetireMemoryEntry {
                     project,
@@ -923,6 +930,10 @@ impl MemoryPane {
     /// `r` over a new entry's clash (M1 D4): the holder is superseded by the editor's text. Never
     /// for an amend (O-1): its stack offers no replace, and this refuses one anyway.
     fn replace(&mut self, ctx: &Ctx<'_>) {
+        if let Some(why) = self.write_refusal() {
+            self.notice = Some(Notice::Error(why));
+            return;
+        }
         let (project, all) = (self.project, self.all);
         let Mode::Clash { existing, editor } = &self.mode else {
             return;
