@@ -6,7 +6,7 @@ maintainer's request, 2026-11-08)
 **Complexity**: Large. A new prompt section across the assembler, the trimmer, the run snapshot and
 the engine; a new Settings pane with its own key context and store-worker family; one new setting
 key; one comment-only migration (`trim_record` v5).
-**Status**: confirmed 2026-11-08 (maintainer CONFIRM, sandbox run `hr/MOD-163`); implementation in progress.
+**Status**: complete 2026-11-09 (confirmed 2026-11-08; maintainer decisions P-1 and O-1 in the blueprint). T1-T4 and review-fix round R1 landed on `hr/MOD-163`; rust-reviewer (three areas): approve / approve with fixes ×2, findings verified and applied in R1. Write-up `docs/decisions/mod/mod-163.md`.
 
 ## Summary
 
