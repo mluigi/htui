@@ -79,8 +79,8 @@ pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind {
 /// template's body and ref, `handoff: Some(HandoffInputs { StepSummary::from_events(events,
 /// roots), diff_so_far, failure_reason })`, `verify_failure`/`previous_diff`/`judge` cleared, and
 /// `skills` emptied (MOD-9 D44: a handoff body cannot place `{{skills}}`, so a candidate would only
-/// be scrubbed — failing the handoff on a skill body it never shows — and recorded `not_placed`).
-/// Every other field is the phase's.
+/// be scrubbed — failing the handoff on a skill body it never shows — and recorded `not_placed`),
+/// and `persona` and `memory` cleared (MOD-26 OQ-5, MOD-163 D18). Every other field is the phase's.
 #[must_use]
 pub fn handoff_spec(
     phase: PromptSpec,
@@ -103,6 +103,8 @@ pub fn handoff_spec(
         skills: Vec::new(),
         // MOD-26 OQ-5: a handoff runs under no persona, whatever the abandoned phase named.
         persona: None,
+        // MOD-163 D18: a handoff carries no project memory.
+        memory: None,
         handoff: Some(HandoffInputs {
             step_summary: StepSummary::from_events(events, roots),
             diff_so_far,
@@ -473,6 +475,8 @@ mod tests {
             // Blueprint F-C, D63: the fixture phase carries one skill, and a handoff carries none.
             skills: Vec::new(),
             persona: None,
+            // MOD-163 D18: a handoff carries no project memory.
+            memory: None,
             ..phase.clone()
         };
         assert_eq!(
@@ -503,6 +507,28 @@ mod tests {
             "gave up".to_owned(),
         );
         assert_eq!(spec.persona, None);
+    }
+
+    /// MOD-163 D18: the handoff spec never carries the abandoned phase's project memory, and its
+    /// prompt renders no memory section.
+    #[test]
+    fn the_handoff_spec_drops_the_memory() {
+        let phase = PromptSpec {
+            memory: Some(htui_core::prompt::fixtures::memory_two_of_three()),
+            ..phase_implement_attempt2()
+        };
+        let spec = handoff_spec(
+            phase,
+            &handoff_template(),
+            &handoff_events(),
+            &[root()],
+            Some(diff()),
+            "gave up".to_owned(),
+        );
+        assert_eq!(spec.memory, None);
+        let assembled = assemble(&spec, &MinimalScrubber::new([])).expect("the handoff assembles");
+        assert!(!assembled.text.contains("name=\"memory\""));
+        assert_eq!(assembled.trim.memory, None);
     }
 
     /// MOD-9 D44 (blueprint F-D, D63): the handoff body cannot place `{{skills}}`, so a phase's
