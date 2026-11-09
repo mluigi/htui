@@ -449,7 +449,7 @@ fn handoff_event(seq: i32, turn: i32, kind: EventKind, payload: serde_json::Valu
         payload,
         raw: None,
         // A literal, never a clock: `at` is informational and nothing here orders by it.
-        at: chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid fixed timestamp"),
+        at: DateTime::from_timestamp(1_788_393_600, 0).expect("a valid fixed timestamp"),
     }
 }
 

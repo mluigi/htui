@@ -28,11 +28,12 @@
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
-use crate::model::memory::SnapshotMemoryEntry;
+use crate::model::memory::{SnapshotMemory, SnapshotMemoryEntry};
 use crate::model::skill::BoundSkill;
 use crate::model::{EventKind, SessionEvent};
 use crate::prompt::defaults::COMMAND_QUEUE_TEXT;
 use crate::prompt::excerpt::{Excerpt, RepoRoot};
+use crate::prompt::memory::{MEMORY_PREAMBLE, left_out_line};
 use crate::prompt::template::ParsedTemplate;
 use crate::prompt::{
     DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec, SectionName, StepSummary,
@@ -679,6 +680,34 @@ pub fn memory_entry_block(entry: &SnapshotMemoryEntry) -> String {
     } else {
         format!("{open}\n{body}\n</entry>")
     }
+}
+
+/// MOD-163 D15: the `memory` section over `memory.entries[..shown]` (clamped to the length): the
+/// preamble, one LF, the blocks joined by one LF, then — when `shown < total` — one LF and the
+/// left-out line. `None` when `shown` is 0 (no empty section, I-7). No attributes.
+///
+/// The trimmer re-renders through this with a smaller `shown` (MOD-163 D16), so the left-out line
+/// always counts what reached the prompt and no rendered byte is ever edited.
+#[must_use]
+pub fn memory(memory: &SnapshotMemory, shown: usize) -> Option<Rendered> {
+    let shown = shown.min(memory.entries.len());
+    if shown == 0 {
+        return None;
+    }
+    let blocks: Vec<String> = memory.entries[..shown]
+        .iter()
+        .map(memory_entry_block)
+        .collect();
+    let mut content = format!("{MEMORY_PREAMBLE}\n{}", blocks.join("\n"));
+    if let Some(line) = left_out_line(shown, memory.total) {
+        content.push('\n');
+        content.push_str(&line);
+    }
+    Some(Rendered {
+        name: SectionName::Memory,
+        attrs: Vec::new(),
+        content,
+    })
 }
 
 /// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim — less the

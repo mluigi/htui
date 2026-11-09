@@ -184,6 +184,11 @@ impl From<&SnapshotPersona> for PersonaBlock {
 /// frame's estimate.
 pub const PERSONA_SEPARATOR: &str = "\n\n";
 
+/// MOD-163 D14 (C8 option a): the blank line between the memory section and what follows it.
+/// Counted in the **memory section's own span**, not the frame, so dropping the section drops it
+/// and `estimated_after` describes only sent bytes.
+pub const MEMORY_SEPARATOR: &str = "\n\n";
+
 /// MOD-11 D19, B-7: the bytes between the template body and the `output` trailer, counted in the
 /// frame's estimate.
 pub const OUTPUT_SEPARATOR: &str = "\n\n";
@@ -293,6 +298,8 @@ pub enum SectionName {
     /// The persona frame (MOD-26 D13). Always `sections[1]` when present: `template` keeps
     /// `sections[0]`, P-9.
     Persona,
+    /// MOD-163 D14: project memory. `sections[1]` without a persona, `sections[2]` with one (P-9).
+    Memory,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -333,6 +340,7 @@ impl SectionName {
         match self {
             Self::Template => "template".to_owned(),
             Self::Persona => "persona".to_owned(),
+            Self::Memory => "memory".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -546,6 +554,12 @@ pub fn assemble(
     for section in render_sections(Placeholder::Persona, spec, upstream, skills, candidates) {
         rendered.push((Placeholder::Persona, section, 1));
     }
+    // MOD-163 D14: the memory section renders after the persona and outside the body's spans, so
+    // it is scanned with every section below, trimmed by `TrimStep::Memory`, and recorded as
+    // `sections[1]`, or `sections[2]` behind a persona (P-9). Phase specs only (blueprint P-5).
+    for section in render_sections(Placeholder::Memory, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Memory, section, 1));
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -714,6 +728,12 @@ fn substitute(
         text.push_str(&frame.join("\n\n"));
         text.push_str(PERSONA_SEPARATOR);
     }
+    // MOD-163 D14: the memory section, then its own blank line. `live` carries it only when the
+    // memory section survived the trim, so a memory-less prompt is byte-identical (I-7).
+    if let Some(memory) = blocks.get(&Placeholder::Memory) {
+        text.push_str(&memory.join("\n\n"));
+        text.push_str(MEMORY_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {
@@ -739,6 +759,14 @@ fn substitute(
         text.push_str(&trailer.join("\n\n"));
     }
     text
+}
+
+/// MOD-163 blueprint P-5: the memory a spec renders — its own, for a phase spec, and none for a
+/// judge or handoff, whose trim orders have no memory step.
+fn memory_of(spec: &PromptSpec) -> Option<&SnapshotMemory> {
+    spec.memory
+        .as_ref()
+        .filter(|_| matches!(spec.role, TemplateRole::Phase))
 }
 
 /// Whether `spec` renders the `output` trailer: the tool is on and there is a kind to name.
@@ -847,6 +875,10 @@ fn render_sections(
             .map(|handoff| render::failure_reason(&handoff.failure_reason))
             .collect(),
         Placeholder::Persona => spec.persona.iter().map(render::persona).collect(),
+        Placeholder::Memory => memory_of(spec)
+            .and_then(|memory| render::memory(memory, memory.entries.len()))
+            .into_iter()
+            .collect(),
         Placeholder::Output => {
             if has_output(spec) {
                 spec.output_kind
@@ -984,6 +1016,18 @@ fn scrubbed_inputs(
         let persona_name = SectionName::Persona.render();
         mask(scrubber, &mut persona.name, &persona_name)?;
         mask(scrubber, &mut persona.body, &persona_name)?;
+    }
+
+    // MOD-163 D15: subjects and bodies, under the section that renders them, and only for a phase
+    // spec — a judge or handoff never shows its memory, so it must not be refused over it (P-5).
+    if matches!(spec.role, TemplateRole::Phase)
+        && let Some(memory) = &mut spec.memory
+    {
+        let memory_name = SectionName::Memory.render();
+        for entry in &mut memory.entries {
+            mask(scrubber, &mut entry.subject, &memory_name)?;
+            mask(scrubber, &mut entry.body, &memory_name)?;
+        }
     }
 
     let excerpts_name = SectionName::Excerpts.render();
@@ -1415,6 +1459,7 @@ mod tests {
         assert_eq!(SectionName::JudgeCandidate(2).render(), "judge_candidate:2");
         assert_eq!(SectionName::Box.to_string(), "box");
         assert_eq!(SectionName::Persona.render(), "persona");
+        assert_eq!(SectionName::Memory.render(), "memory");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1441,6 +1486,7 @@ mod tests {
             }
             for name in [
                 SectionName::Item,
+                SectionName::Memory,
                 SectionName::Documents("plan".to_owned()),
                 SectionName::Upstream,
                 SectionName::Excerpts,

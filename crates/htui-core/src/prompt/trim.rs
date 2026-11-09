@@ -38,7 +38,9 @@ use crate::prompt::estimate::TokenEstimator;
 use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, Rendered, UpstreamState};
 use crate::prompt::template::{Placeholder, TemplateRole};
-use crate::prompt::{AssembleError, JudgeCandidate, PromptSpec, SectionName, TemplateRef};
+use crate::prompt::{
+    AssembleError, JudgeCandidate, MEMORY_SEPARATOR, PromptSpec, SectionName, TemplateRef,
+};
 use crate::scrub::{Scrubber, Unmasked};
 
 /// §4.4's floor for `item` and `judge_task`: half the body, and never fewer than this many lines.
@@ -323,6 +325,18 @@ impl TrimRecord {
     }
 }
 
+/// MOD-163 D14: a section's span — its wrapper, plus the memory section's trailing
+/// [`MEMORY_SEPARATOR`] — estimated and multiplied by how often the body places it. The one
+/// arithmetic `Trimmer::new`, `re_estimate` and `section_yardstick` record with (M-3), so the
+/// separator is counted, and dropped, with the memory section and never with the frame.
+fn span_tokens(est: TokenEstimator, rendered: &Rendered, weight: i64) -> i64 {
+    let mut span = render::wrap(rendered);
+    if rendered.name == SectionName::Memory {
+        span.push_str(MEMORY_SEPARATOR);
+    }
+    est.estimate(&span) * weight
+}
+
 /// One entry in a role's trim order. A group (`Documents`, `Candidates`) is one entry because
 /// §4.4 trims its members against one shared floor rather than one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +405,8 @@ enum Source {
     Excerpts(Vec<usize>),
     /// The previous attempt's verification output, re-rendered when tail-cut.
     VerifyFailure,
+    /// How many of `spec.memory.entries` are still rendered (a prefix; the tail goes first).
+    Memory(usize),
     /// A diff; `true` once it has been degraded to its stat.
     Diff(bool),
     /// `candidates[i]`; `true` once its diff has been degraded to its stat.
@@ -457,7 +473,7 @@ impl<'a> Trimmer<'a> {
         let entries = rendered
             .into_iter()
             .map(|(placeholder, rendered, weight)| {
-                let tokens = est.estimate(&render::wrap(&rendered)) * weight;
+                let tokens = span_tokens(est, &rendered, weight);
                 let source = Self::source_of(&inputs, &rendered.name);
                 Entry {
                     record: Section::untouched(rendered.name.clone(), tokens),
@@ -501,6 +517,13 @@ impl<'a> Trimmer<'a> {
                 Source::Excerpts((0..inputs.spec.excerpts.files.len()).collect())
             }
             SectionName::VerifyFailure => Source::VerifyFailure,
+            SectionName::Memory => Source::Memory(
+                inputs
+                    .spec
+                    .memory
+                    .as_ref()
+                    .map_or(0, |memory| memory.entries.len()),
+            ),
             SectionName::PreviousDiff | SectionName::DiffSoFar => Source::Diff(false),
             SectionName::JudgeCandidate(index) => inputs
                 .candidates
@@ -649,8 +672,7 @@ impl<'a> Trimmer<'a> {
     /// Re-measures one section after its content changed (§4.4 step 8).
     fn re_estimate(&mut self, index: usize) {
         let entry = &mut self.entries[index];
-        entry.record.tokens_after =
-            self.est.estimate(&render::wrap(&entry.rendered)) * entry.weight;
+        entry.record.tokens_after = span_tokens(self.est, &entry.rendered, entry.weight);
     }
 
     /// §4.4 step 7's drop: the section leaves the prompt and keeps an entry saying so.
@@ -682,7 +704,7 @@ impl<'a> Trimmer<'a> {
                 content: content.to_owned(),
                 ..shape.clone()
             };
-            est.estimate(&render::wrap(&candidate)) * weight
+            span_tokens(est, &candidate, weight)
         }
     }
 
@@ -817,6 +839,7 @@ impl<'a> Trimmer<'a> {
                 .and_then(|handoff| handoff.diff_so_far.as_ref()),
             SectionName::Template
             | SectionName::Persona
+            | SectionName::Memory
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream

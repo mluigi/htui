@@ -2042,7 +2042,7 @@ mod tests {
             estimator: "chars-v2".to_owned(),
             total: 1,
             entries: vec![SnapshotMemoryEntry {
-                id: crate::model::MemoryEntryId::from_uuid(uuid::Uuid::from_u128(1)),
+                id: crate::model::MemoryEntryId::from_uuid(Uuid::from_u128(1)),
                 version: 1,
                 kind: MemoryKind::Fact,
                 subject: "Build cache".to_owned(),
