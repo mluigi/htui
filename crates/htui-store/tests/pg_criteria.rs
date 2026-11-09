@@ -13162,3 +13162,87 @@ async fn owner_document_versions_do_not_collide_under_contention() {
 
     db.drop_db().await;
 }
+
+/// MOD-147 M1 R1 (L3): a workspace whose scope row is missing — a rename that raced the bootstrap,
+/// or a row deleted by hand — gets it back on its next slug or name edit, in the edit's own
+/// transaction: the scope-row `UPDATE` matches nothing, so `insert_scope_row` runs instead and the
+/// row carries the new `@<slug>` and name, with its `WS` seed.
+#[tokio::test]
+async fn workspace_rename_restores_a_missing_scope_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let created = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "healer".to_owned(),
+            name: "Healer".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the create lands");
+    sqlx::query("DELETE FROM project WHERE owner_workspace_id = $1")
+        .bind(created.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("drop the scope row by hand");
+    assert_eq!(
+        db.store
+            .scope_project(created.id)
+            .await
+            .expect("scope_project"),
+        None,
+        "the scope row is gone"
+    );
+
+    let CasOutcome::Applied(renamed) = db
+        .store
+        .update_workspace(
+            created.id,
+            created.updated_at,
+            WorkspacePatch {
+                slug: Some("mended".to_owned()),
+                name: Some("Mended".to_owned()),
+                ..WorkspacePatch::default()
+            },
+        )
+        .await
+        .expect("the rename lands")
+    else {
+        panic!("the rename applies");
+    };
+    assert_eq!(renamed.slug, "mended");
+
+    let scope = db
+        .store
+        .scope_project(created.id)
+        .await
+        .expect("scope_project")
+        .expect("the rename put the scope row back");
+    let row = db
+        .store
+        .project(scope)
+        .await
+        .expect("project")
+        .expect("the scope row is a project");
+    assert_eq!(
+        (row.slug.as_str(), row.name.as_str(), row.owner_workspace_id),
+        ("@mended", "Mended", Some(created.id)),
+        "the restored scope row follows the new slug and name"
+    );
+    assert_eq!(
+        db.store
+            .item_kinds(scope)
+            .await
+            .expect("item_kinds")
+            .iter()
+            .map(|kind| kind.prefix.as_str())
+            .collect::<Vec<_>>(),
+        ["WS"],
+        "with its `WS` seed"
+    );
+
+    db.drop_db().await;
+}

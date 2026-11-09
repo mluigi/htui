@@ -6997,4 +6997,48 @@ mod tests {
             other => panic!("a check with no runtime is refused, not served: {other:?}"),
         }
     }
+
+    /// MOD-147 M1 R1 (L9): the nil startup scope (`WorkspaceId::default()`, no workspace yet) is
+    /// never looked up: a store that does hold a scope row under the nil id is not asked, so the
+    /// refresher follows the scope's own projects and remembers nothing. A real workspace's scope
+    /// row is still followed, and remembered.
+    #[tokio::test]
+    async fn refresher_projects_skips_the_nil_startup_scope() {
+        let store = MemStore::demo();
+        store
+            .create_workspace(htui_core::model::NewWorkspace {
+                id: WorkspaceId::default(),
+                slug: "nil".to_owned(),
+                name: "Nil".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a workspace under the nil id, so a lookup would find a scope row");
+        let backend = Backend::memory(store);
+        let mut scope_rows = BTreeMap::new();
+
+        let startup = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        assert_eq!(
+            refresher_projects(&backend, &startup, &mut scope_rows).await,
+            Vec::<ProjectId>::new(),
+            "the nil scope follows nothing"
+        );
+        assert!(scope_rows.is_empty(), "and remembers nothing");
+
+        let platform = platform_scope(&backend).await;
+        let mut expected = platform.project_ids.clone();
+        expected.push(ids::PROJECT_SCOPE_PLATFORM);
+        assert_eq!(
+            refresher_projects(&backend, &platform, &mut scope_rows).await,
+            expected
+        );
+        assert_eq!(
+            scope_rows.get(&ids::WORKSPACE_PLATFORM),
+            Some(&ids::PROJECT_SCOPE_PLATFORM)
+        );
+    }
 }

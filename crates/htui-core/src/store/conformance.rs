@@ -79,7 +79,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
-    scope_row_joins_no_workspace, workspace_has_live_run,
+    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -27235,6 +27235,11 @@ async fn create_workspace_creates_its_scope_row<S: WriteStore>(store: &S) {
         "{CASE}: an unknown creator is refused, got {refused:?}"
     );
     assert_eq!(
+        store.workspace(ghost_id).await.expect(CASE),
+        None,
+        "{CASE}: a refused create writes no workspace"
+    );
+    assert_eq!(
         store.scope_project(ghost_id).await.expect(CASE),
         None,
         "{CASE}: a refused create writes no scope row"
@@ -27436,9 +27441,10 @@ async fn user_slug_cannot_start_with_at<S: WriteStore>(store: &S) {
             },
         )
         .await;
-    assert!(
-        matches!(renamed, Err(StoreError::Constraint(_))),
-        "{CASE}: a scope row's slug follows its workspace, got {renamed:?}"
+    assert_eq!(
+        renamed,
+        Err(StoreError::Constraint(scope_row_slug_is_fixed("@platform"))),
+        "{CASE}: a scope row's slug follows its workspace, in the same words on both stores"
     );
     assert_eq!(
         project_of(CASE, store, ids::PROJECT_SCOPE_PLATFORM).await,
@@ -27910,7 +27916,11 @@ async fn workspace_delete_refuses_while_a_scope_row_run_is_live<S: WriteStore>(s
         .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
 
     let mut runs = Vec::new();
-    for live in RunStatus::ALL.iter().copied().filter(|status| status.is_active()) {
+    for live in RunStatus::ALL
+        .iter()
+        .copied()
+        .filter(|status| status.is_active())
+    {
         let run = run_to(live).await;
         runs.push(run);
         assert_eq!(
@@ -27947,7 +27957,11 @@ async fn workspace_delete_refuses_while_a_scope_row_run_is_live<S: WriteStore>(s
     }
     // The finished statuses: none of them refuses, so all of them are in place before the one
     // delete that goes through.
-    for finished in RunStatus::ALL.iter().copied().filter(|status| status.is_terminal()) {
+    for finished in RunStatus::ALL
+        .iter()
+        .copied()
+        .filter(|status| status.is_terminal())
+    {
         runs.push(run_to(finished).await);
     }
 
