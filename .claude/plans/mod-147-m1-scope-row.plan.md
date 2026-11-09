@@ -24,7 +24,7 @@ hides it; a slug reservation and a membership refusal make that hold by construc
 | D3 | Slugs starting with `@` are reserved for scope rows: DB CHECKs tie `owner_workspace_id IS NOT NULL` ⇔ `type = 'workspace'` ⇔ `slug LIKE '@%'`; `create_project`/`update_project` refuse `@` with a readable Constraint error (Pg and Mem); the migration aborts with a named message if a user project already has an `@` slug | No slug validation exists anywhere today and `update_project` can change a slug (claim 14) |
 | D4 | `upsert_workspace_project` (Pg `pg/write.rs:3046`, Mem `mem.rs:3028`) refuses a scope row | The scope row must never join membership; every lister relies on it |
 | D5 | The WS kind's graph is project-scoped (owned by the scope row, `GraphScope::Project`), like every seeded graph; phases `plan` (soft gate) → `review` (**hard** gate), reusing the existing `plan` and `review` templates (`prompt/defaults.rs:221,223`); the scope row gets all ten `DEFAULT_TEMPLATES`. `seed_project` takes the kind list as a parameter (today it loops all of `seed::KINDS`, claim 5) | Project scope keeps `delete_workspace`'s held-graph check (graphs with `workspace_id`) untripped; templates reuse settles the PRD open question until MOD-148 adds the workspace `plan` body and narrows templates per type. **Maintainer to confirm the gates** |
-| D6 | **Workspace delete cascades its scope row with counts** (amended by the maintainer 2026-11-08 after blueprint V11 showed the refusal could never be lifted: no item delete or move exists): `delete_reach(Workspace)` adds the scope row's full project reach, the person confirms, the scope row and everything it owns go with the workspace (`ON DELETE CASCADE` on Pg, by hand on Mem `mem.rs:5555`); refused only while a scope-row run is live. `delete_project` refuses a scope row ("delete the workspace instead", blueprint V12) | Same model as `delete_project` (preview with counts, then cascade); every FK to `project` cascades (claim 4) |
+| D6 | **Workspace delete cascades its scope row with counts** (amended by the maintainer 2026-11-08 after blueprint V11 showed the refusal could never be lifted: no item delete or move exists): `delete_reach(Workspace)` adds the scope row's full project reach, the person confirms, the scope row and everything it owns go with the workspace (`ON DELETE CASCADE` on Pg, by hand on Mem `mem.rs:5555`); refused only while a scope-row run is live (queued, running, awaiting_approval or stopped). `delete_project` refuses a scope row ("delete the workspace instead", blueprint V12) | Same model as `delete_project` (preview with counts, then cascade); every FK to `project` cascades (claim 4) |
 | D7 | `create_workspace` and `update_workspace` become transactions; a workspace slug rename renames its scope row (`@<new-slug>`) | Both are single pool statements today (claim 3) |
 | D8 | `workspace_box_path` stays un-mirrored; `WorkspaceBoxPath.root_path` → `folder_path`; helper `workspace_folder(slug, row, home)` gives `~/workspaces/<slug>` when no row exists; `infer` anchors on the resolved folder | The table has never been mirrored. PRD M1 row amended: the cache mirrors the scope row and owner documents, not the folder |
 | D9 | `Project` gains `owner_workspace_id: Option<WorkspaceId>` (5 literals, 3 `query_as!(Project…)`, claim 2); `workspace_of` (`htui/src/hierarchy.rs:537`) resolves a scope row through it | `workspace_of` matches membership today, so it answers NotFound for a scope row (claim 16); M3's secret-binding path needs it |
@@ -92,8 +92,16 @@ bash scripts/gate.sh                              # full gate; live-Qdrant suite
 | Fixture/demo id strides and whole-store counts move | Medium | scope rows in their own id block; the three fixture tests and the demo per-table counts re-derived (claims 11, 17) |
 | Cache 0009 must apply to a populated old mirror before the rebuild | Medium | T1 test opens a cache file at 0008 with document rows, then migrates |
 | `.sqlx` churn | High | one `cargo sqlx prepare` at the end of T3 |
-| A scope-row run with no item (MOD-136 later) on workspace delete | Low | D6 refuses while any run exists; covered by the refusal case |
+| A scope-row run with no item (MOD-136 later) on workspace delete | Low | D6 refuses while any scope-row run is live (queued, running, awaiting_approval or stopped); covered by the refusal case |
 | Snapshot churn | Low | no visible text changes in M1; full insta run anyway |
+
+## Carried to M2/MOD-136
+
+- R1 L8 (rust-reviewer, recorded only; no M1 change): the usable-graph checks admit a workspace graph
+  only through `workspace_project` membership, which a scope row never has, and a scope-row run's
+  `run.workspace_id` is what names its workspace. A scope row that should run a workspace-scoped
+  graph (M2, MOD-136's item-less scope-row runs) needs both paths to recognise the owner workspace
+  (`project.owner_workspace_id`) as well as membership.
 
 ## Acceptance
 - [ ] All tasks complete, tests written first

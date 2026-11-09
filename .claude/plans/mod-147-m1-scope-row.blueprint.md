@@ -29,8 +29,8 @@ dry-run on an in-memory SQLite built from cache 0001-0008 with rows in `project`
   scope row's full project reach** (every `DeleteReach` field the scope row's `project_reach` fills: items,
   counters, kinds, graphs, phases, templates, documents incl. owner documents (V7), runs, steps, events, notes,
   revisions, links, memory…), field-wise summed. The report equals the act (PRD D13). Both stores.
-- `delete_workspace` is **refused only while a scope-row run is live** (`queued`, `running`,
-  `awaiting_approval`), with the sentence `workspace_has_live_run(workspace_slug, n)` → "workspace `shop` has
+- `delete_workspace` is **refused only while a scope-row run is live** (queued, running,
+  awaiting_approval or stopped — `RunStatus::is_active`, maintainer 2026-11-09, R1 M2), with the sentence `workspace_has_live_run(workspace_slug, n)` → "workspace `shop` has
   1 live run; stop it before deleting the workspace" (`n` singular/plural). Items, documents and finished runs
   no longer refuse; they cascade and are counted.
 - So **`workspace_owns_work` is not written**; T2.3 adds `workspace_has_live_run` instead (unit test
@@ -38,11 +38,12 @@ dry-run on an in-memory SQLite built from cache 0001-0008 with rows in `project`
   refusal, then `reach = workspace part + project_reach(scope)`, then `delete_project(scope)` internals (bypassing
   A2's refusal) and the existing removals; returns the summed reach. T3.6 Postgres: the count query becomes
   `SELECT count(*) FROM run r JOIN project p ON p.id = r.project_id WHERE p.owner_workspace_id = $1 AND r.status
-  IN ('queued','running','awaiting_approval')`; `workspace_reach` (`pg/write.rs:~480-510`) adds the scope row's
+  IN ('queued', 'running', 'awaiting_approval', 'stopped')`; `workspace_reach` (`pg/write.rs:~480-510`) adds the scope row's
   `project_reach` summed in; the `DELETE FROM workspace` cascade is unchanged.
 - Conformance case 12 becomes **`workspace_delete_refuses_while_a_scope_row_run_is_live`** (ws `busy`: mint a
-  `WS` item, `create_run` on it → `Err(Constraint(workspace_has_live_run("busy", 1)))`, nothing removed; after the
-  run finishes/cancels the delete succeeds). Case 13 becomes **`workspace_delete_cascades_its_scope_row_with_counts`**
+  `WS` item, a run on it in each live status — queued, running, awaiting_approval, stopped — →
+  `Err(Constraint(workspace_has_live_run("busy", 1)))`, nothing removed; done, failed and cancelled runs do not
+  refuse, and the delete then succeeds and counts them). Case 13 becomes **`workspace_delete_cascades_its_scope_row_with_counts`**
   (ws with one `WS` item and one owner document: `reach = delete_reach(Workspace)` has `items 1`, `documents ≥ 1`,
   `item_kinds 1`, `step_graphs 1`, `phases 2`, `prompt_templates 10`; `delete_workspace(..) == reach`; then
   `project(scope)` `None`, the item gone, `owner_documents(scope)` empty, `scope_project(ws.id)` `None`).
