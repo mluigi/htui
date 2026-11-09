@@ -32,7 +32,10 @@ use htui_core::model::{
     StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId,
     WorkspacePatch, WorkspaceSummary,
 };
-use htui_core::model::{QueueMove, QueueOverview, QueueSetting};
+use htui_core::model::{
+    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove, QueueOverview,
+    QueueSetting,
+};
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::secret::{SecretScope, SecretSource};
@@ -59,6 +62,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hand_written::{self, DocumentFormContext, HandText};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete, ScopeWrite};
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
+use crate::memory::{self, MemoryWrite};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
@@ -1135,6 +1139,75 @@ pub enum StoreRequest {
         /// The citation kind.
         kind: CitationKind,
     },
+    /// MOD-163 D21: one project's memory entries, live (`active | suspect`) unless `all`, for the
+    /// Hierarchy memory pane. Answered with [`StoreReply::Memory`]; `entries: None` offline (the
+    /// table is not mirrored).
+    MemoryEntries {
+        /// The project.
+        project: ProjectId,
+        /// Every state, not only the live ones (D20's toggle).
+        all: bool,
+    },
+    /// A new entry (D21): [`StoreReply::MemoryWritten`], [`StoreReply::MemorySubjectTaken`] on a
+    /// live-subject clash, or `Failed`.
+    CreateMemoryEntry {
+        /// The project the entry belongs to.
+        project: ProjectId,
+        /// The pane's toggle, so the re-read matches its list.
+        all: bool,
+        /// The kind.
+        kind: MemoryKind,
+        /// The checked subject (length-only `Debug`).
+        subject: MemorySubject,
+        /// The checked body (length-only `Debug`).
+        body: MemoryBody,
+    },
+    /// A compare-and-set amend of all three fields (D21): `MemoryWritten`, `MemoryStale` on
+    /// `Diverged`, `MemorySubjectTaken` on a clash with another entry, or `Failed`.
+    AmendMemoryEntry {
+        /// The entry's project.
+        project: ProjectId,
+        /// The pane's toggle.
+        all: bool,
+        /// The entry.
+        id: MemoryEntryId,
+        /// The version the pane edited from.
+        expected: i32,
+        /// The kind.
+        kind: MemoryKind,
+        /// The checked subject.
+        subject: MemorySubject,
+        /// The checked body.
+        body: MemoryBody,
+    },
+    /// A compare-and-set retire (D21): `MemoryWritten`, `MemoryStale`, or `Failed`.
+    RetireMemoryEntry {
+        /// The entry's project.
+        project: ProjectId,
+        /// The pane's toggle.
+        all: bool,
+        /// The entry.
+        id: MemoryEntryId,
+        /// The version the pane read.
+        expected: i32,
+    },
+    /// The clash question's "replace" (M1 D4): `old` superseded by a new entry with this text.
+    SupersedeMemoryEntry {
+        /// The project.
+        project: ProjectId,
+        /// The pane's toggle.
+        all: bool,
+        /// The live entry the new one replaces.
+        old: MemoryEntryId,
+        /// `old`'s version as the pane read it.
+        expected: i32,
+        /// The new entry's kind.
+        kind: MemoryKind,
+        /// The new entry's checked subject.
+        subject: MemorySubject,
+        /// The new entry's checked body.
+        body: MemoryBody,
+    },
     /// MOD-13 milestone 2 D3: the read that opens the Backlog's item form; answered with
     /// [`StoreReply::ItemForm`]. Refused offline (D2). For an edit, `project` must be the item's.
     ItemForm {
@@ -1406,6 +1479,12 @@ impl StoreRequest {
             Self::CiteRequirement { .. } => "cite_requirement",
             Self::UnciteRequirement { .. } => "uncite_requirement",
             Self::ReconfirmCitation { .. } => "reconfirm_citation",
+            // The five of `memory::REQUEST_NAMES`, in that order (MOD-163 D21).
+            Self::MemoryEntries { .. } => "memory_entries",
+            Self::CreateMemoryEntry { .. } => "create_memory_entry",
+            Self::AmendMemoryEntry { .. } => "amend_memory_entry",
+            Self::RetireMemoryEntry { .. } => "retire_memory_entry",
+            Self::SupersedeMemoryEntry { .. } => "supersede_memory_entry",
             // The three of `item_writes::REQUEST_NAMES`, in that order (MOD-13 milestone 2).
             Self::ItemForm { .. } => "item_form",
             Self::MintItem { .. } => "mint_item",
@@ -1757,6 +1836,42 @@ pub enum StoreReply {
     RequirementDetail(Box<RequirementDetail>),
     /// Answer to [`StoreRequest::ItemRequirements`] and to every citation write that applied.
     ItemCitations(Box<ItemCitations>),
+    /// Answer to [`StoreRequest::MemoryEntries`] (MOD-163 D21).
+    Memory {
+        /// The project read; a pane open on another project ignores this.
+        project: ProjectId,
+        /// The entries in `(updated_at DESC, id)` order; `None` when the backend holds no memory
+        /// (offline: the table is not mirrored).
+        entries: Option<Vec<MemoryEntry>>,
+    },
+    /// A memory write landed (D21): what it did, and the project's entries re-read. A failed
+    /// re-read still answers this, carrying the failure: the write has landed.
+    MemoryWritten {
+        /// The project written.
+        project: ProjectId,
+        /// What the write did.
+        written: MemoryWrite,
+        /// The entries as they are now, or the re-read's `StoreError` through `Display`.
+        entries: Result<Vec<MemoryEntry>, String>,
+    },
+    /// An amend, retire or supersede missed its version: nothing was written; the row as it is
+    /// now and the re-read list.
+    MemoryStale {
+        /// The project.
+        project: ProjectId,
+        /// The entry as it is now (a closed one is not in a live list).
+        head: MemoryEntry,
+        /// The entries as they are now.
+        entries: Vec<MemoryEntry>,
+    },
+    /// A create or amend met a live entry with the same folded subject (M1 D4): typed by
+    /// re-reading, never by parsing the refusal.
+    MemorySubjectTaken {
+        /// The project.
+        project: ProjectId,
+        /// The live entry that holds the subject.
+        existing: MemoryEntry,
+    },
     /// Answer to [`StoreRequest::ItemForm`]; boxed, it carries a whole `Item`.
     ItemForm(Box<ItemFormContext>),
     /// An item write that applied (self-naming, MOD-59): the tab lands a write on this alone.
@@ -2364,6 +2479,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::CiteRequirement { .. }
         | StoreRequest::UnciteRequirement { .. }
         | StoreRequest::ReconfirmCitation { .. } => requirements::serve(backend, request).await?,
+        // The five memory requests, or-ed for the reason the arms above are (MOD-15 M3 plan F-12,
+        // MOD-163 D21).
+        StoreRequest::MemoryEntries { .. }
+        | StoreRequest::CreateMemoryEntry { .. }
+        | StoreRequest::AmendMemoryEntry { .. }
+        | StoreRequest::RetireMemoryEntry { .. }
+        | StoreRequest::SupersedeMemoryEntry { .. } => memory::serve(backend, request).await?,
         // The three item requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-13
         // milestone 2 D1).
