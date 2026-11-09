@@ -63,20 +63,20 @@ use crate::model::{
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
     MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
     MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType,
-    PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
-    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    Note, OpenPermission, OwnerDocument, PermissionChoice, PermissionId, PermissionStatus, Persona,
+    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectType, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId,
+    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::prompt::settings::{Rungs, SettingKey, validate};
@@ -345,6 +345,27 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>>;
+
+    // ---- MOD-147 M1 ----
+
+    /// The workspace's scope row (MOD-147 D1): the one `project` with `owner_workspace_id =
+    /// workspace`. `None` for an unknown workspace, and on the mirror for one whose scope row is
+    /// not mirrored yet (the store worker adds it to the refresher's projects). Mirrored, so every
+    /// backend answers.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>>;
+
+    /// The project's owner documents (`item_id IS NULL`, MOD-147 D2), every version, bodies
+    /// included, in `(kind bytes, version)` order; empty for an unknown project. Item documents
+    /// never appear here, and owner documents never appear in [`documents`](Self::documents),
+    /// [`document`](Self::document), [`documents_of_kinds`](Self::documents_of_kinds) or
+    /// [`resolve_inputs`](Self::resolve_inputs).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>>;
 }
 
 /// Everything a write path needs.
@@ -744,15 +765,19 @@ pub trait WriteStore: ReadStore {
 
     // workspace
 
-    /// Inserts a workspace; the returned row carries the store's clock, not the caller's.
+    /// Inserts a workspace **and its scope row** (MOD-147: `@<slug>`, type `workspace`, the
+    /// `WS` seed — one kind, one graph, two phases, two edges, ten templates) in one transaction;
+    /// the returned row carries the store's clock, not the caller's.
     ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken or
-    /// `created_by` names no user.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken (or
+    /// its scope row's `@<slug>` is) or `created_by` names no user; nothing is written then.
     async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace>;
 
     /// Edits `slug` / `name` / `description` when the row's `updated_at` still equals `expected`;
-    /// `Stale` carries the row as it is now so the editor can reload (D3).
+    /// `Stale` carries the row as it is now so the editor can reload (D3). A `slug`/`name` edit
+    /// renames the scope row (`@<slug>`, the workspace's name) in the same transaction (MOD-147
+    /// D7).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
@@ -777,8 +802,10 @@ pub trait WriteStore: ReadStore {
     /// `updated_at`, so no CAS).
     ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names no
-    /// row.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`scope_row_joins_no_workspace`], MOD-147 D4) when the project is a scope row, judged
+    /// first; [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names
+    /// no row.
     async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()>;
 
     /// Removes one link; the project survives (D4).
@@ -820,6 +847,8 @@ pub trait WriteStore: ReadStore {
     /// `DEFAULT_TEMPLATES` at version 1 (M2 D4). `item_key_counter` is not seeded.
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`project_slug_refusal`], MOD-147 D3) when `slug` starts with `@`, judged first;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken or
     /// `created_by` names no user; either way nothing is written.
     async fn create_project(&self, new: NewProject) -> Result<Project>;
@@ -828,8 +857,11 @@ pub trait WriteStore: ReadStore {
     /// [`set_setting`](Self::set_setting)'s).
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`project_slug_refusal`], MOD-147 D3) when a `slug` patch starts with `@`, judged first;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `slug` collision.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `slug` collision, or
+    /// on any `slug` patch of a scope row (its slug follows its workspace's).
     async fn update_project(
         &self,
         id: ProjectId,
@@ -1407,22 +1439,31 @@ pub trait WriteStore: ReadStore {
     /// The backend's own failures only.
     async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>>;
 
-    /// Removes a workspace, its links and its box paths; projects survive
-    /// (`0001_init.sql:162,174`). Its graphs go with it (MOD-137 D3).
+    /// Removes a workspace, its links and its box paths; member projects survive
+    /// (`0001_init.sql:162,174`). Its graphs go with it (MOD-137 D3), and so do its scope row and
+    /// everything the scope row owns (MOD-147 A1), counted in the returned reach as
+    /// [`delete_reach`](Self::delete_reach) counts them.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// ([`workspace_graph_is_held`], MOD-138 A3) while a kind's `default_graph_id` or an item's
     /// `step_graph_id` names one of its graphs, naming the first holder in (graph name bytes,
-    /// holder bytes, project slug bytes) order; nothing is deleted then.
+    /// holder bytes, project slug bytes) order;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`workspace_has_live_run`], MOD-147 A1) while a run of its scope row is live
+    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped). Nothing is
+    /// deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
     /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts
     /// it took. The mirror rebuild is the caller's (D5).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`scope_row_is_deleted_with_its_workspace`], MOD-147 A2) for a scope row, before any
+    /// write.
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach>;
 
     // ---- ANA-2 §8: graph runs (MOD-4 milestone 1) --------------------------------------------
@@ -1849,6 +1890,17 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a duplicate id or an
     /// unknown `produced_by_step_id` / `created_by`.
     async fn write_document(&self, new: NewDocument) -> Result<Document>;
+
+    /// Inserts an owner document at `max(version) + 1` for `(project, kind)` among the project's
+    /// owner documents, under the project's row lock (MOD-147 D2), so two writers cannot allocate
+    /// one version. An item document of the same kind does not move the count, nor this one the
+    /// item's.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "project" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a duplicate id (any
+    /// document) or an unknown `created_by`.
+    async fn write_owner_document(&self, new: NewOwnerDocument) -> Result<OwnerDocument>;
 
     /// §4.8's promotion, one transaction over the step and its run: the step
     /// `failed | awaiting_approval -> awaiting_approval` with `promoted_at = at`; its run
@@ -3270,6 +3322,65 @@ pub fn workspace_graph_is_held(graph: &str, holder: &str, project: &str) -> Stri
     )
 }
 
+// ---- MOD-147 M1: the workspace scope row's refusals (plan D3, D4; amendments A1, A2) ----
+
+/// MOD-147 D3: a user project's slug may not start with `@`.
+#[must_use]
+pub fn project_slug_is_reserved(slug: &str) -> String {
+    format!("project.slug `{slug}` starts with `@`, which is reserved for a workspace's scope row")
+}
+
+/// MOD-147 D3: [`project_slug_is_reserved`] when `slug` starts with `@`, else `None`. Both stores
+/// judge it before any read, on create and on a slug patch, so they refuse in the same words.
+#[must_use]
+pub fn project_slug_refusal(slug: &str) -> Option<String> {
+    crate::seed::is_scope_row_slug(slug).then(|| project_slug_is_reserved(slug))
+}
+
+/// MOD-147 D3: a slug patch on a scope row, in both stores' words (R1 L7: Postgres reads the row
+/// first; its `chk_project_scope_slug` is only the backstop).
+#[must_use]
+pub fn scope_row_slug_is_fixed(slug: &str) -> String {
+    format!(
+        "project `{slug}` is a workspace's scope row; its slug follows the workspace's, so rename \
+         the workspace"
+    )
+}
+
+/// MOD-147 D4: `upsert_workspace_project` on a scope row.
+#[must_use]
+pub fn scope_row_joins_no_workspace(slug: &str) -> String {
+    format!("project `{slug}` is a workspace's own scope row and joins no workspace")
+}
+
+/// MOD-147 A1: `delete_workspace` while `runs` (≥ 1) of its scope row's runs are live
+/// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
+/// Everything else the scope row owns cascades and is counted. The advice is "finish or cancel",
+/// never "stop": a `stopped` run is live too, so stopping cannot clear the refusal (a stopped run
+/// is resumed first, then finishes or is cancelled).
+#[must_use]
+pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
+    let (noun, pronoun) = if runs == 1 {
+        ("run", "it")
+    } else {
+        ("runs", "them")
+    };
+    format!(
+        "workspace `{workspace}` has {runs} live {noun}; finish or cancel {pronoun} before \
+         deleting the workspace"
+    )
+}
+
+/// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
+/// the scope row goes only with its workspace.
+#[must_use]
+pub fn scope_row_is_deleted_with_its_workspace(slug: &str) -> String {
+    let workspace = slug.strip_prefix('@').unwrap_or(slug);
+    format!(
+        "project `{slug}` is workspace `{workspace}`'s own scope row; delete the workspace instead"
+    )
+}
+
 // ---- MOD-138 M2: the readiness walker's refusals (plan D4; blueprint §1.2) ----
 
 /// MOD-138 M2 D4 (W4): an `if` edge's predicate is outside the closed set
@@ -3626,7 +3737,8 @@ pub enum ParkOutcome {
 /// What [`WriteStore::delete_reach`] counts for (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteTarget {
-    /// A workspace: its links and its box paths, and no project.
+    /// A workspace: its links and its box paths, plus its scope row's whole project reach
+    /// (MOD-147 A1); no member project.
     Workspace(WorkspaceId),
     /// A project: the whole `ON DELETE CASCADE` chain of PRD D13.
     Project(ProjectId),
@@ -3637,7 +3749,8 @@ pub enum DeleteTarget {
 ///
 /// One struct rather than a method per table, so a table `0003` adds is a field here and the two
 /// callers of the counting code cannot disagree about it. A workspace delete fills
-/// `workspace_links` and `workspace_box_paths` only. `phase_agents` is counted on both stores
+/// `workspace_links` and `workspace_box_paths`, plus its scope row's project reach added field by
+/// field ([`Add`](std::ops::Add), MOD-147 A1). `phase_agents` is counted on both stores
 /// since MOD-37 R-6 gave `MemStore` the table, and is `0` on the demo fixture, which seeds none;
 /// `run_step_commits`, `run_step_trees` and `command_runs` are counted on both since MOD-4.
 /// MOD-38's six requirement fields are counted on both stores. MOD-163's two memory fields are
@@ -3710,6 +3823,79 @@ pub struct DeleteReach {
     pub memory_entries: u64,
     /// `memory_entry_revision` rows of those entries.
     pub memory_revisions: u64,
+}
+
+/// Field-wise sum (MOD-147 A1): a workspace's reach is its own part plus its scope row's project
+/// reach. Destructured exhaustively, so a field added above cannot be left out of the sum.
+impl std::ops::Add for DeleteReach {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        let Self {
+            workspace_links,
+            workspace_box_paths,
+            items,
+            item_key_counters,
+            item_kinds,
+            step_graphs,
+            phases,
+            phase_agents,
+            prompt_templates,
+            repos,
+            repo_box_paths,
+            skill_bindings,
+            runs,
+            run_steps,
+            session_events,
+            run_step_commits,
+            run_step_trees,
+            command_runs,
+            notes,
+            revisions,
+            links,
+            documents,
+            requirement_specs,
+            requirement_areas,
+            requirement_key_counters,
+            requirements,
+            requirement_revisions,
+            item_requirements,
+            memory_entries,
+            memory_revisions,
+        } = self;
+        Self {
+            workspace_links: workspace_links + other.workspace_links,
+            workspace_box_paths: workspace_box_paths + other.workspace_box_paths,
+            items: items + other.items,
+            item_key_counters: item_key_counters + other.item_key_counters,
+            item_kinds: item_kinds + other.item_kinds,
+            step_graphs: step_graphs + other.step_graphs,
+            phases: phases + other.phases,
+            phase_agents: phase_agents + other.phase_agents,
+            prompt_templates: prompt_templates + other.prompt_templates,
+            repos: repos + other.repos,
+            repo_box_paths: repo_box_paths + other.repo_box_paths,
+            skill_bindings: skill_bindings + other.skill_bindings,
+            runs: runs + other.runs,
+            run_steps: run_steps + other.run_steps,
+            session_events: session_events + other.session_events,
+            run_step_commits: run_step_commits + other.run_step_commits,
+            run_step_trees: run_step_trees + other.run_step_trees,
+            command_runs: command_runs + other.command_runs,
+            notes: notes + other.notes,
+            revisions: revisions + other.revisions,
+            links: links + other.links,
+            documents: documents + other.documents,
+            requirement_specs: requirement_specs + other.requirement_specs,
+            requirement_areas: requirement_areas + other.requirement_areas,
+            requirement_key_counters: requirement_key_counters + other.requirement_key_counters,
+            requirements: requirements + other.requirements,
+            requirement_revisions: requirement_revisions + other.requirement_revisions,
+            item_requirements: item_requirements + other.item_requirements,
+            memory_entries: memory_entries + other.memory_entries,
+            memory_revisions: memory_revisions + other.memory_revisions,
+        }
+    }
 }
 
 /// Where a setting lives (D8): an `app_setting` row, one key of `project.settings`, or
@@ -3866,7 +4052,10 @@ pub fn queue_token_refusal(
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_RUN_STATUSES, not_startable, startable};
+    use super::{
+        LIVE_RUN_STATUSES, not_startable, project_slug_is_reserved, project_slug_refusal,
+        scope_row_is_deleted_with_its_workspace, startable, workspace_has_live_run,
+    };
     use crate::model::{ItemState, RunStatus, Status};
     use crate::store::StoreError;
 
@@ -3912,5 +4101,39 @@ mod tests {
             );
             assert_eq!(refusal(Status::Closed, live), "item HTUI-1 is `closed`");
         }
+    }
+
+    /// MOD-147 A1: the refusal counts the live runs, `1 live run` / `2 live runs`, and never
+    /// says "stop": a `stopped` run is live too (R1 M2), so stopping it cannot clear the refusal.
+    #[test]
+    fn workspace_has_live_run_counts_runs() {
+        assert_eq!(
+            workspace_has_live_run("shop", 1),
+            "workspace `shop` has 1 live run; finish or cancel it before deleting the workspace"
+        );
+        assert_eq!(
+            workspace_has_live_run("shop", 3),
+            "workspace `shop` has 3 live runs; finish or cancel them before deleting the \
+             workspace"
+        );
+    }
+
+    /// MOD-147 D3 / A2: the reserved-slug judge refuses only the scope-row form, and the
+    /// scope-row delete names both rows.
+    #[test]
+    fn scope_row_sentences_name_the_rows() {
+        assert_eq!(project_slug_refusal("ops"), None);
+        assert_eq!(
+            project_slug_refusal("@ops"),
+            Some(project_slug_is_reserved("@ops"))
+        );
+        assert_eq!(
+            project_slug_is_reserved("@ops"),
+            "project.slug `@ops` starts with `@`, which is reserved for a workspace's scope row"
+        );
+        assert_eq!(
+            scope_row_is_deleted_with_its_workspace("@shop"),
+            "project `@shop` is workspace `shop`'s own scope row; delete the workspace instead"
+        );
     }
 }

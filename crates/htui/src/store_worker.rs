@@ -2914,6 +2914,42 @@ async fn on_run_served(
     }
 }
 
+/// The projects the cache refresher follows for an `Items` read of `scope` (plan D9): the scope's
+/// own, then the workspace's scope row (MOD-147 D1), which joins no workspace and so is never in
+/// `scope.project_ids`.
+///
+/// The row is looked up once per workspace and remembered in `scope_rows`: a workspace's scope row
+/// never changes. The nil startup scope (`WorkspaceId::default()`, before any workspace is chosen)
+/// is not looked up at all, so it costs no round trip per read (MOD-147 M1 R1). `Ok(None)` is not
+/// remembered (an offline mirror may not hold the row yet), and a failed lookup is logged and
+/// skipped, so the read the user asked for still follows its projects.
+async fn refresher_projects(
+    backend: &Backend,
+    scope: &Scope,
+    scope_rows: &mut BTreeMap<WorkspaceId, ProjectId>,
+) -> Vec<ProjectId> {
+    let mut ids = scope.project_ids.clone();
+    if scope.workspace_id.as_uuid().is_nil() {
+        return ids;
+    }
+    let row = match scope_rows.get(&scope.workspace_id) {
+        Some(row) => Some(*row),
+        None => match backend.scope_project(scope.workspace_id).await {
+            Ok(Some(row)) => {
+                scope_rows.insert(scope.workspace_id, row);
+                Some(row)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "the workspace's scope row was not read; the refresher follows its projects alone");
+                None
+            }
+        },
+    };
+    ids.extend(row.filter(|row| !ids.contains(row)));
+    ids
+}
+
 /// [`spawn_with`] over a chosen [`RunRuntime`] too (plan D153): the orchestrator's runtime lives
 /// inside this loop beside the chat one, for the same reason.
 ///
@@ -3010,6 +3046,8 @@ pub(crate) fn spawn_with_concepts(
             tokio::time::interval_at(tokio::time::Instant::now() + box_heartbeat, box_heartbeat);
         box_beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut beat: Option<tokio::task::JoinHandle<()>> = None;
+        // MOD-147 D1: each workspace's scope row, once a read has named it ([`refresher_projects`]).
+        let mut scope_rows: BTreeMap<WorkspaceId, ProjectId> = BTreeMap::new();
 
         loop {
             // MOD-11 B-2 (H-10): the backend this iteration serves is the one a tool session
@@ -3033,8 +3071,16 @@ pub(crate) fn spawn_with_concepts(
                     // Publish the scope so the refresher follows what the user is looking at
                     // (plan D9). On every `Items` request, not only on a change: the send is a
                     // pointer swap and a missed update mirrors the wrong project.
+                    // MOD-147 D1: with the workspace's scope row, so its kinds, items and owner
+                    // documents are mirrored too; `Scope` itself never carries it.
                     if let StoreRequest::Items { scope, .. } = &envelope.request {
-                        projects.send_replace(scope.project_ids.clone());
+                        projects.send_replace(
+                            refresher_projects(&backend, scope, &mut scope_rows).await,
+                        );
+                    }
+                    // A deleted workspace's scope row went with it; forget it.
+                    if let StoreRequest::DeleteWorkspace(id) = &envelope.request {
+                        scope_rows.remove(id);
                     }
 
                     let reply = match &envelope.request {
@@ -4863,9 +4909,33 @@ mod tests {
         assert!(matches!(reply, StoreReply::Items(_)));
         assert_eq!(
             *scope_rx.borrow(),
-            scope.project_ids,
-            "the refresher follows what the user is looking at (plan D9)"
+            vec![
+                ids::PROJECT_HTUI,
+                ids::PROJECT_AGY,
+                ids::PROJECT_SCOPE_PLATFORM
+            ],
+            "the refresher follows what the user is looking at (plan D9), and the workspace's \
+             scope row with it (MOD-147 D1)"
         );
+
+        // A workspace with no scope row (none yet in the mirror, or none at all) publishes its
+        // projects alone; a later read asks again rather than remembering the absence.
+        let rowless = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let reply = round_trip(
+            &req_tx,
+            &mut rep_rx,
+            StoreRequest::Items {
+                scope: rowless.clone(),
+                filter: ItemFilter::default(),
+                ready_here: false,
+            },
+        )
+        .await;
+        assert!(matches!(reply, StoreReply::Items(_)));
+        assert_eq!(*scope_rx.borrow(), rowless.project_ids);
 
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
@@ -6930,5 +7000,49 @@ mod tests {
             }
             other => panic!("a check with no runtime is refused, not served: {other:?}"),
         }
+    }
+
+    /// MOD-147 M1 R1 (L9): the nil startup scope (`WorkspaceId::default()`, no workspace yet) is
+    /// never looked up: a store that does hold a scope row under the nil id is not asked, so the
+    /// refresher follows the scope's own projects and remembers nothing. A real workspace's scope
+    /// row is still followed, and remembered.
+    #[tokio::test]
+    async fn refresher_projects_skips_the_nil_startup_scope() {
+        let store = MemStore::demo();
+        store
+            .create_workspace(htui_core::model::NewWorkspace {
+                id: WorkspaceId::default(),
+                slug: "nil".to_owned(),
+                name: "Nil".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a workspace under the nil id, so a lookup would find a scope row");
+        let backend = Backend::memory(store);
+        let mut scope_rows = BTreeMap::new();
+
+        let startup = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        assert_eq!(
+            refresher_projects(&backend, &startup, &mut scope_rows).await,
+            Vec::<ProjectId>::new(),
+            "the nil scope follows nothing"
+        );
+        assert!(scope_rows.is_empty(), "and remembers nothing");
+
+        let platform = platform_scope(&backend).await;
+        let mut expected = platform.project_ids.clone();
+        expected.push(ids::PROJECT_SCOPE_PLATFORM);
+        assert_eq!(
+            refresher_projects(&backend, &platform, &mut scope_rows).await,
+            expected
+        );
+        assert_eq!(
+            scope_rows.get(&ids::WORKSPACE_PLATFORM),
+            Some(&ids::PROJECT_SCOPE_PLATFORM)
+        );
     }
 }

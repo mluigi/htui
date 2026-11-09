@@ -143,7 +143,11 @@ async fn a_pass_mirrors_the_demo_projects() {
         return;
     };
     let cache = open_cache(&db).await;
-    let report = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+    // MOD-147 D1: the two workspaces' scope rows are projects too, and the store worker adds a
+    // workspace's to the projects it hands the refresher, so "everything" names all five.
+    let mut everything = all_projects();
+    everything.extend([ids::PROJECT_SCOPE_PLATFORM, ids::PROJECT_SCOPE_GRAPHICS]);
+    let report = run_pass(&db.pool, &cache, &everything, &settings(&db, 20))
         .await
         .expect("one pass");
 
@@ -1679,10 +1683,11 @@ async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
         let pool = db.pool.clone();
         async move {
             sqlx::query(
-                "INSERT INTO document (item_id, kind, version, title, body, \
+                "INSERT INTO document (project_id, item_id, kind, version, title, body, \
                                        produced_by_step_id, created_by) \
-                 VALUES ($1, 'research', $2, $3, 'body', $4, $5) RETURNING id",
+                 VALUES ($1, $2, 'research', $3, $4, 'body', $5, $6) RETURNING id",
             )
+            .bind(ids::PROJECT_HTUI.as_uuid())
             .bind(ids::HTUI_ANA_1.as_uuid())
             .bind(version)
             .bind(format!("research v{version}"))
@@ -1750,11 +1755,12 @@ async fn plant_mirrored_document(
 ) -> DocumentId {
     let id = DocumentId::new();
     sqlx::query(
-        "INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id, \
-                               created_by, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'body', ?, ?, 0)",
+        "INSERT INTO document (id, project_id, item_id, kind, version, title, body, \
+                               produced_by_step_id, created_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'body', ?, ?, 0)",
     )
     .bind(id.as_uuid().to_string())
+    .bind(ids::PROJECT_HTUI.as_uuid().to_string())
     .bind(ids::HTUI_ANA_1.as_uuid().to_string())
     .bind(kind)
     .bind(version)
@@ -3089,4 +3095,151 @@ async fn a_week_old_full_refresh_clears_the_cursors_without_a_rebuild() {
     );
 
     teardown(db, &[&reopened]).await;
+}
+
+/// MOD-147 (plan D1, D2): a scope row mirrors like any project once the refresher is given it —
+/// its row with `owner_workspace_id`, its `WS` kind, an item minted on it and its owner documents —
+/// and the mirror answers `scope_project`, `owner_documents` and `items` as Postgres does, while
+/// `document(owner)` stays `None` and `workspaces()` still lists no scope row.
+#[tokio::test]
+async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let scope = ids::PROJECT_SCOPE_PLATFORM;
+
+    let item = db
+        .store
+        .mint_item(htui_core::model::NewItem {
+            id: htui_core::model::ItemId::new(),
+            project_id: scope,
+            kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+            title: "Spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("mint WS-1 on the scope row");
+    assert_eq!(item.key, "WS-1");
+    let owner = db
+        .store
+        .write_owner_document(htui_core::model::NewOwnerDocument {
+            id: DocumentId::new(),
+            project_id: scope,
+            kind: "goals".to_owned(),
+            title: "Goals".to_owned(),
+            body: "Ship it.".to_owned(),
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("write an owner document on the scope row");
+
+    let mut projects = all_projects();
+    projects.push(scope);
+    run_pass(&db.pool, &cache, &projects, &settings(&db, 20))
+        .await
+        .expect("one pass over the demo projects and the scope row");
+
+    assert_eq!(
+        cache
+            .scope_project(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("cache scope_project"),
+        Some(scope),
+        "the mirror names Platform's scope row"
+    );
+    let mirrored = cache
+        .project(scope)
+        .await
+        .expect("cache project")
+        .expect("the scope row is mirrored");
+    assert_eq!(mirrored.owner_workspace_id, Some(ids::WORKSPACE_PLATFORM));
+    assert_eq!(
+        Some(mirrored),
+        db.store.project(scope).await.expect("pg project"),
+        "the two backends project the scope row alike"
+    );
+    let mirrored_docs = cache
+        .owner_documents(scope)
+        .await
+        .expect("cache owner_documents");
+    assert_eq!(
+        mirrored_docs,
+        db.store
+            .owner_documents(scope)
+            .await
+            .expect("pg owner_documents"),
+        "owner documents come off the mirror as Postgres has them"
+    );
+    assert_eq!(
+        mirrored_docs.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        [owner.id]
+    );
+    assert_eq!(
+        cache.document(owner.id).await.expect("cache document"),
+        None,
+        "an owner document is never an item document"
+    );
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM item_kind WHERE project_id = ?")
+            .bind(scope.as_uuid().to_string())
+            .fetch_all(cache.pool())
+            .await
+            .expect("read the mirrored kinds");
+    assert_eq!(kinds, ["WS"], "the scope row's one kind is mirrored");
+    let scope_items = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![scope],
+    };
+    let items = cache
+        .items(&scope_items, &ItemFilter::default())
+        .await
+        .expect("cache items");
+    assert_eq!(
+        items.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+        ["WS-1"],
+        "the scope row's item is mirrored"
+    );
+    let platform = cache
+        .workspaces()
+        .await
+        .expect("cache workspaces")
+        .into_iter()
+        .find(|ws| ws.workspace_id == ids::WORKSPACE_PLATFORM)
+        .expect("Platform is mirrored");
+    assert!(
+        platform
+            .projects
+            .iter()
+            .all(|project| project.project_id != scope),
+        "the mirror's workspaces() lists no scope row: {:?}",
+        platform.projects
+    );
+    let asked = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY, scope],
+    };
+    let listed = cache.projects(&asked).await.expect("cache projects");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "the mirror's projects() over a scope naming the scope row lists members only"
+    );
+    assert_eq!(
+        listed,
+        db.store.projects(&asked).await.expect("pg projects"),
+        "the two backends list a scope's projects alike"
+    );
+
+    teardown(db, &[&cache]).await;
 }

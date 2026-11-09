@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO document (id, project_id, item_id, kind, version, title, body, produced_by_step_id, created_by, created_at) VALUES ($1, (SELECT project_id FROM item WHERE id = $2), $2, $3, $4, $5, $6, $7, $8, $9)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5dc7f33fc94851213adaebdf17ae9a1961f112e9d12ce177880a3c0fa32654af"
+}

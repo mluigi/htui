@@ -763,6 +763,15 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
     ) -> StoreResult<Option<Vec<MemoryRevision>>> {
         self.inner.memory_revisions(id).await
     }
+    async fn scope_project(&self, workspace: WorkspaceId) -> StoreResult<Option<ProjectId>> {
+        self.inner.scope_project(workspace).await
+    }
+    async fn owner_documents(
+        &self,
+        project: ProjectId,
+    ) -> StoreResult<Vec<htui_core::model::OwnerDocument>> {
+        self.inner.owner_documents(project).await
+    }
 }
 
 impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
@@ -1338,6 +1347,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn write_document(&self, new: NewDocument) -> StoreResult<Document> {
         self.inner.write_document(new).await
+    }
+    async fn write_owner_document(
+        &self,
+        new: htui_core::model::NewOwnerDocument,
+    ) -> StoreResult<htui_core::model::OwnerDocument> {
+        self.inner.write_owner_document(new).await
     }
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> StoreResult<()> {
         self.inner.promote_step(step, at).await

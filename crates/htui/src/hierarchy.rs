@@ -14,7 +14,7 @@ use chrono::Utc;
 use htui_core::model::{
     BoxId, NewProject, NewRepo, NewWorkspace, Project, ProjectId, ProjectPatch, ProjectRef, Repo,
     RepoBoxPath, RepoId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
-    WorkspaceSummary,
+    WorkspaceSummary, workspace_folder,
 };
 use htui_core::root_path::canonical_root;
 use htui_core::store::{
@@ -39,8 +39,10 @@ use crate::ui::kit::label::plural;
 pub struct HierarchySnapshot {
     /// The workspace row itself; `updated_at` is the CAS token an editor opens on.
     pub workspace: Workspace,
-    /// This box's root path for the workspace, when a row exists. Other boxes' rows are dropped.
-    pub root_path: Option<WorkspaceBoxPath>,
+    /// This box's `workspace_box_path` row for the workspace, when one exists (MOD-147 D8: its
+    /// `folder_path`). Other boxes' rows are dropped. With none, the folder defaults to
+    /// `<home>/workspaces/<slug>` ([`workspace_root`]).
+    pub folder_path: Option<WorkspaceBoxPath>,
     /// The workspace's projects, ordered by `workspace_project.position`.
     pub projects: Vec<ProjectEntry>,
 }
@@ -76,9 +78,6 @@ pub enum MirrorAfterDelete {
     Rebuilt,
     /// There is no mirror on this backend (`Backend::Memory`).
     NoMirror,
-    /// A workspace delete: `workspace` and `workspace_project` are full-table replaced on every
-    /// refresh pass, so nothing stale can survive one.
-    NotNeeded,
     /// The rebuild failed; the delete still happened.
     Failed(String),
 }
@@ -166,6 +165,20 @@ impl HierarchySnapshot {
     }
 }
 
+/// MOD-147 D8: this box's folder for the tree's workspace — the row's `folder_path`, else
+/// `<home>/workspaces/<slug>`; `None` with no row and no home, or with no row and a slug that is
+/// not one plain name ([`workspace_folder`], MOD-147 M1 R1). Not canonicalised: the caller
+/// resolves it (a row through `canonical`'s guard, as it was stored).
+#[must_use]
+pub fn workspace_root(tree: &HierarchySnapshot, home: Option<&Path>) -> Option<PathBuf> {
+    let row = tree.folder_path.as_ref();
+    match (row, home) {
+        (_, Some(home)) => workspace_folder(&tree.workspace.slug, row, home),
+        (Some(row), None) => Some(PathBuf::from(&row.folder_path)),
+        (None, None) => None,
+    }
+}
+
 /// One read of the whole tree; `None` when the workspace does not exist.
 ///
 /// N+1 reads on purpose (D5): they happen per event — activation, a scope change, after a write —
@@ -184,7 +197,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
     let Some(workspace) = store.workspace(ws).await? else {
         return Ok(None);
     };
-    let root_path = store
+    let folder_path = store
         .workspace_box_paths(ws)
         .await?
         .into_iter()
@@ -213,7 +226,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 
     Ok(Some(HierarchySnapshot {
         workspace,
-        root_path,
+        folder_path,
         projects,
     }))
 }
@@ -233,6 +246,20 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 /// the hierarchy variants below here, so it is unreachable from the shell, and a caller that
 /// reached it anyway is better told which request it sent than killed.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
+    serve_with_home(backend, request, dirs::home_dir().as_deref()).await
+}
+
+/// [`serve`] with the home directory a test chooses (MOD-147 V10), so no test reads the real
+/// `~/workspaces`; `serve` passes `dirs::home_dir()`. Only `InferRepoPaths` reads it, for the
+/// default workspace folder (D8).
+///
+/// # Errors
+/// As [`serve`].
+pub async fn serve_with_home(
+    backend: &Backend,
+    request: &StoreRequest,
+    home: Option<&Path>,
+) -> Result<StoreReply> {
     let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
@@ -278,12 +305,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // whatever the path says — paying `canonical`'s `spawn_blocking` stat to answer with
             // the *path's* refusal would both cost a blocking call and name the wrong problem.
             let box_id = box_id(this_box)?;
-            let root_path = canonical(path).await?;
+            let folder_path = canonical(path).await?;
             writer
                 .upsert_workspace_box_path(&WorkspaceBoxPath {
                     workspace_id: *id,
                     box_id,
-                    root_path,
+                    folder_path,
                     // The store's trigger stamps the column; nothing here sets `updated_at` by
                     // hand, and the value passed in is overwritten on both backends.
                     updated_at: Utc::now(),
@@ -417,32 +444,26 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         StoreRequest::DeleteReach(target) => Ok(StoreReply::DeleteReach(
             writer.delete_reach(*target).await?.map(Box::new),
         )),
-        StoreRequest::DeleteWorkspace(id) => Ok(StoreReply::Deleted {
-            target: DeleteTarget::Workspace(*id),
-            reach: Box::new(writer.delete_workspace(*id).await?),
-            // `workspace` and `workspace_project` are full-table replaced on every refresh pass,
-            // so the mirror cannot serve a workspace this just removed (D10).
-            mirror: MirrorAfterDelete::NotNeeded,
-        }),
+        StoreRequest::DeleteWorkspace(id) => {
+            let reach = writer.delete_workspace(*id).await?;
+            // The workspace takes its scope row with it (MOD-147 A1): a project, with its kinds,
+            // templates, items and documents, all in per-project mirror tables that no refresh
+            // pass empties. So the mirror is rebuilt exactly as for `DeleteProject` (D10).
+            Ok(StoreReply::Deleted {
+                target: DeleteTarget::Workspace(*id),
+                reach: Box::new(reach),
+                mirror: rebuild_mirror(backend).await,
+            })
+        }
         StoreRequest::DeleteProject(id) => {
             let reach = writer.delete_project(*id).await?;
-            // The rows are gone before this line, so a failed rebuild is reported *inside* a
-            // successful reply rather than turning the delete into a `Failed` that claims nothing
-            // happened.
-            let mirror = match backend.cache() {
-                Some(cache) => match cache.rebuild().await {
-                    Ok(()) => MirrorAfterDelete::Rebuilt,
-                    Err(err) => MirrorAfterDelete::Failed(err.to_string()),
-                },
-                None => MirrorAfterDelete::NoMirror,
-            };
             Ok(StoreReply::Deleted {
                 target: DeleteTarget::Project(*id),
                 reach: Box::new(reach),
-                mirror,
+                mirror: rebuild_mirror(backend).await,
             })
         }
-        StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box).await,
+        StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box, home).await,
         other => Err(StoreError::Backend(format!(
             "not a hierarchy request: {}",
             other.name()
@@ -527,6 +548,20 @@ async fn canonical(path: &str) -> Result<String> {
     })
 }
 
+/// Rebuilds the mirror after a delete whose rows the refresher cannot drop (D10).
+///
+/// The rows are gone before this runs, so a failed rebuild is reported *inside* a successful
+/// reply rather than turning the delete into a `Failed` that claims nothing happened.
+async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
+    match backend.cache() {
+        Some(cache) => match cache.rebuild().await {
+            Ok(()) => MirrorAfterDelete::Rebuilt,
+            Err(err) => MirrorAfterDelete::Failed(err.to_string()),
+        },
+        None => MirrorAfterDelete::NoMirror,
+    }
+}
+
 /// Which workspace a project belongs to.
 ///
 /// The seam has **no reverse reader** — no `workspace_of(project)` and no `repo(id)` — so this
@@ -534,50 +569,79 @@ async fn canonical(path: &str) -> Result<String> {
 /// `ProjectRef`s. A project linked into two workspaces resolves to the first by name; the section
 /// always passes the scope's own workspace for the requests where that would be visible, so the
 /// ambiguity only ever picks which tree a reply re-reads.
+///
+/// A workspace's scope row joins no workspace (MOD-147), so it is in no `ProjectRef` list: with no
+/// membership match, the project's own `owner_workspace_id` answers (D9).
 async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<WorkspaceId> {
-    backend
+    let member = backend
         .workspaces()
         .await?
         .into_iter()
         .find(|summary| summary.projects.iter().any(|row| row.project_id == project))
-        .map(|summary| summary.workspace_id)
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "workspace_project",
-            id: project.to_string(),
-        })
+        .map(|summary| summary.workspace_id);
+    let owner = match member {
+        Some(ws) => Some(ws),
+        None => backend
+            .project(project)
+            .await?
+            .and_then(|row| row.owner_workspace_id),
+    };
+    owner.ok_or_else(|| StoreError::NotFound {
+        entity: "workspace_project",
+        id: project.to_string(),
+    })
 }
 
 /// `InferRepoPaths` (MOD-7 milestone 4, PRD D5, plan D114, D116, D124): this box's filesystem,
 /// this box's rows, this workspace only.
 ///
 /// The box first, then the tree, then this box's root, canonicalised (a legacy link row walks its
-/// target). With no root, the answer is `root: None` and nothing is walked. With every repo
-/// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
-/// then per repo without a row, in tree order: `choose` against the paths already held on this
-/// box (each row as stored and as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
-/// for every later repo. A truncated scan infers nothing. The reply is the re-read tree and the
-/// report.
+/// target): the row's `folder_path`, else the default `<home>/workspaces/<slug>` (MOD-147 D8,
+/// [`workspace_root`]). With no root — no row and no home, no row and a slug that is not one plain
+/// name, or a default folder that does not resolve — the answer is `root: None` and nothing is
+/// walked; a *row* that no longer resolves is still refused. With every repo already set, nothing
+/// is walked either. Otherwise one `find_checkouts` under `spawn_blocking`, then per repo without a
+/// row, in tree order: `choose` against the paths already held on this box (each row as stored and
+/// as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass
+/// writes is held for every later repo. A truncated scan infers nothing. The reply is the re-read
+/// tree and the report.
 async fn infer(
     backend: &Backend,
     writer: &Writer,
     ws: WorkspaceId,
     this_box: Option<BoxId>,
+    home: Option<&Path>,
 ) -> Result<StoreReply> {
     let box_id = box_id(this_box)?;
     let tree = fresh_tree(writer, ws, this_box).await?;
-    let Some(root_row) = &tree.root_path else {
-        return Ok(StoreReply::RepoPathsInferred {
-            tree: Box::new(tree),
-            report: InferReport {
-                root: None,
-                truncated: false,
-                repos: Vec::new(),
-            },
-        });
+    let no_root = |tree: HierarchySnapshot| StoreReply::RepoPathsInferred {
+        tree: Box::new(tree),
+        report: InferReport {
+            root: None,
+            truncated: false,
+            repos: Vec::new(),
+        },
     };
-    // A root that no longer resolves is a `Constraint`, which the status line reads as
-    // `infer_repo_paths: constraint violated: …`.
-    let root = canonical(&root_row.root_path).await?;
+    let root = match &tree.folder_path {
+        // A root that no longer resolves is a `Constraint`, which the status line reads as
+        // `infer_repo_paths: constraint violated: …`.
+        Some(row) => canonical(&row.folder_path).await?,
+        // MOD-147 D8: the default folder. Absent (or not a usable directory) is the ordinary
+        // state of a box rather than an error: nothing is walked.
+        None => {
+            let Some(folder) = workspace_root(&tree, home) else {
+                return Ok(no_root(tree));
+            };
+            let Some(folder) = folder.to_str() else {
+                return Ok(no_root(tree));
+            };
+            match canonical(folder).await {
+                Ok(root) => root,
+                Err(StoreError::Constraint(_)) => return Ok(no_root(tree)),
+                Err(err) => return Err(err),
+            }
+        }
+    };
 
     let entries: Vec<&RepoEntry> = tree
         .projects
@@ -832,12 +896,17 @@ mod tests {
 
     use chrono::Utc;
     use htui_core::fixtures::ids;
-    use htui_core::model::{BoxId, RepoBoxPath};
+    use std::path::{Path, PathBuf};
+
+    use htui_core::model::{BoxId, RepoBoxPath, WorkspaceBoxPath};
     use htui_core::store::{DeleteReach, MemStore, StoreError, WriteStore};
     use htui_orch::infer::Checkout;
     use htui_store::Backend;
 
-    use super::{InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals};
+    use super::{
+        InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals, snapshot,
+        workspace_root,
+    };
     use crate::store_worker::{StoreRequest, serve};
 
     /// A path write on a box with no row is refused by name rather than stored under a nil id.
@@ -925,6 +994,42 @@ mod tests {
             vec![typed.as_str()],
             "the manual row is untouched"
         );
+    }
+
+    /// MOD-147 D8: this box's row wins; without one the folder is `<home>/workspaces/<slug>`, and
+    /// with neither there is none.
+    #[tokio::test]
+    async fn workspace_root_prefers_the_row_then_the_default_under_home() {
+        let store = MemStore::demo();
+        let mut tree = snapshot(&store, ids::WORKSPACE_GRAPHICS, Some(ids::BOX))
+            .await
+            .expect("the store answers")
+            .expect("the demo has Graphics");
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            workspace_root(&tree, Some(home)),
+            Some(PathBuf::from("/home/someone/workspaces/graphics"))
+        );
+        assert_eq!(workspace_root(&tree, None), None);
+
+        // R1 M1: a slug that is not one plain name never becomes a folder — no escape from
+        // `<home>/workspaces`, and `infer` then walks nothing.
+        let slug = std::mem::replace(&mut tree.workspace.slug, "../escape".to_owned());
+        assert_eq!(workspace_root(&tree, Some(home)), None);
+        tree.workspace.slug = slug;
+
+        tree.folder_path = Some(WorkspaceBoxPath {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            box_id: ids::BOX,
+            folder_path: "/srv/graphics".to_owned(),
+            updated_at: Utc::now(),
+        });
+        for home in [Some(home), None] {
+            assert_eq!(
+                workspace_root(&tree, home),
+                Some(PathBuf::from("/srv/graphics"))
+            );
+        }
     }
 
     /// Zeros are dropped and what is left reads in the struct's field order, not in the order the

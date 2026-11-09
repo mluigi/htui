@@ -113,7 +113,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            25, 26
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -125,8 +125,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
          0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
-         MOD-144's 0024_item_status.sql and MOD-138 M2's 0025_run_step_branch.sql, in ordinal \
-         order"
+         MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql and MOD-147's \
+         0026_workspace_scope.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -3904,8 +3904,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(25),
-        "twenty-five embedded migrations, none applied (through MOD-138's 0025_run_step_branch.sql)"
+        MigrationState::Pending(26),
+        "twenty-six embedded migrations, none applied (through MOD-147's 0026_workspace_scope.sql)"
     );
 
     db.drop_db().await;
@@ -4005,8 +4005,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(25),
-        "twenty-five embedded migrations, through MOD-138's 0025_run_step_branch.sql"
+        MigrationState::Pending(26),
+        "twenty-six embedded migrations, through MOD-147's 0026_workspace_scope.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4014,8 +4014,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(25),
-        "every one of the twenty-five, through MOD-138's 0025_run_step_branch.sql, is pending"
+        HeadlessError::MigrationsPending(26),
+        "every one of the twenty-six, through MOD-147's 0026_workspace_scope.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4037,8 +4037,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(25),
-        "every one of the twenty-five, through MOD-138's 0025_run_step_branch.sql, is pending"
+        HeadlessError::MigrationsPending(26),
+        "every one of the twenty-six, through MOD-147's 0026_workspace_scope.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4189,9 +4189,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        25,
-        "the later applies migrate nothing: the twenty-five embedded migrations (through MOD-138's \
-         0025_run_step_branch.sql) are applied once"
+        26,
+        "the later applies migrate nothing: the twenty-six embedded migrations (through MOD-147's \
+         0026_workspace_scope.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -4939,8 +4939,8 @@ async fn load_demo_round_trips_a_count_per_table() {
 
     assert_eq!(
         data.edges.len(),
-        42,
-        "fourteen default edges per project (MOD-137 D9)"
+        46,
+        "fourteen default edges per project (MOD-137 D9), two per scope row (MOD-147 D5)"
     );
     let expected: [(&str, usize); 27] = [
         ("app_user", data.users.len()),
@@ -6118,6 +6118,551 @@ async fn uq_run_item_live_matches_run_status_is_active() {
         quoted, expected,
         "the index covers graph runs at exactly the live statuses, got {def}"
     );
+
+    db.drop_db().await;
+}
+
+/// MOD-147 milestone 1: a workspace's scope row (`owner_workspace_id`, type `workspace`, slug
+/// `@<workspace slug>`), raw-inserted the way `create_workspace` and the bootstrap write it.
+/// The result is the statement's, so a refusal can be asserted.
+async fn try_scope_row(
+    pool: &sqlx::PgPool,
+    user: uuid::Uuid,
+    workspace: uuid::Uuid,
+    slug: &str,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO project (id, slug, name, type, owner_workspace_id, created_by) \
+         VALUES ($1, $2, $2, 'workspace', $3, $4)",
+    )
+    .bind(id)
+    .bind(slug)
+    .bind(workspace)
+    .bind(user)
+    .execute(pool)
+    .await
+    .map(|_| id)
+}
+
+/// Inserts a `document` in the 0026 shape: `project_id` on every row, `item_id` only on an item
+/// document. The result is the statement's, so a refusal can be asserted.
+async fn try_document(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+    item: Option<uuid::Uuid>,
+    kind: &str,
+    version: i32,
+    user: uuid::Uuid,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO document (id, project_id, item_id, kind, version, title, body, created_by) \
+         VALUES ($1, $2, $3, $4, $5, 't', 'b', $6)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(item)
+    .bind(kind)
+    .bind(version)
+    .bind(user)
+    .execute(pool)
+    .await
+    .map(|_| id)
+}
+
+/// `(is_nullable)` of `table.column`, or `None` when the column does not exist.
+async fn column_nullable(pool: &sqlx::PgPool, table: &str, column: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT is_nullable::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|err| panic!("read {table}.{column}'s column: {err}"))
+}
+
+/// MOD-147 (plan D2, D8): 0026 backfills `document.project_id` from the item, keeps `item_id`,
+/// makes `project_id` NOT NULL and `item_id` nullable, adds `project.owner_workspace_id` and
+/// renames `workspace_box_path.root_path` to `folder_path`. It writes no scope row: those are the
+/// bootstrap's (code, `htui_core::seed`), not the migration's. Staged at v25, as on a real box.
+#[tokio::test]
+async fn migration_0026_backfills_document_project_and_keeps_item() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(25, &db.pool)
+        .await
+        .expect("apply 0001 through 0025");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod147").await;
+    insert_workspace(pool, user, "shop").await;
+    let pk = plant_project_kind(pool, user, "shop-app").await;
+    let item = plant_item(pool, pk, 1, "open", None, user).await;
+    let mut documents = Vec::new();
+    for version in [1, 2] {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO document (id, item_id, kind, version, title, body, created_by) \
+             VALUES ($1, $2, 'plan', $3, 'p', 'b', $4)",
+        )
+        .bind(id)
+        .bind(item)
+        .bind(version)
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert a v25 document v{version}: {err}"));
+        documents.push(id);
+    }
+
+    MIGRATOR.run(pool).await.expect("apply 0026");
+
+    for id in documents {
+        let (project, owner_item): (uuid::Uuid, Option<uuid::Uuid>) =
+            sqlx::query_as("SELECT project_id, item_id FROM document WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read the backfilled document");
+        assert_eq!(
+            (project, owner_item),
+            (pk.0, Some(item)),
+            "a document from before 0026 names its item's project and keeps its item"
+        );
+    }
+    for (table, column, nullable) in [
+        ("document", "project_id", "NO"),
+        ("document", "item_id", "YES"),
+        ("project", "owner_workspace_id", "YES"),
+        ("workspace_box_path", "folder_path", "NO"),
+    ] {
+        assert_eq!(
+            column_nullable(pool, table, column).await.as_deref(),
+            Some(nullable),
+            "{table}.{column} exists with is_nullable {nullable}"
+        );
+    }
+    assert_eq!(
+        column_nullable(pool, "workspace_box_path", "root_path").await,
+        None,
+        "workspace_box_path.root_path is renamed, not kept"
+    );
+    let scope_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM project WHERE owner_workspace_id IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .expect("count scope rows");
+    assert_eq!(
+        scope_rows, 0,
+        "0026 writes no scope row: the bootstrap does (MOD-147 T3)"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-147 (plan D3): two CHECKs tie `owner_workspace_id` set, type `workspace` and an `@` slug
+/// together; one scope row per workspace; an item document's `project_id` must be its item's.
+#[tokio::test]
+async fn migration_0026_checks_refuse_a_half_scope_row() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let workspace = insert_workspace(pool, user, "shop").await;
+
+    assert_refused(
+        sqlx::query("INSERT INTO project (slug, name, created_by) VALUES ('@x', 'x', $1)")
+            .bind(user)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_project_scope_slug",
+        "a user project with an @ slug",
+    );
+    assert_refused(
+        sqlx::query(
+            "INSERT INTO project (slug, name, type, created_by) VALUES ('x', 'x', 'workspace', $1)",
+        )
+        .bind(user)
+        .execute(pool)
+        .await,
+        "23514",
+        "chk_project_scope_row",
+        "a workspace-typed project without an owner",
+    );
+    try_scope_row(pool, user, workspace, "@shop")
+        .await
+        .expect("a whole scope row lands");
+    assert_refused(
+        try_scope_row(pool, user, workspace, "@shop-again").await,
+        "23505",
+        "uq_project_owner_workspace",
+        "a second scope row for one workspace",
+    );
+
+    let (here, kind) = plant_project_kind(pool, user, "here").await;
+    let (there, _) = plant_project_kind(pool, user, "there").await;
+    let item = plant_item(pool, (here, kind), 1, "open", None, user).await;
+    assert_refused(
+        try_document(pool, there, Some(item), "plan", 1, user).await,
+        "23503",
+        "fk_document_item_project",
+        "an item document naming another project",
+    );
+    try_document(pool, here, Some(item), "plan", 1, user)
+        .await
+        .expect("an item document naming its item's project lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-147 (ANA-35 D2): owner documents (`item_id` NULL) version per (owner, kind) under
+/// `uq_document_owner_kind_version`, which is NULLS NOT DISTINCT, so two owner v1s collide; an
+/// item document of the same kind and version beside them does not.
+#[tokio::test]
+async fn migration_0026_versions_owner_documents_per_owner_and_kind() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let pk = plant_project_kind(pool, user, "owner").await;
+    let item = plant_item(pool, pk, 1, "open", None, user).await;
+
+    try_document(pool, pk.0, None, "goals", 1, user)
+        .await
+        .expect("an owner document v1 lands");
+    assert_refused(
+        try_document(pool, pk.0, None, "goals", 1, user).await,
+        "23505",
+        "uq_document_owner_kind_version",
+        "a second owner `goals` v1",
+    );
+    try_document(pool, pk.0, None, "goals", 2, user)
+        .await
+        .expect("an owner document v2 lands");
+    try_document(pool, pk.0, Some(item), "goals", 1, user)
+        .await
+        .expect("an item document `goals` v1 of the same project lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-147 (plan D3): `@` slugs and the type `workspace` are reserved for scope rows, so 0026
+/// refuses a database whose projects already use either, naming them (and nothing else), and the
+/// transaction leaves the database at v25.
+#[tokio::test]
+async fn migration_0026_refuses_a_reserved_slug_naming_the_projects() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(25, &db.pool)
+        .await
+        .expect("apply 0001 through 0025");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod147").await;
+    insert_project(pool, user, "@legacy").await;
+    let typed = insert_project(pool, user, "typed-as-workspace").await;
+    sqlx::query("UPDATE project SET type = 'workspace' WHERE id = $1")
+        .bind(typed)
+        .execute(pool)
+        .await
+        .expect("type a v25 project workspace");
+    insert_project(pool, user, "ordinary-shop").await;
+
+    let err = MIGRATOR
+        .run_to(26, pool)
+        .await
+        .expect_err("a reserved slug refuses 0026");
+    let text = err.to_string();
+    assert!(
+        text.contains("MOD-147") && text.contains("@legacy") && text.contains("typed-as-workspace"),
+        "the refusal names the migration and both projects, got {text}"
+    );
+    assert!(
+        !text.contains("ordinary-shop"),
+        "a project using neither is not named, got {text}"
+    );
+    assert_eq!(
+        common::count(pool, "_sqlx_migrations").await,
+        25,
+        "the refused migration is not recorded"
+    );
+    assert_eq!(
+        column_nullable(pool, "document", "project_id").await,
+        None,
+        "nothing of 0026 applied"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-147 (plan D6 as amended, A1): deleting a workspace cascades its scope row and everything
+/// the row owns (graph, phase, kind, template, owner document). `item_kind.default_graph_id` is
+/// NO ACTION, and the one statement removes both ends, so it does not trip.
+#[tokio::test]
+async fn migration_0026_deleting_a_workspace_cascades_its_scope_row() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let workspace = insert_workspace(pool, user, "shop").await;
+    let scope = try_scope_row(pool, user, workspace, "@shop")
+        .await
+        .expect("a scope row lands");
+    let graph = insert_graph(pool, scope, "ws").await;
+    insert_phase(pool, graph, 0, "plan", 1, 0).await;
+    sqlx::query(
+        "INSERT INTO item_kind (project_id, prefix, name, default_graph_id) \
+         VALUES ($1, 'WS', 'workspace', $2)",
+    )
+    .bind(scope)
+    .bind(graph)
+    .execute(pool)
+    .await
+    .expect("insert the scope row's kind");
+    sqlx::query(
+        "INSERT INTO prompt_template (project_id, name, version, body, created_by) \
+         VALUES ($1, 'plan', 1, 'b', $2)",
+    )
+    .bind(scope)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("insert the scope row's template");
+    try_document(pool, scope, None, "goals", 1, user)
+        .await
+        .expect("an owner document on the scope row lands");
+
+    sqlx::query("DELETE FROM workspace WHERE id = $1")
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("deleting the workspace cascades");
+
+    for (table, sql) in [
+        ("project", "SELECT count(*) FROM project WHERE id = $1"),
+        (
+            "step_graph",
+            "SELECT count(*) FROM step_graph WHERE project_id = $1",
+        ),
+        (
+            "item_kind",
+            "SELECT count(*) FROM item_kind WHERE project_id = $1",
+        ),
+        (
+            "prompt_template",
+            "SELECT count(*) FROM prompt_template WHERE project_id = $1",
+        ),
+        (
+            "document",
+            "SELECT count(*) FROM document WHERE project_id = $1",
+        ),
+    ] {
+        let left: i64 = sqlx::query_scalar(sql)
+            .bind(scope)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|err| panic!("count {table}: {err}"));
+        assert_eq!(
+            left, 0,
+            "the scope row's {table} rows went with the workspace"
+        );
+    }
+    let phases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM step_graph_phase WHERE graph_id = $1")
+            .bind(graph)
+            .fetch_one(pool)
+            .await
+            .expect("count the graph's phases");
+    assert_eq!(phases, 0, "the scope row's phases went with its graph");
+
+    db.drop_db().await;
+}
+
+/// MOD-147 (blueprint T1.3): `CACHE_MIGRATOR` runs before the `schema_version` check
+/// (`cache/mod.rs`), so cache 0009 must apply on a populated 0008 mirror. `document` is dropped
+/// and recreated in the new shape (the forced rebuild refills it); `project` keeps its rows and
+/// gains `owner_workspace_id`. Needs no server and therefore never skips.
+#[tokio::test]
+async fn cache_0009_applies_over_a_populated_0008_mirror() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().expect("a temp cache dir");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("cache.sqlite"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open the cache file");
+    htui_store::CACHE_MIGRATOR
+        .run_to(8, &pool)
+        .await
+        .expect("apply cache 0001 through 0008");
+    sqlx::query(
+        "INSERT INTO project (id, slug, name, created_by, created_at, updated_at) \
+         VALUES ('p1', 'shop-app', 'Shop', 'u1', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a 0008 project");
+    sqlx::query(
+        "INSERT INTO document (id, item_id, kind, version, title, body, created_by, created_at) \
+         VALUES ('d1', 'i1', 'plan', 1, 't', 'b', 'u1', 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a 0008 document");
+
+    htui_store::CACHE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("cache 0009 applies over a populated 0008 file");
+
+    let notnull = |table: &'static str, column: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT \"notnull\" FROM pragma_table_info(?1) WHERE name = ?2",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("read {table}.{column}: {err}"))
+        }
+    };
+    assert_eq!(
+        notnull("document", "project_id").await,
+        Some(1),
+        "document.project_id is NOT NULL"
+    );
+    assert_eq!(
+        notnull("document", "item_id").await,
+        Some(0),
+        "document.item_id is nullable"
+    );
+    assert_eq!(
+        notnull("project", "owner_workspace_id").await,
+        Some(0),
+        "project.owner_workspace_id exists, nullable"
+    );
+    let documents: i64 = sqlx::query_scalar("SELECT count(*) FROM document")
+        .fetch_one(&pool)
+        .await
+        .expect("count documents");
+    assert_eq!(
+        documents, 0,
+        "document is recreated empty; the rebuild refills it"
+    );
+    let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
+        .fetch_one(&pool)
+        .await
+        .expect("count projects");
+    assert_eq!(projects, 1, "project keeps its rows");
+    for index in [
+        "idx_cache_document_item",
+        "idx_cache_document_project",
+        "idx_cache_project_owner",
+    ] {
+        let found: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        )
+        .bind(index)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("look up {index}: {err}"));
+        assert_eq!(found, 1, "index {index} exists");
+    }
+
+    pool.close().await;
+}
+
+/// MOD-147 (blueprint T3.10): 0026 writes no scope row, so the bootstrap gives every workspace
+/// that predates it one — `@<slug>`, type `workspace`, owned by the workspace, seeded with the one
+/// `WS` kind and the ten templates — and a second pass adds nothing. Staged at v25, as on a real
+/// box, with two workspaces written before the migration.
+#[tokio::test]
+async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(25, &db.pool)
+        .await
+        .expect("apply 0001 through 0025");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod147").await;
+    // `shop` gets a name that differs from its slug, so the name check tells them apart.
+    let shop = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO workspace (id, slug, name, created_by) VALUES ($1, 'shop', 'Shop Floor', $2)",
+    )
+    .bind(shop)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("insert workspace `shop`");
+    let lab = insert_workspace(pool, user, "lab").await;
+    MIGRATOR.run(pool).await.expect("apply 0026");
+
+    for pass in ["first", "second"] {
+        db.store
+            .seed_if_empty_as("mod147")
+            .await
+            .unwrap_or_else(|err| panic!("the {pass} bootstrap pass: {err}"));
+        for (workspace, slug, workspace_name) in [(shop, "shop", "Shop Floor"), (lab, "lab", "lab")]
+        {
+            let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
+                "SELECT id, slug, name, type FROM project WHERE owner_workspace_id = $1",
+            )
+            .bind(workspace)
+            .fetch_all(pool)
+            .await
+            .expect("read the scope rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "{pass} pass: workspace `{slug}` has exactly one scope row"
+            );
+            let (scope, scope_slug, name, project_type) = rows[0].clone();
+            assert_eq!(
+                (scope_slug.as_str(), name.as_str(), project_type.as_str()),
+                (format!("@{slug}").as_str(), workspace_name, "workspace"),
+                "{pass} pass: `@<slug>`, the workspace's name, type `workspace`"
+            );
+            let kinds: Vec<String> =
+                sqlx::query_scalar("SELECT prefix FROM item_kind WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_all(pool)
+                    .await
+                    .expect("read the scope row's kinds");
+            assert_eq!(kinds, ["WS"], "{pass} pass: one `WS` kind");
+            let templates: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM prompt_template WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count the scope row's templates");
+            assert_eq!(templates, 10, "{pass} pass: the ten default templates");
+            let members: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM workspace_project WHERE project_id = $1")
+                    .bind(scope)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count the scope row's memberships");
+            assert_eq!(members, 0, "{pass} pass: a scope row joins no workspace");
+        }
+    }
 
     db.drop_db().await;
 }

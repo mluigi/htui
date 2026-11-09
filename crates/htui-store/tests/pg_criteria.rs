@@ -2825,7 +2825,7 @@ async fn cas_tokens_advance_by_the_trigger_alone() {
         .upsert_workspace_box_path(&WorkspaceBoxPath {
             workspace_id: second.id,
             box_id: ids::BOX,
-            root_path: "/srv/trigger".to_owned(),
+            folder_path: "/srv/trigger".to_owned(),
             updated_at: caller_stamp,
         })
         .await
@@ -13007,6 +13007,241 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
             .map(|node| &node.phase),
         Some(&phase),
         "every step_graph_phase column loaded"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-147 V3: the two inherent listers read through membership, so neither lists a scope row:
+/// `workspaces()` gives Platform its two member projects and Graphics its one, and `projects`
+/// over a workspace's scope answers its members only, while the scope row is still a `project`.
+#[tokio::test]
+async fn workspaces_and_projects_never_list_a_scope_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let scope_rows = [ids::PROJECT_SCOPE_PLATFORM, ids::PROJECT_SCOPE_GRAPHICS];
+    let workspaces = db.store.workspaces().await.expect("workspaces");
+    for workspace in &workspaces {
+        assert!(
+            workspace
+                .projects
+                .iter()
+                .all(|project| !scope_rows.contains(&project.project_id)
+                    && !project.slug.starts_with('@')),
+            "`{}` lists no scope row: {:?}",
+            workspace.slug,
+            workspace.projects
+        );
+        let scope = htui_core::model::Scope::from_workspace(workspace);
+        let listed = db.store.projects(&scope).await.expect("projects");
+        assert!(
+            listed
+                .iter()
+                .all(|project| !scope_rows.contains(&project.project_id)),
+            "`{}`'s scope lists no scope row: {listed:?}",
+            workspace.slug
+        );
+    }
+    let platform = workspaces
+        .iter()
+        .find(|ws| ws.workspace_id == ids::WORKSPACE_PLATFORM)
+        .expect("Platform");
+    assert_eq!(
+        platform
+            .projects
+            .iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "Platform's members, and nothing else"
+    );
+    // Asked about the scope row directly, `projects` still answers members only: it reads
+    // through `workspace_project`, and the scope row is never a member.
+    let asked = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![
+            ids::PROJECT_HTUI,
+            ids::PROJECT_AGY,
+            ids::PROJECT_SCOPE_PLATFORM,
+        ],
+    };
+    assert_eq!(
+        db.store
+            .projects(&asked)
+            .await
+            .expect("projects")
+            .iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "a scope naming the scope row still lists Platform's members only"
+    );
+    for (workspace, scope) in [
+        (ids::WORKSPACE_PLATFORM, ids::PROJECT_SCOPE_PLATFORM),
+        (ids::WORKSPACE_GRAPHICS, ids::PROJECT_SCOPE_GRAPHICS),
+    ] {
+        let row = db
+            .store
+            .project(scope)
+            .await
+            .expect("project")
+            .expect("the scope row is a project");
+        assert_eq!(row.owner_workspace_id, Some(workspace));
+        assert_eq!(
+            db.store
+                .scope_project(workspace)
+                .await
+                .expect("scope_project"),
+            Some(scope)
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-147 D2 (the `document_versions_do_not_collide_under_contention` pattern): two writers
+/// arriving together at one `(project, kind)` owner document get consecutive versions, never the
+/// same one. `write_owner_document` takes the project row `FOR NO KEY UPDATE` before its
+/// `COALESCE(MAX(version), 0) + 1`; without it both read `MAX = 0` and the second insert hits
+/// `uq_document_owner_kind_version`.
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_document_versions_do_not_collide_under_contention() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let left = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let right = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    let goals = |title: &str| htui_core::model::NewOwnerDocument {
+        id: htui_core::model::DocumentId::new(),
+        project_id: ids::PROJECT_SCOPE_PLATFORM,
+        kind: "goals".to_owned(),
+        title: title.to_owned(),
+        body: String::new(),
+        created_by: ids::USER,
+        created_at: Utc::now(),
+    };
+
+    let (one, two) = tokio::join!(
+        left.write_owner_document(goals("Left")),
+        right.write_owner_document(goals("Right")),
+    );
+    let mut versions = [
+        one.expect("the first write must not fail").version,
+        two.expect("the second write must not fail").version,
+    ];
+    versions.sort_unstable();
+    assert_eq!(versions, [1, 2], "never 1 twice");
+
+    let stored: Vec<i32> = sqlx::query_scalar(
+        "SELECT version FROM document WHERE project_id = $1 AND item_id IS NULL \
+         AND kind = 'goals' ORDER BY version",
+    )
+    .bind(ids::PROJECT_SCOPE_PLATFORM.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .expect("read the versions back");
+    assert_eq!(stored, [1, 2], "and the table agrees: no gap, no repeat");
+    assert_eq!(
+        db.store
+            .owner_documents(ids::PROJECT_SCOPE_PLATFORM)
+            .await
+            .expect("owner_documents")
+            .iter()
+            .map(|doc| doc.version)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-147 M1 R1 (L3): a workspace whose scope row is missing — a rename that raced the bootstrap,
+/// or a row deleted by hand — gets it back on its next slug or name edit, in the edit's own
+/// transaction: the scope-row `UPDATE` matches nothing, so `insert_scope_row` runs instead and the
+/// row carries the new `@<slug>` and name, with its `WS` seed.
+#[tokio::test]
+async fn workspace_rename_restores_a_missing_scope_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let created = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "healer".to_owned(),
+            name: "Healer".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the create lands");
+    sqlx::query("DELETE FROM project WHERE owner_workspace_id = $1")
+        .bind(created.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("drop the scope row by hand");
+    assert_eq!(
+        db.store
+            .scope_project(created.id)
+            .await
+            .expect("scope_project"),
+        None,
+        "the scope row is gone"
+    );
+
+    let CasOutcome::Applied(renamed) = db
+        .store
+        .update_workspace(
+            created.id,
+            created.updated_at,
+            WorkspacePatch {
+                slug: Some("mended".to_owned()),
+                name: Some("Mended".to_owned()),
+                ..WorkspacePatch::default()
+            },
+        )
+        .await
+        .expect("the rename lands")
+    else {
+        panic!("the rename applies");
+    };
+    assert_eq!(renamed.slug, "mended");
+
+    let scope = db
+        .store
+        .scope_project(created.id)
+        .await
+        .expect("scope_project")
+        .expect("the rename put the scope row back");
+    let row = db
+        .store
+        .project(scope)
+        .await
+        .expect("project")
+        .expect("the scope row is a project");
+    assert_eq!(
+        (row.slug.as_str(), row.name.as_str(), row.owner_workspace_id),
+        ("@mended", "Mended", Some(created.id)),
+        "the restored scope row follows the new slug and name"
+    );
+    assert_eq!(
+        db.store
+            .item_kinds(scope)
+            .await
+            .expect("item_kinds")
+            .iter()
+            .map(|kind| kind.prefix.as_str())
+            .collect::<Vec<_>>(),
+        ["WS"],
+        "with its `WS` seed"
     );
 
     db.drop_db().await;

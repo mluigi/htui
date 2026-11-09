@@ -13,6 +13,7 @@ use chrono::Utc;
 use htui::app::{Action, Handled};
 use htui::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, REQUEST_NAMES, RepoInference,
+    ScopeWrite,
 };
 use htui::store_worker::{LIST_CAP, LIST_DIR, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
@@ -69,7 +70,7 @@ async fn a_hierarchy_read_returns_the_demo_tree() {
     assert_eq!(tree.workspace.slug, "graphics");
     assert_eq!(tree.workspace.id, ids::WORKSPACE_GRAPHICS);
     assert!(
-        tree.root_path.is_none(),
+        tree.folder_path.is_none(),
         "the fixture seeds no `workspace_box_path` row"
     );
 
@@ -356,8 +357,8 @@ async fn a_root_is_stored_canonical_and_a_link_is_refused() {
         )
         .await,
     );
-    let row = stored.root_path.expect("this box's row is in the tree");
-    assert_eq!(row.root_path, canonical.display().to_string());
+    let row = stored.folder_path.expect("this box's row is in the tree");
+    assert_eq!(row.folder_path, canonical.display().to_string());
     assert_eq!(row.box_id, ids::BOX, "the worker fills in the box");
 
     let missing = dir.path().join("gone");
@@ -410,7 +411,7 @@ async fn a_root_is_stored_canonical_and_a_link_is_refused() {
 }
 
 /// A canonical path that is not UTF-8 is refused rather than stored mangled: `to_string_lossy`
-/// would put a string naming nothing on disk into `root_path`. The typed path is valid UTF-8 — it
+/// would put a string naming nothing on disk into `folder_path`. The typed path is valid UTF-8 — it
 /// arrived as a `String` — so only what a link resolves to can get here, and the refusal names what
 /// was typed and never the target (`R-BOX-4`).
 #[cfg(unix)]
@@ -774,8 +775,10 @@ async fn delete_reach_equals_deleted_reach() {
     );
 }
 
-/// A workspace delete takes its links and its box paths and **not** its projects (M1 D4), and it
-/// needs no rebuild: the two tables it touches are full-table replaced on every refresh pass.
+/// A workspace delete takes its links and its box paths and **not** its projects (M1 D4). Its
+/// scope row goes with it, counted (MOD-147 A1): the `WS` kind, its graph, two phases and the ten
+/// templates. That makes it a project delete as far as the mirror goes, so it rebuilds one like
+/// `DeleteProject` does; on a memory backend there is none.
 #[tokio::test]
 async fn delete_workspace_keeps_its_projects() {
     let store = MemStore::demo();
@@ -796,8 +799,12 @@ async fn delete_workspace_keeps_its_projects() {
     };
     assert_eq!(target, DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS));
     assert_eq!(reach.workspace_links, 1);
-    assert_eq!(reach.items, 0, "a workspace delete reaches no item");
-    assert_eq!(mirror, MirrorAfterDelete::NotNeeded);
+    assert_eq!(reach.items, 0, "the demo scope row owns no item");
+    assert_eq!(reach.item_kinds, 1, "the scope row's `WS` kind");
+    assert_eq!(reach.step_graphs, 1);
+    assert_eq!(reach.phases, 2);
+    assert_eq!(reach.prompt_templates, 10);
+    assert_eq!(mirror, MirrorAfterDelete::NoMirror);
 
     let after = serve(&backend, &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await;
     assert!(
@@ -812,6 +819,60 @@ async fn delete_workspace_keeps_its_projects() {
             .is_some(),
         "its project survives and stays reachable from other workspaces"
     );
+    assert!(
+        store
+            .project(ids::PROJECT_SCOPE_GRAPHICS)
+            .await
+            .expect("the store answers")
+            .is_none(),
+        "its scope row went with it"
+    );
+}
+
+/// MOD-147 D9: a workspace's scope row resolves to its workspace through `owner_workspace_id`,
+/// although it joins no workspace: a scope write on it answers with the workspace's tree.
+#[tokio::test]
+async fn a_scope_row_resolves_its_workspace() {
+    let backend = demo();
+    let expected = backend
+        .writer()
+        .expect("a memory backend writes")
+        .project(ids::PROJECT_SCOPE_GRAPHICS)
+        .await
+        .expect("the store answers")
+        .expect("the demo has Graphics' scope row")
+        .updated_at;
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::SetProjectSecretScope {
+            id: ids::PROJECT_SCOPE_GRAPHICS,
+            expected,
+            scope: None,
+        },
+    )
+    .await;
+
+    let StoreReply::SecretScopeWritten {
+        project,
+        tree,
+        outcome,
+    } = reply
+    else {
+        panic!("a scope row's write answers its workspace's tree: {reply:?}");
+    };
+    assert_eq!(project, ids::PROJECT_SCOPE_GRAPHICS);
+    assert_eq!(tree.workspace.id, ids::WORKSPACE_GRAPHICS);
+    assert_eq!(outcome, ScopeWrite::Applied);
+}
+
+/// MOD-147: the tree lists a workspace's projects through membership, so its scope row, which
+/// joins no workspace, is never one of them.
+#[tokio::test]
+async fn the_tree_never_lists_a_scope_row() {
+    let tree = tree(serve(&demo(), &StoreRequest::Hierarchy(ids::WORKSPACE_PLATFORM)).await);
+    let projects: Vec<ProjectId> = tree.projects.iter().map(|entry| entry.project.id).collect();
+    assert_eq!(projects, vec![ids::PROJECT_HTUI, ids::PROJECT_AGY]);
 }
 
 /// Offline, every one of the thirteen is refused by its own name with the one sentence MOD-25
@@ -969,14 +1030,20 @@ fn inferred(reply: StoreReply) -> (HierarchySnapshot, InferReport) {
     }
 }
 
-/// One `InferRepoPaths` over `Graphics`.
+/// One `InferRepoPaths` over `Graphics`, with no home directory: a test never reads the real
+/// `~/workspaces` (MOD-147 V10).
 async fn infer(backend: &Backend) -> (HierarchySnapshot, InferReport) {
+    infer_under(backend, None).await
+}
+
+/// One `InferRepoPaths` over `Graphics` with `home` as the home directory the default workspace
+/// folder hangs off (MOD-147 D8).
+async fn infer_under(backend: &Backend, home: Option<&Path>) -> (HierarchySnapshot, InferReport) {
+    let request = StoreRequest::InferRepoPaths(ids::WORKSPACE_GRAPHICS);
     inferred(
-        serve(
-            backend,
-            &StoreRequest::InferRepoPaths(ids::WORKSPACE_GRAPHICS),
-        )
-        .await,
+        htui::hierarchy::serve_with_home(backend, &request, home)
+            .await
+            .unwrap_or_else(|err| panic!("the inference is served: {err}")),
     )
 }
 
@@ -1010,6 +1077,58 @@ fn canonical(path: &Path) -> String {
         .into_os_string()
         .into_string()
         .expect("a tempdir path is UTF-8")
+}
+
+/// MOD-147 D8: with no row on this box, the workspace's folder is `<home>/workspaces/<slug>`. The
+/// walk starts there, a checkout under it is inferred, and no folder row is written for it.
+#[tokio::test]
+async fn infer_defaults_to_the_workspace_folder_under_home() {
+    let backend = demo();
+    let home = tempfile::tempdir().expect("a throwaway home");
+    let folder = home.path().join("workspaces").join("graphics");
+    let core = checkout(&folder, "core", Some(CORE_CLONE_REMOTE));
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+
+    let (tree, report) = infer_under(&backend, Some(home.path())).await;
+
+    assert_eq!(report.root, Some(canonical(&folder)));
+    assert!(!report.truncated);
+    assert_eq!(
+        outcome(&report, "core"),
+        &InferOutcome::Inferred {
+            path: canonical(&core),
+            by: MatchedBy::Remote,
+        }
+    );
+    assert_eq!(
+        local_path(&tree, "core").map(|row| row.local_path),
+        Some(canonical(&core))
+    );
+    assert!(
+        tree.folder_path.is_none(),
+        "the default folder is not written as a row"
+    );
+}
+
+/// MOD-147 D8: no row, and no default folder on disk (or no home at all), walks nothing and is not
+/// an error: an absent default folder is the ordinary state of a box.
+#[tokio::test]
+async fn infer_without_a_row_or_default_folder_walks_nothing() {
+    let backend = demo();
+    let home = tempfile::tempdir().expect("a throwaway home with no `workspaces`");
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    let nothing = InferReport {
+        root: None,
+        truncated: false,
+        repos: Vec::new(),
+    };
+
+    let (tree, report) = infer_under(&backend, Some(home.path())).await;
+    assert_eq!(report, nothing);
+    assert_eq!(local_path(&tree, "core"), None);
+
+    let (_, report) = infer_under(&backend, None).await;
+    assert_eq!(report, nothing, "no home directory, no default folder");
 }
 
 /// The first failing test of T4: a remote match under the root is stored canonical, under this
@@ -1144,7 +1263,7 @@ async fn a_symlinked_root_yields_paths_under_its_target() {
 
     let stored = set_root(&backend, &link).await;
     assert_eq!(
-        stored.root_path.map(|row| row.root_path),
+        stored.folder_path.map(|row| row.folder_path),
         Some(canonical(&real)),
         "the root is stored as the link's target"
     );
@@ -1613,7 +1732,7 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
                 workspace_links: 1,
                 ..DeleteReach::default()
             }),
-            mirror: MirrorAfterDelete::NotNeeded,
+            mirror: MirrorAfterDelete::Rebuilt,
         },
     );
     let asked = bench.drained();
@@ -2039,10 +2158,10 @@ async fn a_wrong_slug_deletes_nothing() {
 
 /// `tree` with a root on this box at `path`: a synthetic row, since the section never stats one.
 fn with_root(mut tree: HierarchySnapshot, path: &str) -> HierarchySnapshot {
-    tree.root_path = Some(WorkspaceBoxPath {
+    tree.folder_path = Some(WorkspaceBoxPath {
         workspace_id: tree.workspace.id,
         box_id: ids::BOX,
-        root_path: path.to_owned(),
+        folder_path: path.to_owned(),
         updated_at: tree.workspace.updated_at,
     });
     tree
@@ -2960,7 +3079,7 @@ async fn rooted_store(root: &str) -> MemStore {
         .upsert_workspace_box_path(&WorkspaceBoxPath {
             workspace_id: ids::WORKSPACE_GRAPHICS,
             box_id: ids::BOX,
-            root_path: root.to_owned(),
+            folder_path: root.to_owned(),
             updated_at: Utc::now(),
         })
         .await
@@ -3704,14 +3823,66 @@ async fn a_delete_counts_in_words() {
                 workspace_links: 1,
                 ..DeleteReach::default()
             }),
-            mirror: MirrorAfterDelete::NotNeeded,
+            mirror: MirrorAfterDelete::Rebuilt,
         },
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("deleted `graphics`: 1 row across 1 table; no rebuild needed"),
+        frame.contains("deleted `graphics`: 1 row across 1 table; mirror rebuilt"),
         "{frame}"
     );
+}
+
+/// MOD-147 A1: a workspace delete takes its scope row and everything the row owns, and the pane
+/// names those counts as a project delete's does, after the links and box paths; with nothing
+/// beyond those two, it adds nothing.
+#[tokio::test]
+async fn a_workspace_delete_names_what_its_scope_row_takes() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
+            workspace_links: 1,
+            items: 1,
+            item_kinds: 1,
+            step_graphs: 1,
+            phases: 2,
+            prompt_templates: 10,
+            documents: 1,
+            ..DeleteReach::default()
+        }))),
+    );
+    let frame = flat(&bench.render_section(&section, 300));
+    assert!(
+        frame.contains(
+            "This deletes workspace `graphics`: 1 project link and 0 box root paths. Its projects \
+             survive and stay reachable from other workspaces. Gone for good with it: 1 item, 1 \
+             kind, 1 graph, 2 phases, 10 templates, 1 document."
+        ),
+        "{frame}"
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
+            workspace_links: 1,
+            workspace_box_paths: 1,
+            ..DeleteReach::default()
+        }))),
+    );
+    let frame = flat(&bench.render_section(&section, 300));
+    assert!(
+        frame.contains("1 project link and 1 box root path"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Gone for good"), "{frame}");
 }
 
 /// MOD-83: a write in flight reads in words, on the Browse hint as in the refusal, and never as a

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT count(*) AS \"live!\"\n              FROM run r JOIN project p ON p.id = r.project_id\n             WHERE p.owner_workspace_id = $1\n               AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped')\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7f981ce02686e35d495fc56babd7c909063f0597c0994fc350114d0118d3329b"
+}

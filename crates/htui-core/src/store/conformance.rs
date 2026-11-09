@@ -47,6 +47,7 @@ use crate::model::{
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
+use crate::model::{NewOwnerDocument, Project};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::scrub::MinimalScrubber;
@@ -76,6 +77,10 @@ use crate::store::traits::{
     fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
+};
+use crate::store::traits::{
+    project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
+    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -325,6 +330,21 @@ pub const CASES: &[&str] = &[
     "record_branch_refuses_a_stale_fence",
     // MOD-138 M3: W5, a back `asks_you` beside another `asks_you` (plan D8, Q-3)
     "replace_graph_refuses_a_back_asks_you_beside_another_asks_you",
+    // MOD-147 M1: the workspace scope row and owner documents (plan D1-D9, amendments A1, A2)
+    "create_workspace_creates_its_scope_row",
+    "scope_row_is_in_no_listing",
+    "scope_project_names_the_scope_row",
+    "scope_row_cannot_join_a_workspace",
+    "user_slug_cannot_start_with_at",
+    "scope_row_is_seeded_with_the_ws_kind",
+    "scope_row_mints_ws_keys",
+    "owner_document_versions_per_owner_and_kind",
+    "owner_documents_exclude_item_documents",
+    "item_documents_exclude_owner_documents",
+    "workspace_rename_renames_its_scope_row",
+    "workspace_delete_refuses_while_a_scope_row_run_is_live",
+    "workspace_delete_cascades_its_scope_row_with_counts",
+    "scope_row_cannot_be_deleted_alone",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1034,6 +1054,45 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "replace_graph_refuses_a_back_asks_you_beside_another_asks_you" => {
             Box::pin(replace_graph_refuses_a_back_asks_you_beside_another_asks_you(store)).await
+        }
+        "create_workspace_creates_its_scope_row" => {
+            Box::pin(create_workspace_creates_its_scope_row(store)).await
+        }
+        "scope_row_is_in_no_listing" => Box::pin(scope_row_is_in_no_listing(store)).await,
+        "scope_project_names_the_scope_row" => {
+            Box::pin(scope_project_names_the_scope_row(store)).await
+        }
+        "scope_row_cannot_join_a_workspace" => {
+            Box::pin(scope_row_cannot_join_a_workspace(store)).await
+        }
+        "user_slug_cannot_start_with_at" => Box::pin(user_slug_cannot_start_with_at(store)).await,
+        "scope_row_is_seeded_with_the_ws_kind" => {
+            Box::pin(scope_row_is_seeded_with_the_ws_kind(store)).await
+        }
+        "scope_row_mints_ws_keys" => Box::pin(scope_row_mints_ws_keys(store)).await,
+        "owner_document_versions_per_owner_and_kind" => {
+            Box::pin(owner_document_versions_per_owner_and_kind(store)).await
+        }
+        "owner_documents_exclude_item_documents" => {
+            Box::pin(owner_documents_exclude_item_documents(store)).await
+        }
+        "item_documents_exclude_owner_documents" => {
+            Box::pin(item_documents_exclude_owner_documents(store)).await
+        }
+        "workspace_rename_renames_its_scope_row" => {
+            Box::pin(workspace_rename_renames_its_scope_row(store)).await
+        }
+        "workspace_delete_refuses_while_a_scope_row_run_is_live" => {
+            Box::pin(workspace_delete_refuses_while_a_scope_row_run_is_live(
+                store,
+            ))
+            .await
+        }
+        "workspace_delete_cascades_its_scope_row_with_counts" => {
+            Box::pin(workspace_delete_cascades_its_scope_row_with_counts(store)).await
+        }
+        "scope_row_cannot_be_deleted_alone" => {
+            Box::pin(scope_row_cannot_be_deleted_alone(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3394,7 +3453,7 @@ async fn workspace_links_and_box_paths_upsert<S: WriteStore>(store: &S) {
     let path = |root: &str| WorkspaceBoxPath {
         workspace_id: workspace.id,
         box_id: ids::BOX,
-        root_path: root.to_owned(),
+        folder_path: root.to_owned(),
         updated_at: Utc::now(),
     };
     store
@@ -3409,15 +3468,16 @@ async fn workspace_links_and_box_paths_upsert<S: WriteStore>(store: &S) {
     assert_eq!(
         paths
             .iter()
-            .map(|row| (row.box_id, row.root_path.as_str()))
+            .map(|row| (row.box_id, row.folder_path.as_str()))
             .collect::<Vec<_>>(),
         vec![(ids::BOX, "/srv/second")],
         "{CASE}: the per-box path is replaced in place, never doubled (R-BOX-4)"
     );
 }
 
-/// D4's first half: a workspace delete reaches its links and its box paths and stops there. The
-/// reach is counted before the act and the act reports the same struct (PRD D13).
+/// D4's first half: a workspace delete reaches its links and its box paths, and since MOD-147 A1
+/// its scope row's seed, and stops there: member projects survive. The reach is counted before
+/// the act and the act reports the same struct (PRD D13).
 async fn workspace_delete_reports_its_reach<S: WriteStore>(store: &S) {
     const CASE: &str = "workspace_delete_reports_its_reach";
     let workspace = store
@@ -3436,7 +3496,7 @@ async fn workspace_delete_reports_its_reach<S: WriteStore>(store: &S) {
         .upsert_workspace_box_path(&WorkspaceBoxPath {
             workspace_id: workspace.id,
             box_id: ids::BOX,
-            root_path: "/srv/doomed".to_owned(),
+            folder_path: "/srv/doomed".to_owned(),
             updated_at: Utc::now(),
         })
         .await
@@ -3453,8 +3513,8 @@ async fn workspace_delete_reports_its_reach<S: WriteStore>(store: &S) {
             workspace_links: 1,
             workspace_box_paths: 1,
             ..DeleteReach::default()
-        },
-        "{CASE}: a workspace reaches its two tables and nothing else"
+        } + scope_seed_reach(),
+        "{CASE}: a workspace reaches its two tables and its scope row's seed, nothing else"
     );
 
     let report = store.delete_workspace(workspace.id).await.expect(CASE);
@@ -3581,8 +3641,7 @@ async fn project_create_update_cas<S: WriteStore>(store: &S) {
 /// keep, a stale token, clear.
 async fn project_secret_columns_set_clear_cas<S: WriteStore>(store: &S) {
     const CASE: &str = "project_secret_columns_set_clear_cas";
-    let columns =
-        |row: &crate::model::Project| (row.secret_provider.clone(), row.secret_scope.clone());
+    let columns = |row: &Project| (row.secret_provider.clone(), row.secret_scope.clone());
     let scope = SecretScope::new("p-vault", "dev", "/ops").expect(CASE);
     let other = SecretScope::new("p-other", "prod", "/").expect(CASE);
     let created = store
@@ -24813,15 +24872,16 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
         .await
         .expect(CASE)
         .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+    // MOD-147 A1: plus the scope row's own graph and its two phases.
     assert_eq!(
         (reach.step_graphs, reach.phases, reach.phase_agents),
-        (1, 2, 2),
-        "{CASE}: the reach counts the graph, its phases and its candidates"
+        (2, 4, 2),
+        "{CASE}: the reach counts the graph, its phases and its candidates, and the scope row's"
     );
     let done = store.delete_workspace(workspace.id).await.expect(CASE);
     assert_eq!(
         (done.step_graphs, done.phases, done.phase_agents),
-        (1, 2, 2),
+        (2, 4, 2),
         "{CASE}: the delete reports what the reach said"
     );
     assert!(
@@ -25344,7 +25404,10 @@ async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
         "{CASE}: the item lets go, got {repointed:?}"
     );
     let done = store.delete_workspace(workspace).await.expect(CASE);
-    assert_eq!(done.step_graphs, 1, "{CASE}: the delete takes the graph");
+    assert_eq!(
+        done.step_graphs, 2,
+        "{CASE}: the delete takes the graph, and the scope row's (MOD-147 A1)"
+    );
     assert_eq!(
         store.graph_body(graph.id).await.expect(CASE),
         None,
@@ -27119,6 +27182,973 @@ async fn project_delete_counts_memory<S: WriteStore>(store: &S) {
         memory_history(CASE, store, agy.id).await.len(),
         1,
         "{CASE}: and so does its revision"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-147 M1: the workspace scope row and owner documents (plan D1-D9, amendments A1, A2)
+// ------------------------------------------------------------------------------------------------
+
+/// MOD-147: an owner-document request with a fresh id, by the fixture user; the version is the
+/// store's to allocate.
+fn new_owner_document(project: ProjectId, kind: &str) -> NewOwnerDocument {
+    NewOwnerDocument {
+        id: DocumentId::new(),
+        project_id: project,
+        kind: kind.to_owned(),
+        title: format!("{kind} of {project}"),
+        body: format!("The {kind}."),
+        created_by: ids::USER,
+        created_at: seam_clock(),
+    }
+}
+
+/// MOD-147 A1: what a fresh workspace's scope row adds to the workspace's delete reach — the `WS`
+/// seed: one kind, one graph, two phases, ten templates (its two edges have no field).
+fn scope_seed_reach() -> DeleteReach {
+    DeleteReach {
+        item_kinds: 1,
+        step_graphs: 1,
+        phases: 2,
+        prompt_templates: 10,
+        ..DeleteReach::default()
+    }
+}
+
+/// MOD-147 D1: the workspace's scope row, or a panic naming the case.
+async fn scope_of<S: ReadStore>(case: &str, store: &S, workspace: WorkspaceId) -> ProjectId {
+    store
+        .scope_project(workspace)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: workspace `{workspace}` has a scope row"))
+}
+
+/// A `project` row that has to exist, or a panic naming the case.
+async fn project_of<S: ReadStore>(case: &str, store: &S, project: ProjectId) -> Project {
+    store
+        .project(project)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: project `{project}` exists"))
+}
+
+/// `delete_reach(Project(htui)).documents`, or a panic naming the case.
+async fn htui_documents_reach<S: WriteStore>(case: &str, store: &S) -> u64 {
+    store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: htui has a reach"))
+        .documents
+}
+
+/// MOD-147 D5: the scope row's one kind, `WS`, or a panic naming the case.
+async fn ws_kind_of<S: WriteStore>(case: &str, store: &S, scope: ProjectId) -> ItemKindId {
+    let kinds = store.item_kinds(scope).await.expect(case);
+    assert_eq!(kinds.len(), 1, "{case}: a scope row has one kind");
+    kinds[0].id
+}
+
+/// MOD-147 D7: `create_workspace` writes the scope row in the same transaction — `@<slug>`, type
+/// `workspace`, owned by the workspace, named after it, `{}` settings, no secret. A refused
+/// create writes no second one.
+async fn create_workspace_creates_its_scope_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_workspace_creates_its_scope_row";
+    let workspace = store
+        .create_workspace(new_workspace("scoped"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let row = project_of(CASE, store, scope).await;
+    assert_eq!(
+        (
+            row.slug.as_str(),
+            row.project_type.as_str(),
+            row.owner_workspace_id,
+            row.name.as_str(),
+            row.description.as_str(),
+        ),
+        (
+            "@scoped",
+            seed::SCOPE_ROW_TYPE,
+            Some(workspace.id),
+            workspace.name.as_str(),
+            "",
+        ),
+        "{CASE}: the scope row's columns"
+    );
+    assert_eq!(row.settings, json!({}), "{CASE}: settings start empty");
+    assert_eq!(
+        (row.secret_provider, row.secret_scope),
+        (None, None),
+        "{CASE}: no secret binding"
+    );
+    assert_eq!(row.created_by, workspace.created_by, "{CASE}: the creator");
+
+    let again = store.create_workspace(new_workspace("scoped")).await;
+    assert!(
+        matches!(again, Err(StoreError::Constraint(_))),
+        "{CASE}: a taken slug is refused, got {again:?}"
+    );
+    let mut ghost = new_workspace("ghost");
+    ghost.created_by = UserId::new();
+    let ghost_id = ghost.id;
+    let refused = store.create_workspace(ghost).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown creator is refused, got {refused:?}"
+    );
+    assert_eq!(
+        store.workspace(ghost_id).await.expect(CASE),
+        None,
+        "{CASE}: a refused create writes no workspace"
+    );
+    assert_eq!(
+        store.scope_project(ghost_id).await.expect(CASE),
+        None,
+        "{CASE}: a refused create writes no scope row"
+    );
+    assert_eq!(
+        store.scope_project(workspace.id).await.expect(CASE),
+        Some(scope),
+        "{CASE}: the first workspace keeps its one scope row"
+    );
+}
+
+/// MOD-147 D1: the scope row joins no workspace, so no membership read lists it and a workspace's
+/// item listing never shows its scope row's items. The two inherent listers (`workspaces`,
+/// `projects`) are not on `WriteStore`; each store pins them itself (blueprint V3).
+async fn scope_row_is_in_no_listing<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_is_in_no_listing";
+    let members = |links: Vec<WorkspaceProject>| -> Vec<ProjectId> {
+        links.into_iter().map(|link| link.project_id).collect()
+    };
+    assert_eq!(
+        members(
+            store
+                .workspace_projects(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect(CASE)
+        ),
+        [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        "{CASE}: Platform's members, not its scope row"
+    );
+    let fresh = store
+        .create_workspace(new_workspace("lonely"))
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .workspace_projects(fresh.id)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a fresh workspace has no member, its scope row included"
+    );
+
+    let minted = store
+        .mint_item(new_item(
+            ids::PROJECT_SCOPE_PLATFORM,
+            ids::KIND_SCOPE_PLATFORM_WS,
+            "spans the platform",
+        ))
+        .await
+        .expect(CASE);
+    let listed = store
+        .items(&platform_scope(), &ItemFilter::default())
+        .await
+        .expect(CASE);
+    assert!(
+        !listed.is_empty(),
+        "{CASE}: control: the Platform scope lists items"
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|item| item.project_id != ids::PROJECT_SCOPE_PLATFORM && item.id != minted.id),
+        "{CASE}: the members' listing holds no item of the scope row"
+    );
+}
+
+/// MOD-147 D1, D9: `scope_project` names each fixture workspace's scope row and nothing for an
+/// unknown workspace; `owner_workspace_id` is set on a scope row only.
+async fn scope_project_names_the_scope_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_project_names_the_scope_row";
+    assert_eq!(
+        store
+            .scope_project(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect(CASE),
+        Some(ids::PROJECT_SCOPE_PLATFORM),
+        "{CASE}: Platform"
+    );
+    assert_eq!(
+        store
+            .scope_project(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect(CASE),
+        Some(ids::PROJECT_SCOPE_GRAPHICS),
+        "{CASE}: Graphics"
+    );
+    assert_eq!(
+        store.scope_project(WorkspaceId::new()).await.expect(CASE),
+        None,
+        "{CASE}: an unknown workspace has none"
+    );
+    assert_eq!(
+        project_of(CASE, store, ids::PROJECT_SCOPE_PLATFORM)
+            .await
+            .owner_workspace_id,
+        Some(ids::WORKSPACE_PLATFORM),
+        "{CASE}: the scope row names its owner"
+    );
+    assert_eq!(
+        project_of(CASE, store, ids::PROJECT_HTUI)
+            .await
+            .owner_workspace_id,
+        None,
+        "{CASE}: a user project has no owner"
+    );
+}
+
+/// MOD-147 D4: `upsert_workspace_project` refuses a scope row before anything else, so it never
+/// joins a workspace — its own or another.
+async fn scope_row_cannot_join_a_workspace<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_cannot_join_a_workspace";
+    let refusal = Err(StoreError::Constraint(scope_row_joins_no_workspace(
+        "@platform",
+    )));
+    for workspace in [
+        ids::WORKSPACE_GRAPHICS,
+        ids::WORKSPACE_PLATFORM,
+        WorkspaceId::new(),
+    ] {
+        assert_eq!(
+            store
+                .upsert_workspace_project(&WorkspaceProject {
+                    workspace_id: workspace,
+                    project_id: ids::PROJECT_SCOPE_PLATFORM,
+                    position: 9,
+                })
+                .await,
+            refusal,
+            "{CASE}: the scope row joins no workspace (`{workspace}`)"
+        );
+    }
+    assert_eq!(
+        store
+            .workspace_projects(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|link| link.project_id)
+            .collect::<Vec<_>>(),
+        [ids::PROJECT_VULKAN],
+        "{CASE}: nothing joined"
+    );
+}
+
+/// MOD-147 D3: `@` starts a scope row's slug only. A user project is refused one on create and on
+/// a slug patch, in the same words on both stores; a scope row's slug is not patched at all (it
+/// follows its workspace), while its other columns are.
+async fn user_slug_cannot_start_with_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "user_slug_cannot_start_with_at";
+    let new = new_project("@ops");
+    let id = new.id;
+    assert_eq!(
+        store.create_project(new).await,
+        Err(StoreError::Constraint(project_slug_is_reserved("@ops"))),
+        "{CASE}: create"
+    );
+    assert_eq!(
+        store.project(id).await.expect(CASE),
+        None,
+        "{CASE}: the refused create wrote nothing"
+    );
+    let mut ghost = new_project("@ghost");
+    ghost.created_by = UserId::new();
+    assert_eq!(
+        store.create_project(ghost).await,
+        Err(StoreError::Constraint(project_slug_is_reserved("@ghost"))),
+        "{CASE}: the slug is judged first"
+    );
+
+    let htui = project_of(CASE, store, ids::PROJECT_HTUI).await;
+    assert_eq!(
+        store
+            .update_project(
+                ids::PROJECT_HTUI,
+                htui.updated_at,
+                ProjectPatch {
+                    slug: Some("@htui".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await,
+        Err(StoreError::Constraint(project_slug_is_reserved("@htui"))),
+        "{CASE}: a slug patch"
+    );
+    assert_eq!(
+        project_of(CASE, store, ids::PROJECT_HTUI).await,
+        htui,
+        "{CASE}: the refused patch wrote nothing"
+    );
+
+    let scope = project_of(CASE, store, ids::PROJECT_SCOPE_PLATFORM).await;
+    let renamed = store
+        .update_project(
+            ids::PROJECT_SCOPE_PLATFORM,
+            scope.updated_at,
+            ProjectPatch {
+                slug: Some("platform2".to_owned()),
+                ..ProjectPatch::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        renamed,
+        Err(StoreError::Constraint(scope_row_slug_is_fixed("@platform"))),
+        "{CASE}: a scope row's slug follows its workspace, in the same words on both stores"
+    );
+    assert_eq!(
+        project_of(CASE, store, ids::PROJECT_SCOPE_PLATFORM).await,
+        scope,
+        "{CASE}: the refused patch wrote nothing"
+    );
+    let named = applied(
+        CASE,
+        store
+            .update_project(
+                ids::PROJECT_SCOPE_PLATFORM,
+                scope.updated_at,
+                ProjectPatch {
+                    description: Some("Cross-project work".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (named.slug.as_str(), named.description.as_str()),
+        ("@platform", "Cross-project work"),
+        "{CASE}: a scope row's other columns are editable"
+    );
+    let titled = applied(
+        CASE,
+        store
+            .update_project(
+                ids::PROJECT_SCOPE_PLATFORM,
+                named.updated_at,
+                ProjectPatch {
+                    name: Some("Platform scope".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            titled.slug.as_str(),
+            titled.name.as_str(),
+            titled.description.as_str()
+        ),
+        ("@platform", "Platform scope", "Cross-project work"),
+        "{CASE}: a name-only patch on the scope row applies"
+    );
+}
+
+/// MOD-147 D5: a scope row is seeded with one kind, `WS`, whose project-scoped graph is `plan`
+/// (soft gate) then `review` (hard gate) with their default edges, and the ten templates.
+async fn scope_row_is_seeded_with_the_ws_kind<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_is_seeded_with_the_ws_kind";
+    let workspace = store
+        .create_workspace(new_workspace("seeded"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+
+    let kinds = store.item_kinds(scope).await.expect(CASE);
+    assert_eq!(
+        kinds
+            .iter()
+            .map(|kind| (kind.prefix.as_str(), kind.name.as_str(), kind.position))
+            .collect::<Vec<_>>(),
+        [("WS", "workspace", 0)],
+        "{CASE}: one kind"
+    );
+    let graphs = store.step_graphs(scope).await.expect(CASE);
+    assert_eq!(graphs.len(), 1, "{CASE}: one graph");
+    let graph = &graphs[0];
+    assert_eq!(
+        (graph.name.as_str(), graph.scope),
+        ("workspace", GraphScope::Project(scope)),
+        "{CASE}: the graph is the scope row's own"
+    );
+    assert_eq!(
+        kinds[0].default_graph_id, graph.id,
+        "{CASE}: the kind's default graph"
+    );
+    let phases = store.phases(graph.id).await.expect(CASE);
+    assert_eq!(
+        phases
+            .iter()
+            .map(|phase| (
+                phase.name.as_str(),
+                phase
+                    .input_kinds
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                phase.gate_hard
+            ))
+            .collect::<Vec<_>>(),
+        [("plan", vec![], false), ("review", vec!["plan"], true)],
+        "{CASE}: plan then a hard review"
+    );
+    let edges = store.graph_edges(graph.id).await.expect(CASE);
+    assert_eq!(edges.len(), 2, "{CASE}: two default edges");
+    assert_eq!(
+        edge_shape(&edges),
+        edge_shape(&seed::default_edges(&phases, EdgeId::new)),
+        "{CASE}: the default edges, in order"
+    );
+    let reach = store
+        .delete_reach(DeleteTarget::Project(scope))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the scope row has a reach"));
+    assert_eq!(
+        (
+            reach.item_kinds,
+            reach.step_graphs,
+            reach.phases,
+            reach.prompt_templates,
+            reach.items,
+            reach.workspace_links,
+        ),
+        (1, 1, 2, 10, 0, 0),
+        "{CASE}: the seed, and nothing else"
+    );
+}
+
+/// MOD-147 D5: the scope row mints `WS` keys under its own counter; a member project's counter
+/// does not move.
+async fn scope_row_mints_ws_keys<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_mints_ws_keys";
+    let mut minted = Vec::new();
+    for title in ["first", "second"] {
+        minted.push(
+            store
+                .mint_item(new_item(
+                    ids::PROJECT_SCOPE_PLATFORM,
+                    ids::KIND_SCOPE_PLATFORM_WS,
+                    title,
+                ))
+                .await
+                .expect(CASE),
+        );
+    }
+    assert_eq!(
+        minted
+            .iter()
+            .map(|item| (item.key.as_str(), item.project_id))
+            .collect::<Vec<_>>(),
+        [
+            ("WS-1", ids::PROJECT_SCOPE_PLATFORM),
+            ("WS-2", ids::PROJECT_SCOPE_PLATFORM),
+        ],
+        "{CASE}: WS keys on the scope row"
+    );
+    let mut listed: Vec<ItemId> = store
+        .items(
+            &Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_SCOPE_PLATFORM],
+            },
+            &ItemFilter::default(),
+        )
+        .await
+        .expect(CASE)
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    listed.sort();
+    let mut want: Vec<ItemId> = minted.iter().map(|item| item.id).collect();
+    want.sort();
+    assert_eq!(listed, want, "{CASE}: a scope naming the row lists both");
+    let feat = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "member"))
+        .await
+        .expect(CASE);
+    assert_eq!(feat.key, "FEAT-4", "{CASE}: htui's counter is its own");
+}
+
+/// MOD-147 D2: owner documents version per `(owner, kind)`; an unknown owner is `NotFound`, a
+/// reused id (owner or item document) is refused, and a project's delete reach counts its owner
+/// documents (V7).
+async fn owner_document_versions_per_owner_and_kind<S: WriteStore>(store: &S) {
+    const CASE: &str = "owner_document_versions_per_owner_and_kind";
+    let before = htui_documents_reach(CASE, store).await;
+
+    let mut versions = Vec::new();
+    for (project, kind) in [
+        (ids::PROJECT_HTUI, "overview"),
+        (ids::PROJECT_HTUI, "overview"),
+        (ids::PROJECT_HTUI, "goals"),
+        (ids::PROJECT_SCOPE_PLATFORM, "goals"),
+    ] {
+        let new = new_owner_document(project, kind);
+        let written = store.write_owner_document(new.clone()).await.expect(CASE);
+        assert_eq!(
+            (
+                written.id,
+                written.project_id,
+                written.kind.as_str(),
+                written.title.as_str(),
+                written.body.as_str(),
+                written.produced_by_step_id,
+                written.created_by,
+            ),
+            (
+                new.id,
+                project,
+                kind,
+                new.title.as_str(),
+                new.body.as_str(),
+                None,
+                ids::USER,
+            ),
+            "{CASE}: the row carries the request"
+        );
+        versions.push(written.version);
+    }
+    assert_eq!(versions, [1, 2, 1, 1], "{CASE}: per owner and kind");
+
+    not_found_on(
+        CASE,
+        store
+            .write_owner_document(new_owner_document(ProjectId::new(), "goals"))
+            .await,
+        "project",
+        "an unknown owner",
+    );
+    for reused in [
+        store.owner_documents(ids::PROJECT_HTUI).await.expect(CASE)[0].id,
+        ids::DOC_FEAT_1_PLAN_V1,
+    ] {
+        let mut new = new_owner_document(ids::PROJECT_HTUI, "goals");
+        new.id = reused;
+        let refused = store.write_owner_document(new).await;
+        assert!(
+            matches!(refused, Err(StoreError::Constraint(_))),
+            "{CASE}: a reused id `{reused}` is refused, got {refused:?}"
+        );
+    }
+    let mut stranger = new_owner_document(ids::PROJECT_HTUI, "goals");
+    stranger.created_by = UserId::new();
+    let refused = store.write_owner_document(stranger).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown author is refused, got {refused:?}"
+    );
+    assert_eq!(
+        htui_documents_reach(CASE, store).await,
+        before + 3,
+        "{CASE}: htui's reach counts its three owner documents"
+    );
+}
+
+/// MOD-147 D2: `owner_documents` answers the owner's documents only, `(kind bytes, version)`
+/// ordered, never an item document; empty for an unknown project.
+async fn owner_documents_exclude_item_documents<S: WriteStore>(store: &S) {
+    const CASE: &str = "owner_documents_exclude_item_documents";
+    let b = store
+        .write_owner_document(new_owner_document(ids::PROJECT_HTUI, "b"))
+        .await
+        .expect(CASE);
+    let a = store
+        .write_owner_document(new_owner_document(ids::PROJECT_HTUI, "a"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.owner_documents(ids::PROJECT_HTUI).await.expect(CASE),
+        [a, b],
+        "{CASE}: exactly the two, in kind byte order"
+    );
+    assert!(
+        store
+            .owner_documents(ids::PROJECT_AGY)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: another project's owner documents are its own"
+    );
+    assert!(
+        store
+            .owner_documents(ProjectId::new())
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: an unknown project has none"
+    );
+}
+
+/// MOD-147 D2, V5: no item-document reader answers an owner document, and an owner document of
+/// the item's kind does not move the item's version.
+async fn item_documents_exclude_owner_documents<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_documents_exclude_owner_documents";
+    let heads = store.documents(ids::HTUI_FEAT_1).await.expect(CASE);
+    let owner = store
+        .write_owner_document(new_owner_document(ids::PROJECT_HTUI, "plan"))
+        .await
+        .expect(CASE);
+    assert_eq!(owner.version, 1, "{CASE}: the owner's first plan");
+    assert_eq!(
+        store.documents(ids::HTUI_FEAT_1).await.expect(CASE),
+        heads,
+        "{CASE}: the item's documents are unchanged"
+    );
+    assert_eq!(
+        store
+            .documents_of_kinds(ids::HTUI_FEAT_1, &["plan".to_owned()])
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        [ids::DOC_FEAT_1_PLAN_V2],
+        "{CASE}: the item's latest plan"
+    );
+    assert_eq!(
+        store.document(owner.id).await.expect(CASE),
+        None,
+        "{CASE}: `document` answers item documents only"
+    );
+    let next = store
+        .write_document(new_document(ids::HTUI_FEAT_1, "plan", None))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        next.version, 3,
+        "{CASE}: the item's versions ignore the owner's"
+    );
+    assert_eq!(
+        store.owner_documents(ids::PROJECT_HTUI).await.expect(CASE),
+        [owner],
+        "{CASE}: and the owner's ignore the item's"
+    );
+}
+
+/// MOD-147 D7: a workspace's slug or name edit renames its scope row in the same write; a stale
+/// edit and a description-only edit leave it alone.
+async fn workspace_rename_renames_its_scope_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_rename_renames_its_scope_row";
+    let workspace = store
+        .create_workspace(new_workspace("before"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let original = project_of(CASE, store, scope).await;
+
+    let edited = applied(
+        CASE,
+        store
+            .update_workspace(
+                workspace.id,
+                workspace.updated_at,
+                WorkspacePatch {
+                    slug: Some("after".to_owned()),
+                    name: Some("After".to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    let renamed = project_of(CASE, store, scope).await;
+    assert_eq!(
+        (renamed.slug.as_str(), renamed.name.as_str()),
+        ("@after", "After"),
+        "{CASE}: the scope row follows"
+    );
+    assert_ne!(
+        renamed.updated_at, original.updated_at,
+        "{CASE}: the scope row's token moved"
+    );
+
+    stale(
+        CASE,
+        store
+            .update_workspace(
+                workspace.id,
+                workspace.updated_at,
+                WorkspacePatch {
+                    slug: Some("stale".to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        project_of(CASE, store, scope).await,
+        renamed,
+        "{CASE}: a stale edit changes nothing"
+    );
+    applied(
+        CASE,
+        store
+            .update_workspace(
+                workspace.id,
+                edited.updated_at,
+                WorkspacePatch {
+                    description: Some("Only the description".to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        project_of(CASE, store, scope).await,
+        renamed,
+        "{CASE}: a description edit leaves the scope row alone"
+    );
+    assert_eq!(
+        store.scope_project(workspace.id).await.expect(CASE),
+        Some(scope),
+        "{CASE}: the same scope row"
+    );
+}
+
+/// MOD-147 A1 (R1 M2): a live run of the scope row — `queued`, `running`, `awaiting_approval` or
+/// `stopped`, exactly [`RunStatus::is_active`] — refuses the workspace delete, naming the count,
+/// and nothing goes; a finished run (`done`, `failed`, `cancelled`) does not refuse, and goes with
+/// the workspace, counted. Every status of [`RunStatus::ALL`] is walked, so the case also pins
+/// each store's live set (Postgres spells it as a SQL literal) to `is_active`.
+async fn workspace_delete_refuses_while_a_scope_row_run_is_live<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_refuses_while_a_scope_row_run_is_live";
+    let workspace = store
+        .create_workspace(new_workspace("busy"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let kind = ws_kind_of(CASE, store, scope).await;
+    let item = store
+        .mint_item(new_item(scope, kind, "spans the workspace"))
+        .await
+        .expect(CASE);
+    let item_id = item.id;
+    let at = seam_clock();
+    // One run at a time (an item holds one live run): walk it to `to` from `queued`.
+    let run_to = |to: RunStatus| async move {
+        let run = store
+            .create_run(new_run(scope, item_id, Vec::new()))
+            .await
+            .unwrap_or_else(|error| panic!("{CASE}: a run to {to} is created: {error}"))
+            .id;
+        let walk: &[(RunStatus, RunStatus)] = match to {
+            RunStatus::Queued | RunStatus::Failed | RunStatus::Cancelled => &[],
+            RunStatus::Running | RunStatus::Done => &[(RunStatus::Queued, RunStatus::Running)],
+            RunStatus::AwaitingApproval => &[
+                (RunStatus::Queued, RunStatus::Running),
+                (RunStatus::Running, RunStatus::AwaitingApproval),
+            ],
+            RunStatus::Stopped => &[
+                (RunStatus::Queued, RunStatus::Running),
+                (RunStatus::Running, RunStatus::Stopped),
+            ],
+        };
+        for &(from, next) in walk {
+            assert!(
+                store.transition_run(run, from, next, at).await.expect(CASE),
+                "{CASE}: run {from} -> {next}"
+            );
+        }
+        if to.is_terminal() {
+            let failure = matches!(to, RunStatus::Failed).then_some("boom");
+            store.finish_run(run, to, failure, at).await.expect(CASE);
+        }
+        run
+    };
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+
+    let mut runs = Vec::new();
+    for live in RunStatus::ALL
+        .iter()
+        .copied()
+        .filter(|status| status.is_active())
+    {
+        let run = run_to(live).await;
+        runs.push(run);
+        assert_eq!(
+            store.delete_workspace(workspace.id).await,
+            Err(StoreError::Constraint(workspace_has_live_run("busy", 1))),
+            "{CASE}: a {live} run refuses"
+        );
+        assert!(
+            store.workspace(workspace.id).await.expect(CASE).is_some(),
+            "{CASE}: the workspace is still there under a {live} run"
+        );
+        assert_eq!(
+            store.scope_project(workspace.id).await.expect(CASE),
+            Some(scope),
+            "{CASE}: and its scope row"
+        );
+        assert!(
+            store.item(item.id).await.expect(CASE).is_some(),
+            "{CASE}: and its item"
+        );
+        assert_eq!(
+            store
+                .delete_reach(DeleteTarget::Workspace(workspace.id))
+                .await
+                .expect(CASE)
+                .map(|now| (now.items, now.runs)),
+            Some((reach.items, runs.len() as u64)),
+            "{CASE}: nothing was deleted under a {live} run"
+        );
+        store
+            .finish_run(run, RunStatus::Cancelled, None, at)
+            .await
+            .expect(CASE);
+    }
+    // The finished statuses: none of them refuses, so all of them are in place before the one
+    // delete that goes through.
+    for finished in RunStatus::ALL
+        .iter()
+        .copied()
+        .filter(|status| status.is_terminal())
+    {
+        runs.push(run_to(finished).await);
+    }
+
+    let done = store.delete_workspace(workspace.id).await.expect(CASE);
+    assert_eq!(
+        (done.items, done.runs),
+        (1, runs.len() as u64),
+        "{CASE}: the finished runs and their item went with the workspace"
+    );
+    for run in runs {
+        assert!(
+            store.run(run).await.expect(CASE).is_none(),
+            "{CASE}: run {run} is gone"
+        );
+    }
+}
+
+/// MOD-147 A1: a workspace delete takes its scope row and everything the scope row owns, counted
+/// before the act and reported by it (PRD D13).
+async fn workspace_delete_cascades_its_scope_row_with_counts<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_cascades_its_scope_row_with_counts";
+    let workspace = store
+        .create_workspace(new_workspace("full"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let kind = ws_kind_of(CASE, store, scope).await;
+    let item = store
+        .mint_item(new_item(scope, kind, "spans the workspace"))
+        .await
+        .expect(CASE);
+    store
+        .write_owner_document(new_owner_document(scope, "goals"))
+        .await
+        .expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+    assert_eq!(
+        reach,
+        scope_seed_reach()
+            + DeleteReach {
+                items: 1,
+                item_key_counters: 1,
+                revisions: 1,
+                documents: 1,
+                ..DeleteReach::default()
+            },
+        "{CASE}: the seed, the item with its counter and revision, the owner document"
+    );
+    assert_eq!(
+        store.delete_workspace(workspace.id).await.expect(CASE),
+        reach,
+        "{CASE}: the report equals the act (PRD D13)"
+    );
+    assert_eq!(
+        store.project(scope).await.expect(CASE),
+        None,
+        "{CASE}: the scope row is gone"
+    );
+    assert!(
+        store.item(item.id).await.expect(CASE).is_none(),
+        "{CASE}: its item is gone"
+    );
+    assert!(
+        store.owner_documents(scope).await.expect(CASE).is_empty(),
+        "{CASE}: its owner document is gone"
+    );
+    assert!(
+        store.item_kinds(scope).await.expect(CASE).is_empty()
+            && store.step_graphs(scope).await.expect(CASE).is_empty(),
+        "{CASE}: its seed is gone"
+    );
+    assert_eq!(
+        store.scope_project(workspace.id).await.expect(CASE),
+        None,
+        "{CASE}: no scope row is left"
+    );
+}
+
+/// MOD-147 A2: a scope row is deleted with its workspace and never alone; its reach still answers
+/// (read-only).
+async fn scope_row_cannot_be_deleted_alone<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_cannot_be_deleted_alone";
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_SCOPE_PLATFORM))
+        .await
+        .expect(CASE);
+    assert!(reach.is_some(), "{CASE}: the reach answers");
+    assert_eq!(
+        store.delete_project(ids::PROJECT_SCOPE_PLATFORM).await,
+        Err(StoreError::Constraint(
+            scope_row_is_deleted_with_its_workspace("@platform")
+        )),
+        "{CASE}: refused"
+    );
+    assert!(
+        store
+            .project(ids::PROJECT_SCOPE_PLATFORM)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the scope row is still there"
+    );
+    assert_eq!(
+        store
+            .delete_reach(DeleteTarget::Project(ids::PROJECT_SCOPE_PLATFORM))
+            .await
+            .expect(CASE),
+        reach,
+        "{CASE}: nothing was deleted"
+    );
+    assert_eq!(
+        store
+            .scope_project(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect(CASE),
+        Some(ids::PROJECT_SCOPE_PLATFORM),
+        "{CASE}: Platform keeps its scope row"
     );
 }
 

@@ -2031,7 +2031,6 @@ fn deleted_notice(prefix: Option<&str>, mirror: &MirrorAfterDelete) -> String {
     let mirror = match mirror {
         MirrorAfterDelete::Rebuilt => "mirror rebuilt".to_owned(),
         MirrorAfterDelete::NoMirror => "no mirror".to_owned(),
-        MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
         MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
     };
     match prefix {

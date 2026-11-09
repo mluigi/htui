@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        234,
+        248,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -76,7 +76,9 @@ async fn demo_store_loads_the_fixture() {
          for a kind's kept graph (A7), and MOD-144's nine for the item status reduction (ANA-35 §7.1) \
          and its review round's one for `block_if_idle` (R1 M1), and MOD-138 M2's one for the \
          closed `if` set (plan D4, W4) and its three for `record_branch` (plan D5, Q-A), and \
-         MOD-138 M3's one for W5, a back `asks_you` beside another `asks_you` (plan D8, Q-3)"
+         MOD-138 M3's one for W5, a back `asks_you` beside another `asks_you` (plan D8, Q-3), \
+         and MOD-147 M1's fourteen for the workspace scope row and owner documents (plan D1-D9, \
+         amendments A1, A2)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

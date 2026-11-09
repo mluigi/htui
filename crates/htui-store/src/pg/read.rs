@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use htui_core::model::OwnerDocument;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -48,8 +49,8 @@ use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow,
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
 /// The `status IN (...)` list of a live run (MOD-125 D2, MOD-144 Δ2) that `waiting_candidates`,
-/// `create_run`, `close_out` and 0024's `uq_run_item_live` spell out, because `query!` needs a
-/// literal and cannot read a Rust constant.
+/// `create_run`, `close_out`, `delete_workspace_once` (MOD-147 A1) and 0024's `uq_run_item_live`
+/// spell out, because `query!` needs a literal and cannot read a Rust constant.
 ///
 /// Test-only: the query text is the real definition, and
 /// `live_runs_literal_matches_run_status` is what keeps it honest against
@@ -306,7 +307,7 @@ impl ReadStore for PgStore {
             DocumentHead,
             r#"
             SELECT id                  AS "id: htui_core::model::DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -522,7 +523,7 @@ impl ReadStore for PgStore {
             Document,
             r#"
             SELECT id                  AS "id: DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -530,7 +531,7 @@ impl ReadStore for PgStore {
                    produced_by_step_id AS "produced_by_step_id: StepId",
                    created_by          AS "created_by: htui_core::model::UserId",
                    created_at
-              FROM document WHERE id = $1
+              FROM document WHERE id = $1 AND item_id IS NOT NULL
             "#,
             id.as_uuid(),
         )
@@ -553,7 +554,7 @@ impl ReadStore for PgStore {
             r#"
             SELECT DISTINCT ON (kind)
                    id                  AS "id: DocumentId",
-                   item_id             AS "item_id: ItemId",
+                   item_id             AS "item_id!: ItemId",
                    kind,
                    version,
                    title,
@@ -689,6 +690,7 @@ impl ReadStore for PgStore {
                    name,
                    description,
                    type            AS project_type,
+                   owner_workspace_id AS "owner_workspace_id: WorkspaceId",
                    secret_provider,
                    secret_scope,
                    settings,
@@ -1154,6 +1156,37 @@ impl ReadStore for PgStore {
         .fetch_all(&self.pool)
         .await
         .map(Some)
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-147 D1: the workspace's scope row, by `owner_workspace_id` (unique).
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        crate::pg::write::scope_row_id(&self.pool, workspace).await
+    }
+
+    /// MOD-147 D2: the project's owner documents (`item_id IS NULL`), bodies included, in
+    /// `(kind bytes, version)` order — `COLLATE "C"`, as `MemStore` and the mirror sort bytes.
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
+        sqlx::query_as!(
+            OwnerDocument,
+            r#"
+            SELECT id                  AS "id: DocumentId",
+                   project_id          AS "project_id: ProjectId",
+                   kind,
+                   version,
+                   title,
+                   body,
+                   produced_by_step_id AS "produced_by_step_id: StepId",
+                   created_by          AS "created_by: UserId",
+                   created_at
+              FROM document
+             WHERE project_id = $1 AND item_id IS NULL
+             ORDER BY kind COLLATE "C", version
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
         .map_err(map_sqlx)
     }
 
@@ -2872,7 +2905,7 @@ impl PgStore {
             r#"
             SELECT workspace_id AS "workspace_id: WorkspaceId",
                    box_id       AS "box_id: BoxId",
-                   root_path,
+                   folder_path,
                    updated_at
               FROM workspace_box_path
              WHERE workspace_id = $1
@@ -3859,6 +3892,54 @@ mod tests {
             LIVE_RUN_STATUSES.to_vec(),
             "the `status IN (...)` literal of `waiting_candidates` and `RunStatus::is_active` must \
              agree"
+        );
+    }
+
+    /// The `r.status IN (...)` filter `LIVE_RUN_STATUSES` spells: quoted, comma-spaced.
+    fn live_status_filter() -> String {
+        let literal = LIVE_RUN_STATUSES
+            .iter()
+            .map(|status| format!("'{status}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("r.status IN ({literal})")
+    }
+
+    /// Whether `delete_workspace_once`'s body in `src` counts live runs with `filter`. Only
+    /// the method's own body counts: the queue_batch drain in `write.rs` spells the same filter.
+    fn delete_workspace_once_counts(src: &str, filter: &str) -> bool {
+        let start = src
+            .find("async fn delete_workspace_once(")
+            .expect("`delete_workspace_once` is in write.rs");
+        let body = &src[start..];
+        // The method's closing brace is the first one back at the impl's 4-space indent.
+        let end = body
+            .find("\n    }\n")
+            .expect("`delete_workspace_once` closes");
+        body[..end].contains(filter)
+    }
+
+    /// MOD-147 M1 R1 (M2): `delete_workspace_once`'s scope-row live-run count spells the same
+    /// list, quoted and comma-spaced, so a status added to `RunStatus::is_active` fails here
+    /// before a stopped run's workspace can be deleted under it.
+    #[test]
+    fn delete_workspace_live_literal_matches_run_status() {
+        let filter = live_status_filter();
+        let src = include_str!("write.rs");
+        assert!(
+            delete_workspace_once_counts(src, &filter),
+            "`delete_workspace_once` must count runs with `{filter}`"
+        );
+        // Negative control: the same filter elsewhere in `write.rs` (the queue_batch drain)
+        // must not satisfy the check once `delete_workspace_once`'s own list drifts.
+        let start = src
+            .find("async fn delete_workspace_once(")
+            .expect("`delete_workspace_once` is in write.rs");
+        let drifted_body = src[start..].replacen(&filter, "r.status IN ('queued')", 1);
+        let drifted = format!("{}{drifted_body}", &src[..start]);
+        assert!(
+            !delete_workspace_once_counts(&drifted, &filter),
+            "a drifted `delete_workspace_once` list must fail the check"
         );
     }
 

@@ -1,5 +1,7 @@
 //! Workspaces, projects, repositories and their per-box paths (`docs/ANA-9.md` §5.3).
 
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,6 +68,11 @@ pub struct Project {
     /// `project.type`: the slug of the [`ProjectType`] the project was created as (MOD-146 D2).
     /// `software` for every project until MOD-148's picker chooses one.
     pub project_type: String,
+    /// `project.owner_workspace_id` (MOD-147 D9): `Some` only on a workspace's scope row, whose
+    /// `project_type` is `workspace` and whose slug is `@<workspace slug>` (`chk_project_scope_row`,
+    /// `chk_project_scope_slug`). A scope row joins no workspace and is in no project list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_workspace_id: Option<WorkspaceId>,
     /// `project.secret_provider`, e.g. `infisical`.
     pub secret_provider: Option<String>,
     /// `project.secret_scope`: provider-specific project/environment reference.
@@ -242,10 +249,39 @@ pub struct WorkspaceBoxPath {
     pub workspace_id: WorkspaceId,
     /// `workspace_box_path.box_id`.
     pub box_id: BoxId,
-    /// `workspace_box_path.root_path`.
-    pub root_path: String,
+    /// `workspace_box_path.folder_path` (MOD-147 D8): the workspace's folder on this box.
+    pub folder_path: String,
     /// `workspace_box_path.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+/// The directory under the home directory that holds the default workspace folders (ANA-35 §7.5).
+pub const WORKSPACES_DIR: &str = "workspaces";
+
+/// MOD-147 D8: workspace `slug`'s folder on one box — `row.folder_path` when the box has a
+/// `workspace_box_path` row, else `<home>/workspaces/<slug>`. Pure: no I/O, no canonicalisation;
+/// the caller resolves `home` (htui reads `dirs::home_dir()`) and canonicalises the answer.
+///
+/// `None` when there is no row and `slug` is not exactly one plain name (MOD-147 M1 R1): slugs
+/// are free text, and under `Path::join` an absolute slug (`/`, `/srv`) replaces the base, `..`
+/// climbs out of it and a separator nests below it, so none of them may name a folder to walk.
+#[must_use]
+pub fn workspace_folder(
+    slug: &str,
+    row: Option<&WorkspaceBoxPath>,
+    home: &Path,
+) -> Option<PathBuf> {
+    match row {
+        Some(row) => Some(PathBuf::from(&row.folder_path)),
+        None => {
+            let mut parts = Path::new(slug).components();
+            let one_name = matches!(
+                (parts.next(), parts.next()),
+                (Some(std::path::Component::Normal(name)), None) if name == slug
+            );
+            one_name.then(|| home.join(WORKSPACES_DIR).join(slug))
+        }
+    }
 }
 
 /// Join of `workspace_project` and `project`, ordered by position. Not a table.
@@ -278,6 +314,49 @@ pub struct WorkspaceSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MOD-147 D8: with no `workspace_box_path` row a workspace's folder is
+    /// `<home>/workspaces/<slug>`; a row's `folder_path` wins, verbatim.
+    #[test]
+    fn workspace_folder_defaults_under_home() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            workspace_folder("graphics", None, home),
+            Some(PathBuf::from("/home/someone/workspaces/graphics"))
+        );
+        let row = WorkspaceBoxPath {
+            workspace_id: WorkspaceId::new(),
+            box_id: BoxId::new(),
+            folder_path: "/srv/graphics".to_owned(),
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        assert_eq!(
+            workspace_folder("graphics", Some(&row), home),
+            Some(PathBuf::from("/srv/graphics"))
+        );
+    }
+
+    /// MOD-147 M1 R1: a workspace slug is free text, but only one plain name becomes a default
+    /// folder. An absolute slug would replace `<home>/workspaces` under `Path::join`, `..` would
+    /// climb out of it and a separator would nest; each answers `None` (infer walks nothing). A
+    /// row's `folder_path` still wins whatever the slug.
+    #[test]
+    fn workspace_folder_refuses_a_slug_that_is_not_one_name() {
+        let home = Path::new("/home/someone");
+        for slug in ["/", "/srv", "../x", "..", ".", "a/b", "a/", "./a", ""] {
+            assert_eq!(workspace_folder(slug, None, home), None, "slug {slug:?}");
+        }
+        let row = WorkspaceBoxPath {
+            workspace_id: WorkspaceId::new(),
+            box_id: BoxId::new(),
+            folder_path: "/srv/graphics".to_owned(),
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        assert_eq!(
+            workspace_folder("../x", Some(&row), home),
+            Some(PathBuf::from("/srv/graphics"))
+        );
+    }
 
     /// CLEAN-8 #2: `ProjectPatch.secret`'s three states survive a JSON round trip, as
     /// `PhasePatch.persona`'s do. An absent key keeps the scope (`None`), `null` clears it

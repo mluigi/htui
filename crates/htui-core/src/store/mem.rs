@@ -55,6 +55,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
+use crate::model::{NewOwnerDocument, OwnerDocument};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
@@ -90,6 +91,10 @@ use crate::store::traits::{
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     workspace_graph_is_held,
+};
+use crate::store::traits::{
+    project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
+    scope_row_slug_is_fixed, workspace_has_live_run,
 };
 use uuid::Uuid;
 
@@ -290,6 +295,9 @@ struct State {
     notes: Vec<Note>,
     /// `document`, bodies included.
     documents: Vec<Document>,
+    /// MOD-147 D2: the `document` rows with `item_id IS NULL`, a project's (or a scope row's)
+    /// own, kept apart from `documents` so no item-document reader can meet one.
+    owner_documents: Vec<OwnerDocument>,
     /// `run`.
     runs: HashMap<RunId, Run>,
     /// `run_step`.
@@ -440,6 +448,7 @@ impl MemStore {
             links: data.links,
             notes: data.notes,
             documents: data.documents,
+            owner_documents: Vec::new(),
             runs: data.runs.into_iter().map(|row| (row.id, row)).collect(),
             steps: data.steps.into_iter().map(|row| (row.id, row)).collect(),
             step_trees: BTreeMap::new(),
@@ -2956,6 +2965,9 @@ impl State {
         )))
     }
 
+    /// The workspace and its scope row (MOD-147 D7): `@<slug>`, type `workspace`, owned by the
+    /// workspace and seeded with [`seed::WORKSPACE_KIND`] and the ten templates. Validate, then
+    /// mutate, as [`Self::create_project`] does, so a refusal writes neither row.
     fn create_workspace(&mut self, new: NewWorkspace, now: DateTime<Utc>) -> Result<Workspace> {
         self.require_user(new.created_by, "workspace.created_by")?;
         if self.workspaces.contains_key(&new.id) {
@@ -2970,6 +2982,29 @@ impl State {
                 new.slug
             )));
         }
+        let scope_slug = seed::scope_row_slug(&new.slug);
+        // Unreachable while workspace slugs are unique and `@` slugs are reserved for scope rows
+        // (D3), kept as the mirror of Postgres's backstop: `project.slug`'s unique index answers
+        // `23505` for the scope row's insert (MOD-147 M1 R1).
+        if self.projects.values().any(|row| row.slug == scope_slug) {
+            return Err(StoreError::Constraint(format!(
+                "project.slug `{scope_slug}` is taken"
+            )));
+        }
+        let scope = Project {
+            id: ProjectId::new(),
+            slug: scope_slug,
+            name: new.name.clone(),
+            description: String::new(),
+            project_type: seed::SCOPE_ROW_TYPE.to_owned(),
+            owner_workspace_id: Some(new.id),
+            secret_provider: None,
+            secret_scope: None,
+            settings: Value::Object(serde_json::Map::new()),
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
         let row = Workspace {
             id: new.id,
             slug: new.slug,
@@ -2980,6 +3015,14 @@ impl State {
             updated_at: now,
         };
         self.workspaces.insert(row.id, row.clone());
+        let scope_id = scope.id;
+        self.projects.insert(scope_id, scope);
+        self.seed_project(
+            scope_id,
+            std::slice::from_ref(&seed::WORKSPACE_KIND),
+            row.created_by,
+            now,
+        );
         Ok(row)
     }
 
@@ -3012,6 +3055,7 @@ impl State {
                 "workspace.slug `{slug}` is taken"
             )));
         }
+        let renames = patch.slug.is_some() || patch.name.is_some();
         let row = self
             .workspaces
             .get_mut(&id)
@@ -3026,12 +3070,34 @@ impl State {
             row.description = description;
         }
         row.updated_at = now;
-        Ok(CasOutcome::Applied(row.clone()))
+        let row = row.clone();
+        // MOD-147 D7: a slug or name edit renames the scope row in the same write.
+        if renames
+            && let Some(scope) = self
+                .projects
+                .values_mut()
+                .find(|project| project.owner_workspace_id == Some(id))
+        {
+            scope.slug = seed::scope_row_slug(&row.slug);
+            scope.name.clone_from(&row.name);
+            scope.updated_at = now;
+        }
+        Ok(CasOutcome::Applied(row))
     }
 
     /// Inserts or repositions a link; the PK is `(workspace_id, project_id)` and there is no
-    /// `updated_at` to compare (D3).
+    /// `updated_at` to compare (D3). A scope row is refused first (MOD-147 D4), as Postgres's
+    /// pre-read refuses it.
     fn upsert_workspace_project(&mut self, link: &WorkspaceProject) -> Result<()> {
+        if let Some(scope) = self
+            .projects
+            .get(&link.project_id)
+            .filter(|row| row.owner_workspace_id.is_some())
+        {
+            return Err(StoreError::Constraint(scope_row_joins_no_workspace(
+                &scope.slug,
+            )));
+        }
         if !self.workspaces.contains_key(&link.workspace_id) {
             return Err(StoreError::Constraint(format!(
                 "workspace_project.workspace_id `{}` references no workspace",
@@ -3145,6 +3211,10 @@ impl State {
     /// leave a half-seeded project. `item_key_counter` is untouched; `mint` creates the row
     /// lazily. `settings` stays `{}`: `set_setting` is that column's only writer.
     fn create_project(&mut self, new: NewProject, now: DateTime<Utc>) -> Result<Project> {
+        // MOD-147 D3: `@` is a scope row's, judged before anything is read.
+        if let Some(refusal) = project_slug_refusal(&new.slug) {
+            return Err(StoreError::Constraint(refusal));
+        }
         self.require_user(new.created_by, "project.created_by")?;
         if self.projects.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
@@ -3166,6 +3236,7 @@ impl State {
             name: new.name,
             description: new.description,
             project_type: seed::DEFAULT_PROJECT_TYPE.to_owned(),
+            owner_workspace_id: None,
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
@@ -3175,8 +3246,22 @@ impl State {
         };
         let project_id = row.id;
         self.projects.insert(project_id, row.clone());
+        self.seed_project(project_id, &seed::KINDS, created_by, now);
+        Ok(row)
+    }
 
-        for (position, kind) in seed::KINDS.iter().enumerate() {
+    /// A project's seed (MOD-147 D5 parameterises the kinds): per kind its default graph, the
+    /// graph's phases and default edges (MOD-137 D9) and the kind at its index in `kinds`; then
+    /// all ten `DEFAULT_TEMPLATES` whatever `kinds` is. Infallible: the rows come from `seed`'s
+    /// self-consistent tables, so the callers validate before and call this last.
+    fn seed_project(
+        &mut self,
+        project_id: ProjectId,
+        kinds: &[seed::KindSeed],
+        created_by: UserId,
+        now: DateTime<Utc>,
+    ) {
+        for (position, kind) in kinds.iter().enumerate() {
             let graph = seed::graph_row(StepGraphId::new(), project_id, kind, now);
             let graph_id = graph.id;
             self.graphs.insert(graph_id, graph);
@@ -3213,8 +3298,6 @@ impl State {
                 now,
             ));
         }
-
-        Ok(row)
     }
 
     /// Compare-and-set on `project.updated_at`; `settings` is not this writer's (D8).
@@ -3225,6 +3308,10 @@ impl State {
         patch: ProjectPatch,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Project>> {
+        // MOD-147 D3: a `@` slug is refused before anything is read, as on create.
+        if let Some(refusal) = patch.slug.as_deref().and_then(project_slug_refusal) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let current = self
             .projects
             .get(&id)
@@ -3235,6 +3322,13 @@ impl State {
             })?;
         if current.updated_at != expected {
             return Ok(CasOutcome::Stale(current));
+        }
+        // MOD-147 D3: a scope row's slug follows its workspace's (Postgres's
+        // `chk_project_scope_slug` refuses any user-form slug on it).
+        if patch.slug.is_some() && current.owner_workspace_id.is_some() {
+            return Err(StoreError::Constraint(scope_row_slug_is_fixed(
+                &current.slug,
+            )));
         }
         if let Some(slug) = &patch.slug
             && self
@@ -5295,7 +5389,16 @@ impl State {
             return None;
         }
         let (graphs, phases) = self.workspace_graphs(id);
-        Some(self.workspace_reach_of(id, &graphs, &phases))
+        Some(self.workspace_reach_of(id, &graphs, &phases) + self.scope_row_reach(id))
+    }
+
+    /// MOD-147 A1: the workspace's scope row's whole project reach, which its delete takes and
+    /// counts; zero when it has none.
+    fn scope_row_reach(&self, id: WorkspaceId) -> DeleteReach {
+        self.scope_row_of(id)
+            .and_then(|scope| self.project_reach(scope))
+            .map(|(reach, _)| reach)
+            .unwrap_or_default()
     }
 
     /// [`Self::workspace_reach`] over [`Self::workspace_graphs`]'s sets, so `delete_workspace`
@@ -5496,11 +5599,17 @@ impl State {
                     })
                     .count(),
             ),
+            // MOD-147 V7: the project's owner documents go with it too.
             documents: rows(
                 self.documents
                     .iter()
                     .filter(|row| items.contains(&row.item_id))
-                    .count(),
+                    .count()
+                    + self
+                        .owner_documents
+                        .iter()
+                        .filter(|row| row.project_id == id)
+                        .count(),
             ),
             requirement_specs: rows(usize::from(self.requirement_specs.contains_key(&id))),
             requirement_areas: rows(requirement_areas.len()),
@@ -5551,8 +5660,8 @@ impl State {
         ))
     }
 
-    /// Removes a workspace, its links and its box paths. Projects survive it
-    /// (`0001_init.sql:162,174`).
+    /// Removes a workspace, its links and its box paths, and its scope row with everything the
+    /// scope row owns (MOD-147 A1). Member projects survive it (`0001_init.sql:162,174`).
     ///
     /// MOD-125 (blueprint F16) emulates `0019_stop_runs.sql`'s two foreign keys: the stop record
     /// goes with the workspace (`ON DELETE CASCADE`), and its runs and queue entries outlive it
@@ -5572,7 +5681,29 @@ impl State {
         if let Some(held) = self.workspace_graph_holder(&graphs) {
             return Err(StoreError::Constraint(held));
         }
-        let reach = self.workspace_reach_of(id, &graphs, &phases);
+        // MOD-147 A1: a live run of the scope row (`RunStatus::is_active`: queued, running,
+        // awaiting_approval or stopped, R1 M2) refuses; everything else it owns goes with it,
+        // counted. The scope row and its rows go first, by `remove_project` (A2's refusal is for
+        // a scope row deleted alone).
+        let scope = self.scope_row_of(id);
+        if let Some(scope) = scope {
+            let live = self
+                .runs
+                .values()
+                .filter(|run| run.project_id == scope && run.status.is_active())
+                .count();
+            if live > 0 {
+                let slug = &self.workspaces[&id].slug;
+                return Err(StoreError::Constraint(workspace_has_live_run(
+                    slug,
+                    rows(live),
+                )));
+            }
+        }
+        let mut reach = self.workspace_reach_of(id, &graphs, &phases);
+        if let Some(scope) = scope {
+            reach = reach + self.remove_project(scope, now)?;
+        }
         self.phase_agents
             .retain(|(phase, _), _| !phases.contains(phase));
         self.phase_parts
@@ -5612,7 +5743,25 @@ impl State {
     /// `item_link` goes when **either** end is the project's, tombstones included: that is what
     /// takes the fixture's cross-project edge from `agy:FEAT-1` to `htui:FEAT-2`, which no
     /// per-project predicate would have reached.
+    ///
+    /// MOD-147 A2: a scope row is refused before anything goes; it goes only with its workspace
+    /// ([`Self::delete_workspace`] calls [`Self::remove_project`] directly).
     fn delete_project(&mut self, id: ProjectId, now: DateTime<Utc>) -> Result<DeleteReach> {
+        if let Some(scope) = self
+            .projects
+            .get(&id)
+            .filter(|row| row.owner_workspace_id.is_some())
+        {
+            return Err(StoreError::Constraint(
+                scope_row_is_deleted_with_its_workspace(&scope.slug),
+            ));
+        }
+        self.remove_project(id, now)
+    }
+
+    /// [`Self::delete_project`]'s act, with no scope-row check: every row the project's reach
+    /// counted goes, and the reach is returned.
+    fn remove_project(&mut self, id: ProjectId, now: DateTime<Utc>) -> Result<DeleteReach> {
         let (reach, gone) = self.project_reach(id).ok_or_else(|| StoreError::NotFound {
             entity: "project",
             id: id.to_string(),
@@ -5650,6 +5799,7 @@ impl State {
             .retain(|id, _| run_commands.contains_key(id));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
+        self.owner_documents.retain(|row| row.project_id != id);
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
         self.revisions
             .retain(|(item, _), _| !gone.items.contains(item));
@@ -7226,10 +7376,17 @@ impl State {
         rows
     }
 
+    /// Whether any `document` row, item or owner (MOD-147 D2), has `id`: the one primary key
+    /// both kinds share on Postgres.
+    fn document_id_taken(&self, id: DocumentId) -> bool {
+        self.documents.iter().any(|row| row.id == id)
+            || self.owner_documents.iter().any(|row| row.id == id)
+    }
+
     /// The document at `max(version) + 1` for its `(item, kind)` (plan D6).
     fn write_document(&mut self, new: NewDocument) -> Result<Document> {
         self.require_item(new.item_id)?;
-        if self.documents.iter().any(|row| row.id == new.id) {
+        if self.document_id_taken(new.id) {
             return Err(StoreError::Constraint(already_exists("document", new.id)));
         }
         self.require_user(new.created_by, "document.created_by")?;
@@ -7263,6 +7420,67 @@ impl State {
         };
         self.documents.push(row.clone());
         Ok(row)
+    }
+
+    /// MOD-147 D2: an owner document at `max(version) + 1` for its `(project, kind)` among the
+    /// project's owner documents; item documents never move the count. Validate, then push.
+    fn write_owner_document(&mut self, new: NewOwnerDocument) -> Result<OwnerDocument> {
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: new.project_id.to_string(),
+            });
+        }
+        if self.document_id_taken(new.id) {
+            return Err(StoreError::Constraint(already_exists("document", new.id)));
+        }
+        self.require_user(new.created_by, "document.created_by")?;
+        let version = self
+            .owner_documents
+            .iter()
+            .filter(|row| row.project_id == new.project_id && row.kind == new.kind)
+            .map(|row| row.version)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = OwnerDocument {
+            id: new.id,
+            project_id: new.project_id,
+            kind: new.kind,
+            version,
+            title: new.title,
+            body: new.body,
+            produced_by_step_id: None,
+            created_by: new.created_by,
+            created_at: new.created_at,
+        };
+        self.owner_documents.push(row.clone());
+        Ok(row)
+    }
+
+    /// MOD-147 D2: the project's owner documents in `(kind bytes, version)` order.
+    fn owner_document_rows(&self, project: ProjectId) -> Vec<OwnerDocument> {
+        let mut rows: Vec<OwnerDocument> = self
+            .owner_documents
+            .iter()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.kind
+                .as_bytes()
+                .cmp(right.kind.as_bytes())
+                .then(left.version.cmp(&right.version))
+        });
+        rows
+    }
+
+    /// MOD-147 D1: the workspace's scope row, the one project it owns.
+    fn scope_row_of(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+        self.projects
+            .values()
+            .find(|row| row.owner_workspace_id == Some(workspace))
+            .map(|row| row.id)
     }
 
     /// MOD-37 M5: the step's opening, replacing any earlier one; the step's `updated_at` moves.
@@ -9475,6 +9693,14 @@ impl ReadStore for MemStore {
     async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
         Ok(Some(self.read(|state| state.memory_revision_rows(id))))
     }
+
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        Ok(self.read(|state| state.scope_row_of(workspace)))
+    }
+
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
+        Ok(self.read(|state| state.owner_document_rows(project)))
+    }
 }
 
 impl WriteStore for MemStore {
@@ -10172,6 +10398,10 @@ impl WriteStore for MemStore {
         self.write(|state| state.write_document(new))
     }
 
+    async fn write_owner_document(&self, new: NewOwnerDocument) -> Result<OwnerDocument> {
+        self.write(|state| state.write_owner_document(new))
+    }
+
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         let now = self.now();
         self.write(|state| state.promote_step(step, at, now))
@@ -10614,6 +10844,46 @@ mod tests {
     use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-147 V3: the two inherent listers read through membership, so neither lists a scope
+    /// row — not even when a caller's scope names one (the conformance suite cannot reach these,
+    /// they are not on `WriteStore`).
+    #[tokio::test]
+    async fn workspaces_and_projects_never_list_a_scope_row() {
+        let store = MemStore::demo();
+        let scope_rows = [ids::PROJECT_SCOPE_PLATFORM, ids::PROJECT_SCOPE_GRAPHICS];
+        let summaries = store.workspaces().await.expect("workspaces");
+        assert_eq!(summaries.len(), 2, "Platform and Graphics");
+        for summary in &summaries {
+            assert!(
+                summary
+                    .projects
+                    .iter()
+                    .all(|project| !scope_rows.contains(&project.project_id)),
+                "`{}` lists no scope row",
+                summary.slug
+            );
+        }
+        let projects = store
+            .projects(&Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![
+                    ids::PROJECT_HTUI,
+                    ids::PROJECT_AGY,
+                    ids::PROJECT_SCOPE_PLATFORM,
+                ],
+            })
+            .await
+            .expect("projects");
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.project_id)
+                .collect::<Vec<_>>(),
+            [ids::PROJECT_HTUI, ids::PROJECT_AGY],
+            "a scope naming the scope row still lists the members only"
+        );
+    }
 
     /// MOD-158 R1 (A-L6): under a clock that does not move, a write still moves the `qdrant_url`
     /// token past the old one, so a spent token never matches the row again.

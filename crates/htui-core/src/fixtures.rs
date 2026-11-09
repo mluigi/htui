@@ -30,7 +30,7 @@ use crate::model::{
     Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges, SessionEvent, Skill,
     SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
     SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
-    StepStatus, Workspace, WorkspaceProject,
+    StepStatus, Workspace, WorkspaceId, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -198,6 +198,22 @@ pub mod ids {
         KIND_VULKAN_CLEAN: ItemKindId = (class::ITEM_KIND, 13),
         /// `item_kind` `TOOL` of `vulkan-tutorials`.
         KIND_VULKAN_TOOL: ItemKindId = (class::ITEM_KIND, 14),
+    );
+
+    demo_ids!(
+        /// `project` `@platform`, workspace `Platform`'s scope row (MOD-147), in the scope rows'
+        /// own id block ([`super::SCOPE_BLOCK`]).
+        PROJECT_SCOPE_PLATFORM: ProjectId = (class::PROJECT, 200),
+        /// `project` `@graphics`, workspace `Graphics`'s scope row (MOD-147).
+        PROJECT_SCOPE_GRAPHICS: ProjectId = (class::PROJECT, 201),
+        /// `item_kind` `WS` of `@platform`.
+        KIND_SCOPE_PLATFORM_WS: ItemKindId = (class::ITEM_KIND, 200),
+        /// `item_kind` `WS` of `@graphics`.
+        KIND_SCOPE_GRAPHICS_WS: ItemKindId = (class::ITEM_KIND, 201),
+        /// Default `step_graph` of `WS` in `@platform`.
+        GRAPH_SCOPE_PLATFORM_WS: StepGraphId = (class::STEP_GRAPH, 200),
+        /// Default `step_graph` of `WS` in `@graphics`.
+        GRAPH_SCOPE_GRAPHICS_WS: StepGraphId = (class::STEP_GRAPH, 201),
     );
 
     demo_ids!(
@@ -746,8 +762,47 @@ const PROJECT_SPECS: [(ProjectId, &str, &str, &str); 3] = [
     ),
 ];
 
-/// `project` (§5.3).
+/// `(workspace, scope row, workspace slug, workspace name)` of the two demo scope rows (MOD-147),
+/// in `demo_uuid` order.
+const SCOPE_SPECS: [(WorkspaceId, ProjectId, &str, &str); 2] = [
+    (
+        ids::WORKSPACE_PLATFORM,
+        ids::PROJECT_SCOPE_PLATFORM,
+        "platform",
+        "Platform",
+    ),
+    (
+        ids::WORKSPACE_GRAPHICS,
+        ids::PROJECT_SCOPE_GRAPHICS,
+        "graphics",
+        "Graphics",
+    ),
+];
+
+/// First `n` of the scope rows' id block (MOD-147): above every per-project stride (the highest
+/// is the phases', 45 for three projects), so no project's rows reach it.
+const SCOPE_BLOCK: u8 = 200;
+
+/// `project` (§5.3): the three demo projects, then the two workspaces' scope rows (MOD-147), as
+/// `create_workspace` writes one — `@<slug>`, the workspace's name, type `workspace`, `{}`
+/// settings, no secret.
 fn projects() -> Vec<Project> {
+    let scope_rows = SCOPE_SPECS
+        .iter()
+        .map(|(workspace, id, slug, name)| Project {
+            id: *id,
+            slug: seed::scope_row_slug(slug),
+            name: (*name).to_owned(),
+            description: String::new(),
+            project_type: seed::SCOPE_ROW_TYPE.to_owned(),
+            owner_workspace_id: Some(*workspace),
+            secret_provider: None,
+            secret_scope: None,
+            settings: json!({}),
+            created_by: ids::USER,
+            created_at: epoch(),
+            updated_at: epoch(),
+        });
     PROJECT_SPECS
         .iter()
         .map(|(id, slug, name, description)| Project {
@@ -756,6 +811,7 @@ fn projects() -> Vec<Project> {
             name: (*name).to_owned(),
             description: (*description).to_owned(),
             project_type: seed::DEFAULT_PROJECT_TYPE.to_owned(),
+            owner_workspace_id: None,
             secret_provider: None,
             secret_scope: None,
             settings: json!({
@@ -767,6 +823,7 @@ fn projects() -> Vec<Project> {
             created_at: epoch(),
             updated_at: epoch(),
         })
+        .chain(scope_rows)
         .collect()
 }
 
@@ -793,6 +850,12 @@ type Catalogue = (
 /// `(class, n)`, so a stride below the number of rows per project hands project *i*'s first row
 /// the id project *i−1*'s late rows already hold, and `load_demo` fails on the second insert
 /// (blueprint E-5, when the template stride was `8` for eight names).
+///
+/// The two workspaces' scope rows (MOD-147) follow, seeded as `create_workspace` seeds one (the
+/// [`seed::WORKSPACE_KIND`], its graph, two phases, two default edges, the ten templates), in
+/// their own id block from [`SCOPE_BLOCK`]: kind and graph `SCOPE_BLOCK + scope_index`, phases
+/// `SCOPE_BLOCK + scope_index * 2 + position`, edges one counter from `SCOPE_BLOCK`, templates
+/// `SCOPE_BLOCK + scope_index * DEFAULT_TEMPLATES.len() + template_index` (highest 219).
 fn catalogue() -> Catalogue {
     let kinds_per_project = seed::KINDS.len() as u8;
     let phases_per_project = seed::PHASES_PER_PROJECT as u8;
@@ -857,6 +920,67 @@ fn catalogue() -> Catalogue {
                 PromptTemplateId::from_uuid(demo_uuid(
                     class::PROMPT_TEMPLATE,
                     project_index * templates_per_project + template_index as u8,
+                )),
+                *project_id,
+                name,
+                body,
+                ids::USER,
+                epoch(),
+            ));
+        }
+    }
+
+    // MOD-147: each workspace's scope row, in its own id block so no per-project stride reaches it.
+    let kind = &seed::WORKSPACE_KIND;
+    let ws_phases = kind.phases.len() as u8;
+    let mut scope_edge_n = SCOPE_BLOCK;
+    for (scope_index, (_, project_id, _, _)) in SCOPE_SPECS.iter().enumerate() {
+        let scope_index = scope_index as u8;
+        let n = SCOPE_BLOCK + scope_index;
+        let graph = seed::graph_row(
+            StepGraphId::from_uuid(demo_uuid(class::STEP_GRAPH, n)),
+            *project_id,
+            kind,
+            epoch(),
+        );
+        let graph_id = graph.id;
+        graphs.push(graph);
+        kinds.push(seed::kind_row(
+            ItemKindId::from_uuid(demo_uuid(class::ITEM_KIND, n)),
+            *project_id,
+            graph_id,
+            0,
+            kind,
+            epoch(),
+        ));
+        let graph_phases: Vec<StepGraphPhase> = kind
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(position, phase)| {
+                seed::phase_row(
+                    PhaseId::from_uuid(demo_uuid(
+                        class::PHASE,
+                        SCOPE_BLOCK + scope_index * ws_phases + position as u8,
+                    )),
+                    graph_id,
+                    position as i32,
+                    phase,
+                    epoch(),
+                )
+            })
+            .collect();
+        edges.extend(seed::default_edges(&graph_phases, || {
+            let id = EdgeId::from_uuid(demo_uuid(class::EDGE, scope_edge_n));
+            scope_edge_n += 1;
+            id
+        }));
+        phases.extend(graph_phases);
+        for (template_index, (name, _, body)) in DEFAULT_TEMPLATES.iter().enumerate() {
+            templates.push(seed::template_row(
+                PromptTemplateId::from_uuid(demo_uuid(
+                    class::PROMPT_TEMPLATE,
+                    SCOPE_BLOCK + scope_index * templates_per_project + template_index as u8,
                 )),
                 *project_id,
                 name,
@@ -2192,7 +2316,8 @@ pub async fn edit_agent<S: WriteStore + ?Sized>(store: &S, edited: &Agent) -> St
 #[cfg(test)]
 mod tests {
     use super::{DemoData, demo_at, demo_data, demo_uuid, ids};
-    use crate::model::{Resolution, Status, StepGraphId};
+    use crate::model::{Project, Resolution, Status, StepGraphId};
+    use serde_json::json;
     use std::collections::HashSet;
 
     /// MOD-26 D7 (B-3): the demo registry's personas are the two seed files, re-stamped with the
@@ -2498,13 +2623,86 @@ mod tests {
                 .count();
             assert_eq!(kinds, 5, "R-ENT-6 seeds five kinds per project");
         }
-        assert_eq!(data.graphs.len(), 15, "one default graph per kind");
-        assert_eq!(data.phases.len(), 45, "fifteen phases per project");
+        // MOD-147 D5: each scope row carries exactly one kind, `WS`.
+        for (_, scope_id, ..) in super::SCOPE_SPECS {
+            let prefixes: Vec<&str> = data
+                .kinds
+                .iter()
+                .filter(|kind| kind.project_id == scope_id)
+                .map(|kind| kind.prefix.as_str())
+                .collect();
+            assert_eq!(
+                prefixes,
+                ["WS"],
+                "a scope row is seeded with the WS kind only"
+            );
+        }
+        assert_eq!(
+            data.graphs.len(),
+            17,
+            "one default graph per kind: 3 × 5 + 2 scope rows × 1"
+        );
+        assert_eq!(
+            data.phases.len(),
+            49,
+            "fifteen phases per project, two per scope row"
+        );
+        assert_eq!(
+            data.edges.len(),
+            46,
+            "fourteen edges per project, two per scope row"
+        );
         assert_eq!(
             data.templates.len(),
-            30,
-            "one template version per default template name per project"
+            50,
+            "one template version per default template name per project and scope row"
         );
+    }
+
+    /// MOD-147: each demo workspace has one scope row — `@<slug>`, type `workspace`, owned by the
+    /// workspace, named after it — and no workspace lists one as a member.
+    #[test]
+    fn each_workspace_has_one_scope_row_outside_membership() {
+        let data = demo_data();
+        for workspace in &data.workspaces {
+            let rows: Vec<&Project> = data
+                .projects
+                .iter()
+                .filter(|project| project.owner_workspace_id == Some(workspace.id))
+                .collect();
+            assert_eq!(rows.len(), 1, "`{}` has one scope row", workspace.slug);
+            let row = rows[0];
+            assert_eq!(row.slug, crate::seed::scope_row_slug(&workspace.slug));
+            assert_eq!(row.name, workspace.name);
+            assert_eq!(row.project_type, crate::seed::SCOPE_ROW_TYPE);
+            assert_eq!(row.settings, json!({}));
+            assert_eq!(
+                (row.secret_provider.as_deref(), row.secret_scope.as_deref()),
+                (None, None)
+            );
+            assert!(
+                data.workspace_projects
+                    .iter()
+                    .all(|link| link.project_id != row.id),
+                "a scope row joins no workspace"
+            );
+        }
+        assert_eq!(
+            data.projects
+                .iter()
+                .filter(|project| project.owner_workspace_id.is_some())
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            [ids::PROJECT_SCOPE_PLATFORM, ids::PROJECT_SCOPE_GRAPHICS]
+        );
+        for project in &data.projects {
+            assert_eq!(
+                project.owner_workspace_id.is_some(),
+                crate::seed::is_scope_row_slug(&project.slug),
+                "`{}`: owner set <=> `@` slug",
+                project.slug
+            );
+        }
     }
 
     /// The demo corpus is the shipped bodies, not a stand-in: `fixtures.rs` seeds from
@@ -2528,6 +2726,15 @@ mod tests {
                 .map(|template| template.name.as_str())
                 .collect();
             assert_eq!(names, expected, "ten per project, in order");
+        }
+        for (_, scope_id, ..) in super::SCOPE_SPECS {
+            let names: Vec<&str> = data
+                .templates
+                .iter()
+                .filter(|template| template.project_id == scope_id)
+                .map(|template| template.name.as_str())
+                .collect();
+            assert_eq!(names, expected, "ten per scope row, in order (MOD-147 D5)");
         }
 
         for template in &data.templates {
@@ -2605,9 +2812,10 @@ mod tests {
         assert_eq!(
             ids.len(),
             data.templates.len(),
-            "three projects × ten templates is thirty distinct `prompt_template` ids"
+            "three projects and two scope rows × ten templates is fifty distinct \
+             `prompt_template` ids"
         );
-        assert_eq!(ids.len(), 30);
+        assert_eq!(ids.len(), 50);
     }
 
     /// The `implement` step is the one fixture step with a `run_step.trim_record`, and plan

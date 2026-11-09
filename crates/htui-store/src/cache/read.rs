@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use htui_core::model::OwnerDocument;
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
@@ -829,7 +830,7 @@ impl ReadStore for CacheStore {
     async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
         let row = sqlx::query(
             "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
-             created_at FROM document WHERE id = ?",
+             created_at FROM document WHERE id = ? AND item_id IS NOT NULL",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -945,8 +946,8 @@ impl ReadStore for CacheStore {
 
     async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
         let row = sqlx::query(
-            "SELECT id, slug, name, description, type, secret_provider, secret_scope, settings, \
-             created_by, created_at, updated_at FROM project WHERE id = ?",
+            "SELECT id, slug, name, description, type, owner_workspace_id, secret_provider, \
+             secret_scope, settings, created_by, created_at, updated_at FROM project WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -959,6 +960,10 @@ impl ReadStore for CacheStore {
             name: text(&row, "name")?,
             description: text(&row, "description")?,
             project_type: text(&row, "type")?,
+            owner_workspace_id: opt_uuid_col::<WorkspaceId>(
+                "project.owner_workspace_id",
+                opt_text(&row, "owner_workspace_id")?.as_deref(),
+            )?,
             secret_provider: opt_text(&row, "secret_provider")?,
             secret_scope: opt_text(&row, "secret_scope")?,
             settings: json_col("project.settings", &text(&row, "settings")?)?,
@@ -1284,6 +1289,53 @@ impl ReadStore for CacheStore {
     /// seam's "not available here".
     async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
         Ok(None)
+    }
+
+    /// MOD-147 D1: the mirrored scope row of `workspace`; `None` until the refresher has been
+    /// given the row (the store worker adds it to the projects it refreshes, T4).
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        let row = sqlx::query("SELECT id FROM project WHERE owner_workspace_id = ?")
+            .bind(workspace.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        row.map(|row| uuid_col::<ProjectId>("project.id", &text(&row, "id")?))
+            .transpose()
+    }
+
+    /// MOD-147 D2: the project's mirrored owner documents, `(kind, version)` order under SQLite's
+    /// default `BINARY` collation, which is byte order as the contract asks.
+    async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, kind, version, title, body, produced_by_step_id, created_by, \
+             created_at FROM document WHERE project_id = ? AND item_id IS NULL \
+             ORDER BY kind, version",
+        )
+        .bind(project.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(OwnerDocument {
+                    id: uuid_col("document.id", &text(row, "id")?)?,
+                    project_id: uuid_col("document.project_id", &text(row, "project_id")?)?,
+                    kind: text(row, "kind")?,
+                    version: get(row, "version")?,
+                    title: text(row, "title")?,
+                    body: text(row, "body")?,
+                    produced_by_step_id: opt_uuid_col::<StepId>(
+                        "document.produced_by_step_id",
+                        opt_text(row, "produced_by_step_id")?.as_deref(),
+                    )?,
+                    created_by: uuid_col::<UserId>(
+                        "document.created_by",
+                        &text(row, "created_by")?,
+                    )?,
+                    created_at: ts_col("document.created_at", get(row, "created_at")?)?,
+                })
+            })
+            .collect()
     }
 
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {

@@ -454,9 +454,9 @@ impl HierarchySection {
                     snapshot.workspace.name,
                     snapshot.workspace.slug,
                     snapshot
-                        .root_path
+                        .folder_path
                         .as_ref()
-                        .map_or("unset", |path| path.root_path.as_str())
+                        .map_or("unset", |path| path.folder_path.as_str())
                 )),
                 Row::Project { index } => group(
                     snapshot
@@ -818,9 +818,9 @@ impl HierarchySection {
             return;
         };
         let workspace_root = snapshot
-            .root_path
+            .folder_path
             .as_ref()
-            .map(|path| path.root_path.as_str());
+            .map(|path| path.folder_path.as_str());
         let (target, title, stored, fallback) = match row {
             Row::Workspace => (
                 PathTarget::WorkspaceRoot(snapshot.workspace.id),
@@ -1025,7 +1025,6 @@ impl HierarchySection {
         let mirror = match mirror {
             MirrorAfterDelete::Rebuilt => "mirror rebuilt".to_owned(),
             MirrorAfterDelete::NoMirror => "no mirror".to_owned(),
-            MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
             MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
         };
         let rows = plural(usize::try_from(rows).unwrap_or(usize::MAX), "row", "rows");
@@ -1300,7 +1299,7 @@ impl HierarchySection {
         // Only with a root on this box: without one the answer could only be "no root". The
         // `stored as …` notice set above stays on screen until the inference answers, and is
         // carried in front of its report.
-        if follow && snapshot.root_path.is_some() {
+        if follow && snapshot.folder_path.is_some() {
             self.carried = self.notice.clone();
             self.send(StoreRequest::InferRepoPaths(snapshot.workspace.id), ctx);
         }
@@ -1322,9 +1321,9 @@ impl HierarchySection {
         };
         let stored = match *target {
             PathTarget::WorkspaceRoot(_) if request == "set_workspace_root" => snapshot
-                .root_path
+                .folder_path
                 .as_ref()
-                .map(|path| path.root_path.clone())?,
+                .map(|path| path.folder_path.clone())?,
             PathTarget::RepoPath { id, .. } if request == "set_repo_path" => snapshot
                 .projects
                 .iter()
@@ -1902,19 +1901,34 @@ fn delete_pane(
             };
             format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
         }
-        DeleteTarget::Workspace(_) => format!(
-            "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
-            plural(
-                usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
-                "project link",
-                "project links"
-            ),
-            plural(
-                usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
-                "box root path",
-                "box root paths"
-            ),
-        ),
+        DeleteTarget::Workspace(_) => {
+            let mut headline = format!(
+                "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
+                plural(
+                    usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
+                    "project link",
+                    "project links"
+                ),
+                plural(
+                    usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
+                    "box root path",
+                    "box root paths"
+                ),
+            );
+            // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
+            // names them: everything its scope row owns, summed with the workspace's own
+            // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
+            // counts above are left out here, rather than said twice.
+            let owned = reach_parts(&DeleteReach {
+                workspace_links: 0,
+                workspace_box_paths: 0,
+                ..**reach
+            });
+            if !owned.is_empty() {
+                headline.push_str(&format!(" Gone for good with it: {}.", owned.join(", ")));
+            }
+            headline
+        }
     };
 
     let room = usize::from(width).max(1);
