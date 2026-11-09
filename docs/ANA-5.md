@@ -1568,9 +1568,10 @@ order. Nothing derives the other way, so the two can never drift, and a reader w
 story reads the step rather than the event.
 
 *Amended by MOD-163, 2026-11-08 (plan D17, migration `0026_trim_record_v5.sql`):* the record is
-version 5. It gains `memory: { shown: [{ id, version }], total }` when the step's prompt carried project
+version 5. It gains `memory: { shown: [{ id, version }], total }` when a phase step's run froze project
 memory:
-- `shown` lists the entries that reached the prompt after trimming, in render order;
+- `shown` lists the entries that reached the prompt after trimming, in render order, and is empty
+  when the cap or the trim left none;
 - `total` is how many active entries the project had when the run started.
 
 The key is absent when there was no memory, so a memory-less v5 record differs from v4 only in `v`. A

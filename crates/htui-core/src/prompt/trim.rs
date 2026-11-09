@@ -842,8 +842,9 @@ impl<'a> Trimmer<'a> {
     /// line after each; the last one takes the section and its separator with it.
     ///
     /// Renders from `self.inputs.spec.memory`, the **masked** spec, so a re-render cannot bring an
-    /// unmasked byte back (review C-1); every rung is a prefix of the scanned full section plus a
-    /// line that changes only its digits. The counters go in before the render, as in
+    /// unmasked byte back (review C-1); every rung is a prefix of the scanned full section plus
+    /// the fixed left-out line (`left_out_line`: fixed text and two counts, no entry bytes). The
+    /// counters go in before the render, as in
     /// [`Trimmer::trim_upstream`] (L-1).
     fn trim_memory(&mut self) {
         let Some(index) = self.live_index(&SectionName::Memory) else {

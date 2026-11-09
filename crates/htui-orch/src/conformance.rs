@@ -8338,8 +8338,8 @@ async fn closed_memory_entries_never_reach_a_prompt<H: CaseHarness>(harness: &H)
 }
 
 /// MOD-163 D11 (`R-PRM-1`), the persona case's twin: an entry amended and then retired after
-/// `StartRun` does not reach the run. The next step and a retry render the run-start bytes, and
-/// the snapshot keeps version 1.
+/// `StartRun` does not reach the run. The next step, a retry and a resume render the run-start
+/// bytes, and the snapshot keeps version 1.
 async fn a_memory_edit_after_start_run_does_not_reach_the_run<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
@@ -8403,6 +8403,25 @@ async fn a_memory_edit_after_start_run_does_not_reach_the_run<H: CaseHarness>(ha
         memory_of_step(&orch, retry.id).await,
         frozen,
         "a retry reads the memory frozen at `StartRun`"
+    );
+
+    // Review R2-2: a resume walks from the stored snapshot, not from the live (now retired)
+    // entry, so the step it starts renders the run-start bytes too.
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    let resumed = orch.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("memory is outside the topology, so the snapshot still hashes: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(2)),
+        "the resume walked to the third phase's gate"
+    );
+    let third = at(&steps_of(&orch, run).await, 2, 1).clone();
+    assert_eq!(
+        memory_of_step(&orch, third.id).await,
+        frozen,
+        "a resumed run reads the memory frozen at `StartRun`"
     );
     let snapshot = snapshot_of(&orch, run).await;
     let memory = snapshot.memory.expect("the run froze the entry");

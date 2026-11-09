@@ -1,4 +1,5 @@
-//! The prompt preview: ten store reads, one `assemble()`, and no write at all (plan D102, D103).
+//! The prompt preview: the store reads a run would make, one `assemble()`, and no write at all
+//! (plan D102, D103).
 //!
 //! This is the milestone's reason to exist. MOD-4's stage 3 will build a [`PromptSpec`] from a
 //! `run_step` and hand it to [`assemble`]; the preview builds **the same type** and hands it to
@@ -115,8 +116,6 @@ const EXCERPTS_NOTE: &str = "preview: no run exists, so no run_step_tree row; ro
 /// MOD-163 D18: the preview's memory is a live stand-in for a run-start snapshot.
 const MEMORY_NOTE: &str = "preview: memory is selected now from the project's active entries; a \
                            run freezes its own at StartRun";
-/// MOD-163 D18: a memory read that is not available here (the offline mirror) previews no memory.
-const MEMORY_OFFLINE_NOTE: &str = "memory not available offline";
 
 /// What the Prompt sub-tab receives: one reply per request, the assembler's verdict either way.
 ///
@@ -148,11 +147,11 @@ pub fn offline_refusal() -> &'static str {
 ///
 /// Blueprint D.4's table, read top to bottom: the item, its project, its kind, the project's
 /// templates, the item's graph (for the phase id), `app_setting`, the documents, the upstream
-/// walk, the box and the skills. Nine reads, every one of them the same read MOD-4 will make, and
-/// three fields filled by [`STAND_INS`] instead of by a `run_step`. Two more since MOD-7 milestone
-/// 4: the project's repos and this box's `repo_box_path` rows, the roots the excerpt pass reads
-/// (plan D120). A tenth since MOD-163 M2: the project's live `Active` memory entries, selected
-/// under the cap by the engine's own `select` (D18).
+/// walk, the box (its info and profile) and the skills, every one of them the same read MOD-4
+/// will make, with the fields a `run_step` would fill declared in [`STAND_INS`]. Since MOD-163
+/// M2: the project's live `Active` memory entries, selected under the cap by the engine's own
+/// `select` (D18). Since MOD-7 milestone 4, last: the project's repos and this box's
+/// `repo_box_path` rows, the roots the excerpt pass reads (plan D120).
 ///
 /// Returns a whole [`PromptPreview`] rather than a bare [`PromptSpec`] because both halves of the
 /// answer are things the pane renders: a project with no template row is not an error, and neither
@@ -268,18 +267,13 @@ pub async fn build(
         };
     let skills = backend.bound_skills(row.project_id, phase).await?;
     // MOD-163 D18: what a run started now would freeze — the same `select`, over the project's
-    // live `Active` entries. Read after the templates, so an offline arm still refuses with the
-    // prompt sentence first; a `None` ("not available here") previews no memory and says so.
-    let memory = match backend
+    // live `Active` entries. Read after the templates, so an offline arm refuses with the prompt
+    // sentence before it gets here; a `None` ("not available here") is no memory, as the engine's
+    // `graph::frozen_memory` treats it.
+    let memory = backend
         .memory_entries(row.project_id, Some(vec![MemoryState::Active]))
         .await?
-    {
-        Some(entries) => select_memory(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT),
-        None => {
-            notes.push(MEMORY_OFFLINE_NOTE.to_owned());
-            None
-        }
-    };
+        .and_then(|entries| select_memory(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT));
     // MOD-7 milestone 4 (plan D120): ANA-5 §4.5 step 1's "otherwise the project's repos". A
     // preview has no run, so no `run_step_tree` row: each root is this box's `repo_box_path` row,
     // else `no_path`. Read after every other read, so an offline arm still refuses with the prompt

@@ -76,7 +76,14 @@ impl MemorySource {
 
 /// One memory entry as a run froze it at `StartRun` (MOD-163 D11): a **copy of the text**, so a
 /// retry or a resume renders the same bytes after the entry is amended or retired (`R-PRM-1`).
-/// No `deny_unknown_fields` (blueprint P-15): a later builder's entry must still decode here.
+/// No `deny_unknown_fields` (blueprint P-15): an entry a later builder wrote with **new fields**
+/// still decodes here. A new [`MemorySource`] or [`MemoryKind`] variant does not: it fails to
+/// decode, so it ships with the migration that introduces it, and an older build then refuses to
+/// connect to the newer schema (`applied_state`'s "schema is newer than this htui"). A variant
+/// shipped without a migration must bump [`GraphSnapshot::V`], so an older reader answers a
+/// clean `SnapshotVersion` instead of a decode error.
+///
+/// [`GraphSnapshot::V`]: crate::model::GraphSnapshot::V
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMemoryEntry {
     /// `memory_entry.id`; recorded in `trim_record.memory.shown`, never rendered.

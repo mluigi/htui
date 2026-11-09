@@ -570,6 +570,39 @@ fn a_memory_section_is_trimmed_after_excerpts_and_before_upstream() {
 }
 
 #[test]
+fn a_trimmed_memory_section_re_renders_from_the_masked_text() {
+    // Review R1-3: `trim_memory` re-renders the section after each drop. It must render the
+    // masked spec, so a known secret in the entry that survives stays masked.
+    let mut spec = trimmable();
+    spec.memory.as_mut().expect("memory").entries[0].body =
+        "The cache password is hunter2-secret.".to_owned();
+    let secret = MinimalScrubber::new(["hunter2-secret".to_owned()]);
+    let full = assemble(&at_target(&spec, i64::MAX / 4), &secret).expect("masked, not refused");
+    assert_eq!(
+        memory_row(&full).expect("memory").strategy,
+        TrimStrategy::None
+    );
+    let prompt = assemble(&at_target(&spec, full.trim.estimated_after - 10), &secret)
+        .expect("masked and trimmed");
+    let memory = memory_row(&prompt).expect("the memory row");
+    assert_eq!(memory.dropped, Some(1), "one entry went: {memory:?}");
+    assert!(
+        prompt.text.contains("The cache password is [REDACTED]."),
+        "the surviving entry is re-rendered masked:\n{}",
+        prompt.text
+    );
+    assert!(!prompt.text.contains("hunter2-secret"), "{}", prompt.text);
+    assert!(!prompt.digest_text.contains("hunter2-secret"));
+    assert!(
+        prompt
+            .text
+            .contains("</entry>\n1 of 3 project memory entries shown.\n</section>\n\n"),
+        "{}",
+        prompt.text
+    );
+}
+
+#[test]
 fn a_tighter_budget_drops_the_section_and_its_separator() {
     let spec = trimmable();
     let target = full_cost(&spec) - 219;

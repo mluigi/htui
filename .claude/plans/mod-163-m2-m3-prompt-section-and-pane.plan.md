@@ -98,6 +98,7 @@ Numbered after M1's D1–D10.
   - **The preview runs the same `select` over live `Active` entries** (`preview::build` is async over `&Backend`, spawned from `agent_worker.rs:1737-1765`, C5). That way the preview shows what a run started now would get.
   - The preview's memory is a live stand-in for a run-start snapshot, so it is listed in `STAND_INS`.
   - A `None` read previews no memory and adds the note "memory not available offline".
+  - *Amended 2026-11-09 (review R1, R2-1):* the offline note was removed as unreachable. An offline backend refuses earlier, at `prompt_templates`, with the prompt sentence, so `build` never reaches the memory read offline. A `None` read now previews no memory without a note, as `graph::frozen_memory` treats it.
 - **D19 — The `memory_capture` switch (M3, PRD Q3).**
   - `SettingKey::MemoryCapture` takes index 9, between `max_skill_tokens` and `prompt_reserve_fraction`. `ALL` and `SPECS` go from 12 to 13, and indexes 9–11 move to 10–12.
   - Kind `Boolean`, default `true` (`MEMORY_CAPTURE_DEFAULT`), rungs `Rungs::APP.or(Rungs::PROJECT)` (the `UpstreamHops` shape), `project_key: Some("memory_capture")`.
