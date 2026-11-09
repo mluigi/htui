@@ -598,13 +598,13 @@ async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<Workspace
 /// The box first, then the tree, then this box's root, canonicalised (a legacy link row walks its
 /// target): the row's `folder_path`, else the default `<home>/workspaces/<slug>` (MOD-147 D8,
 /// [`workspace_root`]). With no root — no row and no home, no row and a slug that is not one plain
-/// name, or a default folder that does not resolve — the answer is `root: None` and nothing is walked; a *row* that no longer resolves is
-/// still refused. With every repo
-/// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
-/// then per repo without a row, in tree order: `choose` against the paths already held on this
-/// box (each row as stored and as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
-/// for every later repo. A truncated scan infers nothing. The reply is the re-read tree and the
-/// report.
+/// name, or a default folder that does not resolve — the answer is `root: None` and nothing is
+/// walked; a *row* that no longer resolves is still refused. With every repo already set, nothing
+/// is walked either. Otherwise one `find_checkouts` under `spawn_blocking`, then per repo without a
+/// row, in tree order: `choose` against the paths already held on this box (each row as stored and
+/// as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass
+/// writes is held for every later repo. A truncated scan infers nothing. The reply is the re-read
+/// tree and the report.
 async fn infer(
     backend: &Backend,
     writer: &Writer,
