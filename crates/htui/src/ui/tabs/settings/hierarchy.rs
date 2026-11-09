@@ -1915,9 +1915,10 @@ fn delete_pane(
                     "box root paths"
                 ),
             );
-            // MOD-147 A1: the workspace's scope row and everything it owns go with it. Its counts
-            // are the rest of the reach, named as a project delete names them; the two counts
-            // above are the workspace's own, so they are left out here rather than said twice.
+            // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
+            // names them: everything its scope row owns, summed with the workspace's own
+            // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
+            // counts above are left out here, rather than said twice.
             let owned = reach_parts(&DeleteReach {
                 workspace_links: 0,
                 workspace_box_paths: 0,

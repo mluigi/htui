@@ -2977,6 +2977,9 @@ impl State {
             )));
         }
         let scope_slug = seed::scope_row_slug(&new.slug);
+        // Unreachable while workspace slugs are unique and `@` slugs are reserved for scope rows
+        // (D3), kept as the mirror of Postgres's backstop: `project.slug`'s unique index answers
+        // `23505` for the scope row's insert (MOD-147 M1 R1).
         if self.projects.values().any(|row| row.slug == scope_slug) {
             return Err(StoreError::Constraint(format!(
                 "project.slug `{scope_slug}` is taken"

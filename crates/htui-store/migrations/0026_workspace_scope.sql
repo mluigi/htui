@@ -19,6 +19,13 @@
 -- (TABLES stays 51). The mirror gains project.owner_workspace_id and the new document shape in
 -- cache_migrations/0009_workspace_scope.sql; schema_version becomes 26, so each box rebuilds its mirror
 -- once. A headless worker never migrates: migrate from a TUI first.
+--
+-- Mixed versions: an older build's insert_document names no project_id and would fail 23502 here.
+-- It never gets that far: PgStore::connect and connect_headless refuse a schema with an applied
+-- version outside their embedded set ("schema is newer than this htui", R-STO-5, MOD-40), so a
+-- pre-0026 binary cannot connect once this has run, and no compatibility trigger is added. Only a
+-- process already connected while a newer TUI migrates keeps running on the old shape, as it does
+-- across every migration.
 
 -- --------------------------------------------------------------------------------------------
 -- 1. Pre-check: '@' slugs and the 'workspace' type are reserved for scope rows
