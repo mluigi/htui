@@ -3324,8 +3324,8 @@ pub fn project_slug_refusal(slug: &str) -> Option<String> {
     crate::seed::is_scope_row_slug(slug).then(|| project_slug_is_reserved(slug))
 }
 
-/// MOD-147 D3: a slug patch on a scope row (MemStore's words; Postgres's `chk_project_scope_slug`
-/// is the backstop and answers its own `Constraint`).
+/// MOD-147 D3: a slug patch on a scope row, in both stores' words (R1 L7: Postgres reads the row
+/// first; its `chk_project_scope_slug` is only the backstop).
 #[must_use]
 pub fn scope_row_slug_is_fixed(slug: &str) -> String {
     format!(

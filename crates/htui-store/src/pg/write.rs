@@ -84,7 +84,7 @@ use htui_core::store::{
 };
 use htui_core::store::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
-    workspace_has_live_run,
+    scope_row_slug_is_fixed, workspace_has_live_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -3018,9 +3018,9 @@ impl WriteStore for PgStore {
 
     // workspace
 
-    /// One `INSERT ... RETURNING`; the row comes back with the server's `now()`, not the caller's.
-    /// Its scope row (`@<slug>`, the `WS` seed) is inserted in the same transaction (MOD-147 D7),
-    /// so a refused create writes neither.
+    /// One transaction: the workspace's `INSERT ... RETURNING` (the row comes back with the
+    /// server's `now()`, not the caller's), then its scope row (`@<slug>`, the `WS` seed) (MOD-147
+    /// D7), so a refused create writes neither.
     ///
     /// # Errors
     ///
@@ -3105,8 +3105,11 @@ impl WriteStore for PgStore {
         match updated {
             Some(row) => {
                 // MOD-147 D7: a slug or name edit renames the scope row in the same transaction.
+                // R1 L3: a workspace with no scope row (one the bootstrap has not reached yet, or
+                // a row removed by hand) gets it here instead, under the new slug and name, so a
+                // rename never leaves the workspace without one.
                 if renames {
-                    sqlx::query!(
+                    let renamed = sqlx::query!(
                         "UPDATE project SET slug = $2, name = $3 WHERE owner_workspace_id = $1",
                         id.as_uuid(),
                         seed::scope_row_slug(&row.slug),
@@ -3115,6 +3118,10 @@ impl WriteStore for PgStore {
                     .execute(&mut *tx)
                     .await
                     .map_err(map_sqlx)?;
+                    if renamed.rows_affected() == 0 {
+                        insert_scope_row(&mut tx, row.id, &row.slug, &row.name, row.created_by)
+                            .await?;
+                    }
                 }
                 tx.commit().await.map_err(map_sqlx)?;
                 Ok(CasOutcome::Applied(row))
@@ -3313,10 +3320,26 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: ProjectPatch,
     ) -> Result<CasOutcome<Project>> {
-        // MOD-147 D3: a `@` slug is refused before anything is read, as on create. A slug patch on
-        // a scope row is `chk_project_scope_slug`'s (`23514`).
+        // MOD-147 D3: a `@` slug is refused before anything is read, as on create.
         if let Some(refusal) = patch.slug.as_deref().and_then(project_slug_refusal) {
             return Err(StoreError::Constraint(refusal));
+        }
+        // MOD-147 D3 (R1 L7): a slug patch on a scope row answers `MemStore`'s sentence, so the
+        // row is read first. It is matched on the caller's token, so a stale edit still answers
+        // `Stale` (MemStore's order); `chk_project_scope_slug` (`23514`) stays the backstop.
+        if patch.slug.is_some() {
+            let scope = sqlx::query_scalar!(
+                "SELECT slug FROM project \
+                  WHERE id = $1 AND updated_at = $2 AND owner_workspace_id IS NOT NULL",
+                id.as_uuid(),
+                expected,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+            if let Some(slug) = scope {
+                return Err(StoreError::Constraint(scope_row_slug_is_fixed(&slug)));
+            }
         }
         let (secret_set, secret_provider, secret_scope) = match &patch.secret {
             None => (false, None, None),
@@ -5989,16 +6012,19 @@ impl WriteStore for PgStore {
     /// (`0001_init.sql:162,174`). Member projects survive it; the workspace's scope row and all it
     /// owns go with it, counted (MOD-147 A1), and a live run of the scope row refuses the delete.
     ///
-    /// Up to `DELETE_ATTEMPTS` tries, because the transaction runs at `REPEATABLE READ` and a link
-    /// or a box path committed under it raises `40001` rather than slipping past the count (review
-    /// M1). Both are named rather than linked because they are private and this doc comment is
-    /// public (`rustdoc::private_intra_doc_links`).
+    /// Up to `DELETE_ATTEMPTS` tries, because the transaction runs at `REPEATABLE READ` and a row
+    /// the cascade would take (a link, a box path, or anything of the scope row's) committed under
+    /// it raises `40001` rather than slipping past the count (review M1). Both are named rather
+    /// than linked because they are private and this doc comment is public
+    /// (`rustdoc::private_intra_doc_links`).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
     /// lost the race, in which case nothing was deleted, or (MOD-138 A3) while a kind or an item
-    /// names one of the workspace's graphs, checked in the same transaction before the delete.
+    /// names one of the workspace's graphs, or with [`workspace_has_live_run`] (MOD-147 A1) while
+    /// a run of its scope row is live (queued, running, awaiting_approval or stopped); both are
+    /// checked in the same transaction before the delete.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
         for _ in 0..DELETE_ATTEMPTS {
             if let Some(reach) = self.delete_workspace_once(id).await? {
@@ -6008,7 +6034,7 @@ impl WriteStore for PgStore {
         Err(StoreError::Constraint(concurrent_write(
             "workspace",
             id,
-            "links or box paths",
+            "rows the cascade would take",
         )))
     }
 
@@ -6025,7 +6051,9 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
-    /// lost the race, in which case nothing was deleted.
+    /// lost the race, in which case nothing was deleted, or with
+    /// [`scope_row_is_deleted_with_its_workspace`] (MOD-147 A2) for a workspace's scope row, before
+    /// any write.
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
         for _ in 0..DELETE_ATTEMPTS {
             if let Some(reach) = self.delete_project_once(id).await? {
@@ -10169,9 +10197,10 @@ impl PgStore {
     /// One attempt of [`WriteStore::delete_project`]'s count-and-delete; `Ok(None)` is the `40001`
     /// the caller retries (review M1).
     ///
-    /// The count is the transaction's first statement after the isolation level is set, so it is
-    /// the statement that takes the snapshot the cascade is then crosschecked against: only the
-    /// `DELETE` can raise the serialization failure, which is why only it is matched on.
+    /// The scope-row check (MOD-147 A2) is the transaction's first statement after the isolation
+    /// level is set, so it takes the snapshot; the count follows in that same snapshot, and the
+    /// cascade is then crosschecked against it: only the `DELETE` can raise the serialization
+    /// failure, which is why only it is matched on.
     async fn delete_project_once(&self, id: ProjectId) -> Result<Option<DeleteReach>> {
         let mut tx = begin_repeatable_read(&self.pool).await?;
 

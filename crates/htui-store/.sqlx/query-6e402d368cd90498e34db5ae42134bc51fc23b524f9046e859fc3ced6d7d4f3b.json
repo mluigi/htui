@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT w.id         AS \"id: WorkspaceId\",\n                   w.slug,\n                   w.name,\n                   w.created_by AS \"created_by: UserId\"\n              FROM workspace w\n             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.owner_workspace_id = w.id)\n             ORDER BY w.id\n            ",
+  "query": "\n            SELECT w.id         AS \"id: WorkspaceId\",\n                   w.slug,\n                   w.name,\n                   w.created_by AS \"created_by: UserId\"\n              FROM workspace w\n             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.owner_workspace_id = w.id)\n             ORDER BY w.id\n               FOR SHARE OF w\n            ",
   "describe": {
     "columns": [
       {
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "80fcfd4b3f6e726684eea820ae1fbb7c3c40d1c74668d6f0477633f861fe8a09"
+  "hash": "6e402d368cd90498e34db5ae42134bc51fc23b524f9046e859fc3ced6d7d4f3b"
 }
