@@ -1179,9 +1179,15 @@ impl MemoryPane {
                 *in_flight = false;
                 keys.label(views::MEMORY_RETIRE, Act::ConfirmYes)
             }
-            Mode::Clash { existing, .. } => {
+            Mode::Clash { existing, editor } => {
                 **existing = head.clone();
-                keys.label(views::MEMORY_CLASH, Act::MemoryClashReplace)
+                // An amend's question offers no replace (O-1): name the key it does offer.
+                match editor.target {
+                    Target::New => keys.label(views::MEMORY_CLASH, Act::MemoryClashReplace),
+                    Target::Amend { .. } => {
+                        keys.label(views::MEMORY_CLASH_AMEND, Act::MemoryClashEdit)
+                    }
+                }
             }
             Mode::Browse => None,
         };
