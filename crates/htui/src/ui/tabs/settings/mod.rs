@@ -20,6 +20,8 @@ pub mod hierarchy;
 pub mod kinds;
 /// The logging section (MOD-122).
 pub mod logging;
+/// A project's memory pane, opened from Settings › Hierarchy (MOD-163 D20).
+pub mod memory;
 pub mod personas;
 pub mod project_types;
 pub mod prompt;
