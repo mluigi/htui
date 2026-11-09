@@ -51,20 +51,22 @@ install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats cas
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-138 M2 (checked against the tree 2026-11-05): migrations run through
+Live coordinates after MOD-147 M1 (checked against the tree 2026-11-09): migrations run through
+`0026_workspace_scope` (MOD-147 M1: `project.owner_workspace_id`, the scope-row CHECKs, `document.project_id` with
+nullable `item_id`, `workspace_box_path.folder_path`; no new table; mirrored by cache `0009_workspace_scope`), before it
 `0025_run_step_branch` (MOD-138 M2: `run_step.branch`, the recorded `if` decision; no new table; mirrored by cache
 `0008_run_step_branch`), before it `0024_item_status` (MOD-144: three-value `item.status`, `uq_run_item_live`; no new table), before it
 `0023_default_edges_repair` (MOD-138 M1: re-derives default edges once; no table, not mirrored), before it `0022_memory`
 (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0026`** (cache: through `0008_run_step_branch`, next `0009`;
+`workspace_stop`), so **the next migration is `0027`** (cache: through `0009_workspace_scope`, next `0010`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges, and MOD-144's `0023` became `0024` behind MOD-138's (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
-`htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143,
-MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+`htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143
+and MOD-159. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
 `htui-orch` `CASES` 140 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
@@ -446,7 +448,18 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 233 (`htui-core/tests/mem_s
   workspace scope. The scope row owns the workspace's graphs as a project
   does: `step_graph.workspace_id` and the workspace scope exist since MOD-137
   (`docs/decisions/mod/mod-137.md`); MOD-146 shipped the `project_type` table and its `workspace` row
-  (`docs/decisions/mod/mod-146.md`). Not blocked.
+  (`docs/decisions/mod/mod-146.md`). Not blocked. PRD `.claude/prds/mod-147-workspace-scope.prd.md` (four
+  milestones: store, keys and links, TUI, search; owner documents index into the current collection, the workspace
+  search scope ships as a TUI/CLI resolver, owner documents live in Settings).
+  **Milestone 1 landed (hr/MOD-147, 2026-11-09):** every workspace has a hidden scope row (`@<slug>`, type
+  `workspace`, `owner_workspace_id`), created with the workspace and by the bootstrap, seeded with `WS` (plan →
+  hard-gated review); `@` slugs reserved; the row never joins `workspace_project`, so no lister shows it; owner
+  documents (`OwnerDocument`, `document.project_id`, nullable `item_id`) apart from item documents;
+  `workspace_box_path.folder_path`, default `~/workspaces/<slug>` (one-name slugs only); a workspace delete
+  cascades its scope row with counted reach and a mirror rebuild, refused while a scope-row run is live (stopped
+  included); `delete_project` refuses a scope row. Migration `0026_workspace_scope`, cache `0009`; `CASES` 247.
+  Plan `.claude/plans/mod-147-m1-scope-row.plan.md` (its "Carried to M2/MOD-136": usable-graph checks and
+  `run.workspace_id` for scope-row runs). Owed on the host: the merged-tree Postgres gate, live-Qdrant suites.
 - [ ] **MOD-148 - Per-type seeds and the type picker** (from ANA-35, `docs/ANA-35.md` §7.4, §7.2).
   `R-ENT-3`, `R-ENT-6`, `R-ORCH-8`, `R-TUI-8`. Per-type kinds, graphs, phases, `needs_repo`, default
   isolation (`settings.default_isolation`: `worktree` for software, `local` otherwise) and templates,
