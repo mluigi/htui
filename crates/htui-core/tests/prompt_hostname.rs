@@ -258,13 +258,17 @@ fn an_item_body_that_spells_the_box_is_left_alone() {
 }
 
 #[test]
-fn the_record_is_v4_with_undigested() {
+fn the_record_is_v5_with_undigested() {
     let prompt = ok(&fixtures::phase_implement_attempt2());
     let record = prompt
         .trim
         .to_value(&scrubber())
         .expect("the record scrubs");
-    assert_eq!(record["v"], json!(4));
+    assert_eq!(
+        record["v"],
+        json!(5),
+        "MOD-163 D17 bumped the record to v 5"
+    );
     assert_eq!(record["undigested"], json!(["box.hostname"]));
     for spec in [
         fixtures::judge_three_candidates(),

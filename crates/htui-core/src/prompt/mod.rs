@@ -51,7 +51,9 @@ pub use settings::{
     rung_refusal, validate,
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
-pub use trim::{Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan};
+pub use trim::{
+    MemoryAudit, MemoryShown, Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan,
+};
 
 use std::collections::BTreeMap;
 
@@ -621,7 +623,12 @@ pub fn assemble(
     let mut trimmer = Trimmer::new(inputs, est, spec.budget.target(), template_tokens, rendered);
     trimmer.refusals()?;
     trimmer.run();
-    let (sections, live, kept_excerpts) = trimmer.finish();
+    let trim::Finished {
+        sections,
+        live,
+        kept_excerpts,
+        kept_memory,
+    } = trimmer.finish();
 
     // 7. Substitute in span order: the frame's literals, each slot's sections wrapped — once per
     // form. 8. Canonicalise both and digest the digest text. With no hostname rendered the two
@@ -661,7 +668,16 @@ pub fn assemble(
         Vec::new()
     };
 
-    // 9. Record.
+    // 9. Record. MOD-163 D17: the memory entries that reached the prompt, in render order.
+    let memory = memory_of(spec).map(|memory| MemoryAudit {
+        shown: memory
+            .entries
+            .iter()
+            .take(kept_memory)
+            .map(MemoryShown::of)
+            .collect(),
+        total: memory.total,
+    });
     let record = trim::record(
         spec,
         &spec.template,
@@ -670,6 +686,7 @@ pub fn assemble(
         masked.skill_choices.clone(),
         undigested,
         surviving_audit(spec, &kept_excerpts, scrubber)?,
+        memory,
         notes(spec),
     );
     Ok(AssembledPrompt {

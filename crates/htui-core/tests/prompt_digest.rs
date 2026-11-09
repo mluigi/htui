@@ -1013,12 +1013,12 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
             "notes",
         ]),
         "§5.1's twelve keys, MOD-9 D42's skill_choices and MOD-33 D270's undigested: fourteen, \
-         no more and no fewer"
+         no more and no fewer (MOD-163 D17's memory is absent when the spec carried none)"
     );
     assert_eq!(
         first["v"],
-        serde_json::json!(4),
-        "MOD-33 D270 bumped the record to v 4"
+        serde_json::json!(5),
+        "MOD-163 D17 bumped the record to v 5"
     );
     assert_eq!(
         first["undigested"],

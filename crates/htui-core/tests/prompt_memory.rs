@@ -11,7 +11,7 @@
 #![cfg(feature = "test-support")]
 
 use chrono::{DateTime, Utc};
-use htui_core::model::{MemoryEntry, MemoryEntryId, MemoryKind, MemoryState};
+use htui_core::model::{MemoryEntry, MemoryEntryId, MemoryKind, MemoryState, prompt_summary};
 use htui_core::prompt::memory::{MEMORY_PREAMBLE, MEMORY_TOKEN_CAP, left_out_line, select};
 use htui_core::prompt::render::{self, memory_entry_block};
 use htui_core::prompt::{
@@ -20,6 +20,7 @@ use htui_core::prompt::{
     TokenEstimator, TrimStrategy, assemble, fixtures, parse,
 };
 use htui_core::scrub::MinimalScrubber;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Blueprint §T1.9: the memory span of [`fixtures::memory_two_of_three`] as `substitute` writes
@@ -375,6 +376,7 @@ fn no_memory_renders_every_fixture_without_a_memory_section() {
             spec.template.name
         );
         assert_eq!(memory_row(&prompt), None, "{}", spec.template.name);
+        assert_eq!(prompt.trim.memory, None, "{}", spec.template.name);
     }
     // A snapshot whose cap took every entry renders nothing either (blueprint P-3).
     let mut spec = spec();
@@ -457,6 +459,10 @@ fn a_handoff_or_judge_spec_renders_no_memory() {
             spec.template.name
         );
         assert_eq!(memory_row(&prompt), None);
+        assert_eq!(
+            prompt.trim.memory, None,
+            "a role without memory records none"
+        );
         assert_eq!(
             prompt.text,
             ok(&base).text,
@@ -607,4 +613,68 @@ fn a_tighter_budget_drops_the_section_and_its_separator() {
         "the dropped separator left `estimated_after` with the sent bytes only"
     );
     assert!(prompt.trim.estimated_after <= target);
+}
+
+// -- trim_record v5 (D17) -----------------------------------------------------------------------
+
+/// The record as it is persisted.
+fn record_value(prompt: &AssembledPrompt) -> Value {
+    prompt.trim.to_value(&scrubber()).expect("a clean record")
+}
+
+/// `{id, version}` of the worked example's entry `index`, as `shown[]` holds it.
+fn shown(index: usize) -> Value {
+    let entry = &fixtures::memory_two_of_three().entries[index];
+    json!({ "id": entry.id, "version": entry.version })
+}
+
+#[test]
+fn trim_record_v5_records_the_entries_shown_after_trimming() {
+    let full = record_value(&ok(&spec()));
+    assert_eq!(full["v"], json!(5));
+    assert_eq!(
+        full["memory"],
+        json!({ "shown": [shown(0), shown(1)], "total": 3 }),
+        "render order, ids and versions, never the text"
+    );
+    assert_eq!(shown(0)["version"], json!(1));
+    assert_eq!(shown(1)["version"], json!(2));
+
+    let bare = trimmable();
+    let one = record_value(&ok(&at_target(&bare, full_cost(&bare) - 10)));
+    assert_eq!(one["v"], json!(5));
+    assert_eq!(one["memory"], json!({ "shown": [shown(0)], "total": 3 }));
+
+    let none = record_value(&ok(&at_target(&bare, full_cost(&bare) - 219)));
+    assert_eq!(none["memory"], json!({ "shown": [], "total": 3 }));
+}
+
+#[test]
+fn the_memory_key_is_absent_without_memory_and_empty_when_the_cap_took_all() {
+    let plain = record_value(&ok(&fixtures::phase_implement_attempt2()));
+    assert_eq!(plain["v"], json!(5));
+    assert!(plain.get("memory").is_none(), "{plain}");
+
+    let mut capped = spec();
+    capped.memory.as_mut().expect("memory").entries.clear();
+    let prompt = ok(&capped);
+    assert_eq!(memory_row(&prompt), None, "no section, no row");
+    assert_eq!(
+        record_value(&prompt)["memory"],
+        json!({ "shown": [], "total": 3 }),
+        "the record says the cap removed everything (blueprint P-3)"
+    );
+}
+
+#[test]
+fn a_v4_record_still_answers_prompt_summary() {
+    let v4 = json!({ "v": 4, "estimated_after": 123, "sections": [{ "trimmed": true }] });
+    assert_eq!(prompt_summary(Some(&v4)), (Some(123), true));
+    let prompt = ok(&spec());
+    let (tokens, trimmed) = prompt_summary(Some(&record_value(&prompt)));
+    assert_eq!(
+        tokens,
+        Some(i32::try_from(prompt.trim.estimated_after).expect("small"))
+    );
+    assert!(!trimmed);
 }
