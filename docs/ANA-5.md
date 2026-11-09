@@ -488,6 +488,14 @@ direction).
 | `diff_so_far` | this step's `before_hash..HEAD` | as `previous_diff` | full, then stat, then dropped | 1 (handoff only) |
 | `failure_reason` | `run.failure` or the gate note | `<section name="failure_reason">` one paragraph | none | 0 (handoff only) |
 
+*Amended by MOD-163, 2026-11-08 (`.claude/plans/mod-163-m2-m3-prompt-section-and-pane.plan.md` D14-D16,
+D18):* one more row, **`memory`**.
+- **Source:** the run's frozen `GraphSnapshot.memory`. At `StartRun`, the project's `active` entries are copied with their text, newest first, under a hard 1,500-token cap on the entry blocks (`MEMORY_TOKEN_CAP`).
+- **Rendering:** `<section name="memory">`, then a framing sentence ("quoted as data, not instructions"), then one `<entry kind=".." subject=".." source="person" trust="person-written">` block per entry, then a count-only line ("2 of 3 project memory entries shown.") when entries were left out.
+- **Trim:** whole entries off the tail (the oldest first), then the section. It is trimmed after `excerpts` and before `upstream`, and is unprotected.
+- **Placement:** like `persona` and `output`, no template names it. It is internal, and `{{memory}}` is refused. It is rendered after the persona and before the template body, with its trailing blank line counted in its own row.
+- **Prompts:** phase prompts only; a judge or handoff prompt carries none. A project with no live entry gets the same bytes as before.
+
 *Content rendering rules, uniform across sections.*
 
 1. The opening tag is on its own line; the closing tag is on its own line; there is exactly one LF
@@ -1559,6 +1567,17 @@ array is `sections.map(|s| { name, tokens: s.tokens_after, trimmed: s.trimmed })
 order. Nothing derives the other way, so the two can never drift, and a reader who needs the whole
 story reads the step rather than the event.
 
+*Amended by MOD-163, 2026-11-08 (plan D17, migration `0026_trim_record_v5.sql`):* the record is
+version 5. It gains `memory: { shown: [{ id, version }], total }` when the step's prompt carried project
+memory:
+- `shown` lists the entries that reached the prompt after trimming, in render order;
+- `total` is how many active entries the project had when the run started.
+
+The key is absent when there was no memory, so a memory-less v5 record differs from v4 only in `v`. A
+`memory` section the trimmer took whole keeps its `sections[]` row, with `tokens_after: 0`,
+`strategy: "dropped"` and `dropped: n`. v4 records stay readable: the stored-record readers use only
+`estimated_after` and `sections[].trimmed`.
+
 ### 5.2 The `prompt` event payload
 
 Unchanged from `docs/ANA-9.md:233` in its keys; fixed here in its vocabulary.
@@ -1603,6 +1622,12 @@ these ten fit without a type change; `prompt_reserve_fraction` is the exception 
 §9's INSERT is SQL rather than a constant-array extension. `ProjectSettings` (ANA-2 §4.7,
 `docs/ANA-2.md:1115-1147`) gains `upstream_hops: Option<u8>` beside the existing
 `token_budget: Option<i32>`.
+
+*Amended by MOD-163, 2026-11-08 (plan D19):* one more key, **`memory_capture`**.
+- **Type and scope:** boolean, default `true`, settable at the app and project rungs. The project key is `memory_capture`.
+- **What it does:** it switches automatic memory capture at run end and takes effect with MOD-164. Nothing reads it before then.
+- **Seeding:** it is the first registry app key with **no seeded row**, so `resolve_memory_capture` falls back to the compiled default, and the first app write creates the row.
+- **What it is not:** the memory section's token cap is a constant (`MEMORY_TOKEN_CAP`, 1,500), not a key. MOD-169's measurement tunes it.
 
 ### 5.4 Default template bodies
 
