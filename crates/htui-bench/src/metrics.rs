@@ -8,52 +8,102 @@ pub const WILSON_Z: f64 = 1.96;
 
 /// 1-based rank of the first entry of `ranked` that is one of `targets`; `None` when none is.
 pub fn first_target_rank(ranked: &[CorpusId], targets: &[CorpusId]) -> Option<usize> {
-    let _ = (ranked, targets);
-    None
+    ranked
+        .iter()
+        .position(|id| targets.contains(id))
+        .map(|index| index + 1)
 }
 
 /// `rank <= k`.
 pub fn hit_at(rank: Option<usize>, k: usize) -> bool {
-    let _ = (rank, k);
-    false
+    rank.is_some_and(|rank| rank <= k)
 }
 
 /// `1 / rank` when `rank <= cutoff`, else 0 (MRR@cutoff summand).
 pub fn reciprocal_rank(rank: Option<usize>, cutoff: usize) -> f64 {
-    let _ = (rank, cutoff);
-    -1.0
+    match rank {
+        Some(rank) if rank >= 1 && rank <= cutoff => 1.0 / rank as f64,
+        _ => 0.0,
+    }
 }
 
 /// Wilson score interval (low, high), clamped to [0, 1]; `n == 0` gives (0.0, 1.0).
 pub fn wilson_interval(successes: usize, n: usize) -> (f64, f64) {
-    let _ = (successes, n);
-    (-1.0, -1.0)
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let trials = n as f64;
+    let p = successes.min(n) as f64 / trials;
+    let z2 = WILSON_Z * WILSON_Z;
+    let denominator = 1.0 + z2 / trials;
+    let centre = (p + z2 / (2.0 * trials)) / denominator;
+    let half =
+        WILSON_Z * (p * (1.0 - p) / trials + z2 / (4.0 * trials * trials)).sqrt() / denominator;
+    // At p = 0 (p = 1) the bound is exactly 0 (1); rounding must not move it off the end.
+    let low = if successes == 0 { 0.0 } else { centre - half };
+    let high = if successes >= n { 1.0 } else { centre + half };
+    (low.clamp(0.0, 1.0), high.clamp(0.0, 1.0))
 }
 
 /// Exact two-sided McNemar: `min(1, 2 · P[X <= min(b, c)])`, X ~ Bin(b + c, 1/2); `b + c == 0` gives 1.
 /// Computed as t0 = 0.5^n, t(i+1) = t(i)·(n−i)/(i+1), summed in f64 (no overflow for n ≤ 1000).
 pub fn mcnemar_exact(only_a: usize, only_b: usize) -> f64 {
-    let _ = (only_a, only_b);
-    -1.0
+    let n = only_a + only_b;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = only_a.min(only_b);
+    let mut term = 0.5_f64.powi(i32::try_from(n).unwrap_or(i32::MAX));
+    let mut tail = 0.0;
+    for i in 0..=k {
+        tail += term;
+        term = term * (n - i) as f64 / (i + 1) as f64;
+    }
+    (2.0 * tail).min(1.0)
 }
 
 /// Mann-Whitney AUC of positives over negatives, a tie counting one half; `None` if either is empty.
 pub fn auc(positives: &[f64], negatives: &[f64]) -> Option<f64> {
-    let _ = (positives, negatives);
-    None
+    if positives.is_empty() || negatives.is_empty() {
+        return None;
+    }
+    let wins: f64 = positives
+        .iter()
+        .flat_map(|p| negatives.iter().map(move |n| (p, n)))
+        .map(|(p, n)| {
+            if p > n {
+                1.0
+            } else if p == n {
+                0.5
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    Some(wins / (positives.len() * negatives.len()) as f64)
 }
 
 /// Fraction of positives strictly above every negative; `None` when positives is empty; an empty
 /// negatives slice makes the threshold −∞.
 pub fn recall_at_zero_false_alarms(positives: &[f64], negatives: &[f64]) -> Option<f64> {
-    let _ = (positives, negatives);
-    None
+    if positives.is_empty() {
+        return None;
+    }
+    let threshold = negatives.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let above = positives.iter().filter(|&&p| p > threshold).count();
+    Some(above as f64 / positives.len() as f64)
 }
 
 /// Nearest-rank percentile (p in 0..=100) of a copy sorted with `f64::total_cmp`; `None` if empty.
 pub fn percentile(values: &[f64], p: f64) -> Option<f64> {
-    let _ = (values, p);
-    None
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    // p · n / 100 rather than (p / 100) · n: 95 · 20 / 100 is exactly 19.
+    let rank = (p.clamp(0.0, 100.0) * sorted.len() as f64 / 100.0).ceil() as usize;
+    Some(sorted[rank.clamp(1, sorted.len()) - 1])
 }
 
 #[cfg(test)]

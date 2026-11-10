@@ -1,6 +1,8 @@
 //! The benchmark's shared vocabulary (MOD-162 T2): corpus IDs, documents, ranked rows, backends,
 //! query classes, and the conversion of production search hits into ranked lists.
 
+use std::collections::HashSet;
+
 use htui_core::model::Item;
 use htui_store::vector::Hit;
 
@@ -24,14 +26,12 @@ pub struct CorpusId(String);
 impl CorpusId {
     /// The ID as written.
     pub fn new(id: impl Into<String>) -> Self {
-        let _ = id.into();
-        Self(String::new())
+        Self(id.into())
     }
 
     /// `DEC:<key>`: a decision's ID.
     pub fn decision(key: &str) -> Self {
-        let _ = key;
-        Self(String::new())
+        Self(format!("{DECISION_PREFIX}{key}"))
     }
 
     /// The ID as written.
@@ -41,19 +41,25 @@ impl CorpusId {
 
     /// Whether this is a decision's ID (`DEC:` prefix).
     pub fn is_decision(&self) -> bool {
-        false
+        self.0.starts_with(DECISION_PREFIX)
     }
 
     /// P3: `DEC:<key>` when `hit.resolution.is_some()`, else `hit.key`.
     pub fn of_hit(hit: &Hit) -> Self {
-        let _ = hit;
-        Self(String::new())
+        if hit.resolution.is_some() {
+            Self::decision(&hit.key)
+        } else {
+            Self::new(hit.key.as_str())
+        }
     }
 
     /// `DEC:<key>` for a closed item (`resolution.is_some()`), else its key.
     pub fn of_item(item: &Item) -> Self {
-        let _ = item;
-        Self(String::new())
+        if item.resolution.is_some() {
+            Self::decision(&item.key)
+        } else {
+            Self::new(item.key.as_str())
+        }
     }
 }
 
@@ -164,17 +170,52 @@ impl Backend {
 
     /// The report's name: `"S"`, `"S-points"`, `"L-or-len"`, …
     pub const fn name(self) -> &'static str {
-        ""
+        match self {
+            Self::S => "S",
+            Self::S10 => "S10",
+            Self::SPoints => "S-points",
+            Self::SDense => "S-dense",
+            Self::SSparse => "S-sparse",
+            Self::LAnd => "L-and",
+            Self::LOr => "L-or",
+            Self::LAndLen => "L-and-len",
+            Self::LOrLen => "L-or-len",
+            Self::G => "G",
+            Self::GDens => "G-dens",
+            Self::H => "H",
+        }
     }
 
     /// L-*, G, G-dens, H: the baselines ("every lexical" in the report).
     pub const fn is_lexical(self) -> bool {
-        false
+        match self {
+            Self::S | Self::S10 | Self::SPoints | Self::SDense | Self::SSparse => false,
+            Self::LAnd
+            | Self::LOr
+            | Self::LAndLen
+            | Self::LOrLen
+            | Self::G
+            | Self::GDens
+            | Self::H => true,
+        }
     }
 
     /// The Postgres variant of an `L-*` backend; `None` for every other.
     pub const fn l_variant(self) -> Option<LVariant> {
-        None
+        match self {
+            Self::LAnd => Some(LVariant::And),
+            Self::LOr => Some(LVariant::Or),
+            Self::LAndLen => Some(LVariant::AndLen),
+            Self::LOrLen => Some(LVariant::OrLen),
+            Self::S
+            | Self::S10
+            | Self::SPoints
+            | Self::SDense
+            | Self::SSparse
+            | Self::G
+            | Self::GDens
+            | Self::H => None,
+        }
     }
 }
 
@@ -182,7 +223,16 @@ impl std::str::FromStr for Backend {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Err(format!("unknown backend {s:?}"))
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.name() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|backend| backend.name()).collect();
+                format!(
+                    "unknown backend {s:?}; expected one of {}",
+                    names.join(", ")
+                )
+            })
     }
 }
 
@@ -202,12 +252,15 @@ pub enum LVariant {
 impl LVariant {
     /// `ts_rank_cd` normalisation: 32 for And/Or, 34 (= 2|32) for the `-len` pair.
     pub const fn normalization(self) -> i32 {
-        0
+        match self {
+            Self::And | Self::Or => 32,
+            Self::AndLen | Self::OrLen => 2 | 32,
+        }
     }
 
     /// Or, OrLen: the tsquery's `&` rewritten to `|`.
     pub const fn is_or(self) -> bool {
-        false
+        matches!(self, Self::Or | Self::OrLen)
     }
 }
 
@@ -236,17 +289,32 @@ impl QueryClass {
 
     /// `"a"` … `"d"`.
     pub const fn letter(self) -> &'static str {
-        ""
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
+            Self::D => "d",
+        }
     }
 
     /// `"duplicates"`, `"questions"`, `"identifiers"`, `"no target"`.
     pub const fn label(self) -> &'static str {
-        ""
+        match self {
+            Self::A => "duplicates",
+            Self::B => "questions",
+            Self::C => "identifiers",
+            Self::D => "no target",
+        }
     }
 
     /// Queries of this class in a set: 24, 20, 16, 12.
     pub const fn expected_count(self) -> usize {
-        0
+        match self {
+            Self::A => 24,
+            Self::B => 20,
+            Self::C => 16,
+            Self::D => 12,
+        }
     }
 }
 
@@ -255,7 +323,10 @@ impl std::str::FromStr for QueryClass {
 
     /// By [`QueryClass::letter`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Err(format!("unknown query class {s:?}"))
+        Self::ALL
+            .into_iter()
+            .find(|class| class.letter() == s)
+            .ok_or_else(|| format!("unknown query class {s:?}; expected one of a, b, c, d"))
     }
 }
 
@@ -263,8 +334,15 @@ impl std::str::FromStr for QueryClass {
 /// `collapse`: one row per corpus ID, first occurrence wins (S, S10, S-dense, S-sparse);
 /// otherwise one row per point, duplicates kept (S-points, ANA-37 §11).
 pub fn ranked_from_hits(hits: &[Hit], collapse: bool, depth: usize) -> Vec<Ranked> {
-    let _ = (hits, collapse, depth);
-    Vec::new()
+    let mut seen = HashSet::new();
+    hits.iter()
+        .map(|hit| Ranked {
+            id: CorpusId::of_hit(hit),
+            score: f64::from(hit.score),
+        })
+        .filter(|row| !collapse || seen.insert(row.id.clone()))
+        .take(depth)
+        .collect()
 }
 
 #[cfg(test)]
