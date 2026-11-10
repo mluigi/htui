@@ -2064,6 +2064,7 @@ async fn a_stream_with_no_init_times_out_and_kills_its_child() {
             command: "sleep".to_owned(),
             args: vec!["1000".to_owned()],
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
         },
         tmp.path(),
     )
@@ -2632,6 +2633,123 @@ async fn launch_for_marks_the_session_whatever_the_setting() {
         }
     }
     assert_eq!(SESSION_VAR, "HTUI_SESSION");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-97 D5: a subscription-billed row's API-billing variables never reach the session
+// ---------------------------------------------------------------------------------------------
+
+/// The two neutral names the MOD-97 cases list. Not a vendor's: the list is row data (`R-AGT-5`).
+#[cfg(unix)]
+const BILLING_ENV: [&str; 2] = ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"];
+
+/// What [`CliDriver::launch_for`] resolves for a row whose `launch.env` carries the first billing
+/// name, whose settings list `billing_env` (or nothing, on `None`), and whose session's `spec.env`
+/// carries the second name (the project-secret route) plus a plain `OTHER`.
+#[cfg(unix)]
+async fn cli_launch_with(
+    billing: Billing,
+    billing_env: Option<serde_json::Value>,
+) -> htui_agent::launch::ResolvedLaunch {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let env = serde_json::Map::from_iter([(BILLING_ENV[0].to_owned(), json!("row-value"))]);
+    let mut row = scripted_row(&dir.path().join("absent"), env);
+    row.billing = billing;
+    if let Some(list) = billing_env {
+        row.settings["api_billing_env"] = list;
+    }
+    cli_launch_for(&row, dir.path()).await
+}
+
+/// [`CliDriver::launch_for`] over `row`, with [`BILLING_ENV`]'s second name and `OTHER` in the
+/// session's environment.
+#[cfg(unix)]
+async fn cli_launch_for(row: &AgentRow, cwd: &Path) -> htui_agent::launch::ResolvedLaunch {
+    let driver = CliDriver::from_row(row, DriverCaps::default()).expect("the row builds");
+    let mut with = spec(cwd.to_path_buf());
+    with.env
+        .insert(BILLING_ENV[1].to_owned(), "secret-value".to_owned());
+    with.env.insert("OTHER".to_owned(), "kept".to_owned());
+    driver.launch_for(&with).await.expect("the row resolves")
+}
+
+/// MOD-97 D1, D5: on a `subscription` row every listed name leaves the resolved environment,
+/// whether the row's `launch.env` or the session's `spec.env` (a project secret) put it there, and
+/// `env_remove` carries the whole list in order, so `spawn` removes an inherited copy too.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_strips_the_billing_env_on_a_subscription_row() {
+    let resolved = cli_launch_with(Billing::Subscription, Some(json!(BILLING_ENV))).await;
+
+    for name in BILLING_ENV {
+        assert!(!resolved.env.contains_key(name), "{name}: {resolved:?}");
+    }
+    assert_eq!(resolved.env.get("OTHER").map(String::as_str), Some("kept"));
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, BILLING_ENV);
+}
+
+/// MOD-97 D2: a `per_token` row carrying the same list keeps every variable, so a copy of a
+/// subscription row flipped to `per_token` bills the API without editing the list.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_keeps_the_billing_env_on_a_per_token_row() {
+    let resolved = cli_launch_with(Billing::PerToken, Some(json!(BILLING_ENV))).await;
+
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+        Some("row-value")
+    );
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+        Some("secret-value")
+    );
+    assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+}
+
+/// MOD-97 D2: a row without the list strips nothing, and neither does one whose settings document
+/// is unreadable (it falls back to `AgentSettings::default()`, as every other setting does).
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_strips_nothing_without_the_list() {
+    let without = cli_launch_with(Billing::Subscription, None).await;
+    let empty = cli_launch_with(Billing::Subscription, Some(json!([]))).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let env = serde_json::Map::from_iter([(BILLING_ENV[0].to_owned(), json!("row-value"))]);
+    let mut unreadable = scripted_row(&dir.path().join("absent"), env);
+    unreadable.settings = json!("x");
+    let unreadable = cli_launch_for(&unreadable, dir.path()).await;
+
+    for resolved in [without, empty, unreadable] {
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+            Some("row-value"),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+            Some("secret-value"),
+            "{resolved:?}"
+        );
+        assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+    }
+}
+
+/// MOD-97 (MOD-91 D4): a list naming `HTUI_SESSION` cannot unset the session marker; the name is
+/// dropped from the list, so `spawn` never removes it either.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_billing_list_cannot_strip_the_session_marker() {
+    let resolved = cli_launch_with(
+        Billing::Subscription,
+        Some(json!([SESSION_VAR, BILLING_ENV[0]])),
+    )
+    .await;
+
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+    assert!(!resolved.env.contains_key(BILLING_ENV[0]));
 }
 
 /// [`TURN_SCRIPT`], after copying its own `HTUI_SESSION` (or `unset`) to `$HTUI_GO_FILE.session`.

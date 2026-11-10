@@ -575,6 +575,7 @@ fn claude_with_args(args: &[&str]) -> ResolvedLaunch {
         command: "claude".to_owned(),
         args: args.iter().map(|&arg| arg.to_owned()).collect(),
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     }
 }
 
@@ -639,6 +640,63 @@ fn debug_prints_arguments_without_mcp_config_unchanged() {
         format!("{launch:?}"),
         format!(r#"ResolvedLaunch {{ command: "claude", args: {args:?}, env: {{}} }}"#)
     );
+}
+
+/// MOD-97 D5: `Debug` names `env_remove` only when it holds something, so every launch without
+/// one prints exactly as before (the two exact assertions above), and a stripped session's log
+/// line says which variables `spawn` removes. Names only: they are not secret, values never are
+/// in the list.
+#[test]
+fn debug_names_env_remove_only_when_set() {
+    let plain = claude_with_args(&[]);
+    assert_eq!(
+        format!("{plain:?}"),
+        r#"ResolvedLaunch { command: "claude", args: [], env: {} }"#
+    );
+
+    let stripped = ResolvedLaunch {
+        env_remove: vec!["HTUI_TEST_VENDOR_KEY".to_owned()],
+        ..claude_with_args(&[])
+    };
+    assert_eq!(
+        format!("{stripped:?}"),
+        r#"ResolvedLaunch { command: "claude", args: [], env: {}, env_remove: ["HTUI_TEST_VENDOR_KEY"] }"#
+    );
+}
+
+/// MOD-97 D5: a launch without `env_remove` serialises the three keys it always did, so the
+/// probe's recorded launch (`agent_box.probe`) round-trips byte for byte and never carries the
+/// list; a recording without the key parses to an empty one, and a non-empty list round-trips.
+#[test]
+fn a_resolved_launch_without_env_remove_serialises_three_keys() {
+    let plain = claude_with_args(&["-p"]);
+    let value = serde_json::to_value(&plain).expect("serialises");
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["args", "command", "env"]);
+
+    let parsed: ResolvedLaunch =
+        serde_json::from_str(r#"{"command":"claude","args":["-p"],"env":{}}"#)
+            .expect("a recording without the key parses");
+    assert!(parsed.env_remove.is_empty());
+    assert_eq!(parsed, plain);
+
+    let stripped = ResolvedLaunch {
+        env_remove: vec![
+            "HTUI_TEST_VENDOR_KEY".to_owned(),
+            "HTUI_TEST_VENDOR_TOKEN".to_owned(),
+        ],
+        ..plain
+    };
+    let round: ResolvedLaunch =
+        serde_json::from_value(serde_json::to_value(&stripped).expect("serialises"))
+            .expect("parses back");
+    assert_eq!(round, stripped);
 }
 
 #[test]
@@ -749,10 +807,23 @@ async fn spawn_sh_with_env(
     env: BTreeMap<String, String>,
     cwd: &std::path::Path,
 ) -> Spawned {
+    spawn_sh_with(script, env, Vec::new(), cwd).await
+}
+
+/// [`spawn_sh_with_env`] with the names `spawn` removes from the child's environment, as a
+/// subscription-billed session's launch carries them (MOD-97 D5).
+#[cfg(unix)]
+async fn spawn_sh_with(
+    script: &str,
+    env: BTreeMap<String, String>,
+    env_remove: Vec<String>,
+    cwd: &std::path::Path,
+) -> Spawned {
     let launch = ResolvedLaunch {
         command: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), script.to_owned()],
         env,
+        env_remove,
     };
     htui_agent::launch::spawn(&launch, cwd)
         .await
@@ -1206,5 +1277,104 @@ async fn an_inherited_htui_qdrant_api_key_never_reaches_an_agent() {
     assert!(
         !stdout.contains(QDRANT_KEY_SENTINEL),
         "the inherited key reached the agent: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A subscription-billed session's API-billing variables never reach the agent (MOD-97 D5)
+// ---------------------------------------------------------------------------------------------
+
+/// The value the MOD-97 cases plant. Never a real key.
+#[cfg(unix)]
+const VENDOR_KEY_SENTINEL: &str = "SENTINEL-VK";
+
+/// The script both MOD-97 spawn cases run: the stripped variable's `printenv` status, then a plain
+/// variable that must still arrive.
+#[cfg(unix)]
+const PRINT_THE_VENDOR_KEY: &str = "printenv HTUI_TEST_VENDOR_KEY; echo \"rc=$?\"; printenv PLAIN";
+
+/// Runs [`PRINT_THE_VENDOR_KEY`] with `env_remove = [HTUI_TEST_VENDOR_KEY]` and answers its stdout.
+#[cfg(unix)]
+async fn print_the_vendor_key(env: BTreeMap<String, String>) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spawned = spawn_sh_with(
+        PRINT_THE_VENDOR_KEY,
+        env,
+        vec!["HTUI_TEST_VENDOR_KEY".to_owned()],
+        dir.path(),
+    )
+    .await;
+    let stdout = spawned.read_stdout_to_end().await.expect("stdout reads");
+    spawned.wait().await.expect("the child exits");
+    stdout
+}
+
+/// The removal runs after `.envs`, so a name in both the launch environment and `env_remove` never
+/// reaches the child: the strip is authoritative even where a caller forgot to drop the entry.
+#[cfg(unix)]
+#[tokio::test]
+async fn env_remove_beats_the_launch_env() {
+    let env = BTreeMap::from([
+        (
+            "HTUI_TEST_VENDOR_KEY".to_owned(),
+            VENDOR_KEY_SENTINEL.to_owned(),
+        ),
+        ("PLAIN".to_owned(), "kept".to_owned()),
+    ]);
+    let stdout = print_the_vendor_key(env).await;
+    assert!(
+        stdout.contains("rc=1"),
+        "printenv finds no key, got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("kept"),
+        "a plain launch variable still arrives, got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(VENDOR_KEY_SENTINEL),
+        "the removed variable reached the agent: {stdout:?}"
+    );
+}
+
+/// The inherited half, the hazard MOD-97 exists for: `htui` itself runs with the variable
+/// exported. Re-runs itself as a child test binary that inherits it, as the MOD-158 case above
+/// does (`set_var` is `unsafe`).
+#[cfg(unix)]
+#[tokio::test]
+async fn an_inherited_variable_in_env_remove_never_reaches_the_child() {
+    const CHILD: &str = "HTUI_AGENT_LAUNCH_TEST_ENV_REMOVE_CHILD";
+    const NAME: &str = "an_inherited_variable_in_env_remove_never_reaches_the_child";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([NAME, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HTUI_TEST_VENDOR_KEY", VENDOR_KEY_SENTINEL)
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matched nothing would also succeed.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+        return;
+    }
+    // The child: the variable is inherited, so without the removal the agent would see it.
+    assert_eq!(
+        std::env::var("HTUI_TEST_VENDOR_KEY").as_deref(),
+        Ok(VENDOR_KEY_SENTINEL)
+    );
+    let stdout =
+        print_the_vendor_key(BTreeMap::from([("PLAIN".to_owned(), "kept".to_owned())])).await;
+    assert!(
+        stdout.contains("rc=1"),
+        "printenv finds no key, got {stdout:?}"
+    );
+    assert!(stdout.contains("kept"), "got {stdout:?}");
+    assert!(
+        !stdout.contains(VENDOR_KEY_SENTINEL),
+        "the inherited variable reached the agent: {stdout:?}"
     );
 }

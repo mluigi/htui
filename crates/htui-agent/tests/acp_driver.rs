@@ -966,6 +966,94 @@ async fn launch_for_marks_the_session_whatever_the_setting() {
     assert_eq!(SESSION_VAR, "HTUI_SESSION");
 }
 
+// ---------------------------------------------------------------------------------------------
+// MOD-97 D5: a subscription-billed row's API-billing variables never reach the session
+// ---------------------------------------------------------------------------------------------
+
+/// The two neutral names the MOD-97 cases list. Not a vendor's: the list is row data (`R-AGT-5`).
+const BILLING_ENV: [&str; 2] = ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"];
+
+/// An [`AcpDriver`] over a ready snapshot whose recorded launch carries the first billing name,
+/// for a row billed `billing` whose settings list both names, plus a spec whose `env` carries the
+/// second name (the project-secret route) and a plain `OTHER`.
+fn billed_driver(tmp: &Path, billing: Billing) -> (AcpDriver, SessionSpec) {
+    let mut agent = unresolvable_row();
+    agent.billing = billing;
+    agent.settings["api_billing_env"] = json!(BILLING_ENV);
+    let recorded = ResolvedLaunch {
+        command: plain_file(&tmp.join("bin/htui-fake-adapter")),
+        args: vec![MARKER.to_owned()],
+        env: BTreeMap::from([(BILLING_ENV[0].to_owned(), "row-value".to_owned())]),
+        env_remove: Vec::new(),
+    };
+    let row_on_box = on_box(
+        &agent,
+        &snapshot(ProbeSource::Probe, ProbeStatus::Ready, recorded),
+    );
+    let driver = AcpDriver::from_row_with_probe(&agent, Some(&row_on_box), caps_for(&agent))
+        .expect("the row's launch parses");
+    let mut with = spec(tmp.to_path_buf());
+    with.env
+        .insert(BILLING_ENV[1].to_owned(), "secret-value".to_owned());
+    with.env.insert("OTHER".to_owned(), "kept".to_owned());
+    (driver, with)
+}
+
+/// MOD-97 D1, D5: on a `subscription` row every listed name leaves what the session would spawn,
+/// whether the recorded launch or the spec put it there, and `env_remove` carries the list, so the
+/// adapter (which hands its own `process.env` to the CLI) never sees an inherited copy either. A
+/// login's launch ([`AcpDriver::launch_in`]) runs no billed turn and is left alone (plan D5).
+#[tokio::test]
+async fn launch_for_strips_the_billing_env_on_a_subscription_row() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (driver, with) = billed_driver(tmp.path(), Billing::Subscription);
+
+    let resolved = driver
+        .launch_for(&with)
+        .await
+        .expect("a ready snapshot is usable");
+
+    for name in BILLING_ENV {
+        assert!(!resolved.env.contains_key(name), "{name}: {resolved:?}");
+    }
+    assert_eq!(resolved.env.get("OTHER").map(String::as_str), Some("kept"));
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, BILLING_ENV);
+
+    let login = driver
+        .launch_in(tmp.path())
+        .await
+        .expect("a ready snapshot is usable");
+    assert_eq!(
+        login.env.get(BILLING_ENV[0]).map(String::as_str),
+        Some("row-value"),
+        "a login is not a session"
+    );
+    assert!(login.env_remove.is_empty(), "{login:?}");
+}
+
+/// MOD-97 D2: a `per_token` row carrying the same list keeps every variable.
+#[tokio::test]
+async fn launch_for_keeps_the_billing_env_on_a_per_token_row() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (driver, with) = billed_driver(tmp.path(), Billing::PerToken);
+
+    let resolved = driver
+        .launch_for(&with)
+        .await
+        .expect("a ready snapshot is usable");
+
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+        Some("row-value")
+    );
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+        Some("secret-value")
+    );
+    assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+}
+
 /// [`AgentDriver::start`], retrying the `ETXTBSY` window a fixture executable opens.
 ///
 /// The harness runs these cases on threads of one process, so a `fork` in another case's spawn

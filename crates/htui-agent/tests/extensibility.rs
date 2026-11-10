@@ -337,6 +337,38 @@ fn the_installer_names_no_vendor() {
     );
 }
 
+/// The `src/` half of `R-AGT-5` for MOD-97's billing strip (plan D2): which variables move a
+/// session onto API billing is row data (`agent.settings.api_billing_env`, seeded on the
+/// subscription rows), and no production source spells one. A row without the list strips nothing,
+/// and a strip that named a vendor's variable in code would be the hard-coded agent the rule
+/// forbids. The only spelling under `src/` today is inside a `mod tests` block.
+#[test]
+fn the_spawn_path_names_no_billing_variable() {
+    /// The prefix every variable the seeded subscription rows list shares.
+    const VOCABULARY: [&str; 1] = ["ANTHROPIC_"];
+
+    let mut offenders = Vec::new();
+    for path in tree_files() {
+        if !path.components().any(|part| part.as_os_str() == "src") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in VOCABULARY {
+            if production_half(&text).contains(name) {
+                offenders.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "`R-AGT-5` says the variables a strip removes are the row's to name, so a production source \
+         that spells one has stopped being data-driven: {offenders:?}"
+    );
+}
+
 /// The `src/` half of `R-AGT-5` for MOD-21's login (plan T1): the method ids an agent advertises,
 /// the host its link points at, the directory its adapter unpacks into and the variables its own
 /// error text names are the agent's words, carried through as data. A `match` on any of them is
