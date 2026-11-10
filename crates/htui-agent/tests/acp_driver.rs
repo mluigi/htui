@@ -992,7 +992,7 @@ fn billed_driver(tmp: &Path, billing: Billing) -> (AcpDriver, SessionSpec) {
 fn billed_driver_with(
     tmp: &Path,
     billing: Billing,
-    settings: impl FnOnce(&mut serde_json::Value),
+    settings: impl FnOnce(&mut Value),
 ) -> (AcpDriver, SessionSpec) {
     let mut agent = unresolvable_row();
     agent.billing = billing;
@@ -1076,13 +1076,14 @@ async fn launch_for_keeps_the_billing_env_on_a_per_token_row() {
 /// `AgentSettings::default()`, as every other setting does): the CLI case's twin.
 #[tokio::test]
 async fn launch_for_strips_nothing_without_the_list() {
-    let editors: [(&str, fn(&mut serde_json::Value)); 4] = [
+    type Edit = fn(&mut Value);
+    let editors: [(&str, Edit); 4] = [
         ("no list", |_| {}),
         ("an empty list", |settings| {
             settings["api_billing_env"] = json!([]);
         }),
         ("a null list", |settings| {
-            settings["api_billing_env"] = serde_json::Value::Null;
+            settings["api_billing_env"] = Value::Null;
         }),
         ("an unreadable document", |settings| *settings = json!("x")),
     ];

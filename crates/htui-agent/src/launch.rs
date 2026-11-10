@@ -310,7 +310,49 @@ pub struct AgentSettings {
     /// `per_token` row the list is ignored, so a copy flipped to `per_token` bills the API without
     /// editing it. Row data, never source (`R-AGT-5`): the seeds name the vendor's variables, and a
     /// row without the list strips nothing. [`SESSION_VAR`] is never stripped (MOD-91 D4).
+    ///
+    /// Read leniently ([`names_or_none`]): `null` is the empty list and a bare string a one-name
+    /// list, so a hand-edited value in either shape cannot fail the whole document, whose fallback
+    /// to `default()` would strip nothing.
+    #[serde(deserialize_with = "names_or_none")]
     pub api_billing_env: Vec<String>,
+}
+
+/// [`AgentSettings::api_billing_env`]'s reader (MOD-97 R1): `null` → no names, a string → that one
+/// name, an array of strings → as written. Anything else is still an error.
+fn names_or_none<'de, D>(deserializer: D) -> core::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<Names>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Names::One(name)) => vec![name],
+        Some(Names::Many(names)) => names,
+    })
+}
+
+/// Parses a row's `agent.settings`, falling back to [`AgentSettings::default`] when it does not
+/// parse, as every setting has always done. The fallback is logged once, naming the agent and
+/// where and how the document failed, never the document or any value in it (`R-SEC-2`):
+/// `serde_json::Error`'s `Display` can quote the input, so only its category and position are
+/// logged.
+pub(crate) fn settings_of(agent: &str, settings: &serde_json::Value) -> AgentSettings {
+    serde_json::from_value(settings.clone()).unwrap_or_else(|err: serde_json::Error| {
+        warn!(
+            agent = %agent,
+            category = ?err.classify(),
+            line = err.line(),
+            column = err.column(),
+            "agent.settings does not parse; using the default settings"
+        );
+        AgentSettings::default()
+    })
 }
 
 /// `agent.settings.acp` (§5.2).
@@ -534,6 +576,11 @@ impl ResolvedLaunch {
     /// private, and the row carries `discovery` and unresolved placeholders the SDK type has no
     /// place for. ANA-4 §5.1's "deserializes into the SDK type with no adapter layer" is one
     /// sentence looser than the crate (plan X6); the *shape* is field-for-field as the ANA says.
+    ///
+    /// **Not a session spawn** (MOD-97 R1): the SDK type has no way to remove an inherited
+    /// variable, so [`ResolvedLaunch::env_remove`] is not applied and a child started from this
+    /// configuration would inherit every name a `subscription` row strips. Sessions spawn through
+    /// [`spawn`], which applies it; nothing in `htui` starts an agent from this value.
     #[must_use]
     pub fn to_acp_config(&self) -> AcpAgentConfig {
         AcpAgentConfig::new(&self.command)
@@ -645,7 +692,8 @@ pub(crate) fn mark_session(env: &mut BTreeMap<String, String>) {
 ///
 /// No wildcard arm, so a new billing kind has to decide. [`SESSION_VAR`] is dropped from the
 /// list: `spawn` removes after `.envs`, so a row naming it would unset the session marker, which
-/// no row can (MOD-91 D4).
+/// no row can (MOD-91 D4). Dropped in any case, on every platform: Windows removes environment
+/// names case-insensitively, so `htui_session` there would unset it too (MOD-97 R1).
 pub(crate) fn billing_env_to_strip(
     billing: htui_core::model::Billing,
     settings: &AgentSettings,
@@ -654,7 +702,7 @@ pub(crate) fn billing_env_to_strip(
         htui_core::model::Billing::Subscription => settings
             .api_billing_env
             .iter()
-            .filter(|name| name.as_str() != SESSION_VAR)
+            .filter(|name| !name.eq_ignore_ascii_case(SESSION_VAR))
             .cloned()
             .collect(),
         htui_core::model::Billing::PerToken => Vec::new(),
@@ -669,9 +717,13 @@ pub(crate) fn billing_env_to_strip(
 /// removing an absent variable does nothing. A name actually present, in the resolved environment
 /// or in this process's own, logs one `warn!` naming the agent and the variable, never its value
 /// (`R-SEC-2`).
+///
+/// On Windows an entry differing only in case is removed too ([`remove_case_variants`]). Spawn-time
+/// removal stays the authority either way: `env_remove` runs after `.envs`.
 pub(crate) fn strip_billing_env(resolved: &mut ResolvedLaunch, names: &[String], agent: &str) {
     for name in names {
-        let named = resolved.env.remove(name).is_some();
+        let named =
+            resolved.env.remove(name).is_some() | remove_case_variants(&mut resolved.env, name);
         if named || std::env::var_os(name).is_some() {
             warn!(
                 agent = %agent,
@@ -681,6 +733,24 @@ pub(crate) fn strip_billing_env(resolved: &mut ResolvedLaunch, names: &[String],
         }
     }
     resolved.env_remove = names.to_vec();
+}
+
+/// Removes every entry of `env` whose name equals `name` ignoring ASCII case, answering whether
+/// one was there (MOD-97 R1). Windows only: its environment names are case-insensitive, so
+/// `.envs` would hand the child a `Name` that `env_remove` of `NAME` then removes anyway, and the
+/// entry should leave the resolved launch (and its log line) as well. Unix names are
+/// case-sensitive, so there `NAME` and `Name` are two variables and only the listed one goes.
+#[cfg(windows)]
+fn remove_case_variants(env: &mut BTreeMap<String, String>, name: &str) -> bool {
+    let before = env.len();
+    env.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    env.len() != before
+}
+
+/// The unix half of [`remove_case_variants`]: names are case-sensitive, nothing more to remove.
+#[cfg(not(windows))]
+fn remove_case_variants(_env: &mut BTreeMap<String, String>, _name: &str) -> bool {
+    false
 }
 
 /// Replaces every `${name}` in one string.

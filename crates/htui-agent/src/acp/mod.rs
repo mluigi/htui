@@ -269,8 +269,7 @@ impl AcpDriver {
             .and_then(crate::probe::ProbeSnapshot::from_row)
             .filter(|snapshot| snapshot.transport == agent.transport)
             .and_then(|snapshot| snapshot.recorded_launch().cloned());
-        let settings: AgentSettings =
-            serde_json::from_value(agent.settings.clone()).unwrap_or_default();
+        let settings = crate::launch::settings_of(&agent.name, &agent.settings);
         let strip_env = crate::launch::billing_env_to_strip(agent.billing, &settings);
         Ok(Self {
             name: agent.name.clone(),

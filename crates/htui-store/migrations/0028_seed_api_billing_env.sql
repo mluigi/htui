@@ -5,9 +5,9 @@
 -- API billing, settings.api_billing_env; a subscription-billed session strips them from the
 -- child's environment. Seeds are a name-keyed insert-once (seed_if_empty_as: ON CONFLICT (name)
 -- DO NOTHING), so a box seeded earlier keeps the hazard. This adds the list to a seeded claude or
--- claude-cli row only while its settings have no api_billing_env key; an explicit value (an empty
--- list or a JSON null included), a settings value that is not an object, another name or the
--- other transport is left alone, and a second run matches nothing. Runs before the seed pass
+-- claude-cli row only while its settings have no api_billing_env key; an explicit value (null and
+-- [] mean none), a settings value that is not an object, another name or the other transport is
+-- left alone, and a second run matches nothing. Runs before the seed pass
 -- (apply_migrations: migrate, then bootstrap), so a fresh database is a no-op here and gets the
 -- new seeds.
 --

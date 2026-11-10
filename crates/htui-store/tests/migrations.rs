@@ -1623,9 +1623,9 @@ async fn migration_0028_seeds_the_billing_env_once() {
 }
 
 /// MOD-97 D4: 0028 is name-, transport- and key-keyed. A `claude` row whose `api_billing_env` is
-/// already set (`[]` and an explicit JSON `null` included: `?` asks whether the key exists, not
-/// what it holds), a settings value that is not an object, and the seeded names on the other
-/// transport are all left alone, `updated_at` included.
+/// already set is an explicit value and is left alone (`null` and `[]` mean none; `?` asks whether
+/// the key exists, not what it holds), as are a settings value that is not an object and the
+/// seeded names on the other transport, `updated_at` included.
 #[tokio::test]
 async fn migration_0028_leaves_explicit_and_other_rows_alone() {
     let at = at_2026();
@@ -1653,7 +1653,7 @@ async fn migration_0028_leaves_explicit_and_other_rows_alone() {
             "claude",
             "acp",
             with(serde_json::Value::Null),
-            "a `claude` row whose list is an explicit JSON null",
+            "a `claude` row whose list is an explicit null (none)",
         ),
         (
             "claude",
