@@ -1,0 +1,8 @@
+---
+source: crates/htui/src/ui/graph_editor/edge_form.rs
+expression: text(&lines)
+---
+ relation    ‹ if ›
+▌predicate   {"verify":"maybe"}
+             one line of JSON, e.g. {"verify":"failed"}
+             `if`: `verify` takes "passed" or "failed"
