@@ -162,6 +162,17 @@ fn redid(label: &str) -> String {
     format!("redid {label}")
 }
 
+/// An undo or redo the client's rules refused before it left (MOD-141 R1 M1): it is dropped
+/// from the history.
+fn cannot(write: &Write, refusal: &str) -> String {
+    let (verb, label) = match write {
+        Write::Undo(label) => ("undo", label),
+        Write::Redo(label) => ("redo", label),
+        Write::Edit(label) => ("save", label),
+    };
+    format!("can't {verb} {label}: {refusal}; dropped from history")
+}
+
 /// The delete question (D10, C3): the editor cannot see the step's skill bindings, so it always
 /// says what undo does not bring back. `answers` is the question's own keys.
 fn delete_question(name: &str, answers: &str) -> String {
@@ -559,7 +570,7 @@ impl GraphEditor {
 
     /// Every reply the host receives; the editor takes its own: its write's answer, and the
     /// agents and templates it reads.
-    pub fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::GraphReplaced { outcome, .. } => match outcome {
                 CasOutcome::Applied(body) if body.graph.id == self.graph() && self.busy() => {
@@ -572,9 +583,18 @@ impl GraphEditor {
                 CasOutcome::Applied(_) | CasOutcome::Stale(_) => {}
             },
             StoreReply::Failed { request, message } if *request == "replace_graph" => {
-                if self.history.failed().is_some() {
-                    self.after_save = None;
-                    self.refuse(message);
+                let Some(write) = self.history.failed() else {
+                    return;
+                };
+                self.after_save = None;
+                self.refuse(message);
+                // MOD-141 R1 M1: the entry stays (the refusal may pass), but the registry may have
+                // lost what it names: the lookups are read again, so the next try is judged on
+                // them and dropped before it leaves. The catalogue goes to the host, which hands
+                // its personas on.
+                if matches!(write, Write::Undo(_) | Write::Redo(_)) {
+                    ctx.request(StoreRequest::Catalogue(ctx.scope.clone()));
+                    ctx.request(StoreRequest::Agents);
                 }
             }
             StoreReply::Agents(agents) => {
@@ -806,17 +826,11 @@ impl GraphEditor {
                 }
             }
             Act::GraphEditorUndo => match self.history.begin_undo(&self.body) {
-                Ok(previous) => {
-                    self.notice = None;
-                    self.send(previous, ctx);
-                }
+                Ok(previous) => self.step_back_or_forth(previous, ctx),
                 Err(refusal) => self.refuse(refusal.sentence()),
             },
             Act::GraphEditorRedo => match self.history.begin_redo(&self.body) {
-                Ok(next) => {
-                    self.notice = None;
-                    self.send(next, ctx);
-                }
+                Ok(next) => self.step_back_or_forth(next, ctx),
                 Err(refusal) => self.refuse(refusal.sentence()),
             },
             Act::GraphEditorClose => {
@@ -1091,6 +1105,21 @@ impl GraphEditor {
         true
     }
 
+    /// An undo or redo the history began (MOD-141 R1 M1): the store's rules first, as for an edit
+    /// (D5), since the registry may have lost what the entry names since it was pushed. A body
+    /// they refuse never leaves: the entry is dropped from the history, not put back, and the
+    /// notice says so.
+    fn step_back_or_forth(&mut self, body: GraphBody, ctx: &Ctx<'_>) {
+        if let Some(refusal) = model::validate(&body, &self.lookups) {
+            if let Some(write) = self.history.dropped() {
+                self.refuse(&cannot(&write, &refusal));
+            }
+            return;
+        }
+        self.notice = None;
+        self.send(body, ctx);
+    }
+
     /// The one request every write is (D4): the whole body, compare-and-set on the revision the
     /// editor shows. The editor keeps showing the current body until the reply.
     fn send(&self, next: GraphBody, ctx: &Ctx<'_>) {
@@ -1209,10 +1238,12 @@ mod tests {
     use chrono::{DateTime, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        EdgeId, NodeBody, ProjectRef, StepGraph, StepGraphEdge, StepGraphPhase,
+        EdgeId, NodeBody, PersonaId, ProjectRef, StepGraph, StepGraphEdge, StepGraphPhase,
     };
     use htui_core::seed::{PhaseSeed, phase_row};
-    use htui_core::store::{MemStore, WriteStore, loop_edge_runs_forward, reserved_phase_name};
+    use htui_core::store::{
+        MemStore, WriteStore, loop_edge_runs_forward, references_no_row, reserved_phase_name,
+    };
     use htui_store::Backend;
     use ratatui::backend::TestBackend;
     use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -1726,6 +1757,145 @@ mod tests {
         bench.key(&mut editor, "U");
         assert_eq!(notice_text(&editor), Some(history::NOTHING_TO_REDO));
         assert!(bench.requests().is_empty());
+    }
+
+    /// The persona the R1 M1 tests reference and then remove from the registry.
+    fn reviewer() -> PersonaSummary {
+        PersonaSummary {
+            id: PersonaId::from_uuid(Uuid::from_u128(0x0141_0900)),
+            name: "reviewer".to_owned(),
+        }
+    }
+
+    /// The sentence the client's rules give for `persona` gone from the registry.
+    fn no_persona(persona: &PersonaSummary) -> String {
+        references_no_row("step_graph_phase.persona_id", persona.id, "persona")
+    }
+
+    /// One `e`, `2`, `enter` rename of the selected step, answered `Applied` with the sent body
+    /// one revision on, `persona` given to research when `Some`.
+    fn renamed(bench: &Bench, editor: &mut GraphEditor, persona: Option<PersonaId>) {
+        bench.key(editor, "e");
+        bench.typed(editor, "2");
+        bench.key(editor, "enter");
+        let (_, _, sent, _) = bench.write();
+        let mut answer = stored(sent);
+        if persona.is_some() {
+            answer.nodes[0].phase.persona_id = persona;
+        }
+        bench.reply(editor, &applied(answer));
+    }
+
+    /// MOD-141 R1 M1: an undo entry the client's rules now refuse (its persona was removed) never
+    /// leaves: nothing is sent, the entry is dropped with a sentence, and the next undo reaches the
+    /// older entry.
+    #[tokio::test]
+    async fn an_undo_the_rules_refuse_is_dropped_and_the_next_undo_reaches_the_older_entry() {
+        let bench = Bench::new().await;
+        let reviewer = reviewer();
+        let (mut editor, _) = GraphEditor::open(
+            flow(0, GraphScope::Library, 0),
+            vec![reviewer.clone()],
+            &bench.scope,
+        );
+        // Edit one: research renamed, and the store's answer has it played by the reviewer.
+        renamed(&bench, &mut editor, Some(reviewer.id));
+        // Edit two: plan renamed; its undo entry is the body naming the reviewer.
+        bench.key(&mut editor, "j");
+        renamed(&bench, &mut editor, None);
+        assert_eq!(editor.history.undo_label(), Some("editing plan"));
+
+        editor.set_personas(&[]);
+        bench.key(&mut editor, "u");
+        assert!(bench.requests().is_empty(), "a refused undo sends nothing");
+        let dropped = format!(
+            "can't undo editing plan: {}; dropped from history",
+            no_persona(&reviewer)
+        );
+        assert_eq!(notice_text(&editor), Some(dropped.as_str()));
+        assert!(!editor.busy());
+        assert_eq!(editor.history.depths(), (1, 0), "dropped, not put back");
+
+        bench.key(&mut editor, "u");
+        let (_, _, sent, _) = bench.write();
+        assert_eq!(names(&sent), ["research", "plan", "review"]);
+        assert_eq!(
+            editor.history.busy(),
+            Some(&Write::Undo("editing research".to_owned()))
+        );
+    }
+
+    /// MOD-141 R1 M1: a redo entry the client's rules now refuse is dropped the same way.
+    #[tokio::test]
+    async fn a_redo_the_rules_refuse_is_dropped() {
+        let bench = Bench::new().await;
+        let reviewer = reviewer();
+        let (mut editor, _) = GraphEditor::open(
+            flow(0, GraphScope::Library, 0),
+            vec![reviewer.clone()],
+            &bench.scope,
+        );
+        renamed(&bench, &mut editor, Some(reviewer.id));
+        // Undo: the redo entry is the body naming the reviewer.
+        bench.key(&mut editor, "u");
+        let (_, _, sent, _) = bench.write();
+        bench.reply(&mut editor, &applied(stored(sent)));
+        assert_eq!(editor.history.depths(), (0, 1));
+
+        editor.set_personas(&[]);
+        bench.key(&mut editor, "U");
+        assert!(bench.requests().is_empty(), "a refused redo sends nothing");
+        let dropped = format!(
+            "can't redo editing research: {}; dropped from history",
+            no_persona(&reviewer)
+        );
+        assert_eq!(notice_text(&editor), Some(dropped.as_str()));
+        assert!(!editor.busy());
+        assert_eq!(editor.history.depths(), (0, 0));
+        bench.key(&mut editor, "U");
+        assert_eq!(notice_text(&editor), Some(history::NOTHING_TO_REDO));
+    }
+
+    /// MOD-141 R1 M1: the store refusing an undo keeps the entry (the refusal may pass) and asks
+    /// for the lookups again, so the next undo is judged against the registry as it is now. An
+    /// edit's refusal asks for nothing.
+    #[tokio::test]
+    async fn a_refused_undo_asks_for_the_lookups_again() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        renamed(&bench, &mut editor, None);
+        bench.key(&mut editor, "u");
+        let _ = bench.write();
+        bench.reply(
+            &mut editor,
+            &StoreReply::Failed {
+                request: "replace_graph",
+                message: "refused".to_owned(),
+            },
+        );
+        let asked = vec![
+            StoreRequest::Catalogue(bench.scope.clone()),
+            StoreRequest::Agents,
+        ];
+        assert_eq!(format!("{:?}", bench.requests()), format!("{asked:?}"));
+        assert_eq!(editor.history.undo_label(), Some("editing research"));
+        assert_eq!(notice_text(&editor), Some("refused"));
+
+        // A redo refused asks the same.
+        bench.key(&mut editor, "u");
+        let (_, _, sent, _) = bench.write();
+        bench.reply(&mut editor, &applied(stored(sent)));
+        bench.key(&mut editor, "U");
+        let _ = bench.write();
+        bench.reply(
+            &mut editor,
+            &StoreReply::Failed {
+                request: "replace_graph",
+                message: "refused".to_owned(),
+            },
+        );
+        assert_eq!(format!("{:?}", bench.requests()), format!("{asked:?}"));
+        assert_eq!(editor.history.depths(), (0, 1));
     }
 
     #[tokio::test]
