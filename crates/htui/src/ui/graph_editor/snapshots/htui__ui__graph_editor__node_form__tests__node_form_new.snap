@@ -1,0 +1,24 @@
+---
+source: crates/htui/src/ui/graph_editor/node_form.rs
+expression: text(&lines)
+---
+▌name
+ template       ‹ research ›
+ version        ‹ latest ›
+ persona        ‹ none ›
+ gate           ‹ never ›
+ hard gate      ○ off
+ retry limit    0
+ isolation      ‹ project default ›
+ commands       ‹ queued when fanned out ›
+ verify
+ token budget
+ inputs
+ output
+ agents         none (ctrl-n adds one)
+ split          none
+ fan-out        1
+ palette        no
+ plan scope     none
+ parts          0 parts
+ deadline       edited in M2
