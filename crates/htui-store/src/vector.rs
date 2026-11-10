@@ -19,7 +19,7 @@ use htui_core::store::StoreError;
 use qdrant_client::qdrant::{
     CollectionInfo, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
     DeletePointsBuilder, Distance, FieldType, Filter, Fusion, Modifier, NamedVectors, PointId,
-    PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, ScrollPointsBuilder,
+    PointStruct, PrefetchQueryBuilder, Query, QueryPoints, QueryPointsBuilder, ScrollPointsBuilder,
     SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpdateCollectionBuilder,
     UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
     point_id::PointIdOptions, vectors_config,
@@ -344,6 +344,19 @@ pub struct SearchQuery {
     pub resolutions: Vec<Resolution>,
     /// Most hits returned.
     pub limit: u64,
+}
+
+/// Which arms of the hybrid search [`QdrantStore::search_arms`] runs (MOD-162 P1). Production
+/// searches `Hybrid` only, through [`VectorStore::search`]; the other two exist for the retrieval
+/// benchmark, so it measures the production request rather than a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchArms {
+    /// Both prefetch arms fused by RRF: exactly [`VectorStore::search`].
+    Hybrid,
+    /// The dense (cosine) arm alone.
+    Dense,
+    /// The sparse (BM25) arm alone. A query with no sparse term finds nothing.
+    Sparse,
 }
 
 /// One search result.
@@ -716,6 +729,70 @@ fn search_filter(query: &SearchQuery) -> Filter {
     Filter::must(must)
 }
 
+/// The request one search sends, or `None` when it would find nothing (a `Sparse` search with
+/// no term, or a dense arm with no vector). Pure, so the request shape is unit-tested.
+fn search_request(
+    collection: &str,
+    query: &SearchQuery,
+    dense: Option<Vec<f32>>,
+    sparse: Vec<(u32, f32)>,
+    arms: SearchArms,
+) -> Option<QueryPoints> {
+    match arms {
+        SearchArms::Hybrid => {
+            let dense = dense?;
+            let filter = search_filter(query);
+            // Each arm fetches more than the final limit so the fusion has overlap to work with.
+            let depth = query.limit.saturating_mul(4).max(20);
+            let mut request = QueryPointsBuilder::new(collection)
+                .add_prefetch(
+                    PrefetchQueryBuilder::default()
+                        .query(Query::new_nearest(dense))
+                        .using(DENSE)
+                        .filter(filter.clone())
+                        .limit(depth),
+                )
+                .query(Query::new_fusion(Fusion::Rrf))
+                .filter(filter.clone())
+                .limit(query.limit)
+                .with_payload(true);
+            if !sparse.is_empty() {
+                request = request.add_prefetch(
+                    PrefetchQueryBuilder::default()
+                        .query(Query::from(sparse))
+                        .using(SPARSE)
+                        .filter(filter)
+                        .limit(depth),
+                );
+            }
+            Some(request.build())
+        }
+        SearchArms::Dense => Some(
+            QueryPointsBuilder::new(collection)
+                .query(Query::new_nearest(dense?))
+                .using(DENSE)
+                .filter(search_filter(query))
+                .limit(query.limit)
+                .with_payload(true)
+                .build(),
+        ),
+        SearchArms::Sparse => {
+            if sparse.is_empty() {
+                return None;
+            }
+            Some(
+                QueryPointsBuilder::new(collection)
+                    .query(Query::from(sparse))
+                    .using(SPARSE)
+                    .filter(search_filter(query))
+                    .limit(query.limit)
+                    .with_payload(true)
+                    .build(),
+            )
+        }
+    }
+}
+
 fn sparse_pairs(v: &SparseVector) -> Vec<(u32, f32)> {
     v.indices
         .iter()
@@ -972,6 +1049,52 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .await
             .map_err(|e| qdrant("create collection", e))?;
         Ok(())
+    }
+
+    /// [`VectorStore::search`] with a choice of arms. `Hybrid` is that search byte for byte;
+    /// `Dense` and `Sparse` send that arm's prefetch query as the top-level query, with the same
+    /// vector, the same filter and `limit = query.limit`. `Sparse` embeds nothing.
+    ///
+    /// # Errors
+    /// As [`VectorStore::search`]: [`QUERY_EMBED_FAILED`] when the model fails (not for
+    /// `Sparse`), and a Qdrant error.
+    pub async fn search_arms(
+        &self,
+        query: &SearchQuery,
+        arms: SearchArms,
+    ) -> Result<Vec<Hit>, StoreError> {
+        if query.projects.is_empty() || query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let dense = if arms == SearchArms::Sparse {
+            None
+        } else {
+            let embed_failed = |e: &dyn std::fmt::Display| {
+                StoreError::Backend(format!("{QUERY_EMBED_FAILED}: {e}"))
+            };
+            Some(
+                self.embedder
+                    .embed(vec![query.text.clone()])
+                    .await
+                    .map_err(|e| embed_failed(&e))?
+                    .pop()
+                    .ok_or_else(|| embed_failed(&"no vector for the query"))?,
+            )
+        };
+        let sparse = sparse_pairs(&bm25::query_vector(&query.text));
+        let Some(request) = search_request(&self.collection, query, dense, sparse, arms) else {
+            return Ok(Vec::new());
+        };
+        let response = self
+            .client
+            .query(request)
+            .await
+            .map_err(|e| qdrant("query", e))?;
+        Ok(response
+            .result
+            .iter()
+            .filter_map(|p| hit(&p.payload, p.score))
+            .collect())
     }
 }
 
@@ -1278,53 +1401,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
-        if query.projects.is_empty() || query.limit == 0 {
-            return Ok(Vec::new());
-        }
-        let embed_failed =
-            |e: &dyn std::fmt::Display| StoreError::Backend(format!("{QUERY_EMBED_FAILED}: {e}"));
-        let dense = self
-            .embedder
-            .embed(vec![query.text.clone()])
-            .await
-            .map_err(|e| embed_failed(&e))?
-            .pop()
-            .ok_or_else(|| embed_failed(&"no vector for the query"))?;
-        let sparse = sparse_pairs(&bm25::query_vector(&query.text));
-        let filter = search_filter(query);
-        // Each arm fetches more than the final limit so the fusion has overlap to work with.
-        let depth = query.limit.saturating_mul(4).max(20);
-        let mut request = QueryPointsBuilder::new(&self.collection)
-            .add_prefetch(
-                PrefetchQueryBuilder::default()
-                    .query(Query::new_nearest(dense))
-                    .using(DENSE)
-                    .filter(filter.clone())
-                    .limit(depth),
-            )
-            .query(Query::new_fusion(Fusion::Rrf))
-            .filter(filter.clone())
-            .limit(query.limit)
-            .with_payload(true);
-        if !sparse.is_empty() {
-            request = request.add_prefetch(
-                PrefetchQueryBuilder::default()
-                    .query(Query::from(sparse))
-                    .using(SPARSE)
-                    .filter(filter)
-                    .limit(depth),
-            );
-        }
-        let response = self
-            .client
-            .query(request)
-            .await
-            .map_err(|e| qdrant("query", e))?;
-        Ok(response
-            .result
-            .iter()
-            .filter_map(|p| hit(&p.payload, p.score))
-            .collect())
+        self.search_arms(query, SearchArms::Hybrid).await
     }
 }
 
