@@ -55,7 +55,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
-use crate::model::{NewOwnerDocument, OwnerDocument, StepRole};
+use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, RunPlan, StepRole};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -5643,6 +5643,8 @@ impl State {
                     .filter(|row| memory_entries.contains(&row.entry_id))
                     .count(),
             ),
+            // MOD-139 plan D5: MemStore holds no `run_plan` rows until T2.
+            run_plans: 0,
         };
         Some((
             reach,
@@ -9704,6 +9706,11 @@ impl ReadStore for MemStore {
     async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>> {
         Ok(self.read(|state| state.owner_document_rows(project)))
     }
+
+    /// MOD-139 M1 T1 stub; T2 reads `State`'s plans.
+    async fn run_plans(&self, _run: RunId) -> Result<Vec<RunPlan>> {
+        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    }
 }
 
 impl WriteStore for MemStore {
@@ -10387,6 +10394,11 @@ impl WriteStore for MemStore {
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
         let now = self.now();
         self.write(|state| state.record_branch(fence, step, branch, now))
+    }
+
+    /// MOD-139 M1 T1 stub; T2 writes `State`'s plans.
+    async fn insert_run_plan(&self, _fence: StepFence, _plan: NewRunPlan) -> Result<RunPlan> {
+        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {

@@ -707,6 +707,8 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         item_requirements: rows(row.item_requirements),
         memory_entries: rows(row.memory_entries),
         memory_revisions: rows(row.memory_revisions),
+        // MOD-139 plan D5: counted by T3's `project_reach` subselect.
+        run_plans: 0,
     }))
 }
 
@@ -7829,6 +7831,15 @@ impl WriteStore for PgStore {
             return Ok(true);
         }
         Box::pin(fenced_miss(&self.pool, step, fence)).await
+    }
+
+    /// MOD-139 M1 T1 stub; T3 writes `run_plan`.
+    async fn insert_run_plan(
+        &self,
+        _fence: StepFence,
+        _plan: htui_core::model::NewRunPlan,
+    ) -> Result<htui_core::model::RunPlan> {
+        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
     }
 
     /// One `command_run` row, every column the caller's (plan D31).

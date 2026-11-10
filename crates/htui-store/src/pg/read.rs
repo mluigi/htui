@@ -1194,6 +1194,11 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-139 M1 T1 stub; T3 reads `run_plan`.
+    async fn run_plans(&self, _run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    }
+
     /// The item's live citations, each joined to the requirement as it is now, in
     /// `(area_code, number, kind)` order.
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {

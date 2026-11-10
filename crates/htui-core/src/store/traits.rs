@@ -71,7 +71,7 @@ use crate::model::{
     QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
     RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
     RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus, RunStep, RunStepCommit,
     RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
     SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
@@ -367,6 +367,17 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn owner_documents(&self, project: ProjectId) -> Result<Vec<OwnerDocument>>;
+
+    // ---- MOD-139 M1: run plans (plan D4) ------------------------------------------------------
+
+    /// The run's `run_plan` revisions in `revision` order; empty for an unknown run. Mirrored
+    /// (plan D2), so the offline mirror answers from its last refresh, as MOD-142's parts tree
+    /// needs. On [`WorkerStore`](crate::store::WorkerStore) too: MOD-139 M2's admission and
+    /// recovery read it.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>>;
 }
 
 /// Everything a write path needs.
@@ -1671,12 +1682,16 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool>;
 
-    /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
+    /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted. `role`,
+    /// `parent_step_id` and `node_key` (MOD-139 D3) are written once, here.
     ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on an unknown run or agent
-    /// (foreign key, like [`append_events`](WriteStore::append_events)), on a duplicate id, or on
-    /// a repeat of `(run_id, position, attempt, fanout_index)`.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) first for a row
+    /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -3..-1 or off
+    /// [`STAGE_KEYS`](crate::model::STAGE_KEYS); a negative position on any other role; a NUL key),
+    /// judged before any read and worded alike on every backend; then on an unknown run, agent or
+    /// parent step (foreign key, like [`append_events`](WriteStore::append_events)), a duplicate
+    /// id, or a repeat of `(run_id, position, attempt, fanout_index)`.
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep>;
 
     /// §4.3 compare-and-set on `run.status`; `started_at = COALESCE(started_at, at)` when `to` is
@@ -1850,6 +1865,26 @@ pub trait WriteStore: ReadStore {
     /// `fence`'s lease. `Ok(false)`: the step is not `done`, or its `branch` is already set;
     /// nothing is written.
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool>;
+
+    /// MOD-139 D4: inserts one `run_plan` revision of `plan.run_id` at
+    /// [`PlanStatus::Proposed`](crate::model::PlanStatus::Proposed) with no `base_refs`, under
+    /// `fence` (as [`write_step_document`](Self::write_step_document) writes under one), and answers
+    /// the stored row, `created_at == updated_at`. Admission (the status move, `base_refs`, the part
+    /// rows) is MOD-139 M2's one-transaction verb, not this one. MOD-140's `plan_submit` and M2's
+    /// revision-1 test path write through it.
+    ///
+    /// # Errors
+    /// In this order: [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`run_plan_refusal`]) for a negative `revision` or `base_position` or a NUL, judged before
+    /// any read; [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) `{ step: plan.planner_step_id }`
+    /// when the run does not carry `fence`'s lease, nothing written;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) ([`planner_not_in_run`])
+    /// when `planner_step_id` is unknown or a step of another run; then `Constraint` for a
+    /// duplicate id (`already_exists("run_plan", id)`) or a taken `(run_id, revision)`
+    /// ([`plan_revision_taken`]). Every text is the same on every backend; the last two are not
+    /// ordered between themselves.
+    async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan>;
 
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
@@ -3808,7 +3843,9 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
 /// [`WriteStore::park_step`] (MOD-37 R-5), [`WriteStore::write_step_document`],
 /// [`WriteStore::add_step_note`], [`WriteStore::propose_link`] and [`WriteStore::withdraw_link`]
-/// (MOD-11 plan D13), and [`WriteStore::record_branch`] (MOD-138 M2 D5) take one and write only
+/// (MOD-11 plan D13), [`WriteStore::record_branch`] (MOD-138 M2 D5), and
+/// [`WriteStore::insert_run_plan`] (MOD-139 D4, fenced on the plan's run and reported as
+/// `Fenced { step: planner_step_id }`) take one and write only
 /// while the step's run carries
 /// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
 /// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
@@ -3868,7 +3905,7 @@ pub enum DeleteTarget {
 /// since MOD-37 R-6 gave `MemStore` the table, and is `0` on the demo fixture, which seeds none;
 /// `run_step_commits`, `run_step_trees` and `command_runs` are counted on both since MOD-4.
 /// MOD-38's six requirement fields are counted on both stores. MOD-163's two memory fields are
-/// counted on both stores (plan D8).
+/// counted on both stores (plan D8). MOD-139's `run_plans` is counted on both stores (plan D5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -3937,6 +3974,8 @@ pub struct DeleteReach {
     pub memory_entries: u64,
     /// `memory_entry_revision` rows of those entries.
     pub memory_revisions: u64,
+    /// `run_plan` rows of the project's runs, every status (MOD-139 plan D5).
+    pub run_plans: u64,
 }
 
 /// Field-wise sum (MOD-147 A1): a workspace's reach is its own part plus its scope row's project
@@ -3976,6 +4015,7 @@ impl std::ops::Add for DeleteReach {
             item_requirements,
             memory_entries,
             memory_revisions,
+            run_plans,
         } = self;
         Self {
             workspace_links: workspace_links + other.workspace_links,
@@ -4008,6 +4048,7 @@ impl std::ops::Add for DeleteReach {
             item_requirements: item_requirements + other.item_requirements,
             memory_entries: memory_entries + other.memory_entries,
             memory_revisions: memory_revisions + other.memory_revisions,
+            run_plans: run_plans + other.run_plans,
         }
     }
 }

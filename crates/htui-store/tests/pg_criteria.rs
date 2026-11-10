@@ -3318,15 +3318,16 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Thirty entries for thirty fields: a field added without an entry leaves the struct literal
-    /// below incomplete and the crate does not compile. MOD-38's six requirement tables follow, in
-    /// `DeleteReach` field order, and MOD-163's two memory tables close it (plan D8).
+    /// Thirty-one entries for thirty-one fields: a field added without an entry leaves the struct
+    /// literal below incomplete and the crate does not compile. MOD-38's six requirement tables
+    /// follow, in `DeleteReach` field order, then MOD-163's two memory tables (plan D8), and
+    /// MOD-139's `run_plan` closes it.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 30] = [
+    const TABLES: [&str; 31] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3357,6 +3358,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "item_requirement",
         "memory_entry",
         "memory_entry_revision",
+        "run_plan",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -3404,8 +3406,9 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         item_requirements,
         memory_entries,
         memory_revisions,
+        run_plans,
     } = report;
-    let claimed: [u64; 30] = [
+    let claimed: [u64; 31] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3436,6 +3439,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         item_requirements,
         memory_entries,
         memory_revisions,
+        run_plans,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {

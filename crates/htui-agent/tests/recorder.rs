@@ -460,6 +460,10 @@ impl ReadStore for SpyStore {
     ) -> StoreResult<Vec<htui_core::model::OwnerDocument>> {
         self.inner.owner_documents(project).await
     }
+
+    async fn run_plans(&self, run: RunId) -> StoreResult<Vec<htui_core::model::RunPlan>> {
+        self.inner.run_plans(run).await
+    }
 }
 
 impl WriteStore for SpyStore {
@@ -1064,6 +1068,14 @@ impl WriteStore for SpyStore {
         branch: &Value,
     ) -> StoreResult<bool> {
         self.inner.record_branch(fence, step, branch).await
+    }
+
+    async fn insert_run_plan(
+        &self,
+        fence: StepFence,
+        plan: htui_core::model::NewRunPlan,
+    ) -> StoreResult<htui_core::model::RunPlan> {
+        self.inner.insert_run_plan(fence, plan).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
         self.inner.record_command_run(new).await

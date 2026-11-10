@@ -1345,6 +1345,11 @@ impl ReadStore for CacheStore {
             .collect()
     }
 
+    /// MOD-139 M1 T1 stub; T3 reads the mirror.
+    async fn run_plans(&self, _run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    }
+
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {REQUIREMENT_SELECT}, ir.kind, ir.requirement_version, \

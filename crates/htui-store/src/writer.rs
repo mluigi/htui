@@ -363,6 +363,13 @@ impl ReadStore for Writer {
             Self::Online(pg) => pg.owner_documents(project).await,
         }
     }
+
+    async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        match self {
+            Self::Memory(store) => store.run_plans(run).await,
+            Self::Online(pg) => pg.run_plans(run).await,
+        }
+    }
 }
 
 impl WriteStore for Writer {
@@ -1258,6 +1265,17 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.record_branch(fence, step, branch).await,
             Self::Online(pg) => pg.record_branch(fence, step, branch).await,
+        }
+    }
+
+    async fn insert_run_plan(
+        &self,
+        fence: StepFence,
+        plan: htui_core::model::NewRunPlan,
+    ) -> Result<htui_core::model::RunPlan> {
+        match self {
+            Self::Memory(store) => store.insert_run_plan(fence, plan).await,
+            Self::Online(pg) => pg.insert_run_plan(fence, plan).await,
         }
     }
 
