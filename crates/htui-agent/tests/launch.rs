@@ -489,6 +489,42 @@ fn the_seeded_rows_keep_accept_edits_and_pin_the_acp_mode() {
     );
 }
 
+/// MOD-97 D2/D3: the seeded rows' API-billing list, parsed as the drivers parse it. Both Claude
+/// rows name the two variables Claude Code bills to; `agy` names none, because its
+/// `GEMINI_API_KEY` is a login tier the probe reads, and a row without the key strips nothing.
+#[test]
+fn the_seeded_subscription_rows_name_their_api_billing_env() {
+    let rows = htui_core::model::agent::seed_rows(
+        chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+    );
+    let settings_of = |name: &str| -> AgentSettings {
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("the seed rows carry `{name}`"));
+        serde_json::from_value(row.settings.clone())
+            .unwrap_or_else(|err| panic!("`{name}`'s settings parse: {err}"))
+    };
+
+    let billing_env = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+    assert_eq!(settings_of("claude").api_billing_env, billing_env, "claude");
+    assert_eq!(
+        settings_of("claude-cli").api_billing_env,
+        billing_env,
+        "claude-cli"
+    );
+    assert!(
+        settings_of("agy").api_billing_env.is_empty(),
+        "agy strips nothing"
+    );
+
+    let empty: AgentSettings = serde_json::from_str("{}").expect("an empty settings object parses");
+    assert!(
+        empty.api_billing_env.is_empty(),
+        "a row without the key strips nothing"
+    );
+}
+
 #[test]
 fn resolve_substitutes_command_args_and_env() {
     let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");

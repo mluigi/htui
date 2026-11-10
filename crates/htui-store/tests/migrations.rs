@@ -113,7 +113,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27
+            25, 26, 27, 28
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -126,7 +126,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
          0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
-         0026_workspace_scope.sql and MOD-163 M2's 0027_trim_record_v5.sql, in ordinal order"
+         0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql and MOD-97's \
+         0028_seed_api_billing_env.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -1440,19 +1441,20 @@ async fn agent_rows(
         .expect("read agent rows")
 }
 
-/// Runs 0018's SQL a second time, outside the migrator (which would refuse to re-apply it).
-async fn rerun_0018(pool: &sqlx::PgPool) {
+/// Runs migration `version`'s SQL a second time, outside the migrator (which would refuse to
+/// re-apply it).
+async fn rerun(pool: &sqlx::PgPool, version: i64) {
     let sql = MIGRATOR
         .iter()
-        .find(|m| m.version == 18)
-        .expect("0018 is embedded")
+        .find(|m| m.version == version)
+        .unwrap_or_else(|| panic!("{version:04} is embedded"))
         .sql
         .as_str()
         .to_owned();
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(pool)
         .await
-        .expect("0018 runs again");
+        .unwrap_or_else(|err| panic!("{version:04} runs again: {err}"));
 }
 
 /// MOD-96 D6 (Q3 = b): `0018_seed_permission_mode.sql` pins a `claude` row seeded before MOD-96
@@ -1462,7 +1464,8 @@ async fn rerun_0018(pool: &sqlx::PgPool) {
 /// nothing.
 ///
 /// Staged at v17 through [`MIGRATOR`] so the rows exist before 0018 runs, as on a real box; the
-/// plain `run` afterwards applies 0018 alone and no seed pass runs.
+/// `run_to(18)` afterwards applies 0018 alone (a plain `run` would carry on into 0028, which
+/// patches the same rows) and no seed pass runs.
 #[tokio::test]
 async fn migration_0018_pins_the_old_claude_row_once() {
     let Some(db) = common::bare_db().await else {
@@ -1477,7 +1480,7 @@ async fn migration_0018_pins_the_old_claude_row_once() {
     insert_agent(&db.pool, "claude", "acp", old_acp_settings(), at).await;
     let before = agent_rows(&db.pool).await;
 
-    MIGRATOR.run(&db.pool).await.expect("apply 0018");
+    MIGRATOR.run_to(18, &db.pool).await.expect("apply 0018");
 
     let mut expected_acp = old_acp_settings();
     expected_acp["acp"]["permission_mode"] = json!("default");
@@ -1497,7 +1500,7 @@ async fn migration_0018_pins_the_old_claude_row_once() {
     );
     assert!(claude.2 > at, "the trigger bumps claude's updated_at");
 
-    rerun_0018(&db.pool).await;
+    rerun(&db.pool, 18).await;
     assert_eq!(
         agent_rows(&db.pool).await,
         after,
@@ -1543,7 +1546,7 @@ async fn migration_0018_leaves_edited_and_other_rows_alone() {
         insert_agent(&db.pool, "my-claude", "acp", old_acp_settings(), at).await;
 
         let before = agent_rows(&db.pool).await;
-        MIGRATOR.run(&db.pool).await.expect("apply 0018");
+        MIGRATOR.run_to(18, &db.pool).await.expect("apply 0018");
         assert_eq!(
             agent_rows(&db.pool).await,
             before,
@@ -1551,6 +1554,165 @@ async fn migration_0018_leaves_edited_and_other_rows_alone() {
         );
         db.drop_db().await;
     }
+}
+
+/// The list `0028_seed_api_billing_env.sql` writes, and the seeds carry (MOD-97 D3).
+fn billing_env() -> serde_json::Value {
+    json!(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+}
+
+/// MOD-97 D4: `0028_seed_api_billing_env.sql` adds `api_billing_env` to a `claude` (ACP) and a
+/// `claude-cli` (CLI) row seeded before MOD-97, and touches nothing else in them. `agy` and a
+/// user's own row are left byte-identical, `updated_at` included. The trigger bumps the patched
+/// rows' `updated_at` (the migration never sets it), and a second run matches nothing.
+///
+/// Staged at v27 so the rows exist before 0028 runs, as on a real box; `run_to(28)` applies 0028
+/// alone, so a later migration cannot move what this case sees.
+#[tokio::test]
+async fn migration_0028_seeds_the_billing_env_once() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(27, &db.pool)
+        .await
+        .expect("apply 0001 through 0027");
+    let at = at_2026();
+    let mut acp = old_acp_settings();
+    acp["acp"]["permission_mode"] = json!("default");
+    insert_agent(&db.pool, "claude", "acp", acp.clone(), at).await;
+    insert_agent(&db.pool, "claude-cli", "cli", old_cli_settings(), at).await;
+    insert_agent(&db.pool, "agy", "acp", old_acp_settings(), at).await;
+    insert_agent(&db.pool, "my-claude", "cli", old_cli_settings(), at).await;
+    let before = agent_rows(&db.pool).await;
+
+    MIGRATOR.run_to(28, &db.pool).await.expect("apply 0028");
+
+    let after = agent_rows(&db.pool).await;
+    let names: Vec<&str> = after.iter().map(|row| row.0.as_str()).collect();
+    assert_eq!(names, ["agy", "claude", "claude-cli", "my-claude"]);
+
+    let mut expected_acp = acp;
+    expected_acp["api_billing_env"] = billing_env();
+    let mut expected_cli = old_cli_settings();
+    expected_cli["api_billing_env"] = billing_env();
+    assert_eq!(
+        after[1].1, expected_acp,
+        "claude gains the list; every other key is as seeded"
+    );
+    assert_eq!(
+        after[2].1, expected_cli,
+        "claude-cli gains the list; every other key is as seeded"
+    );
+    assert!(after[1].2 > at, "the trigger bumps claude's updated_at");
+    assert!(after[2].2 > at, "the trigger bumps claude-cli's updated_at");
+    assert_eq!(after[0], before[0], "agy is untouched, updated_at included");
+    assert_eq!(
+        after[3], before[3],
+        "a user's own row is untouched, updated_at included"
+    );
+
+    rerun(&db.pool, 28).await;
+    assert_eq!(
+        agent_rows(&db.pool).await,
+        after,
+        "a second run matches nothing: settings and updated_at are unchanged"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-97 D4: 0028 is name-, transport- and key-keyed. A `claude` row whose `api_billing_env` is
+/// already set (`[]` and an explicit JSON `null` included: `?` asks whether the key exists, not
+/// what it holds), a settings value that is not an object, and the seeded names on the other
+/// transport are all left alone, `updated_at` included.
+#[tokio::test]
+async fn migration_0028_leaves_explicit_and_other_rows_alone() {
+    let at = at_2026();
+    let with = |value: serde_json::Value| {
+        let mut settings = old_acp_settings();
+        settings["api_billing_env"] = value;
+        settings
+    };
+
+    // One database per world: the name is unique.
+    let worlds = [
+        (
+            "claude",
+            "acp",
+            with(json!([])),
+            "a `claude` row with an explicit empty list",
+        ),
+        (
+            "claude",
+            "acp",
+            with(json!(["MY_VAR"])),
+            "a `claude` row with its own list",
+        ),
+        (
+            "claude",
+            "acp",
+            with(serde_json::Value::Null),
+            "a `claude` row whose list is an explicit JSON null",
+        ),
+        (
+            "claude",
+            "acp",
+            json!(["not", "an", "object"]),
+            "a `claude` row whose settings are not an object",
+        ),
+        (
+            "claude",
+            "cli",
+            old_cli_settings(),
+            "a `claude` row on the CLI transport",
+        ),
+        (
+            "claude-cli",
+            "acp",
+            old_acp_settings(),
+            "a `claude-cli` row on the ACP transport",
+        ),
+    ];
+
+    for (name, transport, settings, what) in worlds {
+        let Some(db) = common::bare_db().await else {
+            return;
+        };
+        MIGRATOR
+            .run_to(27, &db.pool)
+            .await
+            .expect("apply 0001 through 0027");
+        insert_agent(&db.pool, name, transport, settings, at).await;
+
+        let before = agent_rows(&db.pool).await;
+        MIGRATOR.run_to(28, &db.pool).await.expect("apply 0028");
+        assert_eq!(agent_rows(&db.pool).await, before, "{what} is left alone");
+        db.drop_db().await;
+    }
+}
+
+/// MOD-97 D3/D4: a fresh database gets the list from the seeds, not from 0028 (which runs before
+/// the seed pass and so matches nothing there). `agy` carries none.
+#[tokio::test]
+async fn a_fresh_database_seeds_the_billing_env() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let rows: Vec<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT name, settings->'api_billing_env' FROM agent ORDER BY name")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read the seeded agent rows");
+    assert_eq!(
+        rows,
+        [
+            ("agy".to_owned(), None),
+            ("claude".to_owned(), Some(billing_env())),
+            ("claude-cli".to_owned(), Some(billing_env())),
+        ]
+    );
+    db.drop_db().await;
 }
 
 /// Inserts a `workspace` under `slug`, created by `user`, and answers its id.
@@ -3916,8 +4078,9 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(27),
-        "twenty-seven embedded migrations, none applied (through MOD-163's 0027_trim_record_v5.sql)"
+        MigrationState::Pending(28),
+        "twenty-eight embedded migrations, none applied (through MOD-97's \
+         0028_seed_api_billing_env.sql)"
     );
 
     db.drop_db().await;
@@ -4017,8 +4180,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(27),
-        "twenty-seven embedded migrations, through MOD-163's 0027_trim_record_v5.sql"
+        MigrationState::Pending(28),
+        "twenty-eight embedded migrations, through MOD-97's 0028_seed_api_billing_env.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4026,8 +4189,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(27),
-        "every one of the twenty-seven, through MOD-163's 0027_trim_record_v5.sql, is pending"
+        HeadlessError::MigrationsPending(28),
+        "every one of the twenty-eight, through MOD-97's 0028_seed_api_billing_env.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4049,8 +4212,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(27),
-        "every one of the twenty-seven, through MOD-163's 0027_trim_record_v5.sql, is pending"
+        HeadlessError::MigrationsPending(28),
+        "every one of the twenty-eight, through MOD-97's 0028_seed_api_billing_env.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4201,9 +4364,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        27,
-        "the later applies migrate nothing: the twenty-seven embedded migrations (through MOD-163's \
-         0027_trim_record_v5.sql) are applied once"
+        28,
+        "the later applies migrate nothing: the twenty-eight embedded migrations (through MOD-97's \
+         0028_seed_api_billing_env.sql) are applied once"
     );
 
     db.drop_db().await;

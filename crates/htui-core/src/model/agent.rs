@@ -319,6 +319,20 @@ mod tests {
             rows[2].settings.get("acp").is_none(),
             "a CLI row advertises no ACP capabilities"
         );
+
+        // MOD-97 D3: both Claude rows name the variables that would move them onto API billing,
+        // so a subscription-billed spawn strips them. `agy` names none: its `GEMINI_API_KEY` is a
+        // login tier (`discovery.credential.env`), not a billing switch.
+        let billing_env = serde_json::json!(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+        assert_eq!(rows[0].settings["api_billing_env"], billing_env, "claude");
+        assert_eq!(
+            rows[2].settings["api_billing_env"], billing_env,
+            "claude-cli"
+        );
+        assert!(
+            rows[1].settings.get("api_billing_env").is_none(),
+            "agy strips nothing"
+        );
     }
 
     /// Ids are minted per call, not baked into the document: two seeds of the same file are two
