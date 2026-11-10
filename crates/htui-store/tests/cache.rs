@@ -2020,6 +2020,100 @@ async fn a_cycle_never_renders_the_root_as_its_own_upstream() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-147 D9: with a workspace scope, the mirror's upstream walk counts the workspace's own
+/// scope row as in scope, as Postgres does: a member item `blocked_by` a `WS` item on
+/// `@platform` sees it in scope, summary column and all, offline and online alike. The cache's
+/// `scope` CTE binds the workspace once more for its new `UNION` arm.
+#[tokio::test]
+async fn the_mirror_counts_the_scope_row_in_upstream_scope() {
+    use htui_core::model::{ItemId, NewItem};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let ws = db
+        .store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+            title: "spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("a WS item mints on the scope row");
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+         VALUES ($1, $2, 'blocked_by', $3, $4)",
+    )
+    .bind(ids::AGY_FIX_1.as_uuid())
+    .bind(ws.id.as_uuid())
+    .bind(now)
+    .bind(now)
+    .execute(&db.pool)
+    .await
+    .expect("the link lands in Postgres");
+
+    let mut projects = all_projects();
+    projects.push(ids::PROJECT_SCOPE_PLATFORM);
+    run_pass(&db.pool, &cache, &projects, &settings(&db, 20))
+        .await
+        .expect("a pass mirrors the scope row's item and the link");
+
+    let scope = PromptScope {
+        workspace: Some(ids::WORKSPACE_PLATFORM),
+        project: ids::PROJECT_AGY,
+    };
+    let pg = db
+        .store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("pg upstream_summaries");
+    let mirrored = cache
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("cache upstream_summaries");
+
+    for (backend, entries) in [("pg", &pg), ("mirror", &mirrored)] {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.item_id == ws.id)
+            .unwrap_or_else(|| panic!("{backend}: the WS item is upstream, got {entries:?}"));
+        assert_eq!(
+            (entry.qualified_key.as_str(), entry.depth, entry.in_scope),
+            ("@platform:WS-1", 1, true),
+            "{backend}: the scope row is in the workspace's scope"
+        );
+    }
+    assert_eq!(mirrored, pg, "the mirror agrees with Postgres");
+
+    let project_only = PromptScope {
+        workspace: None,
+        project: ids::PROJECT_AGY,
+    };
+    let narrow = cache
+        .upstream_summaries(ids::AGY_FIX_1, 2, &project_only)
+        .await
+        .expect("cache upstream_summaries, project only");
+    assert!(
+        narrow
+            .iter()
+            .any(|entry| entry.item_id == ws.id && !entry.in_scope),
+        "without a workspace the scope row is out of scope: {narrow:?}"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// ANA-5 §12 criterion 19's second clause, as a **suite** rather than as pairwise comparisons:
 /// `store::conformance::READ_CASES` run over the mirror (plan D96).
 ///
