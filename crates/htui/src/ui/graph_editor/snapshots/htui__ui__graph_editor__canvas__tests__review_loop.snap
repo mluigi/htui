@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&body, Some(\"implement\"), &demo_agents().await, (100, 36))"
+---
+
+                                      ╭─ prd ────────────────╮
+                                      │template prd          │
+                                      │gate always · hard · …│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ plan ───────────────╮
+                                      │template plan         │
+                                      │gate always · hard · …│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ implement ──────────╮
+                                      │template implement    │◀╮
+                                      │gate always · retries…│ │
+                                      │any agent             │ │
+                                      ╰───────────●──────────╯ │
+                                                  │            │
+                                                  │  changes requested ×1
+                                                  ▼            │
+                                      ╭─ review ─────────────╮ │
+                                      │template review       │ │
+                                      │gate always · retries…│ │
+                                      │any agent             │─╯
+                                      ╰───────────●──────────╯
