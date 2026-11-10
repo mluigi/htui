@@ -372,6 +372,20 @@ pub struct RunStep {
     /// no `if` edge.
     #[serde(default)]
     pub branch: Option<Value>,
+    /// `run_step.role` (MOD-139 D3, ANA-33 §7.4, §7.11): what the row is. [`StepRole::Step`] on
+    /// every row written before `0028_divided_fanout.sql` and on every compete candidate and judge.
+    /// Written once, by `create_step`.
+    #[serde(default)]
+    pub role: StepRole,
+    /// `run_step.parent_step_id` (MOD-139 D3): the step this one was spawned under, a part's
+    /// planner step; `None` on every other row today. Written once.
+    #[serde(default)]
+    pub parent_step_id: Option<StepId>,
+    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11): a part's `<divided>/<part_key>`, or a
+    /// stage's `pick` | `prepare` | `collect` ([`STAGE_KEYS`]); `None` on a node of the frozen
+    /// snapshot, which `position` names. Written once.
+    #[serde(default)]
+    pub node_key: Option<String>,
     /// `run_step.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -510,7 +524,8 @@ pub struct NewRun {
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`
 /// with every settle column `NULL`. `UNIQUE (run_id, position, attempt, fanout_index)` is the
-/// database's; a repeat is `Constraint`.
+/// database's; a repeat is `Constraint`. `role`, `parent_step_id` and `node_key` must satisfy
+/// [`run_step_refusal`](crate::store::run_step_refusal) (MOD-139 D4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRunStep {
     /// `run_step.id`.
@@ -529,6 +544,12 @@ pub struct NewRunStep {
     pub agent_id: Option<AgentId>,
     /// `run_step.model`.
     pub model: Option<String>,
+    /// `run_step.role` (MOD-139 D3); [`StepRole::Step`] at every engine site in M1 (D7).
+    pub role: StepRole,
+    /// `run_step.parent_step_id` (MOD-139 D3); a part's planner step.
+    pub parent_step_id: Option<StepId>,
+    /// `run_step.node_key` (MOD-139 D3); a part's `<divided>/<part_key>`, a stage's key.
+    pub node_key: Option<String>,
 }
 
 /// What [`crate::store::WriteStore::finish_step`] writes: the settle columns and nothing about
@@ -2812,6 +2833,43 @@ mod tests {
         assert_eq!(
             super::RunStep {
                 branch: step.branch.clone(),
+                ..old
+            },
+            step
+        );
+    }
+
+    /// MOD-139 D3: a step encoded before `run_step.role`, `parent_step_id` and `node_key` existed
+    /// decodes as an ordinary step with neither; a part round-trips.
+    #[test]
+    fn run_step_role_defaults_when_absent() {
+        let mut step = crate::fixtures::demo_data()
+            .steps
+            .into_iter()
+            .next()
+            .expect("the fixture holds steps");
+        step.role = super::StepRole::Part;
+        step.parent_step_id = Some(StepId::new());
+        step.node_key = Some("implement/api".to_owned());
+        let mut value = serde_json::to_value(&step).expect("encodes");
+        assert_eq!(value["role"], json!("part"));
+        assert_eq!(value["node_key"], json!("implement/api"));
+        let back: super::RunStep = serde_json::from_value(value.clone()).expect("decodes");
+        assert_eq!(back, step);
+
+        let object = value.as_object_mut().expect("a step is an object");
+        for key in ["role", "parent_step_id", "node_key"] {
+            object.remove(key);
+        }
+        let old: super::RunStep = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(old.role, super::StepRole::Step);
+        assert_eq!(old.parent_step_id, None);
+        assert_eq!(old.node_key, None);
+        assert_eq!(
+            super::RunStep {
+                role: step.role,
+                parent_step_id: step.parent_step_id,
+                node_key: step.node_key.clone(),
                 ..old
             },
             step

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::OwnerDocument;
+use htui_core::model::StepRole;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -771,6 +772,9 @@ impl ReadStore for PgStore {
                    verify_exit_code,
                    promoted_at,
                    branch,
+                   role                AS "role: StepRole",
+                   parent_step_id      AS "parent_step_id: StepId",
+                   node_key,
                    updated_at
               FROM run_step
              WHERE run_id = $1
@@ -1463,6 +1467,9 @@ impl ReadStore for PgStore {
                        verify_exit_code,
                        promoted_at,
                        branch,
+                       role                AS "role: StepRole",
+                       parent_step_id      AS "parent_step_id: StepId",
+                       node_key,
                        updated_at
                   FROM run_step
                  WHERE run_id = ANY($1)

@@ -10,7 +10,8 @@ use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Claim, Document, DocumentId, GraphSnapshot, Isolation, ItemId, LinkKind, NewRun, NewRunStep,
-    Note, NoteId, ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId, Transport,
+    Note, NoteId, ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId, StepRole,
+    Transport,
 };
 use htui_core::prompt::render::HostnameLine;
 use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
@@ -116,6 +117,9 @@ impl Leased {
                 phase_name: "implement".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step is created")

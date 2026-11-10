@@ -45,7 +45,7 @@ pub use traits::{
     prompt_template_refusal, queue_target_refusal, queue_token_refusal, references_no_row,
     requirement_withdrawn, reserved_phase_name, resolution_not_closable, retry_limit_negative,
     row_names_another_graph, row_names_another_phase, row_names_another_step, rule_kind_unknown,
-    run_is_terminal, run_plan_refusal, scope_row_is_deleted_with_its_workspace,
+    run_is_terminal, run_plan_refusal, run_step_refusal, scope_row_is_deleted_with_its_workspace,
     scope_row_joins_no_workspace, scope_row_slug_is_fixed, skill_body_refusal, skill_patch_refusal,
     skill_version_key, split_fan_out_mismatch, startable, step_is_not_promotable,
     step_slot_is_taken, summary_names_another_item, winner_is_not_settled,

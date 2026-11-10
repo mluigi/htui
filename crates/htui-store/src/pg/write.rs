@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::ItemState;
+use htui_core::model::StepRole;
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
@@ -72,8 +73,8 @@ use htui_core::store::{
     not_a_fanout_candidate, not_a_terminal_status, persona_is_bound, persona_patch_refusal,
     phase_name_refusal, prompt_template_key, prompt_template_refusal, queue_target_refusal,
     queue_token_refusal, references_no_row, requirement_withdrawn, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
-    skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, run_step_refusal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use htui_core::store::{
@@ -7107,14 +7108,19 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`] on an unknown run or agent (foreign key), a repeated `id`
     /// (primary key) or a repeated `(run_id, position, attempt, fanout_index)` — the table's own
-    /// `UNIQUE`, which is why this writer has no guard of its own.
+    /// `UNIQUE`, which is why this writer has no guard of its own. [`run_step_refusal`] first,
+    /// before any statement (MOD-139 blueprint P-7), so both stores refuse a part without its
+    /// parent or key, or a stage off its reserved positions, in one sentence.
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
+        if let Some(refusal) = run_step_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
         sqlx::query_as!(
             RunStep,
             r#"
             INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,
-                                  agent_id, model, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+                                  agent_id, model, status, role, parent_step_id, node_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
             RETURNING id                  AS "id: StepId",
                       run_id              AS "run_id: RunId",
                       position,
@@ -7138,6 +7144,9 @@ impl WriteStore for PgStore {
                       verify_exit_code,
                       promoted_at,
                       branch,
+                      role                AS "role: StepRole",
+                      parent_step_id      AS "parent_step_id: StepId",
+                      node_key,
                       updated_at
             "#,
             new.id.as_uuid(),
@@ -7148,6 +7157,9 @@ impl WriteStore for PgStore {
             new.phase_name,
             new.agent_id.map(AgentId::as_uuid),
             new.model,
+            new.role.as_str(),
+            new.parent_step_id.map(StepId::as_uuid),
+            new.node_key,
         )
         .fetch_one(&self.pool)
         .await

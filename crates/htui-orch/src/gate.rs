@@ -1416,7 +1416,7 @@ mod tests {
     use htui_agent::event::{DoneEvent, StopReason};
     use htui_agent::record::CapBreach;
     use htui_core::fixtures::{demo_data, ids};
-    use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
+    use htui_core::model::{Document, GraphSnapshot, StepRole, VerifyOutcome};
 
     use htui_core::model::{
         BatchId, DocumentId, GateOutcome, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep,
@@ -2760,6 +2760,9 @@ mod tests {
                 phase_name: phase_name.to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the slot has room for this row");

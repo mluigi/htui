@@ -476,7 +476,7 @@ mod tests {
     use htui_core::model::{
         BoxId, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentId, EdgeKind,
         GraphSnapshot, Isolation, ItemId, RepoId, RunStep, RunStepCommit, RunStepTree,
-        SnapshotPhase, StepId, StepStatus, UserId, VerifyOutcome,
+        SnapshotPhase, StepId, StepRole, StepStatus, UserId, VerifyOutcome,
     };
 
     use crate::gate::{Settle, StepFailure};
@@ -934,6 +934,9 @@ mod tests {
             verify_exit_code: None,
             promoted_at: None,
             branch: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
             updated_at: at(0),
         }
     }

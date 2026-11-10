@@ -22,13 +22,14 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 51 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 52 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
 /// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4),
 /// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8), then the one of
-/// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1).
+/// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1),
+/// then the one of `0028_divided_fanout.sql` (MOD-139 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -91,6 +92,8 @@ const TABLES: &[&str] = &[
     // 0022_memory.sql (MOD-163)
     "memory_entry",
     "memory_entry_revision",
+    // 0028_divided_fanout.sql (MOD-139)
+    "run_plan",
 ];
 
 #[tokio::test]
@@ -113,7 +116,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27
+            25, 26, 27, 28
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -126,7 +129,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
          0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
-         0026_workspace_scope.sql and MOD-163 M2's 0027_trim_record_v5.sql, in ordinal order"
+         0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql and MOD-139's \
+         0028_divided_fanout.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -144,7 +148,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        51,
+        52,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -152,17 +156,18 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-125's 0019_stop_runs.sql adds workspace_stop, MOD-137's 0020_step_graph_v2.sql \
          adds step_graph_edge and phase_part, MOD-146's 0021_project_type.sql adds \
          project_type and MOD-163's 0022_memory.sql adds memory_entry and \
-         memory_entry_revision"
+         memory_entry_revision and MOD-139's 0028_divided_fanout.sql adds run_plan"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 51 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 52 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
-         (memory_entry, memory_entry_revision) and nothing else, \
+         (memory_entry, memory_entry_revision) and MOD-139's 0028_divided_fanout.sql \
+         (run_plan) and nothing else, \
          got {present:?}"
     );
 
@@ -823,7 +828,7 @@ const MOD163_M2_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
      skill, ordered by position then name, each {skill, name, version, level, activation, \
      active, reason} with reason always, matched, no_match, off, no_path, missing_version or \
      not_placed (ANA-22 6 item 8); a matched choice adds path, <repo>:<path>, the first \
-     matching file in repo then path byte order. A v 4 record, written before 0027, has no \
+     matching file in repo then path byte order. A v 4 record, written before 0026, has no \
      memory and its prompt carried none; a v 3 record, written before 0010, has no undigested \
      and digested the hostname; a v 2 record, written before 0008, has no matched or \
      no_match; a v 1 record, written before 0007, has no skill_choices. Canonical; the prompt \
@@ -843,6 +848,81 @@ const MOD163_TABLE_COMMENTS: [(&str, &str); 2] = [
         "MOD-163 D1: append-only history of memory_entry, one row per version.",
     ),
 ];
+
+/// The ten `COMMENT ON COLUMN` texts of `0028_divided_fanout.sql` (MOD-139 plan D1), verbatim and
+/// in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD139_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "run_step",
+        "role",
+        "MOD-139 D1 (ANA-33 7.4, 7.11): what the step is. step on every row written before 0028 \
+         and on every compete candidate; planner, part and integrate rows belong to a divided \
+         node; stage rows are htui's own pick, prepare and collect. Written once.",
+    ),
+    (
+        "run_step",
+        "parent_step_id",
+        "MOD-139 D1 (ANA-33 7.4): the step this one was spawned under, a part's planner step; \
+         NULL on every other row today. Written once.",
+    ),
+    (
+        "run_step",
+        "node_key",
+        "MOD-139 D1 (ANA-33 7.4, 7.11): a part's <divided>/<part_key>, or a stage's pick, \
+         prepare or collect; NULL on a node of the frozen snapshot, which position names. \
+         Written once.",
+    ),
+    (
+        "run_plan",
+        "revision",
+        "MOD-139 D1: 0 for default parts the engine admits itself, then one per planner \
+         submission; unique per run.",
+    ),
+    (
+        "run_plan",
+        "planner_step_id",
+        "MOD-139 D1: the step of the same run whose planner produced this revision; \
+         insert_run_plan refuses a step of another run.",
+    ),
+    (
+        "run_plan",
+        "status",
+        "MOD-139 D1: proposed when inserted; admitted, refused or abandoned once decided. Only \
+         an admitted revision's parts run.",
+    ),
+    (
+        "run_plan",
+        "base_position",
+        "MOD-139 D1 (ANA-33 7.2): the run_step.position of this revision's first planned node; \
+         the i-th takes base_position + i, after every frozen node and every earlier revision.",
+    ),
+    (
+        "run_plan",
+        "base_refs",
+        "MOD-139 D1 (ANA-33 7.4): the primary HEAD per repo at admission, which every part and \
+         the integrate step branch from. NULL until admitted; an admitted revision has it.",
+    ),
+    (
+        "run_plan",
+        "digest",
+        "MOD-139 D1 (ANA-33 7.2): sha256 over the canonical body; resume recomputes it to check \
+         an admitted plan.",
+    ),
+    (
+        "run_plan",
+        "updated_at",
+        "MOD-139 D1: an addition to ANA-33 7.2's columns. Moves with status (set_updated_at) \
+         and is the mirror's cursor.",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0028_divided_fanout.sql` (MOD-139 plan D1), verbatim.
+const MOD139_TABLE_COMMENT: (&str, &str) = (
+    "run_plan",
+    "MOD-139 D1 (ANA-33 7.2): one revision of a run's plan, append-only in revisions. Inserted \
+     as proposed; admission sets status and base_refs and writes the part rows in one \
+     transaction (MOD-139 M2). Mirrored.",
+);
 
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
@@ -1079,6 +1159,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD146_COLUMN_COMMENTS)
         .chain(MOD163_COLUMN_COMMENTS)
         .chain(MOD163_M2_COLUMN_COMMENTS)
+        .chain(MOD139_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -1096,7 +1177,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163 or MOD-163 M2) text byte for byte"
+             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2 or MOD-139) text byte for \
+             byte"
         );
     }
 
@@ -1106,6 +1188,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         ANA_TABLE_COMMENT,
         MOD125_TABLE_COMMENT,
         MOD146_TABLE_COMMENT,
+        MOD139_TABLE_COMMENT,
     ]
     .into_iter()
     .chain(MOD137_TABLE_COMMENTS.iter().copied())
@@ -1122,13 +1205,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(expected),
-            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137, MOD-146 or MOD-163) text byte for byte"
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137, MOD-146, MOD-163 or MOD-139) text byte for byte"
         );
     }
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
     // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12, MOD-125 and
-    // MOD-137, MOD-146, MOD-163 and MOD-163 M2 wrote and no half-finished extra one.
+    // MOD-137, MOD-146, MOD-163, MOD-163 M2 and MOD-139 wrote and no half-finished extra one.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -1152,6 +1235,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD146_COLUMN_COMMENTS)
             .chain(MOD163_COLUMN_COMMENTS)
             .chain(MOD163_M2_COLUMN_COMMENTS)
+            .chain(MOD139_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -1175,6 +1259,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD146_COLUMN_COMMENTS)
         .chain(MOD163_COLUMN_COMMENTS)
         .chain(MOD163_M2_COLUMN_COMMENTS)
+        .chain(MOD139_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -3916,8 +4001,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(27),
-        "twenty-seven embedded migrations, none applied (through MOD-163's 0027_trim_record_v5.sql)"
+        MigrationState::Pending(28),
+        "twenty-eight embedded migrations, none applied (through MOD-139's 0028_divided_fanout.sql)"
     );
 
     db.drop_db().await;
@@ -4017,8 +4102,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(27),
-        "twenty-seven embedded migrations, through MOD-163's 0027_trim_record_v5.sql"
+        MigrationState::Pending(28),
+        "twenty-eight embedded migrations, through MOD-139's 0028_divided_fanout.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4026,8 +4111,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(27),
-        "every one of the twenty-seven, through MOD-163's 0027_trim_record_v5.sql, is pending"
+        HeadlessError::MigrationsPending(28),
+        "every one of the twenty-eight, through MOD-139's 0028_divided_fanout.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4049,8 +4134,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(27),
-        "every one of the twenty-seven, through MOD-163's 0027_trim_record_v5.sql, is pending"
+        HeadlessError::MigrationsPending(28),
+        "every one of the twenty-eight, through MOD-139's 0028_divided_fanout.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4201,9 +4286,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        27,
-        "the later applies migrate nothing: the twenty-seven embedded migrations (through MOD-163's \
-         0027_trim_record_v5.sql) are applied once"
+        28,
+        "the later applies migrate nothing: the twenty-eight embedded migrations (through MOD-139's \
+         0028_divided_fanout.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -6595,6 +6680,75 @@ async fn cache_0009_applies_over_a_populated_0008_mirror() {
         .unwrap_or_else(|err| panic!("look up {index}: {err}"));
         assert_eq!(found, 1, "index {index} exists");
     }
+
+    pool.close().await;
+}
+
+/// MOD-139 M1 (plan D2): cache 0010 applies over a populated 0009 mirror, since `CACHE_MIGRATOR`
+/// runs before the `schema_version` check. An existing `run_step` row reads `role = 'step'` with
+/// no parent and no node key (`role`'s DEFAULT), and `run_plan` exists. Needs no server and
+/// therefore never skips.
+#[tokio::test]
+async fn cache_0010_applies_over_a_populated_0009_mirror() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().expect("a temp cache dir");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("cache.sqlite"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open the cache file");
+    htui_store::CACHE_MIGRATOR
+        .run_to(9, &pool)
+        .await
+        .expect("apply cache 0001 through 0009");
+    sqlx::query(
+        "INSERT INTO run_step (id, run_id, position, phase_name, status, updated_at) \
+         VALUES ('s1', 'r1', 0, 'implement', 'done', 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a 0009 run_step");
+    htui_store::CACHE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("cache 0010 applies over a populated 0009 file");
+
+    let (role, parent, key): (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT role, parent_step_id, node_key FROM run_step WHERE id = 's1'")
+            .fetch_one(&pool)
+            .await
+            .expect("read the kept row");
+    assert_eq!(
+        (role.as_str(), parent, key),
+        ("step", None, None),
+        "an existing row is an ordinary step with no parent and no node key"
+    );
+
+    sqlx::query(
+        "INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, status, \
+         base_position, base_refs, body, digest, created_at, updated_at) \
+         VALUES ('p1', 'r1', 0, 's1', 'parts', 'proposed', 1, NULL, '{}', 'sha256:x', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a run_plan row");
+    let (revision, status): (i64, String) =
+        sqlx::query_as("SELECT revision, status FROM run_plan WHERE run_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .expect("read the plan back");
+    assert_eq!((revision, status.as_str()), (0, "proposed"));
+    let index: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_cache_run_plan_run'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("look up the run_plan index");
+    assert_eq!(index, 1, "idx_cache_run_plan_run exists");
 
     pool.close().await;
 }

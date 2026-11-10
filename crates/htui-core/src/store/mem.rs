@@ -55,7 +55,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
-use crate::model::{NewOwnerDocument, OwnerDocument};
+use crate::model::{NewOwnerDocument, OwnerDocument, StepRole};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -2894,6 +2894,9 @@ impl State {
             verify_exit_code: None,
             promoted_at: None,
             branch: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
             updated_at: chat.started_at,
         });
         Ok(())
@@ -6690,6 +6693,9 @@ impl State {
             phase_name: new.phase_name,
             agent_id: new.agent_id,
             model: new.model,
+            role: new.role,
+            parent_step_id: new.parent_step_id,
+            node_key: new.node_key,
             status: StepStatus::Pending,
             gate_outcome: None,
             gate_note: None,
@@ -10828,7 +10834,7 @@ mod tests {
         RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution,
         RunCommand, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
         RunStepCommit, RunStepTree, Scope, SettleOutcome, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+        StepId, StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
         executor_scrub_refusal,
     };
     use crate::model::{EdgeId, EdgeKind, GraphScope, PhasePart, StepGraphEdge};
@@ -14142,6 +14148,9 @@ mod tests {
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: Some("opus".to_owned()),
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         }
     }
 

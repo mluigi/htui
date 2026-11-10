@@ -51,7 +51,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::ItemState;
-use crate::model::PLAN_SUFFIX;
 use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
@@ -80,6 +79,7 @@ use crate::model::{
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
+use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
 use crate::prompt::settings::{Rungs, SettingKey, validate};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
@@ -2758,6 +2758,48 @@ pub fn phase_name_refusal(name: &str) -> Option<String> {
         .then(|| plan_suffix_phase_name(name))
 }
 
+/// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` and `chk_run_step_stage` of
+/// `0028_divided_fanout.sql`, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
+/// both stores give; `None` when the row may be written. Judged before any read. In order: a part
+/// names its parent step and its node key; a stage sits at -3..-1; a negative position is a stage's
+/// only; a stage's key is one of [`STAGE_KEYS`]; then the NUL.
+#[must_use]
+pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
+    let stage = new.role == StepRole::Stage;
+    if new.role == StepRole::Part && (new.parent_step_id.is_none() || new.node_key.is_none()) {
+        return Some("a part step names its parent step and its node key".to_owned());
+    }
+    if stage && !(-3..=-1).contains(&new.position) {
+        return Some(format!(
+            "a stage step sits at position -3, -2 or -1, not {}",
+            new.position
+        ));
+    }
+    if !stage && new.position < 0 {
+        return Some(format!(
+            "position {} is reserved for stage steps, not a {} step",
+            new.position, new.role
+        ));
+    }
+    if stage
+        && !new
+            .node_key
+            .as_deref()
+            .is_some_and(|key| STAGE_KEYS.contains(&key))
+    {
+        return Some(format!(
+            "a stage step's node key is pick, prepare or collect, not {}",
+            new.node_key
+                .as_deref()
+                .map_or_else(|| "none".to_owned(), |key| format!("`{key}`"))
+        ));
+    }
+    new.node_key
+        .as_deref()
+        .is_some_and(|key| key.contains('\0'))
+        .then(|| has_nul("run_step.node_key"))
+}
+
 /// MOD-139 D1, D4 (blueprint P-7): [`WriteStore::insert_run_plan`]'s input rules, judged before
 /// any read, in the sentence both stores give: `chk_run_plan_revision`, the base-position CHECK,
 /// then a NUL in `digest` (Postgres `text`, `22021`) or in any string or key of `body` (Postgres
@@ -4293,6 +4335,87 @@ mod tests {
         assert_eq!(
             super::plan_revision_taken(clean.run_id, 2),
             format!("run {} already has plan revision 2", clean.run_id)
+        );
+    }
+
+    /// MOD-139 D1, D4 (blueprint P-7): the part and stage CHECKs of `0028_divided_fanout.sql`,
+    /// worded once for both stores.
+    #[test]
+    fn run_step_refusal_mirrors_the_0028_checks() {
+        use crate::model::{NewRunStep, RunId, StepId, StepRole};
+        let row =
+            |role: StepRole, position: i32, parent: Option<StepId>, key: Option<&str>| NewRunStep {
+                id: StepId::new(),
+                run_id: RunId::new(),
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: None,
+                model: None,
+                role,
+                parent_step_id: parent,
+                node_key: key.map(str::to_owned),
+            };
+        let refused = |new: NewRunStep| super::run_step_refusal(&new);
+        let parent = Some(StepId::new());
+
+        // Accepted: the shapes §T1.2 probe 3 wrote, and an ordinary step.
+        assert_eq!(refused(row(StepRole::Step, 0, None, None)), None);
+        assert_eq!(refused(row(StepRole::Planner, 1, None, None)), None);
+        assert_eq!(
+            refused(row(StepRole::Part, 5, parent, Some("implement/api"))),
+            None
+        );
+        for (position, key) in [(-3, "pick"), (-2, "prepare"), (-1, "collect")] {
+            assert_eq!(
+                refused(row(StepRole::Stage, position, None, Some(key))),
+                None,
+                "{key} at {position}"
+            );
+        }
+
+        // chk_run_step_part.
+        let part = "a part step names its parent step and its node key";
+        assert_eq!(
+            refused(row(StepRole::Part, 5, None, Some("implement/api"))).as_deref(),
+            Some(part)
+        );
+        assert_eq!(
+            refused(row(StepRole::Part, 5, parent, None)).as_deref(),
+            Some(part)
+        );
+
+        // chk_run_step_stage.
+        assert_eq!(
+            refused(row(StepRole::Stage, 0, None, Some("pick"))).as_deref(),
+            Some("a stage step sits at position -3, -2 or -1, not 0")
+        );
+        assert_eq!(
+            refused(row(StepRole::Stage, -4, None, Some("pick"))).as_deref(),
+            Some("a stage step sits at position -3, -2 or -1, not -4")
+        );
+        assert_eq!(
+            refused(row(StepRole::Step, -1, None, None)).as_deref(),
+            Some("position -1 is reserved for stage steps, not a step step")
+        );
+        assert_eq!(
+            refused(row(StepRole::Planner, -2, None, None)).as_deref(),
+            Some("position -2 is reserved for stage steps, not a planner step")
+        );
+        assert_eq!(
+            refused(row(StepRole::Stage, -1, None, Some("nope"))).as_deref(),
+            Some("a stage step's node key is pick, prepare or collect, not `nope`")
+        );
+        assert_eq!(
+            refused(row(StepRole::Stage, -1, None, None)).as_deref(),
+            Some("a stage step's node key is pick, prepare or collect, not none")
+        );
+
+        // The NUL Postgres `text` cannot hold.
+        assert_eq!(
+            refused(row(StepRole::Part, 5, parent, Some("a\u{0}b"))),
+            Some(super::has_nul("run_step.node_key"))
         );
     }
 }

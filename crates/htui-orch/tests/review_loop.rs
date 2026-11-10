@@ -18,7 +18,7 @@ use chrono::Utc;
 use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{
     EdgeKind, GraphSnapshot, ItemId, NewRun, NewRunStep, Run, RunId, RunMode, SnapshotEdge,
-    SnapshotPhase, StepId, StepStatus,
+    SnapshotPhase, StepId, StepRole, StepStatus,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::command::EngineError;
@@ -118,6 +118,9 @@ async fn step_at(
             phase_name: name.to_owned(),
             agent_id: None,
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("the position is free");

@@ -40,7 +40,7 @@ use htui_core::model::{
     ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
     SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
+    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
     min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
@@ -4558,6 +4558,9 @@ where
                     phase_name: phase.name.clone(),
                     agent_id: Some(chosen.agent_id),
                     model: Some(chosen.model),
+                    role: StepRole::Step,
+                    parent_step_id: None,
+                    node_key: None,
                 })
                 .await?;
         }
@@ -6561,6 +6564,9 @@ where
                 phase_name: judge_phase_name(&phase.name),
                 agent_id,
                 model,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await?)
     }
@@ -9065,7 +9071,8 @@ mod tests {
     use htui_core::model::{
         BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, ItemState, NewRepo,
         NewRunStep, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
-        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepRole,
+        StepStatus,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -11042,6 +11049,9 @@ mod tests {
                 phase_name: "nowhere".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("`UNIQUE (run_id, position, attempt, fanout_index)` is free at 9");
@@ -12521,6 +12531,9 @@ mod tests {
                 phase_name: "ghost".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("MemStore creates the step");
@@ -12832,6 +12845,9 @@ mod tests {
                 phase_name: "plan".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("`(1, attempt, 0)` is free");
@@ -22888,7 +22904,7 @@ mod tests {
             use htui_core::fixtures::ids;
             use htui_core::model::{
                 Claim, NewRunStep, Note, RunId, RunMode, RunStatus, SnapshotCandidate, Status,
-                StepId, StepStatus,
+                StepId, StepRole, StepStatus,
             };
             use htui_core::prompt::settings::SettingKey;
             use htui_core::secret::{INFISICAL, SecretError};
@@ -23384,6 +23400,9 @@ mod tests {
                         phase_name: phase.name.clone(),
                         agent_id: Some(chosen.agent_id),
                         model: Some(chosen.model),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
                     })
                     .await
                     .expect("MemStore creates the candidate")
@@ -23472,6 +23491,9 @@ mod tests {
                         phase_name: lost.phase_name.clone(),
                         agent_id: lost.agent_id,
                         model: lost.model.clone(),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
                     })
                     .await
                     .expect("MemStore creates the step")
@@ -23906,7 +23928,9 @@ mod queued_cancel {
 #[cfg(test)]
 mod settle_walk_writes {
     use htui_core::fixtures::ids;
-    use htui_core::model::{GraphSnapshot, RunMode, RunStatus, SnapshotCandidate, StepStatus};
+    use htui_core::model::{
+        GraphSnapshot, RunMode, RunStatus, SnapshotCandidate, StepRole, StepStatus,
+    };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 
@@ -24025,6 +24049,9 @@ mod settle_walk_writes {
                 phase_name: "plan".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("a pending row under the ended run");
@@ -24235,6 +24262,9 @@ mod settle_walk_writes {
             phase_name: phase.to_owned(),
             agent_id: None,
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         };
         orch.store
             .create_step(pending("prd", 0))

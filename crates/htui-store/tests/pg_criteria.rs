@@ -28,7 +28,7 @@ use htui_core::model::{
     Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
     RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
     RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
-    StepOutcome, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
+    StepOutcome, StepRole, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
     WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -7214,6 +7214,9 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
                 phase_name: "implement".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("create the round's step")
@@ -7357,6 +7360,9 @@ async fn leased_running_step(db: &common::TestDb) -> (RunId, StepId, uuid::Uuid)
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create the step")
@@ -7811,6 +7817,9 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create the step")
@@ -8718,6 +8727,9 @@ macro_rules! step_with_usage {
                 phase_name: "implement".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step lands");
@@ -10751,6 +10763,9 @@ async fn an_unknown_actor_on_a_follow_up_is_refused_before_the_status() {
             phase_name: "review".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create a pending step")
@@ -11087,6 +11102,9 @@ async fn plant_queue_facts<S: htui_core::store::WriteStore>(store: &S, facts: &Q
                 phase_name: "implement".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step");

@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::OwnerDocument;
+use htui_core::model::StepRole;
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
@@ -309,7 +310,7 @@ fn run_of(row: &SqliteRow) -> Result<Run> {
 const RUN_STEP_SELECT: &str = "id, run_id, position, attempt, fanout_index, phase_name, agent_id, \
      model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, \
      usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
-     promoted_at, branch, updated_at";
+     promoted_at, branch, role, parent_step_id, node_key, updated_at";
 
 /// One `run_step` row, every column of [`RUN_STEP_SELECT`].
 fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
@@ -343,6 +344,12 @@ fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
         verify_exit_code: get(row, "verify_exit_code")?,
         promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
         branch: opt_json_col("run_step.branch", opt_text(row, "branch")?.as_deref())?,
+        role: get::<StepRole>(row, "role")?,
+        parent_step_id: opt_uuid_col::<StepId>(
+            "run_step.parent_step_id",
+            opt_text(row, "parent_step_id")?.as_deref(),
+        )?,
+        node_key: opt_text(row, "node_key")?,
         updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
     })
 }

@@ -47,7 +47,7 @@ use crate::model::{
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
-use crate::model::{NewOwnerDocument, Project};
+use crate::model::{NewOwnerDocument, Project, StepRole};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::scrub::MinimalScrubber;
@@ -5445,6 +5445,9 @@ fn new_run_step(run: RunId, position: i32, attempt: i32, fanout_index: i32) -> N
         phase_name: "implement".to_owned(),
         agent_id: Some(ids::AGENT_CLAUDE),
         model: Some("opus".to_owned()),
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
     }
 }
 

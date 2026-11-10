@@ -20,7 +20,7 @@ use htui_core::fixtures::{self, ids};
 use htui_core::model::{
     CitationKind, DocumentId, EventKind, EventRole, ItemFilter, ItemState, LinkGraph,
     MemoryEntryId, NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent,
-    Status, StepId, StepOpening, UserId, WorkspaceSummary,
+    Status, StepId, StepOpening, StepRole, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
@@ -718,6 +718,9 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
         phase_name: "implement".to_owned(),
         agent_id: Some(ids::AGENT_CLAUDE),
         model: Some("opus".to_owned()),
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
     };
     let store = &db.store;
     let claim = |run: RunId| async move {
@@ -1497,6 +1500,94 @@ async fn the_0008_branch_reaches_the_mirror() {
         waiting.branch.as_ref(),
         Some(&waiting_branch),
         "`run_step.branch` comes off the mirror through `waiting_candidates` too"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-139 M1 (`cache_migrations/0010_divided_fanout.sql`): `run_step.role`, `parent_step_id` and
+/// `node_key` reach the mirror. No demo step is anything but an ordinary step, so this writes a
+/// planner, a part under it and a stage on `RUN_1` through `create_step`, refreshes, and reads the
+/// three off the mirror; every fixture step still reads `Step` with no parent and no key.
+#[tokio::test]
+async fn the_0010_step_role_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let new = |position: i32, role: StepRole, parent: Option<StepId>, key: Option<&str>| {
+        htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: None,
+            model: None,
+            role,
+            parent_step_id: parent,
+            node_key: key.map(str::to_owned),
+        }
+    };
+    let planner = db
+        .store
+        .create_step(new(50, StepRole::Planner, None, None))
+        .await
+        .expect("a planner step");
+    let part = db
+        .store
+        .create_step(new(
+            51,
+            StepRole::Part,
+            Some(planner.id),
+            Some("implement/api"),
+        ))
+        .await
+        .expect("a part step");
+    let stage = db
+        .store
+        .create_step(new(-1, StepRole::Stage, None, Some("collect")))
+        .await
+        .expect("a stage step");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let pg_steps = db.store.run_steps(ids::RUN_1).await.expect("pg run steps");
+    let mirrored = cache.run_steps(ids::RUN_1).await.expect("cache run steps");
+    assert_eq!(
+        mirrored, pg_steps,
+        "the two backends project the steps alike"
+    );
+    for written in [&planner, &part, &stage] {
+        let row = mirrored
+            .iter()
+            .find(|step| step.id == written.id)
+            .expect("the written step is mirrored");
+        assert_eq!(
+            (row.role, row.parent_step_id, row.node_key.as_deref()),
+            (
+                written.role,
+                written.parent_step_id,
+                written.node_key.as_deref()
+            ),
+            "role, parent and node key come off the mirror"
+        );
+    }
+    assert_eq!(
+        (part.role, part.parent_step_id, part.node_key.as_deref()),
+        (StepRole::Part, Some(planner.id), Some("implement/api")),
+        "Postgres stored what was asked"
+    );
+    let fixture = mirrored
+        .iter()
+        .filter(|step| ![planner.id, part.id, stage.id].contains(&step.id));
+    assert!(
+        fixture.into_iter().all(|step| step.role == StepRole::Step
+            && step.parent_step_id.is_none()
+            && step.node_key.is_none()),
+        "every fixture step is an ordinary step"
     );
 
     teardown(db, &[&cache]).await;

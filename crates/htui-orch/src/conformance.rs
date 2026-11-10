@@ -28,7 +28,7 @@ use htui_core::model::{
     EdgeKind, EventKind, Gate, GateOutcome, Isolation, Item, ItemId, ItemPatch, ItemState,
     NewDocument, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, Run, RunId,
     RunMode, RunStatus, RunStep, Status, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
-    StepStatus, VerifyOutcome,
+    StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
     BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
@@ -10015,6 +10015,9 @@ async fn a_fails_loop_cut_short_is_replayed_by_settle_failed<H: CaseHarness>(har
             phase_name: "plan".to_owned(),
             agent_id: None,
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("`(1, 1, 0)` is free");
@@ -13629,7 +13632,8 @@ mod fanout_paths {
     use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepStatus,
+        Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepRole,
+        StepStatus,
     };
     use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 
@@ -13677,6 +13681,9 @@ mod fanout_paths {
                 phase_name: "research:judge".to_owned(),
                 agent_id: Some(ids::AGENT_AGY),
                 model: Some("seeded".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the slot has no judge yet")
@@ -14227,6 +14234,9 @@ mod fanout_paths {
                 phase_name: first.phase_name.clone(),
                 agent_id: first.agent_id,
                 model: first.model.clone(),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the slot is new")

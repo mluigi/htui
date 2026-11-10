@@ -19,7 +19,7 @@ use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Claim, GraphSnapshot, NewRun, NewRunStep, OpenPermission, PermissionId, RelayOption,
-    RelayOptionKind, RelaySessionId, RunId, RunMode, StepId, StepStatus,
+    RelayOptionKind, RelaySessionId, RunId, RunMode, StepId, StepRole, StepStatus,
 };
 use htui_core::store::{MemStore, ParkOutcome, ReadStore as _, StepFence, WriteStore as _};
 use uuid::Uuid;
@@ -140,6 +140,9 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
                 phase_name: phase.to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("create_step")

@@ -51,7 +51,7 @@ use htui_core::model::{
     NewFollowUp, NewRun, NewRunStep, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, QueuedFollowUp, RelayOptionKind, RelaySessionId, RunCommandId,
     RunCommandStatus, RunId, RunMode, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings,
-    StepId, StepPermission, StepStatus, executor_scrub_refusal,
+    StepId, StepPermission, StepRole, StepStatus, executor_scrub_refusal,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
@@ -172,6 +172,9 @@ async fn leased_at(run: RunId, step: StepId) -> Leased {
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: Some("opus".to_owned()),
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("the step is created");
