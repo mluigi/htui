@@ -1,0 +1,37 @@
+[package]
+name        = "htui-bench"
+version     = "0.1.0"
+description = "MOD-162: the retrieval benchmark over htui's own search; a dev tool, never shipped"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[dependencies]
+# Rows the point builders take (`Item`, `Requirement`, `Document`) and `QdrantUrl`.
+htui-core     = { workspace = true }
+# The production search, point builders and embedder (MOD-162 P1, P3). `local-embed`: `RtenEmbedder`
+# and `model::ensure_model_noting`, as the `htui` binary loads them.
+htui-store    = { workspace = true, features = ["local-embed"] }
+# A raw client for what `QdrantStore` does not expose: the server version and deleting a collection
+# another embedder made (blueprint F8). Already in the graph through htui-store.
+qdrant-client = { workspace = true }
+# The L baselines (P5). Runtime `sqlx::query` only: no macros, so no `.sqlx` offline entries.
+sqlx          = { workspace = true }
+tokio         = { workspace = true }
+clap          = { workspace = true }
+anyhow        = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+# The query-file freeze (P6) and the deterministic row UUIDs (P3).
+sha2          = { workspace = true }
+uuid          = { workspace = true }
+chrono        = { workspace = true }
+
+[dev-dependencies]
+# `HashEmbedder` (behind `test-support`) for the runner's live wiring test; no model download.
+htui-store = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true
