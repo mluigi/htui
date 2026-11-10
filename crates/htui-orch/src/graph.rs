@@ -27,6 +27,8 @@ use htui_core::model::{
     SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
     sort_snapshot_edges,
 };
+use htui_core::model::{MemoryState, SnapshotMemory};
+use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
     check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
@@ -326,10 +328,10 @@ pub enum NotRunnable {
 ///
 /// ANA-2 defines the hash as "over the canonical serialisation of `phases[]`" (`:1479`) and never
 /// defines "canonical", so this is where it is defined: the envelope (`v`, `graph`, `mode`,
-/// `settings`, `scope`, `personas`) is excluded, field order is [`SnapshotPhase`]'s declaration
-/// order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped when `None`, so
-/// a persona-less phase serialises exactly as before and only a bound phase's digest names its
-/// persona. Any other field added to `SnapshotPhase` changes every digest and is a
+/// `settings`, `scope`, `personas`, `memory`) is excluded, field order is [`SnapshotPhase`]'s
+/// declaration order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped
+/// when `None`, so a persona-less phase serialises exactly as before and only a bound phase's
+/// digest names its persona. Any other field added to `SnapshotPhase` changes every digest and is a
 /// `GraphSnapshot::V` question.
 ///
 /// **Never route this through `serde_json::Value`.** `serde_json`'s `preserve_order` feature is
@@ -374,6 +376,10 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// `graph.scope`, and its phases' templates and personas still resolve in the **item's** project
 /// (`prompt_template(project.id, ..)`), so one shared graph runs with each project's templates.
 ///
+/// A resolved graph's snapshot also freezes the item's project memory (MOD-163 D11, D12): its
+/// `Active` entries under the cap, copied with their text, so every step, retry and resume of the
+/// run renders the same bytes.
+///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
 pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
@@ -396,9 +402,31 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     ))
     .await?
     {
-        Resolution::Resolved(resolved) => Ok(*resolved),
+        Resolution::Resolved(resolved) => {
+            let mut resolved = *resolved;
+            // MOD-163 D11, D12 (maintainer decision P-1): the project's active memory is read
+            // here, on a resolved graph only, so neither a refused resolution nor a v1 run's
+            // resume (`resolve_or_refused`, phases only) reads it or can fail on it. Boxed for
+            // the 2 MiB debug stack, as the graph read is.
+            resolved.snapshot.memory = Box::pin(frozen_memory(store, item.project_id)).await?;
+            Ok(resolved)
+        }
         Resolution::Refused { refusal, .. } => Err(refusal),
     }
+}
+
+/// MOD-163 D11, D12: the project's `Active` memory entries, selected under
+/// [`MEMORY_TOKEN_CAP`] by the shared pure `select` and frozen with their text — what
+/// `GraphSnapshot.memory` holds for the whole run. `None` when the project has no active entry,
+/// and when the store answers `None` ("not available here"), which is no entry.
+async fn frozen_memory<S: htui_core::store::WorkerStore>(
+    store: &S,
+    project: ProjectId,
+) -> std::result::Result<Option<SnapshotMemory>, ResolveError> {
+    Ok(store
+        .memory_entries(project, Some(vec![MemoryState::Active]))
+        .await?
+        .and_then(|entries| select_memory(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT)))
 }
 
 /// What [`resolve_or_refused`] found (MOD-138 blueprint A6).
@@ -623,6 +651,9 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         settings,
         scope: Some(scope),
         personas,
+        // MOD-163 maintainer decision P-1: [`resolve`] freezes the memory on a resolved graph;
+        // a v1 run's resume, which keeps only these phases, never reads it.
+        memory: None,
     };
 
     Ok(Resolution::Resolved(Box::new(Resolved {
@@ -814,7 +845,7 @@ const PLAN_SUFFIX: &str = ":plan";
 ///
 /// The rules of [`topology`] hold: never through `serde_json::Value` (finding 4; a predicate is
 /// key-sorted by its own serialiser, F5), and the envelope (`v`, `graph`, `source`, `mode`,
-/// `settings`, `scope`, `personas`) is outside it.
+/// `settings`, `scope`, `personas`, `memory`) is outside it.
 ///
 /// # Errors
 /// [`ResolveError::Store`] carrying the serialiser's own sentence, as [`topology`].
@@ -4744,6 +4775,200 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 id,
                 "persona",
             )))
+        );
+    }
+
+    // ---- MOD-163 M2 T2: the run-start memory freeze ----
+
+    /// Writes one active memory entry of `kind` into `project` through `WriteStore`, as the M3 pane
+    /// would.
+    async fn remember(
+        store: &MemStore,
+        project: ProjectId,
+        kind: htui_core::model::MemoryKind,
+        subject: &str,
+        body: &str,
+    ) -> htui_core::model::MemoryEntry {
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        store
+            .create_memory_entry(
+                project,
+                htui_core::model::NewMemoryEntry {
+                    id: htui_core::model::MemoryEntryId::new(),
+                    kind,
+                    subject: htui_core::model::MemorySubject::new(subject, &scrubber)
+                        .expect("a plain subject"),
+                    body: htui_core::model::MemoryBody::new(body, &scrubber).expect("a plain body"),
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the store takes the entry")
+    }
+
+    /// MOD-163 D11, D12 (maintainer P-1): `resolve` freezes the project's `Active` entries, under
+    /// the cap and with their text, in `select`'s order; a retired entry stays out, `total` counts
+    /// only the active ones, and the topology is the memory-less graph's (no `V` bump).
+    #[tokio::test]
+    async fn resolve_freezes_the_projects_active_memory_with_its_text() {
+        use htui_core::model::{MemoryKind, MemoryState, SnapshotMemoryEntry};
+        use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
+
+        let store = MemStore::demo();
+        let first = remember(
+            &store,
+            ids::PROJECT_HTUI,
+            MemoryKind::Gotcha,
+            "Build cache",
+            "Clear target/ when the sqlx offline data goes stale.",
+        )
+        .await;
+        let second = remember(
+            &store,
+            ids::PROJECT_HTUI,
+            MemoryKind::Decision,
+            "Errors",
+            "Library crates use thiserror; binaries use anyhow.",
+        )
+        .await;
+        let retired = remember(
+            &store,
+            ids::PROJECT_HTUI,
+            MemoryKind::Fact,
+            "Old fact",
+            "This one was retired before the run.",
+        )
+        .await;
+        store
+            .retire_memory_entry(retired.id, retired.version, ids::USER, None)
+            .await
+            .expect("the store retires the entry");
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        let memory = snapshot
+            .memory
+            .clone()
+            .expect("a project with active entries freezes them");
+        assert_eq!(memory.estimator, "chars-v2");
+        assert_eq!(memory.total, 2, "only the active entries count");
+
+        let live =
+            ReadStore::memory_entries(&store, ids::PROJECT_HTUI, Some(vec![MemoryState::Active]))
+                .await
+                .expect("MemStore never fails a read")
+                .expect("MemStore holds every entry");
+        let expected = select_memory(&live, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT)
+            .expect("two active entries");
+        assert_eq!(
+            memory, expected,
+            "the freeze is `select` over the active entries"
+        );
+        let mut frozen: Vec<_> = memory.entries.iter().map(|entry| entry.id).collect();
+        frozen.sort();
+        let mut written = vec![first.id, second.id];
+        written.sort();
+        assert_eq!(
+            frozen, written,
+            "both active entries, never the retired one"
+        );
+        for entry in [&first, &second] {
+            let snap = memory
+                .entries
+                .iter()
+                .find(|snap| snap.id == entry.id)
+                .expect("frozen");
+            assert_eq!(
+                snap,
+                &SnapshotMemoryEntry::freeze(entry, htui_core::model::MemorySource::Person),
+                "a copy of the text, the version and the person source"
+            );
+        }
+        assert_eq!(
+            snapshot.topology, FEATURE_TOPOLOGY_V2,
+            "memory is outside the topology digest: {TOPOLOGY_MOVED}"
+        );
+    }
+
+    /// MOD-163 D11: a project with no active entry freezes `None`, so the stored snapshot carries
+    /// no `memory` key.
+    #[tokio::test]
+    async fn a_project_without_active_memory_freezes_none() {
+        let store = MemStore::demo();
+        let retired = remember(
+            &store,
+            ids::PROJECT_HTUI,
+            htui_core::model::MemoryKind::Fact,
+            "Gone",
+            "Retired before the run.",
+        )
+        .await;
+        store
+            .retire_memory_entry(retired.id, retired.version, ids::USER, None)
+            .await
+            .expect("the store retires the entry");
+        // Another project's entry is not this project's memory.
+        remember(
+            &store,
+            ids::PROJECT_AGY,
+            htui_core::model::MemoryKind::Fact,
+            "Elsewhere",
+            "Another project's note.",
+        )
+        .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        assert_eq!(snapshot.memory, None);
+        let json = serde_json::to_value(&snapshot).expect("a snapshot serialises");
+        assert!(json.get("memory").is_none(), "{json}");
+    }
+
+    /// MOD-163 maintainer decision P-1: the freeze runs in [`resolve`], on a resolved graph only.
+    /// `resolve_or_refused` — what a v1 run's resume calls, keeping only the live phases — reads
+    /// no memory: its snapshot is memory-less even when the project has active entries.
+    #[tokio::test]
+    async fn resolve_or_refused_reads_no_memory_for_a_v1_resume() {
+        let store = MemStore::demo();
+        remember(
+            &store,
+            ids::PROJECT_HTUI,
+            htui_core::model::MemoryKind::Fact,
+            "Present",
+            "An active entry the resume must not read.",
+        )
+        .await;
+        let item = feat_1(&store).await;
+        let resolution = super::resolve_or_refused(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the seeded feature graph resolves");
+        let super::Resolution::Resolved(live) = resolution else {
+            panic!("the seeded feature graph is not refused");
+        };
+        assert_eq!(
+            live.snapshot.memory, None,
+            "resolve_or_refused never freezes memory (P-1)"
+        );
+        assert!(
+            resolve_feat(&store, &TestSource::claude(&store))
+                .await
+                .expect("the seeded feature graph resolves")
+                .snapshot
+                .memory
+                .is_some(),
+            "resolve itself does"
         );
     }
 

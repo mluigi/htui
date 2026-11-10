@@ -118,6 +118,7 @@ new_workspace = ["N"]              # new workspace
 primary       = ["p"]              # make primary
 choose_path   = ["b"]              # choose path
 infer         = ["i"]              # infer paths
+memory        = ["m"]              # memory
 next_field    = ["tab", "down"]    # next field
 prev_field    = ["backtab", "up"]  # previous field
 
@@ -156,6 +157,14 @@ prev_field = ["backtab", "up"]  # previous field
 
 [settings.queue]
 edit = ["e", "enter"]  # edit
+
+[settings.memory]
+body          = ["b"]              # edit body
+all           = ["a"]              # all states
+clash_edit    = ["e"]              # edit it
+clash_replace = ["r"]              # replace it
+next_field    = ["tab", "down"]    # next field
+prev_field    = ["backtab", "up"]  # previous field
 
 [concepts]
 decisions = ["ctrl-d"]  # decisions only

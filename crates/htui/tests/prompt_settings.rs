@@ -7,9 +7,10 @@
 //!
 //! The worker half's last case is Postgres-gated and returns without asserting when
 //! `HTUI_TEST_DATABASE_URL` is unset, as every other Postgres-backed suite in this crate does: it
-//! is the only store where the ten `app_setting` rows exist before anything writes one
+//! is the only store where the ten seeded `app_setting` rows exist before anything writes one
 //! (`0002_agent_probe.sql:68-79`), and therefore the only one where a set carries a token rather
-//! than `expected: None`.
+//! than `expected: None`. MOD-163's `memory_capture` is the eleventh `App` key and has no seed
+//! row, so it is `expected: None` on both stores.
 #![cfg(feature = "testkit")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,13 +21,14 @@ use htui::prompt_settings::{self, REQUEST_NAMES, SettingsSnapshot, project_keys}
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::kit::label;
 use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, PromptSection, SettingsSection, SettingsTab,
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, Scope, WorkspaceId};
 use htui_core::prompt::settings::{resolve_allow_env_files, resolve_box_hostname};
-use htui_core::prompt::{DEFAULTS, Rungs, SettingKey};
+use htui_core::prompt::{BudgetSource, DEFAULTS, Rungs, SettingKey};
 use htui_core::store::{MemStore, SettingRung, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
@@ -97,7 +99,7 @@ async fn demo_settings(backend: &Backend) -> SettingsSnapshot {
 fn app_token(snapshot: &SettingsSnapshot, key: SettingKey) -> DateTime<Utc> {
     snapshot
         .app_entry(key)
-        .expect("the snapshot carries all ten keys")
+        .expect("the snapshot carries all eleven keys")
         .updated_at
         .expect("an applied write leaves the row a token")
 }
@@ -146,19 +148,20 @@ fn prompt_settings_names_are_stable() {
     assert_eq!(unique.len(), REQUEST_NAMES.len(), "three distinct names");
 }
 
-/// The shape of one read (D3/D4): ten `App` entries in `SettingKey::app_keys` order, all empty on
-/// a fresh `MemStore` (F-7), and one project entry per scope project carrying exactly the keys the
-/// `Project` rung accepts, in [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then
-/// `box_hostname` (MOD-33 D276).
+/// The shape of one read (D3/D4): eleven `App` entries in `SettingKey::app_keys` order (`0002`'s
+/// ten plus MOD-163's `memory_capture`), all empty on a fresh `MemStore` (F-7), and one project
+/// entry per scope project carrying exactly the keys the `Project` rung accepts, in
+/// [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then `box_hostname` (MOD-33
+/// D276), then `memory_capture` (MOD-163 D19).
 ///
-/// The demo project's own blob already holds `token_budget`, so the fourth project value is a
+/// The demo project's own blob already holds `token_budget`, so the fifth project value is a
 /// stored number rather than `None` — which is what makes the `project_key` mapping of D2
 /// observable from the first read.
 #[tokio::test]
-async fn the_demo_snapshot_has_ten_app_entries_and_four_keys_per_project() {
+async fn the_demo_snapshot_has_eleven_app_entries_and_five_keys_per_project() {
     let snapshot = demo_settings(&demo()).await;
 
-    assert_eq!(snapshot.app.len(), 10);
+    assert_eq!(snapshot.app.len(), 11);
     let keys: Vec<SettingKey> = snapshot.app.iter().map(|entry| entry.key).collect();
     assert_eq!(keys, SettingKey::app_keys().collect::<Vec<_>>());
     for entry in &snapshot.app {
@@ -177,14 +180,15 @@ async fn the_demo_snapshot_has_ten_app_entries_and_four_keys_per_project() {
         vec![
             SettingKey::AllowEnvFiles,
             SettingKey::BoxHostname,
+            SettingKey::MemoryCapture,
             SettingKey::UpstreamHops,
             SettingKey::TokenBudget
         ]
     );
-    assert_eq!(project.values[0].value, None);
-    assert_eq!(project.values[1].value, None);
-    assert_eq!(project.values[2].value, None);
-    assert_eq!(project.values[3].value, Some(json!(120_000)));
+    for value in &project.values[0..=3] {
+        assert_eq!(value.value, None, "`{:?}` holds nothing", value.key);
+    }
+    assert_eq!(project.values[4].value, Some(json!(120_000)));
 }
 
 /// `app_map` is the shape `Backend::app_settings` hands the resolvers: only the entries that carry
@@ -208,7 +212,7 @@ async fn app_map_holds_only_entries_with_a_value() {
     );
 
     let map = snapshot.app_map();
-    assert_eq!(map.len(), 1, "nine entries hold nothing: {map:?}");
+    assert_eq!(map.len(), 1, "ten entries hold nothing: {map:?}");
     assert_eq!(map.get("max_skill_tokens"), Some(&json!(4_000)));
 }
 
@@ -235,7 +239,7 @@ async fn set_setting_on_app_with_no_row_applies_then_the_old_token_is_stale() {
     let applied = settings(serve(&backend, &set_budget(None)).await);
     let entry = applied
         .app_entry(SettingKey::TokenBudget)
-        .expect("the snapshot carries all ten keys");
+        .expect("the snapshot carries all eleven keys");
     assert_eq!(entry.value, Some(json!(5_000)));
     let first = app_token(&applied, SettingKey::TokenBudget);
 
@@ -284,7 +288,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     );
     let entry = cleared
         .app_entry(SettingKey::MaxSkillTokens)
-        .expect("the snapshot carries all ten keys");
+        .expect("the snapshot carries all eleven keys");
     assert_eq!(entry.value, None);
     assert_eq!(entry.updated_at, None);
     assert!(cleared.app_map().is_empty());
@@ -293,7 +297,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     assert_eq!(
         reset
             .app_entry(SettingKey::MaxSkillTokens)
-            .expect("the snapshot carries all ten keys")
+            .expect("the snapshot carries all eleven keys")
             .value,
         Some(json!(4_000)),
         "the rung is writable again with `expected: None`"
@@ -384,8 +388,8 @@ async fn set_setting_on_project_stores_under_the_project_key_and_keeps_foreign_k
     assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
     assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
 
-    assert_eq!(entry.values[2].key, SettingKey::UpstreamHops);
-    assert_eq!(entry.values[2].value, Some(json!(2)));
+    assert_eq!(entry.values[3].key, SettingKey::UpstreamHops);
+    assert_eq!(entry.values[3].value, Some(json!(2)));
     assert_ne!(
         entry.project.updated_at, token,
         "the project's own token is what a project-rung write moves"
@@ -621,13 +625,15 @@ async fn serve_refuses_a_foreign_request_by_name() {
     );
 }
 
-/// The store difference D16 exists for: a migrated Postgres holds all ten `app_setting` rows
-/// before anything writes one, so every entry carries a value **and** a token, and the map the
-/// resolvers read is the compiled default table verbatim.
+/// The store difference D16 exists for: a migrated Postgres holds all ten seeded `app_setting`
+/// rows before anything writes one, so each of those entries carries a value **and** a token, and
+/// the map the resolvers read is the compiled default table verbatim. MOD-163's `memory_capture`
+/// (D19) is the eleventh `App` key and has no seed row: no value, no token, and its resolver falls
+/// through to the compiled default.
 ///
 /// Skipped, not failed, with `HTUI_TEST_DATABASE_URL` unset.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_migrated_postgres_presents_ten_app_rows_with_tokens() {
+async fn a_migrated_postgres_presents_ten_seeded_app_rows_and_an_unseeded_memory_capture() {
     let Some(db) = htui_store::testkit::demo_db().await else {
         return;
     };
@@ -636,8 +642,17 @@ async fn a_migrated_postgres_presents_ten_app_rows_with_tokens() {
         .await
         .expect("one read of the migrated scope");
 
-    assert_eq!(snapshot.app.len(), 10);
-    for entry in &snapshot.app {
+    assert_eq!(snapshot.app.len(), 11);
+    let capture = snapshot
+        .app_entry(SettingKey::MemoryCapture)
+        .expect("the snapshot carries all eleven keys");
+    assert_eq!(capture.value, None, "0002 seeds no `memory_capture` row");
+    assert_eq!(capture.updated_at, None, "so a set passes `expected: None`");
+    for entry in snapshot
+        .app
+        .iter()
+        .filter(|entry| entry.key != SettingKey::MemoryCapture)
+    {
         assert!(
             entry.value.is_some(),
             "`{:?}` is seeded by migration 0002",
@@ -653,6 +668,7 @@ async fn a_migrated_postgres_presents_ten_app_rows_with_tokens() {
     let expected: BTreeMap<String, Value> = DEFAULTS
         .as_rows()
         .into_iter()
+        .filter(|(key, _)| *key != SettingKey::MemoryCapture.key())
         .map(|(key, value)| (key.to_owned(), value))
         .collect();
     assert_eq!(snapshot.app_map(), expected);
@@ -765,15 +781,15 @@ fn project_token(snapshot: &SettingsSnapshot) -> DateTime<Utc> {
     snapshot.projects[0].project.updated_at
 }
 
-/// Which row of the tree one `App` key is: the `app` header is row 0 and the ten keys follow in
+/// Which row of the tree one `App` key is: the `app` header is row 0 and the eleven keys follow in
 /// `SettingKey::app_keys` order (D9).
 fn app_row(key: SettingKey) -> usize {
     1 + SettingKey::app_keys()
         .position(|candidate| candidate == key)
-        .expect("one of the ten")
+        .expect("one of the eleven")
 }
 
-/// Which row of the tree one `Project`-rung key of the scope's single project is: the ten `App`
+/// Which row of the tree one `Project`-rung key of the scope's single project is: the eleven `App`
 /// rows and their header, then the `project` header.
 fn project_row(key: SettingKey) -> usize {
     SettingKey::app_keys().count()
@@ -954,7 +970,7 @@ fn row_of(frame: &str, key: SettingKey, nth: usize) -> &str {
         .unwrap_or_else(|| panic!("no row {nth} for `{key}`: {frame}"))
 }
 
-/// The demo world as the section draws it (D9): the `app` group with the ten registry keys, then
+/// The demo world as the section draws it (D9): the `app` group with the eleven registry keys, then
 /// one group per project of the scope with the keys the `Project` rung accepts.
 ///
 /// The demo project's blob already holds `token_budget` (`fixtures.rs:644-648`), so that row reads
@@ -988,7 +1004,13 @@ async fn the_demo_snapshot_renders_the_tree() {
             row.contains("(default)"),
             "so the compiled table answers for it, named in words (MOD-83): {row}"
         );
-        let expected = DEFAULTS.value_of(key).to_string();
+        // A switch reads `on`/`off`, never the JSON `true` (MOD-163 D19's `memory_capture` is
+        // the first switch an App row lists).
+        let expected = match DEFAULTS.value_of(key) {
+            Value::Bool(true) => "on".to_owned(),
+            Value::Bool(false) => "off".to_owned(),
+            value => value.to_string(),
+        };
         // The reserve reads in percent with its fraction beside it (MOD-83).
         assert!(
             row.contains(&format!("| {expected}")) || row.contains(&format!("% ({expected})")),
@@ -1016,12 +1038,18 @@ async fn the_demo_snapshot_renders_the_tree() {
         row_of(&frame, SettingKey::AllowEnvFiles, 0).contains("unset | off (default)"),
         "the env-files switch is off until a project turns it on (MOD-89 D4): {frame}"
     );
+    for nth in [0, 1] {
+        assert!(
+            row_of(&frame, SettingKey::MemoryCapture, nth).contains("unset | on (default)"),
+            "memory capture is on until a rung turns it off (MOD-163 D19), row {nth}: {frame}"
+        );
+    }
 
     insta::assert_snapshot!("demo", frame);
 }
 
 /// A scope with no project is the `app` group alone: there is no rung below it to list, and the
-/// ten `App` rows are never empty.
+/// eleven `App` rows are never empty.
 #[tokio::test]
 async fn no_workspace_lists_the_app_group_alone() {
     let mut harness = prompt_over(MemStore::new()).await;
@@ -1085,7 +1113,7 @@ async fn offline_is_unavailable_with_the_worker_sentence() {
     insta::assert_snapshot!("offline", frame);
 }
 
-/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the ten of
+/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the eleven of
 /// `SettingKey::app_keys`; a project group is `project_keys()` and nothing else.
 #[tokio::test]
 async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
@@ -1096,7 +1124,7 @@ async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
     assert_eq!(
         rows.len(),
         SettingKey::app_keys().count() + project_keys().count(),
-        "ten app rows and one group of project rows: {frame}"
+        "eleven app rows and one group of project rows: {frame}"
     );
 
     let project_rows = &rows[SettingKey::app_keys().count()..];
@@ -1243,6 +1271,92 @@ async fn e_then_on_then_enter_sends_set_setting_true_for_allow_env_files() {
     assert_eq!(*key, SettingKey::AllowEnvFiles);
     assert_eq!(*value, Value::Bool(true));
     assert_eq!(*expected, Some(project_token(&snapshot)));
+}
+
+/// MOD-163 D19: `memory_capture` is listed on both rungs and `e` sets it on each, the `App` write
+/// passing `expected: None` (0002 seeds no row) and the project write the project row's token.
+/// Once the `App` row holds `false`, a project row that holds nothing names that rung, not
+/// `default`.
+#[tokio::test]
+async fn memory_capture_is_listed_and_set_on_both_rungs() {
+    let backend = demo();
+    let (bench, mut section, snapshot) = bench_with(&backend).await;
+    move_to(&bench, &mut section, app_row(SettingKey::MemoryCapture));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "off");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            scope,
+            rung,
+            key,
+            value,
+            expected,
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await, "every write carries the scope");
+    assert_eq!(*rung, SettingRung::App);
+    assert_eq!(*key, SettingKey::MemoryCapture);
+    assert_eq!(*value, Value::Bool(false));
+    assert_eq!(
+        *expected, None,
+        "no `app_setting` row: `expected: None` is the token"
+    );
+
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, project_row(SettingKey::MemoryCapture));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "on");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            rung,
+            key,
+            value,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::MemoryCapture);
+    assert_eq!(*value, Value::Bool(true));
+    assert_eq!(*expected, Some(project_token(&snapshot)));
+
+    let off = applied(
+        &backend,
+        set_app(SettingKey::MemoryCapture, json!(false), None),
+    )
+    .await;
+    assert_eq!(
+        off.app_entry(SettingKey::MemoryCapture)
+            .expect("the snapshot carries all eleven keys")
+            .value,
+        Some(json!(false))
+    );
+    let (bench, section) = bench_from(&off).await;
+    let frame = bench.render_section(&section, 100);
+    let app_setting = label::setting_source(BudgetSource::AppSetting);
+    assert!(
+        row_of(&frame, SettingKey::MemoryCapture, 0)
+            .contains(&format!("false | off ({app_setting})")),
+        "the App row holds the switch: {frame}"
+    );
+    assert!(
+        row_of(&frame, SettingKey::MemoryCapture, 1)
+            .contains(&format!("unset | off ({app_setting})")),
+        "the project inherits it and names the App rung: {frame}"
+    );
 }
 
 /// D11 for the switch: anything but on/off/true/false is refused by shape and asks nothing.

@@ -37,6 +37,10 @@ use htui_core::model::{
     CommandQueue, GraphSnapshot, NewPersona, Persona, PersonaId, PersonaPatch, PersonaPermission,
     PersonaTools, SnapshotPersona,
 };
+use htui_core::model::{
+    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemorySubject,
+    MemorySupersede, MemoryUpdate, NewMemoryEntry, ProjectId,
+};
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{
     CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
@@ -553,6 +557,13 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// first, a cycle of waits its lowest once nothing else can run, and a skipped producer leaves the
 /// kind optional. And finding 6's one: a rejection handed back beside an A7 recovery's
 /// interrupted park ends the run as the in-process answer does.
+///
+/// **Six for MOD-163 M2** (plan D11, D12, D18): the project memory frozen at `StartRun` reaches
+/// every phase step of its project and no other project's; retired and superseded entries never
+/// reach a prompt; an amend and a retire after `StartRun` do not reach the run (the next step
+/// and a retry render the run-start bytes); fan-out siblings carry byte-identical memory and the
+/// judge none; a pre-MOD-163 snapshot resumes with no memory section; and a project without
+/// memory writes no `memory` row.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -887,6 +898,16 @@ pub const CASES: &[&str] = &[
     // MOD-138 M3 R1 (review finding 6, T4's leftover): the hand-back twin of a rejection beside
     // an A7 recovery park ends the run as the in-process answer does.
     "a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_process",
+    // MOD-163 M2 (plan D11, D12, D18): the project's active memory, frozen at `StartRun`, reaches
+    // every phase step of its project and only them; closed entries stay out; an edit after
+    // `StartRun` does not reach the run; fan-out siblings carry the same bytes; a pre-MOD-163
+    // snapshot resumes with none; and a project without memory writes no row.
+    "a_memory_entry_reaches_every_phase_prompt_of_its_project",
+    "closed_memory_entries_never_reach_a_prompt",
+    "a_memory_edit_after_start_run_does_not_reach_the_run",
+    "fan_out_siblings_carry_byte_identical_memory_sections",
+    "a_snapshot_without_memory_resumes_with_no_memory_section",
+    "a_project_without_memory_writes_no_memory_row",
 ];
 
 /// Run one case by name.
@@ -911,6 +932,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     hand_back_case(name, harness)
         .or_else(|| persona_case(name, harness))
+        .or_else(|| memory_case(name, harness))
         .or_else(|| hardening_case(name, harness))
         .or_else(|| input_case(name, harness))
         .or_else(|| command_queue_case(name, harness))
@@ -1216,6 +1238,34 @@ fn persona_case<'a, H: CaseHarness>(
         }
         "a_persona_run_leaves_the_agent_row_untouched" => {
             Box::pin(a_persona_run_leaves_the_agent_row_untouched(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-163 M2's cases, in a frame of their own for [`hand_back_case`]'s reason.
+fn memory_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_memory_entry_reaches_every_phase_prompt_of_its_project" => Box::pin(
+            a_memory_entry_reaches_every_phase_prompt_of_its_project(harness),
+        ),
+        "closed_memory_entries_never_reach_a_prompt" => {
+            Box::pin(closed_memory_entries_never_reach_a_prompt(harness))
+        }
+        "a_memory_edit_after_start_run_does_not_reach_the_run" => Box::pin(
+            a_memory_edit_after_start_run_does_not_reach_the_run(harness),
+        ),
+        "fan_out_siblings_carry_byte_identical_memory_sections" => Box::pin(
+            fan_out_siblings_carry_byte_identical_memory_sections(harness),
+        ),
+        "a_snapshot_without_memory_resumes_with_no_memory_section" => Box::pin(
+            a_snapshot_without_memory_resumes_with_no_memory_section(harness),
+        ),
+        "a_project_without_memory_writes_no_memory_row" => {
+            Box::pin(a_project_without_memory_writes_no_memory_row(harness))
         }
         _ => return None,
     })
@@ -8114,6 +8164,395 @@ async fn a_persona_run_leaves_the_agent_row_untouched<H: CaseHarness>(harness: &
     assert_eq!(claude(&orch).await, before, "the agent row is untouched");
 }
 
+// -- MOD-163 M2: project memory reaches the walk (plan D11, D12, D18) ----------------------------
+
+/// MOD-163: writes one active memory entry of `kind` into `project` through `WriteStore`, as the
+/// M3 pane would (a person's, no box).
+///
+/// # Panics
+/// When the text is refused or the store refuses the write.
+async fn remember<O: Orchestrate>(
+    orch: &O,
+    project: ProjectId,
+    kind: MemoryKind,
+    subject: &str,
+    body: &str,
+) -> MemoryEntry {
+    orch.store()
+        .create_memory_entry(project, new_memory(kind, subject, body))
+        .await
+        .expect("the store takes a plain entry")
+}
+
+/// A person's new memory entry with a fresh id, its text checked by an empty scrubber.
+///
+/// # Panics
+/// When the text is refused, which a case's plain text never is.
+fn new_memory(kind: MemoryKind, subject: &str, body: &str) -> NewMemoryEntry {
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    NewMemoryEntry {
+        id: MemoryEntryId::new(),
+        kind,
+        subject: MemorySubject::new(subject, &scrubber).expect("a plain subject"),
+        body: MemoryBody::new(body, &scrubber).expect("a plain body"),
+        created_by: ids::USER,
+        box_id: None,
+    }
+}
+
+/// The `memory` section of a prompt's text, from its opening tag to its `</section>`, or `None`
+/// when the prompt carries none.
+fn memory_section(text: &str) -> Option<&str> {
+    const OPEN: &str = "<section name=\"memory\">";
+    const CLOSE: &str = "</section>";
+    let start = text.find(OPEN)?;
+    let end = start + text[start..].find(CLOSE)? + CLOSE.len();
+    Some(&text[start..end])
+}
+
+/// The `memory` section of `step`'s recorded prompt.
+///
+/// # Panics
+/// When the prompt carries none, which is what the caller asserts it does.
+async fn memory_of_step<O: Orchestrate>(orch: &O, step: StepId) -> String {
+    let text = prompt_text(orch, step).await;
+    memory_section(&text)
+        .unwrap_or_else(|| panic!("the step's prompt carries a memory section:\n{text}"))
+        .to_owned()
+}
+
+/// MOD-163 D11, D12, D14: an active entry of `FEAT-3`'s project reaches every phase step's prompt
+/// as `sections[1]` (no persona), the same frozen bytes in each; another project's entry reaches
+/// none of them.
+async fn a_memory_entry_reaches_every_phase_prompt_of_its_project<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let ours = remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Gotcha,
+        "Build cache",
+        "Clear target/ when the sqlx offline data goes stale.",
+    )
+    .await;
+    let theirs = remember(
+        &orch,
+        ids::PROJECT_AGY,
+        MemoryKind::Fact,
+        "Elsewhere",
+        "Another project's note stays in that project.",
+    )
+    .await;
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let rest = approve(&orch, run, 4).await;
+    assert_eq!(rest.run, RunStatus::Done, "the four phases walked");
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 4, "one step per phase");
+    let first = memory_of_step(&orch, steps[0].id).await;
+    for step in &steps {
+        let sections = prompt_sections(&orch, step.id).await;
+        assert_eq!(
+            sections.get(..2),
+            Some(["template".to_owned(), "memory".to_owned()].as_slice()),
+            "`{}`: {sections:?}",
+            step.phase_name
+        );
+        let text = prompt_text(&orch, step.id).await;
+        assert!(text.contains(&ours.body), "`{}`:\n{text}", step.phase_name);
+        assert!(
+            !text.contains(&theirs.body),
+            "`{}`:\n{text}",
+            step.phase_name
+        );
+        assert_eq!(
+            memory_of_step(&orch, step.id).await,
+            first,
+            "`{}` renders the run's one frozen memory",
+            step.phase_name
+        );
+    }
+}
+
+/// MOD-163 D11 (blueprint P-8): a retired entry and a superseded one never reach the prompt; the
+/// successor does, and the snapshot's `total` counts only it.
+async fn closed_memory_entries_never_reach_a_prompt<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let retired = remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Fact,
+        "Retired fact",
+        "This note was retired before the run.",
+    )
+    .await;
+    let retire = orch
+        .store()
+        .retire_memory_entry(retired.id, retired.version, ids::USER, None)
+        .await
+        .expect("the entry is live");
+    assert!(matches!(retire, MemoryUpdate::Updated(_)), "{retire:?}");
+    let old = remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Decision,
+        "Error crates",
+        "The superseded wording of the decision.",
+    )
+    .await;
+    let successor = new_memory(
+        MemoryKind::Decision,
+        "Error crates",
+        "Library crates use thiserror; binaries use anyhow.",
+    );
+    let replaced = orch
+        .store()
+        .supersede_memory_entry(old.id, old.version, successor.clone())
+        .await
+        .expect("the old entry is live");
+    assert!(
+        matches!(replaced, MemorySupersede::Superseded { .. }),
+        "{replaced:?}"
+    );
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = at(&steps_of(&orch, run).await, 0, 1).clone();
+    let text = prompt_text(&orch, prd.id).await;
+    assert!(text.contains(successor.body.as_str()), "{text}");
+    assert!(!text.contains(&retired.body), "{text}");
+    assert!(!text.contains(&old.body), "{text}");
+    let memory = snapshot_of(&orch, run)
+        .await
+        .memory
+        .expect("the successor is active");
+    assert_eq!(memory.total, 1, "only the successor is active");
+    assert_eq!(
+        memory
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [successor.id]
+    );
+}
+
+/// MOD-163 D11 (`R-PRM-1`), the persona case's twin: an entry amended and then retired after
+/// `StartRun` does not reach the run. The next step, a retry and a resume render the run-start
+/// bytes, and the snapshot keeps version 1.
+async fn a_memory_edit_after_start_run_does_not_reach_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let entry = remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Lesson,
+        "Small commits",
+        "Commit at every blueprint boundary.",
+    )
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.position, Some(0), "the run parks at `prd`");
+    let frozen = memory_of_step(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(frozen.contains(&entry.body), "{frozen}");
+
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let amended = orch
+        .store()
+        .amend_memory_entry(
+            entry.id,
+            entry.version,
+            MemoryPatch {
+                body: Some(MemoryBody::new("An amended body.", &scrubber).expect("plain")),
+                author_id: ids::USER,
+                ..MemoryPatch::default()
+            },
+        )
+        .await
+        .expect("the entry is live");
+    let MemoryUpdate::Updated(amended) = amended else {
+        panic!("the token is current: {amended:?}");
+    };
+
+    let (parked, _) = answer(&orch, run, GateAnswer::Approved).await;
+    assert_eq!(parked.position, 0);
+    let plan = at(&steps_of(&orch, run).await, 1, 1).clone();
+    assert_eq!(
+        memory_of_step(&orch, plan.id).await,
+        frozen,
+        "the next step reads the memory frozen at `StartRun`"
+    );
+
+    let retired = orch
+        .store()
+        .retire_memory_entry(amended.id, amended.version, ids::USER, None)
+        .await
+        .expect("the entry is live");
+    assert!(matches!(retired, MemoryUpdate::Updated(_)), "{retired:?}");
+    let outcome = orch
+        .dispatch(Command::RetryStep { run, step: plan.id })
+        .await
+        .expect("a parked step is retryable within its budget");
+    assert!(
+        matches!(outcome, CommandOutcome::Retried { .. }),
+        "{outcome:?}"
+    );
+    let retry = at(&steps_of(&orch, run).await, 1, 2).clone();
+    assert_eq!(
+        memory_of_step(&orch, retry.id).await,
+        frozen,
+        "a retry reads the memory frozen at `StartRun`"
+    );
+
+    // Review R2-2: a resume walks from the stored snapshot, not from the live (now retired)
+    // entry, so the step it starts renders the run-start bytes too.
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    let resumed = orch.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("memory is outside the topology, so the snapshot still hashes: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(2)),
+        "the resume walked to the third phase's gate"
+    );
+    let third = at(&steps_of(&orch, run).await, 2, 1).clone();
+    assert_eq!(
+        memory_of_step(&orch, third.id).await,
+        frozen,
+        "a resumed run reads the memory frozen at `StartRun`"
+    );
+    let snapshot = snapshot_of(&orch, run).await;
+    let memory = snapshot.memory.expect("the run froze the entry");
+    assert_eq!(
+        memory
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.version, entry.body.as_str()))
+            .collect::<Vec<_>>(),
+        [(entry.id, 1, entry.body.as_str())],
+        "the snapshot keeps the run-start version and text"
+    );
+}
+
+/// MOD-163 D18: the three candidates of a judged fan-out carry byte-identical memory sections;
+/// the judge's own sections carry none (its task replays a candidate's prompt).
+async fn fan_out_siblings_carry_byte_identical_memory_sections<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 1, "the most thorough");
+    let project = item_of(&orch, ids::HTUI_ANA_2).await.project_id;
+    remember(
+        &orch,
+        project,
+        MemoryKind::Fact,
+        "Research sources",
+        "Cite the ANA document a finding comes from.",
+    )
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+    let steps = steps_of(&orch, run).await;
+    let first = memory_of_step(&orch, candidate(&steps, 0, 1, 0).id).await;
+    for index in 1..3 {
+        assert_eq!(
+            memory_of_step(&orch, candidate(&steps, 0, 1, index).id).await,
+            first,
+            "candidate {index}"
+        );
+    }
+    let judge = judge_of(&steps, 0, 1).expect("the judge is a step");
+    let sections = prompt_sections(&orch, judge.id).await;
+    assert!(
+        !sections.iter().any(|section| section == "memory"),
+        "the judge carries no memory (D18): {sections:?}"
+    );
+}
+
+/// MOD-163 D11: a snapshot written before MOD-163 has no `memory` key. Such a run resumes (no
+/// `SnapshotTampered`: memory is outside the topology) and its next step renders no memory, even
+/// though the project now has an active entry.
+async fn a_snapshot_without_memory_resumes_with_no_memory_section<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Fact,
+        "Present",
+        "An active entry the old run never froze.",
+    )
+    .await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    let mut blob = run_of(&orch, run)
+        .await
+        .graph_snapshot
+        .expect("the walk created the run with a snapshot");
+    assert!(
+        blob.as_object_mut()
+            .expect("a snapshot is an object")
+            .remove("memory")
+            .is_some(),
+        "the run froze the entry: {blob}"
+    );
+    assert!(orch.store().set_run_snapshot(run, blob), "the run exists");
+
+    let resumed = orch.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("a pre-MOD-163 snapshot still hashes to its topology: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the resume walked to `plan`'s gate"
+    );
+    let plan = at(&steps_of(&orch, run).await, 1, 1).clone();
+    let sections = prompt_sections(&orch, plan.id).await;
+    assert!(
+        !sections.iter().any(|section| section == "memory"),
+        "{sections:?}"
+    );
+    let text = prompt_text(&orch, plan.id).await;
+    assert_eq!(memory_section(&text), None, "{text}");
+}
+
+/// MOD-163 D11, D14: a project with no active entry (another project's aside) writes no `memory`
+/// row, freezes `None` and stores no `memory` key.
+async fn a_project_without_memory_writes_no_memory_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    remember(
+        &orch,
+        ids::PROJECT_AGY,
+        MemoryKind::Fact,
+        "Elsewhere",
+        "Another project's note stays in that project.",
+    )
+    .await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = at(&steps_of(&orch, run).await, 0, 1).clone();
+    let sections = prompt_sections(&orch, prd.id).await;
+    assert!(
+        !sections.iter().any(|section| section == "memory"),
+        "{sections:?}"
+    );
+    assert_eq!(memory_section(&prompt_text(&orch, prd.id).await), None);
+    assert_eq!(snapshot_of(&orch, run).await.memory, None);
+    let blob = run_of(&orch, run)
+        .await
+        .graph_snapshot
+        .expect("the walk created the run with a snapshot");
+    assert!(blob.get("memory").is_none(), "{blob}");
+}
+
 // -- MOD-11 T8: the command queue's exposure and the R-MCP-4 denials (plan D16, D17) --------
 
 /// The session key of `phase`'s first attempt, candidate `fanout_index`, first call.
@@ -13075,8 +13514,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            180,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            186,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -13153,7 +13592,10 @@ mod tests {
              loop as in process), and MOD-138 M3 R1's five input-order cases (review finding 1: \
              a consumer waiting for an incomparable producer, the reversed direction, a two-way \
              pair, a cycle of waits, and a skipped producer), and R1's finding-6 one (a \
-             rejection handed back beside an interrupted park ending the run as in process)"
+             rejection handed back beside an interrupted park ending the run as in process), \
+             and MOD-163 M2's six memory cases (plan D11, D12, D18: an entry reaching every \
+             phase of its project, closed entries kept out, an edit after `StartRun`, fan-out \
+             siblings alike, a pre-MOD-163 snapshot, no entries no row)"
         );
     }
 

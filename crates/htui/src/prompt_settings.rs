@@ -1,5 +1,6 @@
-//! The prompt settings behind `Settings > Prompt`: the ten `app_setting` keys of the registry and,
-//! per project of the scope, the keys the `Project` rung accepts (MOD-15 milestone 5, D1/D3).
+//! The prompt settings behind `Settings > Prompt`: the eleven `app_setting` keys of the registry
+//! (`0002`'s ten plus MOD-163's unseeded `memory_capture`) and, per project of the scope, the keys
+//! the `Project` rung accepts (MOD-15 milestone 5, D1/D3).
 //!
 //! One read per event and never one per keystroke (M3 D5's trade), one reply out, and every write
 //! through milestone 1's compare-and-set seam. The section renders from the snapshot and never
@@ -25,7 +26,7 @@ use serde_json::Value;
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
-/// One read of the scope: the ten `App` rows, then every project of the scope that still names a
+/// One read of the scope: the eleven `App` rows, then every project of the scope that still names a
 /// row, each with the keys the `Project` rung accepts.
 ///
 /// `Eq` is absent for the reason [`CatalogueSnapshot`](crate::catalogue::CatalogueSnapshot) gives:
@@ -33,7 +34,8 @@ use crate::store_worker::{StoreReply, StoreRequest};
 /// convenience is not this milestone's to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsSnapshot {
-    /// The `App` rung, in [`SettingKey::app_keys`] order — always ten entries.
+    /// The `App` rung, in [`SettingKey::app_keys`] order — always eleven entries; `memory_capture`
+    /// (MOD-163 D19) has no `0002` seed row, so it reads `value: None` until someone sets it.
     pub app: Vec<AppEntry>,
     /// The scope's projects, in `scope.project_ids` order; an id that names no row is skipped
     /// (D3), exactly as [`crate::catalogue::snapshot`] skips one.
@@ -99,7 +101,7 @@ impl SettingsSnapshot {
             .collect()
     }
 
-    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than ten.
+    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than eleven.
     #[must_use]
     pub fn app_entry(&self, key: SettingKey) -> Option<&AppEntry> {
         self.app.iter().find(|entry| entry.key == key)
@@ -117,10 +119,10 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
         .filter(|key| key.spec().rungs.contains(Rungs::PROJECT))
 }
 
-/// One read of the whole scope: the ten `App` rows with their tokens, then every project of
+/// One read of the whole scope: the eleven `App` rows with their tokens, then every project of
 /// `scope.project_ids` that still names a row, with the keys the `Project` rung accepts.
 ///
-/// N+1 reads on purpose (D3, M3 D5's trade, same words): ten `setting(App, _)` plus, per project,
+/// N+1 reads on purpose (D3, M3 D5's trade, same words): eleven `setting(App, _)` plus, per project,
 /// one `project()` and one `setting(Project(id), _)` per project key. They happen per event —
 /// activation, a scope change, after a write — never per keystroke.
 ///

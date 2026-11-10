@@ -476,6 +476,100 @@ async fn the_preview_declares_its_stand_ins() {
     }
 }
 
+/// MOD-163 D18: the preview runs the engine's `select` over the project's live `Active` entries,
+/// so it shows the entries a run started now would freeze (and never a retired one), and it
+/// declares that stand-in.
+#[tokio::test]
+async fn the_preview_selects_the_memory_a_run_would_freeze() {
+    use htui_core::model::{
+        MemoryBody, MemoryEntryId, MemoryKind, MemoryState, MemorySubject, NewMemoryEntry,
+    };
+    use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
+
+    let store = MemStore::demo();
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let mut written = Vec::new();
+    for (kind, subject, body) in [
+        (
+            MemoryKind::Gotcha,
+            "Build cache",
+            "Clear target/ when the sqlx offline data goes stale.",
+        ),
+        (
+            MemoryKind::Decision,
+            "Error crates",
+            "Library crates use thiserror; binaries use anyhow.",
+        ),
+        (MemoryKind::Fact, "Old fact", "Retired before the preview."),
+    ] {
+        let entry = store
+            .create_memory_entry(
+                ids::PROJECT_HTUI,
+                NewMemoryEntry {
+                    id: MemoryEntryId::new(),
+                    kind,
+                    subject: MemorySubject::new(subject, &scrubber).expect("a plain subject"),
+                    body: MemoryBody::new(body, &scrubber).expect("a plain body"),
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the store takes the entry");
+        written.push(entry);
+    }
+    let retired = written.pop().expect("three entries");
+    store
+        .retire_memory_entry(retired.id, retired.version, ids::USER, None)
+        .await
+        .expect("the entry is live");
+    let backend = Backend::memory(store);
+
+    let assembled = feat_1_prompt(&backend).await;
+    let live = backend
+        .memory_entries(ids::PROJECT_HTUI, Some(vec![MemoryState::Active]))
+        .await
+        .expect("the memory store never fails")
+        .expect("the memory store holds every entry");
+    let frozen = select_memory(&live, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT)
+        .expect("two active entries");
+    let audit = assembled
+        .trim
+        .memory
+        .as_ref()
+        .expect("the preview carried the project's memory");
+    assert_eq!(
+        audit.shown.iter().map(|shown| shown.id).collect::<Vec<_>>(),
+        frozen
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        "the preview shows the entries a run would freeze, in its order"
+    );
+    assert_eq!(audit.total, 2, "the retired entry is not counted");
+    assert!(!audit.shown.iter().any(|shown| shown.id == retired.id));
+    assert!(
+        assembled.text.contains("<section name=\"memory\">"),
+        "{}",
+        assembled.text
+    );
+    assert!(
+        !assembled.text.contains(&retired.body),
+        "{}",
+        assembled.text
+    );
+    assert!(
+        assembled.trim.notes.iter().any(|note| note == MEMORY_NOTE),
+        "the live memory is a declared stand-in: {:#?}",
+        assembled.trim.notes
+    );
+}
+
+/// MOD-163 D18's stand-in, verbatim.
+const MEMORY_NOTE: &str = "preview: memory is selected now from the project's active entries; a \
+                           run freezes its own at StartRun";
+
 /// MOD-9 D45, D124's skills stand-in, verbatim.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; glob attachments match this box's \

@@ -1606,6 +1606,7 @@ fn demo_graph_snapshot() -> Value {
         },
         scope: None,
         personas: Vec::new(),
+        memory: None,
     })
     .expect("a literal this module owns serialises")
 }
@@ -2958,7 +2959,8 @@ mod tests {
 
     /// The fixture record **is** `prompt::fixtures::demo_trim_record()`, byte for byte but for `v`
     /// and `undigested` (MOD-9 D118: written before `0008`, it stays `v 2`; the assembler writes
-    /// `v 4`, whose `undigested` the literal predates, MOD-33 D270).
+    /// `v 5`; `undigested` (v 4) postdates the literal, MOD-33 D270, and v 5's `memory` is absent
+    /// from a memory-less record, MOD-163 D17).
     ///
     /// It is spelled out as a literal rather than computed because `crate::fixtures` is the
     /// `demo` feature and `crate::prompt::fixtures` is `test-support`, and the `htui` binary
@@ -2979,8 +2981,9 @@ mod tests {
             .to_value(&crate::scrub::MinimalScrubber::new([]))
             .expect("the demo record is plain data and carries nothing credential-shaped");
         // MOD-9 D118: the demo's record was written before `0008`, so it stays `v 2` while the
-        // assembler writes `v 4`; v 3 only adds reasons and an optional `path` it does not use,
-        // and v 4 adds `undigested`, stripped below. Every other byte is still the assembler's.
+        // assembler writes `v 5`; v 3 only adds reasons and an optional `path` it does not use,
+        // v 4 adds `undigested`, stripped below, and v 5's `memory` is absent from a memory-less
+        // record (MOD-163 D17). Every other byte is still the assembler's.
         assert_eq!(
             step.trim_record.as_ref().map(|record| &record["v"]),
             Some(&serde_json::json!(2)),

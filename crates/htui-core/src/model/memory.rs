@@ -54,6 +54,80 @@ impl MemoryState {
     }
 }
 
+str_enum!(
+    /// Who wrote a memory entry, as a run snapshot records it (MOD-163 D15). M2 freezes `person`
+    /// only (M1 D9: every entry is a person's); MOD-164 adds `run`.
+    MemorySource {
+        /// A person: the Settings pane, the CLI or the MCP note tool.
+        Person => "person",
+    }
+);
+
+impl MemorySource {
+    /// The `trust` attribute the memory section renders (D15): `person-written` today. MOD-164's
+    /// `run` source is `model-written`; MOD-166 adds `pinned`.
+    #[must_use]
+    pub const fn trust(self) -> &'static str {
+        match self {
+            Self::Person => "person-written",
+        }
+    }
+}
+
+/// One memory entry as a run froze it at `StartRun` (MOD-163 D11): a **copy of the text**, so a
+/// retry or a resume renders the same bytes after the entry is amended or retired (`R-PRM-1`).
+/// No `deny_unknown_fields` (blueprint P-15): an entry a later builder wrote with **new fields**
+/// still decodes here. A new [`MemorySource`] or [`MemoryKind`] variant does not: it fails to
+/// decode, so it ships with the migration that introduces it, and an older build then refuses to
+/// connect to the newer schema (`applied_state`'s "schema is newer than this htui"). A variant
+/// shipped without a migration must bump [`GraphSnapshot::V`], so an older reader answers a
+/// clean `SnapshotVersion` instead of a decode error.
+///
+/// [`GraphSnapshot::V`]: crate::model::GraphSnapshot::V
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMemoryEntry {
+    /// `memory_entry.id`; recorded in `trim_record.memory.shown`, never rendered.
+    pub id: MemoryEntryId,
+    /// `memory_entry.version` at run start; recorded, never rendered.
+    pub version: i32,
+    /// The kind, rendered as `kind="…"`.
+    pub kind: MemoryKind,
+    /// The subject, rendered through `render::attr`.
+    pub subject: String,
+    /// The body, rendered verbatim (LF-normalised).
+    pub body: String,
+    /// Who wrote it; `trust` derives from it.
+    pub source: MemorySource,
+}
+
+impl SnapshotMemoryEntry {
+    /// Freezes `entry` (D11): its id, version, kind and text, with `source`.
+    #[must_use]
+    pub fn freeze(entry: &MemoryEntry, source: MemorySource) -> Self {
+        Self {
+            id: entry.id,
+            version: entry.version,
+            kind: entry.kind,
+            subject: entry.subject.clone(),
+            body: entry.body.clone(),
+            source,
+        }
+    }
+}
+
+/// `GraphSnapshot.memory` (MOD-163 D11): the project's memory as it stood at `StartRun`, already
+/// selected under the cap. Outside `topology_v2`, so no `V` bump and no `SnapshotTampered`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMemory {
+    /// The estimator id the cap was measured with (`"chars-v2"`), so a later per-model estimator
+    /// cannot drift silently.
+    pub estimator: String,
+    /// How many active entries the project had at run start (the left-out line's denominator).
+    pub total: u32,
+    /// The entries that fit the cap, in render order (`updated_at DESC, id ASC`).
+    pub entries: Vec<SnapshotMemoryEntry>,
+}
+
 /// Plan D4: the fold `uq_memory_entry_live_subject` compares by, Postgres's
 /// `lower(btrim(subject))`. `btrim` strips spaces only, so this is `trim_matches(' ')` then
 /// `to_lowercase()`, not `trim()`.
@@ -523,6 +597,46 @@ mod tests {
     fn memory_subject_key_folds_like_btrim_lower() {
         assert_eq!(memory_subject_key(" Build Cache "), "build cache");
         assert_eq!(memory_subject_key("\tX"), "\tx", "btrim keeps a tab");
+    }
+
+    /// MOD-163 D15: M2 freezes person-written entries only.
+    #[test]
+    fn memory_source_is_person_and_person_written() {
+        assert_eq!(MemorySource::ALL, [MemorySource::Person]);
+        assert_eq!(MemorySource::Person.as_str(), "person");
+        assert_eq!(MemorySource::Person.trust(), "person-written");
+        let json = serde_json::to_value(MemorySource::Person).expect("serialise");
+        assert_eq!(json, serde_json::json!("person"));
+        let back: MemorySource = serde_json::from_value(json).expect("decode");
+        assert_eq!(back, MemorySource::Person);
+    }
+
+    /// Blueprint P-15: a later builder's snapshot (MOD-164, MOD-166 add fields) still decodes.
+    #[test]
+    fn snapshot_memory_round_trips_with_unknown_fields_ignored() {
+        let memory = SnapshotMemory {
+            estimator: "chars-v2".to_owned(),
+            total: 2,
+            entries: vec![SnapshotMemoryEntry {
+                id: MemoryEntryId::from_uuid(uuid::Uuid::from_u128(7)),
+                version: 3,
+                kind: MemoryKind::Gotcha,
+                subject: "Build cache".to_owned(),
+                body: "Clear target/.".to_owned(),
+                source: MemorySource::Person,
+            }],
+        };
+        let mut json = serde_json::to_value(&memory).expect("serialise");
+        assert_eq!(
+            serde_json::from_value::<SnapshotMemory>(json.clone()).expect("decode"),
+            memory
+        );
+        json["pinned"] = serde_json::json!(true);
+        json["entries"][0]["suspect_since"] = serde_json::json!("2026-11-08");
+        assert_eq!(
+            serde_json::from_value::<SnapshotMemory>(json).expect("decode with unknown fields"),
+            memory
+        );
     }
 
     #[test]

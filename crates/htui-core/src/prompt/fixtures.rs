@@ -10,12 +10,16 @@
 //! cases — [`phase_oversize`], [`phase_protected_too_big`], [`phase_skills_over_cap`] — and
 //! [`demo_trim_record`], none of which could exist before `assemble()` did.
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::model::box_::BoxProfile;
-use crate::model::ids::{ItemId, SkillId, StepId};
+use crate::model::ids::{ItemId, MemoryEntryId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
+use crate::model::memory::{
+    MemoryEntry, MemoryKind, MemorySource, MemoryState, SnapshotMemory, SnapshotMemoryEntry,
+};
 use crate::model::run::RunStatus;
 use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
@@ -232,6 +236,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
             globs: Vec::new(),
         }],
         persona: None,
+        memory: None,
         excerpts: ExcerptSet {
             files: excerpts,
             audit,
@@ -296,6 +301,7 @@ pub fn phase_all_empty() -> PromptSpec {
         box_hostname: true,
         skills: Vec::new(),
         persona: None,
+        memory: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -390,6 +396,7 @@ pub fn judge_three_candidates() -> PromptSpec {
         box_hostname: true,
         skills: Vec::new(),
         persona: None,
+        memory: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -442,7 +449,7 @@ fn handoff_event(seq: i32, turn: i32, kind: EventKind, payload: serde_json::Valu
         payload,
         raw: None,
         // A literal, never a clock: `at` is informational and nothing here orders by it.
-        at: chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid fixed timestamp"),
+        at: DateTime::from_timestamp(1_788_393_600, 0).expect("a valid fixed timestamp"),
     }
 }
 
@@ -536,6 +543,7 @@ pub fn handoff_basic() -> PromptSpec {
         box_hostname: true,
         skills: Vec::new(),
         persona: None,
+        memory: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -758,6 +766,62 @@ pub fn demo_trim_record() -> crate::prompt::TrimRecord {
     crate::prompt::assemble(&phase_oversize(), &crate::scrub::MinimalScrubber::new([]))
         .expect("the oversize fixture assembles; it is over budget, not unassemblable")
         .trim
+}
+
+/// MOD-163: one `Active` memory entry of the demo `htui` project with a fixed id
+/// (`Uuid::from_u128(n)`), version 1, and every timestamp `updated_at` — no clock, so a select or
+/// a render over it is reproducible.
+#[must_use]
+pub fn memory_entry(
+    n: u128,
+    kind: MemoryKind,
+    subject: &str,
+    body: &str,
+    updated_at: DateTime<Utc>,
+) -> MemoryEntry {
+    MemoryEntry {
+        id: MemoryEntryId::from_uuid(Uuid::from_u128(n)),
+        project_id: crate::fixtures::ids::PROJECT_HTUI,
+        kind,
+        subject: subject.to_owned(),
+        body: body.to_owned(),
+        state: MemoryState::Active,
+        version: 1,
+        confirmed_at: updated_at,
+        superseded_by: None,
+        created_by: crate::fixtures::ids::USER,
+        created_at: updated_at,
+        updated_at,
+    }
+}
+
+/// MOD-163 blueprint §T1.9's worked example: two of the project's three active entries survived
+/// the cap, `E1` (a gotcha, version 1) then `E2` (a decision whose subject needs escaping,
+/// version 2), both person-written.
+#[must_use]
+pub fn memory_two_of_three() -> SnapshotMemory {
+    SnapshotMemory {
+        estimator: TokenEstimator::DEFAULT.id.to_owned(),
+        total: 3,
+        entries: vec![
+            SnapshotMemoryEntry {
+                id: MemoryEntryId::from_uuid(Uuid::from_u128(0xe1)),
+                version: 1,
+                kind: MemoryKind::Gotcha,
+                subject: "Build cache".to_owned(),
+                body: "Clear target/ when the sqlx offline data goes stale.".to_owned(),
+                source: MemorySource::Person,
+            },
+            SnapshotMemoryEntry {
+                id: MemoryEntryId::from_uuid(Uuid::from_u128(0xe2)),
+                version: 2,
+                kind: MemoryKind::Decision,
+                subject: "Errors & \"context\"".to_owned(),
+                body: "Library crates use thiserror; binaries use anyhow.".to_owned(),
+                source: MemorySource::Person,
+            },
+        ],
+    }
 }
 
 /// Criterion 6: the same spec with every body re-encoded as CRLF.

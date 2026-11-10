@@ -33,6 +33,7 @@ pub mod digest;
 pub mod edit_help;
 pub mod estimate;
 pub mod excerpt;
+pub mod memory;
 pub mod render;
 pub mod settings;
 pub mod template;
@@ -44,12 +45,15 @@ pub mod fixtures;
 pub use defaults::{COMMAND_QUEUE_TEXT, DEFAULT_TEMPLATES, body_of};
 pub use estimate::TokenEstimator;
 pub use excerpt::ExcerptSet;
+pub use memory::{MEMORY_PREAMBLE, MEMORY_TOKEN_CAP, select as select_memory};
 pub use settings::{
     Budget, BudgetSource, DEFAULTS, Defaults, Rungs, SPECS, SettingKey, SettingKind, SettingSpec,
     rung_refusal, validate,
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
-pub use trim::{Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan};
+pub use trim::{
+    MemoryAudit, MemoryShown, Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan,
+};
 
 use std::collections::BTreeMap;
 
@@ -58,6 +62,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
+use crate::model::memory::SnapshotMemory;
 use crate::model::persona::SnapshotPersona;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
@@ -113,6 +118,11 @@ pub struct PromptSpec {
     /// the template body. `None` — every judge, handoff and preview spec and every persona-less
     /// phase — renders exactly as before (I-7).
     pub persona: Option<PersonaBlock>,
+    /// MOD-163 D14/D18: the run's frozen memory, rendered as the internal `memory` section after
+    /// the persona and before the body. `None` for every judge, handoff, preview-without-entries
+    /// and fixture spec, and for a run started before MOD-163; renders exactly as before (I-7).
+    /// Rendered only for a Phase spec (blueprint P-5).
+    pub memory: Option<SnapshotMemory>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
@@ -175,6 +185,11 @@ impl From<&SnapshotPersona> for PersonaBlock {
 /// MOD-26 D13, B-17: the bytes between the persona frame and the template body, counted in the
 /// frame's estimate.
 pub const PERSONA_SEPARATOR: &str = "\n\n";
+
+/// MOD-163 D14 (C8 option a): the blank line between the memory section and what follows it.
+/// Counted in the **memory section's own span**, not the frame, so dropping the section drops it
+/// and `estimated_after` describes only sent bytes.
+pub const MEMORY_SEPARATOR: &str = "\n\n";
 
 /// MOD-11 D19, B-7: the bytes between the template body and the `output` trailer, counted in the
 /// frame's estimate.
@@ -285,6 +300,8 @@ pub enum SectionName {
     /// The persona frame (MOD-26 D13). Always `sections[1]` when present: `template` keeps
     /// `sections[0]`, P-9.
     Persona,
+    /// MOD-163 D14: project memory. `sections[1]` without a persona, `sections[2]` with one (P-9).
+    Memory,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -325,6 +342,7 @@ impl SectionName {
         match self {
             Self::Template => "template".to_owned(),
             Self::Persona => "persona".to_owned(),
+            Self::Memory => "memory".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -538,6 +556,12 @@ pub fn assemble(
     for section in render_sections(Placeholder::Persona, spec, upstream, skills, candidates) {
         rendered.push((Placeholder::Persona, section, 1));
     }
+    // MOD-163 D14: the memory section renders after the persona and outside the body's spans, so
+    // it is scanned with every section below, trimmed by `TrimStep::Memory`, and recorded as
+    // `sections[1]`, or `sections[2]` behind a persona (P-9). Phase specs only (blueprint P-5).
+    for section in render_sections(Placeholder::Memory, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Memory, section, 1));
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -599,7 +623,12 @@ pub fn assemble(
     let mut trimmer = Trimmer::new(inputs, est, spec.budget.target(), template_tokens, rendered);
     trimmer.refusals()?;
     trimmer.run();
-    let (sections, live, kept_excerpts) = trimmer.finish();
+    let trim::Finished {
+        sections,
+        live,
+        kept_excerpts,
+        kept_memory,
+    } = trimmer.finish();
 
     // 7. Substitute in span order: the frame's literals, each slot's sections wrapped — once per
     // form. 8. Canonicalise both and digest the digest text. With no hostname rendered the two
@@ -639,7 +668,16 @@ pub fn assemble(
         Vec::new()
     };
 
-    // 9. Record.
+    // 9. Record. MOD-163 D17: the memory entries that reached the prompt, in render order.
+    let memory = memory_of(spec).map(|memory| MemoryAudit {
+        shown: memory
+            .entries
+            .iter()
+            .take(kept_memory)
+            .map(MemoryShown::of)
+            .collect(),
+        total: memory.total,
+    });
     let record = trim::record(
         spec,
         &spec.template,
@@ -648,6 +686,7 @@ pub fn assemble(
         masked.skill_choices.clone(),
         undigested,
         surviving_audit(spec, &kept_excerpts, scrubber)?,
+        memory,
         notes(spec),
     );
     Ok(AssembledPrompt {
@@ -706,6 +745,12 @@ fn substitute(
         text.push_str(&frame.join("\n\n"));
         text.push_str(PERSONA_SEPARATOR);
     }
+    // MOD-163 D14: the memory section, then its own blank line. `live` carries it only when the
+    // memory section survived the trim, so a memory-less prompt is byte-identical (I-7).
+    if let Some(memory) = blocks.get(&Placeholder::Memory) {
+        text.push_str(&memory.join("\n\n"));
+        text.push_str(MEMORY_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {
@@ -731,6 +776,14 @@ fn substitute(
         text.push_str(&trailer.join("\n\n"));
     }
     text
+}
+
+/// MOD-163 blueprint P-5: the memory a spec renders — its own, for a phase spec, and none for a
+/// judge or handoff, whose trim orders have no memory step.
+fn memory_of(spec: &PromptSpec) -> Option<&SnapshotMemory> {
+    spec.memory
+        .as_ref()
+        .filter(|_| matches!(spec.role, TemplateRole::Phase))
 }
 
 /// Whether `spec` renders the `output` trailer: the tool is on and there is a kind to name.
@@ -839,6 +892,10 @@ fn render_sections(
             .map(|handoff| render::failure_reason(&handoff.failure_reason))
             .collect(),
         Placeholder::Persona => spec.persona.iter().map(render::persona).collect(),
+        Placeholder::Memory => memory_of(spec)
+            .and_then(|memory| render::memory(memory, memory.entries.len()))
+            .into_iter()
+            .collect(),
         Placeholder::Output => {
             if has_output(spec) {
                 spec.output_kind
@@ -976,6 +1033,18 @@ fn scrubbed_inputs(
         let persona_name = SectionName::Persona.render();
         mask(scrubber, &mut persona.name, &persona_name)?;
         mask(scrubber, &mut persona.body, &persona_name)?;
+    }
+
+    // MOD-163 D15: subjects and bodies, under the section that renders them, and only for a phase
+    // spec — a judge or handoff never shows its memory, so it must not be refused over it (P-5).
+    if matches!(spec.role, TemplateRole::Phase)
+        && let Some(memory) = &mut spec.memory
+    {
+        let memory_name = SectionName::Memory.render();
+        for entry in &mut memory.entries {
+            mask(scrubber, &mut entry.subject, &memory_name)?;
+            mask(scrubber, &mut entry.body, &memory_name)?;
+        }
     }
 
     let excerpts_name = SectionName::Excerpts.render();
@@ -1407,6 +1476,7 @@ mod tests {
         assert_eq!(SectionName::JudgeCandidate(2).render(), "judge_candidate:2");
         assert_eq!(SectionName::Box.to_string(), "box");
         assert_eq!(SectionName::Persona.render(), "persona");
+        assert_eq!(SectionName::Memory.render(), "memory");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1433,6 +1503,7 @@ mod tests {
             }
             for name in [
                 SectionName::Item,
+                SectionName::Memory,
                 SectionName::Documents("plan".to_owned()),
                 SectionName::Upstream,
                 SectionName::Excerpts,

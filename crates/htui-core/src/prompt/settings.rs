@@ -50,6 +50,11 @@ pub const DEFAULTS: Defaults = Defaults {
 /// Not a field of [`Defaults`], which is the `app_setting` table: no App rung carries the key.
 pub const BOX_HOSTNAME_DEFAULT: bool = true;
 
+/// MOD-163 D19: `memory_capture`'s compiled default, on. An App **and** Project key, but not a
+/// field of [`Defaults`] (`0002`'s ten rows): it is the first registry App key with no seeded
+/// row, so its resolver falls through to this constant.
+pub const MEMORY_CAPTURE_DEFAULT: bool = true;
+
 /// `project.settings.allow_env_files`'s compiled default: a provider project whose session trees
 /// hold env files is refused (MOD-89 D3, D4). Not a field of [`Defaults`]: no App rung.
 pub const ALLOW_ENV_FILES_DEFAULT: bool = false;
@@ -86,8 +91,9 @@ pub struct Defaults {
 }
 
 impl Defaults {
-    /// The ten rows as `(key, value)` in **key byte order**, which is the order migration `0002`'s
-    /// `INSERT` is compared against and the order a seeder must write them in.
+    /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture`, as `(key, value)` in **key byte
+    /// order**, which is the order migration `0002`'s `INSERT` is compared against and the order a
+    /// seeder must write them in.
     ///
     /// Iterated out of [`SettingKey::app_keys`] rather than spelled a second time (MOD-15 plan D7):
     /// the key list has one home, so a key added to the registry cannot be forgotten here and drift
@@ -116,6 +122,7 @@ impl Defaults {
             SettingKey::ExcerptMaxScanFiles => Value::from(self.excerpt_max_scan_files),
             SettingKey::ExcerptProviderDeadlineMs => Value::from(self.excerpt_provider_deadline_ms),
             SettingKey::MaxSkillTokens => Value::from(self.max_skill_tokens),
+            SettingKey::MemoryCapture => Value::Bool(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => {
                 Value::from(f64::from(self.prompt_reserve_fraction_bp) / 10_000.0)
             }
@@ -145,6 +152,7 @@ impl Defaults {
                 i64::try_from(self.excerpt_provider_deadline_ms).unwrap_or(i64::MAX)
             }
             SettingKey::MaxSkillTokens => self.max_skill_tokens,
+            SettingKey::MemoryCapture => i64::from(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => i64::from(self.prompt_reserve_fraction_bp),
             SettingKey::UpstreamHops => i64::from(self.prompt_upstream_hops),
             SettingKey::TokenBudget => self.token_budget,
@@ -152,8 +160,9 @@ impl Defaults {
     }
 }
 
-/// The twelve keys of the registry — ANA-5 §5.3's ten `app_setting` keys and two project-only
-/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files` — declared in **key byte
+/// The thirteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
+/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, and MOD-163's
+/// `memory_capture`, a switch both the App and the Project rung hold — declared in **key byte
 /// order**: the discriminant indexes [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
@@ -180,17 +189,19 @@ pub enum SettingKey {
     ExcerptProviderDeadlineMs = 7,
     /// `max_skill_tokens`.
     MaxSkillTokens = 8,
+    /// `memory_capture`, MOD-163 D19: automatic memory capture at run end; read by MOD-164.
+    MemoryCapture = 9,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 9,
+    PromptReserveFraction = 10,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 10,
+    UpstreamHops = 11,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 11,
+    TokenBudget = 12,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::AllowEnvFiles,
         Self::BoxHostname,
         Self::ExcerptFileLineCap,
@@ -200,14 +211,16 @@ impl SettingKey {
         Self::ExcerptMaxScanFiles,
         Self::ExcerptProviderDeadlineMs,
         Self::MaxSkillTokens,
+        Self::MemoryCapture,
         Self::PromptReserveFraction,
         Self::UpstreamHops,
         Self::TokenBudget,
     ];
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
-    /// keys migration `0002` seeds, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
-    /// and the `app` group of `Settings > Prompt` iterate this, never `ALL`.
+    /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture`, and no project-only
+    /// key (MOD-33 D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate
+    /// this, never `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
             .into_iter()
@@ -226,7 +239,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the twelve.
+    /// The reverse of [`Self::key`], `None` for a string outside the thirteen.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -300,8 +313,8 @@ impl core::fmt::Display for Rungs {
 }
 
 /// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
-/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the two switches,
-/// `allow_env_files` and `box_hostname`, are booleans.
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the three switches,
+/// `allow_env_files`, `box_hostname` and `memory_capture`, are booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
@@ -350,7 +363,7 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 12] = [
+pub const SPECS: [SettingSpec; 13] = [
     SettingSpec {
         key: "allow_env_files",
         project_key: Some("allow_env_files"),
@@ -449,6 +462,17 @@ pub const SPECS: [SettingSpec; 12] = [
         not_above: None,
         unit: "tokens",
         doc: "Tokens the skill section may take before the step is refused.",
+    },
+    SettingSpec {
+        key: "memory_capture",
+        project_key: Some("memory_capture"),
+        kind: SettingKind::Boolean,
+        min: 0,
+        max: 1,
+        rungs: Rungs::APP.or(Rungs::PROJECT),
+        not_above: None,
+        unit: "on/off",
+        doc: "Automatic memory capture at run end (takes effect with automatic capture, MOD-164).",
     },
     SettingSpec {
         key: "prompt_reserve_fraction",
@@ -792,6 +816,17 @@ pub fn resolve_box_hostname(project: Option<&Value>) -> bool {
         .unwrap_or(BOX_HOSTNAME_DEFAULT)
 }
 
+/// `memory_capture` (MOD-163 D19): the project's boolean, else the `app_setting` row's, else
+/// [`MEMORY_CAPTURE_DEFAULT`]. The house fall-through rule: absent, `null` or a non-boolean is
+/// not a value. Nothing reads it until MOD-164.
+#[must_use]
+pub fn resolve_memory_capture(project: Option<&Value>, app: &BTreeMap<String, Value>) -> bool {
+    project_key(project, "memory_capture")
+        .and_then(Value::as_bool)
+        .or_else(|| app.get("memory_capture").and_then(Value::as_bool))
+        .unwrap_or(MEMORY_CAPTURE_DEFAULT)
+}
+
 /// `project.settings.allow_env_files` (MOD-89 D4): whether a provider project whose session trees
 /// hold env files warns instead of refusing.
 ///
@@ -901,8 +936,19 @@ mod tests {
         assert_eq!(rows.len(), 10, "ANA-5 §5.3 reserves ten keys, got {rows:?}");
         let mut expected = rows.clone();
         expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        // MOD-163 D19: `memory_capture` is an App key 0002 does not seed; its resolver falls
+        // through to the compiled default, so the seeded ten are the rows without it.
+        let rows = DEFAULTS.as_rows();
         assert_eq!(
-            DEFAULTS.as_rows(),
+            rows.len(),
+            11,
+            "0002's ten rows plus MOD-163's unseeded `memory_capture`"
+        );
+        assert!(rows.contains(&("memory_capture", Value::Bool(true))));
+        assert_eq!(
+            rows.into_iter()
+                .filter(|(key, _)| *key != "memory_capture")
+                .collect::<Vec<_>>(),
             expected
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.clone()))
@@ -1073,12 +1119,82 @@ mod tests {
         )));
     }
 
-    /// D276: the App group and `as_rows` are the ten `app_setting` keys, never the project-only one.
+    /// MOD-163 D19: the third switch, and the first one an App row may hold too (the
+    /// `UpstreamHops` rung shape).
     #[test]
-    fn app_keys_are_the_ten_app_setting_keys_in_byte_order() {
+    fn memory_capture_is_an_app_and_project_boolean() {
+        let spec = SettingKey::MemoryCapture.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "memory_capture",
+                project_key: Some("memory_capture"),
+                kind: SettingKind::Boolean,
+                min: 0,
+                max: 1,
+                rungs: Rungs::APP.or(Rungs::PROJECT),
+                not_above: None,
+                unit: "on/off",
+                doc: spec.doc,
+            }
+        );
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert_eq!(SettingKey::MemoryCapture.key(), "memory_capture");
+        assert_eq!(rung_refusal(SettingKey::MemoryCapture, Rungs::APP), None);
+        assert_eq!(
+            rung_refusal(SettingKey::MemoryCapture, Rungs::PROJECT),
+            None
+        );
+        assert!(rung_refusal(SettingKey::MemoryCapture, Rungs::PHASE).is_some());
+        assert_eq!(
+            SettingKey::ALL[9],
+            SettingKey::MemoryCapture,
+            "`memory_capture` sorts between `max_skill_tokens` and `prompt_reserve_fraction`"
+        );
+        for at in [Rungs::APP, Rungs::PROJECT] {
+            assert_eq!(
+                validate(SettingKey::MemoryCapture, at, &json!(true), None),
+                Ok(())
+            );
+            assert!(
+                validate(SettingKey::MemoryCapture, at, &json!(1), None).is_err(),
+                "a number is refused, not coerced, on the {at} rung"
+            );
+        }
+    }
+
+    /// MOD-163 D19: default on; an App boolean answers when the project holds none; a project
+    /// boolean beats the App row; a non-boolean on the project rung falls through.
+    #[test]
+    fn resolve_memory_capture_defaults_on_and_project_beats_app() {
+        let off = app(&[("memory_capture", json!(false))]);
+        assert!(resolve_memory_capture(None, &BTreeMap::new()), "default on");
+        assert!(
+            !resolve_memory_capture(None, &off),
+            "the App row turns it off"
+        );
+        assert!(
+            resolve_memory_capture(Some(&json!({"memory_capture": true})), &off),
+            "the project beats the App row"
+        );
+        assert!(
+            !resolve_memory_capture(Some(&json!({"memory_capture": "no"})), &off),
+            "a non-boolean is not a value, so the App row answers"
+        );
+    }
+
+    /// D276: the App group and `as_rows` are the `app_setting` keys, never a project-only one:
+    /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19).
+    #[test]
+    fn app_keys_are_0002s_ten_plus_memory_capture_in_byte_order() {
         let app: Vec<SettingKey> = SettingKey::app_keys().collect();
-        assert_eq!(app.len(), 10, "migration 0002 seeds ten rows");
-        assert_eq!(SettingKey::app_keys().count(), 10);
+        assert_eq!(
+            app.len(),
+            11,
+            "migration 0002 seeds ten rows, and `memory_capture` is the eleventh"
+        );
+        assert_eq!(SettingKey::app_keys().count(), 11);
+        assert!(app.contains(&SettingKey::MemoryCapture));
         assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
         assert_eq!(
@@ -1197,7 +1313,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "twelve distinct keys, strictly ascending as bytes"
+            "thirteen distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),

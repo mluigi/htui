@@ -6434,6 +6434,8 @@ where
             // (`template.rs:188-215`), so a file read here could only reach the audit.
             // MOD-26 OQ-2: a judge runs under no persona, whatever the judged phase names.
             persona: None,
+            // MOD-163 D18: a judge carries no memory.
+            memory: None,
             excerpts: no_excerpts(caps),
             // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
             // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
@@ -7290,6 +7292,10 @@ where
             // for a phase prompt.
             // MOD-26 D13: the phase's persona frame, from the run's snapshot.
             persona: persona.map(PersonaBlock::from),
+            // MOD-163 D18: the run's memory, frozen at StartRun; every phase step of the run
+            // renders it. Not role-guarded here: `assemble` renders it for a Phase spec only
+            // (blueprint P-5), and the handoff builder clears it.
+            memory: snapshot.memory.clone(),
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
@@ -17575,6 +17581,87 @@ mod tests {
             (text, digest),
             "the fallback is the handoff the same promotion would have opened with"
         );
+    }
+
+    /// MOD-163 D18 (blueprint P-9): the run froze an active memory entry and every phase prompt
+    /// renders it, but the handoff a promotion opens with carries no memory section.
+    #[tokio::test]
+    async fn a_handoff_opening_carries_no_memory_section() {
+        use crate::command::OpeningPath;
+        use crate::graph::GraphSource as _;
+
+        const BODY: &str = "Clear target/ when the sqlx offline data goes stale.";
+        let harness = Harness::new().await;
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        harness
+            .orch
+            .store
+            .create_memory_entry(
+                ids::PROJECT_HTUI,
+                htui_core::model::NewMemoryEntry {
+                    id: htui_core::model::MemoryEntryId::new(),
+                    kind: htui_core::model::MemoryKind::Gotcha,
+                    subject: htui_core::model::MemorySubject::new("Build cache", &scrubber)
+                        .expect("a plain subject"),
+                    body: htui_core::model::MemoryBody::new(BODY, &scrubber).expect("a plain body"),
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the store takes the entry");
+        // A primary repo, so the parked step has a tree to chat in.
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        let (run, prd) = (row.id, prd.id);
+        assert!(snapshot.memory.is_some(), "the run froze the entry");
+        let events = harness
+            .orch
+            .store
+            .step_events(prd)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the step recorded its session");
+        let phase_text = events
+            .iter()
+            .find(|event| event.seq == 0)
+            .and_then(|event| event.payload["text"].as_str())
+            .expect("seq 0 is the prompt")
+            .to_owned();
+        assert!(
+            phase_text.contains("<section name=\"memory\">") && phase_text.contains(BODY),
+            "the phase prompt renders the frozen memory:\n{phase_text}"
+        );
+
+        // The seed `claude` row resumes; with both restore routes off a promotion hands off.
+        let mut agent = harness
+            .orch
+            .graphs()
+            .agent(ids::AGENT_CLAUDE)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo registry has the `claude` row");
+        agent.settings["acp"]["session"] = serde_json::json!({ "load": false, "resume": false });
+        htui_core::fixtures::edit_agent(&harness.orch.store, &agent)
+            .await
+            .expect("the row is rewritten");
+        let CommandOutcome::Promoted { opening, .. } = harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: prd,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step")
+        else {
+            panic!("`PromoteStep` answers `Promoted`");
+        };
+        let OpeningPath::Handoff { text, .. } = opening.path else {
+            panic!("a row whose caps say no resume hands off");
+        };
+        assert!(!text.contains("name=\"memory\""), "{text}");
+        assert!(!text.contains(BODY), "{text}");
     }
 
     /// MOD-37 review M-1: the fallback is best effort. A resumable promotion whose handoff

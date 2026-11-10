@@ -32,13 +32,17 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::model::ids::MemoryEntryId;
 use crate::model::link::UpstreamEntry;
+use crate::model::memory::SnapshotMemoryEntry;
 use crate::model::skill::SkillChoice;
 use crate::prompt::estimate::TokenEstimator;
 use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, Rendered, UpstreamState};
 use crate::prompt::template::{Placeholder, TemplateRole};
-use crate::prompt::{AssembleError, JudgeCandidate, PromptSpec, SectionName, TemplateRef};
+use crate::prompt::{
+    AssembleError, JudgeCandidate, MEMORY_SEPARATOR, PromptSpec, SectionName, TemplateRef,
+};
 use crate::scrub::{Scrubber, Unmasked};
 
 /// §4.4's floor for `item` and `judge_task`: half the body, and never fewer than this many lines.
@@ -53,10 +57,10 @@ const DOCUMENT_FLOOR_PERCENT: usize = 25;
 const VERIFY_FLOOR_LINES: usize = 200;
 /// §4.6c's floor for a handoff `step_summary`.
 const STEP_SUMMARY_FLOOR_LINES: usize = 20;
-/// `trim_record.v`: version 4 since MOD-33 D270 added `undigested`; 3 since MOD-9 D118 added
-/// `matched`, `no_match` and `skill_choices[].path`; 2 since MOD-9 D42 added `skill_choices`;
-/// first, so a reader can branch (§5.1).
-const RECORD_VERSION: u8 = 4;
+/// `trim_record.v`: version 5 since MOD-163 D17 added `memory`; 4 since MOD-33 D270 added
+/// `undigested`; 3 since MOD-9 D118 added `matched`, `no_match` and `skill_choices[].path`; 2 since
+/// MOD-9 D42 added `skill_choices`; first, so a reader can branch (§5.1).
+const RECORD_VERSION: u8 = 5;
 
 /// How a section lost content. Closed vocabulary (§5.1 `:1545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -115,6 +119,37 @@ impl UndigestedSpan {
             Self::BoxHostname => "box.hostname",
         }
     }
+}
+
+/// One memory entry that reached the prompt (MOD-163 D17): what `trim_record.memory.shown[]`
+/// holds, in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MemoryShown {
+    /// `memory_entry.id`.
+    pub id: MemoryEntryId,
+    /// The version the run froze.
+    pub version: i32,
+}
+
+impl MemoryShown {
+    /// The record row of one frozen entry.
+    #[must_use]
+    pub const fn of(entry: &SnapshotMemoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            version: entry.version,
+        }
+    }
+}
+
+/// `trim_record.memory` (MOD-163 D17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryAudit {
+    /// What reached the prompt after trimming, in render order; `[]` when the cap or the trim
+    /// left nothing.
+    pub shown: Vec<MemoryShown>,
+    /// How many active entries the project had at run start.
+    pub total: u32,
 }
 
 /// One row of `trim_record.sections` (§5.1 `:1505-1517`).
@@ -193,7 +228,8 @@ pub struct TemplateRecord {
     pub role: TemplateRole,
 }
 
-/// `run_step.trim_record`, version 4 (ANA-5 §5.1 as amended by MOD-9 D42/D118 and MOD-33 D270).
+/// `run_step.trim_record`, version 5 (ANA-5 §5.1 as amended by MOD-9 D42/D118, MOD-33 D270 and
+/// MOD-163 D17).
 ///
 /// Byte-stable, but **not** by the route §5.1 assumed. §5.1 says "`serde_json::Map` is a `BTreeMap`
 /// in this workspace, so object keys serialise sorted"; that is false in a workspace build
@@ -232,6 +268,11 @@ pub struct TrimRecord {
     /// listed once however often the body places `{{box}}`. In v 4, a `box` entry in `sections`
     /// beside an empty list means the project's switch was off.
     pub undigested: Vec<UndigestedSpan>,
+    /// MOD-163 D17: which memory entries reached the prompt after trimming, and how many the
+    /// project had at run start. Absent when the spec carried none, so a memory-less v 5 record
+    /// differs from v 4 only in `v`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryAudit>,
     /// §4.5's audit, verbatim.
     pub excerpts: ExcerptAudit,
     /// Conditions that are not errors: a clamped `hops`, a skipped repo, a declared stand-in.
@@ -323,12 +364,26 @@ impl TrimRecord {
     }
 }
 
+/// MOD-163 D14: a section's span — its wrapper, plus the memory section's trailing
+/// [`MEMORY_SEPARATOR`] — estimated and multiplied by how often the body places it. The one
+/// arithmetic `Trimmer::new`, `re_estimate` and `section_yardstick` record with (M-3), so the
+/// separator is counted, and dropped, with the memory section and never with the frame.
+fn span_tokens(est: TokenEstimator, rendered: &Rendered, weight: i64) -> i64 {
+    let mut span = render::wrap(rendered);
+    if rendered.name == SectionName::Memory {
+        span.push_str(MEMORY_SEPARATOR);
+    }
+    est.estimate(&span) * weight
+}
+
 /// One entry in a role's trim order. A group (`Documents`, `Candidates`) is one entry because
 /// §4.4 trims its members against one shared floor rather than one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrimStep {
     /// Rank 1: budget-derived rather than budget-trimmed, so it goes first.
     Excerpts,
+    /// Phase rank 1b (MOD-163 D16): whole memory entries from the tail, then the section.
+    Memory,
     /// Rank 2: §4.3's depth ladder.
     Upstream,
     /// Rank 2: full diff, then the stat, then the section.
@@ -354,11 +409,13 @@ pub(crate) enum TrimStep {
 /// The phase order is `R-PRM-3`'s list read backwards, with `verify_failure` placed before the
 /// document group and the group before `item` (blueprint P-3, following §5.1's worked example
 /// rather than §4.4's row text — the two disagree and the example is the one with arithmetic in
-/// it). The two role orders are §4.4's own two-entry orders.
+/// it). MOD-163 D16 puts project memory after the excerpts and before upstream (ANA-5 §4.4 as
+/// amended 2026-10-20). The two role orders are §4.4's own two-entry orders.
 pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
     match role {
         TemplateRole::Phase => &[
             TrimStep::Excerpts,
+            TrimStep::Memory,
             TrimStep::Upstream,
             TrimStep::PreviousDiff,
             TrimStep::VerifyFailure,
@@ -391,6 +448,8 @@ enum Source {
     Excerpts(Vec<usize>),
     /// The previous attempt's verification output, re-rendered when tail-cut.
     VerifyFailure,
+    /// How many of `spec.memory.entries` are still rendered (a prefix; the tail goes first).
+    Memory(usize),
     /// A diff; `true` once it has been degraded to its stat.
     Diff(bool),
     /// `candidates[i]`; `true` once its diff has been degraded to its stat.
@@ -430,6 +489,18 @@ pub(crate) struct Inputs<'a> {
     pub(crate) candidates: &'a [JudgeCandidate],
 }
 
+/// What [`Trimmer::finish`] hands back to `assemble`.
+pub(crate) struct Finished {
+    /// The record's rows, in render order.
+    pub(crate) sections: Vec<Section>,
+    /// The surviving sections, in render order.
+    pub(crate) live: Vec<(Placeholder, Rendered)>,
+    /// The surviving excerpt indices.
+    pub(crate) kept_excerpts: Vec<usize>,
+    /// How many of `spec.memory.entries` reached the prompt: a prefix, `0` when none did.
+    pub(crate) kept_memory: usize,
+}
+
 /// §4.4's numbered steps as one greedy linear pass.
 ///
 /// Linear and not a priority search, deliberately: Priompt is the closest prior art and its own
@@ -457,7 +528,7 @@ impl<'a> Trimmer<'a> {
         let entries = rendered
             .into_iter()
             .map(|(placeholder, rendered, weight)| {
-                let tokens = est.estimate(&render::wrap(&rendered)) * weight;
+                let tokens = span_tokens(est, &rendered, weight);
                 let source = Self::source_of(&inputs, &rendered.name);
                 Entry {
                     record: Section::untouched(rendered.name.clone(), tokens),
@@ -501,6 +572,13 @@ impl<'a> Trimmer<'a> {
                 Source::Excerpts((0..inputs.spec.excerpts.files.len()).collect())
             }
             SectionName::VerifyFailure => Source::VerifyFailure,
+            SectionName::Memory => Source::Memory(
+                inputs
+                    .spec
+                    .memory
+                    .as_ref()
+                    .map_or(0, |memory| memory.entries.len()),
+            ),
             SectionName::PreviousDiff | SectionName::DiffSoFar => Source::Diff(false),
             SectionName::JudgeCandidate(index) => inputs
                 .candidates
@@ -587,6 +665,7 @@ impl<'a> Trimmer<'a> {
             }
             match step {
                 TrimStep::Excerpts => self.trim_excerpts(),
+                TrimStep::Memory => self.trim_memory(),
                 TrimStep::Upstream => self.trim_upstream(),
                 TrimStep::PreviousDiff => self.trim_diff(&SectionName::PreviousDiff),
                 TrimStep::DiffSoFar => self.trim_diff(&SectionName::DiffSoFar),
@@ -614,8 +693,9 @@ impl<'a> Trimmer<'a> {
         }
     }
 
-    /// The record's rows, the surviving sections in render order, and which excerpts survived.
-    pub(crate) fn finish(self) -> (Vec<Section>, Vec<(Placeholder, Rendered)>, Vec<usize>) {
+    /// The record's rows, the surviving sections in render order, which excerpts survived, and how
+    /// many memory entries (a prefix of `spec.memory.entries`) reached the prompt.
+    pub(crate) fn finish(self) -> Finished {
         let kept = self
             .entries
             .iter()
@@ -628,6 +708,15 @@ impl<'a> Trimmer<'a> {
                 (Source::Excerpts(kept), true) => kept.clone(),
                 _ => Vec::new(),
             });
+        // MOD-163 D17: no live memory section (none rendered, or the trim dropped it) is none shown.
+        let kept_memory = self
+            .entries
+            .iter()
+            .find(|entry| entry.record.name == SectionName::Memory)
+            .map_or(0, |entry| match (&entry.source, entry.alive) {
+                (Source::Memory(kept), true) => *kept,
+                _ => 0,
+            });
         let mut sections = Vec::with_capacity(self.entries.len());
         let mut live = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
@@ -636,7 +725,12 @@ impl<'a> Trimmer<'a> {
                 live.push((entry.placeholder, entry.rendered));
             }
         }
-        (sections, live, kept)
+        Finished {
+            sections,
+            live,
+            kept_excerpts: kept,
+            kept_memory,
+        }
     }
 
     /// The index of a section by name, if it was rendered and is still alive.
@@ -649,8 +743,7 @@ impl<'a> Trimmer<'a> {
     /// Re-measures one section after its content changed (§4.4 step 8).
     fn re_estimate(&mut self, index: usize) {
         let entry = &mut self.entries[index];
-        entry.record.tokens_after =
-            self.est.estimate(&render::wrap(&entry.rendered)) * entry.weight;
+        entry.record.tokens_after = span_tokens(self.est, &entry.rendered, entry.weight);
     }
 
     /// §4.4 step 7's drop: the section leaves the prompt and keeps an entry saying so.
@@ -682,7 +775,7 @@ impl<'a> Trimmer<'a> {
                 content: content.to_owned(),
                 ..shape.clone()
             };
-            est.estimate(&render::wrap(&candidate)) * weight
+            span_tokens(est, &candidate, weight)
         }
     }
 
@@ -742,6 +835,48 @@ impl<'a> Trimmer<'a> {
         self.entries[index].record.dropped = Some(
             removed.max(u32::try_from(self.inputs.spec.excerpts.files.len()).unwrap_or(u32::MAX)),
         );
+        self.drop_section(index);
+    }
+
+    /// MOD-163 D16: whole entries off the **tail** (the oldest kept), re-rendering the left-out
+    /// line after each; the last one takes the section and its separator with it.
+    ///
+    /// Renders from `self.inputs.spec.memory`, the **masked** spec, so a re-render cannot bring an
+    /// unmasked byte back (review C-1); every rung is a prefix of the scanned full section plus
+    /// the fixed left-out line (`left_out_line`: fixed text and two counts, no entry bytes). The
+    /// counters go in before the render, as in
+    /// [`Trimmer::trim_upstream`] (L-1).
+    fn trim_memory(&mut self) {
+        let Some(index) = self.live_index(&SectionName::Memory) else {
+            return;
+        };
+        let Some(memory) = self.inputs.spec.memory.as_ref() else {
+            return;
+        };
+        let mut removed = self.entries[index].record.dropped.unwrap_or(0);
+        loop {
+            let Source::Memory(kept) = &mut self.entries[index].source else {
+                return;
+            };
+            if *kept == 0 {
+                break;
+            }
+            *kept -= 1;
+            let kept = *kept;
+            removed += 1;
+            self.entries[index].record.dropped = Some(removed);
+            self.mark(index, TrimStrategy::Dropped);
+            // `render::memory` rebuilds the left-out line: "k of total" with the new k.
+            let Some(rendered) = render::memory(memory, kept) else {
+                break;
+            };
+            self.entries[index].rendered = rendered;
+            self.re_estimate(index);
+            if self.deficit() <= 0 {
+                return;
+            }
+        }
+        // Nothing left: tokens_after 0, strategy dropped, trimmed; the separator goes with it.
         self.drop_section(index);
     }
 
@@ -817,6 +952,7 @@ impl<'a> Trimmer<'a> {
                 .and_then(|handoff| handoff.diff_so_far.as_ref()),
             SectionName::Template
             | SectionName::Persona
+            | SectionName::Memory
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream
@@ -1116,7 +1252,7 @@ fn elided_lines<'a>(lines: &'a [&'a str], kept: usize, tail_only: bool) -> Vec<&
 /// role and every path (P-9).
 #[expect(
     clippy::too_many_arguments,
-    reason = "the record's eight inputs are eight different facts from one assembly; a struct \
+    reason = "the record's nine inputs are nine different facts from one assembly; a struct \
               would be built at its one call site only"
 )]
 pub(crate) fn record(
@@ -1127,6 +1263,7 @@ pub(crate) fn record(
     skill_choices: Vec<SkillChoice>,
     undigested: Vec<UndigestedSpan>,
     excerpts: ExcerptAudit,
+    memory: Option<MemoryAudit>,
     notes: Vec<String>,
 ) -> TrimRecord {
     let mut rows = Vec::with_capacity(sections.len() + 1);
@@ -1149,6 +1286,7 @@ pub(crate) fn record(
         sections: rows,
         skill_choices,
         undigested,
+        memory,
         excerpts,
         notes,
     }
@@ -1180,6 +1318,7 @@ mod tests {
             trim_order(TemplateRole::Phase),
             &[
                 TrimStep::Excerpts,
+                TrimStep::Memory,
                 TrimStep::Upstream,
                 TrimStep::PreviousDiff,
                 TrimStep::VerifyFailure,

@@ -119,6 +119,11 @@ pub enum Placeholder {
     /// writes `{{persona}}` is refused as an unknown placeholder. `assemble` renders it ahead of
     /// the body whenever the spec carries a persona.
     Persona,
+    /// MOD-163 D14: the memory section. **Internal**, like [`Placeholder::Persona`]: not in
+    /// [`Placeholder::ALL`], so [`Placeholder::from_token`] never yields it and a body that writes
+    /// `{{memory}}` is refused as an unknown placeholder. `assemble` renders it after the persona
+    /// and before the body whenever a phase spec carries memory.
+    Memory,
     /// MOD-11 D19: the `output` trailer naming the `document_write` tool. **Internal**, like
     /// [`Placeholder::Persona`]: not in [`Placeholder::ALL`], so [`Placeholder::from_token`] never
     /// yields it and a body that writes `{{output}}` is refused as an unknown placeholder.
@@ -135,8 +140,8 @@ const NONE_REQUIRED: &[Placeholder] = &[];
 
 impl Placeholder {
     /// Every placeholder a template may place, in declaration order: every variant but the
-    /// internal [`Placeholder::Persona`] (MOD-26 D13) and [`Placeholder::Output`] (MOD-11 D19),
-    /// which no body can name.
+    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14) and
+    /// [`Placeholder::Output`] (MOD-11 D19), which no body can name.
     pub const ALL: &'static [Self] = &[
         Self::ItemKey,
         Self::ItemTitle,
@@ -185,6 +190,7 @@ impl Placeholder {
             Self::DiffSoFar => "diff_so_far",
             Self::FailureReason => "failure_reason",
             Self::Persona => "persona",
+            Self::Memory => "memory",
             Self::Output => "output",
         }
     }
@@ -209,6 +215,7 @@ impl Placeholder {
                     | Self::DiffSoFar
                     | Self::FailureReason
                     | Self::Persona
+                    | Self::Memory
                     | Self::Output
             ),
             TemplateRole::Judge => {
@@ -232,7 +239,8 @@ impl Placeholder {
 
     /// Whether this placeholder stands for a wrapped section rather than a scalar substitution.
     /// False for the six scalars of ANA-5 `:362`, true for the other fourteen and for the
-    /// internal [`Placeholder::Persona`] (MOD-26 D13) and [`Placeholder::Output`] (MOD-11 D19).
+    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14) and
+    /// [`Placeholder::Output`] (MOD-11 D19).
     #[must_use]
     pub const fn is_section(self) -> bool {
         !matches!(

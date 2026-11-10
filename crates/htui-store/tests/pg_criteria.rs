@@ -1206,6 +1206,7 @@ fn race_run(item: ItemId) -> NewRun {
             },
             scope: None,
             personas: Vec::new(),
+            memory: None,
             source: None,
             edges: Vec::new(),
         },

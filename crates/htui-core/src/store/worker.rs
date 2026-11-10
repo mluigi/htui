@@ -12,8 +12,9 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 62 methods: 14 [`ReadStore`] reads, 7 [`WriteStore`] reads, 26 writes,
-//! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
+//! `WorkerStore` is 63 methods: 15 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`), 7
+//! [`WriteStore`] reads, 26 writes, `write_document`, MOD-42's three command methods, MOD-11's
+//! four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
 //! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; MOD-144 R1 adds the write
 //! `block_if_idle`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
@@ -32,14 +33,15 @@ use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
-    DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun,
-    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope, PromptTemplate,
-    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
-    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
+    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
+    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo,
+    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
+    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
+    WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -142,7 +144,7 @@ pub trait RelayStore: Send + Sync {
 /// `set_skill_binding`, `update_item`) are deliberately absent: it has no production caller and
 /// keeps its [`WriteStore`] bound.
 pub trait WorkerStore: RecorderStore + RelayStore {
-    // -- 14 ReadStore reads
+    // -- 15 ReadStore reads
     /// [`ReadStore::item`].
     fn item(&self, id: ItemId) -> impl Future<Output = Result<Option<Item>>> + Send;
     /// [`ReadStore::documents`].
@@ -189,6 +191,14 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<Vec<ResolvedInput>>> + Send;
     /// [`ReadStore::notes`]: MOD-89 D6's dedupe reads the item's notes before it writes one.
     fn notes(&self, id: ItemId) -> impl Future<Output = Result<Vec<Note>>> + Send;
+    /// [`ReadStore::memory_entries`]: MOD-163 D12's run-start freeze reads the project's
+    /// `Active` entries once, in `graph::resolve` (on a resolved graph only, so a refused
+    /// resolution and a v1 resume read none).
+    fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> impl Future<Output = Result<Option<Vec<MemoryEntry>>>> + Send;
 
     // -- 7 WriteStore reads
     /// [`WriteStore::repos`].
@@ -750,6 +760,13 @@ impl WorkerStore for MemStore {
     }
     async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
         ReadStore::notes(self, id).await
+    }
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        ReadStore::memory_entries(self, project, states).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await

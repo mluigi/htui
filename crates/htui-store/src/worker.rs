@@ -14,14 +14,14 @@ use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
-    GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun, NewDocument, NewNote, NewRun,
-    NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
-    PhaseId, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry,
-    QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
-    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
-    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry, MemoryState, NewCommandRun,
+    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope, PromptTemplate,
+    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
+    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -165,6 +165,13 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
         ReadStore::notes(self, id).await
+    }
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        ReadStore::memory_entries(self, project, states).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
@@ -558,6 +565,13 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
         ReadStore::notes(self, id).await
+    }
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        ReadStore::memory_entries(self, project, states).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
