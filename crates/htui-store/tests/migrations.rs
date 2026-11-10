@@ -6678,14 +6678,14 @@ async fn the_0028_step_role_checks_refuse_what_they_name() {
             "a stage keyed nope",
         ),
         (
-            -2,
+            -1,
             "stage",
             None,
             None,
             "chk_run_step_stage",
-            "a stage with no key",
+            "a stage at -1 with no key",
         ),
-        (-2, "step", None, None, "chk_run_step_stage", "a step at -2"),
+        (-1, "step", None, None, "chk_run_step_stage", "a step at -1"),
         (
             72,
             "part",
