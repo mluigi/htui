@@ -109,7 +109,7 @@ link always starts at the run's item. `to` is a key: a bare `FEAT-12` is looked 
 session's project, `api:FEAT-12` in project `api`, and `@shop:WS-1` names an item of workspace
 `shop` itself. The link may reach the session's project, each workspace that holds it, and those
 workspaces' member projects (a step on a workspace's own item reaches that workspace and its
-members). A key no project has, or an item outside that reach, answers
+members). A key no project has, or an `add` to an item outside that reach, answers
 `out of scope: <to> is not an item of this project or its workspaces`, with `to` as given. The
 answer's `to` is canonical: bare for an item of the session's project (`htui:FEAT-1` from an
 `htui` session answers `FEAT-1`), `slug:KEY` for any other.
@@ -117,8 +117,11 @@ answer's `to` is canonical: bare for an item of the session's project (`htui:FEA
 can withdraw only a link one of its own steps proposed; a live link another run (or a person)
 proposed answers `not yours: <from> <kind> <to> was not proposed by this run`. A `remove` of a
 link that is not live (it never existed, or it is already withdrawn) answers
-`not found: item_link <from-id>-<kind>-><to-id>`, with the two items' ids. `live` says whether
-the link is in force after the call.
+`not found: item_link <from-id>-<kind>-><to-id>`, with the two items' ids, when `to` is an item of
+the session's project. To an item of any other project it answers `not yours` instead, inside the
+reach or outside it: `remove` checks no reach (it can only withdraw this run's own proposals), and
+the store's sentence would print the id of an item outside it. `live` says whether the link is in
+force after the call.
 
 **`search_concepts`** searches the concepts index (see the README's
 [Search](../README.md#search)) within the session's project only. `types` keeps `item`,
