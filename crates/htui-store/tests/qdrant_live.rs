@@ -18,7 +18,8 @@ use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
     DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY, PointType,
-    Probe, QdrantStore, SPARSE, SearchQuery, VectorStore as _, is_embedder_mismatch, probe_with,
+    Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _, is_embedder_mismatch,
+    probe_with,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -1139,4 +1140,105 @@ async fn probe_of_another_embedders_collection_is_mismatch() {
         sentence.contains(&format!("collection `{name}`")),
         "{sentence}"
     );
+}
+
+// MOD-162 T1: the search arms the retrieval benchmark measures.
+
+/// The first htui item of the demo store, synced into `store`.
+async fn synced_item(store: &QdrantStore<HashEmbedder>) -> String {
+    let read = MemStore::demo();
+    Indexer::sync(&read, &scope(), store).await.expect("sync");
+    read.items(
+        &Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        },
+        &ItemFilter::default(),
+    )
+    .await
+    .expect("items")
+    .remove(0)
+    .key
+}
+
+#[tokio::test]
+async fn each_search_arm_finds_an_exact_key() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    let q = query(&key);
+    for arms in [SearchArms::Sparse, SearchArms::Hybrid] {
+        let hits = store.search_arms(&q, arms).await.expect("search");
+        assert!(
+            hits.iter().any(|h| h.key == key),
+            "{arms:?}: {key} not among {hits:?}"
+        );
+    }
+    let dense = store
+        .search_arms(&q, SearchArms::Dense)
+        .await
+        .expect("dense search");
+    assert!(dense.len() <= usize::try_from(q.limit).expect("a small limit"));
+    assert!(dense.iter().all(|h| !h.snippet.is_empty()), "{dense:?}");
+    store.drop_collection().await.expect("drop");
+}
+
+#[tokio::test]
+async fn the_hybrid_arms_are_the_vector_store_search() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    for text in [key.as_str(), "the plan", "?!"] {
+        let q = query(text);
+        let arms = store
+            .search_arms(&q, SearchArms::Hybrid)
+            .await
+            .expect("search_arms");
+        let search = store.search(&q).await.expect("search");
+        assert_eq!(arms, search, "{text}");
+    }
+    store.drop_collection().await.expect("drop");
+}
+
+#[tokio::test]
+async fn a_sparse_search_without_terms_finds_nothing() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    synced_item(&store).await;
+    let q = query("?!");
+    assert_eq!(
+        store
+            .search_arms(&q, SearchArms::Sparse)
+            .await
+            .expect("sparse search"),
+        Vec::new()
+    );
+    store
+        .search_arms(&q, SearchArms::Dense)
+        .await
+        .expect("dense search");
+    store.drop_collection().await.expect("drop");
+}
+
+#[tokio::test]
+async fn every_arm_is_scoped() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    let unscoped = SearchQuery {
+        projects: vec![],
+        ..query(&key)
+    };
+    for arms in [SearchArms::Hybrid, SearchArms::Dense, SearchArms::Sparse] {
+        assert_eq!(
+            store.search_arms(&unscoped, arms).await.expect("search"),
+            Vec::new(),
+            "{arms:?}"
+        );
+    }
+    store.drop_collection().await.expect("drop");
 }

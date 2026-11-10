@@ -2151,4 +2151,193 @@ mod tests {
             id
         );
     }
+
+    // MOD-162 T1: the request each search arm sends.
+
+    /// The request `VectorStore::search` built before MOD-162, copied verbatim from it and ending
+    /// in `.build()`: the pin that `SearchArms::Hybrid` still sends exactly this.
+    fn pre_mod_162_request(
+        collection: &str,
+        query: &SearchQuery,
+        dense: Vec<f32>,
+        sparse: Vec<(u32, f32)>,
+    ) -> QueryPoints {
+        let filter = search_filter(query);
+        // Each arm fetches more than the final limit so the fusion has overlap to work with.
+        let depth = query.limit.saturating_mul(4).max(20);
+        let mut request = QueryPointsBuilder::new(collection)
+            .add_prefetch(
+                PrefetchQueryBuilder::default()
+                    .query(Query::new_nearest(dense))
+                    .using(DENSE)
+                    .filter(filter.clone())
+                    .limit(depth),
+            )
+            .query(Query::new_fusion(Fusion::Rrf))
+            .filter(filter.clone())
+            .limit(query.limit)
+            .with_payload(true);
+        if !sparse.is_empty() {
+            request = request.add_prefetch(
+                PrefetchQueryBuilder::default()
+                    .query(Query::from(sparse))
+                    .using(SPARSE)
+                    .filter(filter)
+                    .limit(depth),
+            );
+        }
+        request.build()
+    }
+
+    fn dense_vector() -> Vec<f32> {
+        vec![0.25, -0.5, 0.75]
+    }
+
+    fn sparse_terms() -> Vec<(u32, f32)> {
+        vec![(7, 1.0), (42, 0.5)]
+    }
+
+    fn filtered() -> SearchQuery {
+        SearchQuery {
+            types: vec![PointType::Item, PointType::Document],
+            statuses: vec![Status::Closed],
+            resolutions: vec![Resolution::Rejected, Resolution::Done],
+            ..scoped("MOD-34 filtered")
+        }
+    }
+
+    #[test]
+    fn hybrid_request_is_the_request_search_sent_before_mod_162() {
+        let limit_3 = SearchQuery {
+            limit: 3,
+            ..scoped("?!")
+        };
+        let cases = [
+            (scoped("MOD-34 the plan"), sparse_terms()),
+            (limit_3, Vec::new()),
+            (filtered(), sparse_terms()),
+        ];
+        for (query, sparse) in cases {
+            assert_eq!(
+                search_request(
+                    "c",
+                    &query,
+                    Some(dense_vector()),
+                    sparse.clone(),
+                    SearchArms::Hybrid
+                ),
+                Some(pre_mod_162_request("c", &query, dense_vector(), sparse)),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_request_prefetches_four_times_the_limit_and_at_least_twenty() {
+        for (limit, depth) in [(10, 40), (3, 20)] {
+            let query = SearchQuery {
+                limit,
+                ..scoped("MOD-34")
+            };
+            let request = search_request(
+                "c",
+                &query,
+                Some(dense_vector()),
+                sparse_terms(),
+                SearchArms::Hybrid,
+            )
+            .expect("a request");
+            assert_eq!(request.prefetch.len(), 2);
+            assert!(request.prefetch.iter().all(|p| p.limit == Some(depth)));
+            assert_eq!(request.limit, Some(limit));
+        }
+    }
+
+    #[test]
+    fn hybrid_request_omits_the_sparse_arm_without_terms() {
+        let request = search_request(
+            "c",
+            &scoped("?!"),
+            Some(dense_vector()),
+            Vec::new(),
+            SearchArms::Hybrid,
+        )
+        .expect("a request");
+        assert_eq!(request.prefetch.len(), 1);
+        assert_eq!(request.prefetch[0].using.as_deref(), Some(DENSE));
+    }
+
+    #[test]
+    fn dense_request_queries_the_dense_vector_alone() {
+        let query = filtered();
+        let request = search_request(
+            "c",
+            &query,
+            Some(dense_vector()),
+            sparse_terms(),
+            SearchArms::Dense,
+        )
+        .expect("a request");
+        assert!(request.prefetch.is_empty());
+        assert_eq!(request.collection_name, "c");
+        assert_eq!(request.query, Some(Query::new_nearest(dense_vector())));
+        assert_eq!(request.using.as_deref(), Some("dense"));
+        assert_eq!(request.limit, Some(query.limit));
+        assert_eq!(request.filter, Some(search_filter(&query)));
+        assert!(request.with_payload.is_some());
+    }
+
+    #[test]
+    fn sparse_request_queries_the_sparse_vector_alone() {
+        let query = filtered();
+        let request = search_request("c", &query, None, sparse_terms(), SearchArms::Sparse)
+            .expect("a request");
+        assert!(request.prefetch.is_empty());
+        assert_eq!(request.collection_name, "c");
+        assert_eq!(request.query, Some(Query::from(sparse_terms())));
+        assert_eq!(request.using.as_deref(), Some("sparse"));
+        assert_eq!(request.limit, Some(query.limit));
+        assert_eq!(request.filter, Some(search_filter(&query)));
+        assert!(request.with_payload.is_some());
+        // The sparse arm ignores a dense vector, should a caller pass one.
+        assert_eq!(
+            search_request(
+                "c",
+                &query,
+                Some(dense_vector()),
+                sparse_terms(),
+                SearchArms::Sparse
+            ),
+            Some(request)
+        );
+    }
+
+    #[test]
+    fn sparse_request_without_terms_is_none() {
+        assert_eq!(
+            search_request("c", &scoped("?!"), None, Vec::new(), SearchArms::Sparse),
+            None
+        );
+        assert_eq!(
+            search_request(
+                "c",
+                &scoped("?!"),
+                Some(dense_vector()),
+                Vec::new(),
+                SearchArms::Sparse
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn dense_arms_without_a_vector_are_none() {
+        for arms in [SearchArms::Hybrid, SearchArms::Dense] {
+            assert_eq!(
+                search_request("c", &scoped("MOD-34"), None, sparse_terms(), arms),
+                None,
+                "{arms:?}"
+            );
+        }
+    }
 }
