@@ -11,9 +11,9 @@ use htui_core::model::{
     AgentSummary, EdgeId, EdgeKind, GraphBody, NodeBody, PhaseId, Split, StepGraphEdge, StepGraphId,
 };
 use rataflow::{
-    ControlsAction, Direction, Edge, EdgeContent, EdgePathContext, EdgeRenderContext, EdgeStyle,
-    Flow, FlowEvent, Handle, HandlePosition, Node, NodeContent, NodeRenderContext, Path, Position,
-    StepEdge, Viewport,
+    ControlsAction, Direction, Edge, EdgeContent, EdgePathContext, EdgePreviewStyle,
+    EdgeRenderContext, EdgeStyle, Flow, FlowEvent, Handle, HandlePosition, Node, NodeContent,
+    NodeRenderContext, Path, Position, StepEdge, Viewport,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -271,7 +271,9 @@ fn predicate_words(value: &Value) -> String {
 /// D7: the margin `ensure_node_visible` keeps (`rataflow` `state/viewport.rs:299`), reused as the
 /// reset viewport's left floor and top offset (execution_graph E5).
 const MARGIN: f64 = 1.0;
-/// D11: a drop anywhere on a node snaps to its `top` handle (the spike's radius).
+/// D11: a drop off every node snaps to the nearest `top` handle this close (the spike's radius).
+/// A drop on a node lands on that node instead ([`Canvas::landing`]): rataflow takes the nearest
+/// handle, and on a node's bottom border row the next layer's `top` is nearer than its own.
 const CONNECTION_RADIUS: f64 = NODE_W / 2.0 + 2.0;
 
 /// D7: one step's node. The flow draws no border (`rataflow` `content.rs:79`), so this does, as a
@@ -576,13 +578,17 @@ impl Default for Canvas {
 
 impl Canvas {
     /// An empty canvas. An edge is never reconnected, a press on empty canvas keeps the selection,
-    /// and a drop anywhere on a node snaps to its `top` handle (D11).
+    /// and a drop anywhere on a node lands on it (D11). rataflow calls a connection between two
+    /// handles an edge already joins invalid, but the store keys a link by its kind too and the
+    /// edge form judges it ([`Canvas::landing`]), so the preview never draws as refused.
     pub(crate) fn new() -> Self {
+        let flow = Flow::new()
+            .with_edges_reconnectable(false)
+            .with_deselect_on_pane_click(false)
+            .with_connection_radius(CONNECTION_RADIUS);
+        let ready = flow.theme.palette().success;
         Self {
-            flow: Flow::new()
-                .with_edges_reconnectable(false)
-                .with_deselect_on_pane_click(false)
-                .with_connection_radius(CONNECTION_RADIUS),
+            flow: flow.preview_style(EdgePreviewStyle::default().with_invalid_color(ready)),
             graph: None,
             selected: None,
             width: 0.0,
@@ -717,6 +723,67 @@ impl Canvas {
         }
     }
 
+    /// The node drawn under terminal cell `at`, if any (rataflow maps a cell through its centre,
+    /// `render_context.rs:74`). Nodes never overlap.
+    fn node_under(&self, (column, row): (u16, u16)) -> Option<String> {
+        let area = self.flow.canvas_area();
+        if !area.contains(ratatui::layout::Position::new(column, row)) {
+            return None;
+        }
+        let world = self.flow.viewport.canvas_to_world(Position::new(
+            f64::from(column - area.x) + 0.5,
+            f64::from(row - area.y) + 0.5,
+        ));
+        self.flow
+            .nodes()
+            .find(|node| !node.hidden && node.bounds().contains_point(&world))
+            .map(|node| node.id.clone())
+    }
+
+    /// D11: while a connection is being drawn over a flow node other than its source, the
+    /// preview points at that node's `top` handle, where [`Canvas::landing`] lands it.
+    fn aim(&mut self, at: (u16, u16)) {
+        let Some(from) = self
+            .flow
+            .edge_preview()
+            .map(|preview| preview.from_node_id.clone())
+        else {
+            return;
+        };
+        if let Some(to) = self.node_under(at).filter(|to| *to != from) {
+            // `false` for a palette node, which takes no connection: the preview stays as is.
+            let _ = self.flow.preview_to_handle(&to, Some("top"));
+        }
+    }
+
+    /// D11: where the connection being drawn lands when it is released at `at`, `None` with no
+    /// connection drawn. The canvas decides, not rataflow: a release on a node lands on that node
+    /// (on its own source, or a palette node, it lands nowhere), and only a release off every node
+    /// takes rataflow's snap to the nearest `top` handle. rataflow's duplicate check (an edge on
+    /// the same two handles) is not applied: every forward edge runs `bottom` to `top`, while the
+    /// store keys a link by its kind too, so a second link of another kind is the form's to judge.
+    fn landing(&self, at: (u16, u16)) -> Option<Option<CanvasEvent>> {
+        if !self.flow.is_dragging() {
+            return None;
+        }
+        let preview = self.flow.edge_preview()?;
+        let to = match self.node_under(at) {
+            Some(to) => self
+                .flow
+                .node(&to)
+                .filter(|node| node.connectable && node.id != preview.from_node_id)
+                .map(|node| node.id.clone()),
+            None => preview.to_node_id.clone(),
+        };
+        let connect = to.and_then(|to| {
+            Some(CanvasEvent::Connect {
+                from: preview.from_node_id.parse().ok()?,
+                to: to.parse().ok()?,
+            })
+        });
+        Some(connect)
+    }
+
     /// Puts the flow's selection back on the editor's (the flow keeps none of its own).
     fn reselect(&mut self) {
         match self.selected {
@@ -783,9 +850,17 @@ impl Canvas {
         ) {
             return None;
         }
+        let at = (mouse.column, mouse.row);
+        let landing = match mouse.kind {
+            MouseEventKind::Up(MouseButton::Left) => self.landing(at),
+            _ => None,
+        };
+        if landing.is_some() {
+            // rataflow then answers the release with `ConnectionCancelled`: the landing stands.
+            self.flow.clear_edge_preview();
+        }
         let response = self.flow.handle_mouse_event(mouse);
         // MOD-74 D6, B-1: every left press assigns the pan; only an empty-canvas start is one.
-        let at = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let pans = response
@@ -798,13 +873,17 @@ impl Canvas {
                 if let Some(pan) = self.pan.as_mut() {
                     *pan = at;
                 }
+                self.aim(at);
             }
             MouseEventKind::Up(MouseButton::Left) => self.pan = None,
             _ => {}
         }
         self.drop_targets();
         self.reselect();
-        response.into_events().find_map(canvas_event)
+        match landing {
+            Some(connect) => connect,
+            None => response.into_events().find_map(canvas_event),
+        }
     }
 
     /// Ends a live gesture without a click, a connection or a menu (MOD-74 D4): a **locked**
@@ -1553,6 +1632,104 @@ mod tests {
         assert_eq!(flow_selected(&canvas), Some(id_of(&body, "implement")));
         // The edge is the editor's to add: the flow did not grow one.
         assert_eq!(canvas.flow.edges().len(), body.edges.len());
+    }
+
+    /// A press on `from`'s `bottom` handle, a drag through the gap below it, then a drag and a
+    /// release on `drop`: the release's answer.
+    fn drag_connection(
+        canvas: &mut Canvas,
+        from: (u16, u16),
+        drop: (u16, u16),
+    ) -> Option<CanvasEvent> {
+        let handle = (from.0 + 12, from.1 + 4);
+        for (kind, at) in [
+            (MouseEventKind::Down(MouseButton::Left), handle),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                (handle.0, handle.1 + 2),
+            ),
+            (MouseEventKind::Drag(MouseButton::Left), drop),
+        ] {
+            assert_eq!(canvas.on_mouse(mouse(kind, at)), None, "{kind:?} at {at:?}");
+        }
+        canvas.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), drop))
+    }
+
+    #[test]
+    fn a_drop_anywhere_on_a_node_lands_on_that_node() {
+        // side sits beside bbb, and ccc one layer below bbb: on bbb's bottom border row ccc's
+        // `top` handle is nearer than bbb's own, and rataflow alone snaps to the nearest.
+        let mut body = body(&["aaa", "side", "bbb", "ccc"]);
+        body.edges = vec![
+            edge(&body, "aaa", "side", EdgeKind::Next),
+            edge(&body, "aaa", "bbb", EdgeKind::Next),
+            edge(&body, "bbb", "ccc", EdgeKind::Next),
+        ];
+        let expected = Some(CanvasEvent::Connect {
+            from: id_of(&body, "side"),
+            to: id_of(&body, "bbb"),
+        });
+        let mut canvas = synced(&body, None);
+        let buf = draw_at(&mut canvas, 80, 30);
+        let side = corner_of(&buf, "side");
+        let (x, y) = corner_of(&buf, "bbb");
+        for row in y..=y + 4 {
+            for column in [x, x + 3, x + 12, x + 20, x + 23] {
+                assert_eq!(
+                    drag_connection(&mut canvas, side, (column, row)),
+                    expected,
+                    "a drop on bbb at {:?}",
+                    (column, row)
+                );
+                let preview_gone = canvas.flow.edge_preview().is_none();
+                assert!(preview_gone && !canvas.flow.is_dragging());
+            }
+        }
+        // While the drag hovers bbb the preview points at bbb.
+        let handle = (side.0 + 12, side.1 + 4);
+        let _ = canvas.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), handle));
+        let _ = canvas.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            (x + 12, y + 4),
+        ));
+        let aimed = canvas
+            .flow
+            .edge_preview()
+            .and_then(|preview| preview.to_node_id.clone());
+        assert_eq!(aimed, Some(id_of(&body, "bbb").to_string()));
+        canvas.end_gesture();
+        // A drop back on its own node connects nothing.
+        assert_eq!(
+            drag_connection(&mut canvas, side, (side.0 + 3, side.1 + 4)),
+            None
+        );
+        assert_eq!(canvas.flow.edges().len(), body.edges.len());
+    }
+
+    #[test]
+    fn a_drag_onto_a_node_already_linked_still_connects() {
+        // implement -next-> review and implement -if-> fix already exist; another link of a
+        // different kind between the same steps is the edge form's to judge, not rataflow's.
+        let body = reference();
+        let implement = id_of(&body, "implement");
+        let mut canvas = synced(&body, Some(implement));
+        let buf = draw(&mut canvas);
+        let from = corner_of(&buf, "implement");
+        for name in ["review", "fix"] {
+            let (x, y) = corner_of(&buf, name);
+            for drop in [(x + 12, y + 2), (x + 3, y + 1), (x + 20, y + 3)] {
+                assert_eq!(
+                    drag_connection(&mut canvas, from, drop),
+                    Some(CanvasEvent::Connect {
+                        from: implement,
+                        to: id_of(&body, name),
+                    }),
+                    "a drop on {name} at {drop:?}"
+                );
+            }
+        }
+        assert_eq!(canvas.flow.edges().len(), body.edges.len());
+        assert_eq!(flow_selected(&canvas), Some(implement));
     }
 
     #[test]
