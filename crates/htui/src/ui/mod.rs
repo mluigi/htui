@@ -5,6 +5,7 @@ pub mod about;
 pub(crate) mod cells;
 pub mod diff;
 pub mod editor_pane;
+pub mod graph_editor;
 pub mod header;
 pub mod kit;
 pub mod layout;
