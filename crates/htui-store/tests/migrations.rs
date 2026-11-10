@@ -6584,6 +6584,386 @@ async fn migration_0026_deleting_a_workspace_cascades_its_scope_row() {
     db.drop_db().await;
 }
 
+/// Inserts a `run_step` on `run` at `position` (phase `implement`) with MOD-139's three columns
+/// (`0028_divided_fanout.sql`), straight through SQL so only the migration's rules decide.
+async fn insert_role_step(
+    pool: &sqlx::PgPool,
+    run: uuid::Uuid,
+    position: i32,
+    role: &str,
+    parent: Option<uuid::Uuid>,
+    key: Option<&str>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO run_step (id, run_id, position, phase_name, role, parent_step_id, node_key) \
+         VALUES (gen_random_uuid(), $1, $2, 'implement', $3, $4, $5) RETURNING id",
+    )
+    .bind(run)
+    .bind(position)
+    .bind(role)
+    .bind(parent)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+}
+
+/// MOD-139 plan D1 (blueprint §T1.2 rows 3, 5-8, P-2): `0028_divided_fanout.sql`'s three
+/// `run_step` CHECKs and the parent foreign key. A planner, a part under it with a key, and the
+/// stage rows at -1 and -3 are admitted. A stage outside -3..-1, a stage with an unknown or a NULL
+/// key, a `step` at a negative position, a part missing its parent or its key, an unknown role
+/// and an unknown parent are each refused by the one rule that names them.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn the_0028_step_role_checks_refuse_what_they_name() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let run = ids::RUN_1.as_uuid();
+
+    let planner = insert_role_step(pool, run, 70, "planner", None, None)
+        .await
+        .expect("a planner is admitted");
+    insert_role_step(pool, run, 71, "part", Some(planner), Some("implement/api"))
+        .await
+        .expect("a part with its parent and key is admitted");
+    insert_role_step(pool, run, -1, "stage", None, Some("collect"))
+        .await
+        .expect("the collect stage at -1 is admitted");
+    insert_role_step(pool, run, -3, "stage", None, Some("pick"))
+        .await
+        .expect("the pick stage at -3 is admitted");
+    let stored: (String, Option<uuid::Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT role, parent_step_id, node_key FROM run_step WHERE run_id = $1 AND position = 71",
+    )
+    .bind(run)
+    .fetch_one(pool)
+    .await
+    .expect("read the part back");
+    assert_eq!(
+        stored,
+        (
+            "part".to_owned(),
+            Some(planner),
+            Some("implement/api".to_owned())
+        ),
+        "the part reads back as written"
+    );
+
+    for (position, role, parent, key, constraint, what) in [
+        (
+            -4,
+            "stage",
+            None,
+            Some("pick"),
+            "chk_run_step_stage",
+            "a stage at -4",
+        ),
+        (
+            0,
+            "stage",
+            None,
+            Some("pick"),
+            "chk_run_step_stage",
+            "a stage at 0",
+        ),
+        (
+            -2,
+            "stage",
+            None,
+            Some("nope"),
+            "chk_run_step_stage",
+            "a stage keyed nope",
+        ),
+        (
+            -2,
+            "stage",
+            None,
+            None,
+            "chk_run_step_stage",
+            "a stage with no key",
+        ),
+        (-2, "step", None, None, "chk_run_step_stage", "a step at -2"),
+        (
+            72,
+            "part",
+            None,
+            Some("implement/x"),
+            "chk_run_step_part",
+            "a part with no parent",
+        ),
+        (
+            73,
+            "part",
+            Some(planner),
+            None,
+            "chk_run_step_part",
+            "a part with no key",
+        ),
+        (
+            74,
+            "swarm",
+            None,
+            None,
+            "chk_run_step_role",
+            "the role swarm",
+        ),
+    ] {
+        assert_refused(
+            insert_role_step(pool, run, position, role, parent, key).await,
+            "23514",
+            constraint,
+            what,
+        );
+    }
+    assert_refused(
+        insert_role_step(
+            pool,
+            run,
+            75,
+            "part",
+            Some(uuid::Uuid::now_v7()),
+            Some("implement/y"),
+        )
+        .await,
+        "23503",
+        "fk_run_step_parent_step",
+        "a part under an unknown parent",
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-139 plan D1 (blueprint §T1.2 rows 9-11, 13-14): `run_plan`'s rules. A plan inserted with
+/// no status reads `proposed` with NULL `base_refs`; a repeated revision, a negative revision or
+/// base position, an unknown scope or status and an admission without refs are each refused by
+/// their own name. Admitting moves `updated_at` (`trg_run_plan_updated_at`), deleting the planner
+/// step takes its plans and its part rows, and the three new indexes exist.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn the_0028_run_plan_checks_refuse_what_they_name() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let run = ids::RUN_1.as_uuid();
+    let planner = insert_role_step(pool, run, 80, "planner", None, None)
+        .await
+        .expect("a planner step");
+    let part = insert_role_step(pool, run, 82, "part", Some(planner), Some("implement/api"))
+        .await
+        .expect("a part under the planner");
+    let plan = |revision: i32, scope: &'static str, base_position: i32| {
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, base_position, \
+                                   body, digest) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, '{}'::jsonb, 'sha256:x') RETURNING id",
+        )
+        .bind(run)
+        .bind(revision)
+        .bind(planner)
+        .bind(scope)
+        .bind(base_position)
+        .fetch_one(pool)
+    };
+
+    let id = plan(0, "parts", 81).await.expect("a plan is admitted");
+    let (status, refs, created, updated): (
+        String,
+        Option<serde_json::Value>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT status, base_refs, created_at, updated_at FROM run_plan WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the plan back");
+    assert_eq!(
+        (status.as_str(), refs),
+        ("proposed", None),
+        "an inserted plan is proposed with no refs"
+    );
+
+    assert_refused(
+        plan(0, "graph", 81).await,
+        "23505",
+        "uq_run_plan_revision",
+        "a repeated revision",
+    );
+    assert_refused(
+        plan(-1, "parts", 81).await,
+        "23514",
+        "chk_run_plan_revision",
+        "revision -1",
+    );
+    assert_refused(
+        plan(1, "parts", -1).await,
+        "23514",
+        "chk_run_plan_base_position",
+        "base position -1",
+    );
+    assert_refused(
+        plan(1, "nodes", 81).await,
+        "23514",
+        "chk_run_plan_scope",
+        "the scope nodes",
+    );
+    assert_refused(
+        sqlx::query("UPDATE run_plan SET status = 'done' WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_run_plan_status",
+        "the status done",
+    );
+    assert_refused(
+        sqlx::query("UPDATE run_plan SET status = 'admitted' WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_run_plan_admitted_base_refs",
+        "an admission without refs",
+    );
+
+    sqlx::query("UPDATE run_plan SET status = 'admitted', base_refs = $2 WHERE id = $1")
+        .bind(id)
+        .bind(json!({"r": "abc"}))
+        .execute(pool)
+        .await
+        .expect("an admission with refs lands");
+    let moved: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM run_plan WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read updated_at");
+    assert_eq!(created, updated, "inserted with created_at == updated_at");
+    assert!(
+        moved > updated,
+        "the status move moves updated_at through the trigger"
+    );
+
+    sqlx::query("DELETE FROM run_step WHERE id = $1")
+        .bind(planner)
+        .execute(pool)
+        .await
+        .expect("delete the planner step");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM run_plan WHERE run_id = $1")
+        .bind(run)
+        .fetch_one(pool)
+        .await
+        .expect("count the run's plans");
+    assert_eq!(left, 0, "deleting the planner step takes its plans");
+    let parts: i64 = sqlx::query_scalar("SELECT count(*) FROM run_step WHERE id = $1")
+        .bind(part)
+        .fetch_one(pool)
+        .await
+        .expect("count the part");
+    assert_eq!(parts, 0, "deleting the planner step takes its part rows");
+
+    let indexes: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname IN ('idx_run_step_parent_step', 'idx_run_plan_updated_at', \
+                           'idx_run_plan_planner_step')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read pg_indexes")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        indexes,
+        BTreeSet::from(
+            [
+                "idx_run_plan_planner_step",
+                "idx_run_plan_updated_at",
+                "idx_run_step_parent_step"
+            ]
+            .map(str::to_owned)
+        ),
+        "0028 creates its three indexes"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-139 plan D1: 0028 backfills nothing. A `run_step` written before it reads `role = 'step'`
+/// with no parent and no key, and `role` is `NOT NULL DEFAULT 'step'`. Staged at v27, as on a real
+/// box.
+#[tokio::test]
+async fn migration_0028_defaults_existing_steps_to_step() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(27, &db.pool)
+        .await
+        .expect("apply 0001 through 0027");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod139").await;
+    let project = insert_project(pool, user, "divided").await;
+    let box_id = insert_box(pool, user).await;
+    let run = insert_run(pool, project, "chat", "done", box_id, user).await;
+    let mut steps = Vec::new();
+    for position in [0, 1] {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO run_step (run_id, position, phase_name, status) \
+             VALUES ($1, $2, 'chat', 'done') RETURNING id",
+        )
+        .bind(run)
+        .bind(position)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert a v27 step at {position}: {err}"));
+        steps.push(id);
+    }
+
+    MIGRATOR.run(pool).await.expect("apply 0028");
+
+    for id in steps {
+        let row: (String, Option<uuid::Uuid>, Option<String>) =
+            sqlx::query_as("SELECT role, parent_step_id, node_key FROM run_step WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read the migrated step");
+        assert_eq!(
+            row,
+            ("step".to_owned(), None, None),
+            "a step from before 0028 is an ordinary step with no parent and no key"
+        );
+    }
+    let (nullable, default): (String, Option<String>) = sqlx::query_as(
+        "SELECT is_nullable::text, column_default::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'run_step' AND column_name = 'role'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read run_step.role's column");
+    assert_eq!(
+        (nullable.as_str(), default.as_deref()),
+        ("NO", Some("'step'::text")),
+        "run_step.role is NOT NULL DEFAULT 'step'"
+    );
+    for column in ["parent_step_id", "node_key"] {
+        assert_eq!(
+            column_nullable(pool, "run_step", column).await.as_deref(),
+            Some("YES"),
+            "run_step.{column} is nullable"
+        );
+    }
+
+    db.drop_db().await;
+}
+
 /// MOD-147 (blueprint T1.3): `CACHE_MIGRATOR` runs before the `schema_version` check
 /// (`cache/mod.rs`), so cache 0009 must apply on a populated 0008 mirror. `document` is dropped
 /// and recreated in the new shape (the forced rebuild refills it); `project` keeps its rows and
