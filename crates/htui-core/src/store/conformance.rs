@@ -61,7 +61,7 @@ use crate::store::traits::{
     StepFence, StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
     citation_key, command_finish_status, command_not_claimable, command_not_queued,
     document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
-    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_project,
+    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_reach,
     memory_entry_closed, memory_subject_taken, not_a_tool_name, note_needs_a_step,
     queue_target_refusal, queue_token_refusal, references_no_row, requirement_withdrawn,
     resolution_not_closable, rule_kind_unknown, self_link, step_writes_own_item,
@@ -21007,7 +21007,7 @@ async fn add_step_note_fenced_on_its_own_item<S: WriteStore>(store: &S) {
 
 /// MOD-11 D13, B-6: [`WriteStore::propose_link`] inserts a live link proposed by the step; a
 /// live row keeps the proposer it has (an importer's `None` included), a tombstone revives with
-/// the new proposer. A self link, a foreign `from`, an unknown or out-of-project `to` and a stale
+/// the new proposer. A self link, a foreign `from`, an unknown or out-of-reach `to` and a stale
 /// fence are refused; after a stranger takes the run, the old owner's proposal and withdraw are
 /// `Fenced` and write nothing.
 async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(store: &S) {
@@ -21150,11 +21150,11 @@ async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(s
         store
             .propose_link(
                 StepFence::Lease(a),
-                propose(ids::HTUI_FEAT_1, LinkKind::Relates, step),
+                propose(ids::VULKAN_FEAT_1, LinkKind::Relates, step),
             )
             .await,
-        &link_outside_project(ids::HTUI_FEAT_1),
-        "a link to another project's item",
+        &link_outside_reach(ids::VULKAN_FEAT_1),
+        "a link to an item outside the run's workspaces",
     );
     let unknown = ItemId::new();
     let missing = store
@@ -21178,7 +21178,7 @@ async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(s
         "{CASE}: an unleased proposal on a leased run is fenced, got {fenced:?}"
     );
     assert!(
-        !live_link(CASE, store, item, ids::HTUI_FEAT_1, LinkKind::Relates).await
+        !live_link(CASE, store, item, ids::VULKAN_FEAT_1, LinkKind::Relates).await
             && !live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Origin).await,
         "{CASE}: the refusals wrote no link"
     );

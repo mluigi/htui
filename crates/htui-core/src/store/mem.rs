@@ -77,7 +77,7 @@ use crate::store::traits::{
     document_needs_a_step, expected_on_row, failure_disagrees_with_status,
     finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
+    link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
     project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
@@ -8364,7 +8364,7 @@ impl State {
             )));
         }
         if self.require_item(link.to)?.project_id != project {
-            return Err(StoreError::Constraint(link_outside_project(link.to)));
+            return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
         let at = self.links.iter().position(|row| {
             row.from_item_id == link.from && row.to_item_id == link.to && row.kind == link.kind

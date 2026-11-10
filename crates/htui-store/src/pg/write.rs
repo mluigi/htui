@@ -57,7 +57,7 @@ use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
     command_not_claimable, command_not_queued, document_needs_a_step, link_key,
-    link_not_proposed_by_run, link_outside_project, memory_entry_closed, memory_subject_taken,
+    link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
     note_needs_a_step, project_settings_not_an_object, reaped_note, self_link,
     step_document_refusal, step_note_refusal, step_writes_own_item,
 };
@@ -9188,7 +9188,7 @@ impl WriteStore for PgStore {
             id: link.to.to_string(),
         })?;
         if project != scope.project {
-            return Err(StoreError::Constraint(link_outside_project(link.to)));
+            return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
 
         let row = sqlx::query_as!(

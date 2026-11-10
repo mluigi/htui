@@ -935,7 +935,9 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a bad prefix, a taken
     /// `(project_id, prefix)` or `(project_id, name)`, or a graph the project may not use
-    /// ([`graph_not_usable`]).
+    /// ([`graph_not_usable`]). MOD-147: a scope row may also use its own workspace's graphs (D7),
+    /// and its kind may not take a prefix a current member project's kind uses
+    /// ([`workspace_prefix_taken`], D5, checked before the graph).
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind>;
 
     /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind),
@@ -947,7 +949,8 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create, the graph
-    /// only when the patch changes it.
+    /// only when the patch changes it and [`workspace_prefix_taken`] only when it changes the
+    /// prefix.
     async fn update_item_kind(
         &self,
         id: ItemKindId,
@@ -1487,7 +1490,9 @@ pub trait WriteStore: ReadStore {
     /// `new.project_id` ([`item_not_in_project`] — the run is filed under that id and
     /// [`delete_project`](WriteStore::delete_project) counts by it), when `id` already exists, or
     /// on any foreign key. For `new.batch_id` (MOD-12 D7): `NotFound { entity: "queue_batch" }`
-    /// for an unknown batch, `Constraint` ([`batch_is_closed`]) for a closed one.
+    /// for an unknown batch, `Constraint` ([`batch_is_closed`]) for a closed one. MOD-147 D8: a run
+    /// on a scope row carries its workspace ([`run_workspace_for`]: `None` is filled), another
+    /// workspace is `Constraint` ([`scope_row_run_workspace`]), checked before any foreign key.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
@@ -2354,8 +2359,9 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// `Constraint(self_link(..))` when `from == to` (before any read); `NotFound { run_step }`;
     /// `Fenced`; `Constraint(step_writes_own_item(..))` when `from` is not the run's item;
-    /// `NotFound { entity: "item" }` for `to`; `Constraint(link_outside_project(..))` when `to` is
-    /// in another project than the run.
+    /// `NotFound { entity: "item" }` for `to`; `Constraint(link_outside_reach(..))` when `to` is
+    /// outside the run's reach (MOD-147 D3): not in the run's project, in no workspace holding it
+    /// (its scope row) and in none of those workspaces' member projects.
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink>;
 
     /// D13, B-5: tombstones the live link `(from, to, kind)` when its `proposed_by_step_id` is a
@@ -2369,8 +2375,9 @@ pub trait WriteStore: ReadStore {
 
     /// B-4: the item of `project` whose `key` is `key`; `None` when there is none, a key holding
     /// a NUL included (answered before any read: no key holds one, and Postgres would fail the
-    /// parameter, `22021`). A read on `WriteStore` by the `command_runs` precedent:
-    /// `WorkerStore`'s reads come from here.
+    /// parameter, `22021`). MOD-147 D2: a qualified `slug:KEY` (split at the last `:`) is looked
+    /// up by slug and `project` is ignored; an unknown slug is `None`. A read on `WriteStore` by
+    /// the `command_runs` precedent: `WorkerStore`'s reads come from here.
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -3517,10 +3524,46 @@ pub fn self_link(item: ItemId) -> String {
     format!("an item cannot link to itself ({item})")
 }
 
-/// D13: an agent links its item only to items of its run's project.
+/// MOD-147 D3: an agent links its item only to items of its run's project, of each workspace
+/// holding that project (the workspace's scope row) and of those workspaces' member projects.
 #[must_use]
-pub fn link_outside_project(to: ItemId) -> String {
-    format!("item {to} is outside the run's project")
+pub fn link_outside_reach(to: ItemId) -> String {
+    format!("item {to} is not in this project or its workspaces")
+}
+
+/// MOD-147 D5: a scope-row kind may not take a prefix a current member project's kind uses.
+#[must_use]
+pub fn workspace_prefix_taken(prefix: &str, member: &str) -> String {
+    format!(
+        "item_kind.prefix `{prefix}` is used by member project `{member}`; a workspace kind may \
+         not share a member's prefix"
+    )
+}
+
+/// MOD-147 D8: a run (or queue entry) on a scope row names another workspace than its own.
+#[must_use]
+pub fn scope_row_run_workspace(scope_slug: &str, asked: WorkspaceId) -> String {
+    format!(
+        "project `{scope_slug}` is a workspace's scope row; its runs carry that workspace, not \
+         workspace {asked}"
+    )
+}
+
+/// MOD-147 D8: the `workspace_id` a run or queue entry stores. `owner` is the project's
+/// `owner_workspace_id`: a scope row's runs carry it (`None` is filled), any other workspace is
+/// `Err(asked)`; a user project (`owner` `None`) keeps `asked`.
+///
+/// # Errors
+/// `Err(asked)` when `owner` is `Some` and `asked` names another workspace.
+pub fn run_workspace_for(
+    owner: Option<WorkspaceId>,
+    asked: Option<WorkspaceId>,
+) -> core::result::Result<Option<WorkspaceId>, WorkspaceId> {
+    match (owner, asked) {
+        (Some(owner), Some(asked)) if asked != owner => Err(asked),
+        (Some(owner), _) => Ok(Some(owner)),
+        (None, asked) => Ok(asked),
+    }
 }
 
 /// The `id` of an `item_link` `NotFound`: its primary key, `from-kind->to` (D13).
@@ -4054,10 +4097,23 @@ pub fn queue_token_refusal(
 mod tests {
     use super::{
         LIVE_RUN_STATUSES, not_startable, project_slug_is_reserved, project_slug_refusal,
-        scope_row_is_deleted_with_its_workspace, startable, workspace_has_live_run,
+        run_workspace_for, scope_row_is_deleted_with_its_workspace, startable,
+        workspace_has_live_run,
     };
-    use crate::model::{ItemState, RunStatus, Status};
+    use crate::model::{ItemState, RunStatus, Status, WorkspaceId};
     use crate::store::StoreError;
+
+    /// MOD-147 D8: a scope row's runs carry its workspace (`None` filled, another refused); a
+    /// user project keeps whatever was asked.
+    #[test]
+    fn run_workspace_for_fills_keeps_and_refuses() {
+        let (a, w, x) = (WorkspaceId::new(), WorkspaceId::new(), WorkspaceId::new());
+        assert_eq!(run_workspace_for(None, None), Ok(None));
+        assert_eq!(run_workspace_for(None, Some(a)), Ok(Some(a)));
+        assert_eq!(run_workspace_for(Some(w), None), Ok(Some(w)));
+        assert_eq!(run_workspace_for(Some(w), Some(w)), Ok(Some(w)));
+        assert_eq!(run_workspace_for(Some(w), Some(x)), Err(x));
+    }
 
     /// MOD-144 Δ8: only an `open` item with no live graph run may start; every refusal names the
     /// item and its derived state by its word, never a stored `item.status`.
