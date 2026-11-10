@@ -560,12 +560,24 @@ impl GraphEditor {
             }
             None => {}
         }
+        // The links list (and the step form) open on a press: that gesture's drag and release
+        // never reach the canvas once its mode is gone.
+        self.end_gesture_off_canvas();
         Handled::Consumed
     }
 
     /// The mouse went away mid-gesture.
     pub fn on_mouse_lost(&mut self) {
         self.canvas.get_mut().end_gesture();
+    }
+
+    /// MOD-141 R1 L2: once the editor has left the canvas, a live gesture is ended. Outside
+    /// [`Mode::Canvas`] no drag or release reaches the canvas, and the host keeps the mouse on
+    /// while the editor is open, so nothing else would end it.
+    fn end_gesture_off_canvas(&mut self) {
+        if !matches!(self.mode, Mode::Canvas) {
+            self.canvas.get_mut().end_gesture();
+        }
     }
 
     /// Every reply the host receives; the editor takes its own: its write's answer, and the
@@ -770,7 +782,11 @@ impl GraphEditor {
     /// One act of the current mode's stack; `None` when this mode declines it.
     fn on_act(&mut self, act: Act, ctx: &mut Ctx<'_>) -> Option<EditorKey> {
         let handled = match self.mode {
-            Mode::Canvas => return self.on_canvas_act(act, ctx),
+            Mode::Canvas => {
+                let answer = self.on_canvas_act(act, ctx);
+                self.end_gesture_off_canvas();
+                return answer;
+            }
             Mode::Connecting { from } => self.on_connecting_act(from, act),
             Mode::NodeForm(_) => self.on_node_form_act(act, ctx),
             Mode::EdgeForm(_) => self.on_edge_form_act(act, ctx),
@@ -1250,6 +1266,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton};
+
     use crate::app::{Action, Emit, TopBarState};
     use crate::keys::{KeyChord, load_str};
     use crate::store_worker::{self, Origin};
@@ -1896,6 +1914,44 @@ mod tests {
         );
         assert_eq!(format!("{:?}", bench.requests()), format!("{asked:?}"));
         assert_eq!(editor.history.depths(), (0, 1));
+    }
+
+    /// MOD-141 R1 L2: a key that takes the editor off the canvas mid-gesture ends the gesture,
+    /// since no drag or release reaches the canvas outside it and the host's mouse stays on.
+    #[tokio::test]
+    async fn a_key_that_leaves_the_canvas_ends_the_gesture() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        let _ = bench.render(&editor);
+        let area = editor.canvas_area.get().expect("the canvas was drawn");
+        // The canvas's bottom-right corner is empty: a press there pans.
+        let (column, row) = (area.right() - 2, area.bottom() - 2);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        {
+            let mut ctx = bench.ctx();
+            let left = MouseButton::Left;
+            editor.on_mouse(mouse(MouseEventKind::Down(left), column, row), &mut ctx);
+            editor.on_mouse(
+                mouse(MouseEventKind::Drag(left), column - 5, row - 3),
+                &mut ctx,
+            );
+        }
+        let gesture = |editor: &GraphEditor| format!("{:?}", editor.canvas.borrow());
+        let live = gesture(&editor);
+        assert!(!live.contains("drag_state: None"), "a pan is live: {live}");
+        assert!(!live.contains("pan: None"), "a pan is live: {live}");
+
+        bench.key(&mut editor, "a");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        let ended = gesture(&editor);
+        assert!(ended.contains("drag_state: None"), "{ended}");
+        assert!(ended.contains("edge_preview: None"), "{ended}");
+        assert!(ended.contains("pan: None"), "{ended}");
     }
 
     #[tokio::test]
