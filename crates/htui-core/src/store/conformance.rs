@@ -78,6 +78,7 @@ use crate::store::traits::{
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
+use crate::store::traits::{invalid_prefix, scope_row_run_workspace, workspace_prefix_taken};
 use crate::store::traits::{
     project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
     scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
@@ -345,6 +346,14 @@ pub const CASES: &[&str] = &[
     "workspace_delete_refuses_while_a_scope_row_run_is_live",
     "workspace_delete_cascades_its_scope_row_with_counts",
     "scope_row_cannot_be_deleted_alone",
+    // MOD-147 M2: keys and links across a workspace (plan D2-D9)
+    "item_by_key_resolves_a_qualified_key",
+    "propose_link_reaches_the_workspace_and_its_members",
+    "workspace_kind_refuses_a_member_prefix",
+    "scope_row_uses_its_workspace_graphs",
+    "workspace_delete_ignores_its_scope_rows_graph_holders",
+    "scope_row_run_carries_its_workspace",
+    "upstream_counts_the_scope_row_in_scope",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1093,6 +1102,27 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "scope_row_cannot_be_deleted_alone" => {
             Box::pin(scope_row_cannot_be_deleted_alone(store)).await
+        }
+        "item_by_key_resolves_a_qualified_key" => {
+            Box::pin(item_by_key_resolves_a_qualified_key(store)).await
+        }
+        "propose_link_reaches_the_workspace_and_its_members" => {
+            Box::pin(propose_link_reaches_the_workspace_and_its_members(store)).await
+        }
+        "workspace_kind_refuses_a_member_prefix" => {
+            Box::pin(workspace_kind_refuses_a_member_prefix(store)).await
+        }
+        "scope_row_uses_its_workspace_graphs" => {
+            Box::pin(scope_row_uses_its_workspace_graphs(store)).await
+        }
+        "workspace_delete_ignores_its_scope_rows_graph_holders" => {
+            Box::pin(workspace_delete_ignores_its_scope_rows_graph_holders(store)).await
+        }
+        "scope_row_run_carries_its_workspace" => {
+            Box::pin(scope_row_run_carries_its_workspace(store)).await
+        }
+        "upstream_counts_the_scope_row_in_scope" => {
+            Box::pin(upstream_counts_the_scope_row_in_scope(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -28150,6 +28180,627 @@ async fn scope_row_cannot_be_deleted_alone<S: WriteStore>(store: &S) {
             .expect(CASE),
         Some(ids::PROJECT_SCOPE_PLATFORM),
         "{CASE}: Platform keeps its scope row"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-147 M2 (plan D2-D9): keys and links across a workspace. A qualified key names its project
+// by slug; a link reaches the step's workspaces, their scope rows and members; a workspace kind
+// keeps off a member's prefix; a scope row uses its workspace's graphs and its runs carry it.
+// ------------------------------------------------------------------------------------------------
+
+/// MOD-147: a `WS` item minted on the scope row `scope` under its `WS` kind `kind`.
+async fn mint_ws<S: WriteStore>(case: &str, store: &S, scope: ProjectId, kind: ItemKindId) -> Item {
+    store
+        .mint_item(new_item(scope, kind, "spans the workspace"))
+        .await
+        .unwrap_or_else(|error| panic!("{case}: a WS item on {scope}: {error}"))
+}
+
+/// MOD-147 D2: [`WriteStore::item_by_key`] resolves `slug:KEY` by slug, whatever project it is
+/// asked in, and `@workspace:KEY` names the workspace's own item, also when a user project is
+/// called like the workspace. An unknown slug, an empty half and a NUL answer `None`.
+async fn item_by_key_resolves_a_qualified_key<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_by_key_resolves_a_qualified_key";
+    let ws = mint_ws(
+        CASE,
+        store,
+        ids::PROJECT_SCOPE_PLATFORM,
+        ids::KIND_SCOPE_PLATFORM_WS,
+    )
+    .await;
+    let platform = store
+        .create_project(new_project("platform"))
+        .await
+        .expect(CASE);
+    let feat = store
+        .item_kinds(platform.id)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|kind| kind.prefix == "FEAT")
+        .unwrap_or_else(|| panic!("{CASE}: a new project is seeded with FEAT"));
+    let named = store
+        .mint_item(new_item(
+            platform.id,
+            feat.id,
+            "a project named like the workspace",
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(named.key, "FEAT-1", "{CASE}: the new project's first FEAT");
+
+    for (project, key, expected) in [
+        (ids::PROJECT_HTUI, "FEAT-1", Some(ids::HTUI_FEAT_1)),
+        (ids::PROJECT_AGY, "htui:FEAT-1", Some(ids::HTUI_FEAT_1)),
+        (ids::PROJECT_HTUI, "htui:FEAT-1", Some(ids::HTUI_FEAT_1)),
+        (ProjectId::new(), "htui:FEAT-1", Some(ids::HTUI_FEAT_1)),
+        (ids::PROJECT_HTUI, "@platform:WS-1", Some(ws.id)),
+        (ids::PROJECT_HTUI, "platform:FEAT-1", Some(named.id)),
+        (ids::PROJECT_HTUI, "@platform:FEAT-1", None),
+        (ids::PROJECT_HTUI, "platform:WS-1", None),
+        (ids::PROJECT_HTUI, "nope:FEAT-1", None),
+        (ids::PROJECT_HTUI, ":FEAT-1", None),
+        (ids::PROJECT_HTUI, "htui:", None),
+        (ids::PROJECT_HTUI, "htui:FEAT-1\0", None),
+        (ids::PROJECT_HTUI, "ht\0ui:FEAT-1", None),
+    ] {
+        assert_eq!(
+            store.item_by_key(project, key).await.expect(CASE),
+            expected,
+            "{CASE}: `{key}` asked in project {project}"
+        );
+    }
+}
+
+/// MOD-147 D3: a step links its item to its own project, to the scope row of a workspace holding
+/// its project and to that workspace's members; a scope-row step reaches its workspace's members.
+/// Anything else is refused with [`link_outside_reach`] and writes nothing; `withdraw_link` keeps
+/// no reach check.
+async fn propose_link_reaches_the_workspace_and_its_members<S: WriteStore>(store: &S) {
+    const CASE: &str = "propose_link_reaches_the_workspace_and_its_members";
+    let ws = mint_ws(
+        CASE,
+        store,
+        ids::PROJECT_SCOPE_PLATFORM,
+        ids::KIND_SCOPE_PLATFORM_WS,
+    )
+    .await;
+    let gws = mint_ws(
+        CASE,
+        store,
+        ids::PROJECT_SCOPE_GRAPHICS,
+        ids::KIND_SCOPE_GRAPHICS_WS,
+    )
+    .await;
+    let from = ids::AGY_FIX_1;
+    let (_, step) = agent_step(CASE, store, ids::PROJECT_AGY, from, None).await;
+    let link = |from: ItemId, to: ItemId, kind: LinkKind, step: StepId| ProposeLink {
+        from,
+        to,
+        kind,
+        step,
+    };
+
+    for (to, kind, what) in [
+        (ids::HTUI_FEAT_1, LinkKind::Relates, "a co-member's item"),
+        (ws.id, LinkKind::BlockedBy, "the workspace's own item"),
+    ] {
+        let proposed = store
+            .propose_link(StepFence::Unleased, link(from, to, kind, step))
+            .await
+            .unwrap_or_else(|error| panic!("{CASE}: {what} is reached: {error}"));
+        assert_eq!(
+            (proposed.to_item_id, proposed.deleted_at),
+            (to, None),
+            "{CASE}: {what} is linked"
+        );
+        assert!(
+            live_link(CASE, store, from, to, kind).await,
+            "{CASE}: {what} is a live edge"
+        );
+    }
+    for (to, what) in [
+        (ids::VULKAN_FEAT_1, "another workspace's member"),
+        (gws.id, "another workspace's own item"),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .propose_link(StepFence::Unleased, link(from, to, LinkKind::Relates, step))
+                .await,
+            &link_outside_reach(to),
+            what,
+        );
+        assert!(
+            !live_link(CASE, store, from, to, LinkKind::Relates).await,
+            "{CASE}: {what} is not linked"
+        );
+    }
+
+    let (_, scope_step) = agent_step(CASE, store, ids::PROJECT_SCOPE_PLATFORM, ws.id, None).await;
+    store
+        .propose_link(
+            StepFence::Unleased,
+            link(ws.id, ids::HTUI_ANA_2, LinkKind::Relates, scope_step),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a scope-row step reaches a member: {error}"));
+    assert!(
+        live_link(CASE, store, ws.id, ids::HTUI_ANA_2, LinkKind::Relates).await,
+        "{CASE}: the scope row's link to a member is live"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .propose_link(
+                StepFence::Unleased,
+                link(ws.id, ids::VULKAN_TOOL_1, LinkKind::Relates, scope_step),
+            )
+            .await,
+        &link_outside_reach(ids::VULKAN_TOOL_1),
+        "a scope-row step to another workspace's member",
+    );
+
+    let withdrawn = store
+        .withdraw_link(
+            StepFence::Unleased,
+            WithdrawLink {
+                from,
+                to: ids::HTUI_FEAT_1,
+                kind: LinkKind::Relates,
+                step,
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        withdrawn.deleted_at.is_some()
+            && !live_link(CASE, store, from, ids::HTUI_FEAT_1, LinkKind::Relates).await,
+        "{CASE}: the co-member link is tombstoned"
+    );
+}
+
+/// MOD-147 D5: a scope-row kind may not take a prefix a current member's kind uses, on create and
+/// on a prefix-changing update; the sentence names the first member by position. An invalid
+/// prefix and a stale token answer first, the graph after. A member's own kind is never refused,
+/// and an update that keeps the prefix is not re-checked.
+async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_kind_refuses_a_member_prefix";
+    let workspace = store
+        .create_workspace(new_workspace("prefixed"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let graph = store.step_graphs(scope).await.expect(CASE)[0].id;
+    let mut members = Vec::new();
+    for (position, slug) in [(0, "pa"), (1, "pb")] {
+        let project = store.create_project(new_project(slug)).await.expect(CASE);
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: workspace.id,
+                project_id: project.id,
+                position,
+            })
+            .await
+            .expect(CASE);
+        members.push(project.id);
+    }
+    let foreign = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "foreign-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let kinds_before = store.item_kinds(scope).await.expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store
+            .create_item_kind(new_item_kind(scope, "FEAT", "feature", graph))
+            .await,
+        &workspace_prefix_taken("FEAT", "pa"),
+        "a member's prefix on the scope row",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_item_kind(new_item_kind(scope, "feat", "feature", graph))
+            .await,
+        &invalid_prefix("feat"),
+        "an invalid prefix answers first",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_item_kind(new_item_kind(scope, "FEAT", "feature", foreign.id))
+            .await,
+        &workspace_prefix_taken("FEAT", "pa"),
+        "the prefix answers before the graph",
+    );
+    assert_eq!(
+        store.item_kinds(scope).await.expect(CASE),
+        kinds_before,
+        "{CASE}: the refusals wrote no kind"
+    );
+
+    let epic = store
+        .create_item_kind(new_item_kind(scope, "EPIC", "epic", graph))
+        .await
+        .expect(CASE);
+    let member_graph = store.step_graphs(members[0]).await.expect(CASE)[0].id;
+    store
+        .create_item_kind(new_item_kind(members[0], "EPIC", "epic", member_graph))
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a member's own kind is not refused: {error}"));
+
+    let to_fix = ItemKindPatch {
+        prefix: Some("FIX".to_owned()),
+        ..ItemKindPatch::default()
+    };
+    constraint_exactly(
+        CASE,
+        store
+            .update_item_kind(epic.id, epic.updated_at, to_fix.clone())
+            .await,
+        &workspace_prefix_taken("FIX", "pa"),
+        "an update to a member's prefix",
+    );
+    let unchanged = store
+        .item_kinds(scope)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|kind| kind.id == epic.id)
+        .unwrap_or_else(|| panic!("{CASE}: EPIC is still there"));
+    assert_eq!(unchanged, epic, "{CASE}: the refused update left the row");
+
+    let renamed = applied(
+        CASE,
+        store
+            .update_item_kind(
+                epic.id,
+                epic.updated_at,
+                ItemKindPatch {
+                    name: Some("saga".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (renamed.prefix.as_str(), renamed.name.as_str()),
+        ("EPIC", "saga"),
+        "{CASE}: a kept prefix is not re-checked, though `pa` shares it"
+    );
+    stale(
+        CASE,
+        store
+            .update_item_kind(epic.id, epic.updated_at, to_fix)
+            .await
+            .expect(CASE),
+    );
+}
+
+/// MOD-147 D7: a scope row may use its own workspace's graphs, listed after its own and before
+/// the library's, as a kind's default on create and on update; another workspace's graph stays
+/// unusable.
+async fn scope_row_uses_its_workspace_graphs<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_uses_its_workspace_graphs";
+    let scope = ids::PROJECT_SCOPE_PLATFORM;
+    let ours = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+            "ws-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let theirs = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "ws-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+
+    let own: Vec<StepGraphId> = store
+        .step_graphs(scope)
+        .await
+        .expect(CASE)
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    let library: Vec<StepGraphId> = store
+        .usable_graphs(ids::PROJECT_VULKAN)
+        .await
+        .expect(CASE)
+        .iter()
+        .filter(|row| row.scope == GraphScope::Library)
+        .map(|row| row.id)
+        .collect();
+    let mut expected = own;
+    expected.push(ours.id);
+    expected.extend(library);
+    assert_eq!(
+        store
+            .usable_graphs(scope)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        expected,
+        "{CASE}: the scope row's own, then its workspace's, then the library's"
+    );
+
+    store
+        .create_item_kind(new_item_kind(scope, "PLAN", "plan", ours.id))
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a kind on the workspace's graph: {error}"));
+    let ws_kind = store
+        .item_kinds(scope)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|kind| kind.id == ids::KIND_SCOPE_PLATFORM_WS)
+        .unwrap_or_else(|| panic!("{CASE}: the WS kind"));
+    let moved = applied(
+        CASE,
+        store
+            .update_item_kind(
+                ws_kind.id,
+                ws_kind.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ours.id),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(moved.default_graph_id, ours.id, "{CASE}: WS moved");
+    constraint_exactly(
+        CASE,
+        store
+            .update_item_kind(
+                ws_kind.id,
+                moved.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(theirs.id),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await,
+        &graph_not_usable(theirs.id, scope),
+        "another workspace's graph",
+    );
+}
+
+/// MOD-147 D7: a workspace delete does not count its own scope row's kinds and items as holders
+/// of its graphs (they cascade with it); a member's kind still holds one.
+async fn workspace_delete_ignores_its_scope_rows_graph_holders<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_ignores_its_scope_rows_graph_holders";
+    let workspace = store
+        .create_workspace(new_workspace("holding"))
+        .await
+        .expect(CASE);
+    let scope = scope_of(CASE, store, workspace.id).await;
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(workspace.id),
+            "held-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    let plan = store
+        .create_item_kind(new_item_kind(scope, "PLAN", "plan", graph.id))
+        .await
+        .expect(CASE);
+    let mut item = new_item(scope, plan.id, "on the workspace graph");
+    item.step_graph_id = Some(graph.id);
+    store.mint_item(item).await.expect(CASE);
+    let member = store
+        .create_project(new_project("holding-member"))
+        .await
+        .expect(CASE);
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace.id,
+            project_id: member.id,
+            position: 0,
+        })
+        .await
+        .expect(CASE);
+    let held = store
+        .create_item_kind(new_item_kind(member.id, "MK", "member kind", graph.id))
+        .await
+        .expect(CASE);
+
+    assert_eq!(
+        store.delete_workspace(workspace.id).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind MK",
+            "holding-member"
+        ))),
+        "{CASE}: the member's kind holds the graph, the scope row's do not"
+    );
+    store.delete_item_kind(held.id).await.expect(CASE);
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+    assert_eq!(
+        store.delete_workspace(workspace.id).await.expect(CASE),
+        reach,
+        "{CASE}: the delete goes through, as counted"
+    );
+    assert_eq!(
+        store.scope_project(workspace.id).await.expect(CASE),
+        None,
+        "{CASE}: the scope row went with it"
+    );
+}
+
+/// MOD-147 D8: a run on a scope row carries its workspace: `None` is filled, the owner is kept,
+/// any other workspace (known or not) is refused before the foreign key and writes no run. A user
+/// project's `None` stays `None`. `queue_item` is inherent, so its twin is a `MemStore` unit test,
+/// `queue_item_fills_a_scope_rows_workspace_and_refuses_another`.
+async fn scope_row_run_carries_its_workspace<S: WriteStore>(store: &S) {
+    const CASE: &str = "scope_row_run_carries_its_workspace";
+    let scope = ids::PROJECT_SCOPE_PLATFORM;
+    let ws1 = mint_ws(CASE, store, scope, ids::KIND_SCOPE_PLATFORM_WS).await;
+    let ws2 = mint_ws(CASE, store, scope, ids::KIND_SCOPE_PLATFORM_WS).await;
+
+    let filled = store
+        .create_run(new_run(scope, ws1.id, Vec::new()))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        filled.workspace_id,
+        Some(ids::WORKSPACE_PLATFORM),
+        "{CASE}: `None` is filled with the owner"
+    );
+    assert_eq!(
+        store
+            .run(filled.id)
+            .await
+            .expect(CASE)
+            .map(|run| run.workspace_id),
+        Some(Some(ids::WORKSPACE_PLATFORM)),
+        "{CASE}: and stored so"
+    );
+
+    for asked in [ids::WORKSPACE_GRAPHICS, WorkspaceId::new()] {
+        let mut new = new_run(scope, ws2.id, Vec::new());
+        new.workspace_id = Some(asked);
+        let id = new.id;
+        constraint_exactly(
+            CASE,
+            store.create_run(new).await,
+            &scope_row_run_workspace("@platform", asked),
+            "another workspace on a scope-row run",
+        );
+        assert!(
+            store.run(id).await.expect(CASE).is_none(),
+            "{CASE}: the refused run was not written"
+        );
+    }
+    let mut own = new_run(scope, ws2.id, Vec::new());
+    own.workspace_id = Some(ids::WORKSPACE_PLATFORM);
+    assert_eq!(
+        store.create_run(own).await.expect(CASE).workspace_id,
+        Some(ids::WORKSPACE_PLATFORM),
+        "{CASE}: the owner itself is kept"
+    );
+
+    let user = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        user.workspace_id, None,
+        "{CASE}: a user project's `None` stays"
+    );
+}
+
+/// MOD-147 D9: under a workspace scope the workspace's own items are in scope, from a member's
+/// walk and from a scope-row item's; a project-only walk keeps to its one project.
+async fn upstream_counts_the_scope_row_in_scope<S: WriteStore>(store: &S) {
+    const CASE: &str = "upstream_counts_the_scope_row_in_scope";
+    let scope = ids::PROJECT_SCOPE_PLATFORM;
+    let ws1 = mint_ws(CASE, store, scope, ids::KIND_SCOPE_PLATFORM_WS).await;
+    let ws2 = mint_ws(CASE, store, scope, ids::KIND_SCOPE_PLATFORM_WS).await;
+    let blocked_by = |from: ItemId, to: ItemId, step: StepId| ProposeLink {
+        from,
+        to,
+        kind: LinkKind::BlockedBy,
+        step,
+    };
+    let entry = |entries: &[UpstreamEntry], item: ItemId| {
+        entries
+            .iter()
+            .find(|entry| entry.item_id == item)
+            .cloned()
+            .unwrap_or_else(|| panic!("{CASE}: {item} is upstream"))
+    };
+
+    let (_, step) = agent_step(CASE, store, ids::PROJECT_AGY, ids::AGY_FIX_1, None).await;
+    store
+        .propose_link(
+            StepFence::Unleased,
+            blocked_by(ids::AGY_FIX_1, ws1.id, step),
+        )
+        .await
+        .expect(CASE);
+    let platform = PromptScope {
+        workspace: Some(ids::WORKSPACE_PLATFORM),
+        project: ids::PROJECT_AGY,
+    };
+    let wide = store
+        .upstream_summaries(ids::AGY_FIX_1, 1, &platform)
+        .await
+        .expect(CASE);
+    let seen = entry(&wide, ws1.id);
+    assert_eq!(
+        (seen.qualified_key.as_str(), seen.depth, seen.in_scope),
+        ("@platform:WS-1", 1, true),
+        "{CASE}: a member's walk sees the workspace's item in scope"
+    );
+    let narrow = store
+        .upstream_summaries(
+            ids::AGY_FIX_1,
+            1,
+            &PromptScope::project_only(ids::PROJECT_AGY),
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        !entry(&narrow, ws1.id).in_scope,
+        "{CASE}: a project-only walk does not"
+    );
+
+    let (_, scope_step) = agent_step(CASE, store, scope, ws1.id, None).await;
+    for to in [ws2.id, ids::HTUI_ANA_1] {
+        store
+            .propose_link(StepFence::Unleased, blocked_by(ws1.id, to, scope_step))
+            .await
+            .expect(CASE);
+    }
+    let wide = store
+        .upstream_summaries(
+            ws1.id,
+            1,
+            &PromptScope {
+                workspace: Some(ids::WORKSPACE_PLATFORM),
+                project: scope,
+            },
+        )
+        .await
+        .expect(CASE);
+    let (own, member) = (entry(&wide, ws2.id), entry(&wide, ids::HTUI_ANA_1));
+    assert!(
+        own.in_scope && member.in_scope && member.summary.is_some(),
+        "{CASE}: a scope-row walk sees its own project and the members, got {wide:?}"
+    );
+    let narrow = store
+        .upstream_summaries(ws1.id, 1, &PromptScope::project_only(scope))
+        .await
+        .expect(CASE);
+    assert!(
+        entry(&narrow, ws2.id).in_scope && !entry(&narrow, ids::HTUI_ANA_1).in_scope,
+        "{CASE}: a project-only scope-row walk keeps to the scope row, got {narrow:?}"
     );
 }
 
