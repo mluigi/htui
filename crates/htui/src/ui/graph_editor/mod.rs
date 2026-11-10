@@ -399,8 +399,12 @@ impl GraphEditor {
     }
 
     /// Opens the step form on the selected step (`e` on a phase row, D14); with none selected,
-    /// says so.
+    /// says so. Refused while a write is in flight: its reply would close the form.
     pub fn open_node_form(&mut self) {
+        if self.busy() {
+            self.refuse(history::IN_FLIGHT);
+            return;
+        }
         let Some(node) = self
             .selected
             .and_then(|id| self.body.nodes.iter().find(|node| node.phase.id == id))
@@ -935,6 +939,7 @@ impl GraphEditor {
     /// The links list's acts. Cycling a relation opens the link form on the link with the next
     /// relation chosen: nothing is sent until it is saved, one write per edit.
     fn on_links_act(&mut self, act: Act, ctx: &mut Ctx<'_>) -> bool {
+        let busy = self.busy();
         let Mode::Links(links) = &mut self.mode else {
             return false;
         };
@@ -944,6 +949,10 @@ impl GraphEditor {
         match act {
             Act::ListDown => links.down(&self.body),
             Act::ListUp => links.up(),
+            // The reply to the write in flight would close the form these open.
+            Act::ChoicePrev | Act::ChoiceNext | Act::LinksEdit if busy => {
+                self.refuse(history::IN_FLIGHT);
+            }
             Act::ChoicePrev | Act::ChoiceNext => {
                 if let Some(edge) = edge {
                     let kind = cycle_kind(edge.kind, act == Act::ChoiceNext);
@@ -1595,6 +1604,34 @@ mod tests {
         }
         assert!(bench.requests().is_empty());
         assert!(bench.hint(&editor).ends_with(" \u{b7} saving\u{2026}"));
+    }
+
+    #[tokio::test]
+    async fn no_form_opens_while_a_write_is_in_flight() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        // plan's links list, `plan -> review` removed: a write in flight, list stays.
+        bench.keys(&mut editor, &["j", "i", "d"]);
+        let (_, _, sent, _) = bench.write();
+        assert!(editor.busy());
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_LINKS);
+        for chord in ["e", "enter", "h", "l"] {
+            editor.notice = None;
+            bench.key(&mut editor, chord);
+            assert_eq!(notice_text(&editor), Some(history::IN_FLIGHT), "{chord}");
+            assert_eq!(editor.stack(), views::GRAPH_EDITOR_LINKS, "{chord}");
+        }
+        bench.key(&mut editor, "esc");
+        editor.notice = None;
+        bench.key(&mut editor, "e");
+        assert_eq!(notice_text(&editor), Some(history::IN_FLIGHT));
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR);
+        assert!(bench.requests().is_empty());
+        bench.reply(&mut editor, &applied(stored(sent)));
+        assert_eq!(
+            notice_text(&editor),
+            Some("saved: removing the link plan \u{2192} review")
+        );
     }
 
     #[tokio::test]
