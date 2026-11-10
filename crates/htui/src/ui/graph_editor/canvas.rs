@@ -59,6 +59,9 @@ pub(crate) struct Layout {
     pub(crate) layers: usize,
     /// The widest row in world units (0.0 for an empty body).
     pub(crate) width: f64,
+    /// Every forward edge that skips layers, by its ends' positions, then id: the top-left
+    /// corner of the empty slot it runs through in each layer it crosses, top to bottom.
+    pub(crate) lanes: Vec<(EdgeId, Vec<(f64, f64)>)>,
 }
 
 /// The width in world units of a row of `n` nodes (`n >= 1`).
@@ -74,7 +77,9 @@ fn units(n: usize) -> f64 {
 
 /// D7: `body` laid out by longest path over its forward edges, deterministic and independent of
 /// the order of `body.edges`. A body the store would refuse (a forward cycle) still lays out:
-/// the steps the walk never reaches each take a layer of their own below the rest.
+/// the steps the walk never reaches each take a layer of their own below the rest. A forward
+/// edge that skips layers takes an empty slot in each layer it crosses (Sugiyama's dummy
+/// nodes), so it runs, and its label reads, clear of the steps between its ends.
 pub(crate) fn layout(body: &GraphBody) -> Layout {
     let mask = forward_edges(body);
     // Flow nodes in body order (position order), palette nodes apart.
@@ -148,32 +153,63 @@ pub(crate) fn layout(body: &GraphBody) -> Layout {
         .map(|slot| layer[slot] + 1)
         .max()
         .unwrap_or(0);
+    let position = |slot: usize| body.nodes[flow[slot]].phase.position;
+    // The forward edges that skip layers, by their ends' positions, then id.
+    let mut long: Vec<(EdgeId, usize, usize)> = body
+        .edges
+        .iter()
+        .zip(&mask)
+        .filter_map(|(edge, forward)| {
+            let (&from, &to) = (slot.get(&edge.from)?, slot.get(&edge.to)?);
+            (*forward && layer[to] > layer[from] + 1).then_some((edge.id, from, to))
+        })
+        .collect();
+    long.sort_by_key(|(id, from, to)| (position(*from), position(*to), *id));
+    // One lane slot per layer crossed, `(lane, unit above, layer)`: unit `flow.len() + i` is
+    // slot `i`, after the flow nodes' units.
+    let mut dummies: Vec<(usize, usize, usize)> = Vec::new();
+    for (lane, (_, from, to)) in long.iter().enumerate() {
+        let mut above = *from;
+        for at in layer[*from] + 1..layer[*to] {
+            dummies.push((lane, above, at));
+            above = flow.len() + dummies.len() - 1;
+        }
+    }
     // Order within a layer, top-down: a step with loops only on the left first and one with
     // loops only on the right last, so no loop's channel runs through a sibling; then by the
-    // leftmost forward predecessor above, then position.
+    // leftmost forward predecessor above, then position. A lane slot sits in the middle group,
+    // under the unit it comes down from, by its target's position, after a step tied with it.
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); layers];
     for slot in 0..flow.len() {
         rows[layer[slot]].push(slot);
     }
-    let mut order = vec![usize::MAX; flow.len()];
+    for (at, (_, _, row)) in dummies.iter().enumerate() {
+        rows[*row].push(flow.len() + at);
+    }
+    let mut order = vec![usize::MAX; flow.len() + dummies.len()];
     for row in &mut rows {
-        let key = |slot: usize| {
-            let above = predecessors[slot]
+        let key = |unit: usize| {
+            if let Some(&(lane, above, _)) =
+                unit.checked_sub(flow.len()).and_then(|at| dummies.get(at))
+            {
+                return (1, order[above], position(long[lane].2), 1, unit);
+            }
+            let above = predecessors[unit]
                 .iter()
-                .filter(|from| layer[**from] < layer[slot])
+                .filter(|from| layer[**from] < layer[unit])
                 .map(|from| order[*from])
                 .min()
                 .unwrap_or(usize::MAX);
-            let side = match (left[slot], right[slot]) {
+            let side = match (left[unit], right[unit]) {
                 (true, false) => 0,
                 (false, true) => 2,
                 _ => 1,
             };
-            (side, above, body.nodes[flow[slot]].phase.position, slot)
+            (side, above, position(unit), 0, unit)
         };
-        row.sort_by_key(|slot| key(*slot));
-        for (at, slot) in row.iter().enumerate() {
-            order[*slot] = at;
+        row.sort_by_key(|unit| key(*unit));
+        for (at, unit) in row.iter().enumerate() {
+            order[*unit] = at;
         }
     }
     let width = rows
@@ -184,12 +220,17 @@ pub(crate) fn layout(body: &GraphBody) -> Layout {
         .map(span)
         .fold(0.0, f64::max);
     let mut positions = Vec::with_capacity(body.nodes.len());
+    let mut lanes: Vec<(EdgeId, Vec<(f64, f64)>)> =
+        long.iter().map(|(id, _, _)| (*id, Vec::new())).collect();
     for (at, row) in rows.iter().enumerate() {
         // Centred on the widest row, in whole cells (execution_graph E7).
         let left = ((width - span(row.len())) / 2.0).floor();
-        for (i, slot) in row.iter().enumerate() {
-            let id = body.nodes[flow[*slot]].phase.id;
-            positions.push((id, (units(i).mul_add(X_STEP, left), units(at) * Y_STEP)));
+        for (i, unit) in row.iter().enumerate() {
+            let corner = (units(i).mul_add(X_STEP, left), units(at) * Y_STEP);
+            match unit.checked_sub(flow.len()) {
+                Some(dummy) => lanes[dummies[dummy].0].1.push(corner),
+                None => positions.push((body.nodes[flow[*unit]].phase.id, corner)),
+            }
         }
     }
     // One empty band between the last layer and the palette, which has no edges.
@@ -205,6 +246,7 @@ pub(crate) fn layout(body: &GraphBody) -> Layout {
         positions,
         layers,
         width,
+        lanes,
     }
 }
 
@@ -455,12 +497,18 @@ fn flow_node(
 /// A back `asks_you` loop shares its side and its handles with `changes_requested`, so it stands
 /// further off its nodes ([`ASKS_STEM`]) and puts its label on the gap's first row: two loops
 /// between one pair stay apart and both read.
+///
+/// A forward edge that skips layers runs through its lane slots ([`Layout::lanes`]) instead
+/// ([`StepLink::through_lanes`]).
 #[derive(Debug)]
 struct StepLink {
     /// The path and its drawing.
     step: StepEdge,
     /// How far into the gap below a side loop's higher end its label sits, in world rows.
     drop: f64,
+    /// A forward edge that skips layers: the top-left corner of its slot in each layer it
+    /// crosses, top to bottom ([`Layout::lanes`]). Empty for any other edge.
+    via: Vec<(f64, f64)>,
 }
 
 impl Default for StepLink {
@@ -468,8 +516,74 @@ impl Default for StepLink {
         Self {
             step: StepEdge::default(),
             drop: V_GAP / 2.0,
+            via: Vec::new(),
         }
     }
+}
+
+impl StepLink {
+    /// A forward edge running through the lane slots `via`.
+    #[cfg(test)]
+    fn through(via: Vec<(f64, f64)>) -> Self {
+        Self {
+            via,
+            ..Self::default()
+        }
+    }
+
+    /// D7: a forward edge that skips layers, down from its source into the gap below, along it
+    /// to the middle of its slot in the next layer, down through that slot, and so on; then
+    /// along the gap above its target to the target's `top` handle. Each turn sits on its gap's
+    /// middle row, where `StepEdge` turns. The label sits in the first slot, which no step and
+    /// no other lane shares, and is no wider than it ([`LABEL_W`]).
+    fn through_lanes(&self, ctx: &EdgePathContext) -> Path {
+        let mut points = vec![ctx.from];
+        let mut x = ctx.from.x;
+        let target_top = ctx.target_bounds.map_or(ctx.to.y, |target| target.y());
+        let stops = self
+            .via
+            .iter()
+            .map(|(left, top)| (left + NODE_W / 2.0, *top))
+            .chain(core::iter::once((ctx.to.x, target_top)));
+        for (lane, top) in stops {
+            let turn = top - V_GAP / 2.0;
+            points.push(Position::new(x, turn));
+            points.push(Position::new(lane, turn));
+            x = lane;
+        }
+        points.push(ctx.to);
+        let label = self.via.first().map_or(ctx.to, |(left, top)| {
+            Position::new(left + NODE_W / 2.0, top + NODE_H / 2.0)
+        });
+        Path::new(
+            straightened(points),
+            ctx.source_position,
+            ctx.target_position,
+        )
+        .with_label_position(label)
+    }
+}
+
+/// `points` without a repeated point or a point in the middle of a straight run, so every
+/// point left is an end or a turn (rataflow draws a corner at each).
+fn straightened(points: Vec<Position>) -> Vec<Position> {
+    let same = |a: f64, b: f64| (a - b).abs() < f64::EPSILON;
+    let mut kept: Vec<Position> = Vec::with_capacity(points.len());
+    for point in points {
+        if kept
+            .last()
+            .is_some_and(|last| same(last.x, point.x) && same(last.y, point.y))
+        {
+            continue;
+        }
+        if let [.., a, b] = kept.as_slice()
+            && ((same(a.x, b.x) && same(b.x, point.x)) || (same(a.y, b.y) && same(b.y, point.y)))
+        {
+            kept.pop();
+        }
+        kept.push(point);
+    }
+    kept
 }
 
 /// D7: how far a back `asks_you` loop's channel stands off its nodes, past the
@@ -481,6 +595,12 @@ const ASKS_DROP: f64 = 0.5;
 
 impl EdgeContent for StepLink {
     fn compute_path(&self, ctx: &EdgePathContext) -> Path {
+        if !self.via.is_empty()
+            && ctx.source_position == HandlePosition::Bottom
+            && ctx.target_position == HandlePosition::Top
+        {
+            return self.through_lanes(ctx);
+        }
         let path = self.step.compute_path(ctx);
         if ctx.source_position != ctx.target_position || !ctx.source_position.is_horizontal() {
             return path;
@@ -513,8 +633,14 @@ impl EdgeContent for StepLink {
     }
 }
 
-/// One body edge, by its handles, in the editor's styles (execution_graph B-4).
-fn flow_edge(edge: &StepGraphEdge, forward: bool, theme: &Theme) -> Edge<StepLink> {
+/// One body edge, by its handles, in the editor's styles (execution_graph B-4); `via` its lane
+/// slots when it skips layers ([`Layout::lanes`]).
+fn flow_edge(
+    edge: &StepGraphEdge,
+    forward: bool,
+    via: &[(f64, f64)],
+    theme: &Theme,
+) -> Edge<StepLink> {
     let step = StepEdge::default().with_style(
         EdgeStyle::default()
             .with_stroke_style(theme.dim)
@@ -524,10 +650,12 @@ fn flow_edge(edge: &StepGraphEdge, forward: bool, theme: &Theme) -> Edge<StepLin
         StepLink {
             step: step.with_stem_length(ASKS_STEM),
             drop: ASKS_DROP,
+            via: Vec::new(),
         }
     } else {
         StepLink {
             step,
+            via: via.to_vec(),
             ..StepLink::default()
         }
     };
@@ -680,7 +808,14 @@ impl Canvas {
             .filter(|(edge, _)| {
                 edge.from != edge.to && known.contains(&edge.from) && known.contains(&edge.to)
             })
-            .map(|(edge, forward)| flow_edge(edge, forward, theme))
+            .map(|(edge, forward)| {
+                let via = layout
+                    .lanes
+                    .iter()
+                    .find(|(id, _)| *id == edge.id)
+                    .map_or(&[][..], |(_, via)| via.as_slice());
+                flow_edge(edge, forward, via, theme)
+            })
             .collect();
         if self
             .flow
@@ -1249,7 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_is_deterministic_and_ignores_edge_order() {
-        for mut body in [demo(ids::GRAPH_VULKAN_FEAT).await, reference()] {
+        for mut body in [demo(ids::GRAPH_VULKAN_FEAT).await, reference(), skip()] {
             let first = layout(&body);
             assert_eq!(layout(&body), first);
             body.edges.reverse();
@@ -1281,6 +1416,7 @@ mod tests {
                 positions: Vec::new(),
                 layers: 0,
                 width: 0.0,
+                lanes: Vec::new(),
             }
         );
     }
@@ -2034,6 +2170,74 @@ mod tests {
 
     // --- what crowds a drawing ---
 
+    /// prd, plan and implement in a line, plus the skip `prd -if {"item_kind":"FIX"}->
+    /// implement`.
+    fn skip() -> GraphBody {
+        let mut body = body(&["prd", "plan", "implement"]);
+        let mut skip = edge(&body, "prd", "implement", EdgeKind::If);
+        skip.predicate = Some(EdgePredicate(json!({"item_kind": "FIX"})));
+        body.edges = vec![
+            edge(&body, "prd", "plan", EdgeKind::Next),
+            edge(&body, "plan", "implement", EdgeKind::Next),
+            skip,
+        ];
+        body
+    }
+
+    #[test]
+    fn a_skip_edge_runs_through_room_of_its_own() {
+        let body = skip();
+        let layout = layout(&body);
+        assert_eq!(layout.layers, 3);
+        let skip = body.edges[2].id;
+        let lanes: Vec<EdgeId> = layout.lanes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(lanes, vec![skip], "only the skip edge needs a lane");
+        let slots = &layout.lanes[0].1;
+        assert_eq!(slots.len(), 1, "one slot in the one layer it crosses");
+        // The slot sits in plan's layer, beside plan and clear of it.
+        let (plan_x, plan_y) = at(&body, &layout, "plan");
+        let (slot_x, slot_y) = slots[0];
+        assert!((slot_y - plan_y).abs() < f64::EPSILON, "{layout:?}");
+        assert!(
+            slot_x >= plan_x + NODE_W || slot_x + NODE_W <= plan_x,
+            "{layout:?}"
+        );
+        assert!(layout.width + f64::EPSILON >= span(2), "{layout:?}");
+
+        // Its path runs clear of plan from prd's bottom handle to implement's top.
+        let bounds = |name: &str| {
+            let (x, y) = at(&body, &layout, name);
+            rataflow::Rect::from_coords(x, y, NODE_W, NODE_H)
+        };
+        let (prd, implement, plan) = (bounds("prd"), bounds("implement"), bounds("plan"));
+        let ctx = EdgePathContext {
+            from: Position::new(prd.center().x, prd.bottom()),
+            to: Position::new(implement.center().x, implement.y()),
+            source_position: HandlePosition::Bottom,
+            target_position: HandlePosition::Top,
+            source_bounds: prd,
+            target_bounds: Some(implement),
+        };
+        let path = StepLink::through(slots.clone()).compute_path(&ctx);
+        assert_eq!(path.points.first(), Some(&ctx.from), "{path:?}");
+        assert_eq!(path.points.last(), Some(&ctx.to), "{path:?}");
+        for run in path.points.windows(2) {
+            let (low_x, high_x) = (run[0].x.min(run[1].x), run[0].x.max(run[1].x));
+            let (low_y, high_y) = (run[0].y.min(run[1].y), run[0].y.max(run[1].y));
+            assert!(
+                high_x <= plan.x()
+                    || low_x >= plan.right()
+                    || high_y <= plan.y()
+                    || low_y >= plan.bottom(),
+                "{run:?} crosses plan {plan:?}"
+            );
+        }
+
+        // Drawn, its label reads in full.
+        let drawn = drawn(&body, None, &[], (100, 28));
+        assert!(drawn.contains("if kind FIX"), "{drawn}");
+    }
+
     #[test]
     fn a_loop_past_a_step_keeps_its_label_in_a_gap() {
         let mut body = body(&["implement", "review", "verify"]);
@@ -2093,5 +2297,10 @@ mod tests {
             channel(&asks) > channel(&changes),
             "{changes:?} and {asks:?} share a channel"
         );
+    }
+
+    #[test]
+    fn snapshot_skip() {
+        insta::assert_snapshot!("skip", drawn(&skip(), None, &[], (100, 28)));
     }
 }
