@@ -19,8 +19,9 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch,
-    NewProject, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId, Scope, Split,
-    StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    NewProject, NewStepGraph, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch,
+    ProjectId, Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase,
+    WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
@@ -66,12 +67,22 @@ fn refusal(reply: StoreReply) -> (&'static str, String) {
     }
 }
 
+/// `ReplaceGraph`'s answer (MOD-141 D13): the write's outcome with the body, and the scope's
+/// catalogue re-read after it, or a panic naming what came back instead.
+#[track_caller]
+fn replaced(reply: StoreReply) -> (CasOutcome<Box<GraphBody>>, CatalogueSnapshot) {
+    match reply {
+        StoreReply::GraphReplaced { outcome, catalogue } => (outcome, *catalogue),
+        other => panic!("expected a replaced graph: {other:?}"),
+    }
+}
+
 /// One read of the demo scope.
 async fn demo_catalogue(backend: &Backend) -> CatalogueSnapshot {
     catalogue(serve(backend, &StoreRequest::Catalogue(vulkan_scope())).await)
 }
 
-/// The empty scope every name-only request is built against: the eleven names are a property of the
+/// The empty scope every name-only request is built against: the twelve names are a property of the
 /// enum, not of a store.
 fn nil_scope() -> Scope {
     Scope {
@@ -80,7 +91,7 @@ fn nil_scope() -> Scope {
     }
 }
 
-/// One of each of the eleven, in [`REQUEST_NAMES`] order. The ids are nil where the request never
+/// One of each of the twelve, in [`REQUEST_NAMES`] order. The ids are nil where the request never
 /// reaches a store.
 fn catalogue_requests() -> Vec<StoreRequest> {
     vec![
@@ -160,20 +171,21 @@ fn catalogue_requests() -> Vec<StoreRequest> {
             scope: nil_scope(),
             phase: PhaseId::default(),
         },
+        StoreRequest::GraphBody(StepGraphId::default()),
     ]
 }
 
-/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a tenth
+/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a thirteenth
 /// request cannot be named in one and matched in the other.
 #[test]
 fn catalogue_names_are_stable() {
     let requests = catalogue_requests();
     assert_eq!(requests.len(), REQUEST_NAMES.len());
-    assert_eq!(REQUEST_NAMES.len(), 11);
+    assert_eq!(REQUEST_NAMES.len(), 12);
     assert_eq!(
         REQUEST_NAMES[9..],
-        ["replace_graph", "delete_phase"],
-        "the two MOD-137 verbs follow the nine (D12)"
+        ["replace_graph", "delete_phase", "graph_body"],
+        "the two MOD-137 verbs follow the nine (D12), then MOD-141's read (D13)"
     );
     for (request, name) in requests.iter().zip(REQUEST_NAMES) {
         assert_eq!(request.name(), name);
@@ -291,7 +303,7 @@ async fn an_unknown_project_id_is_skipped() {
     assert_eq!(snapshot.projects[0].project.slug, "vulkan-tutorials");
 }
 
-/// Offline, every one of the eleven is refused by its own name with MOD-25's one sentence:
+/// Offline, every one of the twelve is refused by its own name with MOD-25's one sentence:
 /// `Backend::writer()` is `None`, so `serve` never reaches the seam — the read included (D7).
 #[tokio::test]
 async fn offline_refuses_every_catalogue_request_by_name() {
@@ -314,7 +326,7 @@ async fn offline_refuses_every_catalogue_request_by_name() {
     }
 }
 
-/// `catalogue::serve` is reachable only through `try_serve`'s eleven or-ed patterns, so a request
+/// `catalogue::serve` is reachable only through `try_serve`'s twelve or-ed patterns, so a request
 /// from anywhere else is told which one it sent rather than panicking.
 #[tokio::test]
 async fn serve_refuses_a_foreign_request_by_name() {
@@ -909,8 +921,9 @@ async fn the_demo_catalogue_carries_seeded_edges() {
     }
 }
 
-/// The editor's one write lands whole and the reply is the catalogue re-read: the renamed phase,
-/// the new edge, and the revision moved by one (MOD-137 D10, D12).
+/// The editor's one write lands whole and the reply carries the body as stored beside the catalogue
+/// re-read: the renamed phase, the new edge, and the revision moved by one (MOD-137 D10, D12,
+/// MOD-141 D13).
 #[tokio::test]
 async fn replace_graph_round_trips_through_the_catalogue() {
     let backend = demo();
@@ -919,9 +932,14 @@ async fn replace_graph_round_trips_through_the_catalogue() {
     let verdict = phase_named(entry, "verdict").id;
     let research = phase_named(entry, "research").id;
 
-    let snapshot = catalogue(serve(&backend, &rename_verdict_request(entry)).await);
+    let (outcome, snapshot) = replaced(serve(&backend, &rename_verdict_request(entry)).await);
 
     let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    let CasOutcome::Applied(body) = outcome else {
+        panic!("a fresh revision applies: {outcome:?}");
+    };
+    assert_eq!(body.graph.revision, 1);
+    assert_eq!(*body, *after, "the reply's body is the one stored");
     assert_eq!(after.graph.revision, 1);
     let names: Vec<&str> = after.nodes.iter().map(|n| n.phase.name.as_str()).collect();
     assert_eq!(names, ["research", "decide"]);
@@ -994,7 +1012,7 @@ async fn replace_graph_from_the_catalogue_keeps_candidates_and_parts() {
 
     // The editor opens the graph from the catalogue and renames `verdict`.
     let opened = demo_catalogue(&backend).await;
-    let snapshot = catalogue(
+    let (_, snapshot) = replaced(
         serve(
             &backend,
             &rename_verdict_request(graph_entry(&opened, ids::GRAPH_VULKAN_ANA)),
@@ -1025,20 +1043,30 @@ async fn replace_graph_from_the_catalogue_keeps_candidates_and_parts() {
     assert_eq!(node(verdict).parts, [part], "and the renamed node its part");
 }
 
-/// The same request twice: the second carries a spent revision and answers `CatalogueStale` with
-/// the catalogue as the first left it (D5, D8).
+/// The same request twice: the second carries a spent revision and answers `GraphReplaced` with
+/// `Stale` and the body as it is now, beside the catalogue as the first left it (D5, D8, MOD-141
+/// D13).
 #[tokio::test]
-async fn a_spent_revision_answers_catalogue_stale() {
+async fn a_spent_revision_answers_graph_replaced_stale() {
     let backend = demo();
     let before = demo_catalogue(&backend).await;
     let request = rename_verdict_request(graph_entry(&before, ids::GRAPH_VULKAN_ANA));
 
-    let first = catalogue(serve(&backend, &request).await);
+    let (applied, first) = replaced(serve(&backend, &request).await);
+    assert!(matches!(applied, CasOutcome::Applied(_)), "{applied:?}");
     let reply = serve(&backend, &request).await;
 
-    let StoreReply::CatalogueStale(snapshot) = reply else {
+    let StoreReply::GraphReplaced {
+        outcome: CasOutcome::Stale(current),
+        catalogue: snapshot,
+    } = reply
+    else {
         panic!("a spent revision answers stale: {reply:?}");
     };
+    assert_eq!(
+        current.graph.revision, 1,
+        "the body as the first write left it"
+    );
     assert_eq!(*snapshot, first, "the refused write changed nothing");
     assert_eq!(
         graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA).graph.revision,
@@ -1113,6 +1141,122 @@ async fn delete_phase_rereads_the_catalogue() {
     assert_eq!(names, ["research"]);
     assert!(after.edges.is_empty(), "the phase's edge went with it");
     assert_eq!(after.graph.revision, 1);
+}
+
+/// MOD-141 D13: `GraphBody` reads one graph by id whatever its scope, the editor's open-by-id
+/// (the Toolbox hook): a project graph from the seed, then a workspace and a library graph made
+/// here; an id no graph has answers `None`.
+#[tokio::test]
+async fn graph_body_reads_one_graph_of_each_scope() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let workspace = StepGraphId::new();
+    let library = StepGraphId::new();
+    for (id, scope, name) in [
+        (
+            workspace,
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "ws-flow",
+        ),
+        (library, GraphScope::Library, "lib-flow"),
+    ] {
+        writer
+            .create_step_graph(NewStepGraph {
+                id,
+                scope,
+                name: name.to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("the graph is created");
+    }
+
+    for (id, scope) in [
+        (
+            ids::GRAPH_VULKAN_ANA,
+            GraphScope::Project(ids::PROJECT_VULKAN),
+        ),
+        (workspace, GraphScope::Workspace(ids::WORKSPACE_GRAPHICS)),
+        (library, GraphScope::Library),
+    ] {
+        let reply = serve(&backend, &StoreRequest::GraphBody(id)).await;
+        let StoreReply::GraphBody(Some(body)) = reply else {
+            panic!("graph {id} answers its body: {reply:?}");
+        };
+        assert_eq!(body.graph.id, id);
+        assert_eq!(body.graph.scope, scope);
+    }
+
+    let reply = serve(&backend, &StoreRequest::GraphBody(StepGraphId::new())).await;
+    assert!(
+        matches!(reply, StoreReply::GraphBody(None)),
+        "an unknown id answers none: {reply:?}"
+    );
+}
+
+/// MOD-141 D13: a library graph is written through the same `ReplaceGraph` as a project one, its
+/// body read by `GraphBody`; the reply's body is the library graph as stored. The scope's catalogue
+/// does not list it, and need not: the editor draws from the body.
+#[tokio::test]
+async fn replace_graph_on_a_library_graph_answers_its_body() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let library = StepGraphId::new();
+    writer
+        .create_step_graph(NewStepGraph {
+            id: library,
+            scope: GraphScope::Library,
+            name: "lib-flow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("the library graph is created");
+    let reply = serve(&backend, &StoreRequest::GraphBody(library)).await;
+    let StoreReply::GraphBody(Some(mut body)) = reply else {
+        panic!("the library graph answers its body: {reply:?}");
+    };
+    body.nodes.push(NodeBody {
+        phase: phase_row(
+            PhaseId::new(),
+            library,
+            0,
+            &PhaseSeed {
+                name: "research",
+                input_kinds: &[],
+                gate_hard: false,
+            },
+            Utc::now(),
+        ),
+        agents: Vec::new(),
+        parts: Vec::new(),
+    });
+
+    let (outcome, snapshot) = replaced(
+        serve(
+            &backend,
+            &StoreRequest::ReplaceGraph {
+                scope: vulkan_scope(),
+                graph: library,
+                expected_revision: body.graph.revision,
+                body,
+            },
+        )
+        .await,
+    );
+
+    let CasOutcome::Applied(stored) = outcome else {
+        panic!("a fresh revision applies: {outcome:?}");
+    };
+    assert_eq!(stored.graph.scope, GraphScope::Library);
+    assert_eq!(stored.graph.revision, 1);
+    let names: Vec<&str> = stored.nodes.iter().map(|n| n.phase.name.as_str()).collect();
+    assert_eq!(names, ["research"]);
+    assert!(
+        snapshot.projects[0].graph(library).is_none(),
+        "the project's catalogue does not list a library graph"
+    );
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1584,7 +1728,7 @@ async fn an_unknown_graph_name_is_refused() {
 async fn a_kind_can_take_a_library_graph() {
     let store = MemStore::demo();
     let library = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Library,
             name: "libflow".to_owned(),
@@ -1676,7 +1820,7 @@ async fn a_kind_can_take_a_library_graph() {
 async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name() {
     let store = MemStore::demo();
     let library = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Library,
             name: "libflow".to_owned(),
@@ -1698,7 +1842,7 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
         .await
         .expect("a kind on the library graph");
     let own = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Project(ids::PROJECT_VULKAN),
             name: "libflow".to_owned(),
@@ -1780,7 +1924,7 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
 async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
     let store = MemStore::demo();
     let shared = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
             name: "wsflow".to_owned(),
@@ -2131,6 +2275,57 @@ async fn a_stale_reply_with_no_editor_open_says_nothing_was_written() {
     bench.reply(
         &mut section,
         &StoreReply::CatalogueStale(Box::new(snapshot.clone())),
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere; nothing was written \u{2014} reopen the editor and retry"),
+        "the miss says the write did not apply, and how to resume: {flagged:?}"
+    );
+}
+
+/// MOD-141 D13: `ReplaceGraph`'s own reply redraws the tree the way `Catalogue` did, and its
+/// `Stale` twin with no editor open says nothing was written, as `CatalogueStale` did.
+#[tokio::test]
+async fn a_graph_replaced_reply_redraws_the_tree_like_a_catalogue() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    assert!(!bench.render_section(&section, 100).contains("decide"));
+    let mut renamed = snapshot.clone();
+    let entry = renamed.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the demo carries the analysis graph");
+    for node in &mut entry.nodes {
+        if node.phase.name == "verdict" {
+            node.phase.name = "decide".to_owned();
+        }
+    }
+    let body = Box::new(entry.clone());
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Applied(body.clone()),
+            catalogue: Box::new(renamed.clone()),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("decide"), "the tree is the reply's: {frame}");
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.is_empty(),
+        "an applied write sets no notice: {flagged:?}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Stale(body),
+            catalogue: Box::new(renamed),
+        },
     );
 
     let flagged = error_text(&bench, &section, 100);

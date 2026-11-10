@@ -204,7 +204,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 ///
 /// # Errors
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
-/// [`StoreError::Backend`] for a request that is not one of this module's eleven.
+/// [`StoreError::Backend`] for a request that is not one of this module's twelve.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -379,14 +379,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let outcome = writer
                 .replace_graph(*graph, *expected_revision, (**body).clone())
                 .await?;
-            cas(&writer, scope, &outcome).await
+            // MOD-141 D13: the body travels back with the scope re-read, so the editor holds what
+            // is stored (`Applied`) or what it now must rebase onto (`Stale`).
+            let catalogue = Box::new(snapshot(&writer, scope).await?);
+            let outcome = match outcome {
+                CasOutcome::Applied(body) => CasOutcome::Applied(Box::new(body)),
+                CasOutcome::Stale(body) => CasOutcome::Stale(Box::new(body)),
+            };
+            Ok(StoreReply::GraphReplaced { outcome, catalogue })
         }
         // MOD-137 D11/D12: the phase goes with its candidates, parts, edges and phase bindings.
         StoreRequest::DeletePhase { scope, phase } => {
             writer.delete_phase(*phase).await?;
             reread(&writer, scope).await
         }
-        // `try_serve` routes exactly this module's eleven variants here, so the last arm is
+        // MOD-141 D13: any scope's graph by id, for the editor's open-by-id (the Toolbox hook).
+        StoreRequest::GraphBody(graph) => Ok(StoreReply::GraphBody(
+            writer.graph_body(*graph).await?.map(Box::new),
+        )),
+        // `try_serve` routes exactly this module's twelve variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -417,11 +428,12 @@ async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Resu
     })
 }
 
-/// The eleven request names, in [`StoreRequest`] order: MOD-15 M4's nine, then MOD-137 D12's two.
+/// The twelve request names, in [`StoreRequest`] order: MOD-15 M4's nine, MOD-137 D12's two, then
+/// MOD-141 D13's one.
 ///
-/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a twelfth
-/// request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 11] = [
+/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a
+/// thirteenth request cannot be named in one place and matched in the other.
+pub const REQUEST_NAMES: [&str; 12] = [
     "catalogue",
     "create_kind",
     "update_kind",
@@ -433,4 +445,5 @@ pub const REQUEST_NAMES: [&str; 11] = [
     "set_phase_budget",
     "replace_graph",
     "delete_phase",
+    "graph_body",
 ];
