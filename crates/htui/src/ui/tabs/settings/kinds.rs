@@ -737,11 +737,20 @@ impl KindsSection {
     fn on_editor_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
         match reply {
             StoreReply::GraphReplaced { catalogue, .. } => {
-                self.snapshot = Some((**catalogue).clone());
-                self.unavailable = None;
-                self.clamp_cursor();
+                match catalogue {
+                    Some(catalogue) => {
+                        self.snapshot = Some((**catalogue).clone());
+                        self.unavailable = None;
+                        self.clamp_cursor();
+                        if let Mode::Graph { editor } = &mut self.mode {
+                            editor.set_personas(&catalogue.personas);
+                        }
+                    }
+                    // MOD-141 R1 L1: the write's outcome stands; the tree it would have moved is
+                    // read again, and its `Catalogue` hands the personas on.
+                    None => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
+                }
                 if let Mode::Graph { editor } = &mut self.mode {
-                    editor.set_personas(&catalogue.personas);
                     editor.on_reply(reply, ctx);
                 }
                 true
@@ -1522,10 +1531,17 @@ impl SettingsSection for KindsSection {
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // MOD-141 D13: `ReplaceGraph`'s answer carries the catalogue; read it as `Catalogue` /
             // `CatalogueStale` were. T7 routes it to an open graph editor first.
-            StoreReply::GraphReplaced { outcome, catalogue } => match outcome {
+            StoreReply::GraphReplaced {
+                outcome,
+                catalogue: Some(catalogue),
+            } => match outcome {
                 CasOutcome::Applied(_) => self.on_catalogue(catalogue),
                 CasOutcome::Stale(_) => self.on_stale(catalogue, ctx.keys()),
             },
+            // MOD-141 R1 L1: the re-read after the write failed; read it again.
+            StoreReply::GraphReplaced {
+                catalogue: None, ..
+            } => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
             StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).

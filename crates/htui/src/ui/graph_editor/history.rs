@@ -189,6 +189,13 @@ impl History {
         Some(write)
     }
 
+    /// An undo (or redo) the client's rules refused before it was sent (MOD-141 R1 M1): the
+    /// pending write is cleared and the entry it popped is dropped, not put back, so the next undo
+    /// reaches the one under it. Answers the write that was dropped; `None` with nothing pending.
+    pub(crate) fn dropped(&mut self) -> Option<Write> {
+        self.pending.take().map(|pending| pending.write)
+    }
+
     /// Forgets both stacks and the pending write.
     pub(crate) fn clear(&mut self) {
         self.undo.clear();
@@ -447,6 +454,33 @@ mod tests {
         assert_eq!(h.begin_redo(&b), Ok(c));
         h.failed();
         assert_eq!(h.busy(), None);
+    }
+
+    /// MOD-141 R1 M1: an undo (or redo) the client's rules refuse before it leaves is dropped:
+    /// nothing in flight, nothing put back, and the next undo reaches the entry under it.
+    #[test]
+    fn a_dropped_entry_is_gone_and_the_next_undo_reaches_the_older_one() {
+        let (a, b, c) = (body("a", 0), body("b", 1), body("c", 2));
+        let mut h = History::default();
+        edit(&mut h, "one", &a);
+        edit(&mut h, "two", &b);
+        assert_eq!(h.begin_undo(&c), Ok(b));
+        assert_eq!(h.dropped(), Some(Write::Undo("two".to_owned())));
+        assert_eq!(h.busy(), None);
+        assert_eq!(h.depths(), (1, 0));
+        assert_eq!(h.undo_label(), Some("one"));
+        assert_eq!(h.begin_undo(&c), Ok(a));
+        assert_eq!(h.applied(), Some(Write::Undo("one".to_owned())));
+        assert_eq!(h.depths(), (0, 1));
+
+        // A redo dropped the same way.
+        assert_eq!(h.begin_redo(&body("a", 3)), Ok(c));
+        assert_eq!(h.dropped(), Some(Write::Redo("one".to_owned())));
+        assert_eq!(h.depths(), (0, 0));
+        assert_eq!(h.busy(), None);
+
+        // Nothing in flight: nothing to drop.
+        assert_eq!(h.dropped(), None);
     }
 
     #[test]
