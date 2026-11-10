@@ -17,6 +17,11 @@
 //! answers arrive as *facts about the CLI* rather than as facts about `htui`'s reading of it.
 //! `HTUI_TOOL_CLAUDE` overrides the resolution the same way it does for any other tool.
 //!
+//! The one exception is case 11 (MOD-97 D6(b)), which goes through `src/cli/` on purpose: what it
+//! pins is the driver's own environment strip on the seeded `claude-cli` row, so it builds its
+//! launch with `CliDriver::launch_for` and its argv with `cli::argv`, then spawns through the same
+//! [`Run`] as every other case.
+//!
 //! Every case: resolve, spawn into a throwaway working directory, feed NDJSON user messages on
 //! stdin, read stdout to EOF on a bounded deadline, record the transcript, and assert **by pid**
 //! that nothing survives (`Spawned::pid`, then `/proc/<pid>` absent or state `Z`/`X` — the
@@ -64,7 +69,7 @@
 //! Message `uuid`s and `tool_use_id`s are **not** redacted: they are the wire's own join keys, they
 //! name nothing outside the transcript, and T51 maps `tool_use_id` back to its call.
 //!
-//! # The nine cases and the question each one answers
+//! # The cases and the question each one answers
 //!
 //! 1. [`case_1_auth_and_the_first_stdin_message`] — **E-0 / D92**. Two spawns, one with `--bare`
 //!    and one without. Which of them authenticates on this box decides whether `--bare` stays in
@@ -86,6 +91,12 @@
 //!    and at zero.
 //! 9. [`case_9_a_denied_tool`] — **D85, E-1**. What a policy denial looks like on the wire, which
 //!    is what `DriverEvent::PermissionAnswer` is mapped from.
+//! 10. [`case_10_a_denial_that_does_not_depend_on_this_box`] — **D85**. The same denial, provoked
+//!     by `--permission-prompts none` rather than by whatever allow list this box carries.
+//! 11. [`case_11_a_subscription_row_ignores_an_inherited_api_key`] — **MOD-97 D1, D5, D6(b)**. The
+//!     seeded `claude-cli` row, spawned by its driver while a bogus API key is exported, still
+//!     authenticates on the subscription login (`system/init.apiKeySource == "none"`). It is also
+//!     the canary for a CLI that makes `--bare` (strictly key or `apiKeyHelper`) the `-p` default.
 //!
 //! # The file's own rule
 //!
@@ -108,7 +119,9 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use htui_agent::launch::{AgentLaunch, Discovery, Spawned, StopSignal, ToolProbe};
+use htui_agent::launch::{
+    AgentLaunch, AgentSettings, Discovery, ResolvedLaunch, Spawned, StopSignal, ToolProbe,
+};
 use htui_core::model::StepId;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -319,8 +332,18 @@ impl Run {
             );
         let resolved =
             htui_agent::launch::resolve(&launch, &tools).expect("`${claude}` substitutes");
-        println!("$ {} {:?}", resolved.command, resolved.args);
-        let mut spawned = htui_agent::launch::spawn(&resolved, cwd)
+        Self::spawn(&resolved, cwd).await
+    }
+
+    /// Spawns an already-resolved launch in `cwd`. [`Run::start`] resolves the file's own
+    /// `${claude}` launch; [`case_11_a_subscription_row_ignores_an_inherited_api_key`] resolves
+    /// through `CliDriver::launch_for`, so the spawn carries the driver's `env_remove`.
+    async fn spawn(resolved: &ResolvedLaunch, cwd: &Path) -> Self {
+        println!(
+            "$ {} {:?} (env_remove {:?})",
+            resolved.command, resolved.args, resolved.env_remove
+        );
+        let mut spawned = htui_agent::launch::spawn(resolved, cwd)
             .await
             .expect("the CLI starts");
         let pid = spawned.pid();
@@ -1994,5 +2017,157 @@ async fn case_10_a_denial_that_does_not_depend_on_this_box() {
          `permission_denials[]`, keyed by the call's own `tool_use_id`. `cli/claude.rs`'s \
          `denials_of` reads exactly these keys, and `tests/cli_map.rs` can stop calling its \
          coverage synthetic."
+    );
+}
+
+/// **MOD-97 D1, D5, D6(b).** A subscription-billed row never bills an exported API key.
+///
+/// Claude Code in `-p` mode uses `ANTHROPIC_API_KEY` whenever it is set, and every agent child
+/// inherits `htui`'s environment, so a box that exports the key (`hr attach --api-key`) would bill
+/// the seeded `claude-cli` row to it. The driver strips the row's `api_billing_env` list from the
+/// session: from the resolved environment and, through `env_remove`, from what the child inherits.
+/// This case spawns the seeded row through `CliDriver::launch_for` with a **bogus** key exported:
+/// if the strip failed the turn would fail authentication, and if the CLI ever made `--bare` the
+/// `-p` default (no `--no-bare` exists) the login would stop counting and this case fails loudly.
+///
+/// `set_var` is `unsafe` and the workspace forbids `unsafe_code`, so the case re-runs its own test
+/// binary as a child with the bogus variables set and `--ignored`, or the filter matches nothing;
+/// the parent asserts the child ran exactly one test and passed. The bogus values never reach a
+/// fixture: [`secret_values`] redacts any variable whose name says `KEY` or `TOKEN`.
+#[tokio::test]
+#[ignore = "spends model tokens against the subscription login this box holds"]
+async fn case_11_a_subscription_row_ignores_an_inherited_api_key() {
+    const CHILD: &str = "HTUI_CLI_LIVE_SUBSCRIPTION_ENV_CHILD";
+    const NAME: &str = "case_11_a_subscription_row_ignores_an_inherited_api_key";
+    const BOGUS_KEY: &str = "sk-ant-api03-htui-mod97-bogus-key-never-valid";
+    const BOGUS_TOKEN: &str = "htui-mod97-bogus-auth-token-never-valid";
+
+    let _serial = ONE_AT_A_TIME.lock().await;
+    if std::env::var_os(CHILD).is_none() {
+        println!("\n=== case 11 / subscription row with an exported API key ===");
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                NAME,
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("ANTHROPIC_API_KEY", BOGUS_KEY)
+            .env("ANTHROPIC_AUTH_TOKEN", BOGUS_TOKEN)
+            .output()
+            .await
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}");
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // `--ignored` is what makes the child run this case at all; a filter that matched nothing
+        // would also succeed.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+        return;
+    }
+
+    // The child: the bogus key is inherited, so without the strip the CLI would bill (and fail) on it.
+    assert_eq!(
+        std::env::var("ANTHROPIC_API_KEY").as_deref(),
+        Ok(BOGUS_KEY),
+        "precondition: the child inherits the exported key"
+    );
+
+    let rows = htui_core::model::agent::seed_rows(Utc::now());
+    let row = rows
+        .iter()
+        .find(|row| row.name == "claude-cli")
+        .expect("precondition: the seed rows carry `claude-cli`");
+    let settings: AgentSettings =
+        serde_json::from_value(row.settings.clone()).expect("the seeded settings parse");
+    let cli = settings
+        .cli
+        .clone()
+        .expect("the seeded CLI row carries a cli block");
+    let driver =
+        htui_agent::cli::CliDriver::from_row(row, htui_agent::driver::DriverCaps::default())
+            .expect("the seeded row builds a driver");
+
+    let cwd = scratch();
+    let spec = htui_agent::driver::SessionSpec {
+        agent_id: htui_core::model::AgentId::new(),
+        step_id: StepId::new(),
+        cwd: cwd.path().to_path_buf(),
+        extra_dirs: Vec::new(),
+        env: BTreeMap::new(),
+        model: None,
+        tools: htui_agent::driver::ToolExposure::default(),
+        mcp: Vec::new(),
+        permission: htui_agent::driver::PermissionPolicy::default(),
+        retain_raw: false,
+        resume: None,
+        budget_micros: None,
+        prompt: None,
+    };
+    let mut resolved = driver.launch_for(&spec).await.expect(
+        "precondition: the seeded row resolves on this box. `${claude}` is a `path` probe; put \
+         the binary on PATH or set HTUI_TOOL_CLAUDE.",
+    );
+    assert!(
+        resolved
+            .env_remove
+            .iter()
+            .any(|name| name == "ANTHROPIC_API_KEY"),
+        "the seeded subscription row strips the API key: {:?}",
+        resolved.env_remove
+    );
+    assert!(
+        !resolved.env.contains_key("ANTHROPIC_API_KEY"),
+        "the resolved environment names no API key"
+    );
+    // The session's own argv, as the driver builds it, with a minted UUIDv7 as case 2 uses.
+    let minted = StepId::new().to_string();
+    resolved.args = htui_agent::cli::argv(
+        &resolved.args,
+        &cli,
+        &spec,
+        &minted,
+        None,
+        settings.user_extensions,
+    );
+
+    let mut run = Run::spawn(&resolved, cwd.path()).await;
+    run.send("reply with exactly the word ok").await;
+    let result = run.read_result(TURN_WINDOW).await;
+    run.close_stdin();
+    let _ = run.drain(EOF_WINDOW).await;
+    let status = run.wait(EOF_WINDOW).await;
+
+    let api_key_source = run
+        .json_lines()
+        .iter()
+        .find(|line| line["type"] == json!("system") && line["subtype"] == json!("init"))
+        .map(|line| line["apiKeySource"].clone());
+    println!("  system/init.apiKeySource = {api_key_source:?}");
+    match &result {
+        Some(result) => println!("  result: {}", usage_line(result)),
+        None => println!("  result: none arrived"),
+    }
+    run.finish("subscription_env", status).await;
+    drop(cwd);
+
+    assert_eq!(
+        api_key_source,
+        Some(json!("none")),
+        "MOD-97 D6(b): the seeded subscription row must authenticate on the login, not on an \
+         exported key. Anything but \"none\" means the key reached the CLI (the strip failed) or \
+         the CLI now reads keys only (`--bare` became the `-p` default): a finding for the \
+         maintainer, not a flake."
+    );
+    let result = result.expect("the turn produced a `result`");
+    assert!(
+        is_success(&result),
+        "the turn succeeded on the subscription login: {result}"
     );
 }

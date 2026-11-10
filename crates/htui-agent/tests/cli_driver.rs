@@ -11,6 +11,8 @@
 //!
 //! Blueprint H-7's fixture rule: no case here touches a seed row. Every row is synthetic and
 //! declares its command directly, so a case can say exactly what the kernel was asked to start.
+//! The one exception is `the_seeded_cli_row_never_asks_for_bare` (MOD-97 D6(a)), which pins the
+//! seed itself and builds its argv without a process.
 //! Nothing here is keyed on the row's **name** either (`R-AGT-5`) — the rows are called
 //! `scripted-cli` precisely so that a supervisor that had started reading names would fail.
 
@@ -41,9 +43,9 @@ use htui_agent::event::{
     DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent, Stamp, StopReason,
     TerminalReason, ToolResultStatus,
 };
-use htui_agent::launch::CliSettings;
+use htui_agent::launch::{AgentLaunch, AgentSettings, CliSettings};
 #[cfg(unix)]
-use htui_agent::launch::{AgentSettings, ChildIo, SESSION_VAR};
+use htui_agent::launch::{ChildIo, SESSION_VAR};
 use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
 #[cfg(unix)]
 use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
@@ -2750,6 +2752,52 @@ async fn a_billing_list_cannot_strip_the_session_marker() {
     assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
     assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
     assert!(!resolved.env.contains_key(BILLING_ENV[0]));
+}
+
+/// MOD-97 D6(a), the one case here that reads a seed row (H-7's exception): the seeded
+/// `claude-cli` row never asks for `--bare`. Claude Code has no `--no-bare`, and `--bare` sets
+/// `CLAUDE_CODE_SIMPLE=1` and makes authentication strictly an API key or an `apiKeyHelper`, so a
+/// seed that asked for it would bill a subscription row to the key [`launch_for`] strips. The argv
+/// is built straight from the row, without `launch_for`, which would resolve `${claude}` on the
+/// `PATH`.
+///
+/// [`launch_for`]: CliDriver::launch_for
+#[test]
+fn the_seeded_cli_row_never_asks_for_bare() {
+    let rows = htui_core::model::agent::seed_rows(
+        chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.name == "claude-cli")
+        .expect("the seed rows carry `claude-cli`");
+    let launch: AgentLaunch =
+        serde_json::from_value(row.launch.clone()).expect("the seeded launch parses");
+    let settings: AgentSettings =
+        serde_json::from_value(row.settings.clone()).expect("the seeded settings parse");
+    let cli = settings
+        .cli
+        .expect("the seeded CLI row carries a cli block");
+
+    let args = argv(
+        &launch.args,
+        &cli,
+        &spec(PathBuf::from("/scratch")),
+        "sid",
+        None,
+        settings.user_extensions,
+    );
+
+    assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
+    assert!(
+        !cli.extra_args.contains(&"--bare".to_owned()),
+        "{:?}",
+        cli.extra_args
+    );
+    assert!(
+        !launch.env.contains_key("CLAUDE_CODE_SIMPLE"),
+        "the seed sets no `CLAUDE_CODE_SIMPLE`"
+    );
 }
 
 /// [`TURN_SCRIPT`], after copying its own `HTUI_SESSION` (or `unset`) to `$HTUI_GO_FILE.session`.
