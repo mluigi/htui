@@ -23,7 +23,7 @@ use crate::error::{map_migrate, map_sqlx};
 /// The mirror file inside [`CacheStore::dir`].
 pub const CACHE_FILE: &str = "cache.sqlite";
 
-/// The twenty-one mirrored tables of §4.4, in foreign-key order.
+/// The twenty-two mirrored tables of §4.4, in foreign-key order.
 ///
 /// The order is the one [`refresh::run_pass`] fills them in and the one [`CacheStore::rebuild`]
 /// empties them in; `cache_meta` and `cache_cursor` are local and deliberately absent.
@@ -41,7 +41,10 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// `requirement_spec`, `requirement_area`, `requirement` and `item_requirement` joined in MOD-38
 /// (plan D12, `docs/ANA-11.md` §5.2): an offline reader answers the §5.1 requirement reads off
 /// them. `requirement_revision` and `requirement_key_counter` are not mirrored.
-pub const MIRRORED_TABLES: [&str; 21] = [
+///
+/// `run_plan` joined in MOD-139 M1 (plan D2): an offline reader answers `ReadStore::run_plans` off
+/// it (MOD-142's parts tree); it rides its own `updated_at`, which a status move bumps.
+pub const MIRRORED_TABLES: [&str; 22] = [
     "app_user",
     "agent",
     "box",
@@ -58,6 +61,7 @@ pub const MIRRORED_TABLES: [&str; 21] = [
     "run_step",
     "run_step_commit",
     "run_step_tree",
+    "run_plan",
     "session_event",
     "requirement_spec",
     "requirement_area",
