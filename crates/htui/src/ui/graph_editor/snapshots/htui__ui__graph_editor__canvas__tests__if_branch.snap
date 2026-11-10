@@ -1,0 +1,18 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&body, None, &[], (100, 28))"
+---
+
+                                      ╭─ implement ──────────╮
+                                      │template implement    │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                   ╭─────────────if verify failed╮
+                                   ▼                             ▼
+                       ╭─ review ─────────────╮      ╭─ fix ────────────────╮
+                       │template review       │      │template fix          │
+                       │gate always · retries…│      │gate always · retries…│
+                       │any agent             │      │any agent             │
+                       ╰───────────●──────────╯      ╰───────────●──────────╯

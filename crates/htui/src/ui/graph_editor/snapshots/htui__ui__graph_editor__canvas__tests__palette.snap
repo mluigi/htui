@@ -1,0 +1,42 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&body, None, &demo_agents().await, (100, 40))"
+---
+
+                                      ╭─ reproduce ──────────╮
+                                      │template reproduce    │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ fix ────────────────╮
+                                      │template fix          │◀╮
+                                      │gate always · retries…│ │
+                                      │any agent             │ │
+                                      ╰───────────●──────────╯ │
+                                                  │            │
+                                                  │  changes requested ×1
+                                                  ▼            │
+                                      ╭─ review ─────────────╮ │
+                                      │template review       │ │
+                                      │gate always · retries…│ │
+                                      │any agent             │─╯
+                                      ╰───────────●──────────╯
+
+
+
+
+
+
+
+
+
+
+
+                                      ╭─ triage ─────────────╮
+                                      │template triage       │
+                                      │gate always · retries…│
+                                      │palette               │
+                                      ╰──────────────────────╯
