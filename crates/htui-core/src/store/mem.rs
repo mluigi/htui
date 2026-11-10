@@ -8441,8 +8441,9 @@ impl State {
     }
 
     /// MOD-11 D13, B-6: the upsert. Refusals run self link, step, fence, own item, `to`, its
-    /// reach (MOD-147 D3, [`Self::link_reaches`]); then a new row is live and the step's, a tombstone revives as the step's, and a
-    /// live row keeps its proposer (only `updated_at` moves, as Postgres's trigger moves it).
+    /// reach (MOD-147 D3, [`Self::link_reaches`]); then a new row is live and the step's, a
+    /// tombstone revives as the step's, and a live row keeps its proposer (only `updated_at`
+    /// moves, as Postgres's trigger moves it).
     fn propose_link(
         &mut self,
         fence: StepFence,
