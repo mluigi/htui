@@ -1499,20 +1499,20 @@ mod tests {
     fn applied(body: GraphBody) -> StoreReply {
         StoreReply::GraphReplaced {
             outcome: CasOutcome::Applied(Box::new(body)),
-            catalogue: Box::new(crate::catalogue::CatalogueSnapshot {
+            catalogue: Some(Box::new(crate::catalogue::CatalogueSnapshot {
                 projects: Vec::new(),
                 personas: Vec::new(),
-            }),
+            })),
         }
     }
 
     fn stale(body: GraphBody) -> StoreReply {
         StoreReply::GraphReplaced {
             outcome: CasOutcome::Stale(Box::new(body)),
-            catalogue: Box::new(crate::catalogue::CatalogueSnapshot {
+            catalogue: Some(Box::new(crate::catalogue::CatalogueSnapshot {
                 projects: Vec::new(),
                 personas: Vec::new(),
-            }),
+            })),
         }
     }
 

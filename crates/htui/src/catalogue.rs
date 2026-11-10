@@ -200,7 +200,9 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 /// Known residue, the same one [`crate::hierarchy::serve`] carries and milestone 3 recorded: every
 /// write arm answers `Failed` if the re-read *after* an applied write fails, so the section is told
 /// nothing happened when the row has in fact changed — separating the two needs a seam method that
-/// returns the write's own outcome without a read, and this milestone adds none.
+/// returns the write's own outcome without a read, and this milestone adds none. `replace_graph`
+/// is exempt (MOD-141 R1 L1): its outcome travels in its own reply, so a failed re-read after it
+/// answers [`StoreReply::GraphReplaced`] with `catalogue: None` rather than `Failed`.
 ///
 /// # Errors
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
@@ -380,8 +382,10 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .replace_graph(*graph, *expected_revision, (**body).clone())
                 .await?;
             // MOD-141 D13: the body travels back with the scope re-read, so the editor holds what
-            // is stored (`Applied`) or what it now must rebase onto (`Stale`).
-            let catalogue = Box::new(snapshot(&writer, scope).await?);
+            // is stored (`Applied`) or what it now must rebase onto (`Stale`). R1 L1: the write
+            // has happened by now, so a failed re-read is `None`, never a `Failed` that says it
+            // did not.
+            let catalogue = snapshot(&writer, scope).await.ok().map(Box::new);
             let outcome = match outcome {
                 CasOutcome::Applied(body) => CasOutcome::Applied(Box::new(body)),
                 CasOutcome::Stale(body) => CasOutcome::Stale(Box::new(body)),

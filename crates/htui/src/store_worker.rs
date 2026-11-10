@@ -1672,8 +1672,10 @@ pub enum StoreReply {
     GraphReplaced {
         /// The write's outcome, the body boxed (clippy `large_enum_variant`).
         outcome: CasOutcome<Box<GraphBody>>,
-        /// The scope's catalogue after the write, or after the miss.
-        catalogue: Box<CatalogueSnapshot>,
+        /// The scope's catalogue after the write, or after the miss; `None` when that re-read
+        /// failed, so a write that landed is never answered `Failed` (MOD-141 R1 L1). The
+        /// receiver keeps the tree it has and reads the catalogue again.
+        catalogue: Option<Box<CatalogueSnapshot>>,
     },
     /// MOD-141 D13: the answer to [`StoreRequest::GraphBody`]; `None` when no graph has the id.
     GraphBody(Option<Box<GraphBody>>),

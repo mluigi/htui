@@ -74,7 +74,10 @@ fn refusal(reply: StoreReply) -> (&'static str, String) {
 #[track_caller]
 fn replaced(reply: StoreReply) -> (CasOutcome<Box<GraphBody>>, CatalogueSnapshot) {
     match reply {
-        StoreReply::GraphReplaced { outcome, catalogue } => (outcome, *catalogue),
+        StoreReply::GraphReplaced {
+            outcome,
+            catalogue: Some(catalogue),
+        } => (outcome, *catalogue),
         other => panic!("expected a replaced graph: {other:?}"),
     }
 }
@@ -1060,7 +1063,7 @@ async fn a_spent_revision_answers_graph_replaced_stale() {
 
     let StoreReply::GraphReplaced {
         outcome: CasOutcome::Stale(current),
-        catalogue: snapshot,
+        catalogue: Some(snapshot),
     } = reply
     else {
         panic!("a spent revision answers stale: {reply:?}");
@@ -2311,7 +2314,7 @@ async fn a_graph_replaced_reply_redraws_the_tree_like_a_catalogue() {
         &mut section,
         &StoreReply::GraphReplaced {
             outcome: CasOutcome::Applied(body.clone()),
-            catalogue: Box::new(renamed.clone()),
+            catalogue: Some(Box::new(renamed.clone())),
         },
     );
 
@@ -2327,7 +2330,7 @@ async fn a_graph_replaced_reply_redraws_the_tree_like_a_catalogue() {
         &mut section,
         &StoreReply::GraphReplaced {
             outcome: CasOutcome::Stale(body),
-            catalogue: Box::new(renamed),
+            catalogue: Some(Box::new(renamed)),
         },
     );
 
@@ -3605,6 +3608,65 @@ async fn a_graph_replaced_reply_updates_the_tree_and_the_editor() {
         "an applied write leaves no notice: {frame}"
     );
     assert!(!section.absorbs_failure("replace_graph"));
+}
+
+/// MOD-141 R1 L1: a write that landed is `Applied` even when the re-read after it failed
+/// (`catalogue: None`): the editor still takes the stored body, and the section keeps the tree it
+/// has and asks for the catalogue again, open editor or not.
+#[tokio::test]
+async fn a_graph_replaced_reply_without_a_catalogue_still_lands_and_asks_for_a_re_read() {
+    let backend = demo();
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    bench.key(&mut section, "enter");
+    for _ in 0.."verdict".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "decide");
+    bench.key(&mut section, "enter");
+    let asked = store_requests(&bench);
+    let [write @ StoreRequest::ReplaceGraph { .. }] = asked.as_slice() else {
+        panic!("the step form's save is one `replace_graph`: {asked:?}");
+    };
+    let (outcome, _) = replaced(serve(&backend, write).await);
+    let landed = StoreReply::GraphReplaced {
+        outcome,
+        catalogue: None,
+    };
+    bench.reply(&mut section, &landed);
+
+    let asked = store_requests(&bench);
+    assert!(
+        matches!(asked.as_slice(), [StoreRequest::Catalogue(scope)] if *scope == vulkan_scope()),
+        "the section reads the catalogue again: {asked:?}"
+    );
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("saved: editing verdict"),
+        "the editor took the landed write: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).is_empty(),
+        "a write that landed is no refusal: {frame}"
+    );
+
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(". verdict "),
+        "the old tree stays until the re-read answers: {frame}"
+    );
+
+    // With no editor open the section still asks again rather than drawing nothing new.
+    bench.reply(&mut section, &landed);
+    let asked = store_requests(&bench);
+    assert!(
+        matches!(asked.as_slice(), [StoreRequest::Catalogue(_)]),
+        "{asked:?}"
+    );
 }
 
 /// MOD-141 D2: a scope change drops the editor with the tree it was opened from (`R-NF-3`'s
