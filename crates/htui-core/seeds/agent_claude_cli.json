@@ -22,6 +22,7 @@
              "extra_args": [] },
     "permission": { "default": "ask", "rules": [], "remembered": [] },
     "quota": { "source": "cli_rate_limit_event" },
-    "usage": { "scope": "model_usage" }
+    "usage": { "scope": "model_usage" },
+    "api_billing_env": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
   }
 }

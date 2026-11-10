@@ -38,6 +38,7 @@
              "session": { "load": true, "resume": true } },
     "permission": { "default": "ask", "rules": [], "remembered": [] },
     "quota": { "source": "acp_meta_rate_limit" },
-    "usage": { "scope": "model_usage" }
+    "usage": { "scope": "model_usage" },
+    "api_billing_env": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
   }
 }
