@@ -28342,6 +28342,26 @@ async fn create_step_writes_role_parent_and_node_key<S: WriteStore>(store: &S) {
         (StepRole::Step, None, None),
         "{CASE}: an ordinary step reads `step` with no parent and no key"
     );
+
+    // Postgres checks the parent's foreign key once the row is in, so a step that names itself
+    // as its parent is accepted there; every store accepts it alike.
+    let own = StepId::new();
+    let itself = store
+        .create_step(NewRunStep {
+            id: own,
+            ..role_step(run, 6, StepRole::Part, Some(own), Some("implement/self"))
+        })
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a step that is its own parent is accepted: {err}"));
+    assert_eq!(
+        (itself.id, itself.parent_step_id),
+        (own, Some(own)),
+        "{CASE}: the row names itself as its parent"
+    );
+    assert!(
+        store.run_steps(run).await.expect(CASE).contains(&itself),
+        "{CASE}: the self-parented row is listed"
+    );
 }
 
 /// MOD-139 D1, D4: a part names both its planner step and its node key; either missing is refused

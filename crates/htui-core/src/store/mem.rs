@@ -6691,7 +6691,10 @@ impl State {
                 "agent",
             )));
         }
+        // Postgres checks the parent's foreign key once the row is in, so a step that names
+        // itself as its parent passes there and here.
         if let Some(parent) = new.parent_step_id
+            && parent != new.id
             && !self.steps.contains_key(&parent)
         {
             return Err(StoreError::Constraint(references_no_row(
