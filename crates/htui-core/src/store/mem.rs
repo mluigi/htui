@@ -55,7 +55,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
-use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, RunPlan, StepRole};
+use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -90,6 +90,9 @@ use crate::store::traits::{
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     workspace_graph_is_held,
+};
+use crate::store::traits::{
+    plan_revision_taken, planner_not_in_run, run_plan_refusal, run_step_refusal,
 };
 use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
@@ -363,6 +366,8 @@ struct State {
     memory_entries: HashMap<MemoryEntryId, MemoryEntry>,
     /// `memory_entry_revision`, append-only, as [`State::requirement_revisions`] is.
     memory_revisions: Vec<MemoryRevision>,
+    /// MOD-139 D1: `run_plan`, append-only in revisions. No fixture loads one (plan D8).
+    run_plans: Vec<RunPlan>,
 }
 
 impl MemStore {
@@ -485,6 +490,7 @@ impl MemStore {
             item_requirements: data.item_requirements,
             memory_entries: HashMap::new(),
             memory_revisions: Vec::new(),
+            run_plans: Vec::new(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -5442,7 +5448,8 @@ impl State {
     /// workspace. `run_step_commits` and `run_step_trees` were `0` until MOD-4 milestone 1 gave
     /// this store the two maps (plan D12), `command_runs` until milestone 3 gave it the third
     /// (plan D31), and `phase_agents` until MOD-37 R-6 gave it the fourth. MOD-38's six
-    /// requirement counts come from the same pass (blueprint F1, §4.4).
+    /// requirement counts come from the same pass (blueprint F1, §4.4), and so do MOD-139's
+    /// `run_plans` (plan D5).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -5643,8 +5650,13 @@ impl State {
                     .filter(|row| memory_entries.contains(&row.entry_id))
                     .count(),
             ),
-            // MOD-139 plan D5: MemStore holds no `run_plan` rows until T2.
-            run_plans: 0,
+            // MOD-139 plan D5: a plan goes with its run.
+            run_plans: rows(
+                self.run_plans
+                    .iter()
+                    .filter(|row| runs.contains(&row.run_id))
+                    .count(),
+            ),
         };
         Some((
             reach,
@@ -5782,6 +5794,9 @@ impl State {
         self.steps.retain(|id, _| !gone.steps.contains(id));
         self.openings.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
+        // MOD-139 plan D5: a plan goes with its run (and its planner step), `ON DELETE CASCADE`.
+        self.run_plans
+            .retain(|row| !gone.runs.contains(&row.run_id));
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
         // MOD-42 plan D1: both relay tables go with their run (`ON DELETE CASCADE`, F-18).
         self.permissions
@@ -6653,6 +6668,10 @@ impl State {
 
     /// A `run_step` at `pending` with every settle column `NULL`.
     fn create_step(&mut self, new: NewRunStep, now: DateTime<Utc>) -> Result<RunStep> {
+        // MOD-139 D4 (blueprint P-7): the role CHECKs first, before any read, in Postgres's words.
+        if let Some(refusal) = run_step_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
         if self.steps.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("run_step", new.id)));
         }
@@ -6670,6 +6689,15 @@ impl State {
                 "run_step.agent_id",
                 agent,
                 "agent",
+            )));
+        }
+        if let Some(parent) = new.parent_step_id
+            && !self.steps.contains_key(&parent)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "run_step.parent_step_id",
+                parent,
+                "run_step",
             )));
         }
         if self.steps.values().any(|row| {
@@ -6894,6 +6922,83 @@ impl State {
         row.branch = Some(branch.clone());
         row.updated_at = now;
         Ok(true)
+    }
+
+    /// MOD-139 D4: [`WriteStore::insert_run_plan`] in Postgres's order (blueprint §1): the shape,
+    /// the run, the fence (`lease_owners` as [`Self::fence_holds`] reads it), the planner step,
+    /// the id, then the revision. One `now` stamps both columns.
+    fn insert_run_plan(
+        &mut self,
+        fence: StepFence,
+        plan: NewRunPlan,
+        now: DateTime<Utc>,
+    ) -> Result<RunPlan> {
+        if let Some(refusal) = run_plan_refusal(&plan) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if !self.runs.contains_key(&plan.run_id) {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: plan.run_id.to_string(),
+            });
+        }
+        if self.lease_owners.get(&plan.run_id).copied() != fence.owner() {
+            return Err(StoreError::Fenced {
+                step: plan.planner_step_id,
+            });
+        }
+        if self
+            .steps
+            .get(&plan.planner_step_id)
+            .is_none_or(|step| step.run_id != plan.run_id)
+        {
+            return Err(StoreError::Constraint(planner_not_in_run(
+                plan.planner_step_id,
+                plan.run_id,
+            )));
+        }
+        if self.run_plans.iter().any(|row| row.id == plan.id) {
+            return Err(StoreError::Constraint(already_exists("run_plan", plan.id)));
+        }
+        if self
+            .run_plans
+            .iter()
+            .any(|row| row.run_id == plan.run_id && row.revision == plan.revision)
+        {
+            return Err(StoreError::Constraint(plan_revision_taken(
+                plan.run_id,
+                plan.revision,
+            )));
+        }
+        let row = RunPlan {
+            id: plan.id,
+            run_id: plan.run_id,
+            revision: plan.revision,
+            planner_step_id: plan.planner_step_id,
+            scope: plan.scope,
+            status: PlanStatus::Proposed,
+            base_position: plan.base_position,
+            base_refs: None,
+            body: plan.body,
+            digest: plan.digest,
+            created_at: now,
+            updated_at: now,
+        };
+        self.run_plans.push(row.clone());
+        Ok(row)
+    }
+
+    /// MOD-139 D4: [`ReadStore::run_plans`], the run's plans in `revision` order; none for an
+    /// unknown run.
+    fn run_plan_rows(&self, run: RunId) -> Vec<RunPlan> {
+        let mut rows: Vec<RunPlan> = self
+            .run_plans
+            .iter()
+            .filter(|row| row.run_id == run)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.revision);
+        rows
     }
 
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.
@@ -9707,9 +9812,8 @@ impl ReadStore for MemStore {
         Ok(self.read(|state| state.owner_document_rows(project)))
     }
 
-    /// MOD-139 M1 T1 stub; T2 reads `State`'s plans.
-    async fn run_plans(&self, _run: RunId) -> Result<Vec<RunPlan>> {
-        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        Ok(self.read(|state| state.run_plan_rows(run)))
     }
 }
 
@@ -10396,9 +10500,9 @@ impl WriteStore for MemStore {
         self.write(|state| state.record_branch(fence, step, branch, now))
     }
 
-    /// MOD-139 M1 T1 stub; T2 writes `State`'s plans.
-    async fn insert_run_plan(&self, _fence: StepFence, _plan: NewRunPlan) -> Result<RunPlan> {
-        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan> {
+        let now = self.now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        self.write(|state| state.insert_run_plan(fence, plan, now))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
@@ -13515,6 +13619,30 @@ mod tests {
             (2, 3),
             "precondition: two entries, three revisions"
         );
+        // MOD-139 plan D5: no fixture seeds a `run_plan` row (D8), so one is staged on an `htui`
+        // run under one of its steps.
+        store.write(|state| {
+            let at = Utc::now();
+            state.run_plans.push(crate::model::RunPlan {
+                id: crate::model::RunPlanId::new(),
+                run_id: ids::RUN_1,
+                revision: 0,
+                planner_step_id: ids::STEP_IMPL,
+                scope: crate::model::PlanScope::Parts,
+                status: crate::model::PlanStatus::Proposed,
+                base_position: 5,
+                base_refs: None,
+                body: serde_json::json!({"parts": []}),
+                digest: "sha256:staged".to_owned(),
+                created_at: at,
+                updated_at: at,
+            });
+        });
+        assert_eq!(
+            store.read(|state| state.run_plans.len()),
+            1,
+            "precondition: one run plan"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
@@ -13530,6 +13658,10 @@ mod tests {
             assert!(
                 state.phase_parts.is_empty(),
                 "phase_part goes with its phase (MOD-137 D8)"
+            );
+            assert!(
+                state.run_plans.is_empty(),
+                "run_plan goes with its run (MOD-139 D5)"
             );
             assert!(
                 state
