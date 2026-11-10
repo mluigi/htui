@@ -51,6 +51,7 @@ use crate::catalogue::{
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::graph_editor::{EditorKey, GraphEditor};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label;
@@ -86,6 +87,7 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::KindsNewGraph, "graph"),
     Hint::One(Act::Edit, "edit"),
     Hint::One(Act::KindsGraph, "graph"),
+    Hint::One(Act::KindsEditor, "graph editor"),
     Hint::One(Act::Delete, "delete kind"),
     Hint::One(Act::Reload, "reload"),
 ];
@@ -332,6 +334,12 @@ enum Mode {
         /// The prefix that was typed.
         new: String,
     },
+    /// MOD-141 D2: the graph editor on one of the project's own graphs, over the whole section. It
+    /// takes every key, paste and its own replies while open; its close act returns to Browse.
+    Graph {
+        /// The editor (boxed: it is by far the largest variant).
+        editor: Box<GraphEditor>,
+    },
 }
 
 /// Everything the mode is *about*, never what was typed into it (H-7).
@@ -363,6 +371,7 @@ impl core::fmt::Debug for Mode {
                 .field("editor", editor)
                 .field("old", old)
                 .finish_non_exhaustive(),
+            Self::Graph { editor } => f.debug_struct("Graph").field("editor", editor).finish(),
         }
     }
 }
@@ -701,16 +710,8 @@ impl KindsSection {
                 };
                 let id = kind.default_graph_id;
                 if self.locate_graph(id).is_none() {
-                    // MOD-138 D12: a workspace or library graph is the kind's to name, not this
-                    // section's to edit; say which, rather than calling it missing.
-                    let shared = self
-                        .project(p)
-                        .and_then(|project| project.graph_name(id))
-                        .map(|(name, scope)| graph_label(name, scope));
-                    self.refuse(shared.map_or_else(
-                        || GRAPH_MISSING.to_owned(),
-                        |label| format!("graph {label} is not edited here"),
-                    ));
+                    let refusal = self.not_a_project_graph(p, id);
+                    self.refuse(refusal);
                     return;
                 }
                 id
@@ -728,6 +729,137 @@ impl KindsSection {
         let expected = entry.graph.updated_at;
         let fields = edit_graph_fields(entry);
         self.open(EditorKind::EditGraph(id), fields, Some(expected));
+    }
+
+    /// Why a kind's default graph `id` opens no editor here: it is a workspace or library graph
+    /// (MOD-138 D12: the kind's to name, not this section's to edit; say which, rather than calling
+    /// it missing), or it names nothing at all.
+    fn not_a_project_graph(&self, p: usize, id: StepGraphId) -> String {
+        self.project(p)
+            .and_then(|project| project.graph_name(id))
+            .map(|(name, scope)| graph_label(name, scope))
+            .map_or_else(
+                || GRAPH_MISSING.to_owned(),
+                |label| format!("graph {label} is not edited here"),
+            )
+    }
+
+    /// MOD-141 D3: the graph editor on the row's graph, over the whole section (D2). A graph row
+    /// opens on its graph, a phase row on its graph with that step selected (`form`: its step form
+    /// open too, D14), a kind row on its default graph when that is one of the project's own. A
+    /// project row has no graph, and says which rows do. The caller has checked
+    /// [`blocked`](KindsSection::blocked).
+    fn open_editor(&mut self, row: Row, form: bool, ctx: &Ctx<'_>) {
+        let (p, g, step) = match row {
+            Row::Project { .. } => {
+                let key = ctx.keys().label(views::KINDS_BROWSE, Act::KindsEditor);
+                self.refuse(pick_a_graph(key.as_deref()));
+                return;
+            }
+            Row::Kind { p, k } => {
+                let Some(id) = self
+                    .project(p)
+                    .and_then(|project| project.kinds.get(k))
+                    .map(|kind| kind.default_graph_id)
+                else {
+                    return;
+                };
+                let Some(g) = self.project(p).and_then(|project| {
+                    project.graphs.iter().position(|entry| entry.graph.id == id)
+                }) else {
+                    let refusal = self.not_a_project_graph(p, id);
+                    self.refuse(refusal);
+                    return;
+                };
+                (p, g, None)
+            }
+            Row::Graph { p, g } => (p, g, None),
+            Row::Phase { p, g, i } => (p, g, self.phase_at(p, g, i).map(|phase| phase.id)),
+        };
+        let Some(entry) = self.graph_at(p, g) else {
+            return;
+        };
+        let (mut editor, requests) =
+            GraphEditor::open(entry.clone(), self.personas().to_vec(), ctx.scope);
+        if let Some(step) = step {
+            editor.select(step);
+            if form {
+                editor.open_node_form();
+            }
+        }
+        for request in requests {
+            ctx.request(request);
+        }
+        self.notice = None;
+        self.mode = Mode::Graph {
+            editor: Box::new(editor),
+        };
+    }
+
+    /// MOD-141 D2: the editor closed. Browse again, the cursor on the first row that shows the
+    /// graph it was on: the kind pointing at it, or its own row when no kind does.
+    fn close_editor(&mut self) {
+        let Mode::Graph { editor } = core::mem::take(&mut self.mode) else {
+            return;
+        };
+        let graph = editor.graph();
+        let shows = |row: &Row| match *row {
+            Row::Kind { p, k } => self
+                .project(p)
+                .and_then(|project| project.kinds.get(k))
+                .is_some_and(|kind| kind.default_graph_id == graph),
+            Row::Graph { p, g } => self
+                .graph_at(p, g)
+                .is_some_and(|entry| entry.graph.id == graph),
+            Row::Project { .. } | Row::Phase { .. } => false,
+        };
+        if let Some(at) = self.rows().iter().position(shows) {
+            self.cursor = at;
+        }
+        self.clamp_cursor();
+    }
+
+    /// MOD-141 D2, D13: one reply while the editor is open, `true` when it was the editor's.
+    ///
+    /// The editor's write is answered with the scope's catalogue: the tree behind it is adopted
+    /// quietly (no `busy` of the section's is involved, so nothing closes and nothing is said) and
+    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then hands the
+    /// persona registry on. The editor's reads and its refusals are its own.
+    fn on_editor_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
+        match reply {
+            StoreReply::GraphReplaced { catalogue, .. } => {
+                self.snapshot = Some((**catalogue).clone());
+                self.unavailable = None;
+                self.clamp_cursor();
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.set_personas(&catalogue.personas);
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            StoreReply::Catalogue(snapshot) => {
+                self.on_catalogue(snapshot, ctx);
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.set_personas(&snapshot.personas);
+                }
+                true
+            }
+            StoreReply::Agents(_) | StoreReply::Templates(_) => {
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            StoreReply::Failed { request, .. }
+                if matches!(*request, "replace_graph" | "agents" | "templates") =>
+            {
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `d`: the one destructive key this section has (D11).
@@ -813,7 +945,10 @@ impl KindsSection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => {
+            Mode::Browse
+            | Mode::ConfirmPrefix { .. }
+            | Mode::Deleting { .. }
+            | Mode::Graph { .. } => {
                 return Handled::Pass;
             }
         };
@@ -1186,7 +1321,9 @@ impl KindsSection {
         self.busy = None;
         let prefix = match &self.mode {
             Mode::Deleting { prefix, .. } => Some(prefix.clone()),
-            Mode::Browse | Mode::Editing(_) | Mode::ConfirmPrefix { .. } => None,
+            Mode::Browse | Mode::Editing(_) | Mode::ConfirmPrefix { .. } | Mode::Graph { .. } => {
+                None
+            }
         };
         self.mode = Mode::Browse;
         self.unavailable = None;
@@ -1211,7 +1348,10 @@ impl KindsSection {
         }
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
-            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => None,
+            Mode::Browse
+            | Mode::ConfirmPrefix { .. }
+            | Mode::Deleting { .. }
+            | Mode::Graph { .. } => None,
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -1353,6 +1493,8 @@ impl KindsSection {
     /// Rendered through the mode's own stack, so a rebound key shows its new chord.
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
+            // MOD-141 D2: the editor's own row, its write in flight included.
+            Mode::Graph { editor } => return editor.hint_text(keys),
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Deleting { .. } => HINT_DELETING,
@@ -1388,6 +1530,7 @@ impl KindsSection {
             Mode::Browse => views::KINDS_BROWSE,
             Mode::Editing(_) => views::KINDS_EDITOR,
             Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => views::KINDS_CONFIRM,
+            Mode::Graph { editor } => editor.stack(),
         }
     }
 
@@ -1425,6 +1568,14 @@ impl KindsSection {
                         && let Some(row) = self.selected()
                     {
                         self.open_graph(row);
+                    }
+                }
+                // MOD-141 D3: the graph editor on the row's graph.
+                Act::KindsEditor => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_editor(row, false, ctx);
                     }
                 }
                 Act::Delete => {
@@ -1467,7 +1618,8 @@ impl KindsSection {
                 .collect()
         };
         match &self.mode {
-            Mode::Browse => Vec::new(),
+            // The editor draws over the whole section (MOD-141 D2), so it has no pane here.
+            Mode::Browse | Mode::Graph { .. } => Vec::new(),
             Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
             // The question, and while the delete is out, what it is waiting for.
             Mode::Deleting {
@@ -1550,7 +1702,12 @@ impl SettingsSection for KindsSection {
     }
 
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Catalogue(scope.clone())]
+        let mut wanted = vec![StoreRequest::Catalogue(scope.clone())];
+        // MOD-141 D1: an open editor reads its agents and templates again on activation.
+        if let Mode::Graph { editor } = &self.mode {
+            wanted.extend(editor.wants_requests(scope));
+        }
+        wanted
     }
 
     fn on_scope_change(&mut self, _scope: &Scope) {
@@ -1571,9 +1728,19 @@ impl SettingsSection for KindsSection {
         Some(self.stack())
     }
 
+    fn takes_paste(&self) -> bool {
+        match &self.mode {
+            Mode::Graph { editor } => editor.takes_paste(),
+            _ => self.captures_input(),
+        }
+    }
+
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
     /// is not a field: a paste there is dropped, so its `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        if let Mode::Graph { editor } = &mut self.mode {
+            return editor.on_paste(text);
+        }
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1584,6 +1751,17 @@ impl SettingsSection for KindsSection {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // MOD-141 D2: the graph editor takes every key while it is open; its close act returns to
+        // Browse (the memory pane's shape, `hierarchy.rs`).
+        if let Mode::Graph { editor } = &mut self.mode {
+            return match editor.on_key(key, ctx) {
+                EditorKey::Handled(handled) => handled,
+                EditorKey::Close => {
+                    self.close_editor();
+                    Handled::Consumed
+                }
+            };
+        }
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
         }
@@ -1597,6 +1775,9 @@ impl SettingsSection for KindsSection {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        if matches!(self.mode, Mode::Graph { .. }) && self.on_editor_reply(reply, ctx) {
+            return;
+        }
         match reply {
             StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
@@ -1633,15 +1814,30 @@ impl SettingsSection for KindsSection {
         }
     }
 
+    /// MOD-141 D2: a refused graph write is said on the open editor's notice row, so the status
+    /// line does not repeat it.
+    fn absorbs_failure(&self, request: &str) -> bool {
+        matches!(self.mode, Mode::Graph { .. }) && request == "replace_graph"
+    }
+
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         key_line(self.hint_text(keys), theme)
     }
 
     fn scroll(&self) -> Option<ScrollSpan> {
+        if matches!(self.mode, Mode::Graph { .. }) {
+            return None;
+        }
         self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        // MOD-141 D2: the graph editor draws over the whole section.
+        if let Mode::Graph { editor } = &self.mode {
+            self.scroll.set(None);
+            editor.render(frame, area, ctx);
+            return;
+        }
         let theme = ctx.theme;
         let pane = self.pane(area.width, ctx);
         let [rows, pane_area, hint] = Layout::vertical([
@@ -2152,6 +2348,15 @@ fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<list::
             kind: RowKind::Note,
         })
         .collect()
+}
+
+/// What the graph editor's key says on a project row (MOD-141 D3): a project has no graph of its
+/// own, so the sentence names the rows that do and the key in force (MD-A).
+fn pick_a_graph(key: Option<&str>) -> String {
+    key.map_or_else(
+        || "select a graph or a step to open the graph editor".to_owned(),
+        |key| format!("select a graph or a step: {key} opens the graph editor"),
+    )
 }
 
 /// The next step of [`NO_WORKSPACE`]: the reload key in force (MD-A), or what happens without one.

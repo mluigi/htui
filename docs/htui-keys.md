@@ -125,6 +125,7 @@ prev_field    = ["backtab", "up"]  # previous field
 [settings.kinds]
 new_graph  = ["N"]              # new graph
 graph      = ["g"]              # edit graph
+editor     = ["enter"]          # graph editor
 next_field = ["tab", "down"]    # next field
 prev_field = ["backtab", "up"]  # previous field
 

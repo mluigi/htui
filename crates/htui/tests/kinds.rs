@@ -9,9 +9,11 @@ use chrono::{Duration, Utc};
 use htui::app::{Action, Handled};
 use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, PersonaSummary, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
+use htui::keys::views;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::graph_editor::GraphEditor;
 use htui::ui::kit::pane::Pane;
 use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, SettingsSection, SettingsTab,
@@ -3442,7 +3444,7 @@ async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("e edit \u{b7} G graph \u{b7} d delete kind"),
+            .contains("e edit \u{b7} G graph \u{b7} Enter graph editor \u{b7} d delete kind"),
         "{}",
         bench.key_hint(&section)
     );
@@ -3865,4 +3867,342 @@ async fn the_section_at_80_columns() {
         "the tree overflows the pane, so the pane shows a thumb: {frame}"
     );
     insta::assert_snapshot!("demo_80", frame);
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-141 T7: the graph editor, hosted over the whole section (D2, D3, D14)
+// -------------------------------------------------------------------------------------------
+
+/// The store requests the section emitted since the last drain, in order.
+fn store_requests(bench: &SectionBench) -> Vec<StoreRequest> {
+    bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Presses `j` until the cursor's row reads `needle`.
+#[track_caller]
+fn cursor_to(bench: &SectionBench, section: &mut KindsSection, needle: &str) {
+    for _ in 0..64 {
+        let rows = selected_rows(&drawn(bench, section, 100));
+        if rows.iter().any(|(_, text)| text.contains(needle)) {
+            return;
+        }
+        bench.key(section, "j");
+    }
+    panic!(
+        "no row reads `{needle}`: {}",
+        bench.render_section(section, 100)
+    );
+}
+
+/// The cursor's row, as drawn.
+#[track_caller]
+fn cursor_row(bench: &SectionBench, section: &KindsSection) -> String {
+    let rows = selected_rows(&drawn(bench, section, 100));
+    let [(_, text)] = rows.as_slice() else {
+        panic!("one cursor row: {rows:?}");
+    };
+    text.clone()
+}
+
+/// Answers the editor's two reads (`Agents`, `Templates`) from the demo world, as the worker would.
+async fn answer_lookups(bench: &SectionBench, section: &mut KindsSection) {
+    let backend = demo();
+    for request in store_requests(bench) {
+        if matches!(request, StoreRequest::Agents | StoreRequest::Templates(_)) {
+            let reply = serve(&backend, &request).await;
+            bench.reply(section, &reply);
+        }
+    }
+    let _ = bench.drained();
+}
+
+/// The demo catalogue with the ANA kind pointed away from its graph, so `analysis` is listed on
+/// its own `Graph` row, its phases under it, at the end of the tree.
+async fn bench_with_unreferenced_analysis() -> (SectionBench, KindsSection) {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0].kinds[0].default_graph_id = StepGraphId::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    (bench, section)
+}
+
+/// The editor's header names the graph, its scope and its revision.
+const ANALYSIS_HEADER: &str = "analysis \u{b7} project graph \u{b7} revision";
+
+/// MOD-141 D3: `Enter` on a graph row opens the editor over the section; it asks for the agents
+/// and the templates its step form picks from, and the section's keys are the editor's.
+#[tokio::test]
+async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates() {
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
+    cursor_to(&bench, &mut section, "analysis \u{b7} graph, no kind");
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+
+    let asked = store_requests(&bench);
+    let scope = bench_scope().await;
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [StoreRequest::Agents, StoreRequest::Templates(asked_scope)] if *asked_scope == scope
+        ),
+        "{asked:?}"
+    );
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    assert!(
+        section.captures_input(),
+        "the tab's `h`/`l` are the editor's"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+    let wanted = section.wants_requests(&scope);
+    assert!(
+        matches!(
+            wanted.as_slice(),
+            [
+                StoreRequest::Catalogue(_),
+                StoreRequest::Agents,
+                StoreRequest::Templates(_)
+            ]
+        ),
+        "an open editor reads again on activation: {wanted:?}"
+    );
+}
+
+/// MOD-141 D3: `Enter` on a phase row opens the editor on that step: the editor's own `Enter`
+/// then edits it.
+#[tokio::test]
+async fn enter_on_a_phase_row_opens_the_editor_on_that_step() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR_NODE_FORM));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("step verdict"), "{frame}");
+    assert!(
+        store_requests(&bench).is_empty(),
+        "opening a form writes nothing"
+    );
+}
+
+/// MOD-141 D3: `Enter` on a kind opens its default graph when that is one of the project's own;
+/// a shared graph is refused in the words `g` uses, and the project row points at a graph row.
+#[tokio::test]
+async fn enter_on_a_kind_opens_its_project_graph_and_refuses_a_shared_one() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(store_requests(&bench).is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"select a graph or a step: Enter opens the graph editor".to_owned()),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+
+    // The same kind, pointed at a library graph: the section edits none of those.
+    let mut shared = snapshot;
+    let now = Utc::now();
+    let library = StepGraph {
+        id: StepGraphId::new(),
+        scope: GraphScope::Library,
+        name: "triage".to_owned(),
+        description: String::new(),
+        is_override: false,
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    shared.projects[0].kinds[0].default_graph_id = library.id;
+    shared.projects[0].shared.push(library);
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(shared)));
+    let _ = bench.drained();
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(store_requests(&bench).is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"graph triage \u{b7} library is not edited here".to_owned()),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+}
+
+/// MOD-141 D2: while the editor is open the Settings tab's `h`/`l` are the editor's (it captures
+/// input), so the sections do not cycle under it.
+#[tokio::test]
+async fn while_the_editor_is_open_h_and_l_do_not_cycle_sections() {
+    let mut harness = kinds_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+
+    for chord in ["l", "h", "l"] {
+        harness.key(chord);
+        harness.settle().await;
+        let frame = harness.render();
+        assert!(
+            frame.contains(ANALYSIS_HEADER),
+            "`{chord}` moved inside the editor, not the strip: {frame}"
+        );
+    }
+}
+
+/// MOD-141 D2: closing the editor returns to Browse with the cursor on the first row that shows
+/// the graph: its kind, or its own row when no kind points at it.
+#[tokio::test]
+async fn closing_the_editor_returns_to_browse_with_the_cursor_on_the_graph() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    assert!(section.captures_input());
+
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+
+    assert!(!section.captures_input());
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(
+        cursor_row(&bench, &section).contains("ANA  analysis"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "esc");
+    assert!(
+        cursor_row(&bench, &section).contains("analysis \u{b7} graph, no kind"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+}
+
+/// MOD-141 D13, D2: the editor's write is answered with the scope's catalogue; the section adopts
+/// it quietly (the tree behind the editor moves) and the editor takes the outcome.
+#[tokio::test]
+async fn a_graph_replaced_reply_updates_the_tree_and_the_editor() {
+    let backend = demo();
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    bench.key(&mut section, "enter");
+    for _ in 0.."verdict".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "decide");
+    bench.key(&mut section, "enter");
+    let asked = store_requests(&bench);
+    let [write @ StoreRequest::ReplaceGraph { .. }] = asked.as_slice() else {
+        panic!("the step form's save is one `replace_graph`: {asked:?}");
+    };
+
+    let reply = serve(&backend, write).await;
+    assert!(
+        matches!(
+            &reply,
+            StoreReply::GraphReplaced {
+                outcome: CasOutcome::Applied(_),
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    bench.reply(&mut section, &reply);
+
+    assert!(store_requests(&bench).is_empty(), "nothing more is sent");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("decide"),
+        "the editor shows the stored body: {frame}"
+    );
+    assert!(
+        section.absorbs_failure("replace_graph"),
+        "the editor's notice says a refused write"
+    );
+
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(". decide "),
+        "the tree is the reply's: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).is_empty(),
+        "an applied write leaves no notice: {frame}"
+    );
+    assert!(!section.absorbs_failure("replace_graph"));
+}
+
+/// MOD-141 D2: a scope change drops the editor with the tree it was opened from (`R-NF-3`'s
+/// rule for every editor: its token belongs to the other workspace).
+#[tokio::test]
+async fn a_scope_change_closes_the_editor() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let other = Scope {
+        workspace_id: WorkspaceId::new(),
+        project_ids: vec![ProjectId::new()],
+    };
+
+    section.on_scope_change(&other);
+
+    assert!(!section.captures_input());
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    let wanted = section.wants_requests(&other);
+    assert!(
+        matches!(wanted.as_slice(), [StoreRequest::Catalogue(scope)] if *scope == other),
+        "{wanted:?}"
+    );
+}
+
+/// MOD-141 D2: the hint row is the editor's own while it is open, and Browse's names the key that
+/// opens it.
+#[tokio::test]
+async fn the_hint_row_is_the_editors_while_it_is_open() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let browse = bench.key_hint(&section);
+    assert!(browse.contains("Enter graph editor"), "{browse}");
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "enter");
+
+    let entry = snapshot.projects[0]
+        .graph(ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .clone();
+    let (editor, _) = GraphEditor::open(entry, snapshot.personas.clone(), &bench_scope().await);
+    assert_eq!(
+        bench.key_hint(&section),
+        editor.hint_text(htui::keys::Keys::compiled())
+    );
 }
