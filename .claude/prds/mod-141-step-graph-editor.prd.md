@@ -91,8 +91,8 @@ catalogue action.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Editor core in `Settings > Kinds` | A project graph opens as nodes and edges; add, delete, connect; base node form (gate and hard flag, retry limit, isolation, command queue, verify command, deadline, token budget, template, persona, candidate agents) and edge form (relation, `if` predicate, loop limit); validated save through `replace_graph`; undo and redo; catalogue keys with per-context collisions resolved; the position-based phase forms retired | pending | — |
-| 2 | Splits, palette and graph header | Split none, divide (planner and integrate persona and agent, default parts, `max_parts`) or compete behind the new later-tier toggle; palette flag and plan scope; the header shows the project's bounds, tightens them and carries the graph's `runtime_changes` override | pending | — |
+| 1 | Editor core in `Settings > Kinds` | A project graph opens as nodes and edges; add, delete, connect; base node form (gate and hard flag, retry limit, isolation, command queue, verify command, token budget, template, persona, candidate agents) and edge form (relation, `if` predicate, loop limit); validated save through `replace_graph`; undo and redo; catalogue keys with per-context collisions resolved; the position-based phase forms retired; the store worker answers the written body so any scope can be edited | in-progress | `.claude/plans/mod-141-m1-step-graph-editor-core.plan.md` |
+| 2 | Splits, palette and graph header | Split none, divide (planner and integrate persona and agent, default parts, `max_parts`) or compete behind the new later-tier toggle; palette flag and plan scope; the step **deadline** (moved from M1 at the plan fact-check: `GraphBody` lacks `deadline_seconds` and the judge columns, so M2 widens it); the header shows the project's bounds, tightens them and carries the graph's `runtime_changes` override | pending | — |
 | 3 | Every scope, and the picker fix | The scope-generic entry point opens workspace and library graphs (MOD-124's hook); item and kind pickers qualify duplicate `name · workspace` labels and refuse an ambiguous typed match | pending | — |
 
 ## Open Questions
@@ -100,10 +100,8 @@ catalogue action.
 - [ ] Key collisions: `c`, `x`, `r` differ between Runs and the editor, `Ctrl-Z` meets pane zoom, and MOD-124's
   spec names `F9`-era keys; F9 was rejected as a reserved key. Which contexts and defaults? — settle in the M1
   plan against the key catalogue.
-- [ ] Undo across a CAS conflict: when another writer moved `revision`, what do undo and redo do (reload and
-  drop the stack, or rebase)? — TBD, M1 plan.
-- [ ] Layout: is node placement rataflow's automatic layout on every open, or stored? — TBD, M1 plan (no
-  layout column exists today, to be verified).
+- [x] Undo across a CAS conflict: reload and clear undo and redo (M1 plan D4).
+- [x] Layout: computed on every change from the forward edges, not stored; no node move in M1 (M1 plan D7).
 - [ ] Graph-level `runtime_changes` override and bound tightening: does storage carry them on `step_graph`
   today, or does M2 need a migration? — TBD, verify in the M2 plan.
 - [ ] Where the later-tier compete toggle lives (project settings rung or UI settings) and whether the engine
