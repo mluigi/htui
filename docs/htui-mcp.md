@@ -77,7 +77,7 @@ Code CLI may add keys to its call: an extra key there is ignored.
 | `document_write` | `body` (Markdown), `title` (optional; the output kind when omitted) | `{"document_id", "kind", "version"}` |
 | `note_add` | `body`, at most 16384 bytes | `{"note_id"}` |
 | `item_status` | `status`, `reason`, `resolution` (optional, only with `closed`) | `{"note_id"}` |
-| `item_link` | `op` (`add` or `remove`), `to` (an item key such as `FEAT-12`), `kind` | `{"from", "to", "kind", "live"}` |
+| `item_link` | `op` (`add` or `remove`), `to` (an item key: `FEAT-12` in this project, `api:FEAT-12` in another project of its workspaces, `@shop:WS-1` for a workspace's own item), `kind` | `{"from", "to", "kind", "live"}`; `to` is canonical: bare in this project, `slug:KEY` elsewhere |
 | `search_concepts` | `query`, `types` (optional), `statuses` (optional), `limit` (optional, 1 to 20, default 10) | `{"hits": […]}` |
 | `command_run` | `class` (`build`, `test` or `run`), `command`, `cwd` (optional), `timeout_secs` (optional, 1 to 1800, default 1800) | `{"exit_code", "status", "output", "truncated", "command_run_id"}` |
 | `permission_prompt` | `tool_name`, `input`, `tool_use_id` (the Claude Code CLI's contract) | `{"behavior": "allow", "updatedInput": …}` or `{"behavior": "deny", "message": …}` |
@@ -105,8 +105,14 @@ moved by a person, or by the engine's own rules, never by this tool.
 
 **`item_link`** proposes (`add`) or withdraws (`remove`) a link that reads
 `<this item> <kind> <to>`, where `kind` is `blocked_by`, `origin`, `relates` or `supersedes`. The
-link always starts at the run's item. `to` is a key looked up in the session's project only; a key
-the project does not have answers `out of scope: <key> is not an item of this project`.
+link always starts at the run's item. `to` is a key: a bare `FEAT-12` is looked up in the
+session's project, `api:FEAT-12` in project `api`, and `@shop:WS-1` names an item of workspace
+`shop` itself. The link may reach the session's project, each workspace that holds it, and those
+workspaces' member projects (a step on a workspace's own item reaches that workspace and its
+members). A key no project has, or an item outside that reach, answers
+`out of scope: <to> is not an item of this project or its workspaces`, with `to` as given. The
+answer's `to` is canonical: bare for an item of the session's project (`htui:FEAT-1` from an
+`htui` session answers `FEAT-1`), `slug:KEY` for any other.
 `add` revives a withdrawn link, and leaves a live link exactly as it was, proposer included. A run
 can withdraw only a link one of its own steps proposed; a live link another run (or a person)
 proposed answers `not yours: <from> <kind> <to> was not proposed by this run`. A `remove` of a
