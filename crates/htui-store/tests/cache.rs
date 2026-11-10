@@ -1413,6 +1413,78 @@ async fn the_0007_project_type_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-147 D11: the offline key qualifier reads a project's kinds off the mirror
+/// (`CacheStore::item_kinds`), in the order Postgres lists them (`position`, then `prefix` bytes):
+/// a member's seeded five, a scope row's `WS`, nothing for a project the mirror does not hold; and
+/// `Backend::item_kinds` answers offline from the mirror.
+#[tokio::test]
+async fn the_mirror_lists_item_kinds_like_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let mut projects = all_projects();
+    projects.push(ids::PROJECT_SCOPE_PLATFORM);
+    run_pass(&db.pool, &cache, &projects, &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let pg = db
+        .store
+        .item_kinds(ids::PROJECT_HTUI)
+        .await
+        .expect("pg item_kinds");
+    assert_eq!(pg.len(), 5, "htui's seeded kinds");
+    let mirrored = cache
+        .item_kinds(ids::PROJECT_HTUI)
+        .await
+        .expect("cache item_kinds");
+    assert_eq!(mirrored, pg, "the mirror lists htui's kinds like Postgres");
+    let scope_row = cache
+        .item_kinds(ids::PROJECT_SCOPE_PLATFORM)
+        .await
+        .expect("cache item_kinds of the scope row");
+    assert_eq!(
+        scope_row
+            .iter()
+            .map(|kind| kind.prefix.as_str())
+            .collect::<Vec<_>>(),
+        ["WS"],
+        "the scope row's one kind"
+    );
+    assert_eq!(
+        scope_row,
+        db.store
+            .item_kinds(ids::PROJECT_SCOPE_PLATFORM)
+            .await
+            .expect("pg item_kinds of the scope row"),
+        "and Postgres lists it alike"
+    );
+    assert!(
+        cache
+            .item_kinds(ProjectId::new())
+            .await
+            .expect("an unknown project reads")
+            .is_empty(),
+        "a project the mirror does not hold has no kinds"
+    );
+
+    let backend = Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    };
+    assert_eq!(
+        backend
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect("an offline kinds read answers from the mirror"),
+        pg,
+        "the offline backend reads the mirror"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-138 M2 D5 (`cache_migrations/0008_run_step_branch.sql`): `run_step.branch` reaches the
 /// mirror. No demo step carries a decision, so an equality against Postgres proves nothing about
 /// it: this writes one by raw SQL (the step trigger bumps `updated_at`), refreshes, and reads it off

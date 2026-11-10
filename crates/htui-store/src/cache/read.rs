@@ -32,14 +32,14 @@ use htui_core::model::OwnerDocument;
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
-    ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry,
-    MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority, Project,
-    ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea, RequirementFilter,
-    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution,
-    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepOpening,
-    StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
-    WorkspaceId, WorkspaceSummary,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
+    MemoryEntry, MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority,
+    Project, ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea,
+    RequirementFilter, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
+    Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId,
+    StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
+    WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1643,6 +1643,45 @@ impl CacheStore {
                     slug: text(row, "slug")?,
                     name: text(row, "name")?,
                     position: get(row, "position")?,
+                })
+            })
+            .collect()
+    }
+
+    /// A project's kinds off the mirror, ordered as `PgStore::item_kind_rows` orders them
+    /// (`position`, then `prefix` bytes: SQLite's BINARY is byte order). MOD-147 D11's offline
+    /// qualifier reads it; empty for a project the mirror does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`], or [`StoreError::Backend`] from a
+    /// decoding helper on a corrupt mirror.
+    pub async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, prefix, name, description, default_graph_id, position, \
+             updated_at FROM item_kind WHERE project_id = ? ORDER BY position, prefix",
+        )
+        .bind(project.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(ItemKind {
+                    id: uuid_col::<ItemKindId>("item_kind.id", &text(row, "id")?)?,
+                    project_id: uuid_col::<ProjectId>(
+                        "item_kind.project_id",
+                        &text(row, "project_id")?,
+                    )?,
+                    prefix: text(row, "prefix")?,
+                    name: text(row, "name")?,
+                    description: text(row, "description")?,
+                    default_graph_id: uuid_col::<StepGraphId>(
+                        "item_kind.default_graph_id",
+                        &text(row, "default_graph_id")?,
+                    )?,
+                    position: get(row, "position")?,
+                    updated_at: ts_col("item_kind.updated_at", get(row, "updated_at")?)?,
                 })
             })
             .collect()
