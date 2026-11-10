@@ -42,6 +42,8 @@ use htui_core::model::{
     StepGraphId, StepGraphPatch, StepGraphPhase,
 };
 
+use htui_core::store::CasOutcome;
+
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{
     CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, graph_label,
@@ -1598,6 +1600,12 @@ impl SettingsSection for KindsSection {
         match reply {
             StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
+            // MOD-141 D13: `ReplaceGraph`'s answer carries the catalogue; read it as `Catalogue` /
+            // `CatalogueStale` were. T7 routes it to an open graph editor first.
+            StoreReply::GraphReplaced { outcome, catalogue } => match outcome {
+                CasOutcome::Applied(_) => self.on_catalogue(catalogue, ctx),
+                CasOutcome::Stale(_) => self.on_stale(catalogue, ctx.keys()),
+            },
             StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
@@ -2059,6 +2067,7 @@ fn doing(busy: &str) -> &'static str {
         "set_phase_budget" => "saving the budget",
         "replace_graph" => "replacing the graph",
         "delete_phase" => "deleting the phase",
+        "graph_body" => "reading the graph",
         _ => "writing",
     }
 }
