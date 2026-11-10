@@ -287,6 +287,31 @@ mod tests {
     }
 
     #[test]
+    fn an_applied_redo_keeps_the_rest_of_redo() {
+        let mut h = History::default();
+        let (a, b, c) = (body("a", 0), body("b", 1), body("c", 2));
+        edit(&mut h, "one", &a);
+        edit(&mut h, "two", &b);
+        // Undo both, so redo holds two entries: "two" under "one".
+        assert_eq!(h.begin_undo(&c), Ok(b.clone()));
+        h.applied();
+        let b2 = body("b", 3);
+        assert_eq!(h.begin_undo(&b2), Ok(a));
+        h.applied();
+        assert_eq!(h.depths(), (0, 2));
+        assert_eq!(h.redo_label(), Some("one"));
+
+        // Redo one: it lands on undo and "two" stays redoable.
+        let a2 = body("a", 4);
+        assert_eq!(h.begin_redo(&a2), Ok(b2));
+        assert_eq!(h.applied(), Some(Write::Redo("one".to_owned())));
+        assert_eq!(h.depths(), (1, 1));
+        assert_eq!(h.undo_label(), Some("one"));
+        assert_eq!(h.redo_label(), Some("two"));
+        assert_eq!(h.begin_redo(&body("b", 5)), Ok(c));
+    }
+
+    #[test]
     fn a_new_edit_after_an_undo_clears_redo() {
         let mut h = History::default();
         edit(&mut h, "one", &body("a", 0));
