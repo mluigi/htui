@@ -44,7 +44,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::pane::{Pane, ScrollSpan};
 use crate::ui::shell::{PaneId, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use agents::AgentsSection;
 pub use boxes::BoxesSection;
@@ -185,6 +185,20 @@ pub trait SettingsSection {
     fn absorbs_failure(&self, _request: &str) -> bool {
         false
     }
+    /// Whether this section's own gesture wants the mouse now (MOD-141 D11, the graph editor's
+    /// canvas): the tab answers [`Tab::wants_mouse`] with the active section's. Defaulted to
+    /// `false`.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// A mouse event, offered only while [`wants_mouse`](SettingsSection::wants_mouse) says so.
+    /// Defaulted to `Pass`.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
+    /// The mouse went away, maybe mid-gesture ([`Tab::on_mouse_lost`], told to every section).
+    /// Defaulted to nothing.
+    fn on_mouse_lost(&mut self) {}
     /// Draws inside the Settings pane's inner rect (MOD-115 M3 D4): the pane's frame, its
     /// section chips, hints and scrollbar are the tab's.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
@@ -449,6 +463,28 @@ impl Tab for SettingsTab {
             .sections
             .iter()
             .any(|section| section.absorbs_failure(request))
+    }
+
+    /// MOD-141 D11: the active section's own gesture (the graph editor's canvas in Kinds).
+    fn wants_mouse(&self) -> bool {
+        self.sections
+            .active()
+            .is_some_and(SettingsSection::wants_mouse)
+    }
+
+    /// The active section's, while it wants the mouse.
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match self.sections.sections.get_mut(self.sections.active) {
+            Some(section) if section.wants_mouse() => section.on_mouse(mouse, ctx),
+            _ => Handled::Pass,
+        }
+    }
+
+    /// Every section's: a section switched away from mid-gesture still ends it.
+    fn on_mouse_lost(&mut self) {
+        for section in &mut self.sections.sections {
+            section.on_mouse_lost();
+        }
     }
 
     /// The one tab that has sections to focus (MOD-15 M6 D7).

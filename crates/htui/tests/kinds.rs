@@ -3653,3 +3653,70 @@ async fn the_hint_row_is_the_editors_while_it_is_open() {
         editor.hint_text(htui::keys::Keys::compiled())
     );
 }
+
+/// MOD-141 D11, C5: the Settings tab hands the mouse to its active section's gesture. Kinds wants it
+/// only while the graph editor is open: a press on the canvas is the editor's, a press off it is
+/// not, and closing the editor gives the mouse back.
+#[tokio::test]
+async fn the_settings_tab_hands_the_mouse_to_the_open_editor_only() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use htui::keys::KeyChord;
+    use htui::ui::tabs::Tab;
+
+    let press = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let key = |chord: &str| {
+        KeyChord::parse(chord)
+            .unwrap_or_else(|| panic!("`{chord}`"))
+            .to_event()
+    };
+    let draw = |tab: &SettingsTab, ctx: &htui::app::Ctx<'_>| {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(100, 30),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("a test terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), ctx))
+            .expect("the tab draws");
+    };
+    let bench = SectionBench::new().await;
+    let mut ctx = bench.ctx();
+    let mut tab = SettingsTab::with_sections(vec![Box::new(KindsSection::new())]);
+    tab.on_reply(
+        &StoreReply::Catalogue(Box::new(demo_catalogue(&demo()).await)),
+        &mut ctx,
+    );
+    draw(&tab, &ctx);
+    assert!(!tab.wants_mouse(), "Browse has no gesture of its own");
+    assert_eq!(tab.on_mouse(press(50, 15), &mut ctx), Handled::Pass);
+
+    tab.on_key(key("j"), &mut ctx);
+    tab.on_key(key("enter"), &mut ctx);
+    assert!(
+        tab.wants_mouse(),
+        "the open editor's canvas takes the mouse"
+    );
+    draw(&tab, &ctx);
+    assert_eq!(
+        tab.on_mouse(press(50, 15), &mut ctx),
+        Handled::Consumed,
+        "a press on the canvas is the editor's"
+    );
+    assert_eq!(
+        tab.on_mouse(press(0, 0), &mut ctx),
+        Handled::Pass,
+        "a press on the pane's border is not"
+    );
+    tab.on_mouse_lost();
+
+    tab.on_key(key("esc"), &mut ctx);
+    assert!(!tab.wants_mouse(), "closed, the mouse goes back");
+}

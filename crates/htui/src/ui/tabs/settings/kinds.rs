@@ -63,7 +63,7 @@ use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 /// What the rows pane says before any catalogue has arrived.
 const NO_WORKSPACE: &str = "no workspace: nothing to list";
@@ -1557,6 +1557,24 @@ impl SettingsSection for KindsSection {
     /// line does not repeat it.
     fn absorbs_failure(&self, request: &str) -> bool {
         matches!(self.mode, Mode::Graph { .. }) && request == "replace_graph"
+    }
+
+    /// MOD-141 D11: the open graph editor's canvas takes the mouse; Browse and the forms do not.
+    fn wants_mouse(&self) -> bool {
+        matches!(self.mode, Mode::Graph { .. })
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::Graph { editor } => editor.on_mouse(mouse, ctx),
+            _ => Handled::Pass,
+        }
+    }
+
+    fn on_mouse_lost(&mut self) {
+        if let Mode::Graph { editor } = &mut self.mode {
+            editor.on_mouse_lost();
+        }
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
