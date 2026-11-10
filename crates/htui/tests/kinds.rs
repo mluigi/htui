@@ -3720,3 +3720,24 @@ async fn the_settings_tab_hands_the_mouse_to_the_open_editor_only() {
     tab.on_key(key("esc"), &mut ctx);
     assert!(!tab.wants_mouse(), "closed, the mouse goes back");
 }
+
+/// MOD-141 D2: the graph editor over the whole section at 100x30: the analysis graph opened from
+/// its kind, then opened on `verdict` with its step form (`e`, D14), its agents and templates read.
+#[tokio::test]
+async fn the_graph_editor_draws_over_the_section() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+    insta::assert_snapshot!("graph_editor", frame);
+
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "e");
+    answer_lookups(&bench, &mut section).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("step verdict"), "{frame}");
+    insta::assert_snapshot!("graph_editor_step", frame);
+}
