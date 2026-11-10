@@ -230,6 +230,14 @@ bash scripts/gate.sh
 | Task independence W1: T1 {htui-store vector.rs, qdrant_live.rs}, T2 {root Cargo.toml, Cargo.lock, crates/htui-bench/**} | verified disjoint | T2 adds a path dependency on `htui-store` but no file of it; `Cargo.lock` is T2's alone (T1 adds no dependency) |
 | T6 depends on T1's `SearchArms` | dependency, not a conflict | T6 runs in W3 after T1 merged |
 
+**Amended by the blueprint's fact-check** (`.claude/plans/mod-162-m1-blueprint.md` §0, F1-F8; no decision
+changed): requirement bullets come in six header shapes, not one (F1); decision headers have 5 irregular
+shapes incl. `(status, …)`, not 4 (F2); the pin chunks to 777 document points, not ANA-37's 759 (F3,
+reported as a threat); T1's and T4's test commands corrected (F4, F5); the query JSON is scanned by
+htui-agent's forbidden-literal test (F6); sqlx 0.9 needs `AssertSqlSafe` for dynamic SQL (F7); `run`
+deletes a stale collection through a raw client, since `connect_to` refuses another embedder's (F8). The
+blueprint adds `crates/htui-bench/src/types.rs`, owned by T2; disjointness unchanged.
+
 ## Acceptance
 
 - [ ] All tasks complete, each committed
