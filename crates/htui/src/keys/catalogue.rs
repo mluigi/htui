@@ -924,6 +924,8 @@ pub enum Act {
     LinksDelete,
     /// `graph_editor.links.close`: back to the canvas (MOD-141 D12).
     LinksClose,
+    /// `settings.kinds.editor`: open the graph editor on the row's graph (MOD-141 D3).
+    KindsEditor,
 }
 
 impl Act {
@@ -1429,6 +1431,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "graph",
         &["g"],
         "edit graph",
+    ),
+    // kinds.rs `open_editor`: the graph editor on the row's graph (MOD-141 D3).
+    row(
+        Act::KindsEditor,
+        SettingsKinds,
+        "editor",
+        &["enter"],
+        "graph editor",
     ),
     // [settings.connection]
     // connection.rs:802.
@@ -2969,6 +2979,7 @@ mod tests {
         Act::LinksEdit,
         Act::LinksDelete,
         Act::LinksClose,
+        Act::KindsEditor,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3219,6 +3230,7 @@ mod tests {
             Act::LinksEdit => 241,
             Act::LinksDelete => 242,
             Act::LinksClose => 243,
+            Act::KindsEditor => 244,
         }
     }
 
@@ -3252,7 +3264,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 244);
+        assert_eq!(CATALOGUE.len(), 245);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

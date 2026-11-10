@@ -358,7 +358,7 @@ pub const MEMORY_CLASH_AMEND: Stack<'static> = Stack::new(&[
 pub const KINDS_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::SettingsKinds,
-        &[Act::KindsNewGraph, Act::KindsGraph],
+        &[Act::KindsNewGraph, Act::KindsGraph, Act::KindsEditor],
     ),
     SETTINGS,
     Layer::only(
@@ -1608,6 +1608,7 @@ mod tests {
             [Act::BoxesExecutor, Act::Workspaces]
         );
         assert_eq!(resolve(KINDS_BROWSE, "g"), [Act::KindsGraph]);
+        assert_eq!(resolve(KINDS_BROWSE, "enter"), [Act::KindsEditor]);
         assert_eq!(resolve(CONCEPTS_QUERY, "?"), []);
         assert_eq!(resolve(CONCEPTS_QUERY, "f1"), [Act::Help]);
         assert_eq!(
