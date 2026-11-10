@@ -451,11 +451,33 @@ fn flow_node(
 /// ends, and a label wider than the channel reaches into that column; so the label sits where the
 /// run crosses the gap below the higher end, a row no node is on, however many layers the loop
 /// spans (between adjacent layers that is the run's midpoint).
-#[derive(Debug, Default)]
+///
+/// A back `asks_you` loop shares its side and its handles with `changes_requested`, so it stands
+/// further off its nodes ([`ASKS_STEM`]) and puts its label on the gap's first row: two loops
+/// between one pair stay apart and both read.
+#[derive(Debug)]
 struct StepLink {
     /// The path and its drawing.
     step: StepEdge,
+    /// How far into the gap below a side loop's higher end its label sits, in world rows.
+    drop: f64,
 }
+
+impl Default for StepLink {
+    fn default() -> Self {
+        Self {
+            step: StepEdge::default(),
+            drop: V_GAP / 2.0,
+        }
+    }
+}
+
+/// D7: how far a back `asks_you` loop's channel stands off its nodes, past the
+/// `changes_requested` one's (rataflow's default stem, 1.0) and inside [`H_GAP`].
+const ASKS_STEM: f64 = 3.0;
+/// D7: where a back `asks_you` loop's label sits in the gap: its first row, above the
+/// `changes_requested` label on the middle row.
+const ASKS_DROP: f64 = 0.5;
 
 impl EdgeContent for StepLink {
     fn compute_path(&self, ctx: &EdgePathContext) -> Path {
@@ -477,7 +499,7 @@ impl EdgeContent for StepLink {
             .target_bounds
             .filter(|target| target.y() <= ctx.source_bounds.y())
             .unwrap_or(ctx.source_bounds);
-        let gap = higher.bottom() + V_GAP / 2.0;
+        let gap = higher.bottom() + self.drop;
         let y = if (low..=high).contains(&gap) {
             gap
         } else {
@@ -493,12 +515,21 @@ impl EdgeContent for StepLink {
 
 /// One body edge, by its handles, in the editor's styles (execution_graph B-4).
 fn flow_edge(edge: &StepGraphEdge, forward: bool, theme: &Theme) -> Edge<StepLink> {
-    let content = StepLink {
-        step: StepEdge::default().with_style(
-            EdgeStyle::default()
-                .with_stroke_style(theme.dim)
-                .with_label_style(theme.base),
-        ),
+    let step = StepEdge::default().with_style(
+        EdgeStyle::default()
+            .with_stroke_style(theme.dim)
+            .with_label_style(theme.base),
+    );
+    let content = if !forward && edge.kind == EdgeKind::AsksYou {
+        StepLink {
+            step: step.with_stem_length(ASKS_STEM),
+            drop: ASKS_DROP,
+        }
+    } else {
+        StepLink {
+            step,
+            ..StepLink::default()
+        }
     };
     let (source, target) = edge_handles(edge.kind, forward);
     let drawn = Edge::new(
@@ -2020,5 +2051,47 @@ mod tests {
         for label in ["fails \u{d7}2", "changes requested \u{d7}3"] {
             assert!(drawn.contains(label), "{label}:\n{drawn}");
         }
+    }
+
+    #[test]
+    fn two_loops_on_one_pair_read_apart() {
+        let mut body = body(&["implement", "review"]);
+        let mut changes = edge(&body, "review", "implement", EdgeKind::ChangesRequested);
+        changes.loop_limit = Some(3);
+        let mut asks = edge(&body, "review", "implement", EdgeKind::AsksYou);
+        asks.loop_limit = Some(2);
+        body.edges = vec![
+            edge(&body, "implement", "review", EdgeKind::Next),
+            changes,
+            asks,
+        ];
+        let drawn = drawn(&body, None, &[], (100, 28));
+        for label in ["changes requested \u{d7}3", "asks you \u{d7}2"] {
+            assert!(drawn.contains(label), "{label}:\n{drawn}");
+        }
+        // The two run in channels of their own, from the same side handles.
+        let canvas = synced(&body, None);
+        let path = |id: EdgeId| {
+            let edge = canvas
+                .flow
+                .edge(&id.to_string())
+                .expect("the loop is drawn");
+            let source = canvas.flow.node_bounds(&edge.source).expect("review");
+            let target = canvas.flow.node_bounds(&edge.target).expect("implement");
+            edge.content.compute_path(&EdgePathContext {
+                from: Position::new(source.right(), 0.75f64.mul_add(NODE_H, source.y())),
+                to: Position::new(target.right(), 0.25f64.mul_add(NODE_H, target.y())),
+                source_position: HandlePosition::Right,
+                target_position: HandlePosition::Right,
+                source_bounds: source,
+                target_bounds: Some(target),
+            })
+        };
+        let (changes, asks) = (path(body.edges[1].id), path(body.edges[2].id));
+        let channel = |path: &Path| path.points.iter().map(|at| at.x).fold(0.0, f64::max);
+        assert!(
+            channel(&asks) > channel(&changes),
+            "{changes:?} and {asks:?} share a channel"
+        );
     }
 }
