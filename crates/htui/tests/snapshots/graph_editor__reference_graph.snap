@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/graph_editor.rs
+expression: frame
+---
+Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Kinds ──────────────────────────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
+│reference · project graph · revision 6 · u undoes: linking review → implement                     │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                ╭─ implement ──────────╮                                                          │
+│                │template implement    │◀───────────────╮                                         │
+│                │gate never            │                │                                         │
+│                │agy · gemini-3.8-flas…│                │                                         │
+│                ╰───────────●──────────╯                │                                         │
+│                            │                           │                                         │
+│            if verify failed┴──────────────╮  changes requested ×3                                │
+│             ▼                             ▼            │                                         │
+│ ╭─ fix ────────────────╮      ╭─ review ─────────────╮ │                                         │
+│ │template implement    │      │template implement    │ │                                         │
+│ │gate never            │      │gate never            │ │                                         │
+│ │agy · gemini-3.8-flas…│      │agy · gemini-3.8-flas…│─╯                                         │
+│ ╰───────────●──────────╯      ╰───────────●──────────╯                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│saved: linking review → implement                                                                 │
+╰─Down/Up select · a add · e edit · x delete · c connect · i links · u undo · U redo · = fit …─────╯

@@ -1040,7 +1040,7 @@ impl GraphEditor {
         &self,
         editing: &NodeEditing,
     ) -> Result<(String, GraphBody, Option<PhaseId>), String> {
-        let node = editing.form.build(&editing.base)?;
+        let node = editing.form.build(&editing.base, &self.lookups)?;
         match editing.form.target() {
             NodeTarget::New { after } => {
                 let label = format!("adding {}", node.phase.name);
