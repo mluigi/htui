@@ -166,6 +166,34 @@ clash_replace = ["r"]              # replace it
 next_field    = ["tab", "down"]    # next field
 prev_field    = ["backtab", "up"]  # previous field
 
+[graph_editor]
+add              = ["a"]              # add step
+edit             = ["e", "enter"]     # edit
+delete           = ["x"]              # delete step
+connect          = ["c"]              # connect
+open_links       = ["i"]              # links
+undo             = ["u", "ctrl-z"]    # undo
+redo             = ["U", "ctrl-r"]    # redo
+zoom_in          = ["+"]              # zoom in
+zoom_out         = ["-"]              # zoom out
+zoom_fit         = ["="]              # fit
+left             = ["left", "h"]      # select left
+down             = ["down", "j"]      # select down
+up               = ["up", "k"]        # select up
+right            = ["right", "l"]     # select right
+close            = []                 # close; Esc always
+candidate_add    = ["alt-n"]          # add agent
+candidate_remove = ["alt-d"]          # remove agent
+candidate_up     = ["alt-up"]         # agent up
+candidate_down   = ["alt-down"]       # agent down
+next_field       = ["tab", "down"]    # next field
+prev_field       = ["backtab", "up"]  # previous field
+
+[graph_editor.links]
+edit   = ["e", "enter"]  # edit link
+delete = ["x", "d"]      # delete link
+close  = []              # back; Esc always
+
 [concepts]
 decisions = ["ctrl-d"]  # decisions only
 project   = ["ctrl-p"]  # cycle project scope

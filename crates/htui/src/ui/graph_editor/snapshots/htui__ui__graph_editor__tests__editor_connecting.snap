@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/ui/graph_editor/mod.rs
+expression: bench.render(&editor)
+---
+flow · library graph · revision 2
+
+                                      ╭─ research ───────────╮
+                                      │template research     │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ plan ───────────────╮
+                                      │template plan         │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ review ─────────────╮
+                                      │template review       │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+
+
+
+
+
+
+linking from research: pick the step it leads to

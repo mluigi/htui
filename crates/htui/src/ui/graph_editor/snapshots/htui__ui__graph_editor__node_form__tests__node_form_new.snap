@@ -15,7 +15,7 @@ expression: text(&lines)
  token budget
  inputs
  output
- agents         none (ctrl-n adds one)
+ agents         none (Alt+n adds one)
  split          none
  fan-out        1
  palette        no

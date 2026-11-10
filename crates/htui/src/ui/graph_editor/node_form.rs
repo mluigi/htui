@@ -32,9 +32,12 @@ pub(crate) const NO_AGENTS: &str = "no agents to choose from; add one in Setting
 pub(crate) const NO_CANDIDATE: &str = "no candidate agent is selected";
 /// What a `divide` node's split row adds.
 pub(crate) const DIVIDE_NOTE: &str = "runs once MOD-139 lands";
-/// The placeholder row's text while the node has no candidate. The editor substitutes its own
-/// key label for `ctrl-n` (D12).
-pub(crate) const NO_CANDIDATES: &str = "none (ctrl-n adds one)";
+/// The placeholder row's text while the node has no candidate, naming `add`, the key the editor
+/// binds to adding one (D12, R-TUI-10: the key comes from the key file, never this module), or
+/// `none` alone while nothing is bound to it.
+pub(crate) fn no_candidates(add: Option<&str>) -> String {
+    add.map_or_else(|| "none".to_owned(), |key| format!("none ({key} adds one)"))
+}
 
 /// The fixed rows before the candidates, in focus order.
 const FIXED_ROWS: usize = 13;
@@ -433,11 +436,12 @@ impl NodeForm {
     }
 
     /// The form's rows `width` cells wide, the focused one being edited, then the read-only rows
-    /// from `base`.
+    /// from `base`. `add` is the label of the key that adds a candidate, for the placeholder row.
     pub(crate) fn lines(
         &self,
         base: &NodeBody,
         lookups: &Lookups,
+        add: Option<&str>,
         width: u16,
         accent: Style,
         theme: &Theme,
@@ -496,7 +500,10 @@ impl NodeForm {
             )
             .field(Field::new("output", Value::Text(&self.output_kind)).help("empty for the name"));
         if candidates.is_empty() {
-            form = form.field(Field::new("agents", Value::ReadOnly(NO_CANDIDATES.into())));
+            form = form.field(Field::new(
+                "agents",
+                Value::ReadOnly(no_candidates(add).into()),
+            ));
         }
         for (label, value) in &candidates {
             form = form.field(
@@ -691,6 +698,9 @@ mod tests {
     fn accent() -> Style {
         Style::new().fg(Color::Magenta)
     }
+
+    /// The candidate-add key's label as the compiled keys write it.
+    const ADD: Option<&str> = Some("Alt+n");
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_788_393_600, 0).expect("a valid instant")
@@ -1057,7 +1067,8 @@ mod tests {
         let mut form = edit(&node);
         focus(&mut form, TEMPLATE);
         assert!(
-            text(&form.lines(&node, &lookups, 56, accent(), &Theme::default())).contains("legacy")
+            text(&form.lines(&node, &lookups, ADD, 56, accent(), &Theme::default()))
+                .contains("legacy")
         );
         form.cycle(false, &lookups).expect("names to choose");
         assert_eq!(
@@ -1132,7 +1143,7 @@ mod tests {
         let mut node = research();
         node.phase.persona_id = Some(unknown);
         let mut form = edit(&node);
-        let shown = text(&form.lines(&node, &lookups, 80, accent(), &Theme::default()));
+        let shown = text(&form.lines(&node, &lookups, ADD, 80, accent(), &Theme::default()));
         assert!(shown.contains(&unknown.to_string()), "{shown}");
         focus(&mut form, PERSONA);
         form.cycle(true, &lookups).expect("a choice");
@@ -1398,7 +1409,7 @@ mod tests {
     fn node_form_edit() {
         let node = research_bound();
         let form = edit(&node);
-        let lines = form.lines(&node, &lookups(), 56, accent(), &Theme::default());
+        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_edit", text(&lines));
     }
 
@@ -1415,7 +1426,7 @@ mod tests {
             after: Some(PhaseId::new()),
         };
         let form = NodeForm::new(&node, target);
-        let lines = form.lines(&node, &lookups(), 56, accent(), &Theme::default());
+        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_new", text(&lines));
     }
 
@@ -1434,7 +1445,7 @@ mod tests {
         node.parts = vec![part(&node, 0, "ui"), part(&node, 1, "store")];
         let mut form = edit(&node);
         focus(&mut form, OUTPUT);
-        let lines = form.lines(&node, &lookups(), 56, accent(), &Theme::default());
+        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_divide", text(&lines));
     }
 }

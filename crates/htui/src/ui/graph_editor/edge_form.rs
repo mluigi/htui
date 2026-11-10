@@ -129,6 +129,7 @@ impl EdgeForm {
     }
 
     /// The chosen relation.
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> EdgeKind {
         self.kind
     }
