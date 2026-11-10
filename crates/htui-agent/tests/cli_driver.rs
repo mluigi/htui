@@ -2754,6 +2754,85 @@ async fn a_billing_list_cannot_strip_the_session_marker() {
     assert!(!resolved.env.contains_key(BILLING_ENV[0]));
 }
 
+/// MOD-97 R1 L1: the marker is dropped from the list whatever its case, because Windows removes
+/// environment names case-insensitively, so `htui_session` there would unset `HTUI_SESSION`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_billing_list_cannot_strip_the_session_marker_in_another_case() {
+    let lower = SESSION_VAR.to_ascii_lowercase();
+    let resolved = cli_launch_with(
+        Billing::Subscription,
+        Some(json!([lower, "Htui_Session", BILLING_ENV[0]])),
+    )
+    .await;
+
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+}
+
+/// MOD-97 R1 M1: a hand-written bare string is a one-name list, and a subscription row strips it,
+/// rather than failing the settings document and stripping nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_string_list_is_stripped_on_a_subscription_row() {
+    let resolved = cli_launch_with(Billing::Subscription, Some(json!(BILLING_ENV[0]))).await;
+
+    assert!(!resolved.env.contains_key(BILLING_ENV[0]), "{resolved:?}");
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+        Some("secret-value"),
+        "an unlisted name is kept"
+    );
+}
+
+/// [`TURN_SCRIPT`], after copying the two [`BILLING_ENV`] variables it was started with (or `unset`)
+/// to `$HTUI_GO_FILE.billing`, one per line.
+#[cfg(unix)]
+const BILLING_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n%s\n' "${HTUI_TEST_VENDOR_KEY-unset}" "${HTUI_TEST_VENDOR_TOKEN-unset}" > "$HTUI_GO_FILE.billing"
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// MOD-97 D5 composed, through the factory and a real child: the row's `launch.env` carries the
+/// first listed variable and the session's `spec.env` (a project secret) the second. A
+/// `subscription` row's child sees neither; a `per_token` row's sees both.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_session_never_sees_the_billing_env_on_a_subscription_row() {
+    for (billing, expected) in [
+        (Billing::Subscription, "unset\nunset\n"),
+        (Billing::PerToken, "row-value\nsecret-value\n"),
+    ] {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut scripted = scripted(tmp.path(), BILLING_SCRIPT);
+        scripted.row.billing = billing;
+        scripted.row.launch["env"][BILLING_ENV[0]] = json!("row-value");
+        scripted.row.settings["api_billing_env"] = json!(BILLING_ENV);
+        let mut with = spec(tmp.path().to_path_buf());
+        with.env
+            .insert(BILLING_ENV[1].to_owned(), "secret-value".to_owned());
+        let mut session = start_with(&scripted.row, with).await;
+        // The script records before it prints `init`, so the file exists by now.
+        let _ = next(&mut session, "the banner").await;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("go.billing"))
+                .expect("the script recorded its billing variables"),
+            expected,
+            "{billing:?}"
+        );
+
+        session.cancel(Duration::ZERO).await.expect("cancel");
+    }
+}
+
 /// MOD-97 D6(a), the one case here that reads a seed row (H-7's exception): the seeded
 /// `claude-cli` row never asks for `--bare`. Claude Code has no `--no-bare`, and `--bare` sets
 /// `CLAUDE_CODE_SIMPLE=1` and makes authentication strictly an API key or an `apiKeyHelper`, so a

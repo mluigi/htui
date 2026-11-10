@@ -525,6 +525,50 @@ fn the_seeded_subscription_rows_name_their_api_billing_env() {
     );
 }
 
+/// MOD-97 R1 M1: `api_billing_env` reads the shapes a hand-edited row plausibly holds, so one odd
+/// value cannot fail the whole settings document (which would fall back to the defaults and strip
+/// nothing): `null` is the empty list, a bare string is a one-name list, an array is as written.
+/// The other keys survive either way.
+#[test]
+fn api_billing_env_reads_null_a_string_or_a_list() {
+    let null: AgentSettings =
+        serde_json::from_str(r#"{"api_billing_env": null, "user_extensions": true}"#)
+            .expect("a null list parses");
+    assert!(null.api_billing_env.is_empty(), "{null:?}");
+    assert!(null.user_extensions, "the other keys survive a null list");
+
+    let one: AgentSettings = serde_json::from_str(
+        r#"{"api_billing_env": "HTUI_TEST_VENDOR_KEY", "user_extensions": true}"#,
+    )
+    .expect("a bare string parses");
+    assert_eq!(one.api_billing_env, ["HTUI_TEST_VENDOR_KEY"]);
+    assert!(one.user_extensions, "the other keys survive a bare string");
+
+    let many: AgentSettings = serde_json::from_str(
+        r#"{"api_billing_env": ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"]}"#,
+    )
+    .expect("a list parses");
+    assert_eq!(
+        many.api_billing_env,
+        ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"]
+    );
+}
+
+/// MOD-97 R1 M1: anything else is still an error, not silently an empty list.
+#[test]
+fn api_billing_env_refuses_other_shapes() {
+    for document in [
+        r#"{"api_billing_env": 42}"#,
+        r#"{"api_billing_env": {"HTUI_TEST_VENDOR_KEY": true}}"#,
+        r#"{"api_billing_env": ["HTUI_TEST_VENDOR_KEY", 7]}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<AgentSettings>(document).is_err(),
+            "{document} parsed"
+        );
+    }
+}
+
 #[test]
 fn resolve_substitutes_command_args_and_env() {
     let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");

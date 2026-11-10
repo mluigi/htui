@@ -2030,6 +2030,10 @@ async fn case_10_a_denial_that_does_not_depend_on_this_box() {
 /// if the strip failed the turn would fail authentication, and if the CLI ever made `--bare` the
 /// `-p` default (no `--no-bare` exists) the login would stop counting and this case fails loudly.
 ///
+/// The argv is built by hand with `cli::argv` (`mcp_config: None`, so no `--mcp-config` file) rather
+/// than through the driver's `io_in`: the case pins the environment the child is spawned with,
+/// which `launch_for` owns, not the session plumbing around it.
+///
 /// `set_var` is `unsafe` and the workspace forbids `unsafe_code`, so the case re-runs its own test
 /// binary as a child with the bogus variables set and `--ignored`, or the filter matches nothing;
 /// the parent asserts the child ran exactly one test and passed. The bogus values never reach a
@@ -2068,7 +2072,10 @@ async fn case_11_a_subscription_row_ignores_an_inherited_api_key() {
         );
         // `--ignored` is what makes the child run this case at all; a filter that matched nothing
         // would also succeed.
-        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "child ran no test:\n{stdout}"
+        );
         return;
     }
 

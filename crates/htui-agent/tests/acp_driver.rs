@@ -982,9 +982,21 @@ const BILLING_ENV: [&str; 2] = ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"
 /// for a row billed `billing` whose settings list both names, plus a spec whose `env` carries the
 /// second name (the project-secret route) and a plain `OTHER`.
 fn billed_driver(tmp: &Path, billing: Billing) -> (AcpDriver, SessionSpec) {
+    billed_driver_with(tmp, billing, |settings| {
+        settings["api_billing_env"] = json!(BILLING_ENV);
+    })
+}
+
+/// [`billed_driver`] with the row's settings document edited by `settings` instead of listing
+/// both names.
+fn billed_driver_with(
+    tmp: &Path,
+    billing: Billing,
+    settings: impl FnOnce(&mut serde_json::Value),
+) -> (AcpDriver, SessionSpec) {
     let mut agent = unresolvable_row();
     agent.billing = billing;
-    agent.settings["api_billing_env"] = json!(BILLING_ENV);
+    settings(&mut agent.settings);
     let recorded = ResolvedLaunch {
         command: plain_file(&tmp.join("bin/htui-fake-adapter")),
         args: vec![MARKER.to_owned()],
@@ -1057,6 +1069,44 @@ async fn launch_for_keeps_the_billing_env_on_a_per_token_row() {
         Some("secret-value")
     );
     assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+}
+
+/// MOD-97 D2: a `subscription` row without the list strips nothing, nor does one whose list is
+/// empty or `null`, nor one whose settings document is unreadable (it falls back to
+/// `AgentSettings::default()`, as every other setting does): the CLI case's twin.
+#[tokio::test]
+async fn launch_for_strips_nothing_without_the_list() {
+    let editors: [(&str, fn(&mut serde_json::Value)); 4] = [
+        ("no list", |_| {}),
+        ("an empty list", |settings| {
+            settings["api_billing_env"] = json!([]);
+        }),
+        ("a null list", |settings| {
+            settings["api_billing_env"] = serde_json::Value::Null;
+        }),
+        ("an unreadable document", |settings| *settings = json!("x")),
+    ];
+    for (what, edit) in editors {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (driver, with) = billed_driver_with(tmp.path(), Billing::Subscription, edit);
+
+        let resolved = driver
+            .launch_for(&with)
+            .await
+            .expect("a ready snapshot is usable");
+
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+            Some("row-value"),
+            "{what}: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+            Some("secret-value"),
+            "{what}: {resolved:?}"
+        );
+        assert!(resolved.env_remove.is_empty(), "{what}: {resolved:?}");
+    }
 }
 
 /// [`AgentDriver::start`], retrying the `ETXTBSY` window a fixture executable opens.
