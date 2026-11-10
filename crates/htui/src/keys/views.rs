@@ -382,6 +382,96 @@ pub const KINDS_EDITOR: Stack<'static> = Stack::new(&[
 pub const KINDS_CONFIRM: Stack<'static> =
     Stack::new(&[Layer::view(Context::SettingsKinds, &[]), CONFIRM, MODAL]);
 
+/// The graph editor's canvas (MOD-141 D12): its own acts and the modal global layer only - no
+/// `settings`, `common` or `layout`, so `c` is not `common.clear` and `h`/`l` select.
+pub const GRAPH_EDITOR: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::GraphEditor,
+        &[
+            Act::GraphEditorAdd,
+            Act::GraphEditorEdit,
+            Act::GraphEditorDelete,
+            Act::GraphEditorConnect,
+            Act::GraphEditorOpenLinks,
+            Act::GraphEditorUndo,
+            Act::GraphEditorRedo,
+            Act::GraphEditorZoomIn,
+            Act::GraphEditorZoomOut,
+            Act::GraphEditorFit,
+            Act::GraphEditorLeft,
+            Act::GraphEditorDown,
+            Act::GraphEditorUp,
+            Act::GraphEditorRight,
+            Act::GraphEditorClose,
+        ],
+    ),
+    MODAL,
+]);
+
+/// The graph editor while connecting (MOD-141 D12): the directions pick the target, `edit`
+/// (Enter) connects here, `close` cancels.
+pub const GRAPH_EDITOR_CONNECT: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::GraphEditor,
+        &[
+            Act::GraphEditorLeft,
+            Act::GraphEditorDown,
+            Act::GraphEditorUp,
+            Act::GraphEditorRight,
+            Act::GraphEditorZoomIn,
+            Act::GraphEditorZoomOut,
+            Act::GraphEditorFit,
+            Act::GraphEditorEdit,
+            Act::GraphEditorClose,
+        ],
+    ),
+    MODAL,
+]);
+
+/// The graph editor's step form (MOD-141 D12): text fields, choices, the field moves and the
+/// candidate list.
+pub const GRAPH_EDITOR_NODE_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::GraphEditor,
+        &[
+            Act::GraphEditorCandidateAdd,
+            Act::GraphEditorCandidateRemove,
+            Act::GraphEditorCandidateUp,
+            Act::GraphEditorCandidateDown,
+        ],
+    ),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
+]);
+
+/// The graph editor's link form (MOD-141 D12): relation (a choice), predicate and loop limit
+/// (text fields).
+pub const GRAPH_EDITOR_EDGE_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::GraphEditor, &[]),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
+]);
+
+/// The graph editor's links list (MOD-141 D12): rows, relation cycling (it opens the link form),
+/// edit, delete, back.
+pub const GRAPH_EDITOR_LINKS: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::GraphEditorLinks,
+        &[Act::LinksEdit, Act::LinksDelete, Act::LinksClose],
+    ),
+    PICK,
+    LIST,
+    MODAL,
+]);
+
+/// The graph editor's delete question (MOD-141 D12).
+pub const GRAPH_EDITOR_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::GraphEditor, &[]), CONFIRM, MODAL]);
+
 /// Settings > Prompt, browsing.
 pub const PROMPT_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsPrompt, &[]),
@@ -1180,6 +1270,7 @@ mod tests {
         source!("ui/tabs/settings/hierarchy.rs"),
         source!("ui/tabs/settings/memory.rs"),
         source!("ui/tabs/settings/kinds.rs"),
+        source!("ui/graph_editor/mod.rs"),
         source!("ui/tabs/settings/personas.rs"),
         source!("ui/tabs/settings/prompt.rs"),
         source!("ui/tabs/settings/qdrant.rs"),
@@ -1291,6 +1382,12 @@ mod tests {
         KINDS_BROWSE,
         KINDS_EDITOR,
         KINDS_CONFIRM,
+        GRAPH_EDITOR,
+        GRAPH_EDITOR_CONNECT,
+        GRAPH_EDITOR_NODE_FORM,
+        GRAPH_EDITOR_EDGE_FORM,
+        GRAPH_EDITOR_LINKS,
+        GRAPH_EDITOR_CONFIRM,
         PROMPT_BROWSE,
         CONNECTION_BROWSE,
         CONNECTION_CONFIRM,
@@ -1449,6 +1546,27 @@ mod tests {
 
     #[test]
     fn the_view_stacks_resolve_as_designed() {
+        // MOD-141 D12: the graph editor's canvas has no `common`, `settings` or `layout` layer,
+        // so `c` connects, `z` and `q` are nothing and `l` selects; `ctrl-c` still quits.
+        assert_eq!(resolve(GRAPH_EDITOR, "c"), [Act::GraphEditorConnect]);
+        assert_eq!(resolve(GRAPH_EDITOR, "ctrl-z"), [Act::GraphEditorUndo]);
+        assert_eq!(resolve(GRAPH_EDITOR, "z"), []);
+        assert_eq!(resolve(GRAPH_EDITOR, "q"), []);
+        assert_eq!(resolve(GRAPH_EDITOR, "ctrl-c"), [Act::Quit]);
+        assert_eq!(resolve(GRAPH_EDITOR, "l"), [Act::GraphEditorRight]);
+        assert_eq!(
+            resolve(GRAPH_EDITOR_CONNECT, "enter"),
+            [Act::GraphEditorEdit]
+        );
+        assert_eq!(
+            resolve(GRAPH_EDITOR_NODE_FORM, "alt-n"),
+            [Act::GraphEditorCandidateAdd]
+        );
+        assert_eq!(resolve(GRAPH_EDITOR_NODE_FORM, "tab"), [Act::FormNextField]);
+        assert_eq!(resolve(GRAPH_EDITOR_LINKS, "h"), [Act::ChoicePrev]);
+        assert_eq!(resolve(GRAPH_EDITOR_LINKS, "d"), [Act::LinksDelete]);
+        assert_eq!(resolve(GRAPH_EDITOR_LINKS, "j"), [Act::ListDown]);
+        assert_eq!(resolve(GRAPH_EDITOR_CONFIRM, "y"), [Act::ConfirmYes]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(KINDS_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(HIERARCHY_BROWSE, "d"), [Act::Delete]);
@@ -1911,6 +2029,8 @@ mod tests {
                 "MEMORY_EDIT",
                 "MEMORY_BODY",
                 "KINDS_EDITOR",
+                "GRAPH_EDITOR_NODE_FORM",
+                "GRAPH_EDITOR_EDGE_FORM",
                 "BOXES_EDITOR",
                 "PERSONAS_FORM",
                 "PERSONAS_EDITOR",
@@ -2008,8 +2128,8 @@ mod tests {
             .collect();
         // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
-        // Hierarchy memory pane's six, 84.
-        assert_eq!(views.len(), 84);
+        // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90.
+        assert_eq!(views.len(), 90);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

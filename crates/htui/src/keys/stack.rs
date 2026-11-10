@@ -344,6 +344,28 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
         "in the Memory subject question (amend)",
         views::MEMORY_CLASH_AMEND,
     ),
+    // MOD-141 D12: the graph editor, appended so every first-reported phrase is unchanged.
+    ("in the graph editor", views::GRAPH_EDITOR),
+    (
+        "while the graph editor connects",
+        views::GRAPH_EDITOR_CONNECT,
+    ),
+    (
+        "in the graph editor's step form",
+        views::GRAPH_EDITOR_NODE_FORM,
+    ),
+    (
+        "in the graph editor's link form",
+        views::GRAPH_EDITOR_EDGE_FORM,
+    ),
+    (
+        "in the graph editor's links list",
+        views::GRAPH_EDITOR_LINKS,
+    ),
+    (
+        "in the graph editor's delete question",
+        views::GRAPH_EDITOR_CONFIRM,
+    ),
 ];
 
 impl Keys {
@@ -436,7 +458,8 @@ mod tests {
         );
         // MOD-115 M2 T6: the quit question's entry went with it; MOD-122 D5 adds Settings >
         // Logging's before it.
-        assert_eq!(DECLARED.len(), 91);
+        // MOD-141 D12: the graph editor's six.
+        assert_eq!(DECLARED.len(), 97);
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
         assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));

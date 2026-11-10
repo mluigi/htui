@@ -89,11 +89,13 @@ impl History {
     }
 
     /// The label redo would put back.
+    #[cfg(test)]
     pub(crate) fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|e| e.label.as_str())
     }
 
     /// The (undo, redo) stack depths.
+    #[cfg(test)]
     pub(crate) fn depths(&self) -> (usize, usize) {
         (self.undo.len(), self.redo.len())
     }
