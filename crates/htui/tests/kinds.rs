@@ -9,9 +9,11 @@ use chrono::{Duration, Utc};
 use htui::app::{Action, Handled};
 use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, PersonaSummary, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
+use htui::keys::views;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::graph_editor::GraphEditor;
 use htui::ui::kit::pane::Pane;
 use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, SettingsSection, SettingsTab,
@@ -19,8 +21,9 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch,
-    NewProject, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId, Scope, Split,
-    StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    NewProject, NewStepGraph, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch,
+    ProjectId, Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase,
+    WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
@@ -66,12 +69,25 @@ fn refusal(reply: StoreReply) -> (&'static str, String) {
     }
 }
 
+/// `ReplaceGraph`'s answer (MOD-141 D13): the write's outcome with the body, and the scope's
+/// catalogue re-read after it, or a panic naming what came back instead.
+#[track_caller]
+fn replaced(reply: StoreReply) -> (CasOutcome<Box<GraphBody>>, CatalogueSnapshot) {
+    match reply {
+        StoreReply::GraphReplaced {
+            outcome,
+            catalogue: Some(catalogue),
+        } => (outcome, *catalogue),
+        other => panic!("expected a replaced graph: {other:?}"),
+    }
+}
+
 /// One read of the demo scope.
 async fn demo_catalogue(backend: &Backend) -> CatalogueSnapshot {
     catalogue(serve(backend, &StoreRequest::Catalogue(vulkan_scope())).await)
 }
 
-/// The empty scope every name-only request is built against: the eleven names are a property of the
+/// The empty scope every name-only request is built against: the twelve names are a property of the
 /// enum, not of a store.
 fn nil_scope() -> Scope {
     Scope {
@@ -80,7 +96,7 @@ fn nil_scope() -> Scope {
     }
 }
 
-/// One of each of the eleven, in [`REQUEST_NAMES`] order. The ids are nil where the request never
+/// One of each of the twelve, in [`REQUEST_NAMES`] order. The ids are nil where the request never
 /// reaches a store.
 fn catalogue_requests() -> Vec<StoreRequest> {
     vec![
@@ -160,20 +176,21 @@ fn catalogue_requests() -> Vec<StoreRequest> {
             scope: nil_scope(),
             phase: PhaseId::default(),
         },
+        StoreRequest::GraphBody(StepGraphId::default()),
     ]
 }
 
-/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a tenth
+/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a thirteenth
 /// request cannot be named in one and matched in the other.
 #[test]
 fn catalogue_names_are_stable() {
     let requests = catalogue_requests();
     assert_eq!(requests.len(), REQUEST_NAMES.len());
-    assert_eq!(REQUEST_NAMES.len(), 11);
+    assert_eq!(REQUEST_NAMES.len(), 12);
     assert_eq!(
         REQUEST_NAMES[9..],
-        ["replace_graph", "delete_phase"],
-        "the two MOD-137 verbs follow the nine (D12)"
+        ["replace_graph", "delete_phase", "graph_body"],
+        "the two MOD-137 verbs follow the nine (D12), then MOD-141's read (D13)"
     );
     for (request, name) in requests.iter().zip(REQUEST_NAMES) {
         assert_eq!(request.name(), name);
@@ -291,7 +308,7 @@ async fn an_unknown_project_id_is_skipped() {
     assert_eq!(snapshot.projects[0].project.slug, "vulkan-tutorials");
 }
 
-/// Offline, every one of the eleven is refused by its own name with MOD-25's one sentence:
+/// Offline, every one of the twelve is refused by its own name with MOD-25's one sentence:
 /// `Backend::writer()` is `None`, so `serve` never reaches the seam — the read included (D7).
 #[tokio::test]
 async fn offline_refuses_every_catalogue_request_by_name() {
@@ -314,7 +331,7 @@ async fn offline_refuses_every_catalogue_request_by_name() {
     }
 }
 
-/// `catalogue::serve` is reachable only through `try_serve`'s eleven or-ed patterns, so a request
+/// `catalogue::serve` is reachable only through `try_serve`'s twelve or-ed patterns, so a request
 /// from anywhere else is told which one it sent rather than panicking.
 #[tokio::test]
 async fn serve_refuses_a_foreign_request_by_name() {
@@ -909,8 +926,9 @@ async fn the_demo_catalogue_carries_seeded_edges() {
     }
 }
 
-/// The editor's one write lands whole and the reply is the catalogue re-read: the renamed phase,
-/// the new edge, and the revision moved by one (MOD-137 D10, D12).
+/// The editor's one write lands whole and the reply carries the body as stored beside the catalogue
+/// re-read: the renamed phase, the new edge, and the revision moved by one (MOD-137 D10, D12,
+/// MOD-141 D13).
 #[tokio::test]
 async fn replace_graph_round_trips_through_the_catalogue() {
     let backend = demo();
@@ -919,9 +937,14 @@ async fn replace_graph_round_trips_through_the_catalogue() {
     let verdict = phase_named(entry, "verdict").id;
     let research = phase_named(entry, "research").id;
 
-    let snapshot = catalogue(serve(&backend, &rename_verdict_request(entry)).await);
+    let (outcome, snapshot) = replaced(serve(&backend, &rename_verdict_request(entry)).await);
 
     let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    let CasOutcome::Applied(body) = outcome else {
+        panic!("a fresh revision applies: {outcome:?}");
+    };
+    assert_eq!(body.graph.revision, 1);
+    assert_eq!(*body, *after, "the reply's body is the one stored");
     assert_eq!(after.graph.revision, 1);
     let names: Vec<&str> = after.nodes.iter().map(|n| n.phase.name.as_str()).collect();
     assert_eq!(names, ["research", "decide"]);
@@ -994,7 +1017,7 @@ async fn replace_graph_from_the_catalogue_keeps_candidates_and_parts() {
 
     // The editor opens the graph from the catalogue and renames `verdict`.
     let opened = demo_catalogue(&backend).await;
-    let snapshot = catalogue(
+    let (_, snapshot) = replaced(
         serve(
             &backend,
             &rename_verdict_request(graph_entry(&opened, ids::GRAPH_VULKAN_ANA)),
@@ -1025,20 +1048,30 @@ async fn replace_graph_from_the_catalogue_keeps_candidates_and_parts() {
     assert_eq!(node(verdict).parts, [part], "and the renamed node its part");
 }
 
-/// The same request twice: the second carries a spent revision and answers `CatalogueStale` with
-/// the catalogue as the first left it (D5, D8).
+/// The same request twice: the second carries a spent revision and answers `GraphReplaced` with
+/// `Stale` and the body as it is now, beside the catalogue as the first left it (D5, D8, MOD-141
+/// D13).
 #[tokio::test]
-async fn a_spent_revision_answers_catalogue_stale() {
+async fn a_spent_revision_answers_graph_replaced_stale() {
     let backend = demo();
     let before = demo_catalogue(&backend).await;
     let request = rename_verdict_request(graph_entry(&before, ids::GRAPH_VULKAN_ANA));
 
-    let first = catalogue(serve(&backend, &request).await);
+    let (applied, first) = replaced(serve(&backend, &request).await);
+    assert!(matches!(applied, CasOutcome::Applied(_)), "{applied:?}");
     let reply = serve(&backend, &request).await;
 
-    let StoreReply::CatalogueStale(snapshot) = reply else {
+    let StoreReply::GraphReplaced {
+        outcome: CasOutcome::Stale(current),
+        catalogue: Some(snapshot),
+    } = reply
+    else {
         panic!("a spent revision answers stale: {reply:?}");
     };
+    assert_eq!(
+        current.graph.revision, 1,
+        "the body as the first write left it"
+    );
     assert_eq!(*snapshot, first, "the refused write changed nothing");
     assert_eq!(
         graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA).graph.revision,
@@ -1113,6 +1146,122 @@ async fn delete_phase_rereads_the_catalogue() {
     assert_eq!(names, ["research"]);
     assert!(after.edges.is_empty(), "the phase's edge went with it");
     assert_eq!(after.graph.revision, 1);
+}
+
+/// MOD-141 D13: `GraphBody` reads one graph by id whatever its scope, the editor's open-by-id
+/// (the Toolbox hook): a project graph from the seed, then a workspace and a library graph made
+/// here; an id no graph has answers `None`.
+#[tokio::test]
+async fn graph_body_reads_one_graph_of_each_scope() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let workspace = StepGraphId::new();
+    let library = StepGraphId::new();
+    for (id, scope, name) in [
+        (
+            workspace,
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "ws-flow",
+        ),
+        (library, GraphScope::Library, "lib-flow"),
+    ] {
+        writer
+            .create_step_graph(NewStepGraph {
+                id,
+                scope,
+                name: name.to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("the graph is created");
+    }
+
+    for (id, scope) in [
+        (
+            ids::GRAPH_VULKAN_ANA,
+            GraphScope::Project(ids::PROJECT_VULKAN),
+        ),
+        (workspace, GraphScope::Workspace(ids::WORKSPACE_GRAPHICS)),
+        (library, GraphScope::Library),
+    ] {
+        let reply = serve(&backend, &StoreRequest::GraphBody(id)).await;
+        let StoreReply::GraphBody(Some(body)) = reply else {
+            panic!("graph {id} answers its body: {reply:?}");
+        };
+        assert_eq!(body.graph.id, id);
+        assert_eq!(body.graph.scope, scope);
+    }
+
+    let reply = serve(&backend, &StoreRequest::GraphBody(StepGraphId::new())).await;
+    assert!(
+        matches!(reply, StoreReply::GraphBody(None)),
+        "an unknown id answers none: {reply:?}"
+    );
+}
+
+/// MOD-141 D13: a library graph is written through the same `ReplaceGraph` as a project one, its
+/// body read by `GraphBody`; the reply's body is the library graph as stored. The scope's catalogue
+/// does not list it, and need not: the editor draws from the body.
+#[tokio::test]
+async fn replace_graph_on_a_library_graph_answers_its_body() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let library = StepGraphId::new();
+    writer
+        .create_step_graph(NewStepGraph {
+            id: library,
+            scope: GraphScope::Library,
+            name: "lib-flow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("the library graph is created");
+    let reply = serve(&backend, &StoreRequest::GraphBody(library)).await;
+    let StoreReply::GraphBody(Some(mut body)) = reply else {
+        panic!("the library graph answers its body: {reply:?}");
+    };
+    body.nodes.push(NodeBody {
+        phase: phase_row(
+            PhaseId::new(),
+            library,
+            0,
+            &PhaseSeed {
+                name: "research",
+                input_kinds: &[],
+                gate_hard: false,
+            },
+            Utc::now(),
+        ),
+        agents: Vec::new(),
+        parts: Vec::new(),
+    });
+
+    let (outcome, snapshot) = replaced(
+        serve(
+            &backend,
+            &StoreRequest::ReplaceGraph {
+                scope: vulkan_scope(),
+                graph: library,
+                expected_revision: body.graph.revision,
+                body,
+            },
+        )
+        .await,
+    );
+
+    let CasOutcome::Applied(stored) = outcome else {
+        panic!("a fresh revision applies: {outcome:?}");
+    };
+    assert_eq!(stored.graph.scope, GraphScope::Library);
+    assert_eq!(stored.graph.revision, 1);
+    let names: Vec<&str> = stored.nodes.iter().map(|n| n.phase.name.as_str()).collect();
+    assert_eq!(names, ["research"]);
+    assert!(
+        snapshot.projects[0].graph(library).is_none(),
+        "the project's catalogue does not list a library graph"
+    );
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1286,9 +1435,10 @@ async fn the_selected_phase_shows_the_read_only_line() {
 
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("MOD-4 owns these"),
-        "the detail line names its owner: {frame}"
+        !frame.contains("MOD-4 owns these"),
+        "the detail line has no owner tail any more (MOD-141 D14): {frame}"
     );
+    assert!(frame.contains("template: latest"), "{frame}");
     assert!(
         error_text(&bench, &section, 100).is_empty(),
         "read-only is dim, not an error"
@@ -1584,7 +1734,7 @@ async fn an_unknown_graph_name_is_refused() {
 async fn a_kind_can_take_a_library_graph() {
     let store = MemStore::demo();
     let library = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Library,
             name: "libflow".to_owned(),
@@ -1676,7 +1826,7 @@ async fn a_kind_can_take_a_library_graph() {
 async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name() {
     let store = MemStore::demo();
     let library = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Library,
             name: "libflow".to_owned(),
@@ -1698,7 +1848,7 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
         .await
         .expect("a kind on the library graph");
     let own = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Project(ids::PROJECT_VULKAN),
             name: "libflow".to_owned(),
@@ -1780,7 +1930,7 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
 async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
     let store = MemStore::demo();
     let shared = store
-        .create_step_graph(htui_core::model::NewStepGraph {
+        .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
             scope: GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
             name: "wsflow".to_owned(),
@@ -2141,6 +2291,57 @@ async fn a_stale_reply_with_no_editor_open_says_nothing_was_written() {
     );
 }
 
+/// MOD-141 D13: `ReplaceGraph`'s own reply redraws the tree the way `Catalogue` did, and its
+/// `Stale` twin with no editor open says nothing was written, as `CatalogueStale` did.
+#[tokio::test]
+async fn a_graph_replaced_reply_redraws_the_tree_like_a_catalogue() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    assert!(!bench.render_section(&section, 100).contains("decide"));
+    let mut renamed = snapshot.clone();
+    let entry = renamed.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the demo carries the analysis graph");
+    for node in &mut entry.nodes {
+        if node.phase.name == "verdict" {
+            node.phase.name = "decide".to_owned();
+        }
+    }
+    let body = Box::new(entry.clone());
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Applied(body.clone()),
+            catalogue: Some(Box::new(renamed.clone())),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("decide"), "the tree is the reply's: {frame}");
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.is_empty(),
+        "an applied write sets no notice: {flagged:?}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Stale(body),
+            catalogue: Some(Box::new(renamed)),
+        },
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere; nothing was written \u{2014} reopen the editor and retry"),
+        "the miss says the write did not apply, and how to resume: {flagged:?}"
+    );
+}
+
 /// A prefix change is a warning before it is a write (PRD D12, D10): the old keys and their counter
 /// survive, and the next item minted under the kind spells the new one. Nothing is sent until that
 /// sentence has been on screen.
@@ -2250,443 +2451,24 @@ async fn y_on_the_prefix_warning_writes_once() {
     );
 }
 
-/// The phase a bench's demo catalogue draws first: the analysis graph's `research`.
-fn research(snapshot: &CatalogueSnapshot) -> StepGraphPhase {
-    snapshot.projects[0]
-        .graph(ids::GRAPH_VULKAN_ANA)
-        .expect("the analysis graph")
-        .nodes[0]
-        .phase
-        .clone()
-}
-
-/// `e` on a phase opens exactly PRD D2's six columns plus MOD-26 M2's `persona`, last — MOD-4's
-/// are on the read-only line, not in the editor — and `Enter` sends one `update_phase` with
-/// `input_kinds` replaced whole (D13) and the untouched `persona` left alone (D23, B-8).
+/// MOD-141 D14: `n` on a graph or a phase row points at the graph editor, where steps are added,
+/// naming the key in force; nothing is sent and no form opens.
 #[tokio::test]
-async fn e_on_a_phase_opens_seven_fields_and_enter_sends_update_phase() {
-    let (bench, mut section, snapshot) = bench_with_demo().await;
-    let stored = research(&snapshot);
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-
-    bench.key(&mut section, "e");
-    let frame = bench.render_section(&section, 100);
-    let rows: Vec<usize> = [
-        "name",
-        "position",
-        "template",
-        "hard gate (y/n)",
-        "inputs",
-        "token budget",
-        "persona",
-    ]
-    .into_iter()
-    .map(|label| {
-        field_line(&frame, label)
-            .unwrap_or_else(|| panic!("`{label}` is an editable column: {frame}"))
-    })
-    .collect();
-    assert!(
-        rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
-        "one row per field, in editor order, `persona` last: {rows:?} {frame}"
-    );
-    assert_eq!(
-        field_value(&frame, "persona").as_deref(),
-        Some(""),
-        "`persona` is blank for an unbound phase: {frame}"
-    );
-    assert!(
-        !frame.contains("fan_out  "),
-        "MOD-4's columns are not editable here: {frame}"
-    );
-    insta::assert_snapshot!("editor_phase", frame);
-
-    for _ in 0..4 {
-        bench.key(&mut section, "tab");
+async fn n_on_a_graph_or_phase_points_at_the_graph_editor() {
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
+    for row in ["analysis \u{b7} graph, no kind", ". verdict "] {
+        cursor_to(&bench, &mut section, row);
+        bench.key(&mut section, "n");
+        assert!(bench.drained().is_empty(), "{row}");
+        assert!(!section.captures_input(), "{row}: no form opens");
+        assert!(
+            error_text(&bench, &section, 100).contains(
+                &"steps are added and deleted in the graph editor: Enter opens it".to_owned()
+            ),
+            "{row}"
+        );
+        bench.key(&mut section, "esc");
     }
-    type_at(&bench, &mut section, "plan,");
-    bench.key(&mut section, "space");
-    type_at(&bench, &mut section, "review,,");
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [
-        Action::Store(StoreRequest::UpdatePhase {
-            id,
-            expected,
-            patch,
-            ..
-        }),
-    ] = asked.as_slice()
-    else {
-        panic!("a patch-only change is one write: {asked:?}");
-    };
-    assert_eq!(*id, stored.id);
-    assert_eq!(*expected, stored.updated_at);
-    assert_eq!(
-        patch.input_kinds.as_deref(),
-        Some(["plan".to_owned(), "review".to_owned()].as_slice()),
-        "split on `,`, trimmed, empties dropped, order kept (D13)"
-    );
-    assert_eq!(patch.name.as_deref(), Some(stored.name.as_str()));
-    assert_eq!(patch.position, Some(stored.position));
-    assert_eq!(
-        patch.template_name.as_deref(),
-        Some(stored.template_name.as_str())
-    );
-    assert_eq!(patch.gate_hard, Some(stored.gate_hard));
-    assert_eq!(
-        patch.persona, None,
-        "an untouched `persona` field writes nothing to the binding (B-8)"
-    );
-}
-
-/// `token_budget` is not in `PhasePatch` at all: it rides the `Phase` rung, so a budget-only change
-/// is one `set_phase_budget` and no `update_phase` (D6, D16).
-#[tokio::test]
-async fn a_budget_only_change_sends_set_phase_budget() {
-    let (bench, mut section, snapshot) = bench_with_demo().await;
-    let stored = research(&snapshot);
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    type_at(&bench, &mut section, "60000");
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [
-        Action::Store(StoreRequest::SetPhaseBudget {
-            phase,
-            expected,
-            budget,
-            ..
-        }),
-    ] = asked.as_slice()
-    else {
-        panic!("a budget-only change is one write, on the rung: {asked:?}");
-    };
-    assert_eq!(*phase, stored.id);
-    assert_eq!(*expected, stored.updated_at, "the phase's own token (B-2)");
-    assert_eq!(*budget, Some(60_000));
-}
-
-/// An emptied budget field clears the setting rather than writing a default: clearing lets the
-/// project or app rung answer (D16, PRD D7).
-#[tokio::test]
-async fn clearing_the_budget_sends_none() {
-    let bench = SectionBench::new().await;
-    let mut section = KindsSection::new();
-    let mut snapshot = demo_catalogue(&demo()).await;
-    snapshot.projects[0]
-        .graphs
-        .iter_mut()
-        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
-        .expect("the analysis graph")
-        .nodes[0]
-        .phase
-        .token_budget = Some(60_000);
-    bench.reply(
-        &mut section,
-        &StoreReply::Catalogue(Box::new(snapshot.clone())),
-    );
-    let _ = bench.drained();
-    assert!(
-        bench
-            .render_section(&section, 100)
-            .contains("budget 60000 tokens"),
-        "the row prints the number it holds"
-    );
-
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    for _ in 0.."60000".len() {
-        bench.key(&mut section, "backspace");
-    }
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [Action::Store(StoreRequest::SetPhaseBudget { budget, .. })] = asked.as_slice() else {
-        panic!("an emptied field is one clear: {asked:?}");
-    };
-    assert_eq!(*budget, None, "empty means inherit, not zero");
-}
-
-/// A budget that is not a number is refused here; every other bound on the column is the store's
-/// (B-1), so the section never re-implements a minimum or a maximum.
-#[tokio::test]
-async fn a_non_number_budget_is_refused() {
-    let (bench, mut section, _) = bench_with_demo().await;
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    type_at(&bench, &mut section, "lots");
-
-    bench.key(&mut section, "enter");
-
-    assert!(bench.drained().is_empty());
-    assert!(
-        error_text(&bench, &section, 100)
-            .contains(&"`token budget` is a whole number or empty".to_owned())
-    );
-}
-
-/// One `Enter` that changed both the patch columns and the budget is two writes, in order (B-4):
-/// the second is sent from the first one's reply, with the token that reply carries, because `busy`
-/// is one slot and the second's token would otherwise be stale by construction.
-#[tokio::test]
-async fn a_patch_and_budget_change_is_two_writes_in_order() {
-    let backend = demo();
-    let (bench, mut section, snapshot) = bench_with_demo().await;
-    let stored = research(&snapshot);
-
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-    type_at(&bench, &mut section, "2");
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    type_at(&bench, &mut section, "60000");
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [Action::Store(StoreRequest::UpdatePhase { patch, .. })] = asked.as_slice() else {
-        panic!("the patch goes first: {asked:?}");
-    };
-    assert_eq!(patch.name.as_deref(), Some("research2"));
-
-    // The worker's reply to that write, with the phase's token moved.
-    let fresh = catalogue(
-        serve(
-            &backend,
-            &StoreRequest::UpdatePhase {
-                scope: vulkan_scope(),
-                id: stored.id,
-                expected: stored.updated_at,
-                patch: PhasePatch {
-                    name: Some("research2".to_owned()),
-                    ..PhasePatch::default()
-                },
-            },
-        )
-        .await,
-    );
-    let moved = research(&fresh);
-    assert_ne!(moved.updated_at, stored.updated_at);
-    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(fresh)));
-
-    let asked = bench.drained();
-    let [
-        Action::Store(StoreRequest::SetPhaseBudget {
-            phase,
-            expected,
-            budget,
-            ..
-        }),
-    ] = asked.as_slice()
-    else {
-        panic!("the budget follows, once: {asked:?}");
-    };
-    assert_eq!(*phase, stored.id);
-    assert_eq!(
-        *expected, moved.updated_at,
-        "against the token the first reply carried, not the one the editor opened on"
-    );
-    assert_eq!(*budget, Some(60_000));
-    assert!(
-        section.captures_input(),
-        "the editor closes on the *second* reply, not the first"
-    );
-
-    bench.reply(
-        &mut section,
-        &StoreReply::Catalogue(Box::new(demo_catalogue(&backend).await)),
-    );
-    assert!(!section.captures_input(), "and then it closes");
-    assert!(bench.drained().is_empty(), "with nothing left to send");
-}
-
-/// The budget half of B-4's chain is retried by a second `Enter` when it comes back stale: the
-/// editor's stored budget still holds what the *row* said, so the retry is the `set_phase_budget`
-/// that never landed and not a no-op `update_phase` that would close the editor with the number
-/// the user typed never written (D8, `R-ENT-10`).
-#[tokio::test]
-async fn a_stale_budget_follow_up_is_retried_by_enter() {
-    let backend = demo();
-    let (bench, mut section, snapshot) = bench_with_demo().await;
-    let stored = research(&snapshot);
-
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-    type_at(&bench, &mut section, "2");
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    type_at(&bench, &mut section, "60000");
-    bench.key(&mut section, "enter");
-    let _ = bench.drained();
-
-    // The patch lands, and its reply is what the budget write is sent from.
-    let fresh = catalogue(
-        serve(
-            &backend,
-            &StoreRequest::UpdatePhase {
-                scope: vulkan_scope(),
-                id: stored.id,
-                expected: stored.updated_at,
-                patch: PhasePatch {
-                    name: Some("research2".to_owned()),
-                    ..PhasePatch::default()
-                },
-            },
-        )
-        .await,
-    );
-    let moved = research(&fresh);
-    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(fresh)));
-    let asked = bench.drained();
-    assert!(
-        matches!(
-            asked.as_slice(),
-            [Action::Store(StoreRequest::SetPhaseBudget { .. })]
-        ),
-        "the budget follows the patch: {asked:?}"
-    );
-
-    // Someone else moved the row while that budget write was out, so it never applied.
-    let current = catalogue(
-        serve(
-            &backend,
-            &StoreRequest::SetPhaseBudget {
-                scope: vulkan_scope(),
-                phase: stored.id,
-                expected: moved.updated_at,
-                budget: Some(1_000),
-            },
-        )
-        .await,
-    );
-    bench.reply(
-        &mut section,
-        &StoreReply::CatalogueStale(Box::new(current.clone())),
-    );
-    assert!(
-        section.captures_input(),
-        "the editor stays open over the number that was typed"
-    );
-    assert!(
-        bench.drained().is_empty(),
-        "a miss retries nothing by itself"
-    );
-
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [
-        Action::Store(StoreRequest::SetPhaseBudget {
-            phase,
-            expected,
-            budget,
-            ..
-        }),
-    ] = asked.as_slice()
-    else {
-        panic!("the retry is the budget write, once and alone: {asked:?}");
-    };
-    assert_eq!(*phase, stored.id);
-    assert_eq!(
-        *budget,
-        Some(60_000),
-        "the number that was typed, not the one the other writer left"
-    );
-    assert_eq!(
-        *expected,
-        research(&current).updated_at,
-        "against the token the miss re-took, not the one the patch's reply carried"
-    );
-}
-
-/// `n` on a graph or a phase row creates a phase in that graph, prefilled with the position after
-/// its last one (B-8) and `gate_hard` at `n` (B-3: a phase is born inheriting its budget).
-#[tokio::test]
-async fn n_on_a_phase_creates_in_its_graph() {
-    let (bench, mut section, _) = bench_with_demo().await;
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-
-    bench.key(&mut section, "n");
-    let frame = bench.render_section(&section, 100);
-    assert!(
-        !frame.contains("token budget"),
-        "a new phase inherits its budget; the column is set by `e` afterwards (B-3): {frame}"
-    );
-    type_at(&bench, &mut section, "triage");
-    bench.key(&mut section, "tab");
-    bench.key(&mut section, "tab");
-    type_at(&bench, &mut section, "triage");
-    bench.key(&mut section, "tab");
-    for _ in 0.."n".len() {
-        bench.key(&mut section, "backspace");
-    }
-    type_at(&bench, &mut section, "y");
-    bench.key(&mut section, "tab");
-    type_at(&bench, &mut section, "verdict");
-    bench.key(&mut section, "enter");
-
-    let asked = bench.drained();
-    let [
-        Action::Store(StoreRequest::CreatePhase {
-            graph,
-            name,
-            position,
-            template_name,
-            gate_hard,
-            input_kinds,
-            ..
-        }),
-    ] = asked.as_slice()
-    else {
-        panic!("`n` on a phase row creates in its graph: {asked:?}");
-    };
-    assert_eq!(*graph, ids::GRAPH_VULKAN_ANA);
-    assert_eq!(name, "triage");
-    assert_eq!(*position, 2, "after `research` and `verdict`");
-    assert_eq!(template_name, "triage");
-    assert!(*gate_hard);
-    assert_eq!(input_kinds, &["verdict".to_owned()]);
-}
-
-/// A `gate_hard` field that is neither `y` nor `n` is refused rather than guessed at (B-10), by the
-/// parser both sections share (D14).
-#[tokio::test]
-async fn a_gate_hard_that_is_not_y_or_n_is_refused() {
-    let (bench, mut section, _) = bench_with_demo().await;
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "e");
-    for _ in 0..3 {
-        bench.key(&mut section, "tab");
-    }
-    bench.key(&mut section, "backspace");
-    type_at(&bench, &mut section, "maybe");
-
-    bench.key(&mut section, "enter");
-
-    assert!(bench.drained().is_empty());
-    assert!(error_text(&bench, &section, 100).contains(&"`hard gate (y/n)` is y or n".to_owned()));
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2739,167 +2521,10 @@ async fn bench_with_bound(
     (bench, section, snapshot)
 }
 
-/// The editor's `persona` line, as drawn: the last field of a phase edit.
-#[track_caller]
-fn persona_field(bench: &SectionBench, section: &KindsSection) -> String {
-    let frame = bench.render_section(section, 100);
-    field_value(&frame, "persona")
-        .unwrap_or_else(|| panic!("the editor draws a `persona` field: {frame}"))
-}
-
-/// Opens the phase editor on `research` (project → ANA → `research`).
-fn edit_research(bench: &SectionBench, section: &mut KindsSection) {
-    bench.key(section, "j");
-    bench.key(section, "j");
-    bench.key(section, "e");
-}
-
-/// Moves the focus from `name` to `persona`, the seventh field.
-fn focus_persona(bench: &SectionBench, section: &mut KindsSection) {
-    for _ in 0..6 {
-        bench.key(section, "tab");
-    }
-}
-
-/// The one `update_phase` an `Enter` sent, or a panic naming what was sent instead.
-#[track_caller]
-fn the_update_phase(asked: &[Action]) -> PhasePatch {
-    let [Action::Store(StoreRequest::UpdatePhase { patch, .. })] = asked else {
-        panic!("exactly one `update_phase`: {asked:?}");
-    };
-    patch.clone()
-}
-
-/// A name the loaded list holds binds the phase: the patch carries that persona's id (D23).
-#[tokio::test]
-async fn a_typed_persona_name_binds_the_phase() {
-    let (bench, mut section, _) = bench_with_demo().await;
-    edit_research(&bench, &mut section);
-    focus_persona(&bench, &mut section);
-    type_at(&bench, &mut section, "reviewer");
-
-    bench.key(&mut section, "enter");
-
-    let patch = the_update_phase(&bench.drained());
-    assert_eq!(patch.persona, Some(Some(ids::PERSONA_REVIEWER)));
-}
-
-/// A persona and a budget changed by one `Enter` are D-4's shape: the patch goes first and carries
-/// the persona, and the budget follows on the patch's reply (B-4). Without the persona in
-/// `patch_changed` this was one `set_phase_budget`, with the persona dropped.
-#[tokio::test]
-async fn a_persona_and_budget_change_sends_the_patch_then_the_budget() {
-    let (bench, mut section, snapshot) = bench_with_demo().await;
-    edit_research(&bench, &mut section);
-    for _ in 0..5 {
-        bench.key(&mut section, "tab");
-    }
-    type_at(&bench, &mut section, "9000");
-    bench.key(&mut section, "tab");
-    type_at(&bench, &mut section, "reviewer");
-
-    bench.key(&mut section, "enter");
-
-    let patch = the_update_phase(&bench.drained());
-    assert_eq!(
-        patch.persona,
-        Some(Some(ids::PERSONA_REVIEWER)),
-        "the persona rides the patch, which goes first"
-    );
-
-    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
-    let asked = bench.drained();
-    let [Action::Store(StoreRequest::SetPhaseBudget { budget, .. })] = asked.as_slice() else {
-        panic!("the budget is still owed, once: {asked:?}");
-    };
-    assert_eq!(*budget, Some(9_000));
-}
-
-/// A bound phase opens with its persona's name in the field, and blanking it unbinds: `Some(None)`
-/// (D23).
-#[tokio::test]
-async fn blanking_a_bound_persona_sends_some_none() {
-    let (bench, mut section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
-    edit_research(&bench, &mut section);
-    assert_eq!(
-        persona_field(&bench, &section),
-        "reviewer",
-        "prefilled with the bound name"
-    );
-    focus_persona(&bench, &mut section);
-    for _ in 0.."reviewer".len() {
-        bench.key(&mut section, "backspace");
-    }
-
-    bench.key(&mut section, "enter");
-
-    let patch = the_update_phase(&bench.drained());
-    assert_eq!(patch.persona, Some(None), "a blank field is no persona");
-}
-
-/// An edit that never touched the `persona` field leaves the binding alone: `None`, so another
-/// writer's binding is not rewritten from this editor's copy (B-8).
-#[tokio::test]
-async fn an_untouched_bound_persona_sends_none() {
-    let (bench, mut section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
-    edit_research(&bench, &mut section);
-    type_at(&bench, &mut section, "2");
-
-    bench.key(&mut section, "enter");
-
-    let patch = the_update_phase(&bench.drained());
-    assert_eq!(patch.name.as_deref(), Some("research2"));
-    assert_eq!(patch.persona, None, "the untouched field writes nothing");
-}
-
-/// A name the loaded list does not hold is refused before anything is sent, with the names it
-/// does hold, in `theme.error` (D23).
-#[tokio::test]
-async fn an_unknown_persona_name_is_refused_before_sending() {
-    let (bench, mut section, _) = bench_with_demo().await;
-    edit_research(&bench, &mut section);
-    focus_persona(&bench, &mut section);
-    type_at(&bench, &mut section, "ghost");
-
-    bench.key(&mut section, "enter");
-
-    assert!(bench.drained().is_empty(), "nothing is sent");
-    let flagged = error_text(&bench, &section, 100);
-    assert!(
-        flagged.contains(&"no persona named `ghost`; known: architect, reviewer".to_owned()),
-        "the refusal lists the known names: {flagged:?}"
-    );
-}
-
-/// With an empty registry the refusal says where personas are made rather than listing nothing
-/// (D23).
-#[tokio::test]
-async fn with_no_personas_the_refusal_says_add_one() {
-    let bench = SectionBench::new().await;
-    let mut section = KindsSection::new();
-    let mut snapshot = demo_catalogue(&demo()).await;
-    snapshot.personas.clear();
-    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
-    let _ = bench.drained();
-    edit_research(&bench, &mut section);
-    focus_persona(&bench, &mut section);
-    type_at(&bench, &mut section, "ghost");
-
-    bench.key(&mut section, "enter");
-
-    assert!(bench.drained().is_empty(), "nothing is sent");
-    let flagged = error_text(&bench, &section, 100);
-    assert!(
-        flagged.contains(&"no personas exist; add one in Settings \u{203a} Personas".to_owned()),
-        "the refusal says where personas come from: {flagged:?}"
-    );
-}
-
 /// A binding to an id the loaded list does not know — a persona created after the catalogue was
-/// read — prints as the id, prefills the field with it, and is left alone by an edit that does not
-/// touch the field (D23, B-8).
+/// read — prints as the id (D23). Editing it is the graph editor's (MOD-141 D14).
 #[tokio::test]
-async fn an_id_the_list_does_not_know_prints_as_the_id_and_is_left_alone() {
+async fn an_id_the_list_does_not_know_prints_as_the_id() {
     let unknown = PersonaId::new();
     let bench = SectionBench::new().await;
     let mut section = KindsSection::new();
@@ -2924,21 +2549,6 @@ async fn an_id_the_list_does_not_know_prints_as_the_id_and_is_left_alone() {
         line.trim_end()
             .ends_with(&format!(" \u{b7} persona {unknown}")),
         "an id the list does not know prints as the id: {line}"
-    );
-
-    edit_research(&bench, &mut section);
-    assert_eq!(
-        persona_field(&bench, &section),
-        unknown.to_string(),
-        "and prefills the field"
-    );
-    type_at(&bench, &mut section, "2");
-    bench.key(&mut section, "enter");
-
-    let patch = the_update_phase(&bench.drained());
-    assert_eq!(
-        patch.persona, None,
-        "an id nobody typed is not refused and not rewritten"
     );
 }
 
@@ -3076,11 +2686,11 @@ async fn a_kind_delete_reports_the_mirror() {
     );
 }
 
-/// `d` elsewhere says where deletes live: graphs and phases have no seam method at all (D5), and
-/// projects belong to the hierarchy section (B-13).
+/// `d` elsewhere says where deletes live: graphs have no seam method at all (D5), steps are deleted
+/// in the graph editor (MOD-141 D14), and projects belong to the hierarchy section (B-13).
 #[tokio::test]
 async fn d_on_a_phase_or_graph_is_refused() {
-    let (bench, mut section, _) = bench_with_demo().await;
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
 
     bench.key(&mut section, "d");
     assert!(bench.drained().is_empty());
@@ -3088,14 +2698,23 @@ async fn d_on_a_phase_or_graph_is_refused() {
         error_text(&bench, &section, 100).contains(&"projects are edited in Hierarchy".to_owned())
     );
 
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
+    cursor_to(&bench, &mut section, "analysis \u{b7} graph, no kind");
     bench.key(&mut section, "d");
     assert!(bench.drained().is_empty());
     assert!(
-        error_text(&bench, &section, 100)
-            .contains(&"graphs and phases are not deleted here".to_owned()),
-        "a phase row says so in this section's own words"
+        error_text(&bench, &section, 100).contains(&"graphs are not deleted here".to_owned()),
+        "a graph row says so in the section's own words"
+    );
+
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "d");
+    assert!(bench.drained().is_empty());
+    assert!(!section.captures_input(), "no question is asked");
+    assert!(
+        error_text(&bench, &section, 100).contains(
+            &"steps are added and deleted in the graph editor: Enter opens it".to_owned()
+        ),
+        "a phase row points at the graph editor"
     );
 }
 
@@ -3247,7 +2866,7 @@ async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("e edit \u{b7} G graph \u{b7} d delete kind"),
+            .contains("e edit \u{b7} G graph \u{b7} Enter graph editor \u{b7} d delete kind"),
         "{}",
         bench.key_hint(&section)
     );
@@ -3388,7 +3007,7 @@ async fn the_read_only_line_names_its_columns_in_words() {
         flat(&frame).contains(
             "fan-out 1 \u{b7} gate: always \u{b7} isolation: project default \u{b7} commands: \
              queued when fanned out \u{b7} verify: none \u{b7} retries 1 \u{b7} output: research \
-             \u{b7} template: latest \u{2014} MOD-4 owns these"
+             \u{b7} template: latest"
         ),
         "{frame}"
     );
@@ -3620,12 +3239,13 @@ async fn the_pane_draws_a_thumb_exactly_when_a_tree_row_is_hidden() {
     let cut = framed_at(&bench, &section, 100, height - 1);
     assert!(!thumb_rows(&cut).is_empty(), "a hidden row shows a thumb");
 
-    // The last phase's editor under the tree: the tree scrolls to its end, the thumb with it.
+    // An editor under the tree, opened on the last phase (`N`, a new graph: MOD-141 D14 took the
+    // phase editor into the graph editor): the tree scrolls to its end, the thumb with it.
     for _ in 1..rows {
         bench.key(&mut section, "j");
     }
-    bench.key(&mut section, "e");
-    assert!(section.captures_input(), "the phase editor is open");
+    bench.key(&mut section, "N");
+    assert!(section.captures_input(), "the graph form is open");
     let editing = framed_at(&bench, &section, 100, height);
     let thumb = thumb_rows(&editing);
     assert!(!thumb.is_empty(), "the form hides tree rows");
@@ -3670,4 +3290,516 @@ async fn the_section_at_80_columns() {
         "the tree overflows the pane, so the pane shows a thumb: {frame}"
     );
     insta::assert_snapshot!("demo_80", frame);
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-141 T7: the graph editor, hosted over the whole section (D2, D3, D14)
+// -------------------------------------------------------------------------------------------
+
+/// The store requests the section emitted since the last drain, in order.
+fn store_requests(bench: &SectionBench) -> Vec<StoreRequest> {
+    bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Presses `j` until the cursor's row reads `needle`.
+#[track_caller]
+fn cursor_to(bench: &SectionBench, section: &mut KindsSection, needle: &str) {
+    for _ in 0..64 {
+        let rows = selected_rows(&drawn(bench, section, 100));
+        if rows.iter().any(|(_, text)| text.contains(needle)) {
+            return;
+        }
+        bench.key(section, "j");
+    }
+    panic!(
+        "no row reads `{needle}`: {}",
+        bench.render_section(section, 100)
+    );
+}
+
+/// The cursor's row, as drawn.
+#[track_caller]
+fn cursor_row(bench: &SectionBench, section: &KindsSection) -> String {
+    let rows = selected_rows(&drawn(bench, section, 100));
+    let [(_, text)] = rows.as_slice() else {
+        panic!("one cursor row: {rows:?}");
+    };
+    text.clone()
+}
+
+/// Answers the editor's two reads (`Agents`, `Templates`) from the demo world, as the worker would.
+async fn answer_lookups(bench: &SectionBench, section: &mut KindsSection) {
+    let backend = demo();
+    for request in store_requests(bench) {
+        if matches!(request, StoreRequest::Agents | StoreRequest::Templates(_)) {
+            let reply = serve(&backend, &request).await;
+            bench.reply(section, &reply);
+        }
+    }
+    let _ = bench.drained();
+}
+
+/// The demo catalogue with the ANA kind pointed away from its graph, so `analysis` is listed on
+/// its own `Graph` row, its phases under it, at the end of the tree.
+async fn bench_with_unreferenced_analysis() -> (SectionBench, KindsSection) {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0].kinds[0].default_graph_id = StepGraphId::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    (bench, section)
+}
+
+/// The editor's header names the graph, its scope and its revision.
+const ANALYSIS_HEADER: &str = "analysis \u{b7} project graph \u{b7} revision";
+
+/// MOD-141 D3: `Enter` on a graph row opens the editor over the section; it asks for the agents
+/// and the templates its step form picks from, and the section's keys are the editor's.
+#[tokio::test]
+async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates() {
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
+    cursor_to(&bench, &mut section, "analysis \u{b7} graph, no kind");
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+
+    let asked = store_requests(&bench);
+    let scope = bench_scope().await;
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [StoreRequest::Agents, StoreRequest::Templates(asked_scope)] if *asked_scope == scope
+        ),
+        "{asked:?}"
+    );
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    assert!(
+        section.captures_input(),
+        "the tab's `h`/`l` are the editor's"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+    let wanted = section.wants_requests(&scope);
+    assert!(
+        matches!(
+            wanted.as_slice(),
+            [
+                StoreRequest::Catalogue(_),
+                StoreRequest::Agents,
+                StoreRequest::Templates(_)
+            ]
+        ),
+        "an open editor reads again on activation: {wanted:?}"
+    );
+}
+
+/// MOD-141 D3: `Enter` on a phase row opens the editor on that step: the editor's own `Enter`
+/// then edits it.
+#[tokio::test]
+async fn enter_on_a_phase_row_opens_the_editor_on_that_step() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR_NODE_FORM));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("step verdict"), "{frame}");
+    assert!(
+        store_requests(&bench).is_empty(),
+        "opening a form writes nothing"
+    );
+}
+
+/// MOD-141 D14: `e` on a phase row opens the editor with that step's form already open; `Esc`
+/// cancels the form back to the canvas, and the editor stays.
+#[tokio::test]
+async fn e_on_a_phase_row_opens_its_step_form_in_the_editor() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+
+    bench.key(&mut section, "e");
+
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR_NODE_FORM));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("step verdict"), "{frame}");
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+    let asked = store_requests(&bench);
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [StoreRequest::Agents, StoreRequest::Templates(_)]
+        ),
+        "only the editor's reads: {asked:?}"
+    );
+
+    bench.key(&mut section, "esc");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+}
+
+/// MOD-141 D3: `Enter` on a kind opens its default graph when that is one of the project's own;
+/// a shared graph is refused in the words `g` uses, and the project row points at a graph row.
+#[tokio::test]
+async fn enter_on_a_kind_opens_its_project_graph_and_refuses_a_shared_one() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(store_requests(&bench).is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"select a graph or a step: Enter opens the graph editor".to_owned()),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+
+    // The same kind, pointed at a library graph: the section edits none of those.
+    let mut shared = snapshot;
+    let now = Utc::now();
+    let library = StepGraph {
+        id: StepGraphId::new(),
+        scope: GraphScope::Library,
+        name: "triage".to_owned(),
+        description: String::new(),
+        is_override: false,
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    shared.projects[0].kinds[0].default_graph_id = library.id;
+    shared.projects[0].shared.push(library);
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(shared)));
+    let _ = bench.drained();
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(store_requests(&bench).is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"graph triage \u{b7} library is not edited here".to_owned()),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+}
+
+/// MOD-141 D2: while the editor is open the Settings tab's `h`/`l` are the editor's (it captures
+/// input), so the sections do not cycle under it.
+#[tokio::test]
+async fn while_the_editor_is_open_h_and_l_do_not_cycle_sections() {
+    let mut harness = kinds_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+
+    for chord in ["l", "h", "l"] {
+        harness.key(chord);
+        harness.settle().await;
+        let frame = harness.render();
+        assert!(
+            frame.contains(ANALYSIS_HEADER),
+            "`{chord}` moved inside the editor, not the strip: {frame}"
+        );
+    }
+}
+
+/// MOD-141 D2: closing the editor returns to Browse with the cursor on the first row that shows
+/// the graph: its kind, or its own row when no kind points at it.
+#[tokio::test]
+async fn closing_the_editor_returns_to_browse_with_the_cursor_on_the_graph() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    assert!(section.captures_input());
+
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+
+    assert!(!section.captures_input());
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    assert!(
+        cursor_row(&bench, &section).contains("ANA  analysis"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+
+    let (bench, mut section) = bench_with_unreferenced_analysis().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "esc");
+    assert!(
+        cursor_row(&bench, &section).contains("analysis \u{b7} graph, no kind"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+}
+
+/// MOD-141 D13, D2: the editor's write is answered with the scope's catalogue; the section adopts
+/// it quietly (the tree behind the editor moves) and the editor takes the outcome.
+#[tokio::test]
+async fn a_graph_replaced_reply_updates_the_tree_and_the_editor() {
+    let backend = demo();
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    bench.key(&mut section, "enter");
+    for _ in 0.."verdict".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "decide");
+    bench.key(&mut section, "enter");
+    let asked = store_requests(&bench);
+    let [write @ StoreRequest::ReplaceGraph { .. }] = asked.as_slice() else {
+        panic!("the step form's save is one `replace_graph`: {asked:?}");
+    };
+
+    let reply = serve(&backend, write).await;
+    assert!(
+        matches!(
+            &reply,
+            StoreReply::GraphReplaced {
+                outcome: CasOutcome::Applied(_),
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    bench.reply(&mut section, &reply);
+
+    assert!(store_requests(&bench).is_empty(), "nothing more is sent");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("decide"),
+        "the editor shows the stored body: {frame}"
+    );
+    assert!(
+        section.absorbs_failure("replace_graph"),
+        "the editor's notice says a refused write"
+    );
+
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(". decide "),
+        "the tree is the reply's: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).is_empty(),
+        "an applied write leaves no notice: {frame}"
+    );
+    assert!(!section.absorbs_failure("replace_graph"));
+}
+
+/// MOD-141 R1 L1: a write that landed is `Applied` even when the re-read after it failed
+/// (`catalogue: None`): the editor still takes the stored body, and the section keeps the tree it
+/// has and asks for the catalogue again, open editor or not.
+#[tokio::test]
+async fn a_graph_replaced_reply_without_a_catalogue_still_lands_and_asks_for_a_re_read() {
+    let backend = demo();
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    bench.key(&mut section, "enter");
+    for _ in 0.."verdict".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "decide");
+    bench.key(&mut section, "enter");
+    let asked = store_requests(&bench);
+    let [write @ StoreRequest::ReplaceGraph { .. }] = asked.as_slice() else {
+        panic!("the step form's save is one `replace_graph`: {asked:?}");
+    };
+    let (outcome, _) = replaced(serve(&backend, write).await);
+    let landed = StoreReply::GraphReplaced {
+        outcome,
+        catalogue: None,
+    };
+    bench.reply(&mut section, &landed);
+
+    let asked = store_requests(&bench);
+    assert!(
+        matches!(asked.as_slice(), [StoreRequest::Catalogue(scope)] if *scope == vulkan_scope()),
+        "the section reads the catalogue again: {asked:?}"
+    );
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("saved: editing verdict"),
+        "the editor took the landed write: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).is_empty(),
+        "a write that landed is no refusal: {frame}"
+    );
+
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(". verdict "),
+        "the old tree stays until the re-read answers: {frame}"
+    );
+
+    // With no editor open the section still asks again rather than drawing nothing new.
+    bench.reply(&mut section, &landed);
+    let asked = store_requests(&bench);
+    assert!(
+        matches!(asked.as_slice(), [StoreRequest::Catalogue(_)]),
+        "{asked:?}"
+    );
+}
+
+/// MOD-141 D2: a scope change drops the editor with the tree it was opened from (`R-NF-3`'s
+/// rule for every editor: its token belongs to the other workspace).
+#[tokio::test]
+async fn a_scope_change_closes_the_editor() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "enter");
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    let other = Scope {
+        workspace_id: WorkspaceId::new(),
+        project_ids: vec![ProjectId::new()],
+    };
+
+    section.on_scope_change(&other);
+
+    assert!(!section.captures_input());
+    assert_eq!(section.key_stack(), Some(views::KINDS_BROWSE));
+    let wanted = section.wants_requests(&other);
+    assert!(
+        matches!(wanted.as_slice(), [StoreRequest::Catalogue(scope)] if *scope == other),
+        "{wanted:?}"
+    );
+}
+
+/// MOD-141 D2: the hint row is the editor's own while it is open, and Browse's names the key that
+/// opens it.
+#[tokio::test]
+async fn the_hint_row_is_the_editors_while_it_is_open() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let browse = bench.key_hint(&section);
+    assert!(browse.contains("Enter graph editor"), "{browse}");
+    assert!(browse.contains("n kind "), "{browse}");
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "enter");
+
+    let entry = snapshot.projects[0]
+        .graph(ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .clone();
+    let (editor, _) = GraphEditor::open(entry, snapshot.personas.clone(), &bench_scope().await);
+    assert_eq!(
+        bench.key_hint(&section),
+        editor.hint_text(htui::keys::Keys::compiled())
+    );
+}
+
+/// MOD-141 D11, C5: the Settings tab hands the mouse to its active section's gesture. Kinds wants it
+/// only while the graph editor is open: a press on the canvas is the editor's, a press off it is
+/// not, and closing the editor gives the mouse back.
+#[tokio::test]
+async fn the_settings_tab_hands_the_mouse_to_the_open_editor_only() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use htui::keys::KeyChord;
+    use htui::ui::tabs::Tab;
+
+    let press = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let key = |chord: &str| {
+        KeyChord::parse(chord)
+            .unwrap_or_else(|| panic!("`{chord}`"))
+            .to_event()
+    };
+    let draw = |tab: &SettingsTab, ctx: &htui::app::Ctx<'_>| {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(100, 30),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("a test terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), ctx))
+            .expect("the tab draws");
+    };
+    let bench = SectionBench::new().await;
+    let mut ctx = bench.ctx();
+    let mut tab = SettingsTab::with_sections(vec![Box::new(KindsSection::new())]);
+    tab.on_reply(
+        &StoreReply::Catalogue(Box::new(demo_catalogue(&demo()).await)),
+        &mut ctx,
+    );
+    draw(&tab, &ctx);
+    assert!(!tab.wants_mouse(), "Browse has no gesture of its own");
+    assert_eq!(tab.on_mouse(press(50, 15), &mut ctx), Handled::Pass);
+
+    tab.on_key(key("j"), &mut ctx);
+    tab.on_key(key("enter"), &mut ctx);
+    assert!(
+        tab.wants_mouse(),
+        "the open editor's canvas takes the mouse"
+    );
+    draw(&tab, &ctx);
+    assert_eq!(
+        tab.on_mouse(press(50, 15), &mut ctx),
+        Handled::Consumed,
+        "a press on the canvas is the editor's"
+    );
+    assert_eq!(
+        tab.on_mouse(press(0, 0), &mut ctx),
+        Handled::Pass,
+        "a press on the pane's border is not"
+    );
+    tab.on_mouse_lost();
+
+    tab.on_key(key("esc"), &mut ctx);
+    assert!(!tab.wants_mouse(), "closed, the mouse goes back");
+}
+
+/// MOD-141 D2: the graph editor over the whole section at 100x30: the analysis graph opened from
+/// its kind, then opened on `verdict` with its step form (`e`, D14), its agents and templates read.
+#[tokio::test]
+async fn the_graph_editor_draws_over_the_section() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, "ANA  analysis");
+    bench.key(&mut section, "enter");
+    answer_lookups(&bench, &mut section).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(ANALYSIS_HEADER), "{frame}");
+    insta::assert_snapshot!("graph_editor", frame);
+
+    let (bench, mut section, _) = bench_with_demo().await;
+    cursor_to(&bench, &mut section, ". verdict ");
+    bench.key(&mut section, "e");
+    answer_lookups(&bench, &mut section).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("step verdict"), "{frame}");
+    insta::assert_snapshot!("graph_editor_step", frame);
 }

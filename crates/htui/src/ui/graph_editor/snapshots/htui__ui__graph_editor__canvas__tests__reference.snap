@@ -1,0 +1,18 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&reference(), Some(\"review\"), &[], (100, 28))"
+---
+
+                                      ╭─ implement ──────────╮
+                                      │template implement    │◀───────────────╮
+                                      │gate always · retries…│                │
+                                      │any agent             │                │
+                                      ╰───────────●──────────╯                │
+                                                  │                           │
+                                  if verify failed┴──────────────╮  changes requested ×3
+                                   ▼                             ▼            │
+                       ╭─ fix ────────────────╮      ╭─ review ─────────────╮ │
+                       │template fix          │      │template review       │ │
+                       │gate always · retries…│      │gate always · retries…│ │
+                       │any agent             │      │any agent             │─╯
+                       ╰───────────●──────────╯      ╰───────────●──────────╯

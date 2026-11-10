@@ -1,0 +1,26 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&skip(), None, &[], (100, 28))"
+---
+
+                                      ╭─ prd ────────────────╮
+                                      │template prd          │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                   ╭──────────────┴──────────────╮
+                                   ▼                             │
+                       ╭─ plan ───────────────╮                  │
+                       │template plan         │                  │
+                       │gate always · retries…│             if kind FIX
+                       │any agent             │                  │
+                       ╰───────────●──────────╯                  │
+                                   │                             │
+                                   ╰──────────────┬──────────────╯
+                                                  ▼
+                                      ╭─ implement ──────────╮
+                                      │template implement    │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯

@@ -1,0 +1,29 @@
+---
+source: crates/htui/src/ui/graph_editor/node_form.rs
+expression: text(&lines)
+---
+ name           research
+ template       ‹ research ›
+ version        ‹ latest ›
+ persona        ‹ reviewer ›
+ gate           ‹ always ›
+ hard gate      ○ off
+ retry limit    1
+ isolation      ‹ project default ›
+ commands       ‹ queued when fanned out ›
+ verify
+ token budget
+ inputs
+▌output         research
+                empty for the name
+ agent 1        ‹ claude · sonnet ›
+ agent 2        ‹ agy · gemini ›
+ split          divide · runs once MOD-139 lands
+ fan-out        1
+ palette        no
+ plan scope     its parts
+ divide         planner architect, claude · opus ·
+                integrate reviewer, agy · at most 4
+                parts
+ parts          2 parts
+ deadline       edited in M2

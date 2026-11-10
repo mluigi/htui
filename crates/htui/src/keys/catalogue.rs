@@ -45,10 +45,11 @@
 use Context::{
     Answer, Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes,
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
-    Field, Form, Global, History, Layout, Leave, List, Logs, Overlay, Pane, Picker, Queue,
-    Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy,
-    SettingsKinds, SettingsMemory, SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills,
-    SkillsAttach, SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
+    Field, Form, Global, GraphEditor, GraphEditorLinks, History, Layout, Leave, List, Logs,
+    Overlay, Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes,
+    SettingsConnection, SettingsHierarchy, SettingsKinds, SettingsMemory, SettingsPersonas,
+    SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
+    SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -105,6 +106,10 @@ pub enum Context {
     /// `[settings.memory]`: the memory pane a project row opens in Settings › Hierarchy (MOD-163
     /// D22).
     SettingsMemory,
+    /// `[graph_editor]`: the graph editor's canvas, its connect mode and its forms (MOD-141 D12).
+    GraphEditor,
+    /// `[graph_editor.links]`: the graph editor's links list (MOD-141 D12).
+    GraphEditorLinks,
     /// `[concepts]`: the concepts search overlay.
     Concepts,
     /// `[switcher]`: the workspace switcher overlay.
@@ -201,6 +206,8 @@ impl Context {
         Self::SettingsProjectTypes,
         Self::SettingsLogging,
         Self::SettingsMemory,
+        Self::GraphEditor,
+        Self::GraphEditorLinks,
         Self::Concepts,
         Self::Switcher,
         Self::Migration,
@@ -259,6 +266,8 @@ impl Context {
             Self::SettingsProjectTypes => "settings.project_types",
             Self::SettingsLogging => "settings.logging",
             Self::SettingsMemory => "settings.memory",
+            Self::GraphEditor => "graph_editor",
+            Self::GraphEditorLinks => "graph_editor.links",
             Self::Concepts => "concepts",
             Self::Switcher => "switcher",
             Self::Migration => "migration",
@@ -319,6 +328,8 @@ impl Context {
             Self::SettingsProjectTypes => "Project types",
             Self::SettingsLogging => "Logging",
             Self::SettingsMemory => "Memory",
+            Self::GraphEditor => "Graph editor",
+            Self::GraphEditorLinks => "Links",
             Self::Concepts => "Search concepts",
             Self::Switcher => "Workspaces",
             Self::Migration => "Schema",
@@ -374,6 +385,8 @@ impl Context {
                 | Self::SettingsProjectTypes
                 | Self::SettingsLogging
                 | Self::SettingsMemory
+                | Self::GraphEditor
+                | Self::GraphEditorLinks
                 | Self::Concepts
                 | Self::Switcher
                 | Self::Migration
@@ -867,6 +880,52 @@ pub enum Act {
     MemoryClashEdit,
     /// `settings.memory.clash_replace`: the subject question's "replace it" (M1 D4).
     MemoryClashReplace,
+    /// `graph_editor.add`: add a step after the selected one (MOD-141 D12).
+    GraphEditorAdd,
+    /// `graph_editor.edit`: edit the selected step; while connecting, connect to it (MOD-141 D12).
+    GraphEditorEdit,
+    /// `graph_editor.delete`: delete the selected step, after a question (MOD-141 D12).
+    GraphEditorDelete,
+    /// `graph_editor.connect`: link the selected step to another (MOD-141 D12).
+    GraphEditorConnect,
+    /// `graph_editor.open_links`: the selected step's links (MOD-141 D12).
+    GraphEditorOpenLinks,
+    /// `graph_editor.undo`: take the last saved edit back (MOD-141 D12).
+    GraphEditorUndo,
+    /// `graph_editor.redo`: put the last undone edit back (MOD-141 D12).
+    GraphEditorRedo,
+    /// `graph_editor.zoom_in`: zoom the canvas in (MOD-141 D12).
+    GraphEditorZoomIn,
+    /// `graph_editor.zoom_out`: zoom the canvas out (MOD-141 D12).
+    GraphEditorZoomOut,
+    /// `graph_editor.zoom_fit`: fit the whole graph on the canvas (MOD-141 D12).
+    GraphEditorFit,
+    /// `graph_editor.left`: select the step to the left (MOD-141 D12).
+    GraphEditorLeft,
+    /// `graph_editor.down`: select the step below (MOD-141 D12).
+    GraphEditorDown,
+    /// `graph_editor.up`: select the step above (MOD-141 D12).
+    GraphEditorUp,
+    /// `graph_editor.right`: select the step to the right (MOD-141 D12).
+    GraphEditorRight,
+    /// `graph_editor.close`: close the editor, cancel connecting (MOD-141 D12).
+    GraphEditorClose,
+    /// `graph_editor.candidate_add`: the step form: add a candidate agent (MOD-141 D12).
+    GraphEditorCandidateAdd,
+    /// `graph_editor.candidate_remove`: the step form: remove the focused candidate agent (MOD-141 D12).
+    GraphEditorCandidateRemove,
+    /// `graph_editor.candidate_up`: the step form: move the focused candidate agent up (MOD-141 D12).
+    GraphEditorCandidateUp,
+    /// `graph_editor.candidate_down`: the step form: move the focused candidate agent down (MOD-141 D12).
+    GraphEditorCandidateDown,
+    /// `graph_editor.links.edit`: edit the link under the cursor (MOD-141 D12).
+    LinksEdit,
+    /// `graph_editor.links.delete`: remove the link under the cursor (MOD-141 D12).
+    LinksDelete,
+    /// `graph_editor.links.close`: back to the canvas (MOD-141 D12).
+    LinksClose,
+    /// `settings.kinds.editor`: open the graph editor on the row's graph (MOD-141 D3).
+    KindsEditor,
 }
 
 impl Act {
@@ -1373,6 +1432,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["g"],
         "edit graph",
     ),
+    // kinds.rs `open_editor`: the graph editor on the row's graph (MOD-141 D3).
+    row(
+        Act::KindsEditor,
+        SettingsKinds,
+        "editor",
+        &["enter"],
+        "graph editor",
+    ),
     // [settings.connection]
     // connection.rs:802.
     row(
@@ -1480,6 +1547,144 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["r"],
         "replace it",
     ),
+    // [graph_editor]: the graph editor's canvas, connect mode and forms (MOD-141 D12).
+    row(Act::GraphEditorAdd, GraphEditor, "add", &["a"], "add step"),
+    row(
+        Act::GraphEditorEdit,
+        GraphEditor,
+        "edit",
+        &["e", "enter"],
+        "edit",
+    ),
+    row(
+        Act::GraphEditorDelete,
+        GraphEditor,
+        "delete",
+        &["x"],
+        "delete step",
+    ),
+    row(
+        Act::GraphEditorConnect,
+        GraphEditor,
+        "connect",
+        &["c"],
+        "connect",
+    ),
+    row(
+        Act::GraphEditorOpenLinks,
+        GraphEditor,
+        "open_links",
+        &["i"],
+        "links",
+    ),
+    row(
+        Act::GraphEditorUndo,
+        GraphEditor,
+        "undo",
+        &["u", "ctrl-z"],
+        "undo",
+    ),
+    row(
+        Act::GraphEditorRedo,
+        GraphEditor,
+        "redo",
+        &["U", "ctrl-r"],
+        "redo",
+    ),
+    row(
+        Act::GraphEditorZoomIn,
+        GraphEditor,
+        "zoom_in",
+        &["+"],
+        "zoom in",
+    ),
+    row(
+        Act::GraphEditorZoomOut,
+        GraphEditor,
+        "zoom_out",
+        &["-"],
+        "zoom out",
+    ),
+    row(Act::GraphEditorFit, GraphEditor, "zoom_fit", &["="], "fit"),
+    row(
+        Act::GraphEditorLeft,
+        GraphEditor,
+        "left",
+        &["left", "h"],
+        "select left",
+    ),
+    row(
+        Act::GraphEditorDown,
+        GraphEditor,
+        "down",
+        &["down", "j"],
+        "select down",
+    ),
+    row(
+        Act::GraphEditorUp,
+        GraphEditor,
+        "up",
+        &["up", "k"],
+        "select up",
+    ),
+    row(
+        Act::GraphEditorRight,
+        GraphEditor,
+        "right",
+        &["right", "l"],
+        "select right",
+    ),
+    row(
+        Act::GraphEditorClose,
+        GraphEditor,
+        "close",
+        &["esc"],
+        "close",
+    ),
+    row(
+        Act::GraphEditorCandidateAdd,
+        GraphEditor,
+        "candidate_add",
+        &["alt-n"],
+        "add agent",
+    ),
+    row(
+        Act::GraphEditorCandidateRemove,
+        GraphEditor,
+        "candidate_remove",
+        &["alt-d"],
+        "remove agent",
+    ),
+    row(
+        Act::GraphEditorCandidateUp,
+        GraphEditor,
+        "candidate_up",
+        &["alt-up"],
+        "agent up",
+    ),
+    row(
+        Act::GraphEditorCandidateDown,
+        GraphEditor,
+        "candidate_down",
+        &["alt-down"],
+        "agent down",
+    ),
+    // [graph_editor.links]: the graph editor's links list (MOD-141 D12).
+    row(
+        Act::LinksEdit,
+        GraphEditorLinks,
+        "edit",
+        &["e", "enter"],
+        "edit link",
+    ),
+    row(
+        Act::LinksDelete,
+        GraphEditorLinks,
+        "delete",
+        &["x", "d"],
+        "delete link",
+    ),
+    row(Act::LinksClose, GraphEditorLinks, "close", &["esc"], "back"),
     // [concepts]: all in capture, the query field types every printable chord.
     // concepts_search.rs:295.
     capture_row(
@@ -2306,6 +2511,9 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // MOD-163 D22: the memory form moves on `Down`/`Up`, as every Settings form does.
     (SettingsMemory, Act::FormNextField, &["down"]),
     (SettingsMemory, Act::FormPrevField, &["up"]),
+    // MOD-141 D12: the graph editor's forms move on `Down`/`Up`, as every Settings form does.
+    (GraphEditor, Act::FormNextField, &["down"]),
+    (GraphEditor, Act::FormPrevField, &["up"]),
     // migration_prompt.rs:92, :97: the capitals answer too.
     (Context::Migration, Act::ConfirmYes, &["Y"]),
     (Context::Migration, Act::ConfirmNo, &["N"]),
@@ -2450,42 +2658,44 @@ mod tests {
             Context::SettingsProjectTypes => 19,
             Context::SettingsLogging => 20,
             Context::SettingsMemory => 21,
-            Context::Concepts => 22,
-            Context::Switcher => 23,
-            Context::Migration => 24,
-            Context::Waiting => 25,
-            Context::Skills => 26,
-            Context::SkillsLibrary => 27,
-            Context::SkillsTemplates => 28,
-            Context::SkillsAttach => 29,
-            Context::SkillsHelp => 30,
-            Context::Requirements => 31,
-            Context::Backlog => 32,
-            Context::BacklogBody => 33,
-            Context::BacklogRuns => 34,
-            Context::BacklogGraph => 35,
-            Context::BacklogDocs => 36,
-            Context::BacklogNotes => 37,
-            Context::BacklogPrompt => 38,
-            Context::BacklogReqs => 39,
-            Context::BacklogFilter => 40,
-            Context::BacklogItem => 41,
-            Context::Chat => 42,
-            Context::Logs => 43,
-            Context::Queue => 44,
-            Context::Picker => 45,
-            Context::Layout => 46,
-            Context::History => 47,
-            Context::Leave => 48,
-            Context::Field => 49,
-            Context::Choice => 50,
-            Context::Answer => 51,
+            Context::GraphEditor => 22,
+            Context::GraphEditorLinks => 23,
+            Context::Concepts => 24,
+            Context::Switcher => 25,
+            Context::Migration => 26,
+            Context::Waiting => 27,
+            Context::Skills => 28,
+            Context::SkillsLibrary => 29,
+            Context::SkillsTemplates => 30,
+            Context::SkillsAttach => 31,
+            Context::SkillsHelp => 32,
+            Context::Requirements => 33,
+            Context::Backlog => 34,
+            Context::BacklogBody => 35,
+            Context::BacklogRuns => 36,
+            Context::BacklogGraph => 37,
+            Context::BacklogDocs => 38,
+            Context::BacklogNotes => 39,
+            Context::BacklogPrompt => 40,
+            Context::BacklogReqs => 41,
+            Context::BacklogFilter => 42,
+            Context::BacklogItem => 43,
+            Context::Chat => 44,
+            Context::Logs => 45,
+            Context::Queue => 46,
+            Context::Picker => 47,
+            Context::Layout => 48,
+            Context::History => 49,
+            Context::Leave => 50,
+            Context::Field => 51,
+            Context::Choice => 52,
+            Context::Answer => 53,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 52);
+        assert_eq!(Context::ALL.len(), 54);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -2747,6 +2957,29 @@ mod tests {
         Act::MemoryAll,
         Act::MemoryClashEdit,
         Act::MemoryClashReplace,
+        Act::GraphEditorAdd,
+        Act::GraphEditorEdit,
+        Act::GraphEditorDelete,
+        Act::GraphEditorConnect,
+        Act::GraphEditorOpenLinks,
+        Act::GraphEditorUndo,
+        Act::GraphEditorRedo,
+        Act::GraphEditorZoomIn,
+        Act::GraphEditorZoomOut,
+        Act::GraphEditorFit,
+        Act::GraphEditorLeft,
+        Act::GraphEditorDown,
+        Act::GraphEditorUp,
+        Act::GraphEditorRight,
+        Act::GraphEditorClose,
+        Act::GraphEditorCandidateAdd,
+        Act::GraphEditorCandidateRemove,
+        Act::GraphEditorCandidateUp,
+        Act::GraphEditorCandidateDown,
+        Act::LinksEdit,
+        Act::LinksDelete,
+        Act::LinksClose,
+        Act::KindsEditor,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2975,6 +3208,29 @@ mod tests {
             Act::MemoryAll => 219,
             Act::MemoryClashEdit => 220,
             Act::MemoryClashReplace => 221,
+            Act::GraphEditorAdd => 222,
+            Act::GraphEditorEdit => 223,
+            Act::GraphEditorDelete => 224,
+            Act::GraphEditorConnect => 225,
+            Act::GraphEditorOpenLinks => 226,
+            Act::GraphEditorUndo => 227,
+            Act::GraphEditorRedo => 228,
+            Act::GraphEditorZoomIn => 229,
+            Act::GraphEditorZoomOut => 230,
+            Act::GraphEditorFit => 231,
+            Act::GraphEditorLeft => 232,
+            Act::GraphEditorDown => 233,
+            Act::GraphEditorUp => 234,
+            Act::GraphEditorRight => 235,
+            Act::GraphEditorClose => 236,
+            Act::GraphEditorCandidateAdd => 237,
+            Act::GraphEditorCandidateRemove => 238,
+            Act::GraphEditorCandidateUp => 239,
+            Act::GraphEditorCandidateDown => 240,
+            Act::LinksEdit => 241,
+            Act::LinksDelete => 242,
+            Act::LinksClose => 243,
+            Act::KindsEditor => 244,
         }
     }
 
@@ -3008,7 +3264,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 222);
+        assert_eq!(CATALOGUE.len(), 245);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3321,6 +3577,8 @@ mod tests {
             ),
             (Context::SettingsLogging, "settings.logging", "Logging"),
             (Context::SettingsMemory, "settings.memory", "Memory"),
+            (Context::GraphEditor, "graph_editor", "Graph editor"),
+            (Context::GraphEditorLinks, "graph_editor.links", "Links"),
             (Context::Concepts, "concepts", "Search concepts"),
             (Context::Switcher, "switcher", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
@@ -3372,6 +3630,9 @@ mod tests {
         assert!(Context::SettingsLogging.is_view() && !Context::SettingsLogging.is_shared());
         // MOD-163 D22: the Hierarchy memory pane is a view.
         assert!(Context::SettingsMemory.is_view() && !Context::SettingsMemory.is_shared());
+        // MOD-141 D12: the graph editor and its links list are views.
+        assert!(Context::GraphEditor.is_view() && !Context::GraphEditor.is_shared());
+        assert!(Context::GraphEditorLinks.is_view() && !Context::GraphEditorLinks.is_shared());
         // MOD-67 M4 §3.1: `skills` is shared (Library and Templates inherit it), the rest views.
         assert!(Context::Skills.is_shared() && !Context::Skills.is_view());
         for context in [

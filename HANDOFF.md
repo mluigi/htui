@@ -1088,6 +1088,18 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   M1, `graph_body_walk_refusal`); MOD-115 is done (`docs/decisions/mod/mod-115.md`). Owed from MOD-138 M1's review:
   two workspaces holding one project may each own a graph of one name, and the item and kind pickers then show two
   identical `name · workspace` entries and take the first typed match; qualify the label or refuse the ambiguity.
+  PRD `.claude/prds/mod-141-step-graph-editor.prd.md` (M1 editor core, M2 splits/palette/header and the
+  deadline, M3 every scope and the picker fix; framing 2026-11-10: Toolbox reach is a tested scope-generic
+  entry MOD-124 wires, duplicate labels are qualified by workspace name, a compete toggle off by default, divide
+  offered with a MOD-139 note).
+  **Phase M1 landed (`hr/MOD-141` `a040804e`, 2026-11-10):** `crates/htui/src/ui/graph_editor/` (rataflow canvas,
+  node form with candidates, edge form with live `if` parse, links list, client-side validator in the store's
+  order, undo/redo where each applied edit is one `ReplaceGraph` CAS, Stale clears the stacks), hosted by
+  `Settings > Kinds` on `Enter` (the position-based phase forms retired); `ReplaceGraph` answers
+  `GraphReplaced` with the body and `GraphBody` reads one graph of any scope (the Toolbox hook); keys
+  `[graph_editor]`/`[graph_editor.links]` (redo `U`/`ctrl-r`, candidate add/remove `alt-n`/`alt-d`). Review R1
+  fixed undo past a refused entry, a landed write read as failed, and a gesture outliving the canvas. Gate green
+  but for 25 sandbox Qdrant timeouts (owed on the host). M2, M3 open.
 - [ ] **MOD-142 - Runs pane for divided and planned runs** (from ANA-33, `docs/ANA-33.md` §7.10, §10). `R-TUI-4`,
   `R-ORCH-11`. `RunSummary` carries the decoded v2 graph and `run_plan` rows; the step list groups planner, parts and
   integrate as a tree with each part's key, agent and state, offline from the mirrored `role`, `parent_step_id` and

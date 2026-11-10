@@ -40,8 +40,8 @@ use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::secret::{SecretScope, SecretSource};
 use htui_core::store::{
-    DeleteReach, DeleteTarget, QueueTarget, QueueToken, ReadStore, Result as StoreResult,
-    SettingRung, StoreError, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, QueueTarget, QueueToken, ReadStore,
+    Result as StoreResult, SettingRung, StoreError, WriteStore,
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
@@ -653,10 +653,11 @@ pub enum StoreRequest {
         show_hidden: bool,
     },
 
-    // MOD-15 milestone 4 (D5): the eleven catalogue requests (M4's nine, then MOD-137 D12's
-    // `ReplaceGraph` and `DeletePhase`), served by [`crate::catalogue`]. Every write carries the
-    // `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all eleven are served
-    // through one further or-ed arm of [`try_serve`].
+    // MOD-15 milestone 4 (D5): the twelve catalogue requests (M4's nine, MOD-137 D12's
+    // `ReplaceGraph` and `DeletePhase`, then MOD-141 D13's `GraphBody`), served by
+    // [`crate::catalogue`]. Every write carries the `Scope` because the tree the reply re-reads
+    // *is* the scope (M4 D7), and all twelve are served through one further or-ed arm of
+    // [`try_serve`].
     /// The catalogue of every project in the scope (M4 D2): kinds, graphs, phases. One request per
     /// event, never one per project — the staleness index keeps only the newest of a variant, so N
     /// requests of one variant would leave all but one project undrawn.
@@ -765,7 +766,8 @@ pub enum StoreRequest {
         budget: Option<i64>,
     },
     /// MOD-137 D12: the editor's one write. `replace_graph` under CAS on `step_graph.revision`;
-    /// `Stale` answers [`StoreReply::CatalogueStale`], a refusal `Failed { request: "replace_graph" }`.
+    /// answers [`StoreReply::GraphReplaced`] (`Applied` or `Stale`), a refusal
+    /// `Failed { request: "replace_graph" }` (MOD-141 D13).
     ///
     /// `body` must start from the graph's whole stored body — a
     /// [`GraphEntry`](crate::catalogue::GraphEntry) of the catalogue, or
@@ -791,6 +793,10 @@ pub enum StoreRequest {
         /// The phase to delete.
         phase: PhaseId,
     },
+    /// MOD-141 D13: one graph's whole body, any scope (project, workspace, library): how the graph
+    /// editor opens a graph by id (MOD-124's Toolbox hook). A read. Answers
+    /// [`StoreReply::GraphBody`].
+    GraphBody(StepGraphId),
     /// The ten prompt keys on `App` plus the `Project`-rung keys of every scope project (M5 D3).
     PromptSettings(Scope),
     /// `set_setting` on `App` or `Project` (M5 D7). `expected: None` is "I expect no row", accepted
@@ -1400,7 +1406,8 @@ impl StoreRequest {
             Self::InferRepoPaths(..) => "infer_repo_paths",
             // MOD-49: outside `hierarchy::REQUEST_NAMES` on purpose (blueprint D2).
             Self::ListDir { .. } => LIST_DIR,
-            // The eleven of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5, MOD-137 D12).
+            // The twelve of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5, MOD-137 D12,
+            // MOD-141 D13).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
             Self::UpdateKind { .. } => "update_kind",
@@ -1412,6 +1419,7 @@ impl StoreRequest {
             Self::SetPhaseBudget { .. } => "set_phase_budget",
             Self::ReplaceGraph { .. } => "replace_graph",
             Self::DeletePhase { .. } => "delete_phase",
+            Self::GraphBody(..) => "graph_body",
             // The three of `prompt_settings::REQUEST_NAMES`, in that order (MOD-15 M5 D7).
             Self::PromptSettings(..) => "prompt_settings",
             Self::SetSetting { .. } => "set_setting",
@@ -1657,6 +1665,20 @@ pub enum StoreReply {
         /// The scope's catalogue without the kind.
         catalogue: Box<CatalogueSnapshot>,
     },
+    /// MOD-141 D13: the answer to [`StoreRequest::ReplaceGraph`]. `outcome` is `replace_graph`'s
+    /// own: `Applied` with the body as stored, `Stale` with the body as it is now. `catalogue` is the
+    /// scope re-read after it, which `Settings > Kinds` keeps drawing from. A refusal is still
+    /// `Failed { request: "replace_graph" }`.
+    GraphReplaced {
+        /// The write's outcome, the body boxed (clippy `large_enum_variant`).
+        outcome: CasOutcome<Box<GraphBody>>,
+        /// The scope's catalogue after the write, or after the miss; `None` when that re-read
+        /// failed, so a write that landed is never answered `Failed` (MOD-141 R1 L1). The
+        /// receiver keeps the tree it has and reads the catalogue again.
+        catalogue: Option<Box<CatalogueSnapshot>>,
+    },
+    /// MOD-141 D13: the answer to [`StoreRequest::GraphBody`]; `None` when no graph has the id.
+    GraphBody(Option<Box<GraphBody>>),
     /// The scope's prompt settings, freshly read: the answer to [`StoreRequest::PromptSettings`]
     /// and to every settings write that applied (M5 D3/D7).
     PromptSettings(Box<SettingsSnapshot>),
@@ -2394,7 +2416,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::InferRepoPaths(..)
         | StoreRequest::SetProjectSecretScope { .. }
         | StoreRequest::SecretsTree(..) => hierarchy::serve(backend, request).await?,
-        // The eleven catalogue requests, or-ed for the same reason the fourteen above are: a guard
+        // The twelve catalogue requests, or-ed for the same reason the fourteen above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
         StoreRequest::Catalogue(..)
@@ -2407,7 +2429,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::UpdatePhase { .. }
         | StoreRequest::SetPhaseBudget { .. }
         | StoreRequest::ReplaceGraph { .. }
-        | StoreRequest::DeletePhase { .. } => catalogue::serve(backend, request).await?,
+        | StoreRequest::DeletePhase { .. }
+        | StoreRequest::GraphBody(..) => catalogue::serve(backend, request).await?,
         // The three prompt settings requests, or-ed for the same reason the twenty-five above are:
         // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
         // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).

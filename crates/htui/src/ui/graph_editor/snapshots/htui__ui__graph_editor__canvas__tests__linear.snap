@@ -1,0 +1,18 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "drawn(&body, Some(\"research\"), &demo_agents().await, (100, 28))"
+---
+
+                                      ╭─ research ───────────╮
+                                      │template research     │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ verdict ────────────╮
+                                      │template verdict      │
+                                      │gate always · hard · …│
+                                      │any agent             │
+                                      ╰───────────●──────────╯

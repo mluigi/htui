@@ -13,9 +13,9 @@
 //! kind, so the common shape is kind-then-phases; listing the unreferenced graphs separately is
 //! what keeps a graph created here from becoming invisible the moment nothing names it.
 //!
-//! A phase's persona (MOD-26 milestone 2, D23) is picked the way a kind's graph is: by typing its
-//! name into the phase editor's seventh field, resolved against the persona list the catalogue
-//! carries and refused before anything is sent when the list does not hold it.
+//! The phases themselves are edited in the graph editor (MOD-141 D2, D3, D14): `Enter` opens it
+//! over the whole section on the row's graph, and `e` on a phase row opens it with that step's form
+//! open. The tree's phase rows are read-only lines; a bound persona is named on its phase's line.
 //!
 //! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
 //! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
@@ -38,9 +38,11 @@ use ratatui::widgets::Paragraph;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, PersonaId, PhaseId, PhasePatch, ProjectId, Scope,
-    StepGraphId, StepGraphPatch, StepGraphPhase,
+    ItemKind, ItemKindId, ItemKindPatch, PersonaId, ProjectId, Scope, StepGraphId, StepGraphPatch,
+    StepGraphPhase,
 };
+
+use htui_core::store::CasOutcome;
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{
@@ -49,6 +51,7 @@ use crate::catalogue::{
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::graph_editor::{EditorKey, GraphEditor};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label;
@@ -60,7 +63,7 @@ use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 /// What the rows pane says before any catalogue has arrived.
 const NO_WORKSPACE: &str = "no workspace: nothing to list";
@@ -80,10 +83,11 @@ const GRAPH_MISSING: &str = "graph missing";
 /// Browse's keys.
 const HINT_BROWSE: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, ""),
-    Hint::One(Act::New, "kind/phase"),
+    Hint::One(Act::New, "kind"),
     Hint::One(Act::KindsNewGraph, "graph"),
     Hint::One(Act::Edit, "edit"),
     Hint::One(Act::KindsGraph, "graph"),
+    Hint::One(Act::KindsEditor, "graph editor"),
     Hint::One(Act::Delete, "delete kind"),
     Hint::One(Act::Reload, "reload"),
 ];
@@ -120,31 +124,16 @@ const NO_GRAPH_NAMED: &str = "`graph` names no graph this project can use";
 /// What an editor says when a `position` field is not a number (B-8).
 const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
 
-/// What the phase editor says when its budget is neither empty nor a number (B-1).
-///
-/// The only bound this section checks: every other one — the range, the column's width — is the
-/// store's, and it answers with its own sentence (M1 D7).
-const BUDGET_IS_A_NUMBER: &str = "`token budget` is a whole number or empty";
-
-/// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
-const GATE_IS_Y_OR_N: &str = "`hard gate (y/n)` is y or n";
-
 /// The delete confirmation's keys (D11), on the hint row and at the end of the question.
 const HINT_DELETING: HintSpec = &[
     Hint::One(Act::ConfirmYes, "delete"),
     Hint::All(Act::ConfirmNo, "stop"),
 ];
 
-/// What `d` says on a graph or a phase row: the seam has `delete_item_kind` and nothing else in
-/// this area, and this milestone adds no method to it (D5).
-const NOT_DELETED_HERE: &str = "graphs and phases are not deleted here";
-
-/// What the `persona` field says when the registry is empty (MOD-26 M2 D23).
-const NO_PERSONAS: &str = "no personas exist; add one in Settings \u{203a} Personas";
-
-/// The tail of the read-only detail line (D15): the columns are MOD-4's to give semantics to, so
-/// they are shown and not edited.
-const MOD_4_OWNS: &str = "MOD-4 owns these";
+/// What `d` says on a graph row: the seam has `delete_item_kind` and nothing else in this area,
+/// and this milestone adds no method to it (D5). A phase row's `d` points at the graph editor
+/// instead (MOD-141 D14), where steps are deleted.
+const NOT_DELETED_HERE: &str = "graphs are not deleted here";
 
 /// What one line of the tree is, by index into the snapshot.
 ///
@@ -197,40 +186,7 @@ enum EditorKind {
     NewGraph(ProjectId),
     /// `e` on a graph row, and `g` on a kind, phase or graph row (D19).
     EditGraph(StepGraphId),
-    /// `n` on a graph or phase row.
-    NewPhase(StepGraphId),
-    /// `e` on a phase row.
-    EditPhase(PhaseId),
 }
-
-/// The second write of a phase edit that changed both the patch columns and the budget (B-4).
-///
-/// Held on the editor until the first write's reply carries the token the second one needs: two
-/// requests sent on one tick are both delivered, but the second's compare-and-set token would be
-/// stale by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FollowUp {
-    /// `set_phase_budget`, with what the field said.
-    Budget(Option<i64>),
-}
-
-/// What an editor remembers of the row it opened on, beyond the text in its fields.
-///
-/// Three values, because three comparisons are made at submit: the prefix D10 warns about, the
-/// budget B-4 decides the second write from, and the persona MOD-26 M2 D23 writes only when it was
-/// edited (B-8). Everything else goes out whole (B-5).
-#[derive(Debug, Default)]
-struct Stored {
-    /// The kind's prefix as it is stored.
-    prefix: Option<String>,
-    /// The phase's budget as the field renders it (`""` for inherit).
-    budget: Option<String>,
-    /// The phase editor's `persona` text at open (`""` for none).
-    persona: Option<String>,
-}
-
-/// One `Enter`'s outcome: the request that goes out now, and the one it owes afterwards (B-4).
-type Built = (StoreRequest, Option<FollowUp>);
 
 /// One labelled input of an editor.
 #[derive(Debug)]
@@ -255,15 +211,6 @@ struct Editor {
     expected: Option<DateTime<Utc>>,
     /// A kind edit's stored prefix, for D10's comparison; `None` for every other editor.
     stored_prefix: Option<String>,
-    /// A phase edit's stored budget as text, for B-4's comparison; `None` for every other editor.
-    stored_budget: Option<String>,
-    /// A phase edit's `persona` text at open, for D23's comparison; `None` for every other editor.
-    ///
-    /// Never refreshed, `stored_budget`'s rule (B-8): a `CatalogueStale` leaves it holding what this
-    /// user found in the field, so only a user who typed in it rewrites another writer's binding.
-    stored_persona: Option<String>,
-    /// The write this editor still owes after the one in flight (B-4).
-    follow_up: Option<FollowUp>,
 }
 
 impl Editor {
@@ -330,6 +277,12 @@ enum Mode {
         /// The prefix that was typed.
         new: String,
     },
+    /// MOD-141 D2: the graph editor on one of the project's own graphs, over the whole section. It
+    /// takes every key, paste and its own replies while open; its close act returns to Browse.
+    Graph {
+        /// The editor (boxed: it is by far the largest variant).
+        editor: Box<GraphEditor>,
+    },
 }
 
 /// Everything the mode is *about*, never what was typed into it (H-7).
@@ -361,6 +314,7 @@ impl core::fmt::Debug for Mode {
                 .field("editor", editor)
                 .field("old", old)
                 .finish_non_exhaustive(),
+            Self::Graph { editor } => f.debug_struct("Graph").field("editor", editor).finish(),
         }
     }
 }
@@ -558,23 +512,18 @@ impl KindsSection {
 
     /// Opens an editor, clearing whatever the last one said.
     fn open(&mut self, kind: EditorKind, fields: Vec<Field>, expected: Option<DateTime<Utc>>) {
-        self.open_with(kind, fields, expected, Stored::default());
+        self.open_with(kind, fields, expected, None);
     }
 
-    /// The same, for the two editors that carry a stored value to compare what was typed against:
-    /// a kind edit's prefix (D10) and a phase edit's budget (B-4).
+    /// The same, for the one editor that carries a stored value to compare what was typed
+    /// against: a kind edit's prefix (D10).
     fn open_with(
         &mut self,
         kind: EditorKind,
         fields: Vec<Field>,
         expected: Option<DateTime<Utc>>,
-        stored: Stored,
+        stored_prefix: Option<String>,
     ) {
-        let Stored {
-            prefix: stored_prefix,
-            budget: stored_budget,
-            persona: stored_persona,
-        } = stored;
         self.notice = None;
         self.mode = Mode::Editing(Editor {
             kind,
@@ -582,29 +531,21 @@ impl KindsSection {
             focus: 0,
             expected,
             stored_prefix,
-            stored_budget,
-            stored_persona,
-            follow_up: None,
         });
     }
 
-    /// `n`: a kind under a project or a kind row (B-13).
-    fn open_new_child(&mut self, row: Row) {
-        if let Row::Project { p } | Row::Kind { p, .. } = row
-            && let Some(project) = self.project(p)
-        {
-            let id = project.project.id;
-            let fields = new_kind_fields(project);
-            self.open(EditorKind::NewKind(id), fields, None);
-            return;
-        }
-        // On a graph or a phase row, `n` is a phase of that graph.
-        if let Row::Graph { p, g } | Row::Phase { p, g, .. } = row
-            && let Some(entry) = self.graph_at(p, g)
-        {
-            let id = entry.graph.id;
-            let fields = new_phase_fields(entry);
-            self.open(EditorKind::NewPhase(id), fields, None);
+    /// `n`: a kind under a project or a kind row (B-13). On a graph or a phase row it points at
+    /// the graph editor, where steps are added (MOD-141 D14).
+    fn open_new_child(&mut self, row: Row, keys: &Keys) {
+        match row {
+            Row::Project { p } | Row::Kind { p, .. } => {
+                if let Some(project) = self.project(p) {
+                    let id = project.project.id;
+                    let fields = new_kind_fields(project);
+                    self.open(EditorKind::NewKind(id), fields, None);
+                }
+            }
+            Row::Graph { .. } | Row::Phase { .. } => self.refuse(steps_in_the_editor(keys)),
         }
     }
 
@@ -627,8 +568,9 @@ impl KindsSection {
         }
     }
 
-    /// `e`: the row under the cursor, prefilled, with its `updated_at` as the token.
-    fn open_edit(&mut self, row: Row) {
+    /// `e`: the row under the cursor, prefilled, with its `updated_at` as the token. A phase row
+    /// opens the graph editor with that step's form open (MOD-141 D14).
+    fn open_edit(&mut self, row: Row, ctx: &Ctx<'_>) {
         match row {
             Row::Project { .. } => self.refuse(PROJECTS_ELSEWHERE.to_owned()),
             Row::Kind { p, k } => {
@@ -644,11 +586,7 @@ impl KindsSection {
                     EditorKind::EditKind(id),
                     fields,
                     Some(expected),
-                    Stored {
-                        prefix: Some(prefix),
-                        budget: None,
-                        persona: None,
-                    },
+                    Some(prefix),
                 );
             }
             Row::Graph { p, g } => {
@@ -659,25 +597,7 @@ impl KindsSection {
                 let fields = edit_graph_fields(entry);
                 self.open(EditorKind::EditGraph(id), fields, Some(expected));
             }
-            Row::Phase { p, g, i } => {
-                let Some(phase) = self.phase_at(p, g, i) else {
-                    return;
-                };
-                let (id, expected) = (phase.id, phase.updated_at);
-                let budget = budget_text(phase.token_budget);
-                let persona = persona_text(phase.persona_id, self.personas());
-                let fields = edit_phase_fields(phase, self.personas());
-                self.open_with(
-                    EditorKind::EditPhase(id),
-                    fields,
-                    Some(expected),
-                    Stored {
-                        prefix: None,
-                        budget: Some(budget),
-                        persona: Some(persona),
-                    },
-                );
-            }
+            Row::Phase { .. } => self.open_editor(row, true, ctx),
         }
     }
 
@@ -699,16 +619,8 @@ impl KindsSection {
                 };
                 let id = kind.default_graph_id;
                 if self.locate_graph(id).is_none() {
-                    // MOD-138 D12: a workspace or library graph is the kind's to name, not this
-                    // section's to edit; say which, rather than calling it missing.
-                    let shared = self
-                        .project(p)
-                        .and_then(|project| project.graph_name(id))
-                        .map(|(name, scope)| graph_label(name, scope));
-                    self.refuse(shared.map_or_else(
-                        || GRAPH_MISSING.to_owned(),
-                        |label| format!("graph {label} is not edited here"),
-                    ));
+                    let refusal = self.not_a_project_graph(p, id);
+                    self.refuse(refusal);
                     return;
                 }
                 id
@@ -728,15 +640,157 @@ impl KindsSection {
         self.open(EditorKind::EditGraph(id), fields, Some(expected));
     }
 
+    /// Why a kind's default graph `id` opens no editor here: it is a workspace or library graph
+    /// (MOD-138 D12: the kind's to name, not this section's to edit; say which, rather than calling
+    /// it missing), or it names nothing at all.
+    fn not_a_project_graph(&self, p: usize, id: StepGraphId) -> String {
+        self.project(p)
+            .and_then(|project| project.graph_name(id))
+            .map(|(name, scope)| graph_label(name, scope))
+            .map_or_else(
+                || GRAPH_MISSING.to_owned(),
+                |label| format!("graph {label} is not edited here"),
+            )
+    }
+
+    /// MOD-141 D3: the graph editor on the row's graph, over the whole section (D2). A graph row
+    /// opens on its graph, a phase row on its graph with that step selected (`form`: its step form
+    /// open too, D14), a kind row on its default graph when that is one of the project's own. A
+    /// project row has no graph, and says which rows do. The caller has checked
+    /// [`blocked`](KindsSection::blocked).
+    fn open_editor(&mut self, row: Row, form: bool, ctx: &Ctx<'_>) {
+        let (p, g, step) = match row {
+            Row::Project { .. } => {
+                let key = ctx.keys().label(views::KINDS_BROWSE, Act::KindsEditor);
+                self.refuse(pick_a_graph(key.as_deref()));
+                return;
+            }
+            Row::Kind { p, k } => {
+                let Some(id) = self
+                    .project(p)
+                    .and_then(|project| project.kinds.get(k))
+                    .map(|kind| kind.default_graph_id)
+                else {
+                    return;
+                };
+                let Some(g) = self.project(p).and_then(|project| {
+                    project.graphs.iter().position(|entry| entry.graph.id == id)
+                }) else {
+                    let refusal = self.not_a_project_graph(p, id);
+                    self.refuse(refusal);
+                    return;
+                };
+                (p, g, None)
+            }
+            Row::Graph { p, g } => (p, g, None),
+            Row::Phase { p, g, i } => (p, g, self.phase_at(p, g, i).map(|phase| phase.id)),
+        };
+        let Some(entry) = self.graph_at(p, g) else {
+            return;
+        };
+        let (mut editor, requests) =
+            GraphEditor::open(entry.clone(), self.personas().to_vec(), ctx.scope);
+        if let Some(step) = step {
+            editor.select(step);
+            if form {
+                editor.open_node_form();
+            }
+        }
+        for request in requests {
+            ctx.request(request);
+        }
+        self.notice = None;
+        self.mode = Mode::Graph {
+            editor: Box::new(editor),
+        };
+    }
+
+    /// MOD-141 D2: the editor closed. Browse again, the cursor on the first row that shows the
+    /// graph it was on: the kind pointing at it, or its own row when no kind does.
+    fn close_editor(&mut self) {
+        let Mode::Graph { editor } = core::mem::take(&mut self.mode) else {
+            return;
+        };
+        let graph = editor.graph();
+        let shows = |row: &Row| match *row {
+            Row::Kind { p, k } => self
+                .project(p)
+                .and_then(|project| project.kinds.get(k))
+                .is_some_and(|kind| kind.default_graph_id == graph),
+            Row::Graph { p, g } => self
+                .graph_at(p, g)
+                .is_some_and(|entry| entry.graph.id == graph),
+            Row::Project { .. } | Row::Phase { .. } => false,
+        };
+        if let Some(at) = self.rows().iter().position(shows) {
+            self.cursor = at;
+        }
+        self.clamp_cursor();
+    }
+
+    /// MOD-141 D2, D13: one reply while the editor is open, `true` when it was the editor's.
+    ///
+    /// The editor's write is answered with the scope's catalogue: the tree behind it is adopted
+    /// quietly (no `busy` of the section's is involved, so nothing closes and nothing is said) and
+    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then hands the
+    /// persona registry on. The editor's reads and its refusals are its own.
+    fn on_editor_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
+        match reply {
+            StoreReply::GraphReplaced { catalogue, .. } => {
+                match catalogue {
+                    Some(catalogue) => {
+                        self.snapshot = Some((**catalogue).clone());
+                        self.unavailable = None;
+                        self.clamp_cursor();
+                        if let Mode::Graph { editor } = &mut self.mode {
+                            editor.set_personas(&catalogue.personas);
+                        }
+                    }
+                    // MOD-141 R1 L1: the write's outcome stands; the tree it would have moved is
+                    // read again, and its `Catalogue` hands the personas on.
+                    None => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
+                }
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            StoreReply::Catalogue(snapshot) => {
+                self.on_catalogue(snapshot);
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.set_personas(&snapshot.personas);
+                }
+                true
+            }
+            StoreReply::Agents(_) | StoreReply::Templates(_) => {
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            StoreReply::Failed { request, .. }
+                if matches!(*request, "replace_graph" | "agents" | "templates") =>
+            {
+                if let Mode::Graph { editor } = &mut self.mode {
+                    editor.on_reply(reply, ctx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// `d`: the one destructive key this section has (D11).
     ///
     /// One confirmation rather than PRD D13's two: a kind any item holds cannot be deleted at all
     /// (D6), so the destructive case the typed slug exists for does not arise — and two
     /// confirmations over an act the database refuses would train the reflex D13 exists to defeat.
-    fn begin_delete(&mut self, row: Row) {
+    fn begin_delete(&mut self, row: Row, keys: &Keys) {
         match row {
             Row::Project { .. } => self.refuse(PROJECTS_ELSEWHERE.to_owned()),
-            Row::Graph { .. } | Row::Phase { .. } => self.refuse(NOT_DELETED_HERE.to_owned()),
+            Row::Graph { .. } => self.refuse(NOT_DELETED_HERE.to_owned()),
+            // MOD-141 D14: a step is deleted in the graph editor.
+            Row::Phase { .. } => self.refuse(steps_in_the_editor(keys)),
             Row::Kind { p, k } => {
                 let Some(kind) = self.project(p).and_then(|project| project.kinds.get(k)) else {
                     return;
@@ -811,7 +865,10 @@ impl KindsSection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => {
+            Mode::Browse
+            | Mode::ConfirmPrefix { .. }
+            | Mode::Deleting { .. }
+            | Mode::Graph { .. } => {
                 return Handled::Pass;
             }
         };
@@ -888,10 +945,7 @@ impl KindsSection {
             return;
         }
         match built {
-            Ok((request, follow_up)) => {
-                if let Mode::Editing(editor) = &mut self.mode {
-                    editor.follow_up = follow_up;
-                }
+            Ok(request) => {
                 self.notice = None;
                 self.send(request, ctx);
             }
@@ -919,10 +973,7 @@ impl KindsSection {
                 // `CatalogueStale` has to find something to re-take the token for (D8).
                 self.mode = Mode::Editing(editor);
                 match built {
-                    Ok((request, follow_up)) => {
-                        if let Mode::Editing(editor) = &mut self.mode {
-                            editor.follow_up = follow_up;
-                        }
+                    Ok(request) => {
                         self.notice = None;
                         self.send(request, ctx);
                     }
@@ -946,24 +997,21 @@ impl KindsSection {
     ///
     /// Every editable column goes out on an edit whether or not it changed (B-5): one habit across
     /// both sections, and the compare-and-set token is what makes it safe.
-    fn build(&self, editor: &Editor, scope: &Scope) -> Result<Built, String> {
+    fn build(&self, editor: &Editor, scope: &Scope) -> Result<StoreRequest, String> {
         match editor.kind {
             EditorKind::NewKind(project) => {
                 let owner = self
                     .project_by_id(project)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok((
-                    StoreRequest::CreateKind {
-                        scope: scope.clone(),
-                        project,
-                        prefix: editor.text(0),
-                        name: editor.text(1),
-                        description: editor.text(2),
-                        graph: graph_named(owner, &editor.text(3), None)?,
-                        position: position(&editor.text(4))?,
-                    },
-                    None,
-                ))
+                Ok(StoreRequest::CreateKind {
+                    scope: scope.clone(),
+                    project,
+                    prefix: editor.text(0),
+                    name: editor.text(1),
+                    description: editor.text(2),
+                    graph: graph_named(owner, &editor.text(3), None)?,
+                    position: position(&editor.text(4))?,
+                })
             }
             EditorKind::EditKind(id) => {
                 let expected = editor
@@ -972,139 +1020,44 @@ impl KindsSection {
                 let (owner, kind) = self
                     .locate_kind(id)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok((
-                    StoreRequest::UpdateKind {
-                        scope: scope.clone(),
-                        id,
-                        expected,
-                        patch: ItemKindPatch {
-                            prefix: Some(editor.text(0)),
-                            name: Some(editor.text(1)),
-                            description: Some(editor.text(2)),
-                            default_graph_id: Some(graph_named(
-                                owner,
-                                &editor.text(3),
-                                Some(kind.default_graph_id),
-                            )?),
-                            position: Some(position(&editor.text(4))?),
-                        },
-                    },
-                    None,
-                ))
-            }
-            EditorKind::NewGraph(project) => Ok((
-                StoreRequest::CreateGraph {
+                Ok(StoreRequest::UpdateKind {
                     scope: scope.clone(),
-                    project,
-                    name: editor.text(0),
-                    description: editor.text(1),
-                },
-                None,
-            )),
+                    id,
+                    expected,
+                    patch: ItemKindPatch {
+                        prefix: Some(editor.text(0)),
+                        name: Some(editor.text(1)),
+                        description: Some(editor.text(2)),
+                        default_graph_id: Some(graph_named(
+                            owner,
+                            &editor.text(3),
+                            Some(kind.default_graph_id),
+                        )?),
+                        position: Some(position(&editor.text(4))?),
+                    },
+                })
+            }
+            EditorKind::NewGraph(project) => Ok(StoreRequest::CreateGraph {
+                scope: scope.clone(),
+                project,
+                name: editor.text(0),
+                description: editor.text(1),
+            }),
             EditorKind::EditGraph(id) => {
                 let expected = editor
                     .expected
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok((
-                    StoreRequest::UpdateGraph {
-                        scope: scope.clone(),
-                        id,
-                        expected,
-                        patch: StepGraphPatch {
-                            name: Some(editor.text(0)),
-                            description: Some(editor.text(1)),
-                        },
-                    },
-                    None,
-                ))
-            }
-            EditorKind::NewPhase(graph) => Ok((
-                StoreRequest::CreatePhase {
+                Ok(StoreRequest::UpdateGraph {
                     scope: scope.clone(),
-                    graph,
-                    name: editor.text(0),
-                    position: position(&editor.text(1))?,
-                    template_name: editor.text(2),
-                    gate_hard: super::yes_or_no(&editor.text(3))
-                        .ok_or_else(|| GATE_IS_Y_OR_N.to_owned())?,
-                    input_kinds: input_kinds(&editor.text(4)),
-                },
-                None,
-            )),
-            EditorKind::EditPhase(id) => self.build_phase_edit(editor, scope, id),
-        }
-    }
-
-    /// The one editor that can owe two writes (B-4).
-    ///
-    /// `token_budget` is not a `PhasePatch` column at all — it rides the `Phase` rung (D6, F-14) —
-    /// so an `Enter` that moved both sends `update_phase` now and keeps `set_phase_budget` for the
-    /// reply that carries the row's new token. An `Enter` that moved only one sends only that one.
-    fn build_phase_edit(
-        &self,
-        editor: &Editor,
-        scope: &Scope,
-        id: PhaseId,
-    ) -> Result<Built, String> {
-        let expected = editor
-            .expected
-            .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-        let stored = self
-            .phase_by_id(id)
-            .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-
-        let name = editor.text(0);
-        let position = position(&editor.text(1))?;
-        let template_name = editor.text(2);
-        let gate_hard =
-            super::yes_or_no(&editor.text(3)).ok_or_else(|| GATE_IS_Y_OR_N.to_owned())?;
-        let input_kinds = input_kinds(&editor.text(4));
-        let budget = budget(&editor.text(5))?;
-        let persona = persona_patch(
-            &editor.text(6),
-            editor.stored_persona.as_deref().unwrap_or_default(),
-            self.personas(),
-        )?;
-
-        // The persona is part of the patch (D-4): left out, a persona + budget edit with no other
-        // column moved would take the budget-only branch below and drop the persona.
-        let patch_changed = name != stored.name
-            || position != stored.position
-            || template_name != stored.template_name
-            || gate_hard != stored.gate_hard
-            || input_kinds != stored.input_kinds
-            || persona.is_some();
-        let budget_changed = editor.stored_budget.as_deref() != Some(editor.text(5).trim());
-
-        let patch = PhasePatch {
-            name: Some(name),
-            position: Some(position),
-            template_name: Some(template_name),
-            gate_hard: Some(gate_hard),
-            input_kinds: Some(input_kinds),
-            persona,
-        };
-        // A budget-only change is one write on the rung; anything else starts with the patch.
-        if budget_changed && !patch_changed {
-            return Ok((
-                StoreRequest::SetPhaseBudget {
-                    scope: scope.clone(),
-                    phase: id,
+                    id,
                     expected,
-                    budget,
-                },
-                None,
-            ));
+                    patch: StepGraphPatch {
+                        name: Some(editor.text(0)),
+                        description: Some(editor.text(1)),
+                    },
+                })
+            }
         }
-        Ok((
-            StoreRequest::UpdatePhase {
-                scope: scope.clone(),
-                id,
-                expected,
-                patch,
-            },
-            budget_changed.then_some(FollowUp::Budget(budget)),
-        ))
     }
 
     /// The persona registry the last catalogue carried, or none before the first one (D23).
@@ -1112,17 +1065,6 @@ impl KindsSection {
         self.snapshot
             .as_ref()
             .map_or(&[], |snapshot| snapshot.personas.as_slice())
-    }
-
-    /// One phase of the snapshot, by id.
-    fn phase_by_id(&self, id: PhaseId) -> Option<&StepGraphPhase> {
-        self.snapshot
-            .as_ref()?
-            .projects
-            .iter()
-            .flat_map(|project| project.graphs.iter())
-            .flat_map(|entry| entry.nodes.iter().map(|node| &node.phase))
-            .find(|phase| phase.id == id)
     }
 
     /// One project of the snapshot, by id.
@@ -1134,48 +1076,6 @@ impl KindsSection {
             .find(|project| project.project.id == id)
     }
 
-    /// The second write of B-4's chain, sent from the first one's reply.
-    ///
-    /// Answers whether it took the reply: the editor stays open until the budget lands, so the
-    /// caller must not close it. The token comes from the snapshot that just arrived — the one the
-    /// first write moved — because the editor's own is spent by construction.
-    fn follow_up(&mut self, ctx: &Ctx<'_>) -> bool {
-        let Mode::Editing(editor) = &self.mode else {
-            return false;
-        };
-        let EditorKind::EditPhase(id) = editor.kind else {
-            return false;
-        };
-        let Some(FollowUp::Budget(budget)) = editor.follow_up else {
-            return false;
-        };
-        let Some(expected) = self.phase_by_id(id).map(|phase| phase.updated_at) else {
-            // The row went while the patch was in flight: there is nothing left to set a budget on.
-            self.mode = Mode::Browse;
-            self.say(DELETED_ELSEWHERE);
-            return true;
-        };
-        // `stored_budget` is left where it was, holding what the *row* said when the editor opened.
-        // Writing the typed text here would say the number had landed before its write had even
-        // been answered: a `CatalogueStale` or a `Failed` on it would leave the retry `Enter` with
-        // `budget_changed == false`, sending a no-op `update_phase` that closes the editor with the
-        // budget never written. The editor closes on the budget's own reply either way.
-        if let Mode::Editing(editor) = &mut self.mode {
-            editor.expected = Some(expected);
-            editor.follow_up = None;
-        }
-        self.send(
-            StoreRequest::SetPhaseBudget {
-                scope: ctx.scope.clone(),
-                phase: id,
-                expected,
-                budget,
-            },
-            ctx,
-        );
-        true
-    }
-
     /// A kind is gone, with what the worker did to the mirror afterwards (D12).
     ///
     /// The prefix comes from the mode when there is one; a reply that arrives with none — a scope
@@ -1184,7 +1084,9 @@ impl KindsSection {
         self.busy = None;
         let prefix = match &self.mode {
             Mode::Deleting { prefix, .. } => Some(prefix.clone()),
-            Mode::Browse | Mode::Editing(_) | Mode::ConfirmPrefix { .. } => None,
+            Mode::Browse | Mode::Editing(_) | Mode::ConfirmPrefix { .. } | Mode::Graph { .. } => {
+                None
+            }
         };
         self.mode = Mode::Browse;
         self.unavailable = None;
@@ -1209,7 +1111,10 @@ impl KindsSection {
         }
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
-            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => None,
+            Mode::Browse
+            | Mode::ConfirmPrefix { .. }
+            | Mode::Deleting { .. }
+            | Mode::Graph { .. } => None,
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -1231,16 +1136,6 @@ impl KindsSection {
                     if editor.stored_prefix.is_some() {
                         editor.stored_prefix = stored;
                     }
-                    // `stored_budget` is **not** refreshed with it, which is where this departs
-                    // from blueprint §4.9's "`stored_prefix`/`stored_budget` refreshed from the
-                    // current row". The two are not symmetric: `stored_prefix` decides whether a
-                    // *question* is asked, so asking it against the row as it is now is right,
-                    // while `stored_budget` decides whether a *write* goes out at all (B-4). Taken
-                    // from the row the other writer just moved, an untouched `token_budget` field
-                    // would read as changed and this editor's `Enter` would write the old number
-                    // back over theirs. Left alone, it still means what it meant when the editor
-                    // opened — what this user found there — so only a user who typed in the column
-                    // writes it.
                 }
                 self.say(&retry);
             }
@@ -1351,6 +1246,8 @@ impl KindsSection {
     /// Rendered through the mode's own stack, so a rebound key shows its new chord.
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
+            // MOD-141 D2: the editor's own row, its write in flight included.
+            Mode::Graph { editor } => return editor.hint_text(keys),
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Deleting { .. } => HINT_DELETING,
@@ -1386,6 +1283,7 @@ impl KindsSection {
             Mode::Browse => views::KINDS_BROWSE,
             Mode::Editing(_) => views::KINDS_EDITOR,
             Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => views::KINDS_CONFIRM,
+            Mode::Graph { editor } => editor.stack(),
         }
     }
 
@@ -1401,7 +1299,7 @@ impl KindsSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_new_child(row);
+                        self.open_new_child(row, ctx.keys());
                     }
                 }
                 Act::KindsNewGraph => {
@@ -1415,7 +1313,7 @@ impl KindsSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row);
+                        self.open_edit(row, ctx);
                     }
                 }
                 Act::KindsGraph => {
@@ -1425,11 +1323,19 @@ impl KindsSection {
                         self.open_graph(row);
                     }
                 }
+                // MOD-141 D3: the graph editor on the row's graph.
+                Act::KindsEditor => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_editor(row, false, ctx);
+                    }
+                }
                 Act::Delete => {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.begin_delete(row);
+                        self.begin_delete(row, ctx.keys());
                     }
                 }
                 Act::ListDown => self.move_cursor(true),
@@ -1465,7 +1371,8 @@ impl KindsSection {
                 .collect()
         };
         match &self.mode {
-            Mode::Browse => Vec::new(),
+            // The editor draws over the whole section (MOD-141 D2), so it has no pane here.
+            Mode::Browse | Mode::Graph { .. } => Vec::new(),
             Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
             // The question, and while the delete is out, what it is waiting for.
             Mode::Deleting {
@@ -1509,9 +1416,7 @@ impl KindsSection {
     ///
     /// `busy` is the whole of the attribution, and a `Catalogue` carries nothing that says which
     /// request it answers — so a read that lands between a write and its reply is taken for that
-    /// reply and closes the editor early. The case the reviewer of M4 names is a re-read issued in
-    /// the middle of B-4's two-write chain: the first `Catalogue` sends `set_phase_budget` and the
-    /// *read's* reply, arriving next, is counted as the budget's. `r` is not that door today —
+    /// reply and closes the editor early. `r` is not that door today —
     /// `on_key` hands every key to the open editor, where `r` is a letter (`:1336`), and every write
     /// this section sends leaves `Browse` behind — but a scope change, a tab re-activation
     /// (`app/state.rs`'s `wants_requests`) or a future read on the Browse side all are. `r` stays
@@ -1519,16 +1424,13 @@ impl KindsSection {
     /// busy would wedge exactly the section that needs it. The loss is bounded and deliberate — the
     /// write itself has already been sent, so all that goes is the retry affordance if it comes back
     /// `CatalogueStale`, and [`CHANGED_ELSEWHERE_CLOSED`] says so when it does.
-    fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot, ctx: &Ctx<'_>) {
+    fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot) {
         let write = self.busy.take();
         // A read that answered is the end of an outage: leaving `unavailable` set would say the
         // catalogue is unavailable over a store that just spoke.
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
-        if write == Some("update_phase") && self.follow_up(ctx) {
-            return;
-        }
         if write.is_some() {
             self.notice = None;
             if matches!(self.mode, Mode::Editing(_)) {
@@ -1548,7 +1450,12 @@ impl SettingsSection for KindsSection {
     }
 
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Catalogue(scope.clone())]
+        let mut wanted = vec![StoreRequest::Catalogue(scope.clone())];
+        // MOD-141 D1: an open editor reads its agents and templates again on activation.
+        if let Mode::Graph { editor } = &self.mode {
+            wanted.extend(editor.wants_requests(scope));
+        }
+        wanted
     }
 
     fn on_scope_change(&mut self, _scope: &Scope) {
@@ -1569,9 +1476,19 @@ impl SettingsSection for KindsSection {
         Some(self.stack())
     }
 
+    fn takes_paste(&self) -> bool {
+        match &self.mode {
+            Mode::Graph { editor } => editor.takes_paste(),
+            _ => self.captures_input(),
+        }
+    }
+
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
     /// is not a field: a paste there is dropped, so its `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        if let Mode::Graph { editor } = &mut self.mode {
+            return editor.on_paste(text);
+        }
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1582,6 +1499,17 @@ impl SettingsSection for KindsSection {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // MOD-141 D2: the graph editor takes every key while it is open; its close act returns to
+        // Browse (the memory pane's shape, `hierarchy.rs`).
+        if let Mode::Graph { editor } = &mut self.mode {
+            return match editor.on_key(key, ctx) {
+                EditorKey::Handled(handled) => handled,
+                EditorKey::Close => {
+                    self.close_editor();
+                    Handled::Consumed
+                }
+            };
+        }
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
         }
@@ -1595,9 +1523,25 @@ impl SettingsSection for KindsSection {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        if matches!(self.mode, Mode::Graph { .. }) && self.on_editor_reply(reply, ctx) {
+            return;
+        }
         match reply {
-            StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
+            StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot),
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
+            // MOD-141 D13: `ReplaceGraph`'s answer carries the catalogue; read it as `Catalogue` /
+            // `CatalogueStale` were. T7 routes it to an open graph editor first.
+            StoreReply::GraphReplaced {
+                outcome,
+                catalogue: Some(catalogue),
+            } => match outcome {
+                CasOutcome::Applied(_) => self.on_catalogue(catalogue),
+                CasOutcome::Stale(_) => self.on_stale(catalogue, ctx.keys()),
+            },
+            // MOD-141 R1 L1: the re-read after the write failed; read it again.
+            StoreReply::GraphReplaced {
+                catalogue: None, ..
+            } => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
             StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
@@ -1625,15 +1569,48 @@ impl SettingsSection for KindsSection {
         }
     }
 
+    /// MOD-141 D2: a refused graph write is said on the open editor's notice row, so the status
+    /// line does not repeat it.
+    fn absorbs_failure(&self, request: &str) -> bool {
+        matches!(self.mode, Mode::Graph { .. }) && request == "replace_graph"
+    }
+
+    /// MOD-141 D11: the open graph editor's canvas takes the mouse; Browse and the forms do not.
+    fn wants_mouse(&self) -> bool {
+        matches!(self.mode, Mode::Graph { .. })
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::Graph { editor } => editor.on_mouse(mouse, ctx),
+            _ => Handled::Pass,
+        }
+    }
+
+    fn on_mouse_lost(&mut self) {
+        if let Mode::Graph { editor } = &mut self.mode {
+            editor.on_mouse_lost();
+        }
+    }
+
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         key_line(self.hint_text(keys), theme)
     }
 
     fn scroll(&self) -> Option<ScrollSpan> {
+        if matches!(self.mode, Mode::Graph { .. }) {
+            return None;
+        }
         self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        // MOD-141 D2: the graph editor draws over the whole section.
+        if let Mode::Graph { editor } = &self.mode {
+            self.scroll.set(None);
+            editor.render(frame, area, ctx);
+            return;
+        }
         let theme = ctx.theme;
         let pane = self.pane(area.width, ctx);
         let [rows, pane_area, hint] = Layout::vertical([
@@ -1801,64 +1778,6 @@ fn edit_graph_fields(entry: &GraphEntry) -> Vec<Field> {
     ]
 }
 
-/// The five columns a new phase carries (D9, B-3).
-///
-/// No `token_budget`: a phase is born inheriting it, and the sixth column is set by `e` afterwards
-/// — a create followed by a budget write would need the new row's id, which only the reply knows.
-fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
-    vec![
-        Field::required("name", ""),
-        Field::required(
-            "position",
-            &next_position(entry.nodes.iter().map(|node| node.phase.position)),
-        ),
-        Field::required("template", ""),
-        Field::required("hard gate (y/n)", "n"),
-        Field::optional("inputs", ""),
-    ]
-}
-
-/// PRD D2's six editable columns plus MOD-26 D23's persona, in editor order.
-fn edit_phase_fields(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> Vec<Field> {
-    vec![
-        Field::required("name", &phase.name),
-        Field::required("position", &phase.position.to_string()),
-        Field::required("template", &phase.template_name),
-        Field::required("hard gate (y/n)", if phase.gate_hard { "y" } else { "n" }),
-        Field::optional("inputs", &phase.input_kinds.join(",")),
-        Field::optional("token budget", &budget_text(phase.token_budget)),
-        Field::optional("persona", &persona_text(phase.persona_id, personas)),
-    ]
-}
-
-/// `token_budget` as the editor holds it: empty is `inherit` (D16).
-fn budget_text(budget: Option<i32>) -> String {
-    budget.map_or_else(String::new, |n| n.to_string())
-}
-
-/// `input_kinds` as D13 reads it: split on `,`, each part trimmed, empty parts dropped, order
-/// preserved, no de-duplication, replaced whole.
-///
-/// De-duplicating would silently edit what was typed; the store takes the list as given.
-fn input_kinds(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The budget field as a number, or `None` for "inherit" (B-1, D16).
-fn budget(text: &str) -> Result<Option<i64>, String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    text.parse::<i64>()
-        .map(Some)
-        .map_err(|_| BUDGET_IS_A_NUMBER.to_owned())
-}
-
 /// One past the largest position, or `0` when there is none.
 fn next_position(positions: impl Iterator<Item = i32>) -> String {
     positions
@@ -1909,50 +1828,6 @@ fn persona_label(id: PersonaId, personas: &[PersonaSummary]) -> String {
         .map_or_else(|| id.to_string(), |row| row.name.clone())
 }
 
-/// The `persona` field's text at open: blank for none (D23).
-fn persona_text(bound: Option<PersonaId>, personas: &[PersonaSummary]) -> String {
-    bound.map_or_else(String::new, |id| persona_label(id, personas))
-}
-
-/// The `persona` field as `PhasePatch.persona` (MOD-26 M2 D23, OQ-11; B-8): `None` while the
-/// trimmed text is still the trimmed text the editor opened with — an id the list does not know
-/// included, so it is left alone unless edited; `Some(None)` for a blank field; `Some(Some(id))`
-/// for a name the list holds.
-///
-/// # Errors
-/// [`no_persona_named`] for any other text.
-fn persona_patch(
-    text: &str,
-    opened: &str,
-    personas: &[PersonaSummary],
-) -> Result<Option<Option<PersonaId>>, String> {
-    let text = text.trim();
-    if text == opened.trim() {
-        return Ok(None);
-    }
-    if text.is_empty() {
-        return Ok(Some(None));
-    }
-    personas
-        .iter()
-        .find(|row| row.name == text)
-        .map(|row| Some(Some(row.id)))
-        .ok_or_else(|| no_persona_named(text, personas))
-}
-
-/// The refusal of a name the loaded list does not hold, before anything is sent (D23).
-fn no_persona_named(name: &str, personas: &[PersonaSummary]) -> String {
-    if personas.is_empty() {
-        return NO_PERSONAS.to_owned();
-    }
-    let known: Vec<&str> = personas.iter().map(|row| row.name.as_str()).collect();
-    format!(
-        "no persona named `{}`; known: {}",
-        name.escape_debug(),
-        known.join(", ")
-    )
-}
-
 /// A `position` field as a number (B-8).
 fn position(text: &str) -> Result<i32, String> {
     text.trim()
@@ -1991,19 +1866,6 @@ fn reload(snapshot: &CatalogueSnapshot, kind: EditorKind) -> Reload {
             .flat_map(|project| project.graphs.iter())
             .find(|entry| entry.graph.id == id)
             .map_or(Reload::Gone, |entry| Reload::Token(entry.graph.updated_at)),
-        EditorKind::NewPhase(graph) => snapshot
-            .projects
-            .iter()
-            .flat_map(|project| project.graphs.iter())
-            .find(|entry| entry.graph.id == graph)
-            .map_or(Reload::Gone, |_| Reload::Keep),
-        EditorKind::EditPhase(id) => snapshot
-            .projects
-            .iter()
-            .flat_map(|project| project.graphs.iter())
-            .flat_map(|entry| entry.nodes.iter().map(|node| &node.phase))
-            .find(|phase| phase.id == id)
-            .map_or(Reload::Gone, |phase| Reload::Token(phase.updated_at)),
     }
 }
 
@@ -2059,6 +1921,7 @@ fn doing(busy: &str) -> &'static str {
         "set_phase_budget" => "saving the budget",
         "replace_graph" => "replacing the graph",
         "delete_phase" => "deleting the phase",
+        "graph_body" => "reading the graph",
         _ => "writing",
     }
 }
@@ -2068,8 +1931,8 @@ fn required(label: &str) -> String {
     format!("`{label}` is required")
 }
 
-/// One phase row: the six columns this section edits, in editor order (D2's six, minus the ones
-/// the row cannot show), read as words (MOD-83: `soft gate`, `no inputs`, `budget inherited`),
+/// One phase row, read-only (MOD-141 D14: the graph editor edits it): D2's six columns, minus the
+/// ones the row cannot show, read as words (MOD-83: `soft gate`, `no inputs`, `budget inherited`),
 /// then the bound persona's name — only when one is bound, so an unbound phase's line says
 /// nothing of personas (D23, I-12).
 fn phase_line(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> String {
@@ -2116,12 +1979,13 @@ fn budget_label(budget: Option<i32>) -> String {
 /// words and its enums through `kit::label` (MOD-83): `fan-out 1 · gate: never · isolation: none
 /// (local tree) · commands: not queued · …`.
 ///
-/// Wrapped here rather than clipped: the last words are the ones that say why nothing on the line
-/// can be typed into, and a detail line cut off at the verify command would read as a row of the
-/// tree that someone forgot to finish. `width` is the row's, after the gutter.
+/// Wrapped here rather than clipped: a detail line cut off at the verify command would read as a
+/// row of the tree that someone forgot to finish. No owner tail any more (MOD-141 D14): the step's
+/// own form in the graph editor is where its columns are seen whole. `width` is the row's, after
+/// the gutter.
 fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<list::Row<'static>> {
     let text = format!(
-        "fan-out {} \u{b7} gate: {} \u{b7} isolation: {} \u{b7} commands: {} \u{b7} verify: {} \u{b7} retries {} \u{b7} output: {} \u{b7} template: {} \u{2014} {MOD_4_OWNS}",
+        "fan-out {} \u{b7} gate: {} \u{b7} isolation: {} \u{b7} commands: {} \u{b7} verify: {} \u{b7} retries {} \u{b7} output: {} \u{b7} template: {}",
         phase.fan_out,
         label::gate(phase.gate),
         // `None` is the project's default (`step_graph_phase.isolation`).
@@ -2143,6 +2007,25 @@ fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<list::
             kind: RowKind::Note,
         })
         .collect()
+}
+
+/// What `n` and `d` say about steps (MOD-141 D14): they are added and deleted in the graph
+/// editor, and the sentence names the key that opens it in force (MD-A).
+fn steps_in_the_editor(keys: &Keys) -> String {
+    let key = keys.label(views::KINDS_BROWSE, Act::KindsEditor);
+    key.map_or_else(
+        || "steps are added and deleted in the graph editor".to_owned(),
+        |key| format!("steps are added and deleted in the graph editor: {key} opens it"),
+    )
+}
+
+/// What the graph editor's key says on a project row (MOD-141 D3): a project has no graph of its
+/// own, so the sentence names the rows that do and the key in force (MD-A).
+fn pick_a_graph(key: Option<&str>) -> String {
+    key.map_or_else(
+        || "select a graph or a step to open the graph editor".to_owned(),
+        |key| format!("select a graph or a step: {key} opens the graph editor"),
+    )
 }
 
 /// The next step of [`NO_WORKSPACE`]: the reload key in force (MD-A), or what happens without one.
@@ -2177,9 +2060,6 @@ mod tests {
             focus: 0,
             expected: None,
             stored_prefix: Some("ANA".to_owned()),
-            stored_budget: None,
-            stored_persona: None,
-            follow_up: None,
         };
         let section = KindsSection {
             mode: Mode::ConfirmPrefix {

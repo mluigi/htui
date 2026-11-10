@@ -25,4 +25,4 @@ Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  
 │     0. plan · template plan · soft gate · no inputs · budget inherited       ┃
 │     1. implement · template implement · soft gate · inputs plan, review · bu…│
 │                                                                              │
-╰─j/k · n kind/phase · N graph · e edit · g graph · d delete kind · r reload───╯
+╰─j/k · n kind · N graph · e edit · g graph · Enter graph editor …─────────────╯

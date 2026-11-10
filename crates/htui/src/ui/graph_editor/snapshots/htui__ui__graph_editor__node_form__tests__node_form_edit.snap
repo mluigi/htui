@@ -1,0 +1,25 @@
+---
+source: crates/htui/src/ui/graph_editor/node_form.rs
+expression: text(&lines)
+---
+▌name           research
+ template       ‹ research ›
+ version        ‹ latest ›
+ persona        ‹ reviewer ›
+ gate           ‹ always ›
+ hard gate      ○ off
+ retry limit    1
+ isolation      ‹ project default ›
+ commands       ‹ queued when fanned out ›
+ verify
+ token budget
+ inputs
+ output         research
+ agent 1        ‹ claude · sonnet ›
+ agent 2        ‹ agy · gemini ›
+ split          none
+ fan-out        1
+ palette        no
+ plan scope     none
+ parts          0 parts
+ deadline       edited in M2
