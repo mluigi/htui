@@ -17,9 +17,9 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
-    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY, PointType,
-    Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _, is_embedder_mismatch,
-    probe_with,
+    DENSE, EMBEDDER_KEY, ExistingCollection, Hit, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY,
+    PointType, Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _,
+    is_embedder_mismatch, probe_with,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -243,7 +243,7 @@ async fn a_requirement_is_found_by_its_exact_key() {
     let row = &rows[0];
     // Among the hits, not necessarily first: `HashEmbedder`'s dense arm is noise, and fusion can
     // tie a sibling key (`R-ENT-2` shares the `ent` term) with it.
-    let own = |hits: &[htui_store::vector::Hit]| {
+    let own = |hits: &[Hit]| {
         hits.iter()
             .find(|h| h.owner == Owner::Requirement(row.id))
             .cloned()
@@ -1184,6 +1184,34 @@ async fn each_search_arm_finds_an_exact_key() {
     store.drop_collection().await.expect("drop");
 }
 
+/// `a` and `b` as the same answer to one search: the same scores, and the same hits except where
+/// Qdrant breaks a tie. RRF ties are common (dense rank 2 with sparse rank 3 scores 0.45, as does
+/// the reverse), and Qdrant 1.19 orders equal scores arbitrarily per request: 20 identical fused
+/// queries against one collection came back in 12 orders. At the limit it may keep either of two
+/// tied points; so hits are compared as sets above the lowest score, and only counted at it.
+fn assert_same_up_to_ties(a: &[Hit], b: &[Hit], what: &str) {
+    fn by_score(hits: &[Hit]) -> Vec<Hit> {
+        let mut hits = hits.to_vec();
+        hits.sort_by(|x, y| {
+            y.score
+                .total_cmp(&x.score)
+                .then_with(|| format!("{x:?}").cmp(&format!("{y:?}")))
+        });
+        hits
+    }
+    let (a, b) = (by_score(a), by_score(b));
+    let scores = |hits: &[Hit]| hits.iter().map(|h| h.score).collect::<Vec<_>>();
+    assert_eq!(scores(&a), scores(&b), "{what}: {a:?} vs {b:?}");
+    let lowest = a.last().map_or(f32::INFINITY, |h| h.score);
+    let above = |hits: &[Hit]| {
+        hits.iter()
+            .filter(|h| h.score > lowest)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(above(&a), above(&b), "{what}");
+}
+
 #[tokio::test]
 async fn the_hybrid_arms_are_the_vector_store_search() {
     let Some(store) = throwaway().await else {
@@ -1197,7 +1225,7 @@ async fn the_hybrid_arms_are_the_vector_store_search() {
             .await
             .expect("search_arms");
         let search = store.search(&q).await.expect("search");
-        assert_eq!(arms, search, "{text}");
+        assert_same_up_to_ties(&arms, &search, text);
     }
     store.drop_collection().await.expect("drop");
 }
