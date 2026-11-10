@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId,
+    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId, RunPlanId,
     StepGraphId, StepId, UserId, WorkspaceId,
 };
 use crate::model::kind::{
@@ -552,6 +552,63 @@ pub struct StepOutcome {
     pub finished_at: DateTime<Utc>,
 }
 
+/// A row of `run_plan` (MOD-139 D1, D3; ANA-33 §7.2): one revision of a run's plan. Append-only in
+/// revisions; only `status` (and, at admission, `base_refs`) moves after the insert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunPlan {
+    /// `run_plan.id`.
+    pub id: RunPlanId,
+    /// `run_plan.run_id`.
+    pub run_id: RunId,
+    /// `run_plan.revision`: 0 for default parts the engine admits itself, then one per planner
+    /// submission; `UNIQUE (run_id, revision)`.
+    pub revision: i32,
+    /// `run_plan.planner_step_id`: a step of the same run.
+    pub planner_step_id: StepId,
+    /// `run_plan.scope` (`step_graph_phase.plan_scope`'s vocabulary).
+    pub scope: PlanScope,
+    /// `run_plan.status`.
+    pub status: PlanStatus,
+    /// `run_plan.base_position`: the `run_step.position` of the revision's first planned node.
+    pub base_position: i32,
+    /// `run_plan.base_refs` (`JSONB`): the primary HEAD per repo at admission; `None` until
+    /// admitted, and always set on an admitted revision (`chk_run_plan_admitted_base_refs`).
+    pub base_refs: Option<Value>,
+    /// `run_plan.body` (`JSONB`): the plan itself (ANA-33 §7.6). Untyped in M1 (D3): MOD-140's
+    /// validator owns its shape, and M2 types default parts.
+    pub body: Value,
+    /// `run_plan.digest`: sha256 over the canonical body, recomputed on resume (ANA-33 §7.2).
+    pub digest: String,
+    /// `run_plan.created_at`.
+    pub created_at: DateTime<Utc>,
+    /// `run_plan.updated_at` (an addition to §7.2, plan D1): moves with `status`; the mirror's
+    /// cursor.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::insert_run_plan`] (MOD-139 D3, D4): a revision inserted
+/// at [`PlanStatus::Proposed`] with no `base_refs`. Must pass
+/// [`run_plan_refusal`](crate::store::run_plan_refusal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRunPlan {
+    /// `run_plan.id`, client-minted.
+    pub id: RunPlanId,
+    /// `run_plan.run_id`.
+    pub run_id: RunId,
+    /// `run_plan.revision`, `>= 0`.
+    pub revision: i32,
+    /// `run_plan.planner_step_id`: a step of `run_id`.
+    pub planner_step_id: StepId,
+    /// `run_plan.scope`.
+    pub scope: PlanScope,
+    /// `run_plan.base_position`, `>= 0`.
+    pub base_position: i32,
+    /// `run_plan.body`.
+    pub body: Value,
+    /// `run_plan.digest`.
+    pub digest: String,
+}
+
 /// A row of `run_step_tree` (ANA-2 §4.6): the isolation tree of one repo for one step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStepTree {
@@ -968,6 +1025,57 @@ impl NodeRole {
         matches!(self, Self::Step)
     }
 }
+
+str_enum!(
+    /// `run_step.role` (MOD-139 D3, ANA-33 §7.4, §7.11; `chk_run_step_role`): what a step **row**
+    /// is. Not [`NodeRole`], the snapshot's three-value role of a frozen node: a node's role says
+    /// what the walk will create, a row's role what was created. M1 writes only `step` (D7).
+    #[derive(Default)]
+    StepRole {
+        /// An ordinary step: every row before `0028`, every compete candidate and its judge.
+        #[default]
+        Step => "step",
+        /// A divided node's planner, `<name>:plan` ([`PLAN_SUFFIX`]); MOD-139 M2 writes it.
+        Planner => "planner",
+        /// One part of an admitted plan revision: `parent_step_id` is the planner step and
+        /// `node_key` is `<divided>/<part_key>` (`chk_run_step_part`); MOD-139 M2 writes it.
+        Part => "part",
+        /// A divided node's integrate step; MOD-139 M2 writes it, M3 runs it.
+        Integrate => "integrate",
+        /// A subgraph node's step (MOD-143).
+        Subgraph => "subgraph",
+        /// A read-only consult-mode subagent (MOD-27).
+        Consult => "consult",
+        /// One of htui's own stages at positions -3..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
+        /// `chk_run_step_stage`); MOD-126 and MOD-132 write them.
+        Stage => "stage",
+    }
+);
+
+/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `pick` at -3,
+/// `prepare` at -2, `collect` at -1 (ANA-33 §7.11). `chk_run_step_stage` lists the same three; the
+/// CHECK does not bind a key to its position (blueprint F-1).
+pub const STAGE_KEYS: [&str; 3] = ["pick", "prepare", "collect"];
+
+/// The suffix of an expanded `divide` node's planner key, `<name>:plan` (MOD-138 D11). A phase may
+/// not be named with it (MOD-139 D6, [`phase_name_refusal`](crate::store::phase_name_refusal)), so a
+/// v2 snapshot's planner key never collides with a saved phase.
+pub const PLAN_SUFFIX: &str = ":plan";
+
+str_enum!(
+    /// `run_plan.status` (MOD-139 D3, ANA-33 §7.2; `chk_run_plan_status`).
+    PlanStatus {
+        /// Written by [`insert_run_plan`](crate::store::WriteStore::insert_run_plan); not yet
+        /// decided.
+        Proposed => "proposed",
+        /// Admitted: `base_refs` is set and its parts are rows (MOD-139 M2's admission).
+        Admitted => "admitted",
+        /// Refused at admission: the validator or a person said no.
+        Refused => "refused",
+        /// Left undecided once a later revision was admitted, or once the run ended.
+        Abandoned => "abandoned",
+    }
+);
 
 str_enum!(
     /// MOD-138 D1: how the run's graph was chosen. `pick` is MOD-126's, added there.

@@ -130,8 +130,8 @@ pub use hierarchy::{
 pub use ids::{
     AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, MemoryEntryId,
     NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
-    RequirementAreaId, RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId,
-    StepId, UserId, WorkspaceId,
+    RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId, SkillBindingId, SkillId,
+    StepGraphId, StepId, UserId, WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
@@ -192,12 +192,13 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunStep, NodeRole, Run, RunFacts, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, RuntimeChanges, SnapshotCandidate, SnapshotDivide,
-    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
-    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
-    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PlanStatus, Run, RunFacts, RunKind, RunMode,
+    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
+    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
+    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
+    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -442,6 +443,33 @@ mod tests {
         );
     }
 
+    /// `0028_divided_fanout.sql`'s `chk_run_step_role` (MOD-139 plan D1), ANA-33 §7.4's order.
+    #[test]
+    fn step_role_matches_check_list() {
+        check_enum(
+            StepRole::ALL,
+            &[
+                "step",
+                "planner",
+                "part",
+                "integrate",
+                "subgraph",
+                "consult",
+                "stage",
+            ],
+        );
+        assert_eq!(StepRole::default(), StepRole::Step);
+    }
+
+    /// `0028_divided_fanout.sql`'s `chk_run_plan_status` (MOD-139 plan D1).
+    #[test]
+    fn plan_status_matches_check_list() {
+        check_enum(
+            PlanStatus::ALL,
+            &["proposed", "admitted", "refused", "abandoned"],
+        );
+    }
+
     /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).
     #[test]
     fn permission_status_matches_check_list() {
@@ -559,6 +587,7 @@ mod tests {
         check_id(PersonaId::from_uuid(u), u);
         check_id(BatchId::from_uuid(u), u);
         check_id(MemoryEntryId::from_uuid(u), u);
+        check_id(RunPlanId::from_uuid(u), u);
     }
 
     #[test]

@@ -58,7 +58,6 @@ use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{NewOwnerDocument, OwnerDocument};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
-use crate::prompt::template::TemplateRole;
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use crate::seed;
 use crate::store::error::{Result, StoreError};
@@ -80,9 +79,9 @@ use crate::store::traits::{
     link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
-    project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
-    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    phase_name_refusal, project_settings_not_an_object, prompt_template_key,
+    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
+    references_no_row, requirement_withdrawn, resolution_not_closable, row_names_another_phase,
     row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
     skill_version_key, startable, step_document_refusal, step_is_not_promotable, step_note_refusal,
     step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
@@ -3897,8 +3896,8 @@ impl State {
     ) -> Result<StepGraphPhase> {
         // MOD-137 blueprint §T2.2's order: the reserved name, the node CHECKs, the graph, the
         // clashes, then the persona and agent references.
-        if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
-            return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
+        if let Some(refusal) = phase_name_refusal(&phase.name) {
+            return Err(StoreError::Constraint(refusal));
         }
         if let Some(refusal) = phase_row_refusal(phase) {
             return Err(StoreError::Constraint(refusal));
@@ -4059,10 +4058,8 @@ impl State {
         if current.updated_at != expected {
             return Ok(CasOutcome::Stale(current));
         }
-        if let Some(name) = &patch.name
-            && TemplateRole::of_name(name) != TemplateRole::Phase
-        {
-            return Err(StoreError::Constraint(reserved_phase_name(name)));
+        if let Some(refusal) = patch.name.as_deref().and_then(phase_name_refusal) {
+            return Err(StoreError::Constraint(refusal));
         }
         self.check_phase(
             current.graph_id,
@@ -16325,6 +16322,56 @@ mod tests {
             (v1.skill_id, v1.version, v1.body.as_str()),
             (id, 1, "one"),
             "the first version of a bare skill is v1"
+        );
+    }
+
+    /// MOD-139 D6: `create_phase` of `x:plan` and `update_phase` renaming a phase to it are both
+    /// refused with the planner-suffix sentence, and nothing is written.
+    #[tokio::test]
+    async fn a_phase_name_with_the_plan_suffix_is_refused() {
+        let store = MemStore::demo();
+        let before = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("the phases read");
+        let first = before[0].clone();
+        let created = store
+            .create_phase(&crate::model::StepGraphPhase {
+                id: crate::model::PhaseId::new(),
+                position: 99,
+                name: "implement:plan".to_owned(),
+                ..first.clone()
+            })
+            .await;
+        assert_eq!(
+            created,
+            Err(StoreError::Constraint(
+                crate::store::plan_suffix_phase_name("implement:plan")
+            ))
+        );
+        let renamed = store
+            .update_phase(
+                first.id,
+                first.updated_at,
+                crate::model::PhasePatch {
+                    name: Some("implement:plan".to_owned()),
+                    ..crate::model::PhasePatch::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            renamed,
+            Err(StoreError::Constraint(
+                crate::store::plan_suffix_phase_name("implement:plan")
+            ))
+        );
+        assert_eq!(
+            store
+                .phases(ids::GRAPH_HTUI_FEAT)
+                .await
+                .expect("the phases read"),
+            before,
+            "nothing was written"
         );
     }
 

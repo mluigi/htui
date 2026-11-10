@@ -131,4 +131,6 @@ id_newtype!(
     BatchId,
     /// `memory_entry.id` (MOD-163 plan D1): one project memory entry.
     MemoryEntryId,
+    /// `run_plan.id` (MOD-139 plan D1, P-1): one revision of a run's plan.
+    RunPlanId,
 );

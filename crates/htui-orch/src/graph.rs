@@ -23,8 +23,8 @@ use htui_core::model::{
     SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
 use htui_core::model::{
-    EdgeKind, GraphScope, ItemFilter, NodeRole, Scope, SnapshotDivide, SnapshotEdge, SnapshotPart,
-    SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
+    EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
+    SnapshotPart, SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
     sort_snapshot_edges,
 };
 use htui_core::model::{MemoryState, SnapshotMemory};
@@ -834,9 +834,6 @@ fn local_concurrent_refusal(
     }
     Ok(())
 }
-
-/// The suffix an expanded `divide` node's planner key carries (MOD-138 D11).
-const PLAN_SUFFIX: &str = ":plan";
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the typed, borrowed `{ phases, edges }`
 /// (MOD-138 D3): the digest a v2 snapshot's `topology` carries. The edges are read in the one

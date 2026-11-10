@@ -51,6 +51,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::ItemState;
+use crate::model::PLAN_SUFFIX;
 use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
@@ -64,19 +65,19 @@ use crate::model::{
     MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
     MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
     NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, OwnerDocument, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectType, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId,
-    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
-    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    NewRequirementArea, NewRun, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
+    NewWorkspace, Note, OpenPermission, OwnerDocument, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::prompt::settings::{Rungs, SettingKey, validate};
@@ -2735,6 +2736,77 @@ pub fn reserved_phase_name(name: &str) -> String {
     format!("`{name}` is a reserved template name, not a phase name")
 }
 
+// ---- MOD-139: divided fan-out's records (plan D1, D4, D6) ----
+
+/// MOD-139 D6: a phase named `<x>:plan` would collide with the planner node a `divide` phase
+/// expands into ([`PLAN_SUFFIX`], MOD-138 D11).
+#[must_use]
+pub fn plan_suffix_phase_name(name: &str) -> String {
+    format!("`{name}` ends in `{PLAN_SUFFIX}`, which names a divided phase's planner, not a phase")
+}
+
+/// MOD-139 D6: why `name` may not name a phase, or `None` when it may: a reserved template name
+/// first ([`reserved_phase_name`]), then the planner suffix ([`plan_suffix_phase_name`]). Rule c of
+/// `graph_body_shape_refusal` and both stores' `create_phase` / `update_phase` ask it. Resolve keeps
+/// its own collision refusal (`expand_divide`), since a graph saved before 0028 may hold one.
+#[must_use]
+pub fn phase_name_refusal(name: &str) -> Option<String> {
+    if TemplateRole::of_name(name) != TemplateRole::Phase {
+        return Some(reserved_phase_name(name));
+    }
+    name.ends_with(PLAN_SUFFIX)
+        .then(|| plan_suffix_phase_name(name))
+}
+
+/// MOD-139 D1, D4 (blueprint P-7): [`WriteStore::insert_run_plan`]'s input rules, judged before
+/// any read, in the sentence both stores give: `chk_run_plan_revision`, the base-position CHECK,
+/// then a NUL in `digest` (Postgres `text`, `22021`) or in any string or key of `body` (Postgres
+/// `jsonb` refuses `\u0000`, `22P05`; probed).
+#[must_use]
+pub fn run_plan_refusal(plan: &NewRunPlan) -> Option<String> {
+    if plan.revision < 0 {
+        return Some(format!(
+            "run_plan.revision must be 0 or more, not {}",
+            plan.revision
+        ));
+    }
+    if plan.base_position < 0 {
+        return Some(format!(
+            "run_plan.base_position must be 0 or more, not {}",
+            plan.base_position
+        ));
+    }
+    if plan.digest.contains('\0') {
+        return Some(has_nul("run_plan.digest"));
+    }
+    json_has_nul(&plan.body).then(|| has_nul("run_plan.body"))
+}
+
+/// Whether any string or object key inside `value` holds U+0000.
+fn json_has_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(json_has_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.contains('\0') || json_has_nul(item)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// MOD-139 D4: `insert_run_plan`'s `planner_step_id` names no step of the plan's run (an unknown
+/// step included).
+#[must_use]
+pub fn planner_not_in_run(step: StepId, run: RunId) -> String {
+    format!("planner step {step} is not a step of run {run}")
+}
+
+/// MOD-139 D1, D4: `uq_run_plan_revision`.
+#[must_use]
+pub fn plan_revision_taken(run: RunId, revision: i32) -> String {
+    format!("run {run} already has plan revision {revision}")
+}
+
 /// MOD-9 D4: a template name [`PromptTemplate::name_is_valid`] refuses, in the sentence both
 /// stores give it.
 #[must_use]
@@ -4134,6 +4206,93 @@ mod tests {
         assert_eq!(
             scope_row_is_deleted_with_its_workspace("@shop"),
             "project `@shop` is workspace `shop`'s own scope row; delete the workspace instead"
+        );
+    }
+
+    // ---- MOD-139 M1: divided fan-out's records (plan D1, D4, D6) ----
+
+    /// MOD-139 D6: a reserved template name is refused before the planner suffix, and a plain name
+    /// (`plan` included) passes.
+    #[test]
+    fn phase_name_refusal_names_the_template_role_first() {
+        assert_eq!(
+            super::phase_name_refusal("judge"),
+            Some(super::reserved_phase_name("judge"))
+        );
+        assert_eq!(
+            super::phase_name_refusal("implement:plan"),
+            Some(super::plan_suffix_phase_name("implement:plan"))
+        );
+        assert_eq!(
+            super::plan_suffix_phase_name("implement:plan"),
+            "`implement:plan` ends in `:plan`, which names a divided phase's planner, not a phase"
+        );
+        assert_eq!(super::phase_name_refusal("implement"), None);
+        assert_eq!(super::phase_name_refusal("plan"), None);
+    }
+
+    /// MOD-139 D4 (blueprint P-7): `insert_run_plan`'s shape rules, judged before any read.
+    #[test]
+    fn run_plan_refusal_refuses_negatives_and_nul() {
+        use crate::model::{NewRunPlan, PlanScope, RunId, RunPlanId, StepId};
+        use serde_json::json;
+        let clean = NewRunPlan {
+            id: RunPlanId::new(),
+            run_id: RunId::new(),
+            revision: 0,
+            planner_step_id: StepId::new(),
+            scope: PlanScope::Parts,
+            base_position: 3,
+            body: json!({"parts": [{"key": "api"}]}),
+            digest: "sha256:abc".to_owned(),
+        };
+        assert_eq!(super::run_plan_refusal(&clean), None);
+        let refused = |plan: NewRunPlan| super::run_plan_refusal(&plan);
+        assert_eq!(
+            refused(NewRunPlan {
+                revision: -1,
+                ..clean.clone()
+            }),
+            Some("run_plan.revision must be 0 or more, not -1".to_owned())
+        );
+        assert_eq!(
+            refused(NewRunPlan {
+                base_position: -1,
+                ..clean.clone()
+            }),
+            Some("run_plan.base_position must be 0 or more, not -1".to_owned())
+        );
+        assert_eq!(
+            refused(NewRunPlan {
+                digest: "sha\u{0}".to_owned(),
+                ..clean.clone()
+            }),
+            Some(super::has_nul("run_plan.digest"))
+        );
+        assert_eq!(
+            refused(NewRunPlan {
+                body: json!({"a": ["x\u{0}"]}),
+                ..clean.clone()
+            }),
+            Some(super::has_nul("run_plan.body"))
+        );
+        assert_eq!(
+            refused(NewRunPlan {
+                body: json!({"k\u{0}": 1}),
+                ..clean.clone()
+            }),
+            Some(super::has_nul("run_plan.body"))
+        );
+        assert_eq!(
+            super::planner_not_in_run(clean.planner_step_id, clean.run_id),
+            format!(
+                "planner step {} is not a step of run {}",
+                clean.planner_step_id, clean.run_id
+            )
+        );
+        assert_eq!(
+            super::plan_revision_taken(clean.run_id, 2),
+            format!("run {} already has plan revision 2", clean.run_id)
         );
     }
 }

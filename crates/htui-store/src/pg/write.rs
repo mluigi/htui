@@ -49,8 +49,8 @@ use htui_core::model::{
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
+use htui_core::prompt::DEFAULT_TEMPLATES;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
-use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use htui_core::seed;
 use htui_core::store::traits::{
@@ -70,8 +70,8 @@ use htui_core::store::{
     illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
     item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal,
     not_a_fanout_candidate, not_a_terminal_status, persona_is_bound, persona_patch_refusal,
-    prompt_template_key, prompt_template_refusal, queue_target_refusal, queue_token_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    phase_name_refusal, prompt_template_key, prompt_template_refusal, queue_target_refusal,
+    queue_token_refusal, references_no_row, requirement_withdrawn, resolution_not_closable,
     row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
     skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
@@ -4011,8 +4011,8 @@ impl WriteStore for PgStore {
     /// D5); a row deleted after that read is the five FKs' `23503`, mapped to the same words by
     /// `phase_fk_refused`.
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
-        if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
-            return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
+        if let Some(refusal) = phase_name_refusal(&phase.name) {
+            return Err(StoreError::Constraint(refusal));
         }
         if let Some(refusal) = phase_row_refusal(phase) {
             return Err(StoreError::Constraint(refusal));
@@ -4124,9 +4124,7 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: PhasePatch,
     ) -> Result<CasOutcome<StepGraphPhase>> {
-        if let Some(name) = &patch.name
-            && TemplateRole::of_name(name) != TemplateRole::Phase
-        {
+        if let Some(refusal) = patch.name.as_deref().and_then(phase_name_refusal) {
             let Some(current) = self.phase_row(id).await? else {
                 return Err(StoreError::NotFound {
                     entity: "step_graph_phase",
@@ -4136,7 +4134,7 @@ impl WriteStore for PgStore {
             if current.updated_at != expected {
                 return Ok(CasOutcome::Stale(current));
             }
-            return Err(StoreError::Constraint(reserved_phase_name(name)));
+            return Err(StoreError::Constraint(refusal));
         }
 
         // MOD-137 D5, F7: bump first (graph row), then the phase row `FOR UPDATE`; a miss on
