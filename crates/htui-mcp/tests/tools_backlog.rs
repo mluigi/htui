@@ -757,6 +757,35 @@ async fn item_link_outside_the_workspaces_is_out_of_scope() {
     assert!(!fx.live_link(ids::VULKAN_FEAT_1, LinkKind::Relates).await);
 }
 
+/// MOD-147 edge 9: `withdraw_link` keeps no reach check, so a `remove` of an item of another
+/// project that holds no live link answers `not yours` (this run proposed nothing there), with
+/// the keys only: never the items' ids, which would name an item outside the reach.
+#[tokio::test]
+async fn item_link_remove_of_another_projects_item_is_not_yours() {
+    let store = MemStore::demo();
+    let (ws, _) = ws_item(&store, ids::PROJECT_SCOPE_GRAPHICS).await;
+    let fx = Leased::on_store(store, ids::PROJECT_HTUI, ids::HTUI_ANA_2).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    // `vulkan-tutorials` and `@graphics` lie outside the reach, `agy` inside it.
+    for to in ["vulkan-tutorials:FEAT-1", "@graphics:WS-1", "agy:FEAT-1"] {
+        let answer = client
+            .call(
+                "item_link",
+                json!({"op": "remove", "to": to, "kind": "relates"}),
+            )
+            .await
+            .expect("a call");
+        assert_eq!(
+            refused(&answer),
+            format!("not yours: ANA-2 relates {to} was not proposed by this run"),
+        );
+    }
+    for item in [ids::VULKAN_FEAT_1, ws, ids::AGY_FEAT_1] {
+        assert!(!fx.live_link(item, LinkKind::Relates).await);
+    }
+}
+
 /// MOD-147 edges 1 and 3: no project has the slug `nope`, and no workspace is called `gone`.
 #[tokio::test]
 async fn item_link_to_an_unknown_slug_is_out_of_scope() {
