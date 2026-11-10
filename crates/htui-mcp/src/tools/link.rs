@@ -1,8 +1,11 @@
 //! `item_link` (MOD-11 M2, plan "Tools", blueprint §7.2): proposes or withdraws a link from the
 //! step's item.
 //!
-//! `from` is always the run's item and `to` an item **key** resolved inside the scope's project
-//! only ([`item_by_key`]; a key the project lacks is `out of scope`, I-1). `add` upserts through
+//! `from` is always the run's item and `to` an item **key** ([`item_by_key`], I-1): `KEY` in the
+//! scope's project, `slug:KEY` in another project of its workspaces, or `@workspace:KEY` for a
+//! workspace's own item (MOD-147 D2). A key no project has, or an item outside the reach of D3
+//! (this project, its workspaces and their members), is `out of scope`. The answer names `to`
+//! canonically: bare in this project, `slug:KEY` elsewhere. `add` upserts through
 //! [`propose_link`], `remove` tombstones through [`withdraw_link`], both under the session's fence
 //! (I-3). A run withdraws only what one of its steps proposed (PRD OQ-4, B-6): anything else
 //! reads `not yours`.
@@ -14,7 +17,7 @@
 use htui_core::model::LinkKind;
 use htui_core::model::link::{ProposeLink, WithdrawLink};
 use htui_core::store::StoreError;
-use htui_core::store::traits::{link_key, link_not_proposed_by_run};
+use htui_core::store::traits::{link_key, link_not_proposed_by_run, link_outside_reach};
 use serde_json::{Value, json};
 
 use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of, store_error};
@@ -29,16 +32,21 @@ enum Op {
     Remove,
 }
 
-// `from` is the scope's item and `to` a key of the scope's project (I-1): a `run_id`, an
-// `item_id` or a `from` is refused. A plain comment, not a doc: schemars would hand a doc to the
-// agent as the schema's description.
+// `from` is the scope's item and `to` a key (I-1): `KEY` of the scope's project, `slug:KEY` of
+// another project of its workspaces or `@workspace:KEY` of a workspace's own item (MOD-147 D2); a
+// `run_id`, an `item_id` or a `from` is refused. A plain comment, not a doc: schemars would hand a
+// doc to the agent as the schema's description.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LinkArgs {
     /// `add` proposes the link, `remove` withdraws one this run proposed.
     #[schemars(schema_with = "op_schema")]
     op: Op,
-    /// The other item's key in this project, e.g. `FEAT-12`.
+    // An attribute, not a doc: a doc wrapped at 100 columns reaches the agent with a line break.
+    #[schemars(
+        description = "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project \
+                       `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+    )]
     to: String,
     /// Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`.
     #[schemars(schema_with = "kind_schema")]
@@ -60,12 +68,21 @@ fn kind_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 pub(crate) const DEF: ToolDef = ToolDef {
     name: "item_link",
     description: "Proposes or withdraws a link from this step's item to another item of its \
-                  project, named by key.",
+                  project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project \
+                  api, @shop:WS-1 for workspace shop's own items.",
     schema: schema_of::<LinkArgs>,
     advertised: |scope, _| scope.item_id.is_some(),
 };
 
-/// `{"from": "<key>", "to": "<key>", "kind": "<kind>", "live": bool}`.
+/// `to` names no item this session reaches (MOD-147 D3), in the agent's own text.
+fn out_of_scope(to: &str) -> ToolError {
+    ToolError(format!(
+        "out of scope: {to} is not an item of this project or its workspaces"
+    ))
+}
+
+/// `{"from": "<key>", "to": "<key>", "kind": "<kind>", "live": bool}`; `to` is canonical: bare in
+/// this project, `slug:KEY` elsewhere.
 pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     ctx: Ctx<'_, H>,
     arguments: Value,
@@ -82,7 +99,20 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     let target = htui_core::store::WorkerStore::item_by_key(store, scope.project_id, &to)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| ToolError(format!("out of scope: {to} is not an item of this project")))?;
+        .ok_or_else(|| out_of_scope(&to))?;
+    let target_item = htui_core::store::WorkerStore::item(store, target)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| ToolError(format!("not found: item {target}")))?;
+    let canonical = if target_item.project_id == scope.project_id {
+        target_item.key
+    } else {
+        let project = htui_core::store::WorkerStore::project(store, target_item.project_id)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| ToolError(format!("not found: project {}", target_item.project_id)))?;
+        format!("{}:{}", project.slug, target_item.key)
+    };
     let from_key = htui_core::store::WorkerStore::item(store, from)
         .await
         .map_err(store_error)?
@@ -113,14 +143,17 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
             if sentence == link_not_proposed_by_run(&link_key(from, target, kind)) =>
         {
             ToolError(format!(
-                "not yours: {from_key} {kind} {to} was not proposed by this run"
+                "not yours: {from_key} {kind} {canonical} was not proposed by this run"
             ))
+        }
+        StoreError::Constraint(sentence) if sentence == link_outside_reach(target) => {
+            out_of_scope(&to)
         }
         other => store_error(other),
     })?;
     Ok(json!({
         "from": from_key,
-        "to": to,
+        "to": canonical,
         "kind": link.kind,
         "live": link.deleted_at.is_none(),
     }))

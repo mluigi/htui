@@ -114,7 +114,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -129,7 +129,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           },
           "to": {
             "type": "string",
-            "description": "The other item's key in this project, e.g. `FEAT-12`."
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
           },
           "kind": {
             "type": "string",
@@ -251,7 +251,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -266,7 +266,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           },
           "to": {
             "type": "string",
-            "description": "The other item's key in this project, e.g. `FEAT-12`."
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
           },
           "kind": {
             "type": "string",
@@ -388,7 +388,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -403,7 +403,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           },
           "to": {
             "type": "string",
-            "description": "The other item's key in this project, e.g. `FEAT-12`."
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
           },
           "kind": {
             "type": "string",
