@@ -441,18 +441,25 @@ fn flow_node(
     .with_handles(handles(palette))
 }
 
-/// D7: rataflow's `StepEdge`, but a loop's label sits on the loop's vertical run.
+/// D7: rataflow's `StepEdge`, but a loop's label sits on the loop's vertical run, in the gap
+/// below the loop's higher end.
 ///
 /// `StepEdge` puts the label of a side-to-side (right to right) path on its longest leg. When a
 /// loop's ends are not stacked (the reference graph's review sits right of implement), that leg
 /// is the horizontal one into the target's side, and a label wider than it runs under the target
-/// node, which is drawn over it. The vertical run's midpoint lies in the gap between the layers.
+/// node, which is drawn over it. The vertical run passes beside every step between the loop's
+/// ends, and a label wider than the channel reaches into that column; so the label sits where the
+/// run crosses the gap below the higher end, a row no node is on, however many layers the loop
+/// spans (between adjacent layers that is the run's midpoint).
 #[derive(Debug, Default)]
-struct StepLink(StepEdge);
+struct StepLink {
+    /// The path and its drawing.
+    step: StepEdge,
+}
 
 impl EdgeContent for StepLink {
     fn compute_path(&self, ctx: &EdgePathContext) -> Path {
-        let path = self.0.compute_path(ctx);
+        let path = self.step.compute_path(ctx);
         if ctx.source_position != ctx.target_position || !ctx.source_position.is_horizontal() {
             return path;
         }
@@ -462,29 +469,37 @@ impl EdgeContent for StepLink {
             .windows(2)
             .filter(|run| (run[0].x - run[1].x).abs() < f64::EPSILON)
             .max_by(|a, b| rise(a).total_cmp(&rise(b)));
-        match run {
-            Some([from, to]) => {
-                let at = Position::new(from.x, f64::midpoint(from.y, to.y));
-                path.with_label_position(at)
-            }
-            _ => path,
-        }
+        let Some(&[from, to]) = run else {
+            return path;
+        };
+        let (low, high) = (from.y.min(to.y), from.y.max(to.y));
+        let higher = ctx
+            .target_bounds
+            .filter(|target| target.y() <= ctx.source_bounds.y())
+            .unwrap_or(ctx.source_bounds);
+        let gap = higher.bottom() + V_GAP / 2.0;
+        let y = if (low..=high).contains(&gap) {
+            gap
+        } else {
+            f64::midpoint(low, high)
+        };
+        path.with_label_position(Position::new(from.x, y))
     }
 
     fn render(&self, ctx: &EdgeRenderContext, buf: &mut Buffer) {
-        self.0.render(ctx, buf);
+        self.step.render(ctx, buf);
     }
 }
 
 /// One body edge, by its handles, in the editor's styles (execution_graph B-4).
 fn flow_edge(edge: &StepGraphEdge, forward: bool, theme: &Theme) -> Edge<StepLink> {
-    let content = StepLink(
-        StepEdge::default().with_style(
+    let content = StepLink {
+        step: StepEdge::default().with_style(
             EdgeStyle::default()
                 .with_stroke_style(theme.dim)
                 .with_label_style(theme.base),
         ),
-    );
+    };
     let (source, target) = edge_handles(edge.kind, forward);
     let drawn = Edge::new(
         edge.id.to_string(),
@@ -1984,5 +1999,26 @@ mod tests {
             "reference",
             drawn(&reference(), Some("review"), &[], (100, 28))
         );
+    }
+
+    // --- what crowds a drawing ---
+
+    #[test]
+    fn a_loop_past_a_step_keeps_its_label_in_a_gap() {
+        let mut body = body(&["implement", "review", "verify"]);
+        let mut fails = edge(&body, "verify", "implement", EdgeKind::Fails);
+        fails.loop_limit = Some(2);
+        let mut changes = edge(&body, "verify", "implement", EdgeKind::ChangesRequested);
+        changes.loop_limit = Some(3);
+        body.edges = vec![
+            edge(&body, "implement", "review", EdgeKind::Next),
+            edge(&body, "review", "verify", EdgeKind::Next),
+            fails,
+            changes,
+        ];
+        let drawn = drawn(&body, None, &[], (100, 28));
+        for label in ["fails \u{d7}2", "changes requested \u{d7}3"] {
+            assert!(drawn.contains(label), "{label}:\n{drawn}");
+        }
     }
 }
