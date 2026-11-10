@@ -36,6 +36,7 @@ use htui_core::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     StepGraphEdge,
 };
+use htui_core::model::{PlanStatus, RunPlan, RunPlanId};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1194,9 +1195,32 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// MOD-139 M1 T1 stub; T3 reads `run_plan`.
-    async fn run_plans(&self, _run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
-        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    /// MOD-139 D4: the run's revisions, `revision` order.
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        sqlx::query_as!(
+            RunPlan,
+            r#"
+            SELECT id              AS "id: RunPlanId",
+                   run_id          AS "run_id: RunId",
+                   revision,
+                   planner_step_id AS "planner_step_id: StepId",
+                   scope           AS "scope: PlanScope",
+                   status          AS "status: PlanStatus",
+                   base_position,
+                   base_refs,
+                   body,
+                   digest,
+                   created_at,
+                   updated_at
+              FROM run_plan
+             WHERE run_id = $1
+             ORDER BY revision
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// The item's live citations, each joined to the requirement as it is now, in
