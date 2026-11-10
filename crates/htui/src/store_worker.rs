@@ -25,12 +25,12 @@ use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
     FollowUpText, GraphBody, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec,
-    ItemSummary, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona, PersonaId,
-    PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectType, RelayView,
-    RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary,
-    Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId,
-    StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId,
-    WorkspacePatch, WorkspaceSummary,
+    ItemSummary, KeyQualifier, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona,
+    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectType,
+    RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId, RunStatus,
+    RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
+    StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
+    WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
     MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove, QueueOverview,
@@ -2294,22 +2294,79 @@ async fn serve_waiting(
     scope: &Scope,
     read_permissions: impl AsyncFnOnce(&Writer, &Scope) -> StoreResult<Vec<WaitingPermission>>,
 ) -> StoreResult<StoreReply> {
-    let active = backend.active_runs(scope).await?;
-    let candidates = backend.waiting_candidates(scope).await?;
+    // The TUI's scope is always a whole workspace (`set_scope`), so it always widens (V5).
+    let (read, keys) = waiting_reads(backend, scope, true).await?;
+    let active = backend.active_runs(&read).await?;
+    let candidates = backend.waiting_candidates(&read).await?;
     let writer = backend.writer();
     let permissions = match &writer {
-        Some(writer) => permissions_or_unknown(read_permissions(writer, scope).await)?,
+        Some(writer) => permissions_or_unknown(read_permissions(writer, &read).await)?,
         None => None,
     };
     Ok(StoreReply::Waiting {
+        // MOD-147 D10: the asked scope, not the widened one: the top bar keeps a reply only for
+        // the scope it asked about (`app/update.rs`).
         scope: scope.clone(),
         // Review L3 with L4: no writer is offline; a writer with unknown permissions is a failed
         // read online, which the overlay must not call offline.
         view: WaitingView {
             offline: writer.is_none(),
-            ..htui_worker::waiting(scope, active, &candidates, permissions.as_deref())
+            ..htui_worker::waiting(&read, active, &candidates, permissions.as_deref(), &keys)
         },
     })
+}
+
+/// MOD-147 D10, D11: the scope the waiting reads use — with `widen`, the asked one with the
+/// workspace's scope row first, when it has one — and the key qualifier over it (`project` and
+/// `kinds` per project). The reply still names the asked scope (`app/update.rs`).
+///
+/// The store worker reads through [`Backend`] (the mirror's kinds offline), the CLI through its
+/// read-only [`PgStore`]. A project the store no longer holds is left out of the qualifier, so its
+/// keys print bare.
+pub(crate) async fn waiting_reads<S: KindsRead>(
+    store: &S,
+    scope: &Scope,
+    widen: bool,
+) -> StoreResult<(Scope, KeyQualifier)> {
+    let row = if widen {
+        store.scope_project(scope.workspace_id).await?
+    } else {
+        None
+    };
+    let read = row.map_or_else(|| scope.clone(), |row| scope.with_scope_row(row));
+    let mut projects = Vec::with_capacity(read.project_ids.len());
+    for id in &read.project_ids {
+        let Some(project) = store.project(*id).await? else {
+            continue;
+        };
+        let prefixes = store
+            .kinds_of(*id)
+            .await?
+            .into_iter()
+            .map(|kind| kind.prefix)
+            .collect();
+        projects.push((*id, project.slug, prefixes));
+    }
+    Ok((read, KeyQualifier::new(&projects)))
+}
+
+/// The two stores [`waiting_reads`] reads: a project's kinds, which are a `WriteStore` read on
+/// Postgres and an inherent one on [`Backend`] (MOD-147 V7).
+pub(crate) trait KindsRead: ReadStore {
+    /// `project`'s kinds, in the store's kind order.
+    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>>;
+}
+
+impl KindsRead for Backend {
+    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>> {
+        self.item_kinds(project).await
+    }
+}
+
+impl KindsRead for PgStore {
+    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>> {
+        WriteStore::item_kinds(self, project).await
+    }
 }
 
 /// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
@@ -4416,6 +4473,9 @@ mod tests {
                 WaitingRow {
                     item: ids::HTUI_FEAT_2,
                     item_key: "FEAT-2".into(),
+                    project: ids::PROJECT_HTUI,
+                    // MOD-147 D11: Platform's members are seeded alike, so every prefix is shared.
+                    display_key: "htui:FEAT-2".into(),
                     run: None,
                     step: None,
                     step_label: String::new(),
@@ -4426,6 +4486,8 @@ mod tests {
                 WaitingRow {
                     item: ids::HTUI_TOOL_1,
                     item_key: "TOOL-1".into(),
+                    project: ids::PROJECT_HTUI,
+                    display_key: "htui:TOOL-1".into(),
                     run: Some(ids::RUN_5),
                     step: None,
                     step_label: String::new(),
@@ -4435,6 +4497,137 @@ mod tests {
                 }
             ]
         );
+    }
+
+    /// A `WS` item minted on Platform's scope row, its run (`workspace_id` `None`, filled by the
+    /// store, MOD-147 D8) claimed and its first step parked at its gate, as the engine leaves one.
+    async fn park_a_workspace_gate(store: &MemStore) -> (ItemId, StepId) {
+        let item = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+                title: "spans the workspace".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        let snapshot = store
+            .run(ids::RUN_1)
+            .await
+            .expect("run")
+            .and_then(|run| run.graph_snapshot)
+            .expect("RUN_1 carries a snapshot");
+        let at = Utc::now();
+        let owner = uuid::Uuid::now_v7();
+        let run = store
+            .create_run(htui_core::model::NewRun {
+                id: htui_core::model::RunId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                item_id: item,
+                mode: htui_core::model::RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: serde_json::from_value(snapshot).expect("RUN_1's snapshot"),
+                repo_scope: Vec::new(),
+                queued_at: at,
+                batch_id: None,
+                workspace_id: None,
+            })
+            .await
+            .expect("create_run")
+            .id;
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, chrono::TimeDelta::minutes(30))
+                .await
+                .expect("claim_run"),
+            htui_core::model::Claim::Admitted
+        );
+        let step = store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "prd".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: Some("opus".to_owned()),
+            })
+            .await
+            .expect("create_step")
+            .id;
+        assert!(
+            store
+                .transition_step(
+                    step,
+                    htui_core::model::StepStatus::Pending,
+                    htui_core::model::StepStatus::Running,
+                    at
+                )
+                .await
+                .expect("transition_step")
+        );
+        assert_eq!(
+            store
+                .park_step(htui_core::store::StepFence::Lease(owner), step)
+                .await
+                .expect("park_step"),
+            htui_core::store::ParkOutcome::Parked
+        );
+        (item, step)
+    }
+
+    /// MOD-147 D10: the waiting reads cover the workspace's own items, listed first (the scope
+    /// row sits at index 0 of the read scope), while the reply still names the asked scope, so the
+    /// top bar adopts it (`app/update.rs`'s `*scope == self.scope`). D11: `WS` is the scope row's
+    /// alone, so its key prints bare.
+    #[tokio::test]
+    async fn serve_waiting_lists_the_scope_rows_items_first() {
+        let store = MemStore::demo();
+        let (item, step) = park_a_workspace_gate(&store).await;
+        let backend = Backend::memory(store);
+        let asked = platform_scope(&backend).await;
+        assert!(
+            !asked.contains(ids::PROJECT_SCOPE_PLATFORM),
+            "the asked scope never holds the scope row"
+        );
+        let StoreReply::Waiting {
+            scope: answered,
+            view,
+        } = serve(
+            &backend,
+            &StoreRequest::Waiting {
+                scope: asked.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(answered, asked, "the reply names the asked scope");
+        let first = &view.rows[0];
+        assert_eq!(first.item, item);
+        assert_eq!(first.step, Some(step));
+        assert_eq!(first.reason, WaitingReason::Gate);
+        assert_eq!(first.project, ids::PROJECT_SCOPE_PLATFORM);
+        assert_eq!(first.item_key, "WS-1");
+        assert_eq!(first.display_key, "WS-1");
+        let keys: Vec<&str> = view
+            .rows
+            .iter()
+            .map(|row| row.display_key.as_str())
+            .collect();
+        assert_eq!(keys, ["WS-1", "htui:FEAT-2", "htui:TOOL-1"]);
+        assert_eq!(view.working, 2, "the parked WS run owns its row");
     }
 
     #[tokio::test]

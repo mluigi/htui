@@ -62,6 +62,9 @@ const OFFLINE: &str = "permissions unavailable (read-only offline)";
 /// listed, yet every row can still be answered, so the line claims neither offline nor read-only.
 const UNREADABLE: &str = "permissions unavailable: the read failed";
 
+/// What `Enter` on a workspace's own item says (MOD-147 D10): the Backlog lists them from M3.
+const WORKSPACE_ITEMS_LATER: &str = "workspace items open in the Backlog from MOD-147 M3";
+
 /// The step column of a row with no step: the Runs pane's `PENDING` dash.
 const NO_STEP: &str = "\u{2014}";
 
@@ -123,11 +126,17 @@ impl WaitingList {
     }
 
     /// `Enter`: close, then reveal the selected row's step, both applied by the same drain (the
-    /// `ConceptsSearch` order). Nothing on an empty list.
+    /// `ConceptsSearch` order). Nothing on an empty list. A workspace's own item (MOD-147 D10: its
+    /// project is the scope row, which the asked scope never holds) is not in the Backlog yet, so
+    /// `Enter` says where it will open and the list stays open.
     fn enter(&self, rows: &[WaitingRow], ctx: &Ctx<'_>) {
         let Some(row) = self.at(rows).and_then(|at| rows.get(at)) else {
             return;
         };
+        if !ctx.scope.contains(row.project) {
+            ctx.emit(Action::Error(WORKSPACE_ITEMS_LATER.to_owned()));
+            return;
+        }
         ctx.emit(Action::Overlay(OverlayAction::Close));
         ctx.emit(Action::Reveal(RevealTarget::Step {
             item: row.item,
@@ -198,7 +207,7 @@ impl Columns {
     fn of(rows: &[WaitingRow]) -> Self {
         let widest = |cell: &dyn Fn(&WaitingRow) -> usize| rows.iter().map(cell).max().unwrap_or(0);
         Self {
-            key: widest(&|row| cell_width(&row.item_key)),
+            key: widest(&|row| cell_width(&row.display_key)),
             step: widest(&|row| cell_width(step_text(row))),
             label: widest(&|row| cell_width(row.reason.label())),
             text: widest(&|row| cell_width(&row.text)),
@@ -228,7 +237,7 @@ fn item_row(row: &WaitingRow, columns: &Columns, theme: &Theme) -> Row<'static> 
         line: Line::styled(
             format!(
                 "{LEAD}{}{GAP}{}{GAP}{}{GAP}{}",
-                cells::fit(&row.item_key, columns.key),
+                cells::fit(&row.display_key, columns.key),
                 cells::fit(step_text(row), columns.step),
                 cells::fit(row.reason.label(), columns.label),
                 row.text,
@@ -450,6 +459,8 @@ mod tests {
         WaitingRow {
             item,
             item_key: key.to_owned(),
+            project: ids::PROJECT_HTUI,
+            display_key: key.to_owned(),
             run: Some(RunId::new()),
             step: Some(StepId::new()),
             step_label: "prd 0.1".to_owned(),
@@ -471,6 +482,8 @@ mod tests {
         WaitingRow {
             item,
             item_key: key.to_owned(),
+            project: ids::PROJECT_HTUI,
+            display_key: key.to_owned(),
             run: None,
             step: None,
             step_label: String::new(),
@@ -823,6 +836,43 @@ mod tests {
         let rendered = bench.render(&list);
         assert!(rendered.contains("\u{258c} FEAT-40 "), "{rendered}");
         assert!(rendered.contains(OFFLINE), "{rendered}");
+    }
+
+    /// MOD-147 D10: a workspace's own item (its project is the scope row, which the asked scope
+    /// never holds) does not open in the Backlog until M3, so `Enter` says so and the list stays
+    /// open, rather than closing on a reveal that finds nothing.
+    #[test]
+    fn enter_on_a_workspace_row_says_where_it_opens() {
+        let ws = WaitingRow {
+            project: ids::PROJECT_SCOPE_PLATFORM,
+            ..gate("WS-1", ItemId::new())
+        };
+        let member = gate("ANA-2", ids::HTUI_ANA_2);
+        let bench = Bench::over(Some(view(vec![ws, member.clone()])));
+        let mut list = WaitingList::new();
+        assert_eq!(bench.code(&mut list, KeyCode::Enter), Handled::Consumed);
+        match bench.emit.take().as_slice() {
+            [Action::Error(said)] => assert_eq!(said, WORKSPACE_ITEMS_LATER),
+            other => panic!("expected the one sentence, no Close or Reveal: {other:?}"),
+        }
+        bench.code(&mut list, KeyCode::Char('j'));
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &member);
+    }
+
+    /// MOD-147 D11: the key column draws each row's display key, widened to the longest.
+    #[test]
+    fn the_key_column_draws_the_display_key() {
+        let ws = WaitingRow {
+            project: ids::PROJECT_SCOPE_PLATFORM,
+            ..gate("WS-1", ItemId::new())
+        };
+        let shared = WaitingRow {
+            display_key: "htui:FEAT-2".to_owned(),
+            ..reopen("FEAT-2", ids::HTUI_FEAT_2)
+        };
+        let bench = Bench::over(Some(view(vec![ws, gate("ANA-2", ids::HTUI_ANA_2), shared])));
+        insta::assert_snapshot!("display_key", bench.render(&WaitingList::new()));
     }
 
     #[test]
