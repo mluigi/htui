@@ -511,6 +511,9 @@ pub struct CliDriver {
     /// `agent_box.version` — the probe's `claude --version` capture — the banner's `agent_version`
     /// fallback when `system/init` names no version.
     box_version: Option<String>,
+    /// The variables a session must not carry (MOD-97 D5): `settings.api_billing_env` on a
+    /// `subscription` row, empty on a `per_token` one ([`crate::launch::billing_env_to_strip`]).
+    strip_env: Vec<String>,
 }
 
 impl core::fmt::Debug for CliDriver {
@@ -567,10 +570,13 @@ impl CliDriver {
             .and_then(crate::probe::ProbeSnapshot::from_row)
             .filter(|snapshot| snapshot.transport == agent.transport)
             .and_then(|snapshot| snapshot.recorded_launch().cloned());
+        let settings: AgentSettings =
+            serde_json::from_value(agent.settings.clone()).unwrap_or_default();
+        let strip_env = crate::launch::billing_env_to_strip(agent.billing, &settings);
         Ok(Self {
             name: agent.name.clone(),
             models: agent.models.clone(),
-            settings: serde_json::from_value(agent.settings.clone()).unwrap_or_default(),
+            settings,
             caps,
             io: IoSource::Spawn {
                 launch: Box::new(launch),
@@ -578,6 +584,7 @@ impl CliDriver {
             },
             stamp: Stamp::Wall,
             box_version: on_box.and_then(|on_box| on_box.version.clone()),
+            strip_env,
         })
     }
 
@@ -587,6 +594,9 @@ impl CliDriver {
     /// `spec.env` is applied **last** and wins (`R-SEC-2`): the row's environment holds paths, the
     /// spec's holds what the secret provider produced for this run. The argv is **not** assembled
     /// here — [`argv`] needs the minted session id, which is `start`'s to make.
+    ///
+    /// A `subscription` row's `settings.api_billing_env` is then stripped from the result and named
+    /// in `env_remove`, so `spawn` removes an inherited copy too (MOD-97 D5).
     ///
     /// `HTUI_SESSION=1` ([`crate::launch::SESSION_VAR`], MOD-91 D4) goes in after `spec.env`, on
     /// every session whatever `user_extensions` says. Only `io_in` calls this in production, so it
@@ -607,6 +617,7 @@ impl CliDriver {
         };
         let mut resolved = crate::launch::launch_from(launch, recorded.as_ref(), &spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
+        crate::launch::strip_billing_env(&mut resolved, &self.strip_env, &self.name);
         crate::launch::mark_session(&mut resolved.env);
         Ok(resolved)
     }
@@ -633,6 +644,8 @@ impl CliDriver {
             io: IoSource::Prepared(Mutex::new(Some(Box::new(io)))),
             stamp,
             box_version: None,
+            // A prepared transport spawns nothing, so there is no environment to strip.
+            strip_env: Vec::new(),
         }
     }
 

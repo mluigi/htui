@@ -248,6 +248,7 @@ async fn gpu_vendor_ids(_root: &Path, env: &ProbeEnv) -> Vec<String> {
         command: "/usr/sbin/system_profiler".to_owned(),
         args: vec!["SPDisplaysDataType".to_owned()],
         env: std::collections::BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     crate::probe::run_bounded("system_profiler", &launch, env)
         .await
@@ -275,6 +276,7 @@ async fn gpu_vendor_ids(_root: &Path, env: &ProbeEnv) -> Vec<String> {
         .map(str::to_owned)
         .collect(),
         env: std::collections::BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     crate::probe::run_bounded("Win32_VideoController", &launch, env)
         .await

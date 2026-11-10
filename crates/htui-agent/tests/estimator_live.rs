@@ -640,6 +640,7 @@ async fn a_failure_between_the_spawn_and_the_reap_still_reaps() {
         command: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), "cat >/dev/null".to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let cwd = tempfile::tempdir().expect("a scratch working directory");
     let mut spawned = htui_agent::launch::spawn(&resolved, cwd.path())

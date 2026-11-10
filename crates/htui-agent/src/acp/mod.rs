@@ -193,6 +193,9 @@ pub struct AcpDriver {
     caps: DriverCaps,
     io: IoSource,
     stamp: Stamp,
+    /// The variables a session must not carry (MOD-97 D5): `settings.api_billing_env` on a
+    /// `subscription` row, empty on a `per_token` one ([`crate::launch::billing_env_to_strip`]).
+    strip_env: Vec<String>,
 }
 
 impl core::fmt::Debug for AcpDriver {
@@ -266,15 +269,19 @@ impl AcpDriver {
             .and_then(crate::probe::ProbeSnapshot::from_row)
             .filter(|snapshot| snapshot.transport == agent.transport)
             .and_then(|snapshot| snapshot.recorded_launch().cloned());
+        let settings: AgentSettings =
+            serde_json::from_value(agent.settings.clone()).unwrap_or_default();
+        let strip_env = crate::launch::billing_env_to_strip(agent.billing, &settings);
         Ok(Self {
             name: agent.name.clone(),
-            settings: serde_json::from_value(agent.settings.clone()).unwrap_or_default(),
+            settings,
             caps,
             io: IoSource::Spawn {
                 launch: Box::new(launch),
                 recorded,
             },
             stamp: Stamp::Wall,
+            strip_env,
         })
     }
 
@@ -318,11 +325,16 @@ impl AcpDriver {
     /// resolves through [`launch_in`](Self::launch_in) and a probe through `launch::spawn`, and
     /// neither is a session (blueprint B3).
     ///
+    /// Between the two, a `subscription` row's `settings.api_billing_env` is stripped from the
+    /// result and named in `env_remove`, so `spawn` removes an inherited copy too and the adapter
+    /// never hands one to the CLI (MOD-97 D5). A login stays unstripped: it runs no billed turn.
+    ///
     /// # Errors
     /// [`launch_in`](Self::launch_in)'s, unchanged.
     pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
         let mut resolved = self.launch_in(&spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
+        crate::launch::strip_billing_env(&mut resolved, &self.strip_env, &self.name);
         crate::launch::mark_session(&mut resolved.env);
         Ok(resolved)
     }
@@ -373,6 +385,8 @@ impl AcpDriver {
             caps,
             io: IoSource::Prepared(Mutex::new(Some(Box::new(io)))),
             stamp,
+            // A prepared transport spawns nothing, so there is no environment to strip.
+            strip_env: Vec::new(),
         }
     }
 

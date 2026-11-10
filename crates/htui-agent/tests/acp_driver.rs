@@ -307,6 +307,7 @@ async fn open_session_times_out_and_kills_its_child() {
             command: "sleep".to_owned(),
             args: vec!["1000".to_owned()],
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
         },
         tmp.path(),
     )
@@ -362,6 +363,7 @@ async fn a_failed_handshake_still_reaps_its_child() {
             command: "sleep".to_owned(),
             args: vec!["1000".to_owned()],
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
         },
         tmp.path(),
     )
@@ -432,6 +434,7 @@ async fn a_refused_session_new_answers_with_the_agents_own_message() {
             command: "sleep".to_owned(),
             args: vec!["1000".to_owned()],
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
         },
         tmp.path(),
     )
@@ -867,6 +870,7 @@ async fn a_usable_snapshot_is_what_the_driver_would_spawn_marker_included() {
             ("ROW_VAR".to_owned(), "row".to_owned()),
             ("SHARED".to_owned(), "row".to_owned()),
         ]),
+        env_remove: Vec::new(),
     };
 
     let mut spec = spec(tmp.path().to_path_buf());
@@ -927,6 +931,7 @@ async fn launch_for_marks_the_session_whatever_the_setting() {
                 env: row_env
                     .map(|value| BTreeMap::from([(SESSION_VAR.to_owned(), value.to_owned())]))
                     .unwrap_or_default(),
+                env_remove: Vec::new(),
             };
             let row_on_box = on_box(
                 &agent,
@@ -1100,6 +1105,7 @@ async fn through_the_factory_the_spawned_argv_carries_the_marker() {
             "HTUI_ARGV_FILE".to_owned(),
             argv_file.to_string_lossy().into_owned(),
         )]),
+        env_remove: Vec::new(),
     };
     let row_on_box = on_box(
         &agent,
@@ -1141,6 +1147,7 @@ async fn a_recorded_command_that_is_gone_falls_back_to_resolution() {
             .into_owned(),
         args: vec!["--uid=".to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let row_on_box = on_box(
         &agent,
@@ -1185,6 +1192,7 @@ async fn a_recorded_command_that_is_now_a_directory_falls_back_to_resolution() {
         command: directory.to_string_lossy().into_owned(),
         args: vec![MARKER.to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let row_on_box = on_box(
         &agent,
@@ -1224,6 +1232,7 @@ async fn a_manual_snapshot_is_used_as_a_launch() {
         command: plain_file(&tmp.path().join("bin/hand-picked")),
         args: vec![MARKER.to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let row_on_box = on_box(
         &agent,
@@ -1330,6 +1339,7 @@ async fn a_snapshot_probed_for_another_transport_is_not_used_as_a_launch() {
         command: plain_file(&tmp.path().join("bin/htui-fake-adapter")),
         args: vec![MARKER.to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let stale_transport = ProbeSnapshot {
         transport: Transport::Cli,
@@ -1367,6 +1377,7 @@ async fn a_probe_column_that_does_not_parse_resolves_as_before() {
         command: plain_file(&tmp.path().join("bin/htui-fake-adapter")),
         args: vec![MARKER.to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let row_on_box = AgentBox {
         // Half a snapshot: `status` alone, with none of the keys the struct requires.
@@ -1691,6 +1702,7 @@ async fn open_against(
                     command: "sleep".to_owned(),
                     args: vec!["1000".to_owned()],
                     env: BTreeMap::new(),
+                    env_remove: Vec::new(),
                 },
                 cwd,
             )

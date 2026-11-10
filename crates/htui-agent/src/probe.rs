@@ -605,6 +605,7 @@ async fn npm_root_global(env: &ProbeEnv) -> Result<Option<PathBuf>> {
         command: npm.to_string_lossy().into_owned(),
         args: vec!["root".to_owned(), "-g".to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let Some(child) = run_bounded("npm root -g", &launch, env).await else {
         return Ok(None);
@@ -1120,6 +1121,7 @@ pub async fn capture_version(path: &Path, probe: &VersionProbe, env: &ProbeEnv) 
         command: path.to_string_lossy().into_owned(),
         args: probe.args.clone(),
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let child = run_bounded(path.to_string_lossy().as_ref(), &launch, env).await?;
 

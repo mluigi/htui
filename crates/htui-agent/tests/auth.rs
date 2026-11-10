@@ -911,6 +911,7 @@ fn launch_with_env(pairs: &[(&str, &str)]) -> ResolvedLaunch {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect(),
+        env_remove: Vec::new(),
     }
 }
 
@@ -1138,6 +1139,7 @@ done
             command: "/bin/sh".to_owned(),
             args: vec![script.to_string_lossy().into_owned()],
             env,
+            env_remove: Vec::new(),
         }
     }
 

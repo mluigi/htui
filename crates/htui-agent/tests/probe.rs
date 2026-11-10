@@ -1052,6 +1052,7 @@ async fn read_stdout_to_end_caps_a_tool_that_streams_forever() {
             "while :; do echo streaming-forever-and-ever; done".to_owned(),
         ],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let mut spawned = spawn_fixture(&launch, tmp.path())
         .await
@@ -1523,6 +1524,7 @@ async fn spawned_io(cwd: &Path, command: &str, args: &[&str]) -> (u32, AcpIo) {
         command: command.to_owned(),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     };
     let spawned = spawn_fixture(&launch, cwd)
         .await
@@ -2445,6 +2447,7 @@ fn recorded() -> ResolvedLaunch {
         command: "/opt/antigravity/agy_acp_server.par".to_owned(),
         args: vec!["--uid=".to_owned()],
         env: BTreeMap::new(),
+        env_remove: Vec::new(),
     }
 }
 

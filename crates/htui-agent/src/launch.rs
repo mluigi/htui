@@ -303,6 +303,14 @@ pub struct AgentSettings {
     /// under `cli` because it applies to both transports. An unreadable settings document falls
     /// back to `default()`, the isolated side.
     pub user_extensions: bool,
+    /// The environment variables that move a session onto API billing (MOD-97 D2): on a
+    /// `subscription` row each is removed from the session's spawn, whether inherited from
+    /// `htui`'s own environment, set by `launch.env` or carried in by a project secret, so the row
+    /// runs on its subscription login or fails the way a subscription row should. On a
+    /// `per_token` row the list is ignored, so a copy flipped to `per_token` bills the API without
+    /// editing it. Row data, never source (`R-AGT-5`): the seeds name the vendor's variables, and a
+    /// row without the list strips nothing. [`SESSION_VAR`] is never stripped (MOD-91 D4).
+    pub api_billing_env: Vec<String>,
 }
 
 /// `agent.settings.acp` (§5.2).
@@ -462,15 +470,24 @@ pub struct ResolvedLaunch {
     pub args: Vec<String>,
     /// Environment for the child, fully substituted. Redacted by `Debug`.
     pub env: BTreeMap<String, String>,
+    /// Names [`spawn`] removes from the child's inherited environment, after `.envs` (MOD-97 D5).
+    /// Set per session by [`strip_billing_env`], never by a probe, so a recorded launch carries
+    /// none and serialises without the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_remove: Vec<String>,
 }
 
 impl core::fmt::Debug for ResolvedLaunch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ResolvedLaunch")
-            .field("command", &self.command)
+        let mut s = f.debug_struct("ResolvedLaunch");
+        s.field("command", &self.command)
             .field("args", &RedactedArgs(&self.args))
-            .field("env", &RedactedEnv(&self.env))
-            .finish()
+            .field("env", &RedactedEnv(&self.env));
+        // Only when set, mirroring `skip_serializing_if`: names, never values (MOD-97 D5).
+        if !self.env_remove.is_empty() {
+            s.field("env_remove", &self.env_remove);
+        }
+        s.finish()
     }
 }
 
@@ -546,6 +563,7 @@ pub fn resolve(launch: &AgentLaunch, tools: &ToolMap) -> Result<ResolvedLaunch> 
             .iter()
             .map(|(key, value)| Ok((key.clone(), substitute(value, tools)?)))
             .collect::<Result<BTreeMap<_, _>>>()?,
+        env_remove: Vec::new(),
     })
 }
 
@@ -620,6 +638,49 @@ pub const SESSION_VAR: &str = "HTUI_SESSION";
 /// [`spawn`] (which the probes use too) and never into `launch.env` (user data, `R-SEC-2`).
 pub(crate) fn mark_session(env: &mut BTreeMap<String, String>) {
     env.insert(SESSION_VAR.to_owned(), "1".to_owned());
+}
+
+/// The names a session of a row billed `billing` must not carry (MOD-97 D2): the row's
+/// [`AgentSettings::api_billing_env`] on a `subscription` row, nothing on a `per_token` one.
+///
+/// No wildcard arm, so a new billing kind has to decide. [`SESSION_VAR`] is dropped from the
+/// list: `spawn` removes after `.envs`, so a row naming it would unset the session marker, which
+/// no row can (MOD-91 D4).
+pub(crate) fn billing_env_to_strip(
+    billing: htui_core::model::Billing,
+    settings: &AgentSettings,
+) -> Vec<String> {
+    match billing {
+        htui_core::model::Billing::Subscription => settings
+            .api_billing_env
+            .iter()
+            .filter(|name| name.as_str() != SESSION_VAR)
+            .cloned()
+            .collect(),
+        htui_core::model::Billing::PerToken => Vec::new(),
+    }
+}
+
+/// Removes every name in `names` from a session's resolved environment and records them in
+/// [`ResolvedLaunch::env_remove`], so [`spawn`] removes an inherited copy too (MOD-97 D5).
+///
+/// Called by both drivers' `launch_for` after `spec.env` (so a project secret is stripped as well)
+/// and before [`mark_session`]. `env_remove` is overwritten with the whole list, present or not:
+/// removing an absent variable does nothing. A name actually present, in the resolved environment
+/// or in this process's own, logs one `warn!` naming the agent and the variable, never its value
+/// (`R-SEC-2`).
+pub(crate) fn strip_billing_env(resolved: &mut ResolvedLaunch, names: &[String], agent: &str) {
+    for name in names {
+        let named = resolved.env.remove(name).is_some();
+        if named || std::env::var_os(name).is_some() {
+            warn!(
+                agent = %agent,
+                variable = %name,
+                "an API-billing variable was stripped from a subscription-billed session"
+            );
+        }
+    }
+    resolved.env_remove = names.to_vec();
 }
 
 /// Replaces every `${name}` in one string.
@@ -1197,6 +1258,11 @@ fn spawn_supervised(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // MOD-97 D5: a subscription-billed session's API-billing variables, inherited or not.
+        // After `.envs`, so the launch environment cannot re-add one.
+        for key in &launch.env_remove {
+            command.env_remove(key);
+        }
         // MOD-158 D5 (`R-SEC-2`): htui's own secret variables never reach an agent, whether
         // inherited or named by the launch row; removed after `.envs` so nothing re-adds them.
         for key in htui_core::secret::HTUI_OWN_ENV {

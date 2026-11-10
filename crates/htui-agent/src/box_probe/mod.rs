@@ -217,6 +217,7 @@ async fn ask_tools(
             command: tool.path.clone(),
             args: ask.args.clone(),
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
         };
         let (tag, matches) = (rule.tag.clone(), ask.matches.clone());
         let (env, permits) = (Arc::clone(env), Arc::clone(permits));
