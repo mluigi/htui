@@ -161,9 +161,14 @@ terminals at once.
 `--api-key` bills the session to the Anthropic API instead of the shared `~/.claude` OAuth login:
 the host's `ANTHROPIC_API_KEY` is forwarded into the container by name (the value never lands on a
 command line), and `attach` exits `2` when it is not set. The key reaches everything the session
-starts, `--shell` included, and htui does not clear it from an agent's environment, so a `claude`
-or `claude-cli` agent row run inside such a session bills the API too, whatever its `billing`
-says (`docs/ANA-30.md` §2.3). Which credit it draws on — a plan's monthly API credit or a purchased
+starts, `--shell` included. An `htui` run inside the session does **not** pass it on to a
+`billing = subscription` agent row: since MOD-97 such a row's spawn drops the variables named in its
+`settings.api_billing_env` (the seeded `claude` and `claude-cli` rows name `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN`), logging a warning with the variable's name, so the row runs on the
+subscription login or fails to authenticate when the container has none. Billing a run to the key
+takes a `per_token` row (`docs/ANA-30.md` §2.3, `docs/decisions/mod/mod-97.md`). A subscription row
+created from scratch starts with empty settings and strips nothing until its `api_billing_env` is set
+(the Settings form does not edit that key). Which credit it draws on — a plan's monthly API credit or a purchased
 one — is the Console's (`docs/ANA-30.md` §3.2).
 Inside, start the lifecycle as usual:
 

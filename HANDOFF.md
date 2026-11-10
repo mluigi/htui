@@ -14,7 +14,12 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-09):** **MOD-163 is done** (`docs/decisions/mod/mod-163.md`): project memory.
+**Current status (2026-11-10):** **MOD-97 is done** (`docs/decisions/mod/mod-97.md`): a
+`billing = subscription` agent row no longer bills an exported or project-secret API key. The row's
+`settings.api_billing_env` names the variables (seeded on `claude` and `claude-cli`, backfilled by
+`0028_seed_api_billing_env`); both drivers drop them from every session spawn, inherited copies included,
+with a names-only warning, and `per_token` rows keep them; `--bare` is pinned by a seeded-argv test and an
+ignored live case. **MOD-163 is done** (`docs/decisions/mod/mod-163.md`): project memory.
 Entries (fact, decision, gotcha, lesson) live in `memory_entry` with revisions, compare-and-set and a
 one-live-subject rule; StartRun freezes the project's active entries into the run snapshot (copied text,
 newest first, 1,500-token cap) and every phase prompt renders them as an internal `memory` section (quoted
@@ -28,14 +33,7 @@ the closed `if` set, `asks_you` stops and per-edge loops; every ready node now r
 `max_parallel_sessions` (incomparable nodes only, in-place trees never overlapping, a node waiting for a sibling
 that makes one of its inputs), a park drains its siblings and an end cuts them, landings into one repo are
 serialised, and crash recovery lands every frontier. MOD-139 is unblocked; MOD-143 waits only on ANA-35 and
-ANA-34. **MOD-160 is done** (`docs/decisions/mod/mod-160.md`): knowledge search
-fails open cheaply. The TUI and MCP search ask Qdrant and the existing collection, and check the embedder,
-before loading the model, and never create a collection; every surface says "knowledge search unavailable"
-(`htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE`) with its cause one key away (`concepts.why`, `ctrl-e`) or
-after a colon; `search_concepts` is offered per session from a cached "URL configured" flag (TUI and worker
-alike); Settings › Qdrant, TUI launch and worker start warn from a model-free probe, never blocking; the gate
-has a `qdrant` step.
-Earlier completions, MOD-158 back to the 2026-10-14
+ANA-34. Earlier completions, MOD-160 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -45,13 +43,15 @@ repo) owes key rotation and a history rewrite, after the live `hr` branches merg
 Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-14's `gate.ps1
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
-install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
+install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-97's live `cli_live` case 11 (an inherited key, `apiKeySource` stays `none`) and Windows build of its
+`remove_case_variants`; MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
 `state_cli_pg`'s index case, MOD-160's
 `concepts_worker` mismatch case; the sandbox Qdrant times out creating collections), MOD-158's bats `3h2` and a real
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-163 M2 (checked against the tree 2026-11-10): migrations run through
+Live coordinates after MOD-97 (checked against the tree 2026-11-10): migrations run through
+`0028_seed_api_billing_env` (MOD-97: data-only, adds `settings.api_billing_env` to seeded `claude`/`claude-cli` rows; not mirrored), before it
 `0027_trim_record_v5` (MOD-163 M2: comment-only, `run_step.trim_record` v 5; not mirrored), before it
 `0026_workspace_scope` (MOD-147 M1: `project.owner_workspace_id`, the scope-row CHECKs, `document.project_id` with
 nullable `item_id`, `workspace_box_path.folder_path`; no new table; mirrored by cache `0009_workspace_scope`), before it
@@ -61,12 +61,14 @@ nullable `item_id`, `workspace_box_path.folder_path`; no new table; mirrored by 
 (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0028`** (cache: through `0009_workspace_scope`, next `0010`;
+`workspace_stop`), so **the next migration is `0029`** (cache: through `0009_workspace_scope`, next `0010`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges, and MOD-144's `0023` became `0024` behind MOD-138's (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
-`htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. Items that still owe one include MOD-139 (and its cache mirror), MOD-143,
+`htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. That rename left
+`migrations::the_ana_column_comments_are_present_and_verbatim` red: `0027`'s column comment says "written before
+0026" while `MOD163_M2_COLUMN_COMMENTS` pins "0027" (fix the pin, or the SQL only where no database has applied it). Items that still owe one include MOD-139 (and its cache mirror), MOD-143,
 MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
 `htui-orch` `CASES` 186 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
 (`htui-store/tests/migrations.rs` `TABLES`).
@@ -633,20 +635,6 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   option, pressed by a person; no mod or agent answers on its own. **Blocked on a maintainer
   decision** (`docs/ANA-29.md` §12 Q2); MOD-92 is done (`docs/htui-cli.md`, its envelope and exit
   codes are the model for `permission list --json`); MOD-93 is done (`docs/decisions/mod/mod-93.md`), so the pane the buttons go in exists.
-- [ ] **MOD-97 - Strip inherited vendor API keys from subscription-billed agent spawns** (from
-  ANA-30, `docs/ANA-30.md` §2.3, §8 call 7). `R-AGT-7`, `R-AGT-9`, `R-SEC-2`. `spawn_supervised`
-  builds every agent child with `.envs(&launch.env)` and no `env_clear`
-  (`crates/htui-agent/src/launch.rs:1184-1199`), and Claude Code always uses `ANTHROPIC_API_KEY` in
-  `-p` mode when present. So an `htui` started where the key is exported (`hr attach --api-key` or
-  `--shell`, `docs/hr-sandbox.md`), or a project secret of that name (`SessionSpec.env`,
-  `driver.rs:283-284`), moves every `claude`/`claude-cli` run onto API billing while the row still
-  says `subscription`: the quota latch watches the wrong thing and no per-token cap applies. Remove
-  vendor auth variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`; which ones is the row's data,
-  not a vendor name in code, `R-AGT-5`) from a `billing = subscription` row's spawn, or refuse the
-  spawn naming the variable; settle which in the plan. Also in scope: Claude Code says `--bare` will
-  become the `-p` default, which would stop the seeded `claude-cli` row (D92, no `--bare`) using the
-  subscription login (`docs/ANA-30.md` §2.3); pin the behaviour with a test or an explicit flag. Not
-  blocked.
 - [ ] **MOD-98 - Opt-in `summary` phase on a cheap row to fill upstream summaries** (from ANA-30,
   `docs/ANA-30.md` §4 U5, §8 call 5). `R-PRM-1`, `R-ORCH-1`, `R-ID-6`. Upstream prompts read the
   latest `document.kind = 'summary'` (`pg/read.rs:588`), whose only writer is close-out's
@@ -794,7 +782,7 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   - **`command_run` controls.** A phase's exposure and the per-box command-class limits become
     editable; Settings › Kinds shows them read-only today.
   - **DSN from an environment variable**, for dev and CI. Read once, and stripped from every agent
-    spawn (beside MOD-97's vendor-key strip).
+    spawn (beside the `api_billing_env` strip of MOD-97, done: `docs/decisions/mod/mod-97.md`).
   - **`htui migrate`.** An explicit, non-interactive CLI verb that applies pending migrations; the
     worker still never migrates.
   Not blocked.
@@ -1185,6 +1173,6 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 79 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 78 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |
