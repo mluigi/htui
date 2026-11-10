@@ -869,11 +869,12 @@ impl ReadStore for CacheStore {
     ///
     /// The Postgres text of `pg/read.rs` with this file's three substitutions plus one more:
     /// SQLite has no `LATERAL`, so the latest-summary lookup is a correlated subquery in the
-    /// `SELECT` list. The workspace and the root are each bound **twice**, positionally, rather
-    /// than reused through a `?NNN` placeholder, because every statement in this file binds plain
-    /// `?` in order — the root's second binding is the `WHERE best.item_id <> ?` that keeps a cycle
-    /// from rendering the root as its own entry (T68, F-52 review, H3), and it comes last because
-    /// that clause is the last placeholder in the text.
+    /// `SELECT` list. The workspace is bound **three times** (MOD-147 D9's scope-row arm is the
+    /// second) and the root **twice**, positionally, rather than reused through a `?NNN`
+    /// placeholder, because every statement in this file binds plain `?` in order — the root's
+    /// second binding is the `WHERE best.item_id <> ?` that keeps a cycle from rendering the root
+    /// as its own entry (T68, F-52 review, H3), and it comes last because that clause is the last
+    /// placeholder in the text.
     async fn upstream_summaries(
         &self,
         id: ItemId,
@@ -899,6 +900,8 @@ impl ReadStore for CacheStore {
              scope AS ( \
                      SELECT project_id FROM workspace_project WHERE workspace_id = ? \
                  UNION \
+                     SELECT id FROM project WHERE owner_workspace_id = ? \
+                 UNION \
                      SELECT ? WHERE ? IS NULL \
              ) \
              SELECT i.id AS item_id, p.slug || ':' || i.key AS qualified_key, i.title, i.status, \
@@ -917,6 +920,7 @@ impl ReadStore for CacheStore {
         )))
         .bind(id.to_string())
         .bind(i64::from(hops))
+        .bind(workspace.clone())
         .bind(workspace.clone())
         .bind(scope.project.to_string())
         .bind(workspace)

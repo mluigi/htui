@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT g.id           AS \"id: StepGraphId\",\n                   g.project_id   AS \"project_id: ProjectId\",\n                   g.workspace_id AS \"workspace_id: WorkspaceId\",\n                   g.name,\n                   g.description,\n                   -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).\n                   g.is_override,\n                   g.revision,\n                   g.created_at,\n                   g.updated_at\n              FROM step_graph g\n             WHERE g.project_id = $1\n                OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                OR g.workspace_id IN (SELECT wp.workspace_id\n                                        FROM workspace_project wp\n                                       WHERE wp.project_id = $1)\n             ORDER BY CASE WHEN g.project_id IS NOT NULL THEN 0\n                           WHEN g.workspace_id IS NOT NULL THEN 1\n                           ELSE 2 END,\n                      g.name COLLATE \"C\",\n                      g.id\n            ",
+  "query": "\n            SELECT g.id           AS \"id: StepGraphId\",\n                   g.project_id   AS \"project_id: ProjectId\",\n                   g.workspace_id AS \"workspace_id: WorkspaceId\",\n                   g.name,\n                   g.description,\n                   -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).\n                   g.is_override,\n                   g.revision,\n                   g.created_at,\n                   g.updated_at\n              FROM step_graph g\n             WHERE g.project_id = $1\n                OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                OR g.workspace_id IN (SELECT wp.workspace_id\n                                        FROM workspace_project wp\n                                       WHERE wp.project_id = $1)\n                OR g.workspace_id = (SELECT p.owner_workspace_id FROM project p WHERE p.id = $1)\n             ORDER BY CASE WHEN g.project_id IS NOT NULL THEN 0\n                           WHEN g.workspace_id IS NOT NULL THEN 1\n                           ELSE 2 END,\n                      g.name COLLATE \"C\",\n                      g.id\n            ",
   "describe": {
     "columns": [
       {
@@ -120,5 +120,5 @@
       false
     ]
   },
-  "hash": "033aa4c40fc29b05682492cd8f202c2c728e244123f3731cc9fb590b73ff6a91"
+  "hash": "a9b7893753951ef3f27d1cc73a7df3e35442342aceae33c62be3b7926cb94295"
 }
