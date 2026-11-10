@@ -6,7 +6,7 @@ expression: frame
    ANA  analysis · graph analysis
 ▌    0. research · template research · soft gate · no inputs · budget inherited
        fan-out 1 · gate: always · isolation: project default · commands: queued when fanned out ·
-       verify: none · retries 1 · output: research · template: latest — MOD-4 owns these
+       verify: none · retries 1 · output: research · template: latest
      1. verdict · template verdict · hard gate · inputs research · budget inherited
    FEAT  feature · graph feature
      0. prd · template prd · hard gate · no inputs · budget inherited
