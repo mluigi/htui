@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::ItemState;
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
+use htui_core::model::split_qualified;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
@@ -58,8 +59,9 @@ use htui_core::store::traits::{
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
     command_not_claimable, command_not_queued, document_needs_a_step, link_key,
     link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
-    note_needs_a_step, project_settings_not_an_object, reaped_note, self_link,
-    step_document_refusal, step_note_refusal, step_writes_own_item,
+    note_needs_a_step, project_settings_not_an_object, reaped_note, run_workspace_for,
+    scope_row_run_workspace, self_link, step_document_refusal, step_note_refusal,
+    step_writes_own_item, workspace_prefix_taken,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
@@ -3602,13 +3604,16 @@ impl WriteStore for PgStore {
     /// [`mint_item`](PgStore::mint_item)'s kind guard has, because `item_kind.default_graph_id`
     /// references `step_graph(id)` alone (`0001_init.sql:288`) and nothing below the seam checks
     /// that the graph is one the kind's project may use (MOD-138 D12: its own, a workspace's that
-    /// holds it, or the library's). Zero rows out is therefore exactly "the guard fired", and one
-    /// follow-up read names which of its two halves.
+    /// holds it, or the library's; MOD-147 D7: for a scope row, its own workspace's). MOD-147 D5
+    /// adds a second conjunct: a scope row's kind may not take a prefix a kind of a current member
+    /// project uses. Zero rows out is therefore exactly "a guard fired", and follow-up reads name
+    /// which one, in `MemStore`'s order.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for a bad prefix, an unknown project, a graph the project may
-    /// not use, or a taken `(project_id, prefix)` / `(project_id, name)` (`23505`).
+    /// [`StoreError::Constraint`] for a bad prefix, an unknown project, a member's prefix on a
+    /// scope row ([`workspace_prefix_taken`]), a graph the project may not use, or a taken
+    /// `(project_id, prefix)` / `(project_id, name)` (`23505`).
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
         if !ItemKind::prefix_is_valid(&new.prefix) {
             return Err(StoreError::Constraint(invalid_prefix(&new.prefix)));
@@ -3626,7 +3631,15 @@ impl WriteStore for PgStore {
                                    OR (g.project_id IS NULL AND g.workspace_id IS NULL)
                                    OR g.workspace_id IN (SELECT wp.workspace_id
                                                            FROM workspace_project wp
-                                                          WHERE wp.project_id = $2)))
+                                                          WHERE wp.project_id = $2)
+                                   OR g.workspace_id = (SELECT p.owner_workspace_id
+                                                          FROM project p WHERE p.id = $2)))
+               AND NOT EXISTS (SELECT 1
+                                 FROM project sr
+                                 JOIN workspace_project wp
+                                   ON wp.workspace_id = sr.owner_workspace_id
+                                 JOIN item_kind mk ON mk.project_id = wp.project_id
+                                WHERE sr.id = $2 AND mk.prefix = $3)
             RETURNING id               AS "id: ItemKindId",
                       project_id       AS "project_id: ProjectId",
                       prefix,
@@ -3651,13 +3664,14 @@ impl WriteStore for PgStore {
         match created {
             Some(row) => Ok(row),
             None => Err(self
-                .kind_guard_refusal(new.project_id, new.default_graph_id)
+                .kind_guard_refusal(new.project_id, new.default_graph_id, &new.prefix)
                 .await),
         }
     }
 
     /// The compare-and-set of D3 with [`create_item_kind`](WriteStore::create_item_kind)'s three
-    /// rules re-applied to the patched values.
+    /// rules re-applied to the patched values, and MOD-147 D5's member-prefix rule when the patch
+    /// moves a scope row's kind to another prefix.
     ///
     /// Renaming the prefix touches no `item` and no `item_key_counter`: `item.key` is generated
     /// from the columns copied at mint time (`0001_init.sql:317`) and the counter is keyed by
@@ -3667,9 +3681,10 @@ impl WriteStore for PgStore {
     /// The graph guard checks `default_graph_id` against the usable-graphs rule only when the patch
     /// changes it (A7), as an item's graph is: a kind keeps a workspace graph its project has left.
     ///
-    /// Zero rows means one of three things, split by one follow-up read the way
-    /// [`update_item`](PgStore::update_item) splits its own: no such row, a spent token, or the
-    /// graph guard — which can only have fired if the token still matches.
+    /// Zero rows means one of four things, split by follow-up reads the way
+    /// [`update_item`](PgStore::update_item) splits its own: no such row, a spent token, the
+    /// member-prefix guard or the graph guard — which can only have fired if the token still
+    /// matches.
     ///
     /// The prefix rule is checked **behind** the compare-and-set, which is `MemStore`'s order and
     /// the order a `(project, prefix)` collision already has here: a spent token answers `Stale`
@@ -3722,7 +3737,18 @@ impl WriteStore for PgStore {
                                        OR g.workspace_id IN (SELECT wp.workspace_id
                                                                FROM workspace_project wp
                                                               WHERE wp.project_id
-                                                                    = item_kind.project_id))))
+                                                                    = item_kind.project_id)
+                                       OR g.workspace_id
+                                          = (SELECT p.owner_workspace_id FROM project p
+                                              WHERE p.id = item_kind.project_id))))
+               AND ($3::text IS NULL
+                    OR $3 = item_kind.prefix
+                    OR NOT EXISTS (SELECT 1
+                                     FROM project sr
+                                     JOIN workspace_project wp
+                                       ON wp.workspace_id = sr.owner_workspace_id
+                                     JOIN item_kind mk ON mk.project_id = wp.project_id
+                                    WHERE sr.id = item_kind.project_id AND mk.prefix = $3))
             RETURNING id               AS "id: ItemKindId",
                       project_id       AS "project_id: ProjectId",
                       prefix,
@@ -3757,9 +3783,20 @@ impl WriteStore for PgStore {
         if current.updated_at != expected {
             return Ok(CasOutcome::Stale(current));
         }
-        // The compare-and-set matched, so the only other conjunct of the `WHERE` - the graph guard
-        // - is what refused the row, and the project exists because the row does. The guard only
-        // refuses a graph the patch changes (A7), so the patch names it.
+        // The compare-and-set matched, so one of the two other conjuncts of the `WHERE` refused the
+        // row: MOD-147 D5's member-prefix guard (a scope row's kind moving to a prefix a member's
+        // kind uses; checked first, `MemStore`'s order) or the graph guard. The project exists
+        // because the row does. The graph guard only refuses a graph the patch changes (A7), so
+        // the patch names it. No lock is held against a concurrent member kind (D5).
+        if let Some(prefix) = patch.prefix.as_deref().filter(|p| *p != current.prefix)
+            && let Some(member) = self
+                .workspace_prefix_holder(current.project_id, prefix)
+                .await?
+        {
+            return Err(StoreError::Constraint(workspace_prefix_taken(
+                prefix, &member,
+            )));
+        }
         let graph = patch.default_graph_id.unwrap_or(current.default_graph_id);
         Err(StoreError::Constraint(graph_not_usable(
             graph,
@@ -6099,7 +6136,9 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] with [`startable`]'s sentence when the item is not `open` or
     /// already has a live graph run (`` item HTUI-1 is `running`: a live run holds it ``), when
-    /// the item is not in `new.project_id`, when the id is taken, or on any of the keys above.
+    /// the item is not in `new.project_id`, when a scope row's run names another workspace than
+    /// its own ([`scope_row_run_workspace`], MOD-147 D8; `None` is filled with it), when the id
+    /// is taken, or on any of the keys above.
     /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
     /// an unknown or closed `new.batch_id` (MOD-12 D7).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
@@ -6155,6 +6194,22 @@ impl WriteStore for PgStore {
                 new.project_id,
             )));
         }
+        // MOD-147 D8: a scope row's run carries its own workspace (`None` is filled), so
+        // `claim_run`'s workspace-stop gate sees it; any other workspace is refused here, before
+        // the workspace FK. The project exists: the locked item references it.
+        let project = sqlx::query!(
+            r#"SELECT slug,
+                      owner_workspace_id AS "owner_workspace_id: WorkspaceId"
+                 FROM project WHERE id = $1"#,
+            new.project_id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let workspace_id = run_workspace_for(project.owner_workspace_id, new.workspace_id)
+            .map_err(|asked| {
+                StoreError::Constraint(scope_row_run_workspace(&project.slug, asked))
+            })?;
 
         // `run.repo_scope` is a `UUID[]`, and an array element cannot carry a `REFERENCES` clause,
         // so the schema cannot refuse a scope naming a repo that does not exist - this writer has
@@ -6240,7 +6295,7 @@ impl WriteStore for PgStore {
             new.queued_at,
             &scope,
             new.batch_id.map(BatchId::as_uuid),
-            new.workspace_id.map(WorkspaceId::as_uuid),
+            workspace_id.map(WorkspaceId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await
@@ -9159,7 +9214,8 @@ impl WriteStore for PgStore {
     }
 
     /// D13, B-6: the upsert, one transaction after `step_scope`, the own-item check and `to`'s
-    /// project. A live row keeps its proposer; a tombstone revives with the step as proposer.
+    /// reach (MOD-147 D3: the step's project, its workspaces' scope rows and members). A live row
+    /// keeps its proposer; a tombstone revives with the step as proposer.
     /// `updated_at` is the `BEFORE UPDATE` trigger's.
     ///
     /// # Errors
@@ -9176,9 +9232,30 @@ impl WriteStore for PgStore {
                 link.step, link.from,
             )));
         }
-        let project = sqlx::query_scalar!(
-            r#"SELECT project_id AS "project_id: ProjectId" FROM item WHERE id = $1"#,
+        // MOD-147 D3: `to` is reachable when it is in the step's project, or in the scope row or
+        // a member of a workspace holding that project (its memberships, plus its owner workspace
+        // when the step's project is itself a scope row). A snapshot read: membership racing the
+        // link is not locked, a link not being structural.
+        let reachable = sqlx::query_scalar!(
+            r#"
+            SELECT (i.project_id = $2
+                    OR EXISTS (
+                         SELECT 1 FROM workspace w
+                          WHERE (w.id IN (SELECT wp.workspace_id FROM workspace_project wp
+                                           WHERE wp.project_id = $2)
+                                 OR w.id = (SELECT p.owner_workspace_id FROM project p
+                                             WHERE p.id = $2))
+                            AND (w.id = (SELECT t.owner_workspace_id FROM project t
+                                          WHERE t.id = i.project_id)
+                                 OR EXISTS (SELECT 1 FROM workspace_project m
+                                             WHERE m.workspace_id = w.id
+                                               AND m.project_id = i.project_id))))
+                   AS "reachable!"
+              FROM item i
+             WHERE i.id = $1
+            "#,
             link.to.as_uuid(),
+            scope.project.as_uuid(),
         )
         .fetch_optional(&mut *tx)
         .await
@@ -9187,7 +9264,7 @@ impl WriteStore for PgStore {
             entity: "item",
             id: link.to.to_string(),
         })?;
-        if project != scope.project {
+        if !reachable {
             return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
 
@@ -9288,7 +9365,9 @@ impl WriteStore for PgStore {
     }
 
     /// B-4: the item of `project` keyed `key`, on the pool. A key holding a NUL is `None` before
-    /// the query, which Postgres would fail on the parameter (`22021`).
+    /// the query, which Postgres would fail on the parameter (`22021`). MOD-147 D2: a qualified
+    /// `slug:KEY` (split at the last `:`) is looked up by slug instead, `@workspace` naming the
+    /// workspace's scope row; an unknown slug or an empty half is `None`.
     ///
     /// # Errors
     ///
@@ -9297,14 +9376,29 @@ impl WriteStore for PgStore {
         if key.contains('\0') {
             return Ok(None);
         }
-        sqlx::query_scalar!(
-            r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
-            project.as_uuid(),
-            key,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)
+        // MOD-147 D2: a qualified `slug:KEY` names its project by slug, and `project` is ignored.
+        match split_qualified(key) {
+            (None, key) => sqlx::query_scalar!(
+                r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
+                project.as_uuid(),
+                key,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx),
+            (Some(slug), key) => sqlx::query_scalar!(
+                r#"
+                SELECT i.id AS "id: ItemId"
+                  FROM item i JOIN project p ON p.id = i.project_id
+                 WHERE p.slug = $1 AND i.key = $2
+                "#,
+                slug,
+                key,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx),
+        }
     }
 
     /// MOD-78 D1: one plain read on the pool. There is no `FOR SHARE`: the answer is a snapshot
@@ -10121,7 +10215,8 @@ impl PgStore {
         // sentence and order, rather than as a `23503` mid-cascade. The FK stays the backstop
         // for a holder that commits after this read. A `UNION` sorts only by its own columns, so
         // the `COLLATE "C"` order goes on a derived table; the project slug breaks a tie between
-        // two projects of the workspace holding the graph under the same prefix or key.
+        // two projects of the workspace holding the graph under the same prefix or key. MOD-147
+        // D7: the workspace's own scope row cascades with it, so its holders do not hold.
         let held = sqlx::query!(
             r#"
             SELECT h.graph AS "graph!", h.project AS "project!", h.holder AS "holder!"
@@ -10130,12 +10225,14 @@ impl PgStore {
                       JOIN step_graph g ON g.id = k.default_graph_id
                       JOIN project pr ON pr.id = k.project_id
                      WHERE g.workspace_id = $1
+                       AND pr.owner_workspace_id IS DISTINCT FROM $1
                     UNION ALL
                     SELECT g.name, pr.slug, 'item ' || i.key
                       FROM item i
                       JOIN step_graph g ON g.id = i.step_graph_id
                       JOIN project pr ON pr.id = i.project_id
-                     WHERE g.workspace_id = $1) h
+                     WHERE g.workspace_id = $1
+                       AND pr.owner_workspace_id IS DISTINCT FROM $1) h
              ORDER BY h.graph COLLATE "C", h.holder COLLATE "C", h.project COLLATE "C"
              LIMIT 1
             "#,
@@ -10180,6 +10277,18 @@ impl PgStore {
         }
         if let Some(scope) = scope_row_id(&mut *tx, id).await? {
             release_repo_references(&mut tx, scope).await?;
+            // MOD-147 D7: the scope row goes first. Its kinds and items may hold the workspace's
+            // own graphs, and in one cascade the `step_graph` delete's foreign-key check can fire
+            // before the project's cascade has reached them; deleted here, they hold nothing by
+            // the time the graphs go. `reach` was counted above, so the order changes no count.
+            match sqlx::query!("DELETE FROM project WHERE id = $1", scope.as_uuid())
+                .execute(&mut *tx)
+                .await
+            {
+                Ok(_) => {}
+                Err(err) if is_serialization_failure(&err) => return Ok(None),
+                Err(err) => return Err(map_sqlx(err)),
+            }
         }
         match sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
@@ -10239,20 +10348,61 @@ impl PgStore {
         Ok(Some(reach))
     }
 
-    /// Which half of the `item_kind` writers' folded `EXISTS` guard refused, in the sentence
-    /// `MemStore` uses for it (D11).
+    /// Which rule of `create_item_kind`'s folded guards refused, in the sentence `MemStore` uses
+    /// for it (D11).
     ///
-    /// The guard is one conjunct and covers two rules — an unknown project and a graph the project
-    /// may not use (MOD-138 D12) — so the split is made here, on the failure path only, rather than by two
-    /// statements on every create.
-    async fn kind_guard_refusal(&self, project: ProjectId, graph: StepGraphId) -> StoreError {
+    /// The guards cover three rules — an unknown project, a member's prefix on a scope row
+    /// (MOD-147 D5) and a graph the project may not use (MOD-138 D12) — so the split is made here,
+    /// on the failure path only, rather than by three statements on every create; in `MemStore`'s
+    /// order.
+    async fn kind_guard_refusal(
+        &self,
+        project: ProjectId,
+        graph: StepGraphId,
+        prefix: &str,
+    ) -> StoreError {
         match self.project(project).await {
-            Ok(Some(_)) => StoreError::Constraint(graph_not_usable(graph, project)),
+            Ok(Some(_)) => match self.workspace_prefix_holder(project, prefix).await {
+                Ok(Some(member)) => StoreError::Constraint(workspace_prefix_taken(prefix, &member)),
+                Ok(None) => StoreError::Constraint(graph_not_usable(graph, project)),
+                Err(err) => err,
+            },
             Ok(None) => StoreError::Constraint(format!(
                 "item_kind.project_id `{project}` references no project"
             )),
             Err(err) => err,
         }
+    }
+
+    /// MOD-147 D5: the member of `project`'s owner workspace (by `position`, then slug bytes)
+    /// whose kinds use `prefix`; `None` when `project` is not a scope row or no member does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn workspace_prefix_holder(
+        &self,
+        project: ProjectId,
+        prefix: &str,
+    ) -> Result<Option<String>> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT m.slug
+              FROM project sr
+              JOIN workspace_project wp ON wp.workspace_id = sr.owner_workspace_id
+              JOIN project m ON m.id = wp.project_id
+             WHERE sr.id = $1
+               AND EXISTS (SELECT 1 FROM item_kind mk
+                            WHERE mk.project_id = m.id AND mk.prefix = $2)
+             ORDER BY wp.position, m.slug COLLATE "C"
+             LIMIT 1
+            "#,
+            project.as_uuid(),
+            prefix,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// One `item_revision` row: the ancestor a [`UpdateOutcome::Diverged`] answer is rendered
@@ -10294,12 +10444,15 @@ impl PgStore {
     /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
     /// answers its stored entry unchanged (`ON CONFLICT (item_id) DO NOTHING`, then the read).
     /// `at` is microsecond-truncated by the driver. `workspace` (MOD-125 D3) is recorded on a new
-    /// entry. An entry already stored comes back unchanged, its workspace included.
+    /// entry. An entry already stored comes back unchanged, its workspace included. MOD-147 D8: a
+    /// scope row's item carries its own workspace (`None` is filled), and another workspace is
+    /// refused, checked before the stored entry is answered.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] for an unknown box, workspace or user (23503, through
+    /// [`StoreError::Constraint`] with [`scope_row_run_workspace`] for a scope row's item named
+    /// with another workspace, or for an unknown box, workspace or user (23503, through
     /// [`map_sqlx`]).
     pub async fn queue_item(
         &self,
@@ -10310,8 +10463,12 @@ impl PgStore {
         at: DateTime<Utc>,
     ) -> Result<QueueEntry> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        sqlx::query_scalar!(
-            r#"SELECT 1 AS "one!" FROM item WHERE id = $1"#,
+        let project = sqlx::query!(
+            r#"
+            SELECT p.slug, p.owner_workspace_id AS "owner_workspace_id: WorkspaceId"
+              FROM item i JOIN project p ON p.id = i.project_id
+             WHERE i.id = $1
+            "#,
             item.as_uuid()
         )
         .fetch_optional(&mut *tx)
@@ -10321,6 +10478,12 @@ impl PgStore {
             entity: "item",
             id: item.to_string(),
         })?;
+        // MOD-147 D8: checked before `ON CONFLICT DO NOTHING`, so a re-queue naming another
+        // workspace is refused too.
+        let workspace =
+            run_workspace_for(project.owner_workspace_id, workspace).map_err(|asked| {
+                StoreError::Constraint(scope_row_run_workspace(&project.slug, asked))
+            })?;
         sqlx::query!(
             r#"
             INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by, workspace_id)

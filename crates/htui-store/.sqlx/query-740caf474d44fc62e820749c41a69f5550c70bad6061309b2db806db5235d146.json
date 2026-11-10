@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT (i.project_id = $2\n                    OR EXISTS (\n                         SELECT 1 FROM workspace w\n                          WHERE (w.id IN (SELECT wp.workspace_id FROM workspace_project wp\n                                           WHERE wp.project_id = $2)\n                                 OR w.id = (SELECT p.owner_workspace_id FROM project p\n                                             WHERE p.id = $2))\n                            AND (w.id = (SELECT t.owner_workspace_id FROM project t\n                                          WHERE t.id = i.project_id)\n                                 OR EXISTS (SELECT 1 FROM workspace_project m\n                                             WHERE m.workspace_id = w.id\n                                               AND m.project_id = i.project_id))))\n                   AS \"reachable!\"\n              FROM item i\n             WHERE i.id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reachable!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "740caf474d44fc62e820749c41a69f5550c70bad6061309b2db806db5235d146"
+}
