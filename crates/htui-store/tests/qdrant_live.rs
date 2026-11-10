@@ -17,8 +17,9 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
-    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY, PointType,
-    Probe, QdrantStore, SPARSE, SearchQuery, VectorStore as _, is_embedder_mismatch, probe_with,
+    DENSE, EMBEDDER_KEY, ExistingCollection, Hit, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY,
+    PointType, Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _,
+    is_embedder_mismatch, probe_with,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -242,7 +243,7 @@ async fn a_requirement_is_found_by_its_exact_key() {
     let row = &rows[0];
     // Among the hits, not necessarily first: `HashEmbedder`'s dense arm is noise, and fusion can
     // tie a sibling key (`R-ENT-2` shares the `ent` term) with it.
-    let own = |hits: &[htui_store::vector::Hit]| {
+    let own = |hits: &[Hit]| {
         hits.iter()
             .find(|h| h.owner == Owner::Requirement(row.id))
             .cloned()
@@ -1139,4 +1140,133 @@ async fn probe_of_another_embedders_collection_is_mismatch() {
         sentence.contains(&format!("collection `{name}`")),
         "{sentence}"
     );
+}
+
+// MOD-162 T1: the search arms the retrieval benchmark measures.
+
+/// The first htui item of the demo store, synced into `store`.
+async fn synced_item(store: &QdrantStore<HashEmbedder>) -> String {
+    let read = MemStore::demo();
+    Indexer::sync(&read, &scope(), store).await.expect("sync");
+    read.items(
+        &Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        },
+        &ItemFilter::default(),
+    )
+    .await
+    .expect("items")
+    .remove(0)
+    .key
+}
+
+#[tokio::test]
+async fn each_search_arm_finds_an_exact_key() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    let q = query(&key);
+    for arms in [SearchArms::Sparse, SearchArms::Hybrid] {
+        let hits = store.search_arms(&q, arms).await.expect("search");
+        assert!(
+            hits.iter().any(|h| h.key == key),
+            "{arms:?}: {key} not among {hits:?}"
+        );
+    }
+    let dense = store
+        .search_arms(&q, SearchArms::Dense)
+        .await
+        .expect("dense search");
+    assert!(dense.len() <= usize::try_from(q.limit).expect("a small limit"));
+    assert!(dense.iter().all(|h| !h.snippet.is_empty()), "{dense:?}");
+    store.drop_collection().await.expect("drop");
+}
+
+/// `a` and `b` as the same answer to one search: the same scores, and the same hits except where
+/// Qdrant breaks a tie. RRF ties are common (dense rank 2 with sparse rank 3 scores 0.45, as does
+/// the reverse), and Qdrant 1.19 orders equal scores arbitrarily per request: 20 identical fused
+/// queries against one collection came back in 12 orders. At the limit it may keep either of two
+/// tied points; so hits are compared as sets above the lowest score, and only counted at it.
+fn assert_same_up_to_ties(a: &[Hit], b: &[Hit], what: &str) {
+    fn by_score(hits: &[Hit]) -> Vec<Hit> {
+        let mut hits = hits.to_vec();
+        hits.sort_by(|x, y| {
+            y.score
+                .total_cmp(&x.score)
+                .then_with(|| format!("{x:?}").cmp(&format!("{y:?}")))
+        });
+        hits
+    }
+    let (a, b) = (by_score(a), by_score(b));
+    let scores = |hits: &[Hit]| hits.iter().map(|h| h.score).collect::<Vec<_>>();
+    assert_eq!(scores(&a), scores(&b), "{what}: {a:?} vs {b:?}");
+    let lowest = a.last().map_or(f32::INFINITY, |h| h.score);
+    let above = |hits: &[Hit]| {
+        hits.iter()
+            .filter(|h| h.score > lowest)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(above(&a), above(&b), "{what}");
+}
+
+#[tokio::test]
+async fn the_hybrid_arms_are_the_vector_store_search() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    for text in [key.as_str(), "the plan", "?!"] {
+        let q = query(text);
+        let arms = store
+            .search_arms(&q, SearchArms::Hybrid)
+            .await
+            .expect("search_arms");
+        let search = store.search(&q).await.expect("search");
+        assert_same_up_to_ties(&arms, &search, text);
+    }
+    store.drop_collection().await.expect("drop");
+}
+
+#[tokio::test]
+async fn a_sparse_search_without_terms_finds_nothing() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    synced_item(&store).await;
+    let q = query("?!");
+    assert_eq!(
+        store
+            .search_arms(&q, SearchArms::Sparse)
+            .await
+            .expect("sparse search"),
+        Vec::new()
+    );
+    store
+        .search_arms(&q, SearchArms::Dense)
+        .await
+        .expect("dense search");
+    store.drop_collection().await.expect("drop");
+}
+
+#[tokio::test]
+async fn every_arm_is_scoped() {
+    let Some(store) = throwaway().await else {
+        return;
+    };
+    let key = synced_item(&store).await;
+    let unscoped = SearchQuery {
+        projects: vec![],
+        ..query(&key)
+    };
+    for arms in [SearchArms::Hybrid, SearchArms::Dense, SearchArms::Sparse] {
+        assert_eq!(
+            store.search_arms(&unscoped, arms).await.expect("search"),
+            Vec::new(),
+            "{arms:?}"
+        );
+    }
+    store.drop_collection().await.expect("drop");
 }
