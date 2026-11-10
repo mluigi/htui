@@ -353,7 +353,14 @@ pub async fn serve_with_home(
                     position,
                 })
                 .await?;
-            reread(&writer, *workspace, this_box).await
+            // MOD-147 D6: a prefix the new project shares with the workspace's own kinds is a
+            // notice, not a refusal (ANA-35 §7.5): keys then print qualified.
+            let shared_prefixes = prefixes_shared_with(&writer, *workspace, project.id).await?;
+            Ok(StoreReply::HierarchyJoined {
+                tree: Box::new(fresh_tree(&writer, *workspace, this_box).await?),
+                project: project.slug,
+                shared_prefixes,
+            })
         }
         StoreRequest::UpdateProject {
             id,
@@ -469,6 +476,31 @@ pub async fn serve_with_home(
             other.name()
         ))),
     }
+}
+
+/// MOD-147 D6: `project`'s kind prefixes that a kind of `workspace`'s scope row also uses, in
+/// `project`'s kind order; empty when the workspace has no scope row.
+async fn prefixes_shared_with(
+    writer: &Writer,
+    workspace: WorkspaceId,
+    project: ProjectId,
+) -> Result<Vec<String>> {
+    let Some(scope) = writer.scope_project(workspace).await? else {
+        return Ok(Vec::new());
+    };
+    let own: Vec<String> = writer
+        .item_kinds(scope)
+        .await?
+        .into_iter()
+        .map(|kind| kind.prefix)
+        .collect();
+    Ok(writer
+        .item_kinds(project)
+        .await?
+        .into_iter()
+        .map(|kind| kind.prefix)
+        .filter(|prefix| own.contains(prefix))
+        .collect())
 }
 
 /// The tree as it is now, for a write that applied. A workspace that vanished between the write

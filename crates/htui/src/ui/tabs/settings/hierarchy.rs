@@ -1551,6 +1551,22 @@ impl SettingsSection for HierarchySection {
                 }
             }
             StoreReply::Hierarchy(Some(snapshot)) => self.on_tree(snapshot, ctx),
+            // MOD-147 D6: a join is a tree like any other; a prefix it shares with the workspace
+            // is one notice line, never a refusal.
+            StoreReply::HierarchyJoined {
+                tree,
+                project,
+                shared_prefixes,
+            } => {
+                self.on_tree(tree, ctx);
+                if !shared_prefixes.is_empty() {
+                    self.notice = Some(joined_notice(
+                        project,
+                        &tree.workspace.slug,
+                        shared_prefixes,
+                    ));
+                }
+            }
             // A read that answered, even with nothing in it, is the end of an outage: leaving
             // `unavailable` set would say "hierarchy needs Postgres" over a store that just spoke.
             StoreReply::Hierarchy(None) => {
@@ -1851,6 +1867,24 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
             .find(|entry| entry.repo.id == id)
             .map_or(Reload::Gone, |entry| Reload::Token(entry.repo.updated_at)),
     }
+}
+
+/// MOD-147 D6: the notice a join that shares prefixes with its workspace leaves: "`api` shares
+/// prefix FEAT with workspace `shop`: keys show as `api:FEAT-1` and `@shop:FEAT-1`" ("prefixes
+/// FEAT, FIX" for several; the example uses the first).
+#[must_use]
+pub fn joined_notice(project: &str, workspace: &str, prefixes: &[String]) -> String {
+    let first = prefixes.first().map_or("", String::as_str);
+    let noun = if prefixes.len() == 1 {
+        "prefix"
+    } else {
+        "prefixes"
+    };
+    format!(
+        "`{project}` shares {noun} {} with workspace `{workspace}`: keys show as \
+         `{project}:{first}-1` and `@{workspace}:{first}-1`",
+        prefixes.join(", ")
+    )
 }
 
 /// The notice an inference leaves (MOD-7 milestone 4, plan D117, blueprint D137).

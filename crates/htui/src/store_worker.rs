@@ -1617,6 +1617,17 @@ pub enum StoreReply {
     /// A CAS write found the row changed (M1 D3): the tree as it is now, for the editor to
     /// reload against (D7). Never a scope change — the editor is still open.
     HierarchyStale(Box<HierarchySnapshot>),
+    /// MOD-147 D6: answer to [`StoreRequest::CreateProject`]: the tree with the new project linked,
+    /// its slug, and the prefixes its kinds share with the workspace's scope row (kind order of
+    /// the new project; empty when none). A notice, never a refusal.
+    HierarchyJoined {
+        /// The workspace re-read after the link.
+        tree: Box<HierarchySnapshot>,
+        /// The new project's slug.
+        project: String,
+        /// The new project's prefixes the scope row's kinds also use.
+        shared_prefixes: Vec<String>,
+    },
     /// Answer to [`StoreRequest::DeleteReach`]; `None` when the target is already gone.
     DeleteReach(Option<Box<DeleteReach>>),
     /// Answer to [`StoreRequest::DeleteWorkspace`] / [`StoreRequest::DeleteProject`]: what was
