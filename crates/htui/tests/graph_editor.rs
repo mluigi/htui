@@ -361,6 +361,41 @@ async fn the_reference_graph_is_built_in_the_tui_and_resolves() {
     assert_eq!(snapshot.edges.len(), 3, "{:?}", snapshot.edges);
 }
 
+/// A new step on an empty graph starts with no template. While the scope has templates to choose,
+/// saving it asks for one to be chosen; it never sends the user off to create a template that
+/// already exists (that sentence is for a scope with none).
+#[tokio::test]
+async fn a_step_saved_without_a_template_asks_for_one() {
+    let mut harness = kinds_over(MemStore::demo()).await;
+    harness.key("N");
+    typed(&mut harness, "solo");
+    harness.key("enter");
+    harness.settle().await;
+    cursor_to(&mut harness, "solo \u{b7} graph, no kind");
+    harness.key("enter");
+    harness.settle().await;
+
+    harness.key("a");
+    typed(&mut harness, "solo");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = flat(&harness.render());
+    assert!(
+        frame.contains("`template` is required; choose one"),
+        "{frame}"
+    );
+    assert!(!frame.contains("add one in Skills"), "{frame}");
+    assert!(!frame.contains("saved:"), "nothing written: {frame}");
+
+    // Choosing one on the template row saves.
+    harness.key("tab");
+    harness.key("l");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("saved: adding solo"), "{frame}");
+}
+
 // -------------------------------------------------------------------------------------------
 // The section bench
 // -------------------------------------------------------------------------------------------

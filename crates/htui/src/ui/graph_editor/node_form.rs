@@ -21,6 +21,8 @@ pub(crate) const RETRY_IS_A_NUMBER: &str = "`retry limit` is a whole number, 0 o
 /// A token budget that is neither empty nor a whole number of at least 1.
 pub(crate) const BUDGET_IS_A_NUMBER: &str =
     "`token budget` is a whole number of at least 1, or empty";
+/// No template chosen while the scope has names to choose from.
+pub(crate) const TEMPLATE_REQUIRED: &str = "`template` is required; choose one";
 /// No template name to choose, and none chosen.
 pub(crate) const NO_TEMPLATE: &str = "no template to choose; add one in Skills \u{203a} Templates";
 /// The agents' read has not answered yet.
@@ -365,17 +367,23 @@ impl NodeForm {
 
     /// Parses and assembles the node. `base` supplies every column the form does not edit (id,
     /// graph id, position, fan-out, split, palette, plan scope, the divide columns, the parts and
-    /// `updated_at`).
+    /// `updated_at`). `lookups` tells an unchosen template with names to choose
+    /// ([`TEMPLATE_REQUIRED`]) from one with none ([`NO_TEMPLATE`]).
     ///
     /// # Errors
     /// The first refusal in row order.
-    pub(crate) fn build(&self, base: &NodeBody) -> Result<NodeBody, String> {
+    pub(crate) fn build(&self, base: &NodeBody, lookups: &Lookups) -> Result<NodeBody, String> {
         let name = text_of(&self.name);
         if name.is_empty() {
             return Err(NAME_REQUIRED.to_owned());
         }
         if self.template_name.is_empty() {
-            return Err(NO_TEMPLATE.to_owned());
+            return Err(if self.template_names(lookups).is_empty() {
+                NO_TEMPLATE
+            } else {
+                TEMPLATE_REQUIRED
+            }
+            .to_owned());
         }
         let retry_limit = match text_of(&self.retry_limit).parse::<i32>() {
             Ok(limit) if limit >= 0 => limit,
@@ -837,7 +845,7 @@ mod tests {
 
     /// The node `form` builds over `research()`'s columns.
     fn built(form: &NodeForm) -> Result<NodeBody, String> {
-        form.build(&research())
+        form.build(&research(), &lookups())
     }
 
     fn cycle_at(form: &mut NodeForm, row: usize, lookups: &Lookups) {
@@ -882,7 +890,7 @@ mod tests {
             ]
         );
         // Untouched, the form writes back exactly what it opened on.
-        assert_eq!(form.build(&node), Ok(node));
+        assert_eq!(form.build(&node, &lookups()), Ok(node));
     }
 
     #[test]
@@ -918,7 +926,7 @@ mod tests {
         base.phase.integrate_model = Some("gemini".to_owned());
         base.phase.max_parts = Some(3);
         base.parts = vec![part(&base, 0, "ui")];
-        let node = form.build(&base).expect("a valid form");
+        let node = form.build(&base, &lookups).expect("a valid form");
 
         let mut want = base.clone();
         want.phase.name = "dig".to_owned();
@@ -1094,7 +1102,13 @@ mod tests {
             form.cycle(true, &Lookups::default()),
             Err(NO_TEMPLATE.to_owned())
         );
-        assert_eq!(built(&form), Err(NO_TEMPLATE.to_owned()));
+        assert_eq!(form.build(&node, &empty), Err(NO_TEMPLATE.to_owned()));
+        assert_eq!(
+            form.build(&node, &Lookups::default()),
+            Err(NO_TEMPLATE.to_owned())
+        );
+        // Names to choose, none chosen: choose one, not "add one".
+        assert_eq!(built(&form), Err(TEMPLATE_REQUIRED.to_owned()));
     }
 
     #[test]
@@ -1304,7 +1318,7 @@ mod tests {
         assert_eq!(form.cycle(true, &none), Err(NO_AGENTS.to_owned()));
         // The candidates the node had are kept as they are while the agents are unread.
         assert_eq!(
-            form.build(&node).map(|built| built.agents),
+            form.build(&node, &lookups()).map(|built| built.agents),
             Ok(node.agents.clone())
         );
 
