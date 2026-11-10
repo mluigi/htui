@@ -1,6 +1,7 @@
 [workspace]
 members  = ["crates/htui-core", "crates/htui", "crates/htui-store", "crates/htui-agent",
-            "crates/htui-orch", "crates/htui-worker", "crates/htui-mcp", "crates/htui-secrets"]
+            "crates/htui-orch", "crates/htui-worker", "crates/htui-mcp", "crates/htui-secrets",
+            "crates/htui-bench"]
 resolver = "3"
 
 [workspace.package]
