@@ -19,8 +19,8 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch,
-    NewProject, NewStepGraph, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId,
-    Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase,
+    NewProject, NewStepGraph, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch,
+    ProjectId, Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase,
     WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
@@ -1143,6 +1143,122 @@ async fn delete_phase_rereads_the_catalogue() {
     assert_eq!(after.graph.revision, 1);
 }
 
+/// MOD-141 D13: `GraphBody` reads one graph by id whatever its scope, the editor's open-by-id
+/// (the Toolbox hook): a project graph from the seed, then a workspace and a library graph made
+/// here; an id no graph has answers `None`.
+#[tokio::test]
+async fn graph_body_reads_one_graph_of_each_scope() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let workspace = StepGraphId::new();
+    let library = StepGraphId::new();
+    for (id, scope, name) in [
+        (
+            workspace,
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "ws-flow",
+        ),
+        (library, GraphScope::Library, "lib-flow"),
+    ] {
+        writer
+            .create_step_graph(NewStepGraph {
+                id,
+                scope,
+                name: name.to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("the graph is created");
+    }
+
+    for (id, scope) in [
+        (
+            ids::GRAPH_VULKAN_ANA,
+            GraphScope::Project(ids::PROJECT_VULKAN),
+        ),
+        (workspace, GraphScope::Workspace(ids::WORKSPACE_GRAPHICS)),
+        (library, GraphScope::Library),
+    ] {
+        let reply = serve(&backend, &StoreRequest::GraphBody(id)).await;
+        let StoreReply::GraphBody(Some(body)) = reply else {
+            panic!("graph {id} answers its body: {reply:?}");
+        };
+        assert_eq!(body.graph.id, id);
+        assert_eq!(body.graph.scope, scope);
+    }
+
+    let reply = serve(&backend, &StoreRequest::GraphBody(StepGraphId::new())).await;
+    assert!(
+        matches!(reply, StoreReply::GraphBody(None)),
+        "an unknown id answers none: {reply:?}"
+    );
+}
+
+/// MOD-141 D13: a library graph is written through the same `ReplaceGraph` as a project one, its
+/// body read by `GraphBody`; the reply's body is the library graph as stored. The scope's catalogue
+/// does not list it, and need not: the editor draws from the body.
+#[tokio::test]
+async fn replace_graph_on_a_library_graph_answers_its_body() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let library = StepGraphId::new();
+    writer
+        .create_step_graph(NewStepGraph {
+            id: library,
+            scope: GraphScope::Library,
+            name: "lib-flow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("the library graph is created");
+    let reply = serve(&backend, &StoreRequest::GraphBody(library)).await;
+    let StoreReply::GraphBody(Some(mut body)) = reply else {
+        panic!("the library graph answers its body: {reply:?}");
+    };
+    body.nodes.push(NodeBody {
+        phase: phase_row(
+            PhaseId::new(),
+            library,
+            0,
+            &PhaseSeed {
+                name: "research",
+                input_kinds: &[],
+                gate_hard: false,
+            },
+            Utc::now(),
+        ),
+        agents: Vec::new(),
+        parts: Vec::new(),
+    });
+
+    let (outcome, snapshot) = replaced(
+        serve(
+            &backend,
+            &StoreRequest::ReplaceGraph {
+                scope: vulkan_scope(),
+                graph: library,
+                expected_revision: body.graph.revision,
+                body,
+            },
+        )
+        .await,
+    );
+
+    let CasOutcome::Applied(stored) = outcome else {
+        panic!("a fresh revision applies: {outcome:?}");
+    };
+    assert_eq!(stored.graph.scope, GraphScope::Library);
+    assert_eq!(stored.graph.revision, 1);
+    let names: Vec<&str> = stored.nodes.iter().map(|n| n.phase.name.as_str()).collect();
+    assert_eq!(names, ["research"]);
+    assert!(
+        snapshot.projects[0].graph(library).is_none(),
+        "the project's catalogue does not list a library graph"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // ---- section (T2) ----
 //
@@ -2159,6 +2275,57 @@ async fn a_stale_reply_with_no_editor_open_says_nothing_was_written() {
     bench.reply(
         &mut section,
         &StoreReply::CatalogueStale(Box::new(snapshot.clone())),
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere; nothing was written \u{2014} reopen the editor and retry"),
+        "the miss says the write did not apply, and how to resume: {flagged:?}"
+    );
+}
+
+/// MOD-141 D13: `ReplaceGraph`'s own reply redraws the tree the way `Catalogue` did, and its
+/// `Stale` twin with no editor open says nothing was written, as `CatalogueStale` did.
+#[tokio::test]
+async fn a_graph_replaced_reply_redraws_the_tree_like_a_catalogue() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    assert!(!bench.render_section(&section, 100).contains("decide"));
+    let mut renamed = snapshot.clone();
+    let entry = renamed.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the demo carries the analysis graph");
+    for node in &mut entry.nodes {
+        if node.phase.name == "verdict" {
+            node.phase.name = "decide".to_owned();
+        }
+    }
+    let body = Box::new(entry.clone());
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Applied(body.clone()),
+            catalogue: Box::new(renamed.clone()),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("decide"), "the tree is the reply's: {frame}");
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.is_empty(),
+        "an applied write sets no notice: {flagged:?}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::GraphReplaced {
+            outcome: CasOutcome::Stale(body),
+            catalogue: Box::new(renamed),
+        },
     );
 
     let flagged = error_text(&bench, &section, 100);
