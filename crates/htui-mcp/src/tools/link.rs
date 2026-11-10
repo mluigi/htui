@@ -8,7 +8,8 @@
 //! canonically: bare in this project, `slug:KEY` elsewhere. `add` upserts through
 //! [`propose_link`], `remove` tombstones through [`withdraw_link`], both under the session's fence
 //! (I-3). A run withdraws only what one of its steps proposed (PRD OQ-4, B-6): anything else
-//! reads `not yours`.
+//! reads `not yours`, and so does a `remove` of another project's item with no live link (edge 9:
+//! the store's `not found` would print an id outside the reach).
 //!
 //! [`item_by_key`]: htui_core::store::WorkerStore::item_by_key
 //! [`propose_link`]: htui_core::store::WorkerStore::propose_link
@@ -104,14 +105,15 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
         .await
         .map_err(store_error)?
         .ok_or_else(|| ToolError(format!("not found: item {target}")))?;
-    let canonical = if target_item.project_id == scope.project_id {
-        target_item.key
-    } else {
+    let elsewhere = target_item.project_id != scope.project_id;
+    let canonical = if elsewhere {
         let project = htui_core::store::WorkerStore::project(store, target_item.project_id)
             .await
             .map_err(store_error)?
             .ok_or_else(|| ToolError(format!("not found: project {}", target_item.project_id)))?;
         format!("{}:{}", project.slug, target_item.key)
+    } else {
+        target_item.key
     };
     let from_key = htui_core::store::WorkerStore::item(store, from)
         .await
@@ -138,14 +140,24 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
             htui_core::store::WorkerStore::withdraw_link(store, scope.fence, link).await
         }
     };
+    let not_yours = || {
+        ToolError(format!(
+            "not yours: {from_key} {kind} {canonical} was not proposed by this run"
+        ))
+    };
     let link = written.map_err(|err| match err {
         StoreError::Constraint(sentence)
             if sentence == link_not_proposed_by_run(&link_key(from, target, kind)) =>
         {
-            ToolError(format!(
-                "not yours: {from_key} {kind} {canonical} was not proposed by this run"
-            ))
+            not_yours()
         }
+        // MOD-147 edge 9: `withdraw_link` has no reach check, so another project's item with no
+        // live link reads `not yours` (this run proposed nothing there). The store's sentence
+        // would print both ids and name an item outside the reach.
+        StoreError::NotFound {
+            entity: "item_link",
+            ..
+        } if elsewhere => not_yours(),
         StoreError::Constraint(sentence) if sentence == link_outside_reach(target) => {
             out_of_scope(&to)
         }
