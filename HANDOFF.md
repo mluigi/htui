@@ -1080,6 +1080,13 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   (the expansion is already frozen) and reserve the `:plan` suffix in phase names at save time (resolve refuses a
   collision today). MOD-138 is done (`docs/decisions/mod/mod-138.md`): the walker runs concurrent nodes and its
   recovery finds every frontier; parts and integrate plug into `schedule::plan_pass` and `recover::frontiers`.
+  **Phase M1 landed (`hr/MOD-139` `9c83196b`, 2026-11-11):** records only, runs unchanged. Migration `0028` (cache
+  `0010`): `run_step.role` (`stage` reserved at -3..-1 with keys `pick`, `prepare`, `collect`), `parent_step_id` and
+  `node_key`, both parent and planner keys composite on the run, a step never its own parent; append-only
+  `run_plan`, mirrored. `run_plans` and the fenced `insert_run_plan` on every store, `DeleteReach.run_plans`, the
+  `:plan` suffix refused at save; conformance 258 cases. Plan `.claude/plans/mod-139-m1-records.plan.md`. Owed on
+  the host: the Qdrant-live tests (sandbox timeouts) and the Postgres gate; MOD-97 also took `0028`, so whichever
+  lands second renumbers and moves the count pins.
 - [ ] **MOD-140 - The planner's MCP tools and run-time changes** (from ANA-33, `docs/ANA-33.md` §7.6, §10). `R-MCP-2`,
   `R-MCP-1`, `R-ID-6`, `R-ORCH-1`. `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced
   `run_plan` proposal writer in the `write_step_document` style; the `ToolScope` role and plan scope set in
