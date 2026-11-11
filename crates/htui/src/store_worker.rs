@@ -46,7 +46,7 @@ use htui_core::store::{
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
 use htui_store::{
-    Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, Writer, connect,
+    Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, ScopeKeys, Started, Writer, connect,
 };
 use htui_worker::WaitingView;
 use serde_json::Value;
@@ -2339,55 +2339,61 @@ async fn serve_waiting(
 }
 
 /// MOD-147 D10, D11: the scope the waiting reads use — with `widen`, the asked one with the
-/// workspace's scope row first, when it has one — and the key qualifier over it (`project` and
-/// `kinds` per project). The reply still names the asked scope (`app/update.rs`).
+/// workspace's scope row first, when it has one — and the key qualifier over it (slug and kind
+/// prefixes per project). The reply still names the asked scope (`app/update.rs`).
 ///
-/// The store worker reads through [`Backend`] (the mirror's kinds offline), the CLI through its
-/// read-only [`PgStore`]. A project the store no longer holds is left out of the qualifier, so its
-/// keys print bare.
-pub(crate) async fn waiting_reads<S: KindsRead>(
+/// MOD-170: both come from one [`WaitingKeysRead::waiting_keys`], which is one Postgres query
+/// online (the top bar asks once a second); it was a scope-row read plus a `project` and a kinds
+/// read per scope project. The store worker reads through [`Backend`] (the mirror offline), the CLI
+/// through its read-only [`PgStore`]. A project the store no longer holds is left out of the
+/// qualifier, so its keys print bare.
+pub(crate) async fn waiting_reads<S: WaitingKeysRead>(
     store: &S,
     scope: &Scope,
     widen: bool,
 ) -> StoreResult<(Scope, KeyQualifier)> {
-    let row = if widen {
-        store.scope_project(scope.workspace_id).await?
-    } else {
-        None
-    };
-    let read = row.map_or_else(|| scope.clone(), |row| scope.with_scope_row(row));
-    let mut projects = Vec::with_capacity(read.project_ids.len());
-    for id in &read.project_ids {
-        let Some(project) = store.project(*id).await? else {
-            continue;
-        };
-        let prefixes = store
-            .kinds_of(*id)
-            .await?
-            .into_iter()
-            .map(|kind| kind.prefix)
-            .collect();
-        projects.push((*id, project.slug, prefixes));
-    }
+    let keys = store
+        .waiting_keys(widen.then_some(scope.workspace_id), &scope.project_ids)
+        .await?;
+    let read = keys
+        .scope_row
+        .map_or_else(|| scope.clone(), |row| scope.with_scope_row(row));
+    let projects: Vec<_> = read
+        .project_ids
+        .iter()
+        .filter_map(|id| keys.projects.iter().find(|(held, ..)| held == id).cloned())
+        .collect();
     Ok((read, KeyQualifier::new(projects)))
 }
 
-/// The two stores [`waiting_reads`] reads: a project's kinds, which are a `WriteStore` read on
-/// Postgres and an inherent one on [`Backend`] (MOD-147 V7).
-pub(crate) trait KindsRead: ReadStore {
-    /// `project`'s kinds, in the store's kind order.
-    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>>;
+/// The two stores [`waiting_reads`] reads (MOD-147 V7, MOD-170): the scope row and each project's
+/// slug and kind prefixes, in one read.
+pub(crate) trait WaitingKeysRead {
+    /// [`Backend::waiting_keys`]: Postgres in one query, the mirror or memory per project.
+    async fn waiting_keys(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> StoreResult<ScopeKeys>;
 }
 
-impl KindsRead for Backend {
-    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>> {
-        self.item_kinds(project).await
+impl WaitingKeysRead for Backend {
+    async fn waiting_keys(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> StoreResult<ScopeKeys> {
+        Backend::waiting_keys(self, workspace, ids).await
     }
 }
 
-impl KindsRead for PgStore {
-    async fn kinds_of(&self, project: ProjectId) -> StoreResult<Vec<htui_core::model::ItemKind>> {
-        WriteStore::item_kinds(self, project).await
+impl WaitingKeysRead for PgStore {
+    async fn waiting_keys(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> StoreResult<ScopeKeys> {
+        PgStore::waiting_keys(self, workspace, ids).await
     }
 }
 
