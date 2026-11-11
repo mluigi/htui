@@ -10520,6 +10520,24 @@ pub async fn enqueue_divided_fake(
     Ok(id)
 }
 
+/// MOD-139 M3 D11: [`Engine::enqueue`] over a `FakeOrchestrator`'s parts — `Manual`, the item's
+/// default scope, no workspace — so `start_enabled`, `missing_tags` and the production resolve
+/// run as for `StartRun`.
+///
+/// # Errors
+/// [`Engine::enqueue`]'s.
+#[cfg(feature = "test-support")]
+pub async fn enqueue_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    item: ItemId,
+) -> Result<RunId, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    Box::pin(engine.enqueue(item, htui_core::model::RunMode::Manual, None, None)).await
+}
+
 /// [`Engine::enqueue_in_batch`] over a `FakeOrchestrator`'s parts (MOD-12 M2 conformance).
 ///
 /// # Errors

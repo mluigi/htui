@@ -302,6 +302,15 @@ pub enum ResolveError {
         /// Why.
         reason: NotRunnable,
     },
+    /// MOD-139 M3 D10 (blueprint P-11): a default-parts divided node admission would refuse,
+    /// refused before any run exists. The sentence is the `RunFailure`'s, which names the node.
+    #[error("{reason}")]
+    DivideRefused {
+        /// The divided node's name.
+        node: String,
+        /// What `divide::admission_refusal` answered.
+        reason: crate::status::RunFailure,
+    },
     /// The store said no.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -313,6 +322,14 @@ pub enum NotRunnable {
     /// MOD-139 M2 D17 (PRD Q1): a divided node with a planner agent configured; MOD-140 runs it.
     #[error("a divided node's planner agent runs from MOD-140 on")]
     PlannerAgent,
+    /// MOD-139 M3 D10: a divided node with no default parts; only its planner can plan them.
+    #[error("a divided node with no default parts needs its planner, which runs from MOD-140 on")]
+    NoParts,
+    /// MOD-139 M3 D10: a divided node whose planner may plan past its own parts.
+    #[error(
+        "a divided node that plans past its own parts (`plan_scope` `successors` or `graph`) runs from MOD-140 and MOD-141 on"
+    )]
+    PlanScope,
     /// (a) A `divide` node, after its expansion is frozen (PRD Q1).
     #[error("a `divide` node runs once divided fan-out lands (MOD-139)")]
     Divide,
@@ -5236,10 +5253,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(pin.topology, snapshot.topology, "the source is not hashed");
     }
 
-    /// MOD-138 D11, D6(a): a `divide` node is expanded (so the validator checks the expansion),
-    /// then refused until MOD-139 lands divided fan-out.
+    /// MOD-138 D11, MOD-139 M3 D10: a `divide` node is expanded (so the validator checks the
+    /// expansion), and a default-parts node admission would take resolves.
     #[tokio::test]
-    async fn a_divide_node_is_expanded_then_refused() {
+    async fn a_divide_node_is_expanded_and_resolves() {
         let store = MemStore::demo();
         replace_feature(&store, |body| {
             let node = body
@@ -5264,17 +5281,17 @@ question and not a test fix. Decide the version bump first, then paste the new d
             }];
         })
         .await;
-        let error = resolve_feat(&store, &TestSource::claude(&store))
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
             .await
-            .expect_err("a divide node cannot run yet");
-        assert_eq!(
-            error,
-            ResolveError::NotYetRunnable {
-                node: "implement".to_owned(),
-                reason: NotRunnable::Divide,
-            }
-        );
-        assert!(error.to_string().contains("MOD-139"), "{error}");
+            .expect("a default-parts divided node resolves")
+            .snapshot;
+        let nodes: Vec<(&str, NodeRole)> = snapshot
+            .phases
+            .iter()
+            .map(|phase| (phase.name.as_str(), phase.role))
+            .collect();
+        assert_eq!(nodes[2], ("implement:plan", NodeRole::Planner));
+        assert_eq!(nodes[3], ("implement", NodeRole::Integrate));
     }
 
     /// The seeded `feature` graph with `implement` divided into one `api` part, its planner agent
@@ -5305,24 +5322,6 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .await;
     }
 
-    /// `resolve_divided` with an empty `app_setting` map and no requested scope.
-    async fn resolve_divided_feat(
-        store: &MemStore,
-        source: &TestSource<'_>,
-    ) -> std::result::Result<Resolved, ResolveError> {
-        let item = feat_1(store).await;
-        super::resolve_divided(
-            store,
-            source,
-            &item,
-            RunMode::Manual,
-            &BTreeMap::new(),
-            None,
-            ids::BOX,
-        )
-        .await
-    }
-
     /// MOD-139 M2 D17 (PRD Q1): a configured planner agent is refused before the divide refusal,
     /// named by the divided node.
     #[tokio::test]
@@ -5342,34 +5341,56 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert!(error.to_string().contains("MOD-140"), "{error}");
     }
 
-    /// MOD-139 M2 D16: the seam lifts the divide refusal and nothing else — the planner agent
-    /// (D17) and a palette node are still refused.
+    /// The `implement` node of the seeded `feature` graph's body.
+    fn implement_node(body: &mut GraphBody) -> &mut NodeBody {
+        body.nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("the feature graph has `implement`")
+    }
+
+    /// MOD-139 M3 D10 (blueprint P-11): resolve refuses a configured planner agent first, then
+    /// what admission would — no default parts (`NoParts`), a `plan_scope` past the parts
+    /// (`PlanScope`), a palette node as ever, then `divide::admission_refusal`'s answer as
+    /// `DivideRefused`, whose sentence is the `RunFailure`'s.
     #[tokio::test]
-    async fn the_seam_lifts_only_the_divide_refusal() {
-        let store = MemStore::demo();
-        divide_feature(&store, None).await;
-        let snapshot = resolve_divided_feat(&store, &TestSource::claude(&store))
-            .await
-            .expect("the seam resolves a divided graph")
-            .snapshot;
-        let nodes: Vec<(&str, NodeRole)> = snapshot
-            .phases
-            .iter()
-            .map(|phase| (phase.name.as_str(), phase.role))
-            .collect();
-        assert_eq!(nodes[2], ("implement:plan", NodeRole::Planner));
-        assert_eq!(nodes[3], ("implement", NodeRole::Integrate));
+    async fn resolve_refuses_a_planner_agent_first_then_what_admission_would() {
+        let refused = |reason| ResolveError::NotYetRunnable {
+            node: "implement".to_owned(),
+            reason,
+        };
 
         let agent = MemStore::demo();
         divide_feature(&agent, Some(ids::AGENT_CLAUDE)).await;
+        replace_feature(&agent, |body| implement_node(body).parts.clear()).await;
         assert_eq!(
-            resolve_divided_feat(&agent, &TestSource::claude(&agent))
+            resolve_feat(&agent, &TestSource::claude(&agent))
                 .await
-                .expect_err("the seam keeps D17"),
-            ResolveError::NotYetRunnable {
-                node: "implement".to_owned(),
-                reason: NotRunnable::PlannerAgent,
-            }
+                .expect_err("a planner agent beats no parts"),
+            refused(NotRunnable::PlannerAgent)
+        );
+
+        let empty = MemStore::demo();
+        divide_feature(&empty, None).await;
+        replace_feature(&empty, |body| implement_node(body).parts.clear()).await;
+        assert_eq!(
+            resolve_feat(&empty, &TestSource::claude(&empty))
+                .await
+                .expect_err("no default parts needs the planner"),
+            refused(NotRunnable::NoParts)
+        );
+
+        let scope = MemStore::demo();
+        divide_feature(&scope, None).await;
+        replace_feature(&scope, |body| {
+            implement_node(body).phase.plan_scope = Some(PlanScope::Successors);
+        })
+        .await;
+        assert_eq!(
+            resolve_feat(&scope, &TestSource::claude(&scope))
+                .await
+                .expect_err("a planner planning past its parts"),
+            refused(NotRunnable::PlanScope)
         );
 
         let palette = store_with(|data| {
@@ -5383,13 +5404,56 @@ question and not a test fix. Decide the version bump first, then paste the new d
         });
         divide_feature(&palette, None).await;
         assert_eq!(
-            resolve_divided_feat(&palette, &TestSource::claude(&palette))
+            resolve_feat(&palette, &TestSource::claude(&palette))
                 .await
-                .expect_err("the seam keeps the palette refusal"),
+                .expect_err("a palette node is still refused"),
             ResolveError::NotYetRunnable {
                 node: "prd".to_owned(),
                 reason: NotRunnable::Palette,
             }
+        );
+
+        let local = MemStore::demo();
+        divide_feature(&local, None).await;
+        replace_feature(&local, |body| {
+            let node = implement_node(body);
+            node.phase.isolation = Some(Isolation::Local);
+            let mut ui = node.parts[0].clone();
+            ui.position = 1;
+            ui.key = "ui".to_owned();
+            ui.title = "The UI".to_owned();
+            ui.owned_paths = vec!["src/ui".to_owned()];
+            node.parts.push(ui);
+        })
+        .await;
+        let failure = crate::status::RunFailure::LocalCannotDivide {
+            node: "implement".to_owned(),
+            parts: 2,
+        };
+        let error = resolve_feat(&local, &TestSource::claude(&local))
+            .await
+            .expect_err("`local` runs one tree");
+        assert_eq!(
+            error,
+            ResolveError::DivideRefused {
+                node: "implement".to_owned(),
+                reason: failure.clone(),
+            }
+        );
+        assert_eq!(error.to_string(), failure.to_string());
+    }
+
+    /// MOD-139 M3 D10: the two new refusals name the milestone that lifts them.
+    #[test]
+    fn not_runnable_sentences_name_their_milestone() {
+        assert_eq!(
+            NotRunnable::NoParts.to_string(),
+            "a divided node with no default parts needs its planner, which runs from MOD-140 on"
+        );
+        assert_eq!(
+            NotRunnable::PlanScope.to_string(),
+            "a divided node that plans past its own parts (`plan_scope` `successors` or `graph`) \
+             runs from MOD-140 and MOD-141 on"
         );
     }
 

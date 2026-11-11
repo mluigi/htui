@@ -262,6 +262,15 @@ pub trait Orchestrate {
     /// Whatever the seam or the store refuses with.
     async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError>;
 
+    /// MOD-139 M3 D11: [`Engine::enqueue`](crate::engine::Engine::enqueue) of `item` — `Manual`,
+    /// the item's default scope, no workspace — so `start_enabled`, `missing_tags` and the
+    /// production resolve run as for `StartRun`; claim the run with
+    /// [`claim`](Orchestrate::claim).
+    ///
+    /// # Errors
+    /// [`Engine::enqueue`](crate::engine::Engine::enqueue)'s.
+    async fn enqueue(&self, item: ItemId) -> Result<RunId, EngineError>;
+
     /// MOD-42 plan D10: every walk of this orchestrator is asked to stop, `grace` given to each
     /// live session. Out of the blueprint's §4.5 list, and needed (MOD-139 M2 R1, F-7): a case
     /// that pins what a cancel does to a parts round has to send one while a part is live.
@@ -404,6 +413,10 @@ impl Orchestrate for FakeOrchestrator {
 
     async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError> {
         crate::engine::enqueue_divided_fake(self, item).await
+    }
+
+    async fn enqueue(&self, item: ItemId) -> Result<RunId, EngineError> {
+        Box::pin(crate::engine::enqueue_fake(self, item)).await
     }
 
     fn cancel_walks(&self, grace: std::time::Duration) {
@@ -586,18 +599,17 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// judge none; a pre-MOD-163 snapshot resumes with no memory section; and a project without
 /// memory writes no `memory` row.
 ///
-/// **Eighteen for MOD-139 M2 T3** (plan D1-D5, D7, D8, D10, D13, D15-D17): divided nodes. Built
-/// through the D16 resolve seam, since production resolve still refuses them (the last case
-/// pins both refusals, and D17's planner agent first). A divided node admits its default parts
-/// as plan revision 0 from the primary's `base_refs`; each part runs in its own tree from those
-/// refs with its own prompt section, agent and session, and never lands; part documents stay out
-/// of input resolution; the integrate node is offered only once every part is done, and then
-/// runs; the parts share the session cap, run one at a time under a cap of one or
-/// under `shared_serialized` (which resets to the refs), and a lone `local` part prepares with no
-/// slot; `local` with two parts, an agent outside the candidates, a part persona, an over-cap and
-/// an empty plan each fail admission; `command_run` reaches a part beside a live sibling and a
-/// parallel branch beside a live one; the operator verbs refuse a part row; and stage rows are
-/// invisible to the walk.
+/// **Thirteen for MOD-139 M2 T3** (plan D1-D5, D7, D8, D10, D13, D15-D17): divided nodes. A
+/// divided node admits its default parts as plan revision 0 from the primary's `base_refs`; each
+/// part runs in its own tree from those refs with its own prompt section, agent and session, and
+/// never lands; part documents stay out of input resolution; the integrate node is offered only
+/// once every part is done, and then runs; the parts share the session cap, run one at a time
+/// under a cap of one or under `shared_serialized` (which resets to the refs), and a lone `local`
+/// part prepares with no slot; `command_run` reaches a part beside a live sibling and a parallel
+/// branch beside a live one; the operator verbs refuse a part row; stage rows are invisible to
+/// the walk; and `start_run_refuses_a_planner_agent_and_what_admission_would` pins, at resolve and
+/// before any run exists, D17's planner agent first and then what admission would refuse (MOD-139
+/// M3 T4 folded M2's five admission-refusal cases into it).
 ///
 /// **Nine for MOD-139 M2 T4** (plan D6, D11, D14): a part that fails is retried alone from the
 /// plan's `base_refs`; a part out of attempts fails the run `part_exhausted`, or takes the divided
@@ -979,16 +991,11 @@ pub const CASES: &[&str] = &[
     "max_parallel_sessions_one_runs_the_parts_one_at_a_time",
     "shared_serialized_parts_reset_to_the_base_refs",
     "a_single_local_part_prepares_with_no_slot",
-    "local_with_two_parts_fails_admission",
-    "a_part_agent_outside_the_candidates_fails_admission",
-    "a_part_persona_fails_admission",
-    "an_over_cap_plan_fails_admission",
-    "an_empty_divided_node_fails_admission",
     "a_part_with_a_live_sibling_gets_command_run",
     "a_fan_out_only_branch_beside_a_live_sibling_gets_command_run",
     "the_operator_verbs_refuse_a_part_row",
     "stage_rows_are_ignored_by_the_walk",
-    "start_run_refuses_a_divided_graph_and_first_a_planner_agent",
+    "start_run_refuses_a_planner_agent_and_what_admission_would",
     // MOD-139 M2 T4 (plan D6, D11, D14): part retries, the exhausted divided step, loops over a
     // divided node, and recovery per role.
     "a_failed_part_retries_alone_from_the_base_refs",
@@ -13649,17 +13656,6 @@ fn divided_case<'a, H: CaseHarness>(
         "a_single_local_part_prepares_with_no_slot" => {
             Box::pin(a_single_local_part_prepares_with_no_slot(harness))
         }
-        "local_with_two_parts_fails_admission" => {
-            Box::pin(local_with_two_parts_fails_admission(harness))
-        }
-        "a_part_agent_outside_the_candidates_fails_admission" => {
-            Box::pin(a_part_agent_outside_the_candidates_fails_admission(harness))
-        }
-        "a_part_persona_fails_admission" => Box::pin(a_part_persona_fails_admission(harness)),
-        "an_over_cap_plan_fails_admission" => Box::pin(an_over_cap_plan_fails_admission(harness)),
-        "an_empty_divided_node_fails_admission" => {
-            Box::pin(an_empty_divided_node_fails_admission(harness))
-        }
         "a_part_with_a_live_sibling_gets_command_run" => {
             Box::pin(a_part_with_a_live_sibling_gets_command_run(harness))
         }
@@ -13672,8 +13668,8 @@ fn divided_case<'a, H: CaseHarness>(
         "stage_rows_are_ignored_by_the_walk" => {
             Box::pin(stage_rows_are_ignored_by_the_walk(harness))
         }
-        "start_run_refuses_a_divided_graph_and_first_a_planner_agent" => Box::pin(
-            start_run_refuses_a_divided_graph_and_first_a_planner_agent(harness),
+        "start_run_refuses_a_planner_agent_and_what_admission_would" => Box::pin(
+            start_run_refuses_a_planner_agent_and_what_admission_would(harness),
         ),
         _ => return None,
     })
@@ -14214,126 +14210,6 @@ async fn a_single_local_part_prepares_with_no_slot<H: CaseHarness>(harness: &H) 
     finished(&orch, run).await;
 }
 
-/// MOD-139 M2 D2, P-8: an admission refusal fails the planner step, writes no plan and no part,
-/// blocks the item with the sentence as its last note and fails the run on it.
-async fn assert_admission_refused<O: Orchestrate>(orch: &O, failure: &RunFailure) {
-    let (run, result) = start_divided(orch).await;
-    let outcome = result.expect("an admission refusal is a rest, not an error");
-    let CommandOutcome::Started { rest, .. } = outcome else {
-        panic!("`claim` answers `Started`, not {outcome:?}");
-    };
-    assert_eq!(
-        (rest.run, rest.position, rest.failure.as_ref()),
-        (RunStatus::Failed, Some(2), Some(failure))
-    );
-    assert_eq!(run_of(orch, run).await.failure, Some(failure.to_string()));
-    let steps = steps_of(orch, run).await;
-    let planner = planner_of(&steps);
-    assert_eq!(planner.status, StepStatus::Failed);
-    assert!(parts_of(&steps, planner.id).is_empty(), "{steps:?}");
-    assert!(plans_of(orch, run).await.is_empty());
-    assert_eq!(
-        item_of(orch, ids::HTUI_FEAT_3).await.status,
-        Status::Blocked
-    );
-    assert_eq!(
-        notes_of(orch, ids::HTUI_FEAT_3).await.last(),
-        Some(&failure.to_string())
-    );
-}
-
-/// MOD-139 M2 D7: `local` runs one tree, so two parts fail admission.
-async fn local_with_two_parts_fails_admission<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
-        phase.isolation = Some(Isolation::Local);
-    })
-    .await;
-    assert_admission_refused(
-        &orch,
-        &RunFailure::LocalCannotDivide {
-            node: "implement".to_owned(),
-            parts: 2,
-        },
-    )
-    .await;
-}
-
-/// MOD-139 M2 D5: a part's agent must be one of the node's candidates; no silent fallback.
-async fn a_part_agent_outside_the_candidates_fails_admission<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(
-        &orch,
-        &[("api", None), ("ui", Some(ids::AGENT_AGY))],
-        |_| {},
-    )
-    .await;
-    assert_admission_refused(
-        &orch,
-        &RunFailure::PartAgentNotCandidate {
-            node: "implement".to_owned(),
-            part: "ui".to_owned(),
-            agent: ids::AGENT_AGY,
-        },
-    )
-    .await;
-}
-
-/// MOD-139 M2 D5: per-part personas are MOD-140's; a part naming one fails admission.
-async fn a_part_persona_fails_admission<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
-    edit_graph(&orch, ids::HTUI_FEAT_3, |body| {
-        let node = body
-            .nodes
-            .iter_mut()
-            .find(|node| node.phase.name == "implement")
-            .expect("FEAT-3's graph has `implement`");
-        node.parts[1].persona_id = Some(ids::PERSONA_ARCHITECT);
-    })
-    .await;
-    assert_admission_refused(
-        &orch,
-        &RunFailure::PartPersonaUnsupported {
-            node: "implement".to_owned(),
-            part: "ui".to_owned(),
-        },
-    )
-    .await;
-}
-
-/// MOD-139 M2 D8: a plan over the node's `max_parts` fails admission.
-async fn an_over_cap_plan_fails_admission<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
-        phase.max_parts = Some(1);
-    })
-    .await;
-    assert_admission_refused(
-        &orch,
-        &RunFailure::PlanOverCaps {
-            node: "implement".to_owned(),
-            cap: crate::status::PlanCap::MaxParts,
-            planned: 2,
-            max: 1,
-        },
-    )
-    .await;
-}
-
-/// MOD-139 M2 D2 (ANA-33 §7.6): a divided node with no default part fails admission.
-async fn an_empty_divided_node_fails_admission<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(&orch, &[], |_| {}).await;
-    assert_admission_refused(
-        &orch,
-        &RunFailure::EmptyPlan {
-            node: "implement".to_owned(),
-        },
-    )
-    .await;
-}
-
 /// MOD-139 M2 D13: a `fan_out_only` part beside a live sibling part gets `command_run`, the
 /// denials and the section; a lone plain step of the same run does not. Both parts are held until
 /// both are live, so each one's prompt is assembled beside a live sibling whatever the poll order.
@@ -14515,54 +14391,171 @@ async fn stage_rows_are_ignored_by_the_walk<H: CaseHarness>(harness: &H) {
     );
 }
 
-/// MOD-139 M2 D16, D17: production resolve (`StartRun`) refuses a divided graph, and first a
-/// configured planner agent, which the seam refuses too. No run is created.
-async fn start_run_refuses_a_divided_graph_and_first_a_planner_agent<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
-    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
-    let start = || {
-        orch.dispatch(Command::StartRun {
-            item: ids::HTUI_FEAT_3,
-            mode: RunMode::Manual,
-            repo_scope: None,
-            workspace: None,
-        })
-    };
-    fn refused<T>(result: &Result<T, EngineError>, reason: crate::graph::NotRunnable) -> bool {
-        matches!(
-            result,
-            Err(EngineError::Resolve(crate::graph::ResolveError::NotYetRunnable {
-                node,
-                reason: found,
-            })) if node == "implement" && *found == reason
-        )
-    }
-    let divide = start().await;
-    assert!(
-        refused(&divide, crate::graph::NotRunnable::Divide),
-        "{divide:?}"
-    );
-
-    edit_graph(&orch, ids::HTUI_FEAT_3, |body| {
+/// `edit_graph` over FEAT-3's `implement` node.
+///
+/// # Panics
+/// When the graph has no `implement` node, or the store refuses the edit.
+async fn edit_implement<O: Orchestrate>(
+    orch: &O,
+    edit: impl FnOnce(&mut htui_core::model::NodeBody),
+) {
+    edit_graph(orch, ids::HTUI_FEAT_3, |body| {
         let node = body
             .nodes
             .iter_mut()
             .find(|node| node.phase.name == "implement")
             .expect("FEAT-3's graph has `implement`");
+        edit(node);
+    })
+    .await;
+}
+
+/// MOD-139 M3 D10, D11: both [`Orchestrate::enqueue`] and `StartRun` answer `refusal` at
+/// resolve: no run is created, the item stays `open` and its notes are still `notes`.
+async fn assert_resolve_refused<O: Orchestrate>(
+    orch: &O,
+    refusal: &crate::graph::ResolveError,
+    notes: &[String],
+) {
+    let enqueued = orch.enqueue(ids::HTUI_FEAT_3).await;
+    assert!(
+        matches!(&enqueued, Err(EngineError::Resolve(found)) if found == refusal),
+        "enqueue answers {refusal:?}: {enqueued:?}"
+    );
+    let started = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: None,
+        })
+        .await;
+    assert!(
+        matches!(&started, Err(EngineError::Resolve(found)) if found == refusal),
+        "`StartRun` answers {refusal:?}: {started:?}"
+    );
+    assert_eq!(feat_3_run(orch).await, None, "no run was created");
+    assert_eq!(item_of(orch, ids::HTUI_FEAT_3).await.status, Status::Open);
+    assert_eq!(notes_of(orch, ids::HTUI_FEAT_3).await, notes);
+}
+
+/// MOD-139 M3 D10, D11 (blueprint P-11, P-12, §T4.4): production resolve, through both
+/// [`Orchestrate::enqueue`] and `StartRun`, refuses a configured planner agent first (D17), then
+/// what admission would — no default parts, a `plan_scope` past the parts, `local` with two parts,
+/// an over-cap plan, a part persona, a part agent outside the candidates and an absolute owned
+/// path, each with its `RunFailure` sentence — before any run exists. The valid graph then runs to
+/// `done`.
+async fn start_run_refuses_a_planner_agent_and_what_admission_would<H: CaseHarness>(harness: &H) {
+    use crate::graph::{NotRunnable, ResolveError};
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    let not_runnable = |reason| ResolveError::NotYetRunnable {
+        node: "implement".to_owned(),
+        reason,
+    };
+    let divide_refused = |reason: RunFailure| {
+        let refusal = ResolveError::DivideRefused {
+            node: "implement".to_owned(),
+            reason: reason.clone(),
+        };
+        assert_eq!(refusal.to_string(), reason.to_string());
+        refusal
+    };
+
+    // 1, 2: a planner agent with no parts is refused for the agent; without it, for the parts.
+    let mut parts = Vec::new();
+    edit_implement(&orch, |node| {
+        parts = std::mem::take(&mut node.parts);
         node.phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
     })
     .await;
-    let agent = start().await;
-    assert!(
-        refused(&agent, crate::graph::NotRunnable::PlannerAgent),
-        "{agent:?}"
-    );
-    let seam = orch.enqueue_divided(ids::HTUI_FEAT_3).await;
-    assert!(
-        refused(&seam, crate::graph::NotRunnable::PlannerAgent),
-        "the seam keeps D17: {seam:?}"
-    );
-    assert_eq!(feat_3_run(&orch).await, None, "no run was created");
+    assert_resolve_refused(&orch, &not_runnable(NotRunnable::PlannerAgent), &notes).await;
+    edit_implement(&orch, |node| node.phase.planner_agent_id = None).await;
+    assert_resolve_refused(&orch, &not_runnable(NotRunnable::NoParts), &notes).await;
+    edit_implement(&orch, |node| node.parts.clone_from(&parts)).await;
+
+    // 3: a planner that may plan past its own parts.
+    edit_implement(&orch, |node| {
+        node.phase.plan_scope = Some(htui_core::model::PlanScope::Successors);
+    })
+    .await;
+    assert_resolve_refused(&orch, &not_runnable(NotRunnable::PlanScope), &notes).await;
+    edit_implement(&orch, |node| node.phase.plan_scope = None).await;
+
+    // 4: `local` runs one tree.
+    edit_implement(&orch, |node| node.phase.isolation = Some(Isolation::Local)).await;
+    let local = divide_refused(RunFailure::LocalCannotDivide {
+        node: "implement".to_owned(),
+        parts: 2,
+    });
+    assert_resolve_refused(&orch, &local, &notes).await;
+    edit_implement(&orch, |node| node.phase.isolation = None).await;
+
+    // 5: a plan over the node's `max_parts`.
+    edit_implement(&orch, |node| node.phase.max_parts = Some(1)).await;
+    let over = divide_refused(RunFailure::PlanOverCaps {
+        node: "implement".to_owned(),
+        cap: crate::status::PlanCap::MaxParts,
+        planned: 2,
+        max: 1,
+    });
+    assert_resolve_refused(&orch, &over, &notes).await;
+    edit_implement(&orch, |node| node.phase.max_parts = None).await;
+
+    // 6: per-part personas are MOD-140's.
+    edit_implement(&orch, |node| {
+        node.parts[1].persona_id = Some(ids::PERSONA_ARCHITECT);
+    })
+    .await;
+    let persona = divide_refused(RunFailure::PartPersonaUnsupported {
+        node: "implement".to_owned(),
+        part: "ui".to_owned(),
+    });
+    assert_resolve_refused(&orch, &persona, &notes).await;
+    edit_implement(&orch, |node| node.parts[1].persona_id = None).await;
+
+    // 7: a part's agent must be one of the node's candidates; no silent fallback.
+    edit_implement(&orch, |node| node.parts[1].agent_id = Some(ids::AGENT_AGY)).await;
+    let agent = divide_refused(RunFailure::PartAgentNotCandidate {
+        node: "implement".to_owned(),
+        part: "ui".to_owned(),
+        agent: ids::AGENT_AGY,
+    });
+    assert_resolve_refused(&orch, &agent, &notes).await;
+    edit_implement(&orch, |node| node.parts[1].agent_id = None).await;
+
+    // 8: an owned path must be a repo-relative glob.
+    edit_implement(&orch, |node| {
+        node.parts[1].owned_paths = vec!["/abs/**".to_owned()];
+    })
+    .await;
+    let path = divide_refused(RunFailure::PartPathRefused {
+        node: "implement".to_owned(),
+        part: "ui".to_owned(),
+        path: "/abs/**".to_owned(),
+        reason: "is an absolute path".to_owned(),
+    });
+    assert_resolve_refused(&orch, &path, &notes).await;
+    edit_implement(&orch, |node| {
+        node.parts[1].owned_paths = vec!["src/ui/**".to_owned()]
+    })
+    .await;
+
+    // 9: the valid graph runs.
+    let outcome = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: None,
+        })
+        .await
+        .expect("the valid divided graph starts");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`StartRun` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!(rest.run, RunStatus::Done, "{rest:?}");
 }
 
 // -- MOD-139 M2 T4: part retries, the exhausted divided step, loops and recovery (D6, D11, D14) --
@@ -16693,8 +16686,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            233,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 6 + 14: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            228,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -16775,7 +16768,8 @@ mod tests {
              and MOD-163 M2's six memory cases (plan D11, D12, D18: an entry reaching every \
              phase of its project, closed entries kept out, an edit after `StartRun`, fan-out \
              siblings alike, a pre-MOD-163 snapshot, no entries no row), and MOD-139 M2 T3's \
-             eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17), and MOD-139 M2 \
+             thirteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17, with the resolve \
+             refusals and what admission would refuse folded into one case by MOD-139 M3 T4), and MOD-139 M2 \
              T4's nine (a part retried alone, the exhausted divided step, its `fails` loop and \
              re-plan, and recovery per role), and MOD-139 M2 R1's six (a cancel, a lost lease \
              and a refusal stopping a parts round's pulls, a failed planner on recovery, and a \
