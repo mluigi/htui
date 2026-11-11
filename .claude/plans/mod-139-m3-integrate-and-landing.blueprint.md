@@ -81,7 +81,7 @@ M2's Main-thread rulings F-1..F-8 and its "Deferred from review" hold unchanged.
   writes one head row per repo of its scope. Harden if capture or scope changes.
 - **L4.** `IntegratePrompt` is cloned into the spec (`premerge`, `parts`). Negligible cost; left.
 
-None yet for M3. M2's F-1..F-8, the F-8 addendum and "Deferred from review (R1)" hold; D9 closes
+M2's F-1..F-8, the F-8 addendum and its "Deferred from review (R1)" still hold; D9 closes
 the deferred `shared_serialized` reset (integrate prepares from `base_refs`), and the at-least-once
 substitution note stays (D12).
 
@@ -728,7 +728,7 @@ pub fn parked_unmerged(notes: &[Note], step: &RunStep) -> bool;
 
 // command.rs, EngineError after RoleRow (:638-645)
 /// MOD-139 M3 D6 (Confirm 3): an answer that would land an integrate step parked on a part its
-/// capture does not hold. Retry is the way on.
+/// capture does not hold. Retry or reject is the way on (R-5).
 #[error("step {step} is parked on integrate_incomplete: approving, skipping or promoting it would land it without a part; retry or reject it instead")] // R-5
 IntegrateIncomplete {
     /// The parked integrate step.
