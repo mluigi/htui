@@ -85,6 +85,24 @@
 - **T3 case 15** (two parallel `fan_out_only` branches) depends on the first-poll order of concurrent
   futures. An implementer who sees it flake reports it as a remaining finding; it is never weakened or
   `#[ignore]`d without a coordinator ruling.
+- **F-7 (R1, adopted).** `drive_parts` stops pulling queued parts after a cancel, a lost fence, an
+  error or a refusal (`WalkEnd::admits`' rule for a round): the parts in flight drain, the unpulled
+  ones stay `pending` (after a cancel or a lost fence, for the cancel's settlement or the adopter)
+  or, after a refusal that ends the run, are `cancelled` with the cut's note (`cancel_parts`).
+  §1.10's "raised once every part settled" means every **pulled** part. `run_part` also reads the
+  run's cancel before its `pending -> running` move. Pinned by the R1 conformance cases
+  `a_cancel_during_a_part_leaves_the_queued_part_pending`,
+  `a_lost_lease_during_a_part_leaves_the_queued_part_pending` and
+  `a_part_refusal_cancels_the_queued_parts`.
+- **F-8 (R1, adopted).** `retire_slot` retires a planner's parts and abandons its plans before the
+  planner row, so a cut-short retirement replays (A6): the planner stays `done`, the loop's
+  source, until the rest is retired. Pinned by `gate::tests::a_cut_short_planner_retirement_replays`.
+
+### Deferred from review (R1)
+
+- The `shared_serialized` end-of-round reset is best-effort: an M3 precondition (integrate must
+  prepare from `base_refs`, or redo the reset idempotently).
+- Substitution notes are at-least-once on a re-admission, as `admit_indices`' already are.
 
 ## 1. Shared decisions for every task
 
