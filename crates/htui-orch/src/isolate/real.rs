@@ -10,19 +10,20 @@
 //! are the one exception by design: they are `async` process supervision, and the `gix`
 //! post-conditions inside them go through the same helper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use htui_core::model::{
-    BoxId, Isolation, PremergeReport, RepoId, RunId, RunStepCommit, RunStepTree, StepId,
+    BoxId, Isolation, PartMerge, PartPremerge, PremergeReport, RepoId, RepoPremerge, RunId,
+    RunStepCommit, RunStepTree, StepId,
 };
 use htui_core::prompt::DiffBlock;
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
 use super::env_files::{self, EnvFiles};
-use super::git::{self, Cli, blocking};
+use super::git::{self, Cli, MergeAttempt, blocking};
 use super::{
     ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, PartTip, Prepared,
     PreparedTree, ResetReport,
@@ -97,6 +98,24 @@ pub fn stale_worktree(path: &Path) -> String {
 #[must_use]
 pub fn copy_tree_vanished(path: &Path) -> String {
     format!("the copy at {} is gone", path.display())
+}
+
+/// MOD-139 M3 D2: a `copy` part committed in a repository but has no `copy` tree row of it, so
+/// there is no object database its range could be copied out of.
+#[must_use]
+pub fn no_part_copy(part: StepId, name: &str) -> String {
+    format!("part {part} committed in {name} but has no copy of it")
+}
+
+/// MOD-139 M3 D3, D6: `part`'s tip in `repo` — its `after_hash` there — or `None` when it committed
+/// nothing there (no row, `after_hash` `None`, or `after_hash == before_hash`).
+fn committed_tip(part: &PartTip, repo: RepoId) -> Option<(&RunStepCommit, String)> {
+    let commit = part.commits.iter().find(|commit| commit.repo_id == repo)?;
+    let tip = commit
+        .after_hash
+        .clone()
+        .filter(|after| *after != commit.before_hash)?;
+    Some((commit, tip))
 }
 
 /// MOD-4 milestone 4 D54(a): the slot's base names no entry for a repository of the scope, so
@@ -1274,6 +1293,245 @@ impl GixIsolator {
         Ok(label.filter(|label| *label != tree.base_ref))
     }
 
+    /// MOD-139 M3 D2, D3: one repository's pre-merge, every part in plan order (blueprint §1.3).
+    /// Under `copy` every committed part's range is copied in first, conflicted and not-attempted
+    /// parts included (D2); then each part is `NoCommits`, `NotAttempted` once the repository
+    /// stopped, or [`premerge_part`](Self::premerge_part)'s answer.
+    async fn premerge_repo(
+        &self,
+        git: &Cli,
+        tree: &RunStepTree,
+        parts: &[PartTip],
+    ) -> Result<RepoPremerge, IsolateError> {
+        let name = self.checkout_of(tree)?.name.clone();
+        if tree.mode == Isolation::Copy {
+            self.copy_part_ranges(tree, parts).await?;
+        }
+        let mut stopped = false;
+        let mut entries = Vec::with_capacity(parts.len());
+        for part in parts {
+            let tip = committed_tip(part, tree.repo_id).map(|(_, tip)| tip);
+            let merge = match &tip {
+                None => PartMerge::NoCommits,
+                Some(_) if stopped => PartMerge::NotAttempted,
+                Some(tip) => {
+                    let merge = self.premerge_part(git, tree, part.step, tip).await?;
+                    stopped = matches!(merge, PartMerge::Conflicted { .. });
+                    merge
+                }
+            };
+            entries.push(PartPremerge {
+                step: part.step,
+                key: part.key.clone(),
+                tip,
+                merge,
+            });
+        }
+        let path = self.premerge_path(tree)?;
+        let head = blocking(move || git::head(&path)).await?;
+        Ok(RepoPremerge {
+            repo_id: tree.repo_id,
+            name,
+            head,
+            parts: entries,
+        })
+    }
+
+    /// MOD-139 M3 D2: under `copy` a part's commits live in its own copy's object database and the
+    /// primary has no label for them, so every committed part's `before..tip` is copied into the
+    /// integrate copy (objects only, `reconcile_isolated`'s precedent) and labelled
+    /// `htui/<part>` there; a label already at the tip is tolerated (a retry of this verb).
+    async fn copy_part_ranges(
+        &self,
+        tree: &RunStepTree,
+        parts: &[PartTip],
+    ) -> Result<(), IsolateError> {
+        let to = PathBuf::from(&tree.path);
+        if !to.join(".git").is_dir() {
+            return Err(IsolateError::Refused(copy_tree_vanished(&to)));
+        }
+        for part in parts {
+            let Some((commit, tip)) = committed_tip(part, tree.repo_id) else {
+                continue;
+            };
+            let from = part
+                .trees
+                .iter()
+                .find(|row| row.repo_id == tree.repo_id && row.mode == Isolation::Copy)
+                .map(|row| PathBuf::from(&row.path))
+                .ok_or_else(|| {
+                    IsolateError::Refused(no_part_copy(part.step, &self.checkout_name(tree)))
+                })?;
+            if !from.join(".git").is_dir() {
+                return Err(IsolateError::Refused(copy_tree_vanished(&from)));
+            }
+            let (to, base) = (to.clone(), commit.before_hash.clone());
+            let (copy_to, copy_tip) = (to.clone(), tip.clone());
+            git::with_retry("copy objects", move || {
+                let (from, to, base, tip) = (
+                    from.clone(),
+                    copy_to.clone(),
+                    base.clone(),
+                    copy_tip.clone(),
+                );
+                async move { blocking(move || git::copy_range(&from, &to, &base, &tip)).await }
+            })
+            .await?;
+            let name = format!("htui/{}", part.step);
+            git::with_retry("create branch", move || {
+                let (to, name, tip) = (to.clone(), name.clone(), tip.clone());
+                async move { blocking(move || git::create_branch(&to, &name, &tip)).await }
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The checkout's name for a refusal, or the repo id when the box has no checkout of it.
+    fn checkout_name(&self, tree: &RunStepTree) -> String {
+        self.checkout_of(tree).map_or_else(
+            |_| tree.repo_id.to_string(),
+            |checkout| checkout.name.clone(),
+        )
+    }
+
+    /// MOD-139 M3 D3: where integrate's pre-merge works: the checkout for the in-place modes, the
+    /// tree itself for `worktree` and `copy`.
+    fn premerge_path(&self, tree: &RunStepTree) -> Result<PathBuf, IsolateError> {
+        Ok(match tree.mode {
+            Isolation::Local | Isolation::SharedSerialized => {
+                self.checkout_of(tree)?.local_path.clone()
+            }
+            Isolation::Worktree | Isolation::Copy => PathBuf::from(&tree.path),
+        })
+    }
+
+    /// MOD-139 M3 D3: one part in one repository. `Contained` when `tip` is already an ancestor of
+    /// the tree's `HEAD`, read now; otherwise `merge --no-ff` onto that `HEAD` under D39's retry.
+    /// In-place trees hold the repository's admin lock from the `HEAD` read through the merge's
+    /// post-condition, as `reconcile_isolated` does (D70, D136): another run's reconcile into the
+    /// same checkout would otherwise move `HEAD` under the two-parent check.
+    async fn premerge_part(
+        &self,
+        git: &Cli,
+        tree: &RunStepTree,
+        part: StepId,
+        tip: &str,
+    ) -> Result<PartMerge, IsolateError> {
+        let in_place = matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized);
+        let _admin = if in_place {
+            Some(self.admin_guard(tree.repo_id).await)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        {
+            if in_place {
+                self.probe_reconcile_admin(tree.repo_id);
+            }
+        }
+        let path = self.premerge_path(tree)?;
+        let read = path.clone();
+        let head = blocking(move || git::head(&read)).await?;
+        let (read, ancestor, at) = (path.clone(), tip.to_owned(), head.clone());
+        if blocking(move || git::is_ancestor(&read, &ancestor, &at)).await? {
+            return Ok(PartMerge::Contained);
+        }
+        let message = git::premerge_message(part);
+        let attempt =
+            git::with_retry("merge", || git.merge_no_ff_as(&path, &message, &head, tip)).await?;
+        #[cfg(test)]
+        {
+            if in_place {
+                self.probe_reconcile_admin(tree.repo_id);
+            }
+        }
+        Ok(match attempt {
+            MergeAttempt::Merged(merged) => PartMerge::Merged {
+                commit: merged.commit,
+            },
+            MergeAttempt::Conflicted(paths) => PartMerge::Conflicted { paths },
+        })
+    }
+
+    /// MOD-139 M3 D6 (blueprint §1.10): the parts integrate's capture row `head` does not hold,
+    /// added to `failing`. The descendant is `after_hash`, else `before_hash`; a part with a
+    /// commit in that repository fails when its tip is not an ancestor of it, or when its own
+    /// changed paths miss `<part before>..<descendant>`'s (Confirm 2(a), P-5). An empty own list
+    /// or a list cut at [`git::DIFF_CAP`] exempts the path half only (P-6).
+    async fn unmerged_in(
+        &self,
+        git: &Cli,
+        trees: &[RunStepTree],
+        head: &RunStepCommit,
+        parts: &[PartTip],
+        failing: &mut BTreeSet<StepId>,
+    ) -> Result<(), IsolateError> {
+        let descendant = head
+            .after_hash
+            .clone()
+            .unwrap_or_else(|| head.before_hash.clone());
+        let repo = self.repo_holding(trees, head.repo_id, &descendant).await?;
+        for part in parts {
+            let Some((commit, tip)) = committed_tip(part, head.repo_id) else {
+                continue;
+            };
+            let (read, ancestor, at) = (repo.clone(), tip.clone(), descendant.clone());
+            if !blocking(move || git::is_ancestor(&read, &ancestor, &at)).await? {
+                failing.insert(part.step);
+                continue;
+            }
+            let own = git.name_only(&repo, &commit.before_hash, &tip).await?;
+            if own.paths.is_empty() || own.truncated {
+                continue;
+            }
+            let merged = git
+                .name_only(&repo, &commit.before_hash, &descendant)
+                .await?;
+            if merged.truncated {
+                continue;
+            }
+            let merged: BTreeSet<&str> = merged.paths.iter().map(String::as_str).collect();
+            if !own.paths.iter().any(|path| merged.contains(path.as_str())) {
+                failing.insert(part.step);
+            }
+        }
+        Ok(())
+    }
+
+    /// D74 (blueprint A-3), factored out of [`range_of`](Self::range_of) for MOD-139 M3 D6: the
+    /// repository that holds `commit` for `repo` — the `copy` tree of the rows when its own object
+    /// database holds it, else the checkout. A `worktree` path is never opened, so a tree capture
+    /// removed (D27) is never read.
+    async fn repo_holding(
+        &self,
+        trees: &[RunStepTree],
+        repo: RepoId,
+        commit: &str,
+    ) -> Result<PathBuf, IsolateError> {
+        let checkout = self
+            .config
+            .repos
+            .get(&repo)
+            .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
+        if let Some(tree) = trees
+            .iter()
+            .find(|tree| tree.repo_id == repo && tree.mode == Isolation::Copy)
+        {
+            let copy = PathBuf::from(&tree.path);
+            // A copy that is gone, or does not hold the commit, falls back to the checkout; a
+            // commit neither holds is the caller's `git` refusal.
+            let (probe, hex) = (copy.clone(), commit.to_owned());
+            if blocking(move || git::has_commit(&probe, &hex))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(copy);
+            }
+        }
+        Ok(checkout.local_path.clone())
+    }
+
     /// Where `htui/<step>` points in `checkout`, or `None` when the step never labelled it.
     async fn label_of(
         &self,
@@ -1342,22 +1600,9 @@ impl GixIsolator {
             .repos
             .get(&commit.repo_id)
             .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
-        let mut repo = checkout.local_path.clone();
-        if let Some(tree) = trees
-            .iter()
-            .find(|tree| tree.repo_id == commit.repo_id && tree.mode == Isolation::Copy)
-        {
-            let copy = PathBuf::from(&tree.path);
-            // A copy that is gone, or does not hold the commit, falls back to the checkout; a
-            // commit neither holds is `git diff`'s own refusal.
-            let (probe, hex) = (copy.clone(), after.to_owned());
-            if blocking(move || git::has_commit(&probe, &hex))
-                .await
-                .unwrap_or(false)
-            {
-                repo = copy;
-            }
-        }
+        // A copy that is gone, or does not hold the commit, falls back to the checkout; a commit
+        // neither holds is `git diff`'s own refusal.
+        let repo = self.repo_holding(trees, commit.repo_id, after).await?;
         // D141: a merge onto a primary another run moved is diffed against its first parent, so
         // the range holds this step's change and never the other run's. D146: the merge is
         // recognised on the checkout only, tied to its first-parent line, and only for a tree
@@ -1637,8 +1882,19 @@ impl Isolator for GixIsolator {
         trees: &'a [RunStepTree],
         parts: &'a [PartTip],
     ) -> IsolatorFuture<'a, PremergeReport> {
-        let _ = (step, trees, parts);
-        Box::pin(async move { Err(IsolateError::Git("premerge: not built yet".into())) })
+        Box::pin(async move {
+            let _ = step;
+            // D40's rule: a repo-less run needs no `git`.
+            if trees.is_empty() {
+                return Ok(PremergeReport::default());
+            }
+            let git = self.cli()?.clone();
+            let mut repos = Vec::with_capacity(trees.len());
+            for tree in trees {
+                repos.push(self.premerge_repo(&git, tree, parts).await?);
+            }
+            Ok(PremergeReport { repos })
+        })
     }
 
     fn unmerged<'a>(
@@ -1648,8 +1904,23 @@ impl Isolator for GixIsolator {
         heads: &'a [RunStepCommit],
         parts: &'a [PartTip],
     ) -> IsolatorFuture<'a, Vec<StepId>> {
-        let _ = (step, trees, heads, parts);
-        Box::pin(async move { Err(IsolateError::Git("premerge: not built yet".into())) })
+        Box::pin(async move {
+            let _ = step;
+            if heads.is_empty() {
+                return Ok(Vec::new());
+            }
+            let git = self.cli()?.clone();
+            let mut failing = BTreeSet::new();
+            for head in heads {
+                self.unmerged_in(&git, trees, head, parts, &mut failing)
+                    .await?;
+            }
+            Ok(parts
+                .iter()
+                .map(|part| part.step)
+                .filter(|step| failing.contains(step))
+                .collect())
+        })
     }
 
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
