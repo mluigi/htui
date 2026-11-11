@@ -821,7 +821,9 @@ pub struct WaitingRowDoc {
     pub item_key: String,
     /// The slug of the item's project (MOD-147 D11): `@<workspace>` for a workspace's own item.
     pub project: String,
-    /// `<project>:<item_key>`, always qualified, so a row names its item across projects.
+    /// `<slug>:<item_key>`, always qualified with the project's slug as the answer read it, so a
+    /// row names its item across projects ([`KeyQualifier::qualified`]); bare `item_key` for a
+    /// project the answer did not read.
     pub qualified_key: String,
     /// The human form's key: qualified only when another project of the answer uses its prefix.
     #[serde(skip)]
