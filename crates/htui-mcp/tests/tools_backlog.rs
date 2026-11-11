@@ -758,8 +758,8 @@ async fn item_link_outside_the_workspaces_is_out_of_scope() {
 }
 
 /// MOD-147 edge 9: `withdraw_link` keeps no reach check, so a `remove` of an item of another
-/// project that holds no live link answers `not yours` (this run proposed nothing there), with
-/// the keys only: never the items' ids, which would name an item outside the reach.
+/// project that holds no live link answers `not yours` (this run proposed nothing live there),
+/// with the keys only: never the items' ids, which would name an item outside the reach.
 #[tokio::test]
 async fn item_link_remove_of_another_projects_item_is_not_yours() {
     let store = MemStore::demo();
@@ -778,12 +778,39 @@ async fn item_link_remove_of_another_projects_item_is_not_yours() {
             .expect("a call");
         assert_eq!(
             refused(&answer),
-            format!("not yours: ANA-2 relates {to} was not proposed by this run"),
+            format!("not yours: ANA-2 relates {to} is no live link this run proposed"),
         );
     }
     for item in [ids::VULKAN_FEAT_1, ws, ids::AGY_FEAT_1] {
         assert!(!fx.live_link(item, LinkKind::Relates).await);
     }
+}
+
+/// MOD-147 edge 9: a second `remove` of a link this run proposed to a co-member's item and already
+/// withdrew answers `not yours` too, and its sentence stays true: the link was this run's, it is
+/// just no longer live.
+#[tokio::test]
+async fn item_link_second_remove_of_a_co_members_link_is_no_live_link() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let link = json!({"op": "add", "to": "agy:FEAT-1", "kind": "relates"});
+    ok(&client.call("item_link", link).await.expect("a call"));
+    let remove = json!({"op": "remove", "to": "agy:FEAT-1", "kind": "relates"});
+    let first = ok(&client
+        .call("item_link", remove.clone())
+        .await
+        .expect("a call"));
+    assert_eq!(
+        first,
+        json!({"from": "ANA-2", "to": "agy:FEAT-1", "kind": "relates", "live": false})
+    );
+    let second = client.call("item_link", remove).await.expect("a call");
+    assert_eq!(
+        refused(&second),
+        "not yours: ANA-2 relates agy:FEAT-1 is no live link this run proposed"
+    );
+    assert!(!fx.live_link(ids::AGY_FEAT_1, LinkKind::Relates).await);
 }
 
 /// MOD-147 edges 1 and 3: no project has the slug `nope`, and no workspace is called `gone`.
