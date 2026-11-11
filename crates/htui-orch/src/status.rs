@@ -621,7 +621,7 @@ pub fn crashed_rejection<'s>(cursor: &Cursor, steps: &'s [RunStep]) -> Option<&'
 
 /// Blueprint D196, widened by MOD-37 R-31: the one predicate every resume reader reads.
 ///
-/// [`resumable_park`]'s five cursors, or a [`crashed_rejection`]. `Unblock`'s third case
+/// [`resumable_park`]'s six cursors, or a [`crashed_rejection`]. `Unblock`'s third case
 /// (through [`crate::command::unblock_enabled`]'s callers), `Engine::resume`'s walk and the
 /// worker box's hand-back resume all read this, and none open-codes it.
 #[must_use]

@@ -6601,7 +6601,9 @@ where
     }
 
     /// A deterministic pre-session refusal of one part (blueprint P-11): the part fails with
-    /// `text` as its note, and the round ends the run on it.
+    /// `text` as its note, and the round ends the run on it. A row another process already moved
+    /// (plan D17) is not this call's, so its refusal ends nothing: [`PartOutcome::Settled`], as
+    /// `run_candidate` keeps a lost refusal out of the run's failure (review M3).
     async fn refuse_part(
         &self,
         run: &Run,
@@ -6611,7 +6613,9 @@ where
         failure: Option<RunFailure>,
         block: bool,
     ) -> Result<PartOutcome, EngineError> {
-        self.fail_part(run, node, step, &text).await?;
+        if !self.fail_part(run, node, step, &text).await? {
+            return Ok(PartOutcome::Settled);
+        }
         Ok(PartOutcome::Refused {
             step: step.id,
             text,
@@ -9291,7 +9295,8 @@ struct PartStage<'s> {
 /// What one part of a round answered (MOD-139 M2 D4).
 #[derive(Debug)]
 enum PartOutcome {
-    /// `done`, or `failed` on its own terms (retried by T4's next round).
+    /// `done`, or `failed` on its own terms (retried by T4's next round); also a refusal whose
+    /// row another process already moved, which is not this round's to end the run on.
     Settled,
     /// A deterministic pre-session refusal (blueprint P-11): the part row is already `failed`
     /// with `text` as its note, and the round ends the run on it.
@@ -9833,8 +9838,9 @@ pub async fn claim_fake(
 
 /// MOD-139 M2 D16 (blueprint P-10): a divided graph's run, created on the fake's `MemStore` through
 /// [`graph::resolve_divided`] — the real resolve with **only** the divide refusal lifted — over
-/// the fake's own graph source, then claimed with [`claim_fake`]. Not an `Engine` method: no
-/// engine path reaches the seam, so a `test-support` build lifts nothing for any other caller.
+/// the fake's own graph source. The caller claims it with [`claim_fake`]. Not an `Engine`
+/// method: no engine path reaches the seam, so a `test-support` build lifts nothing for any
+/// other caller.
 /// M3 deletes it with the refusal.
 ///
 /// # Errors
@@ -24534,6 +24540,92 @@ mod tests {
                         .await
                         .expect("the failure writes"),
                     "a `running` row is this call's to fail"
+                );
+                assert_eq!(step_of(live).await.status, StepStatus::Failed);
+                assert_eq!(notes(&harness).await.len(), before + 1);
+            }
+
+            /// MOD-139 M2 T3 (review M3's rule on parts): a part refusal ends the run only when
+            /// this call failed the part. A row another process already moved (plan D17) is left
+            /// alone, gets no note, and the round reads it as settled.
+            #[tokio::test]
+            async fn refuse_part_ends_the_run_only_on_its_own_refusal() {
+                let harness = Harness::new().await;
+                let (run, [settled, _]) = parked_group(&harness).await;
+                let row = harness.orch.run(run).await;
+                let snapshot = snapshot_of(&harness, run).await;
+                let phase = &snapshot.phases[0];
+                let step_of = |id: StepId| {
+                    let orch = &harness.orch;
+                    async move {
+                        orch.steps(run)
+                            .await
+                            .into_iter()
+                            .find(|step| step.id == id)
+                            .expect("the step exists")
+                    }
+                };
+                let before = notes(&harness).await.len();
+                harness_engine!(harness.orch, engine);
+
+                let lost = step_of(settled).await;
+                assert_ne!(lost.status, StepStatus::Running);
+                let outcome = engine
+                    .refuse_part(&row, phase, &lost, "too late".to_owned(), None, false)
+                    .await
+                    .expect("a lost compare-and-set is no error");
+                assert!(
+                    matches!(outcome, crate::engine::PartOutcome::Settled),
+                    "the row was not this call's to refuse: {outcome:?}"
+                );
+                assert_eq!(notes(&harness).await.len(), before, "and gets no note");
+
+                let live = harness
+                    .orch
+                    .store
+                    .create_step(NewRunStep {
+                        id: StepId::new(),
+                        run_id: run,
+                        position: lost.position,
+                        attempt: lost.attempt + 1,
+                        fanout_index: 0,
+                        phase_name: lost.phase_name.clone(),
+                        agent_id: lost.agent_id,
+                        model: lost.model.clone(),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
+                    })
+                    .await
+                    .expect("MemStore creates the step")
+                    .id;
+                assert!(
+                    harness
+                        .orch
+                        .store
+                        .transition_step(
+                            live,
+                            StepStatus::Pending,
+                            StepStatus::Running,
+                            harness.orch.clock.now()
+                        )
+                        .await
+                        .expect("MemStore moves the step")
+                );
+                let outcome = engine
+                    .refuse_part(
+                        &row,
+                        phase,
+                        &step_of(live).await,
+                        "refused".to_owned(),
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("the failure writes");
+                assert!(
+                    matches!(outcome, crate::engine::PartOutcome::Refused { step, .. } if step == live),
+                    "a `running` row is this call's to refuse: {outcome:?}"
                 );
                 assert_eq!(step_of(live).await.status, StepStatus::Failed);
                 assert_eq!(notes(&harness).await.len(), before + 1);
