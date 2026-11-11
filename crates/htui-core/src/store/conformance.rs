@@ -28362,9 +28362,10 @@ async fn propose_link_reaches_the_workspace_and_its_members<S: WriteStore>(store
 }
 
 /// MOD-147 D5: a scope-row kind may not take a prefix a current member's kind uses, on create and
-/// on a prefix-changing update; the sentence names the first member by position. An invalid
-/// prefix and a stale token answer first, the graph after. A member's own kind is never refused,
-/// and an update that keeps the prefix is not re-checked.
+/// on a prefix-changing update; the sentence names the first member by position (`pb`, though
+/// `pa` was created first and sorts first). An invalid prefix and a stale token answer first, the
+/// graph after. A member's own kind is never refused, and an update that keeps the prefix is not
+/// re-checked.
 async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
     const CASE: &str = "workspace_kind_refuses_a_member_prefix";
     let workspace = store
@@ -28373,8 +28374,9 @@ async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
         .expect(CASE);
     let scope = scope_of(CASE, store, workspace.id).await;
     let graph = store.step_graphs(scope).await.expect(CASE)[0].id;
+    // `pa` comes first by creation and by slug, `pb` by position: only position may pick it.
     let mut members = Vec::new();
-    for (position, slug) in [(0, "pa"), (1, "pb")] {
+    for (position, slug) in [(1, "pa"), (0, "pb")] {
         let project = store.create_project(new_project(slug)).await.expect(CASE);
         store
             .upsert_workspace_project(&WorkspaceProject {
@@ -28401,8 +28403,8 @@ async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
         store
             .create_item_kind(new_item_kind(scope, "FEAT", "feature", graph))
             .await,
-        &workspace_prefix_taken("FEAT", "pa"),
-        "a member's prefix on the scope row",
+        &workspace_prefix_taken("FEAT", "pb"),
+        "a member's prefix on the scope row names the first member by position",
     );
     constraint_exactly(
         CASE,
@@ -28417,7 +28419,7 @@ async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
         store
             .create_item_kind(new_item_kind(scope, "FEAT", "feature", foreign.id))
             .await,
-        &workspace_prefix_taken("FEAT", "pa"),
+        &workspace_prefix_taken("FEAT", "pb"),
         "the prefix answers before the graph",
     );
     assert_eq!(
@@ -28445,7 +28447,7 @@ async fn workspace_kind_refuses_a_member_prefix<S: WriteStore>(store: &S) {
         store
             .update_item_kind(epic.id, epic.updated_at, to_fix.clone())
             .await,
-        &workspace_prefix_taken("FIX", "pa"),
+        &workspace_prefix_taken("FIX", "pb"),
         "an update to a member's prefix",
     );
     let unchanged = store
