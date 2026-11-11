@@ -1691,7 +1691,7 @@ fn a_trim_record_is_never_serialised_outside_to_value() {
 fn the_engine_scrubs_the_record_with_the_scrubber_it_holds() {
     // MOD-32, review finding. The signature change forces *a* `&dyn Scrubber`, not *the* one the
     // run holds. Swapping `self.parts.scrubber` for a locally built `MinimalScrubber::new([])` at
-    // any of the three sites compiles, passes every behavioural case in this file, and silently
+    // any of the four sites (MOD-139 M2 added the part's, `part_live`) compiles, passes every behavioural case in this file, and silently
     // disables the masking half on every path where the scrubber is populated — which is what
     // happens the moment the run engine's empty secret list (`run_worker.rs:1253`) is fixed. So the
     // argument is pinned here, not just the call.
@@ -1701,14 +1701,15 @@ fn the_engine_scrubs_the_record_with_the_scrubber_it_holds() {
 
     assert_eq!(
         source.matches("to_value(self.parts.scrubber").count(),
-        3,
-        "the three `set_step_prompt` sites pass the scrubber the run holds; one is added or removed \
+        4,
+        "the four `set_step_prompt` sites pass the scrubber the run holds; one is added or removed \
          here, and `set_step_prompt`'s production caller list has to stay in step with it"
     );
     for (number, line) in source.lines().enumerate() {
-        if line.contains("to_value(") && !line.contains("to_value(self.parts.scrubber") {
+        // The record's method call; `serde_json::to_value(` (MOD-139's `base_refs`) is no record.
+        if line.contains(".to_value(") && !line.contains(".to_value(self.parts.scrubber") {
             panic!(
-                "engine.rs:{}: a `to_value(` that does not pass `self.parts.scrubber`: {}",
+                "engine.rs:{}: a `.to_value(` that does not pass `self.parts.scrubber`: {}",
                 number + 1,
                 line.trim()
             );
