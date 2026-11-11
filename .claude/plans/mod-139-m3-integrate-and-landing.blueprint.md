@@ -65,6 +65,21 @@ M2's Main-thread rulings F-1..F-8 and its "Deferred from review" hold unchanged.
   Pinned by `premerge_in_a_copy_refuses_a_part_without_a_copy_row`.
 - **R-3:** T3 checks first that integrate inherits the divided node's gate and `verify_command` through
   `expand_divide` (a unit assertion) and pins the reconcile-call ordinal in case 1 before case 8 relies on it.
+- **R-5 (R1, review M1):** the integrate refusals name Retry or Reject: `IntegrateIncomplete` and
+  `IntegrateUnmerged` end "retry or reject it instead" (`PromoteIntegrate` keeps "answer or retry it
+  instead"). The retry budget is not exempted for integrate: an exhausted park refuses Retry
+  (`RetryExhausted`) and Reject takes the divided node's `fails` edge or ends the run `rejected`.
+  Pinned by `an_exhausted_integrate_park_is_rejected_not_retried`.
+- **R-6 (R1, review M2):** the `(Integrate, Finished)` recovery arm fails an isolator or snapshot read
+  error (`EngineError::Isolate`, `EngineError::Snapshot` from `integrate_stage` or `unmerged_keys`) hard,
+  as the walk does: `fail_hard` with `failure_text`, then `Next::Finished(Rest { Failed,
+  Some(position), None })`; store, lease and stale errors still propagate (A-4's transient class). Pinned
+  by `an_integrate_read_error_on_recovery_fails_the_run` (FakeIsolator `fail_unmerged`). CASES 228 → 230.
+
+**Deferred from review (M3):**
+- **L3.** `unmerged` with no head rows passes (no row, no check). Unreachable today: integrate's capture
+  writes one head row per repo of its scope. Harden if capture or scope changes.
+- **L4.** `IntegratePrompt` is cloned into the spec (`premerge`, `parts`). Negligible cost; left.
 
 None yet for M3. M2's F-1..F-8, the F-8 addendum and "Deferred from review (R1)" hold; D9 closes
 the deferred `shared_serialized` reset (integrate prepares from `base_refs`), and the at-least-once
@@ -514,7 +529,7 @@ pub const INTEGRATE_INCOMPLETE: &str = "integrate_incomplete";
 | same bytes as the step's gate note; item note `` step `implement` attempt 1: integrate_incomplete: part `ui` of `implement` is not merged `` (`note_step`, `gate.rs:515-538`) | `StepFailure` `Display` | `step_failure_display_is_the_gate_notes_vocabulary` (`gate.rs:1844`): display + `run_failure_text` |
 | `premerge `implement` attempt 1:\n` + `premerge_content` | item note, `via_step_id` integrate (D4) | `prompt_parts::the_premerge_note_is_the_section_text`; T3 cases 1, 2 |
 | `parts: diffstat of part `<key>` unavailable: <err>` (withheld if unmaskable, `withhold_unmaskable_notes`) | spec trim note | T3 unit `a_part_diff_error_is_a_trim_note` |
-| `step <id> is parked on integrate_incomplete: approving, skipping or promoting it would land it without a part; retry it instead` | `EngineError::IntegrateIncomplete` | T3 case 11 (`to_string()` asserted) |
+| `step <id> is parked on integrate_incomplete: approving, skipping or promoting it would land it without a part; retry or reject it instead` (R-5; `EngineError::IntegrateUnmerged` ends the same) | `EngineError::IntegrateIncomplete` | T3 case 11, R1's `an_exhausted_integrate_park_is_rejected_not_retried` (`to_string()` asserted) |
 | `integrate node `<name>` has no done planner, admitted plan or done parts` | `EngineError::Snapshot { reason }` from `integrate_stage` | `divide.rs` unit tests (the pure `None`) |
 
 Settle precedence (pinned in `gate.rs` tests): driver error > stop > cap > deadline >
@@ -714,7 +729,7 @@ pub fn parked_unmerged(notes: &[Note], step: &RunStep) -> bool;
 // command.rs, EngineError after RoleRow (:638-645)
 /// MOD-139 M3 D6 (Confirm 3): an answer that would land an integrate step parked on a part its
 /// capture does not hold. Retry is the way on.
-#[error("step {step} is parked on integrate_incomplete: approving, skipping or promoting it would land it without a part; retry it instead")]
+#[error("step {step} is parked on integrate_incomplete: approving, skipping or promoting it would land it without a part; retry or reject it instead")] // R-5
 IntegrateIncomplete {
     /// The parked integrate step.
     step: StepId,
