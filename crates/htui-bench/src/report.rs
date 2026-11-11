@@ -712,18 +712,27 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
 
     md.push_str("\n## Threats to validity\n\n");
     md.push_str(THREATS);
+    let _ = writeln!(
+        md,
+        "- This corpus chunks to {} document points ({points_total} points in all) at {} against \
+         ANA-37's {ANA37_DOCUMENT_POINTS} (blueprint F3).",
+        meta.points.document,
+        cell_text(&meta.corpus_ref)
+    );
     md
 }
 
-/// The fixed threats section (blueprint §4.2).
+/// The fixed threats (blueprint §4.2); the F3 line, built from the run, follows them.
 const THREATS: &str = "\
 - The author knew the targets when writing the queries (ANA-37 §5.9).
 - The queries are re-authored from ANA-37 §5.3, not ANA-37's lost set: easier or harder in ways no \
 table here shows.
 - Hybrid (RRF) ties reorder between runs; compare two runs before reading a one-query difference.
 - The corpus is the markdown at a pinned commit, not htui's Postgres rows.
-- This corpus chunks to 777 document points at the pin against ANA-37's 759 (blueprint F3).
 ";
+
+/// ANA-37's document points (blueprint F3).
+const ANA37_DOCUMENT_POINTS: usize = 759;
 
 fn met(yes: bool) -> &'static str {
     if yes { "met" } else { "not met" }
