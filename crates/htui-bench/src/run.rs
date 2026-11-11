@@ -244,7 +244,9 @@ pub async fn run(config: &RunConfig) -> anyhow::Result<Results> {
     let corpus = corpus::build(&config.repo, &config.corpus_ref)?;
     note_corpus(&corpus);
     check_targets(&corpus, &frozen.set)?;
-    warn_on_another_ref(&frozen.set, &config.corpus_ref);
+    if let Some(warning) = ref_warning(&config.repo, &frozen.set.corpus_ref, &config.corpus_ref) {
+        note(&warning);
+    }
 
     let services = Services::connect(config).await?;
     let clock = Instant::now();
@@ -403,13 +405,11 @@ fn note_corpus(corpus: &Corpus) {
     ));
 }
 
-fn warn_on_another_ref(set: &QuerySet, corpus_ref: &str) {
-    if set.corpus_ref != corpus_ref {
-        note(&format!(
-            "warning: the query set was written against {}, the corpus is {corpus_ref}",
-            set.corpus_ref
-        ));
-    }
+/// A warning when the query set was written against another corpus ref than the one run.
+pub fn ref_warning(repo: &Path, set_ref: &str, corpus_ref: &str) -> Option<String> {
+    (set_ref != corpus_ref).then(|| {
+        format!("warning: the query set was written against {set_ref}, the corpus is {corpus_ref}")
+    })
 }
 
 fn elapsed_ms(since: Instant) -> f64 {
@@ -945,6 +945,36 @@ mod tests {
         assert_eq!(checkout_state(sha(), None), ("eb2d60fa".to_owned(), None));
         // No git at all.
         assert_eq!(checkout_state(None, None), ("unknown".to_owned(), None));
+    }
+
+    #[test]
+    fn a_query_set_ref_warns_only_on_another_commit() {
+        let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        assert_eq!(ref_warning(&repo, "d15e9fea", "d15e9fea"), None);
+        assert_eq!(
+            ref_warning(&repo, "d15e9fea", corpus::WORKTREE).as_deref(),
+            Some("warning: the query set was written against d15e9fea, the corpus is WORKTREE")
+        );
+        // Refs git cannot resolve fall back to comparing the strings.
+        assert_eq!(ref_warning(&repo, "no-such-ref-r1", "no-such-ref-r1"), None);
+        assert!(ref_warning(&repo, "no-such-ref-r1", "no-such-ref-r2").is_some());
+
+        let full = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "d15e9fea^{commit}"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+        let Some(full) = full else {
+            eprintln!("skipped: d15e9fea unreachable");
+            return;
+        };
+        assert_eq!(full.len(), 40, "{full}");
+        // The same commit, spelt in full: no warning.
+        assert_eq!(ref_warning(&repo, "d15e9fea", &full), None);
+        assert_eq!(ref_warning(&repo, &full, "d15e9fea"), None);
     }
 
     #[test]

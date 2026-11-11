@@ -190,11 +190,9 @@ fn error_note(summary: &report::Summary) -> Option<String> {
 fn validate(args: &SetArgs) -> anyhow::Result<()> {
     let frozen = queries::load_frozen(&args.queries)?;
     let corpus = corpus::build(&args.repo, &args.corpus_ref)?;
-    if frozen.set.corpus_ref != args.corpus_ref {
-        eprintln!(
-            "htui-bench: warning: the query set was written against {}, the corpus is {}",
-            frozen.set.corpus_ref, args.corpus_ref
-        );
+    if let Some(warning) = run::ref_warning(&args.repo, &frozen.set.corpus_ref, &args.corpus_ref)
+    {
+        eprintln!("htui-bench: {warning}");
     }
     let ids = corpus.ids();
     let unknown = queries::validate(&frozen.set.queries, &ids);
