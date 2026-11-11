@@ -491,6 +491,15 @@ pub struct Merged {
     pub commit: String,
 }
 
+/// MOD-139 M3 D3: what one `merge --no-ff` did — merged, or conflicted (aborted) with its paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeAttempt {
+    /// The two-parent post-condition held.
+    Merged(Merged),
+    /// Exit 1 with no lock signature and a non-empty conflicted-path read; the merge was aborted.
+    Conflicted(Vec<String>),
+}
+
 /// D25's conflict refusal: the sentence ANA-2 `:983` fixes, with the path list.
 ///
 /// Named here rather than in `isolate/real.rs` because [`Cli::merge_no_ff`] is what detects the
@@ -699,6 +708,38 @@ impl Cli {
         Ok(())
     }
 
+    /// MOD-139 M3 D3: D25's merge under any `message`, detached (plan D160) like
+    /// [`merge_no_ff`](Cli::merge_no_ff): `git -c merge.log=false merge --no-ff --no-edit -m
+    /// <message> <after>` in `path`, onto whatever `HEAD` names there, with the post-condition
+    /// that the new `HEAD`'s parents are exactly `[before, after]`.
+    ///
+    /// The pre-merge of integrate's tree (`htui: premerge <part step>`) and D25's reconcile
+    /// (`htui: reconcile <step>`, through `merge_no_ff`) are the two callers.
+    ///
+    /// # Errors
+    /// As [`merge_no_ff`](Cli::merge_no_ff), less the conflict: that is
+    /// `Ok(MergeAttempt::Conflicted(paths))`, answered after `--abort` restored the tree.
+    pub async fn merge_no_ff_as(
+        &self,
+        path: &Path,
+        message: &str,
+        before: &str,
+        after: &str,
+    ) -> Result<MergeAttempt, IsolateError> {
+        let cli = self.clone();
+        let (path, message, before, after) = (
+            path.to_path_buf(),
+            message.to_owned(),
+            before.to_owned(),
+            after.to_owned(),
+        );
+        detached("merge", async move {
+            cli.merge_no_ff_reading(&path, &message, &before, &after, conflicted_paths)
+                .await
+        })
+        .await
+    }
+
     /// D25: `git -c merge.log=false merge --no-ff --no-edit -m "htui: reconcile <step>" <after>`
     /// in the primary checkout, under the four identity variables. Plan D148: `merge.log` is off
     /// so a primary that sets it still gets D25's exact message; `--no-verify` is not passed, so
@@ -730,28 +771,27 @@ impl Cli {
         before: &str,
         after: &str,
     ) -> Result<Merged, IsolateError> {
-        let cli = self.clone();
-        let (primary, before, after) = (primary.to_path_buf(), before.to_owned(), after.to_owned());
-        detached("merge", async move {
-            cli.merge_no_ff_reading(&primary, step, &before, &after, conflicted_paths)
-                .await
-        })
-        .await
+        match self
+            .merge_no_ff_as(primary, &reconcile_message(step), before, after)
+            .await?
+        {
+            MergeAttempt::Merged(merged) => Ok(merged),
+            MergeAttempt::Conflicted(paths) => Err(IsolateError::Refused(merge_conflict(&paths))),
+        }
     }
 
-    /// [`merge_no_ff`](Cli::merge_no_ff) with the conflicted-paths read passed in: the only seam
+    /// [`merge_no_ff_as`](Cli::merge_no_ff_as) with the conflicted-paths read passed in: the only seam
     /// through which a test can make that read fail while leaving the index `--abort` needs intact.
     /// It runs on the caller's own task — it is the body [`detached`] runs — so its abort is the
     /// attached one.
     async fn merge_no_ff_reading(
         &self,
         primary: &Path,
-        step: StepId,
+        message: &str,
         before: &str,
         after: &str,
         read_conflicts: fn(&Path) -> Result<Vec<String>, IsolateError>,
-    ) -> Result<Merged, IsolateError> {
-        let message = reconcile_message(step);
+    ) -> Result<MergeAttempt, IsolateError> {
         let exited = self
             .run(
                 "merge",
@@ -763,7 +803,7 @@ impl Cli {
                     OsStr::new("--no-ff"),
                     OsStr::new("--no-edit"),
                     OsStr::new("-m"),
-                    OsStr::new(&message),
+                    OsStr::new(message),
                     OsStr::new(after),
                 ],
                 &IDENTITY_ENV,
@@ -780,7 +820,7 @@ impl Cli {
                     "the merge commit's parents are not [HEAD, after_hash]",
                 ));
             }
-            return Ok(Merged { commit });
+            return Ok(MergeAttempt::Merged(Merged { commit }));
         }
 
         // A lock, a conflict or anything else: read the paths first, because `--abort` throws the
@@ -807,7 +847,7 @@ impl Cli {
         } else if conflicted.is_empty() {
             Err(exited.failure("merge"))
         } else {
-            Err(IsolateError::Refused(merge_conflict(&conflicted)))
+            Ok(MergeAttempt::Conflicted(conflicted))
         }
     }
 
@@ -1602,6 +1642,13 @@ fn reconcile_message(step: StepId) -> String {
     format!("htui: reconcile {step}")
 }
 
+/// MOD-139 M3 D3: a pre-merge commit's message names the part step it merged. Never D25's
+/// reconcile subject, so [`reconcile_parent`] cannot misread a pre-merge as a reconcile.
+#[must_use]
+pub fn premerge_message(part: StepId) -> String {
+    format!("htui: premerge {part}")
+}
+
 /// The first parent of `after` when `after` is `step`'s own reconcile merge on the primary
 /// `checkout`, or `None` for any other commit (plan D141, D146).
 ///
@@ -2331,8 +2378,8 @@ mod tests {
         commit_file, commit_removal, empty_repo, has_object, repo_with_one_commit,
     };
     use super::{
-        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, NameOnly, SCRUBBED_ENV,
-        TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
+        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, MergeAttempt, NameOnly,
+        SCRUBBED_ENV, TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
     };
     use crate::isolate::IsolateError;
 
@@ -3617,6 +3664,114 @@ mod tests {
         assert!(!super::is_dirty(&repo).expect("status reads"));
     }
 
+    /// MOD-139 M3 D3: the detached merge under any message — a pre-merge's subject names the part
+    /// step it merged, and the post-condition is D25's two parents.
+    #[tokio::test]
+    async fn merge_no_ff_as_writes_the_given_message() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let part = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, part, htui_core::model::RunId::new(), &before)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "written", "by the part\n", "the part's work");
+
+        let attempt = git
+            .merge_no_ff_as(&repo, &super::premerge_message(part), &before, &after)
+            .await
+            .expect("a descendant merges");
+        let MergeAttempt::Merged(merged) = attempt else {
+            panic!("a descendant never conflicts: {attempt:?}");
+        };
+        assert_eq!(super::head(&repo).expect("HEAD reads"), merged.commit);
+        assert_eq!(
+            super::head_parents(&repo).expect("the parents read"),
+            vec![before, after],
+            "--no-ff, two parents [HEAD, after]"
+        );
+        let repository = super::open(&repo).expect("the repository opens");
+        let commit = repository.head_commit().expect("HEAD has a commit");
+        assert_eq!(
+            super::subject(commit.message_raw_sloppy()),
+            format!("htui: premerge {part}").as_bytes(),
+            "the subject is the message handed in, not D25's reconcile subject"
+        );
+        assert!(!repo.join(".git").join("MERGE_HEAD").exists());
+        assert!(!super::is_dirty(&repo).expect("status reads"));
+    }
+
+    /// MOD-139 M3 D3: a conflict is an answer, not an error — its paths, after `--abort` put the
+    /// tree back where it was.
+    #[tokio::test]
+    async fn merge_no_ff_as_reports_conflicted_paths_and_aborts() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let part = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, part, htui_core::model::RunId::new(), &base)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "f", "the part's line\n", "the part's work");
+        let before = commit_file(&repo, "f", "another part's line\n", "meanwhile");
+
+        let attempt = git
+            .merge_no_ff_as(&repo, &super::premerge_message(part), &before, &after)
+            .await
+            .expect("a conflict is not an error");
+        assert_eq!(attempt, MergeAttempt::Conflicted(vec!["f".to_owned()]));
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "--abort ran before the answer"
+        );
+        assert_eq!(super::head(&repo).expect("HEAD reads"), before);
+        assert!(!super::is_dirty(&repo).expect("status reads"), "and clean");
+    }
+
+    /// MOD-139 M3 D3: `merge_no_ff` keeps reconcile's refusal byte for byte, now built from the
+    /// paths `merge_no_ff_as` answers rather than recovered from a string.
+    #[tokio::test]
+    async fn merge_no_ff_keeps_its_conflict_refusal() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let step = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &base)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "f", "the agent's line\n", "the step's work");
+        let before = commit_file(&repo, "f", "the human's line\n", "meanwhile");
+
+        let err = git
+            .merge_no_ff(&repo, step, &before, &after)
+            .await
+            .expect_err("the two edits of `f` conflict");
+        let IsolateError::Refused(reason) = err else {
+            panic!("a conflict is a refusal: {err:?}");
+        };
+        assert_eq!(reason, super::merge_conflict(&["f".to_owned()]));
+        assert_eq!(reason, "merge_conflict: f");
+        assert_eq!(super::head(&repo).expect("HEAD reads"), before);
+    }
+
     /// D25's conflict branch: the path list, then `--abort`, then the refusal.
     #[tokio::test]
     async fn a_conflicting_merge_is_refused_with_the_path_and_aborted() {
@@ -3676,9 +3831,13 @@ mod tests {
         let before = commit_file(&repo, "f", "the human's line\n", "meanwhile");
 
         let err = git
-            .merge_no_ff_reading(&repo, step, &before, &after, |_| {
-                Err(IsolateError::Git("the index could not be read".to_owned()))
-            })
+            .merge_no_ff_reading(
+                &repo,
+                &super::reconcile_message(step),
+                &before,
+                &after,
+                |_| Err(IsolateError::Git("the index could not be read".to_owned())),
+            )
             .await
             .expect_err("the read failed");
         assert_eq!(err.to_string(), "git: the index could not be read");

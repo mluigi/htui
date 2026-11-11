@@ -35,9 +35,10 @@ use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
-    Isolation, Item, ItemId, ItemState, NewDocument, PhaseAgent, PhaseId, ProjectId,
-    PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree,
-    SnapshotPhase, StepId, UserId, VerifyOutcome, latest_graph_run,
+    Isolation, Item, ItemId, ItemState, NewDocument, PartMerge, PartPremerge, PhaseAgent, PhaseId,
+    PremergeReport, ProjectId, PromptTemplate, RepoId, RepoPremerge, ResolvedGraph, Run, RunId,
+    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
+    latest_graph_run,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -66,8 +67,8 @@ use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
-    ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
-    PreparedTree, ResetReport,
+    ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, PartTip,
+    Prepared, PreparedTree, ResetReport,
 };
 use crate::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
@@ -175,6 +176,40 @@ pub struct FakeIsolator {
     /// MOD-138 M3 T3: how many windows opened beside another step's open window while either of
     /// the two was in place (`local` or `shared_serialized`).
     in_place_overlaps: Mutex<u32>,
+    /// MOD-139 M3 T1: scripted `premerge` answers, FIFO, one consumed per call.
+    premerge_answers: Mutex<VecDeque<PremergeScript>>,
+    /// `(integrate step, part steps in the order handed)` per `premerge` call.
+    premerge_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
+    /// `premerge` calls so far, refusals and stalls included.
+    premerges: Mutex<u32>,
+    /// 1-based `premerge` calls that never return, with their signal (one-shot each).
+    premerge_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+    /// Scripted `unmerged` answers by part key, FIFO, one consumed per call.
+    unmerged_answers: Mutex<VecDeque<Vec<String>>>,
+    /// `(integrate step, part steps)` per `unmerged` call.
+    unmerged_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
+    /// 1-based `reset` calls that never return (counted by `resets`), with their signal.
+    reset_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+}
+
+/// One scripted `premerge` answer (by part key, blueprint P-15: part step ids are minted at
+/// admission, after a case starts its run).
+#[derive(Debug, Clone)]
+enum PremergeScript {
+    /// The default report, with `key` `Conflicted { paths }` in every repo it committed in and
+    /// the later parts that committed there `NotAttempted`.
+    Conflict { key: String, paths: Vec<String> },
+    /// `Err(IsolateError::Refused(reason))`.
+    Refuse(String),
+}
+
+/// Takes the entry for the 1-based `call` out of `stalls` (one-shot), answering its signal.
+fn stall_at(stalls: &Mutex<Vec<(u32, Arc<Notify>)>>, call: u32) -> Option<Arc<Notify>> {
+    let mut stalls = stalls
+        .lock()
+        .expect("no panic holds the fake isolator's lock");
+    let at = stalls.iter().position(|(n, _)| *n == call)?;
+    Some(stalls.remove(at).1)
 }
 
 /// One [`FakeIsolator`] call, as [`FakeIsolator::call_log`] records it (MOD-138 M3 T3).
@@ -192,6 +227,10 @@ pub enum IsolatorCall {
     Cleanup(RunId),
     /// `release` of the run's guards.
     Release(RunId),
+    /// MOD-139 M3: `premerge` of the **integrate** step's trees.
+    Premerge(StepId),
+    /// MOD-139 M3: `unmerged`, the post-check of the **integrate** step.
+    Unmerged(StepId),
 }
 
 /// Which of a step's two isolator windows is open (MOD-138 M3 T3).
@@ -513,6 +552,155 @@ impl FakeIsolator {
         (reached, resume)
     }
 
+    /// MOD-139 M3 T1: the next [`premerge`](Isolator::premerge) answers the default report, but
+    /// the part keyed `key` is `Conflicted { paths }` in every repo it committed in and every
+    /// later part that committed there `NotAttempted`; a part with no commits in a repo reads
+    /// `NoCommits` there, as GixIsolator answers (scripted by key, blueprint P-15). FIFO with
+    /// [`refuse_premerge`](Self::refuse_premerge).
+    pub fn conflict_premerge(&self, key: &str, paths: &[&str]) {
+        self.premerge_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(PremergeScript::Conflict {
+                key: key.to_owned(),
+                paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            });
+    }
+
+    /// MOD-139 M3 T1: the next [`premerge`](Isolator::premerge) fails with
+    /// `IsolateError::Refused(reason)`, which fails the step (plan D3).
+    pub fn refuse_premerge(&self, reason: &str) {
+        self.premerge_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(PremergeScript::Refuse(reason.to_owned()));
+    }
+
+    /// MOD-139 M3 T1: the `n`-th [`premerge`](Isolator::premerge) call (1-based) logs itself,
+    /// signals the returned [`Notify`] and then **never returns**: a crash mid-pre-merge.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn stall_nth_premerge(&self, n: u32) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.premerge_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&notify)));
+        notify
+    }
+
+    /// MOD-139 M3 T1: the `n`-th [`reset`](Isolator::reset) call (1-based, as
+    /// [`resets`](Self::resets) counts) logs itself, is counted, signals the returned [`Notify`]
+    /// and then **never returns**: a crash before a round's end reset.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn stall_nth_reset(&self, n: u32) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.reset_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&notify)));
+        notify
+    }
+
+    /// MOD-139 M3 T1: the next [`unmerged`](Isolator::unmerged) answers the steps of the parts
+    /// keyed `keys`, in the order the parts were handed (an unknown key is ignored). Unscripted,
+    /// it answers nothing.
+    pub fn script_unmerged(&self, keys: &[&str]) {
+        self.unmerged_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(keys.iter().map(|key| (*key).to_owned()).collect());
+    }
+
+    /// MOD-139 M3 T1: every [`premerge`](Isolator::premerge) call so far, as `(integrate step,
+    /// part steps in the order handed)`, refused and stalled ones included.
+    #[must_use]
+    pub fn premerge_requests(&self) -> Vec<(StepId, Vec<StepId>)> {
+        self.premerge_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// MOD-139 M3 T1: every [`unmerged`](Isolator::unmerged) call so far, as `(integrate step,
+    /// part steps in the order handed)`.
+    #[must_use]
+    pub fn unmerged_requests(&self) -> Vec<(StepId, Vec<StepId>)> {
+        self.unmerged_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// The default pre-merge report, with `conflict` (a part key and its paths) stopping every
+    /// repo at that part. Merge commits are `fake:merge:<part>:<n>`, `n` the hash counter's.
+    fn premerge_report(
+        &self,
+        trees: &[RunStepTree],
+        parts: &[PartTip],
+        conflict: Option<&(String, Vec<String>)>,
+    ) -> PremergeReport {
+        let repos = trees
+            .iter()
+            .map(|tree| {
+                let mut head = tree.base_ref.clone();
+                let mut stopped = false;
+                let parts = parts
+                    .iter()
+                    .map(|part| {
+                        // GixIsolator's `committed_tip`: an `after_hash` equal to its
+                        // `before_hash` committed nothing.
+                        let tip = part
+                            .commits
+                            .iter()
+                            .find(|commit| commit.repo_id == tree.repo_id)
+                            .and_then(|commit| {
+                                commit
+                                    .after_hash
+                                    .clone()
+                                    .filter(|after| *after != commit.before_hash)
+                            });
+                        // `premerge_repo`'s order: no commits before a stopped repo.
+                        let merge = if tip.is_none() {
+                            PartMerge::NoCommits
+                        } else if stopped {
+                            PartMerge::NotAttempted
+                        } else if let Some((_, paths)) =
+                            conflict.filter(|(key, _)| *key == part.key)
+                        {
+                            stopped = true;
+                            PartMerge::Conflicted {
+                                paths: paths.clone(),
+                            }
+                        } else {
+                            let commit = format!("fake:merge:{}:{}", part.step, self.tick());
+                            head.clone_from(&commit);
+                            PartMerge::Merged { commit }
+                        };
+                        PartPremerge {
+                            step: part.step,
+                            key: part.key.clone(),
+                            tip,
+                            merge,
+                        }
+                    })
+                    .collect();
+                RepoPremerge {
+                    repo_id: tree.repo_id,
+                    name: tree.repo_id.to_string(),
+                    head,
+                    parts,
+                }
+            })
+            .collect();
+        PremergeReport { repos }
+    }
+
     /// The stall's signal and, for a pause, its resume, when `call` is the stalled one, taking
     /// them (one-shot).
     fn reconcile_stall_at(&self, call: usize) -> Option<(Arc<Notify>, Option<Arc<Notify>>)> {
@@ -827,6 +1015,82 @@ impl Isolator for FakeIsolator {
         })
     }
 
+    /// MOD-139 M3 T1: logged first (under the integrate step), counted and recorded, then a
+    /// [`stall_nth_premerge`](FakeIsolator::stall_nth_premerge) stall, then the next script;
+    /// unscripted, the default report: per tree row every part with an `after_hash` there other
+    /// than its `before_hash` `Merged` (`fake:merge:<part>:<n>`) and the rest `NoCommits`, `head`
+    /// the last merge or the
+    /// row's `base_ref`. The fake merges nothing (blueprint G-5).
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        Box::pin(async move {
+            self.log(IsolatorCall::Premerge(step));
+            let call = {
+                let mut premerges = self
+                    .premerges
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                *premerges += 1;
+                *premerges
+            };
+            self.premerge_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push((step, parts.iter().map(|part| part.step).collect()));
+            if let Some(stalled) = stall_at(&self.premerge_stall, call) {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let script = self
+                .premerge_answers
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front();
+            match script {
+                Some(PremergeScript::Refuse(reason)) => Err(IsolateError::Refused(reason)),
+                Some(PremergeScript::Conflict { key, paths }) => {
+                    Ok(self.premerge_report(trees, parts, Some(&(key, paths))))
+                }
+                None => Ok(self.premerge_report(trees, parts, None)),
+            }
+        })
+    }
+
+    /// MOD-139 M3 T1: logged and recorded, then the next
+    /// [`script_unmerged`](FakeIsolator::script_unmerged) keys as the handed parts' steps, in the
+    /// order handed; unscripted, nothing.
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        Box::pin(async move {
+            let _ = (trees, heads);
+            self.log(IsolatorCall::Unmerged(step));
+            self.unmerged_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push((step, parts.iter().map(|part| part.step).collect()));
+            let keys = self
+                .unmerged_answers
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+                .unwrap_or_default();
+            Ok(parts
+                .iter()
+                .filter(|part| keys.contains(&part.key))
+                .map(|part| part.step)
+                .collect())
+        })
+    }
+
     /// `fake:group-base:<repo>` per repo: stable, and **not** drawn from the hash counter, whose
     /// `fake:base:<n>` ordinals milestone 2's cases pin (blueprint H-13).
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
@@ -953,10 +1217,19 @@ impl Isolator for FakeIsolator {
         Box::pin(async move {
             self.log(IsolatorCall::Reset(step));
             self.close_window(step, Window::Tree);
-            *self
-                .resets
-                .lock()
-                .expect("no panic holds the fake isolator's lock") += 1;
+            let call = {
+                let mut resets = self
+                    .resets
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                *resets += 1;
+                *resets
+            };
+            // MOD-139 M3 T1: a crash before the reset answers (the round's end reset, say).
+            if let Some(stalled) = stall_at(&self.reset_stall, call) {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
             let refusal = self
                 .reset_refusals
                 .lock()
@@ -3008,11 +3281,13 @@ mod tests {
     use htui_core::prompt::DiffBlock;
     use htui_core::store::{MemStore, ReadStore as _};
 
+    use super::IsolatorCall;
     use super::{FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep};
     use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
     use crate::isolate::{
-        ChangedPaths, Clock as _, EnvFiles, FanoutSlot, IsolateError, Isolator as _, ResetReport,
+        ChangedPaths, Clock as _, EnvFiles, FanoutSlot, IsolateError, Isolator as _, PartTip,
+        ResetReport,
     };
 
     /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
@@ -3403,6 +3678,326 @@ mod tests {
             "a scripted refusal answers once"
         );
         assert_eq!(isolator.resets(), 3, "every call is counted");
+    }
+
+    /// The rows a fake `premerge` or `unmerged` call is handed: one shared tree per repo of the
+    /// scope, and per part key a part whose commit rows carry `after_hash` in the repos named.
+    fn premerge_rows(
+        scope: &[RepoId],
+        parts: &[(&str, &[usize])],
+    ) -> (Vec<htui_core::model::RunStepTree>, Vec<PartTip>) {
+        let integrate = StepId::new();
+        let trees = scope
+            .iter()
+            .map(|repo| htui_core::model::RunStepTree {
+                run_step_id: integrate,
+                repo_id: *repo,
+                mode: Isolation::Worktree,
+                path: format!("/fake/trees/integrate/{repo}"),
+                base_ref: format!("fake:group-base:{repo}"),
+                dirty: false,
+            })
+            .collect();
+        let parts = parts
+            .iter()
+            .map(|(key, committed)| {
+                let step = StepId::new();
+                PartTip {
+                    step,
+                    key: (*key).to_owned(),
+                    trees: Vec::new(),
+                    commits: scope
+                        .iter()
+                        .enumerate()
+                        .map(|(at, repo)| htui_core::model::RunStepCommit {
+                            run_step_id: step,
+                            repo_id: *repo,
+                            before_hash: format!("fake:group-base:{repo}"),
+                            after_hash: committed
+                                .contains(&at)
+                                .then(|| format!("fake:after:{key}:{at}")),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        (trees, parts)
+    }
+
+    /// MOD-139 M3 T1: unscripted, the fake's pre-merge merges every committed part of every repo
+    /// in plan order and reads the rest `NoCommits`; `head` is the repo's last merge, else its
+    /// base. The call is logged first, under the integrate step, with the parts it was handed.
+    #[tokio::test]
+    async fn the_fake_premerge_merges_by_default_and_logs_first() {
+        use htui_core::model::PartMerge;
+
+        let isolator = FakeIsolator::new();
+        let scope = repos();
+        let (trees, parts) = premerge_rows(&scope, &[("api", &[0, 1]), ("ui", &[0])]);
+        let integrate = trees[0].run_step_id;
+
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("unscripted, the fake never refuses");
+        assert_eq!(report.repos.len(), 2, "one entry per tree row");
+        let first = &report.repos[0];
+        assert_eq!(first.repo_id, scope[0]);
+        assert_eq!(
+            first.name,
+            scope[0].to_string(),
+            "the fake names a repo by its id"
+        );
+        let merges: Vec<_> = first
+            .parts
+            .iter()
+            .map(|part| match &part.merge {
+                PartMerge::Merged { commit } => commit.clone(),
+                other => panic!("both parts committed in the first repo: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            first.parts.iter().map(|part| part.step).collect::<Vec<_>>(),
+            vec![parts[0].step, parts[1].step],
+            "plan order"
+        );
+        assert_eq!(first.parts[0].key, "api");
+        assert_eq!(first.parts[0].tip.as_deref(), Some("fake:after:api:0"));
+        assert!(merges[0].starts_with(&format!("fake:merge:{}:", parts[0].step)));
+        assert_eq!(first.head, merges[1], "head is the repo's last merge");
+
+        let second = &report.repos[1];
+        assert!(matches!(second.parts[0].merge, PartMerge::Merged { .. }));
+        assert_eq!(second.parts[1].merge, PartMerge::NoCommits);
+        assert_eq!(second.parts[1].tip, None);
+        let PartMerge::Merged { commit } = &second.parts[0].merge else {
+            unreachable!()
+        };
+        assert_eq!(&second.head, commit);
+
+        let (none, none_parts) = premerge_rows(&scope[..1], &[("api", &[])]);
+        let report = isolator
+            .premerge(integrate, &none, &none_parts)
+            .await
+            .expect("unscripted");
+        assert_eq!(
+            report.repos[0].head, none[0].base_ref,
+            "a repo with nothing merged keeps its base as head"
+        );
+
+        assert_eq!(
+            isolator.call_log(),
+            vec![
+                IsolatorCall::Premerge(integrate),
+                IsolatorCall::Premerge(integrate)
+            ]
+        );
+        assert_eq!(
+            isolator.premerge_requests(),
+            vec![
+                (integrate, vec![parts[0].step, parts[1].step]),
+                (integrate, vec![none_parts[0].step]),
+            ]
+        );
+        assert_eq!(
+            isolator
+                .premerge(integrate, &[], &parts)
+                .await
+                .expect("a repo-less run"),
+            htui_core::model::PremergeReport::default(),
+            "no tree, no repo entry (blueprint P-10)"
+        );
+    }
+
+    /// MOD-139 M3 T1 (blueprint P-15): a conflict scripted by part key stops every repo at that
+    /// part and marks the later ones `NotAttempted`; the script is FIFO and answers once.
+    #[tokio::test]
+    async fn a_scripted_premerge_conflict_stops_the_repo() {
+        use htui_core::model::PartMerge;
+
+        let isolator = FakeIsolator::new();
+        let scope = repos();
+        let (trees, parts) =
+            premerge_rows(&scope, &[("api", &[0, 1]), ("ui", &[0, 1]), ("docs", &[0])]);
+        let integrate = trees[0].run_step_id;
+
+        isolator.conflict_premerge("ui", &["src/ui/a.rs"]);
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("a conflict is not an error");
+        for repo in &report.repos {
+            let PartMerge::Merged { commit } = &repo.parts[0].merge else {
+                panic!("the part before the conflict merges: {:?}", repo.parts[0]);
+            };
+            assert_eq!(
+                repo.parts[1].merge,
+                PartMerge::Conflicted {
+                    paths: vec!["src/ui/a.rs".to_owned()]
+                }
+            );
+            assert_eq!(&repo.head, commit, "head stays at the last merge");
+        }
+        assert_eq!(
+            report.repos[0].parts[2].merge,
+            PartMerge::NotAttempted,
+            "a later part that committed in the stopped repo is not attempted"
+        );
+        assert_eq!(
+            report.repos[1].parts[2].merge,
+            PartMerge::NoCommits,
+            "a later part with no commits in the stopped repo reads `NoCommits`, as GixIsolator \
+             answers"
+        );
+        assert_eq!(report.repos[1].parts[2].tip, None);
+
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("unscripted again");
+        assert!(
+            report.repos[0]
+                .parts
+                .iter()
+                .all(|part| matches!(part.merge, PartMerge::Merged { .. })),
+            "the script answered once"
+        );
+    }
+
+    /// MOD-139 M3 T1: the fake reads a part's tip as GixIsolator's `committed_tip` does (an
+    /// `after_hash` equal to its `before_hash` committed nothing), so its report shapes are ones
+    /// the real isolator produces.
+    #[tokio::test]
+    async fn the_fake_premerge_reads_an_unmoved_tip_as_no_commits() {
+        use htui_core::model::PartMerge;
+
+        let isolator = FakeIsolator::new();
+        let scope = repos();
+        let (trees, mut parts) = premerge_rows(&scope[..1], &[("api", &[0]), ("ui", &[0])]);
+        let integrate = trees[0].run_step_id;
+        let unmoved = &mut parts[1].commits[0];
+        unmoved.after_hash = Some(unmoved.before_hash.clone());
+
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("unscripted");
+        let repo = &report.repos[0];
+        assert!(matches!(repo.parts[0].merge, PartMerge::Merged { .. }));
+        assert_eq!(
+            repo.parts[1].merge,
+            PartMerge::NoCommits,
+            "`after_hash == before_hash` committed nothing"
+        );
+        assert_eq!(repo.parts[1].tip, None);
+    }
+
+    /// MOD-139 M3 T1: a refused pre-merge is an error, and the call is still logged.
+    #[tokio::test]
+    async fn a_refused_premerge_is_an_error() {
+        let isolator = FakeIsolator::new();
+        let (trees, parts) = premerge_rows(&repos(), &[("api", &[0])]);
+        let integrate = trees[0].run_step_id;
+
+        isolator.refuse_premerge("x");
+        let err = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect_err("scripted");
+        assert!(
+            matches!(&err, IsolateError::Refused(reason) if reason == "x"),
+            "{err:?}"
+        );
+        assert_eq!(isolator.call_log(), vec![IsolatorCall::Premerge(integrate)]);
+        isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the refusal answered once");
+    }
+
+    /// MOD-139 M3 T1 (blueprint P-15): `unmerged` answers nothing unscripted, and a script by part
+    /// key answers those parts' steps in plan order, an unknown key ignored, once.
+    #[tokio::test]
+    async fn the_fake_unmerged_is_scripted_by_key_and_empty_by_default() {
+        let isolator = FakeIsolator::new();
+        let (trees, parts) =
+            premerge_rows(&repos(), &[("api", &[0]), ("ui", &[0]), ("docs", &[0])]);
+        let integrate = trees[0].run_step_id;
+        let heads: Vec<_> = Vec::new();
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("unscripted"),
+            Vec::<StepId>::new()
+        );
+        isolator.script_unmerged(&["docs", "nope", "api"]);
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("scripted"),
+            vec![parts[0].step, parts[2].step],
+            "plan order, the unknown key ignored"
+        );
+        assert!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("consumed")
+                .is_empty()
+        );
+        assert_eq!(
+            isolator.call_log(),
+            vec![IsolatorCall::Unmerged(integrate); 3],
+            "logged under the integrate step"
+        );
+        let handed = vec![parts[0].step, parts[1].step, parts[2].step];
+        assert_eq!(
+            isolator.unmerged_requests(),
+            vec![(integrate, handed.clone()); 3]
+        );
+    }
+
+    /// MOD-139 M3 T1: the `n`-th `premerge` and the `n`-th `reset` each log, signal and never
+    /// return; the calls before them answer as usual.
+    #[tokio::test]
+    async fn premerge_and_reset_stalls_never_return() {
+        let isolator = FakeIsolator::new();
+        let (trees, parts) = premerge_rows(&repos(), &[("api", &[0])]);
+        let integrate = trees[0].run_step_id;
+        let wait = std::time::Duration::from_millis(50);
+
+        let premerge = isolator.stall_nth_premerge(1);
+        let reset = isolator.stall_nth_reset(2);
+
+        let stalled = tokio::time::timeout(wait, isolator.premerge(integrate, &trees, &parts));
+        let (elapsed, ()) = tokio::join!(stalled, premerge.notified());
+        assert!(elapsed.is_err(), "the first premerge never answers");
+        isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the stall was one-shot");
+
+        isolator
+            .reset(integrate, &trees)
+            .await
+            .expect("the first reset answers");
+        let stalled = tokio::time::timeout(wait, isolator.reset(integrate, &trees));
+        let (elapsed, ()) = tokio::join!(stalled, reset.notified());
+        assert!(elapsed.is_err(), "the second reset never answers");
+        assert_eq!(isolator.resets(), 2, "the stalled reset was counted");
+        assert_eq!(
+            isolator.call_log(),
+            vec![
+                IsolatorCall::Premerge(integrate),
+                IsolatorCall::Premerge(integrate),
+                IsolatorCall::Reset(integrate),
+                IsolatorCall::Reset(integrate),
+            ],
+            "each stalled call was logged first"
+        );
     }
 
     /// D99 over F-I's re-key: `release(run)` drops the guard a step of that run holds, and only
@@ -3965,9 +4560,9 @@ mod tests {
         assert_eq!(
             isolator.call_log(),
             [
-                super::IsolatorCall::Reconcile(first),
-                super::IsolatorCall::Reconcile(first),
-                super::IsolatorCall::Reconcile(second),
+                IsolatorCall::Reconcile(first),
+                IsolatorCall::Reconcile(first),
+                IsolatorCall::Reconcile(second),
             ]
         );
         assert_eq!(isolator.in_place_overlaps(), 0, "no tree is in place");

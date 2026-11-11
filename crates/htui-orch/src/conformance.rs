@@ -11329,6 +11329,8 @@ async fn call_log_of<O: Orchestrate>(orch: &O, run: RunId) -> Vec<String> {
             IsolatorCall::Capture(step) => format!("capture {}", name(step)),
             IsolatorCall::Reconcile(step) => format!("reconcile {}", name(step)),
             IsolatorCall::Reset(step) => format!("reset {}", name(step)),
+            IsolatorCall::Premerge(step) => format!("premerge {}", name(step)),
+            IsolatorCall::Unmerged(step) => format!("unmerged {}", name(step)),
             IsolatorCall::Cleanup(id) => format!("cleanup {}", if id == run { "run" } else { "?" }),
             IsolatorCall::Release(id) => format!("release {}", if id == run { "run" } else { "?" }),
         })
