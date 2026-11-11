@@ -198,15 +198,21 @@ pub enum StepKind {
     /// artefact test; a finished part is `done` and never landed, an unfinished one is reset and
     /// failed `interrupted` for its node's next parts round to retry.
     Part,
+    /// MOD-139 M3 D8: a divided node's integrate step (`role = integrate`). Classified by the
+    /// plain artefact test; a finished one is post-checked over its recorded commits before it is
+    /// re-settled and landed, an unfinished one is reset (or parked) as a plain step.
+    Integrate,
 }
 
 impl StepKind {
-    /// A `part` row → Part (MOD-139 M2 D14, first); `fanout_index == -1` → Judge;
-    /// `phase.fan_out > 1` → Candidate; else Plain.
+    /// A `part` row → Part (MOD-139 M2 D14, first); an `integrate` row → Integrate (MOD-139 M3
+    /// D8); `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
     #[must_use]
     pub const fn of(step: &RunStep, phase: &SnapshotPhase) -> Self {
         if matches!(step.role, StepRole::Part) {
             Self::Part
+        } else if matches!(step.role, StepRole::Integrate) {
+            Self::Integrate
         } else if step.fanout_index == JUDGE_FANOUT_INDEX {
             Self::Judge
         } else if phase.fan_out > 1 {
@@ -239,7 +245,8 @@ pub enum Adjudication {
 /// D90/D92/D93 over one `running` step. Seven arguments, which is clippy's limit.
 ///
 /// Finished when the output document exists **and** either `finished_at` is set or the capture
-/// landed. For a plain step, a judge or a part (MOD-139 M2 D14) the capture landed when every
+/// landed. For a plain step, a judge, a part (MOD-139 M2 D14) or an integrate step (M3 D8) the
+/// capture landed when every
 /// repo of `run_scope` has a
 /// `run_step_commit` row and at least one of them has an `after_hash`: stage 2 gives every scope
 /// repo a row, and stage 5's capture batch lands in one transaction, so one `after_hash` proves
@@ -264,7 +271,7 @@ pub fn classify(
     let changed = |repo: &RepoId| row(repo).is_some_and(|row| row.after_hash.is_some());
     let captured = match kind {
         StepKind::Candidate => run_scope.iter().all(changed),
-        StepKind::Plain | StepKind::Judge | StepKind::Part => {
+        StepKind::Plain | StepKind::Judge | StepKind::Part | StepKind::Integrate => {
             run_scope.iter().all(|repo| row(repo).is_some())
                 && (run_scope.is_empty() || run_scope.iter().any(changed))
         }
@@ -1343,6 +1350,60 @@ mod tests {
         let none = [commit(&part, first, None), commit(&part, second, None)];
         let answer = classify(&part, &fanned, &[first, second], &trees, &none, true, &[]);
         assert_eq!(answer, (StepKind::Part, Adjudication::Reset));
+    }
+
+    /// MOD-139 M3 D8: an integrate row is its own kind and is classified by the plain artefact
+    /// test: one `after_hash` proves its capture; none is resettable in a separate tree; a dirty
+    /// in-place tree is never reset.
+    #[test]
+    fn an_integrate_row_classifies_by_the_plain_rule() {
+        let mut integrate = step(3, 1, 0, StepStatus::Running);
+        integrate.role = StepRole::Integrate;
+        assert_eq!(StepKind::of(&integrate, &implement()), StepKind::Integrate);
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&integrate, first, Isolation::Worktree, false),
+            tree(&integrate, second, Isolation::Worktree, false),
+        ];
+        let one = [
+            commit(&integrate, first, Some("after-1")),
+            commit(&integrate, second, None),
+        ];
+        let scope = [first, second];
+        assert_eq!(
+            classify(&integrate, &implement(), &scope, &trees, &one, true, &[]),
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            )
+        );
+        let none = [
+            commit(&integrate, first, None),
+            commit(&integrate, second, None),
+        ];
+        assert_eq!(
+            classify(&integrate, &implement(), &scope, &trees, &none, true, &[]),
+            (StepKind::Integrate, Adjudication::Reset)
+        );
+        let dirty = [tree(&integrate, first, Isolation::SharedSerialized, true)];
+        assert!(matches!(
+            classify(&integrate, &implement(), &[first], &dirty, &[], false, &[]),
+            (StepKind::Integrate, Adjudication::NeverReset { .. })
+        ));
+        assert_eq!(
+            classify(&integrate, &implement(), &[], &[], &[], true, &[]),
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            ),
+            "an empty scope proves the capture vacuously"
+        );
     }
 
     #[test]

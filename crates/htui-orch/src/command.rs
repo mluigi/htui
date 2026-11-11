@@ -785,6 +785,37 @@ pub fn answer_gate_enabled(
     Ok(())
 }
 
+/// MOD-139 M3 D6 (Confirm 3): `Err(IntegrateIncomplete)` for an `awaiting_approval` integrate
+/// row `parked_unmerged` (`gate::parked_unmerged`) read true; `Ok(())` for every other row.
+/// Called for the answers that land a step, `Approved` and `Skipped` (blueprint P-2); `Rejected`
+/// and `RetryStep` stay open.
+///
+/// # Errors
+/// [`EngineError::IntegrateIncomplete`].
+pub fn unmerged_park(step: &RunStep, parked_unmerged: bool) -> Result<(), EngineError> {
+    if step.role == StepRole::Integrate
+        && step.status == StepStatus::AwaitingApproval
+        && parked_unmerged
+    {
+        return Err(EngineError::IntegrateIncomplete { step: step.id });
+    }
+    Ok(())
+}
+
+/// MOD-139 M3 ruling R-1 (and Confirm 3, blueprint P-3): no integrate row is promoted. A park on
+/// `integrate_incomplete` answers [`unmerged_park`]'s refusal; every other integrate row
+/// [`EngineError::PromoteIntegrate`]. `Ok(())` for every other row.
+///
+/// # Errors
+/// [`EngineError::IntegrateIncomplete`] or [`EngineError::PromoteIntegrate`].
+pub fn integrate_promotion(step: &RunStep, parked_unmerged: bool) -> Result<(), EngineError> {
+    if step.role != StepRole::Integrate {
+        return Ok(());
+    }
+    unmerged_park(step, parked_unmerged)?;
+    Err(EngineError::PromoteIntegrate { step: step.id })
+}
+
 /// §6.2's "Enabled when" for `retry` (`docs/ANA-2.md:1561`): the step is `awaiting_approval` or
 /// `failed`, and the attempt about to be created is within budget.
 ///
@@ -1428,9 +1459,9 @@ mod tests {
 
     use super::{
         EngineError, GateAnswer, UnblockCase, accept_enabled, answer_gate_enabled, cleanup_enabled,
-        close_out_enabled, node_of, nothing_is_blocked, operator_row, promote_enabled,
-        retry_admitted, retry_enabled, retry_group_enabled, run_is_walking, run_waits_at_a_gate,
-        select_enabled, start_enabled, unblock_enabled,
+        close_out_enabled, integrate_promotion, node_of, nothing_is_blocked, operator_row,
+        promote_enabled, retry_admitted, retry_enabled, retry_group_enabled, run_is_walking,
+        run_waits_at_a_gate, select_enabled, start_enabled, unblock_enabled, unmerged_park,
     };
     use crate::status::{Cursor, resumable};
 
@@ -1541,6 +1572,65 @@ mod tests {
                 "step {} is a `stage` row; htui drives it, not an operator verb",
                 step.id
             )
+        );
+    }
+
+    /// MOD-139 M3 Confirm 3 and ruling R-1: only an `awaiting_approval` integrate row parked on
+    /// its own `integrate_incomplete` refuses a landing answer; every integrate row refuses a
+    /// promotion, the park in its own words; no other row is touched.
+    #[test]
+    fn unmerged_park_refuses_only_a_parked_integrate() {
+        use htui_core::model::StepRole;
+        let (mut step, _) = review();
+        step.status = StepStatus::AwaitingApproval;
+        assert!(unmerged_park(&step, true).is_ok(), "not an integrate row");
+        assert!(
+            integrate_promotion(&step, true).is_ok(),
+            "not an integrate row"
+        );
+        step.role = StepRole::Integrate;
+        assert!(unmerged_park(&step, false).is_ok(), "an `ok` settle's park");
+        let parked = unmerged_park(&step, true).expect_err("the park is refused");
+        assert!(
+            matches!(parked, EngineError::IntegrateIncomplete { step: id } if id == step.id),
+            "{parked:?}"
+        );
+        assert_eq!(
+            parked.to_string(),
+            format!(
+                "step {} is parked on integrate_incomplete: approving, skipping or promoting it \
+                 would land it without a part; retry it instead",
+                step.id
+            )
+        );
+        assert!(
+            matches!(
+                integrate_promotion(&step, true),
+                Err(EngineError::IntegrateIncomplete { .. })
+            ),
+            "the park's own sentence first"
+        );
+        let promoted = integrate_promotion(&step, false).expect_err("no integrate is promoted");
+        assert!(
+            matches!(promoted, EngineError::PromoteIntegrate { step: id } if id == step.id),
+            "{promoted:?}"
+        );
+        assert_eq!(
+            promoted.to_string(),
+            format!(
+                "step {} is an integrate step: promoting it would land it without its \
+                 post-check; answer or retry it instead",
+                step.id
+            )
+        );
+        step.status = StepStatus::Running;
+        assert!(unmerged_park(&step, true).is_ok(), "not parked");
+        assert!(
+            matches!(
+                integrate_promotion(&step, false),
+                Err(EngineError::PromoteIntegrate { .. })
+            ),
+            "a running integrate is not promoted either"
         );
     }
 

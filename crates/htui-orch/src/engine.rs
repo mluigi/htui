@@ -1427,6 +1427,14 @@ where
 
         let has_output = self.output_of(item, &phase, step.id).await?.is_some();
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
+        // MOD-139 M3 Confirm 3 (P-1, P-2): an approve or a skip would land an integrate parked on
+        // a part its capture does not hold; the park's reason is the item note (boxed read).
+        if step.role == StepRole::Integrate
+            && matches!(answer, GateAnswer::Approved | GateAnswer::Skipped)
+        {
+            let notes = Box::pin(self.parts.store.notes(item)).await?;
+            crate::command::unmerged_park(&step, gate::parked_unmerged(&notes, &step))?;
+        }
         self.answer_guarded(&run, &snapshot, &step, &phase, answer)
             .await
             .map(|rest| CommandOutcome::Answered { rest })
@@ -2084,6 +2092,13 @@ where
         let item = self.item(Self::item_of(&run)?).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
         crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
+        // MOD-139 M3 Confirm 3 (P-3) and ruling R-1: no integrate row is promoted, since an
+        // accepted promotion would land it before its post-check; a park on
+        // `integrate_incomplete` says so in its own words (boxed read).
+        if row.role == StepRole::Integrate {
+            let notes = Box::pin(self.parts.store.notes(item.id)).await?;
+            crate::command::integrate_promotion(&row, gate::parked_unmerged(&notes, &row))?;
+        }
 
         // Plan D108's order: after the pure guard and before the first write.
         self.take_lease(run.id).await?;
@@ -3566,6 +3581,34 @@ where
             (StepKind::Part, Adjudication::NeverReset { .. }) => {
                 self.never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
                     .await
+            }
+            // MOD-139 M3 D8: a finished integrate, before the `(_, Finished)` arm that would land
+            // it unchecked (M2 G-6's lesson): its post-check over the recorded commits feeds the
+            // re-settle, so an unmerged part fails it rather than lands it. Each await boxed (the
+            // stack rule). Reset and NeverReset stay on the plain arms.
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify,
+                    verify_exit_code,
+                },
+            ) => {
+                self.finish_recovered(step, verify, verify_exit_code, now)
+                    .await?;
+                let stage = Box::pin(self.integrate_stage(run, snapshot, phase)).await?;
+                let parts = Box::pin(self.unmerged_keys(step, &stage, &trees, &commits)).await?;
+                let settled = recover::resettle(
+                    output.as_ref(),
+                    verify,
+                    snapshot.reads_verdict(&phase.name),
+                    step.started_at.unwrap_or(now),
+                    now,
+                    Some(Unmerged {
+                        node: crate::divide::divided_name(phase),
+                        parts: &parts,
+                    }),
+                );
+                Box::pin(self.land_recovered(run, snapshot, phase, step, settled)).await
             }
             (
                 _,
