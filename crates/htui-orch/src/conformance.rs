@@ -615,7 +615,7 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// a planner slot cut short (by a store error at a part, or before the planner row) replays on
 /// the resumed walk.
 ///
-/// **Thirteen for MOD-139 M3 T3** (plan D1-D9, Confirm 2(a), 3; ruling R-1): integrate runs. A
+/// **Fourteen for MOD-139 M3 T3** (plan D1-D9, Confirm 2(a), 3; ruling R-1; T3 repair 2): integrate runs. A
 /// two-part run lands one integrate merge, its third reconcile; a conflicted pre-merge reaches the
 /// agent as its prompt section and the item note, and the run lands; a part the post-check finds
 /// unmerged fails `integrate_incomplete` and retries, or takes the divided node's `fails` edge and
@@ -623,8 +623,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// crash mid-pre-merge, fails an unmerged session rather than landing it, lands a `done`
 /// integrate through the frontier once, prepares a `shared_serialized` integrate from the base
 /// refs after a cut round, and parks a dirty in-place one; approve, skip and promote are refused
-/// on an `integrate_incomplete` park; a refused pre-merge fails the run; and no integrate row is
-/// promoted.
+/// on an `integrate_incomplete` park, and approve and skip on any integrate park whose re-run
+/// post-check still finds a part unmerged; a refused pre-merge fails the run; and no integrate row
+/// is promoted.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
