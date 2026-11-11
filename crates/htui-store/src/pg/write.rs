@@ -7155,7 +7155,8 @@ impl WriteStore for PgStore {
     /// run (`(run_id, parent_step_id)`'s key, MOD-139 M1 F1) is refused in `MemStore`'s sentence
     /// through [`parent_fk_refused`]. [`run_step_refusal`] first,
     /// before any statement (MOD-139 blueprint P-7), so both stores refuse a part without its
-    /// parent or key, or a stage off its reserved positions, in one sentence.
+    /// parent or key, a step that names itself as its parent (MOD-139 M1 R1; 0028's self-parent
+    /// CHECK is the database's backstop), or a stage off its reserved positions, in one sentence.
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         if let Some(refusal) = run_step_refusal(&new) {
             return Err(StoreError::Constraint(refusal));

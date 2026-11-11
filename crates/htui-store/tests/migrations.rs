@@ -6609,13 +6609,14 @@ async fn insert_role_step(
     .await
 }
 
-/// MOD-139 plan D1 (blueprint §T1.2 rows 3, 5-8, P-2): `0028_divided_fanout.sql`'s three
+/// MOD-139 plan D1 (blueprint §T1.2 rows 3, 5-8, P-2): `0028_divided_fanout.sql`'s four
 /// `run_step` CHECKs and the parent foreign key. A planner, a part under it with a key, and the
 /// stage rows at -1 and -3 are admitted. A stage outside -3..-1, a stage with an unknown or a NULL
 /// key, a `step` at a negative position, a part missing its parent or its key, an unknown role,
-/// an unknown parent and a parent of another run (MOD-139 M1 F1: the foreign key is
-/// `(run_id, parent_step_id)`) are each refused by the one rule that names them. A step that is
-/// its own parent still passes: the key is checked once the row is in.
+/// an unknown parent, a parent of another run (MOD-139 M1 F1: the foreign key is
+/// `(run_id, parent_step_id)`) and a step that is its own parent (MOD-139 M1 R1: the foreign key
+/// alone would pass it, since it is checked once the row is in) are each refused by the one rule
+/// that names them.
 #[cfg(feature = "demo")]
 #[tokio::test]
 async fn the_0028_step_role_checks_refuse_what_they_name() {
@@ -6753,22 +6754,27 @@ async fn the_0028_step_role_checks_refuse_what_they_name() {
         "fk_run_step_parent_step",
         "a part under a planner of another run",
     );
-    let own: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO run_step (id, run_id, position, phase_name, role, parent_step_id, node_key) \
-         SELECT x, $1, 77, 'implement', 'part', x, 'implement/self' \
-         FROM (SELECT gen_random_uuid() AS x) AS fresh RETURNING id",
+    assert_refused(
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO run_step (id, run_id, position, phase_name, role, parent_step_id, node_key) \
+             SELECT x, $1, 77, 'implement', 'part', x, 'implement/self' \
+             FROM (SELECT gen_random_uuid() AS x) AS fresh RETURNING id",
+        )
+        .bind(run)
+        .fetch_one(pool)
+        .await,
+        "23514",
+        "chk_run_step_parent_not_self",
+        "a step that is its own parent",
+    );
+    let listed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM run_step WHERE run_id = $1 AND parent_step_id = id",
     )
     .bind(run)
     .fetch_one(pool)
     .await
-    .expect("a step that is its own parent is admitted");
-    let parent: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT parent_step_id FROM run_step WHERE id = $1")
-            .bind(own)
-            .fetch_one(pool)
-            .await
-            .expect("read the self-parented step back");
-    assert_eq!(parent, Some(own), "the self-parented step names itself");
+    .expect("count self-parented steps");
+    assert_eq!(listed, 0, "no step names itself as its parent");
 
     db.drop_db().await;
 }

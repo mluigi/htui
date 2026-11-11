@@ -6691,12 +6691,11 @@ impl State {
                 "agent",
             )));
         }
-        // Postgres checks the parent's foreign key once the row is in, so a step that names
-        // itself as its parent passes there and here. The key is (run_id, parent_step_id)
-        // (MOD-139 M1 F1): a step of another run is no parent, in the same words as an unknown
-        // one, which is how PgStore words the key's violation.
+        // A step that names itself as its parent was refused above (MOD-139 M1 R1), so the parent
+        // is always another row. The key is (run_id, parent_step_id) (MOD-139 M1 F1): a step of
+        // another run is no parent, in the same words as an unknown one, which is how PgStore
+        // words the key's violation.
         if let Some(parent) = new.parent_step_id
-            && parent != new.id
             && self
                 .steps
                 .get(&parent)

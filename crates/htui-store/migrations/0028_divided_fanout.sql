@@ -17,8 +17,9 @@
 -- foreign keys are composite, onto uq_run_step_run_id (run_id, id), as 0020's edges reference
 -- uq_step_graph_phase_graph_id. A cross-run parent would otherwise let one project's delete
 -- cascade into another project's steps and plans (MOD-139 M1 F1). MATCH SIMPLE leaves a NULL
--- parent unchecked, and a step that names itself as its parent still passes: the key is checked
--- once the row is in.
+-- parent unchecked. The key alone would pass a step that names itself as its parent (it is
+-- checked once the row is in), so chk_run_step_parent_not_self refuses one (MOD-139 M1 R1): a
+-- part's parent is its planner, a consult's the step that spawned it, never the row itself.
 --
 -- run_plan is one revision of a run's plan (§7.2), append-only in revisions: UNIQUE (run_id,
 -- revision), inserted as 'proposed'; afterwards only status moves, and base_refs is set by the
@@ -42,6 +43,7 @@ ALTER TABLE run_step
   ADD COLUMN parent_step_id UUID,
   ADD CONSTRAINT fk_run_step_parent_step FOREIGN KEY (run_id, parent_step_id)
     REFERENCES run_step (run_id, id) ON DELETE CASCADE,
+  ADD CONSTRAINT chk_run_step_parent_not_self CHECK (parent_step_id IS DISTINCT FROM id),
   ADD COLUMN node_key TEXT,
   ADD CONSTRAINT chk_run_step_part
     CHECK (role <> 'part' OR (parent_step_id IS NOT NULL AND node_key IS NOT NULL)),

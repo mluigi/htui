@@ -2796,13 +2796,17 @@ pub fn phase_name_refusal(name: &str) -> Option<String> {
 /// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` and `chk_run_step_stage` of
 /// `0028_divided_fanout.sql`, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
 /// both stores give; `None` when the row may be written. Judged before any read. In order: a part
-/// names its parent step and its node key; a stage sits at -3..-1; a negative position is a stage's
-/// only; a stage's key is one of [`STAGE_KEYS`]; then the NUL.
+/// names its parent step and its node key; a step is not its own parent (the self-parent CHECK,
+/// MOD-139 M1 R1); a stage sits at -3..-1; a negative position is a stage's only; a stage's key is
+/// one of [`STAGE_KEYS`]; then the NUL.
 #[must_use]
 pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     let stage = new.role == StepRole::Stage;
     if new.role == StepRole::Part && (new.parent_step_id.is_none() || new.node_key.is_none()) {
         return Some("a part step names its parent step and its node key".to_owned());
+    }
+    if new.parent_step_id == Some(new.id) {
+        return Some("a step is not its own parent".to_owned());
     }
     if stage && !(-3..=-1).contains(&new.position) {
         return Some(format!(
@@ -4426,6 +4430,20 @@ mod tests {
             refused(row(StepRole::Part, 5, parent, None)).as_deref(),
             Some(part)
         );
+
+        // The self-parent CHECK (MOD-139 M1 R1): any other step may be the parent, never the row
+        // itself, whatever its role.
+        assert_eq!(refused(row(StepRole::Consult, 2, parent, None)), None);
+        let own = "a step is not its own parent";
+        for (role, key) in [
+            (StepRole::Step, None),
+            (StepRole::Consult, None),
+            (StepRole::Part, Some("implement/api")),
+        ] {
+            let mut new = row(role, 2, None, key);
+            new.parent_step_id = Some(new.id);
+            assert_eq!(refused(new).as_deref(), Some(own), "{role}");
+        }
 
         // chk_run_step_stage.
         assert_eq!(

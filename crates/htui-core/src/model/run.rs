@@ -546,7 +546,7 @@ pub struct NewRunStep {
     pub model: Option<String>,
     /// `run_step.role` (MOD-139 D3); [`StepRole::Step`] at every engine site in M1 (D7).
     pub role: StepRole,
-    /// `run_step.parent_step_id` (MOD-139 D3); a part's planner step.
+    /// `run_step.parent_step_id` (MOD-139 D3); a part's planner step, never the step itself.
     pub parent_step_id: Option<StepId>,
     /// `run_step.node_key` (MOD-139 D3); a part's `<divided>/<part_key>`, a stage's key.
     pub node_key: Option<String>,
