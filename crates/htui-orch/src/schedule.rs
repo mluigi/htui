@@ -24,6 +24,11 @@
 //!      skipped; two-way, the lower position goes first). Without it (b) would admit both, and
 //!      the consumer's stage 3 would meet `MissingInput` or read an older run's document.
 //!
+//!    - (f) MOD-139 M2 D2: a cursor that admits a plan (a `Run` on a planner row) is not admitted
+//!      beside another in flight or taken. Each reads the run's rows and plans for its revision and
+//!      `base_position` before its own `admit_plan`, so two at once would claim the same slots on
+//!      a store whose reads yield, and the store would refuse the second.
+//!
 //!    **No deadlock (R1).** When nothing is in flight and nothing was admitted, but a candidate
 //!    passed (a) to (d) and waits only on (e), the waits form a cycle among incomparable
 //!    nodes: the lowest-position such candidate is admitted alone. Its stage 3 reads the kind as
@@ -36,7 +41,9 @@
 
 use std::collections::BTreeMap;
 
-use htui_core::model::{GraphSnapshot, Isolation, RunStatus, RunStep, SnapshotPhase, StepStatus};
+use htui_core::model::{
+    GraphSnapshot, Isolation, RunStatus, RunStep, SnapshotPhase, StepRole, StepStatus,
+};
 
 use crate::status::{Cursor, position_of};
 use crate::walk::Graph;
@@ -51,6 +58,8 @@ pub(crate) struct Flight {
     pub touches: bool,
     /// Whether its node's trees are the primary checkout (`local`, `shared_serialized`).
     pub in_place: bool,
+    /// Whether it admits a plan: a `Run` on a planner row (MOD-139 M2 D2), rule (f).
+    pub admits: bool,
 }
 
 /// What one pass of the concurrent walk does (blueprint §3.3).
@@ -154,6 +163,10 @@ pub(crate) fn plan_pass(
         if !taken.is_empty() && weight.saturating_add(flight.weight) > cap {
             continue;
         }
+        // (f) MOD-139 M2 D2: one plan admission at a time.
+        if flight.admits && taken.iter().any(|(_, held)| held.admits) {
+            continue;
+        }
         // (e) R1: a node that starts sessions waits for the incomparable producers of its inputs.
         if matches!(
             cursor,
@@ -207,6 +220,9 @@ fn candidate(
         } => (0, false),
         Cursor::Rest { .. } | Cursor::Finished => return None,
     };
+    let admits = matches!(cursor, Cursor::Run(id) if steps
+        .iter()
+        .any(|step| step.id == *id && step.role == StepRole::Planner));
     Some((
         position,
         Flight {
@@ -216,6 +232,7 @@ fn candidate(
                 phase.isolation,
                 Isolation::Local | Isolation::SharedSerialized
             ),
+            admits,
         },
     ))
 }
@@ -256,6 +273,7 @@ mod tests {
             weight,
             touches,
             in_place,
+            admits: false,
         }
     }
 
@@ -753,6 +771,79 @@ mod tests {
             ),
             PassPlan::Wait,
             "`b` in flight is unfinished"
+        );
+    }
+
+    /// MOD-139 M2 D2 (rule (f), T3 repair): two planners on parallel branches are admitted one at
+    /// a time. Each reads the run's rows and plans for its revision and `base_position` before
+    /// its own `admit_plan`, so two in flight would claim the same slots on a store that yields.
+    #[test]
+    fn planners_admit_one_at_a_time() {
+        let mut snapshot = diamond();
+        for phase in &mut snapshot.phases {
+            phase.isolation = Isolation::Worktree;
+        }
+        snapshot.phases[1].role = htui_core::model::NodeRole::Planner;
+        snapshot.phases[2].role = htui_core::model::NodeRole::Planner;
+        let a = done(&snapshot, "a");
+        let mut b = row(&snapshot, "b", 1, StepStatus::Pending);
+        b.role = StepRole::Planner;
+        let mut c = row(&snapshot, "c", 1, StepStatus::Pending);
+        c.role = StepRole::Planner;
+        let steps = [a, b.clone(), c.clone()];
+        let at = |steps: &[RunStep], cursors: &[Cursor], in_flight: &[(i32, Flight)]| {
+            plan_pass(
+                &snapshot,
+                steps,
+                RunStatus::Running,
+                cursors,
+                &in_flight.iter().copied().collect(),
+            )
+        };
+        let PassPlan::Admit(first) = at(&steps, &[Cursor::Run(b.id), Cursor::Run(c.id)], &[])
+        else {
+            panic!("a planner is admitted");
+        };
+        assert_eq!(
+            first,
+            [(
+                Cursor::Run(b.id),
+                1,
+                Flight {
+                    admits: true,
+                    ..flight(1, true, false)
+                }
+            )],
+            "the second planner waits for the first's admission"
+        );
+        let admitting = Flight {
+            admits: true,
+            ..flight(1, true, false)
+        };
+        assert_eq!(
+            at(&steps, &[Cursor::Run(c.id)], &[(1, admitting)]),
+            PassPlan::Wait,
+            "a planner waits on a planner in flight"
+        );
+        assert_eq!(
+            admitted(&at(
+                &steps,
+                &[Cursor::Run(c.id)],
+                &[(1, flight(1, true, false))]
+            )),
+            [2],
+            "beside a plain run a planner is admitted"
+        );
+        let mut plain = c;
+        plain.role = StepRole::Step;
+        assert_eq!(
+            admitted(&at(
+                &[b.clone(), plain.clone()],
+                &[Cursor::Run(plain.id)],
+                &[(1, admitting)]
+            )),
+            [2],
+            "beside a planner a plain run is admitted"
         );
     }
 }
