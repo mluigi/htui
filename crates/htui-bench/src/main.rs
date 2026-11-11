@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, bail};
 use clap::Parser as _;
 use htui_bench::run::{self, RunConfig};
-use htui_bench::{corpus, queries, report};
+use htui_bench::{Backend, corpus, queries, report};
 use htui_core::qdrant::QdrantUrl;
 use htui_store::qdrant_settings::QdrantSettings;
 
@@ -157,7 +157,34 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         "S recall@5 on duplicates: {}/{}",
         summary.thresholds.s_hit5_a, summary.thresholds.n_a
     );
+    if let Some(note) = error_note(&summary) {
+        eprintln!("{note}");
+    }
     Ok(())
+}
+
+/// A stderr line counting the failed calls per backend, so a backend that errored is not read
+/// as a real miss from the terminal; `None` when every call succeeded.
+fn error_note(summary: &report::Summary) -> Option<String> {
+    if summary.errors.is_empty() {
+        return None;
+    }
+    let per_backend: Vec<String> = Backend::ALL
+        .iter()
+        .filter_map(|&backend| {
+            let n = summary
+                .errors
+                .iter()
+                .filter(|e| e.backend == backend)
+                .count();
+            (n > 0).then(|| format!("{} {n}", backend.name()))
+        })
+        .collect();
+    Some(format!(
+        "htui-bench: {} failed calls ({}); see the Errors table in report.md",
+        summary.errors.len(),
+        per_backend.join(", ")
+    ))
 }
 
 fn validate(args: &SetArgs) -> anyhow::Result<()> {
@@ -333,6 +360,29 @@ mod tests {
         assert_eq!(args.b, PathBuf::from("b"));
         assert!(parse(&["compare", "only-one"]).is_err());
         assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn error_note_counts_failed_calls_per_backend() {
+        let row = |query: &str, backend| report::ErrorRow {
+            query: query.into(),
+            backend,
+            message: "boom".into(),
+        };
+        let mut summary = report::Summary::default();
+        assert_eq!(error_note(&summary), None);
+        summary.errors = vec![
+            row("d02", Backend::H),
+            row("a01", Backend::S),
+            row("a02", Backend::S),
+        ];
+        assert_eq!(
+            error_note(&summary).as_deref(),
+            Some(
+                "htui-bench: 3 failed calls (S 2, H 1); \
+                 see the Errors table in report.md"
+            )
+        );
     }
 
     #[test]
