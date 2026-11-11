@@ -461,7 +461,9 @@ impl Backend {
     ) -> Result<ScopeKeys> {
         match self {
             Self::Online { pg, .. } => pg.waiting_keys(workspace, ids).await,
-            Self::Memory(_) | Self::Offline { .. } => self.waiting_keys_by_project(workspace, ids).await,
+            Self::Memory(_) | Self::Offline { .. } => {
+                self.waiting_keys_by_project(workspace, ids).await
+            }
         }
     }
 

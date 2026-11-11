@@ -1531,7 +1531,11 @@ async fn the_mirror_answers_waiting_keys_like_postgres() {
         .await
         .expect("pg waiting_keys with a workspace");
     assert_eq!(wide.scope_row, Some(ids::PROJECT_SCOPE_PLATFORM));
-    assert_eq!(wide.projects.len(), members.len() + 2, "members, bare and the scope row");
+    assert_eq!(
+        wide.projects.len(),
+        members.len() + 2,
+        "members, bare and the scope row"
+    );
     assert_eq!(
         keys_of(&wide, ids::PROJECT_SCOPE_PLATFORM).map(|(_, prefixes)| prefixes),
         Some(vec!["WS"]),
@@ -1549,13 +1553,26 @@ async fn the_mirror_answers_waiting_keys_like_postgres() {
         let (slug, prefixes) = keys_of(&wide, *member).expect("a member is listed");
         assert_eq!(
             slug,
-            db.store.project(*member).await.expect("pg project").expect("held").slug
+            db.store
+                .project(*member)
+                .await
+                .expect("pg project")
+                .expect("held")
+                .slug
         );
         assert_eq!(prefixes, pg_prefixes, "in kind order, like item_kinds");
         assert!(prefixes.contains(&"FEAT"), "Platform's members share FEAT");
     }
-    assert_eq!(keys_of(&wide, bare), Some(("bare", vec![])), "no kinds, empty prefixes");
-    assert_eq!(keys_of(&wide, unknown), None, "a project the store does not hold");
+    assert_eq!(
+        keys_of(&wide, bare),
+        Some(("bare", vec![])),
+        "no kinds, empty prefixes"
+    );
+    assert_eq!(
+        keys_of(&wide, unknown),
+        None,
+        "a project the store does not hold"
+    );
 
     let narrow = db
         .store
@@ -1595,7 +1612,17 @@ async fn the_mirror_answers_waiting_keys_like_postgres() {
         cache: cache.clone(),
         since: Some(Utc::now()),
     };
+    // The scope row reached both ways, by id and through the workspace: listed once.
+    let both_ask = vec![ids::PROJECT_SCOPE_PLATFORM, members[0]];
+    let both = db
+        .store
+        .waiting_keys(Some(ids::WORKSPACE_PLATFORM), &both_ask)
+        .await
+        .expect("pg waiting_keys with the scope row asked by id too");
+    assert_eq!(both.scope_row, Some(ids::PROJECT_SCOPE_PLATFORM));
+    assert_eq!(both.projects.len(), 2, "the scope row once, and the member");
     for (workspace, ask, pg) in [
+        (Some(ids::WORKSPACE_PLATFORM), both_ask, both),
         (Some(ids::WORKSPACE_PLATFORM), asked.clone(), wide),
         (None, asked.clone(), narrow),
         (None, vec![ids::PROJECT_SCOPE_PLATFORM], by_id),
