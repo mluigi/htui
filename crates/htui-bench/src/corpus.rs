@@ -224,13 +224,15 @@ pub fn read_git(repo: &Path, rev: &str) -> anyhow::Result<Sources> {
     if kind.trim() != "tree" {
         bail!(missing());
     }
-    // `-z`: paths verbatim, never quoted.
+    // `-z`: paths verbatim, never quoted. `--full-tree`: the pathspec and the paths printed are
+    // from the root, as `git show <sha>:<path>` reads them, wherever `repo` sits in the checkout.
     let listing = git(
         repo,
         &[
             "ls-tree",
             "-r",
             "-z",
+            "--full-tree",
             "--name-only",
             &sha,
             "--",
@@ -1344,6 +1346,26 @@ not a continuation
         assert!(err.contains("HEAD"), "{err}");
         let err = format!("{:#}", from_disk.expect_err("disk: no docs/decisions"));
         assert!(err.contains("docs/decisions"), "{err}");
+    }
+
+    /// Wave-2 re-verify: `ls-tree`'s pathspec is relative to `git -C`'s directory, so a repo path
+    /// below the root listed nothing under `docs/decisions` and read as zero decisions.
+    #[test]
+    fn read_git_from_a_subdirectory_still_finds_every_decision() {
+        let repo = repo_root();
+        if resolve_commit(&repo, DEFAULT_PIN).is_err() {
+            eprintln!("skipped: {DEFAULT_PIN} unreachable");
+            return;
+        }
+        let sources = read_git(&repo.join("crates"), DEFAULT_PIN).expect("reads from crates/");
+        assert_eq!(sources.decisions.len(), 130);
+        assert!(
+            sources
+                .decisions
+                .iter()
+                .all(|(path, _)| path.starts_with("docs/decisions/")),
+            "paths are repo-relative"
+        );
     }
 
     #[test]
