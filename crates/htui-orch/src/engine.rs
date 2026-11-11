@@ -4581,7 +4581,8 @@ where
                 | ResolveError::ReviewFanOut { .. }
                 | ResolveError::LocalFanOut { .. }
                 | ResolveError::NoCandidate { .. }
-                | ResolveError::UnknownTouchedRepo { .. }),
+                | ResolveError::UnknownTouchedRepo { .. }
+                | ResolveError::DivideRefused { .. }),
             ) => {
                 let body = format!(
                     "live graph not comparable: run {run} walks its snapshot `{lifted}` \
@@ -10491,7 +10492,7 @@ pub async fn enqueue_divided_fake(
         }))?;
     let graphs = orch.graphs();
     let app = orch.store.app_settings().await?;
-    let resolved = Box::pin(graph::resolve_divided(
+    let resolved = Box::pin(graph::resolve(
         &orch.store,
         &graphs,
         &item,

@@ -27,7 +27,7 @@ use htui_core::model::{
     SnapshotPart, SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
     sort_snapshot_edges,
 };
-use htui_core::model::{MemoryState, SnapshotMemory};
+use htui_core::model::{MemoryState, PlanScope, SnapshotMemory};
 use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
@@ -330,9 +330,6 @@ pub enum NotRunnable {
         "a divided node that plans past its own parts (`plan_scope` `successors` or `graph`) runs from MOD-140 and MOD-141 on"
     )]
     PlanScope,
-    /// (a) A `divide` node, after its expansion is frozen (PRD Q1).
-    #[error("a `divide` node runs once divided fan-out lands (MOD-139)")]
-    Divide,
     /// (b) A palette node.
     #[error("a palette node is placed by a planner, which runs from MOD-140 on")]
     Palette,
@@ -411,7 +408,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
 ) -> std::result::Result<Resolved, ResolveError> {
-    Box::pin(resolve_with(
+    match Box::pin(resolve_or_refused(
         store,
         source,
         item,
@@ -419,66 +416,6 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         app,
         requested_scope,
         box_id,
-        false,
-    ))
-    .await
-}
-
-/// MOD-139 M2 D16: [`resolve`] with **only** the `NotRunnable::Divide` refusal lifted — the
-/// palette, the planner-agent (D17) and the `local` refusals, the validator and the caps all
-/// stand. Engine conformance builds divided runs through it; no `Engine` path calls it. M3
-/// deletes it with the refusal.
-///
-/// # Errors
-/// As [`resolve`].
-#[cfg(any(test, feature = "test-support"))]
-pub async fn resolve_divided<S: htui_core::store::WorkerStore, G: GraphSource>(
-    store: &S,
-    source: &G,
-    item: &Item,
-    mode: RunMode,
-    app: &BTreeMap<String, Value>,
-    requested_scope: Option<&[RepoId]>,
-    box_id: BoxId,
-) -> std::result::Result<Resolved, ResolveError> {
-    Box::pin(resolve_with(
-        store,
-        source,
-        item,
-        mode,
-        app,
-        requested_scope,
-        box_id,
-        true,
-    ))
-    .await
-}
-
-/// [`resolve`], with `lift_divide` lifting only the `NotRunnable::Divide` refusal (MOD-139 M2
-/// D16: `true` only through [`resolve_divided`]'s test seam).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "resolve's seven inputs plus the one D16 flag, which M3 deletes"
-)]
-async fn resolve_with<S: htui_core::store::WorkerStore, G: GraphSource>(
-    store: &S,
-    source: &G,
-    item: &Item,
-    mode: RunMode,
-    app: &BTreeMap<String, Value>,
-    requested_scope: Option<&[RepoId]>,
-    box_id: BoxId,
-    lift_divide: bool,
-) -> std::result::Result<Resolved, ResolveError> {
-    match Box::pin(resolve_or_refused_with(
-        store,
-        source,
-        item,
-        mode,
-        app,
-        requested_scope,
-        box_id,
-        lift_divide,
     ))
     .await?
     {
@@ -542,35 +479,6 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
     app: &BTreeMap<String, Value>,
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
-) -> std::result::Result<Resolution, ResolveError> {
-    Box::pin(resolve_or_refused_with(
-        store,
-        source,
-        item,
-        mode,
-        app,
-        requested_scope,
-        box_id,
-        false,
-    ))
-    .await
-}
-
-/// [`resolve_or_refused`], with `lift_divide` lifting only the `NotRunnable::Divide` refusal
-/// (MOD-139 M2 D16).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "resolve's seven inputs plus the one D16 flag, which M3 deletes"
-)]
-async fn resolve_or_refused_with<S: htui_core::store::WorkerStore, G: GraphSource>(
-    store: &S,
-    source: &G,
-    item: &Item,
-    mode: RunMode,
-    app: &BTreeMap<String, Value>,
-    requested_scope: Option<&[RepoId]>,
-    box_id: BoxId,
-    lift_divide: bool,
 ) -> std::result::Result<Resolution, ResolveError> {
     // Boxed: PgStore's read now holds a transaction, and the engine awaits this inside its own
     // futures (MOD-138 blueprint §4, the 2 MiB debug stack).
@@ -693,7 +601,7 @@ async fn resolve_or_refused_with<S: htui_core::store::WorkerStore, G: GraphSourc
         }
         Err(err) => return Err(err),
     }
-    if let Err(refusal) = not_yet_runnable(&phases, lift_divide) {
+    if let Err(refusal) = not_yet_runnable(&phases) {
         return Ok(Resolution::Refused {
             phases: unexpanded,
             refusal,
@@ -764,6 +672,11 @@ async fn resolve_or_refused_with<S: htui_core::store::WorkerStore, G: GraphSourc
         // a v1 run's resume, which keeps only these phases, never reads it.
         memory: None,
     };
+    // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
+    // expanded phases; after every `NotYetRunnable`, so each of those outranks it.
+    if let Some(refusal) = divide_refusal(&snapshot) {
+        return Err(refusal);
+    }
 
     Ok(Resolution::Resolved(Box::new(Resolved {
         snapshot,
@@ -814,14 +727,13 @@ fn live_graph_refusal(
 
 /// MOD-138 D6: what M1 freezes but cannot walk, first refusal wins: (0) MOD-139 M2 D17, the first
 /// planner node, in position order, whose divided node configures a planner agent (named by the
-/// divide phase; checked first, or the divide refusal would hide it); (a) unless `lift_divide`
-/// (D16's seam), the first node, in position order, that is not a `step` (an expanded `divide`
-/// node, named by the divide phase); (b) the first palette node. M2 lifted (c), the refusal of
-/// authored edges (D10): the readiness walker runs them.
-fn not_yet_runnable(
-    phases: &[SnapshotPhase],
-    lift_divide: bool,
-) -> std::result::Result<(), ResolveError> {
+/// divided node; checked first, so it beats every other divided-node refusal); (1) MOD-139 M3 D10,
+/// per planner node in position order, a divided node with no default parts (`NoParts`), then one
+/// whose `plan_scope` is neither unset nor `parts` (`PlanScope`); (b) the first palette node. M2
+/// lifted (c), the refusal of authored edges (D10): the readiness walker runs them; M3 lifted (a),
+/// the refusal of every divided node: a default-parts node runs, refused only by what admission
+/// would refuse ([`divide_refusal`]).
+fn not_yet_runnable(phases: &[SnapshotPhase]) -> std::result::Result<(), ResolveError> {
     let refuse = |node: &str, reason| {
         Err(ResolveError::NotYetRunnable {
             node: node.to_owned(),
@@ -840,13 +752,44 @@ fn not_yet_runnable(
             NotRunnable::PlannerAgent,
         );
     }
-    if !lift_divide && let Some(phase) = phases.iter().find(|phase| !phase.role.is_step()) {
-        return refuse(crate::divide::divided_name(phase), NotRunnable::Divide);
+    for phase in phases.iter().filter(|phase| phase.role == NodeRole::Planner) {
+        let name = crate::divide::divided_name(phase);
+        if phase
+            .divide
+            .as_ref()
+            .is_none_or(|divide| divide.default_parts.is_empty())
+        {
+            return refuse(name, NotRunnable::NoParts);
+        }
+        if !matches!(phase.plan_scope, None | Some(PlanScope::Parts)) {
+            return refuse(name, NotRunnable::PlanScope);
+        }
     }
     if let Some(phase) = phases.iter().find(|phase| phase.palette) {
         return refuse(&phase.name, NotRunnable::Palette);
     }
     Ok(())
+}
+
+/// MOD-139 M3 D10 (blueprint P-11): the first planner node, in position order, whose default
+/// parts `divide::admission_refusal` refuses, as [`ResolveError::DivideRefused`] named by the
+/// divided node. Run over the frozen snapshot (its settings and expanded phases), so resolve
+/// refuses before any run exists what admission would refuse once one did.
+fn divide_refusal(snapshot: &GraphSnapshot) -> Option<ResolveError> {
+    snapshot
+        .phases
+        .iter()
+        .filter(|phase| phase.role == NodeRole::Planner)
+        .find_map(|node| {
+            let mut parts = node.divide.as_ref()?.default_parts.clone();
+            parts.sort_by_key(|part| part.position);
+            crate::divide::admission_refusal(snapshot, node, &parts).map(|reason| {
+                ResolveError::DivideRefused {
+                    node: crate::divide::divided_name(node).to_owned(),
+                    reason,
+                }
+            })
+        })
 }
 
 /// MOD-138 M2 D10 and blueprint A7, over every fanned-out node in position order, first refusal
