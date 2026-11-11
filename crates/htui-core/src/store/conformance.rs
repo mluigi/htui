@@ -25704,7 +25704,7 @@ async fn a_persona_held_by_divide_columns_or_parts_is_not_deleted<S: WriteStore>
 /// MOD-137 D7 (blueprint §1.2, F13): every phase column, MOD-141 M2's deadline and judge
 /// included, on a kept node (the replace's `UPDATE`) and on a new one (the shared insert), and an
 /// `if` edge's JSON predicate read back field for field: the struct-order guard for the Postgres
-/// lists.
+/// lists. A kept node's deadline and judge then clear back to none (D1 replaced F14's keep).
 async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_round_trips_every_node_field";
     let (graph, phases) = scratch_graph(CASE, store, "every-field", &["plan", "split"]).await;
@@ -25811,6 +25811,43 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
             ..next
         }],
         "{CASE}: a `next` edge's JSON null predicate is stored as none"
+    );
+
+    // MOD-141 M2 D1 replaced F14's keep: a kept node takes the body's `None` too. A write that
+    // kept the stored deadline or judge when the body clears them reads the old values back here;
+    // the other kept node keeps its own.
+    let mut cleared = stored.clone();
+    cleared.nodes[1].phase.deadline_seconds = None;
+    cleared.nodes[1].phase.judge_agent_id = None;
+    cleared.nodes[1].phase.judge_model = None;
+    let back = applied(
+        CASE,
+        store
+            .replace_graph(graph, stored.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        back.nodes
+            .iter()
+            .map(|node| (
+                node.phase.name.as_str(),
+                node.phase.deadline_seconds,
+                node.phase.judge_agent_id,
+                node.phase.judge_model.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("plan", None, None, None),
+            ("split", None, None, None),
+            ("merge", Some(900), Some(ids::AGENT_CLAUDE), Some("opus")),
+        ],
+        "{CASE}: a kept node's deadline and judge clear to none; the other kept node keeps its own"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        back,
+        "{CASE}: graph_body reads the cleared node back"
     );
 }
 
