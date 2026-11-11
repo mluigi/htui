@@ -1319,6 +1319,14 @@ async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// every `proposed` or `admitted` plan of that planner, under the walk's fence. The parts sit
 /// past the node list, so no region names their positions.
 ///
+/// MOD-139 M2 R1 (F-8): parts and plans before the planner row, so a cut-short retirement
+/// replays (A6). Every lookup keys on the planner row (`parts_state`, `latest_parts`, the plans
+/// by `planner_step_id`), and a planner retired first would leave a crash with its parts and
+/// plan live under a `superseded` row that the walk replaces with a new attempt and nothing
+/// revisits. Retired last, the planner stays `done` until the rest is retired — still the loop's
+/// source, still read `failed` by its exhausted part — so the loop runs again and finishes. The replay is
+/// idempotent: a retired part is left alone, and a second `abandon_plans` abandons nothing.
+///
 /// # Errors
 /// Every [`EngineError`] `supersede_step`, `transition_step` and `abandon_plans` can raise, and
 /// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
@@ -1339,12 +1347,13 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
     let slot = steps
         .iter()
         .filter(|step| step.position == position && step.attempt == attempt);
-    for step in slot.clone() {
-        retire_row(ctx, step, now).await?;
-    }
-    for planner in slot.filter(|step| step.role == StepRole::Planner) {
+    // R1 (F-8): parts and plans before the planner row, so a cut-short retirement replays.
+    for planner in slot.clone().filter(|step| step.role == StepRole::Planner) {
         retire_parts(ctx, steps, planner, now).await?;
         ctx.store.abandon_plans(ctx.fence, planner.id).await?;
+    }
+    for step in slot {
+        retire_row(ctx, step, now).await?;
     }
     Ok(())
 }
@@ -3082,6 +3091,144 @@ mod tests {
             plans.iter().map(|plan| plan.status).collect::<Vec<_>>(),
             [PlanStatus::Abandoned]
         );
+    }
+
+    /// MOD-139 M2 R1 (F-8, blueprint A6): a planner's slot retires its parts and abandons its plans
+    /// **before** the planner row, so a retirement a store error cut short leaves the planner
+    /// `done` (still the loop's source, read `failed` by its exhausted part) and the next call
+    /// replays it whole; a third call over retired rows is a no-op.
+    #[tokio::test]
+    async fn a_cut_short_planner_retirement_replays() {
+        use htui_core::model::{
+            NewRunPlan, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, RunPlanId, StepId,
+        };
+        use htui_core::store::mem::MemFault;
+
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+            walk: None,
+        };
+        let row = |position: i32, name: &str, role, parent| NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_3,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: name.to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+            role,
+            parent_step_id: parent,
+            node_key: Some(name.to_owned()),
+        };
+        let planner = store
+            .create_step(row(20, "implement:plan", StepRole::Planner, None))
+            .await
+            .expect("the slot has room for the planner");
+        assert!(
+            store
+                .transition_step(
+                    planner.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    epoch()
+                )
+                .await
+                .expect("a legal move")
+        );
+        let (done, failed) = (
+            row(21, "implement/api", StepRole::Part, Some(planner.id)),
+            row(22, "implement/ui", StepRole::Part, Some(planner.id)),
+        );
+        let (done_id, failed_id) = (done.id, failed.id);
+        let body = crate::divide::plan_body(&[]);
+        store
+            .admit_plan(
+                StepFence::Unleased,
+                PlanAdmission {
+                    run_id: ids::RUN_3,
+                    planner_step_id: planner.id,
+                    plan: PlanToAdmit::New(NewRunPlan {
+                        id: RunPlanId::new(),
+                        run_id: ids::RUN_3,
+                        revision: 0,
+                        planner_step_id: planner.id,
+                        scope: PlanScope::Parts,
+                        base_position: 21,
+                        digest: crate::divide::plan_digest(&body),
+                        body,
+                    }),
+                    base_refs: serde_json::json!({}),
+                    parts: vec![done, failed],
+                    at: epoch(),
+                },
+            )
+            .await
+            .expect("the planner is running and the parts are well formed");
+        for (id, path) in [
+            (done_id, [StepStatus::Running, StepStatus::Done]),
+            (failed_id, [StepStatus::Running, StepStatus::Failed]),
+        ] {
+            let mut from = StepStatus::Pending;
+            for to in path {
+                assert!(
+                    store
+                        .transition_step(id, from, to, epoch())
+                        .await
+                        .expect("a legal move")
+                );
+                from = to;
+            }
+        }
+        let plan_statuses = async || {
+            store
+                .run_plans(ids::RUN_3)
+                .await
+                .expect("RUN_3 exists")
+                .iter()
+                .map(|plan| plan.status)
+                .collect::<Vec<_>>()
+        };
+
+        store.set_fault(MemFault::TransitionStep(failed_id), true);
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        let cut = retire_slot(&ctx, &steps, 20, epoch()).await;
+        assert!(
+            matches!(
+                cut,
+                Err(crate::command::EngineError::Store(
+                    htui_core::store::StoreError::Unreachable(_)
+                ))
+            ),
+            "{cut:?}"
+        );
+        assert_eq!(
+            status_of(&store, planner.id).await,
+            StepStatus::Done,
+            "the planner, the loop's source, is retired last"
+        );
+        assert_eq!(status_of(&store, failed_id).await, StepStatus::Failed);
+        assert_eq!(plan_statuses().await, [PlanStatus::Admitted]);
+        store.set_fault(MemFault::TransitionStep(failed_id), false);
+
+        for replay in 0..2 {
+            let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+            retire_slot(&ctx, &steps, 20, epoch())
+                .await
+                .unwrap_or_else(|err| panic!("replay {replay} retires: {err}"));
+            assert_eq!(status_of(&store, planner.id).await, StepStatus::Superseded);
+            assert_eq!(status_of(&store, done_id).await, StepStatus::Superseded);
+            assert_eq!(status_of(&store, failed_id).await, StepStatus::Cancelled);
+            assert_eq!(plan_statuses().await, [PlanStatus::Abandoned]);
+        }
     }
 
     /// Plan D66: the hash half compares the winners of attempts 1 and 2. Attempt 2's winner sits
