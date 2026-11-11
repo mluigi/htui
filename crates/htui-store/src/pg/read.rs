@@ -630,6 +630,8 @@ impl ReadStore for PgStore {
             scope AS (
                     SELECT project_id FROM workspace_project WHERE workspace_id = $3::uuid
                 UNION
+                    SELECT id FROM project WHERE owner_workspace_id = $3::uuid
+                UNION
                     SELECT $4::uuid WHERE $3::uuid IS NULL
             )
             SELECT i.id                       AS "item_id!: ItemId",
@@ -3119,7 +3121,8 @@ impl PgStore {
     }
 
     /// MOD-138 D12 (A4): every graph `project` may use: its own, each workspace's that holds it
-    /// (`workspace_project`), and the library's (neither owner column set); ordered by scope in
+    /// (`workspace_project`) and, for a scope row, its own workspace's (MOD-147 D7), and the
+    /// library's (neither owner column set); ordered by scope in
     /// that order, then `name` bytes, then id, as `MemStore` orders them.
     ///
     /// # Errors
@@ -3145,6 +3148,7 @@ impl PgStore {
                 OR g.workspace_id IN (SELECT wp.workspace_id
                                         FROM workspace_project wp
                                        WHERE wp.project_id = $1)
+                OR g.workspace_id = (SELECT p.owner_workspace_id FROM project p WHERE p.id = $1)
              ORDER BY CASE WHEN g.project_id IS NOT NULL THEN 0
                            WHEN g.workspace_id IS NOT NULL THEN 1
                            ELSE 2 END,

@@ -32,14 +32,14 @@ use htui_core::model::OwnerDocument;
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
-    ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry,
-    MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority, Project,
-    ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea, RequirementFilter,
-    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution,
-    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepOpening,
-    StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
-    WorkspaceId, WorkspaceSummary,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
+    MemoryEntry, MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority,
+    Project, ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea,
+    RequirementFilter, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
+    Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId,
+    StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
+    WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -869,11 +869,12 @@ impl ReadStore for CacheStore {
     ///
     /// The Postgres text of `pg/read.rs` with this file's three substitutions plus one more:
     /// SQLite has no `LATERAL`, so the latest-summary lookup is a correlated subquery in the
-    /// `SELECT` list. The workspace and the root are each bound **twice**, positionally, rather
-    /// than reused through a `?NNN` placeholder, because every statement in this file binds plain
-    /// `?` in order — the root's second binding is the `WHERE best.item_id <> ?` that keeps a cycle
-    /// from rendering the root as its own entry (T68, F-52 review, H3), and it comes last because
-    /// that clause is the last placeholder in the text.
+    /// `SELECT` list. The workspace is bound **three times** (MOD-147 D9's scope-row arm is the
+    /// second) and the root **twice**, positionally, rather than reused through a `?NNN`
+    /// placeholder, because every statement in this file binds plain `?` in order — the root's
+    /// second binding is the `WHERE best.item_id <> ?` that keeps a cycle from rendering the root
+    /// as its own entry (T68, F-52 review, H3), and it comes last because that clause is the last
+    /// placeholder in the text.
     async fn upstream_summaries(
         &self,
         id: ItemId,
@@ -899,6 +900,8 @@ impl ReadStore for CacheStore {
              scope AS ( \
                      SELECT project_id FROM workspace_project WHERE workspace_id = ? \
                  UNION \
+                     SELECT id FROM project WHERE owner_workspace_id = ? \
+                 UNION \
                      SELECT ? WHERE ? IS NULL \
              ) \
              SELECT i.id AS item_id, p.slug || ':' || i.key AS qualified_key, i.title, i.status, \
@@ -917,6 +920,7 @@ impl ReadStore for CacheStore {
         )))
         .bind(id.to_string())
         .bind(i64::from(hops))
+        .bind(workspace.clone())
         .bind(workspace.clone())
         .bind(scope.project.to_string())
         .bind(workspace)
@@ -1643,6 +1647,45 @@ impl CacheStore {
                     slug: text(row, "slug")?,
                     name: text(row, "name")?,
                     position: get(row, "position")?,
+                })
+            })
+            .collect()
+    }
+
+    /// A project's kinds off the mirror, ordered as `PgStore::item_kind_rows` orders them
+    /// (`position`, then `prefix` bytes: SQLite's BINARY is byte order). MOD-147 D11's offline
+    /// qualifier reads it; empty for a project the mirror does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`], or [`StoreError::Backend`] from a
+    /// decoding helper on a corrupt mirror.
+    pub async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, prefix, name, description, default_graph_id, position, \
+             updated_at FROM item_kind WHERE project_id = ? ORDER BY position, prefix",
+        )
+        .bind(project.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(ItemKind {
+                    id: uuid_col::<ItemKindId>("item_kind.id", &text(row, "id")?)?,
+                    project_id: uuid_col::<ProjectId>(
+                        "item_kind.project_id",
+                        &text(row, "project_id")?,
+                    )?,
+                    prefix: text(row, "prefix")?,
+                    name: text(row, "name")?,
+                    description: text(row, "description")?,
+                    default_graph_id: uuid_col::<StepGraphId>(
+                        "item_kind.default_graph_id",
+                        &text(row, "default_graph_id")?,
+                    )?,
+                    position: get(row, "position")?,
+                    updated_at: ts_col("item_kind.updated_at", get(row, "updated_at")?)?,
                 })
             })
             .collect()

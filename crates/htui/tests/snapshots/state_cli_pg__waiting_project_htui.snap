@@ -24,6 +24,8 @@ expression: run.pretty()
     {
       "reason": "unblock",
       "item_key": "FEAT-2",
+      "project": "htui",
+      "qualified_key": "htui:FEAT-2",
       "item_id": "01a06490-d343-7000-8000-000000000803",
       "run_id": null,
       "step_id": null,
@@ -35,6 +37,8 @@ expression: run.pretty()
     {
       "reason": "gate",
       "item_key": "FEAT-3",
+      "project": "htui",
+      "qualified_key": "htui:FEAT-3",
       "item_id": "01a06490-d344-7000-8000-000000000804",
       "run_id": "01a06490-e2e1-7000-8000-000000000c01",
       "step_id": "01a06490-e6cc-7000-8000-000000000d04",
@@ -46,6 +50,8 @@ expression: run.pretty()
     {
       "reason": "unblock",
       "item_key": "TOOL-1",
+      "project": "htui",
+      "qualified_key": "htui:TOOL-1",
       "item_id": "01a06490-d346-7000-8000-000000000806",
       "run_id": "01a06490-e2e4-7000-8000-000000000c04",
       "step_id": null,

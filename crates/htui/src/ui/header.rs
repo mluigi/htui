@@ -507,7 +507,7 @@ mod tests {
     use crate::keys::{Context, views};
     use crate::ui::tabs::settings::{AgentsSection, SettingsTab};
     use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SkillsTab};
-    use htui_core::model::ItemId;
+    use htui_core::model::{ItemId, ProjectId};
     use htui_worker::{WaitingReason, WaitingRow, WaitingView};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -625,6 +625,8 @@ mod tests {
         WaitingRow {
             item: ItemId::new(),
             item_key: key.to_owned(),
+            project: ProjectId::new(),
+            display_key: key.to_owned(),
             run: None,
             step: None,
             step_label: String::new(),

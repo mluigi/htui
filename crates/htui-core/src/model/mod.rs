@@ -88,6 +88,7 @@ pub mod ids;
 pub mod item;
 pub mod item_merge;
 pub mod item_spec;
+pub mod key;
 pub mod kind;
 pub mod link;
 pub mod memory;
@@ -138,6 +139,7 @@ pub use item::{
 };
 pub use item_merge::{FieldState, Side, SpecField, SpecMerge};
 pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
+pub use key::{KeyQualifier, key_prefix, split_qualified};
 pub use kind::{
     CommandQueue, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope, Isolation, ItemKind,
     ItemKindPatch, NewItemKind, NewPromptTemplate, NewStepGraph, NodeBody, PhaseAgent, PhasePart,

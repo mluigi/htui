@@ -12014,6 +12014,98 @@ async fn queue_item_records_its_workspace() {
     db.drop_db().await;
 }
 
+/// MOD-147 D8 (blueprint V2): a scope row's queue entry carries its workspace on Postgres as on
+/// `MemStore` (`mem.rs::queue_item_fills_a_scope_rows_workspace_and_refuses_another`): `None` is
+/// filled with the owner; another workspace is refused in the same sentence and queues nothing,
+/// also on a re-queue of an item already queued (checked before `ON CONFLICT DO NOTHING`); a
+/// re-queue with `None` answers the stored entry unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_item_fills_a_scope_rows_workspace_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(6);
+    let first_id = ItemId::new();
+    let second_id = ItemId::new();
+    let new_ws = |id: ItemId, title: &str| NewItem {
+        id,
+        project_id: ids::PROJECT_SCOPE_PLATFORM,
+        kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+        title: title.to_owned(),
+        body: String::new(),
+        required_tags: Vec::new(),
+        touched_paths: Vec::new(),
+        priority: 0,
+        step_graph_id: None,
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+    };
+    for (id, title) in [(first_id, "first"), (second_id, "second")] {
+        pg.mint_item(new_ws(id, title))
+            .await
+            .expect("a WS item mints on Postgres");
+        mem.mint_item(new_ws(id, title))
+            .await
+            .expect("a WS item mints on MemStore");
+    }
+    let refusal = htui_core::store::scope_row_run_workspace("@platform", ids::WORKSPACE_GRAPHICS);
+
+    let pg_entry = pg
+        .queue_item(first_id, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("a scope-row item queues on Postgres");
+    let mem_entry = mem
+        .queue_item(first_id, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("a scope-row item queues on MemStore");
+    assert_eq!(pg_entry.workspace_id, Some(ids::WORKSPACE_PLATFORM));
+    assert_eq!(pg_entry, mem_entry, "both stores store the same entry");
+
+    let pg_before = pg.queue_entries(ids::BOX).await.expect("the read answers");
+    let mem_before = mem.queue_entries(ids::BOX).await.expect("the read answers");
+    for item in [second_id, first_id] {
+        let pg_refused = pg
+            .queue_item(item, ids::BOX, Some(ids::WORKSPACE_GRAPHICS), ids::USER, at)
+            .await;
+        let mem_refused = mem
+            .queue_item(item, ids::BOX, Some(ids::WORKSPACE_GRAPHICS), ids::USER, at)
+            .await;
+        assert_eq!(
+            pg_refused,
+            Err(htui_core::store::StoreError::Constraint(refusal.clone())),
+            "another workspace is refused on Postgres (re-queue: {})",
+            item == first_id
+        );
+        assert_eq!(pg_refused, mem_refused, "both stores refuse alike");
+    }
+    assert_eq!(
+        pg.queue_entries(ids::BOX).await.expect("the read answers"),
+        pg_before,
+        "the refusals queued nothing on Postgres"
+    );
+    assert_eq!(
+        mem.queue_entries(ids::BOX).await.expect("the read answers"),
+        mem_before,
+        "the refusals queued nothing on MemStore"
+    );
+
+    let later = at + TimeDelta::minutes(1);
+    let pg_again = pg
+        .queue_item(first_id, ids::BOX, None, ids::USER, later)
+        .await
+        .expect("a repeat is answered on Postgres");
+    let mem_again = mem
+        .queue_item(first_id, ids::BOX, None, ids::USER, later)
+        .await
+        .expect("a repeat is answered on MemStore");
+    assert_eq!(pg_again, pg_entry, "the stored entry, unchanged");
+    assert_eq!(mem_again, mem_entry, "the stored entry, unchanged");
+
+    db.drop_db().await;
+}
+
 /// MOD-137 D3, blueprint F6: a graph whose owner names no row, or an override outside a project,
 /// is refused in `MemStore`'s sentence, owner first, never as a raw `23503`/`23514`.
 #[tokio::test(flavor = "multi_thread")]

@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use htui_core::model::{
-    BoxId, ItemId, ProjectId, ProjectRef, RunId, Scope, StepId, WorkspaceId, WorkspaceSummary,
+    BoxId, ItemId, KeyQualifier, ProjectId, ProjectRef, RunId, Scope, StepId, WorkspaceId,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 use htui_store::pg::CONNECT_TIMEOUT;
@@ -195,12 +196,18 @@ async fn answer_online(
     let read = |err: StoreError| Failure::from_read(&err);
     let workspaces = pg.workspaces().await.map_err(read)?;
     let target = state_target(pg, &workspaces, args, ctx.identity).await?;
-    let active = pg.active_runs(&target.scope).await.map_err(read)?;
-    let candidates = pg.waiting_candidates(&target.scope).await.map_err(read)?;
-    let permissions =
-        crate::store_worker::permissions_or_unknown(pg.open_permissions(&target.scope).await)
+    // MOD-147 D10, V5: the whole first workspace also reads its own items (its scope row, listed
+    // first); a `--project`/`--cwd` target reads that one project. The keys print by D11.
+    let (scope, keys) =
+        crate::store_worker::waiting_reads(pg, &target.scope, target.whole_workspace)
+            .await
             .map_err(read)?;
-    let view = htui_worker::waiting(&target.scope, active, &candidates, permissions.as_deref());
+    let active = pg.active_runs(&scope).await.map_err(read)?;
+    let candidates = pg.waiting_candidates(&scope).await.map_err(read)?;
+    let permissions =
+        crate::store_worker::permissions_or_unknown(pg.open_permissions(&scope).await)
+            .map_err(read)?;
+    let view = htui_worker::waiting(&scope, active, &candidates, permissions.as_deref(), &keys);
     Ok(match verb {
         Verb::Status => {
             let this_box = match ctx.identity {
@@ -220,7 +227,7 @@ async fn answer_online(
             };
             Outcome::Status(status_body(&target, &view, this_box))
         }
-        Verb::Waiting => Outcome::Waiting(waiting_body(&target, &view, ctx.now)),
+        Verb::Waiting => Outcome::Waiting(waiting_body(&target, &view, ctx.now, &keys)),
     })
 }
 
@@ -812,6 +819,15 @@ pub struct WaitingRowDoc {
     pub reason: ReasonDoc,
     /// `item.key`.
     pub item_key: String,
+    /// The slug of the item's project (MOD-147 D11): `@<workspace>` for a workspace's own item.
+    pub project: String,
+    /// `<slug>:<item_key>`, always qualified with the project's slug as the answer read it, so a
+    /// row names its item across projects ([`KeyQualifier::qualified`]); bare `item_key` for a
+    /// project the answer did not read.
+    pub qualified_key: String,
+    /// The human form's key: qualified only when another project of the answer uses its prefix.
+    #[serde(skip)]
+    pub display_key: String,
     /// `item.id`.
     pub item_id: ItemId,
     /// The run; `null` for a Reopen row.
@@ -976,6 +992,9 @@ struct Target<'a> {
     workspace: Option<&'a WorkspaceSummary>,
     projects: Vec<&'a ProjectRef>,
     scope: Scope,
+    /// MOD-147 V5: the whole workspace is read, so the waiting reads add its own items; `false`
+    /// for one project (`--project`, `--cwd`) and for no workspace.
+    whole_workspace: bool,
 }
 
 /// The first workspace, as the TUI scopes at start (plan G4); an empty scope when there is none.
@@ -988,6 +1007,7 @@ fn first_workspace(workspaces: &[WorkspaceSummary]) -> Target<'_> {
                 workspace_id: WorkspaceId::default(),
                 project_ids: Vec::new(),
             },
+            whole_workspace: false,
         };
     };
     let scope = Scope::from_workspace(ws);
@@ -1000,6 +1020,7 @@ fn first_workspace(workspaces: &[WorkspaceSummary]) -> Target<'_> {
         workspace: Some(ws),
         projects,
         scope,
+        whole_workspace: true,
     }
 }
 
@@ -1016,6 +1037,7 @@ fn project_target(workspaces: &[WorkspaceSummary], project: ProjectId) -> Option
                     workspace_id: ws.workspace_id,
                     project_ids: vec![project],
                 },
+                whole_workspace: false,
             })
     })
 }
@@ -1103,20 +1125,32 @@ fn status_body(target: &Target<'_>, view: &WaitingView, this_box: Option<BoxDoc>
     }
 }
 
-fn waiting_body(target: &Target<'_>, view: &WaitingView, now: DateTime<Utc>) -> WaitingBody {
+fn waiting_body(
+    target: &Target<'_>,
+    view: &WaitingView,
+    now: DateTime<Utc>,
+    keys: &KeyQualifier,
+) -> WaitingBody {
     WaitingBody {
         workspace: target.workspace.map(workspace_doc),
         projects: project_docs(target),
         working: view.working,
         permissions_known: view.permissions_known,
-        rows: view.rows.iter().map(|row| row_doc(row, now)).collect(),
+        rows: view
+            .rows
+            .iter()
+            .map(|row| row_doc(row, now, keys))
+            .collect(),
     }
 }
 
-fn row_doc(row: &WaitingRow, now: DateTime<Utc>) -> WaitingRowDoc {
+fn row_doc(row: &WaitingRow, now: DateTime<Utc>, keys: &KeyQualifier) -> WaitingRowDoc {
     WaitingRowDoc {
         reason: row.reason.into(),
         item_key: row.item_key.clone(),
+        project: keys.slug(row.project).unwrap_or_default().to_owned(),
+        qualified_key: keys.qualified(row.project, &row.item_key),
+        display_key: row.display_key.clone(),
         item_id: row.item,
         run_id: row.run,
         step_id: row.step,
@@ -1149,14 +1183,22 @@ fn human_status(body: &StatusBody) -> String {
     )
 }
 
-/// One line per row: key, reason, step, age, text. No rows, no text.
+/// One line per row: key, reason, step, age, text. No rows, no text. The key is the display key
+/// (MOD-147 D11), its column as wide as the longest (ten at least).
 fn human_waiting(body: &WaitingBody) -> String {
+    let width = body
+        .rows
+        .iter()
+        .map(|row| clean(&row.display_key).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
     body.rows
         .iter()
         .map(|row| {
             format!(
-                "{:<10} {:<12} {:<16} {:>4}  {}\n",
-                clean(&row.item_key),
+                "{:<width$} {:<12} {:<16} {:>4}  {}\n",
+                clean(&row.display_key),
                 row.reason.label(),
                 clean(row.step.as_deref().unwrap_or_default()),
                 age_text(row.age_seconds),
@@ -1204,6 +1246,15 @@ mod tests {
         ProjectId::from_uuid(Uuid::from_u128(n))
     }
 
+    /// [`workspace`]'s qualifier: `htui` holds `MOD`, `agy` nothing, so every row prints bare and
+    /// qualifies as `htui:…`.
+    fn keys() -> KeyQualifier {
+        KeyQualifier::new([
+            (project(0x10), "htui".to_owned(), vec!["MOD".to_owned()]),
+            (project(0x11), "agy".to_owned(), Vec::new()),
+        ])
+    }
+
     /// Platform, with `agy` before `htui` in the summary but after it by position.
     fn workspace() -> WorkspaceSummary {
         WorkspaceSummary {
@@ -1239,6 +1290,8 @@ mod tests {
         WaitingRow {
             item: ItemId::from_uuid(Uuid::from_u128(0x100 + n)),
             item_key: key.into(),
+            project: project(0x10),
+            display_key: key.into(),
             run: with_run.then(|| RunId::from_uuid(Uuid::from_u128(0x200 + n))),
             step: (!step_label.is_empty()).then(|| StepId::from_uuid(Uuid::from_u128(0x300 + n))),
             step_label: step_label.into(),
@@ -1409,7 +1462,7 @@ mod tests {
         let target = first_workspace(&workspaces);
         let answer = Answer {
             kind: Kind::Waiting,
-            outcome: Outcome::Waiting(waiting_body(&target, &view(six_rows()), now())),
+            outcome: Outcome::Waiting(waiting_body(&target, &view(six_rows()), now(), &keys())),
         };
         insta::assert_snapshot!("waiting_online", pretty(&answer));
     }
@@ -1647,7 +1700,7 @@ mod tests {
             "approve\u{1b}[2J the PRD",
             demo_at(2, 6),
         )];
-        let text = human_waiting(&waiting_body(&target, &view(rows), now()));
+        let text = human_waiting(&waiting_body(&target, &view(rows), now(), &keys()));
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "{text:?}"
@@ -1656,10 +1709,123 @@ mod tests {
         assert!(text.contains("approve[2J the PRD"), "{text}");
         assert!(text.contains(" 18h "), "{text}");
         assert_eq!(
-            human_waiting(&waiting_body(&target, &view(Vec::new()), now())),
+            human_waiting(&waiting_body(&target, &view(Vec::new()), now(), &keys())),
             "",
             "no rows, no text"
         );
+    }
+
+    /// MOD-147 D11: the key column is each row's display key, padded to the longest one (ten at
+    /// least, as before).
+    #[test]
+    fn human_waiting_widens_the_key_column_to_the_longest_key() {
+        let workspaces = [workspace()];
+        let target = first_workspace(&workspaces);
+        let long = WaitingRow {
+            display_key: "vulkan-tutorials:FEAT-2".into(),
+            ..row(
+                1,
+                "FEAT-2",
+                WaitingReason::Gate,
+                true,
+                "prd 0.1",
+                "approve",
+                demo_at(2, 6),
+            )
+        };
+        let short = row(
+            2,
+            "WS-1",
+            WaitingReason::Unblock,
+            false,
+            "",
+            "blocked",
+            demo_at(2, 6),
+        );
+        let text = human_waiting(&waiting_body(
+            &target,
+            &view(vec![long, short]),
+            now(),
+            &keys(),
+        ));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("vulkan-tutorials:FEAT-2 gate "),
+            "{text}"
+        );
+        assert!(
+            lines[1].starts_with(&format!("{:<23} unblock ", "WS-1")),
+            "{text}"
+        );
+    }
+
+    /// MOD-147 D11: a `--json` row names its project's slug and its always-qualified key; the
+    /// display key is the human form's alone.
+    #[test]
+    fn row_doc_carries_project_and_qualified_key() {
+        let keys = KeyQualifier::new([
+            (
+                project(0x10),
+                "htui".to_owned(),
+                vec!["FEAT".to_owned(), "TOOL".to_owned()],
+            ),
+            (project(0x11), "agy".to_owned(), vec!["FEAT".to_owned()]),
+        ]);
+        let shared = WaitingRow {
+            display_key: keys.display(project(0x10), "FEAT-2"),
+            ..row(
+                1,
+                "FEAT-2",
+                WaitingReason::Gate,
+                true,
+                "prd 0.1",
+                "approve",
+                demo_at(2, 6),
+            )
+        };
+        let doc = row_doc(&shared, now(), &keys);
+        assert_eq!(
+            (
+                doc.item_key.as_str(),
+                doc.project.as_str(),
+                doc.qualified_key.as_str(),
+                doc.display_key.as_str()
+            ),
+            ("FEAT-2", "htui", "htui:FEAT-2", "htui:FEAT-2")
+        );
+        let lone = WaitingRow {
+            display_key: keys.display(project(0x10), "TOOL-1"),
+            ..row(
+                2,
+                "TOOL-1",
+                WaitingReason::Unblock,
+                false,
+                "",
+                "blocked",
+                demo_at(2, 6),
+            )
+        };
+        let doc = row_doc(&lone, now(), &keys);
+        assert_eq!(doc.display_key, "TOOL-1", "a lone prefix prints bare");
+        assert_eq!(doc.qualified_key, "htui:TOOL-1", "and still qualifies");
+        let json = serde_json::to_value(&doc).expect("a row serialises");
+        assert_eq!(json["project"], "htui");
+        assert_eq!(json["qualified_key"], "htui:TOOL-1");
+        assert!(json.get("display_key").is_none(), "{json}");
+    }
+
+    /// MOD-147 V5: only the whole first workspace widens to the workspace's own items; a
+    /// `--project` (or `--cwd`) target names one project and lists only it.
+    #[test]
+    fn a_project_target_is_not_a_whole_workspace() {
+        let workspaces = [workspace()];
+        assert!(first_workspace(&workspaces).whole_workspace);
+        assert!(
+            !first_workspace(&[]).whole_workspace,
+            "no workspace, no scope row"
+        );
+        let narrowed = project_target(&workspaces, project(0x11)).expect("listed");
+        assert!(!narrowed.whole_workspace);
     }
 
     #[test]

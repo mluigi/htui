@@ -35,7 +35,7 @@ use htui_core::model::{
     RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount, UpstreamEntry,
     UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore, Result, StoreError};
+use htui_core::store::{MemStore, ReadStore, Result, StoreError, WriteStore};
 use serde_json::Value;
 
 use crate::cache::CacheStore;
@@ -416,6 +416,21 @@ impl Backend {
             Self::Memory(store) => store.item_kind(id).await,
             Self::Online { pg, .. } => pg.item_kind(id).await,
             Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// A project's kinds (MOD-147 D11), ordered by `position`, then `prefix` bytes: Postgres
+    /// online, the mirror offline. Unlike [`Backend::item_kind`], the offline arm answers:
+    /// `item_kind` is mirrored, and the key qualifier must print offline too.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports.
+    pub async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        match self {
+            Self::Memory(store) => WriteStore::item_kinds(store, project).await,
+            Self::Online { pg, .. } => pg.item_kind_rows(project).await,
+            Self::Offline { cache, .. } => cache.item_kinds(project).await,
         }
     }
 

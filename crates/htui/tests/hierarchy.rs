@@ -18,11 +18,12 @@ use htui::hierarchy::{
 use htui::store_worker::{LIST_CAP, LIST_DIR, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::tabs::settings::hierarchy::joined_notice;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch,
+    ItemKindId, NewItemKind, NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::root_path::{DirEntry, DirListing};
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
@@ -40,11 +41,12 @@ fn demo() -> Backend {
     Backend::memory(MemStore::demo())
 }
 
-/// The tree a reply carries, or a panic naming what came back instead.
+/// The tree a reply carries, or a panic naming what came back instead. A join's answer
+/// (`HierarchyJoined`, MOD-147 D6) carries one too.
 #[track_caller]
 fn tree(reply: StoreReply) -> HierarchySnapshot {
     match reply {
-        StoreReply::Hierarchy(Some(tree)) => *tree,
+        StoreReply::Hierarchy(Some(tree)) | StoreReply::HierarchyJoined { tree, .. } => *tree,
         other => panic!("expected a tree: {other:?}"),
     }
 }
@@ -229,6 +231,98 @@ async fn create_project_links_at_the_end() {
     assert_eq!(reach.phases, 15);
     assert_eq!(reach.prompt_templates, 10);
     assert_eq!(reach.workspace_links, 1);
+}
+
+/// MOD-147 D6 (blueprint V4): a project whose kinds share a prefix with its workspace's scope row
+/// still joins, and the answer names the new project and the shared prefixes. Edge 12: a seeded
+/// project shares nothing with a seeded scope row (`WS`), so the scope row gets a custom `FEAT`
+/// kind first, while it has no member (D5 allows it then).
+#[tokio::test]
+async fn create_project_answers_the_prefixes_it_shares_with_its_workspace() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let shop = tree(
+        serve(
+            &backend,
+            &StoreRequest::CreateWorkspace {
+                slug: "shop".to_owned(),
+                name: "Shop".to_owned(),
+                description: String::new(),
+            },
+        )
+        .await,
+    );
+    let ws = shop.workspace.id;
+    let scope = store
+        .scope_project(ws)
+        .await
+        .expect("read")
+        .expect("a workspace has a scope row");
+    let graph = store.item_kinds(scope).await.expect("read")[0].default_graph_id;
+    store
+        .create_item_kind(NewItemKind {
+            id: ItemKindId::new(),
+            project_id: scope,
+            prefix: "FEAT".to_owned(),
+            name: "feature".to_owned(),
+            description: String::new(),
+            default_graph_id: graph,
+            position: 1,
+        })
+        .await
+        .expect("no member holds FEAT yet");
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::CreateProject {
+            workspace: ws,
+            slug: "api".to_owned(),
+            name: "API".to_owned(),
+            description: String::new(),
+        },
+    )
+    .await;
+    let StoreReply::HierarchyJoined {
+        tree,
+        project,
+        shared_prefixes,
+    } = reply
+    else {
+        panic!("a create answers `HierarchyJoined`: {reply:?}");
+    };
+    assert_eq!(project, "api");
+    assert_eq!(shared_prefixes, ["FEAT"]);
+    let slugs: Vec<&str> = tree
+        .projects
+        .iter()
+        .map(|entry| entry.project.slug.as_str())
+        .collect();
+    assert_eq!(slugs, ["api"], "the project joined anyway");
+}
+
+/// MOD-147 D6: a seeded project joining a seeded workspace shares no prefix, so the list is empty.
+#[tokio::test]
+async fn create_project_sharing_no_prefix_answers_an_empty_list() {
+    let reply = serve(
+        &demo(),
+        &StoreRequest::CreateProject {
+            workspace: ids::WORKSPACE_PLATFORM,
+            slug: "renderer".to_owned(),
+            name: "Renderer".to_owned(),
+            description: String::new(),
+        },
+    )
+    .await;
+    let StoreReply::HierarchyJoined {
+        project,
+        shared_prefixes,
+        ..
+    } = reply
+    else {
+        panic!("a create answers `HierarchyJoined`: {reply:?}");
+    };
+    assert_eq!(project, "renderer");
+    assert!(shared_prefixes.is_empty(), "{shared_prefixes:?}");
 }
 
 /// `p` is the only writer of `is_primary` (D12), and the store demotes the old primary in the same
@@ -1686,6 +1780,58 @@ async fn a_stale_reply_keeps_the_typed_text() {
         Some("graphics-2"),
         "and the text that was typed survived the reload"
     );
+}
+
+/// MOD-147 D6: a join that shares prefixes with the workspace leaves one notice line naming them
+/// and how the keys print.
+#[tokio::test]
+async fn a_joined_reply_naming_shared_prefixes_shows_the_notice() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::HierarchyJoined {
+            tree: Box::new(opened),
+            project: "api".to_owned(),
+            shared_prefixes: vec!["FEAT".to_owned(), "FIX".to_owned()],
+        },
+    );
+    let notice = joined_notice("api", "graphics", &["FEAT".to_owned(), "FIX".to_owned()]);
+    assert_eq!(
+        notice,
+        "`api` shares prefixes FEAT, FIX with workspace `graphics`: keys show as `api:FEAT-1` and \
+         `@graphics:FEAT-1`"
+    );
+    let frame = bench.render_section(&section, 160);
+    assert!(frame.contains(&notice), "{frame}");
+    assert_eq!(
+        joined_notice("api", "shop", &["FEAT".to_owned()]),
+        "`api` shares prefix FEAT with workspace `shop`: keys show as `api:FEAT-1` and \
+         `@shop:FEAT-1`"
+    );
+}
+
+/// MOD-147 D6: a join that shares nothing says nothing.
+#[tokio::test]
+async fn a_joined_reply_without_shared_prefixes_shows_no_notice() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::HierarchyJoined {
+            tree: Box::new(opened),
+            project: "api".to_owned(),
+            shared_prefixes: Vec::new(),
+        },
+    );
+    let frame = bench.render_section(&section, 160);
+    assert!(
+        frame.contains("vulkan-tutorials"),
+        "the tree is adopted: {frame}"
+    );
+    assert!(!frame.contains("shares prefix"), "{frame}");
 }
 
 /// The nil startup scope: a pane that names the key that fixes it rather than an empty box. The

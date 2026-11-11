@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT i.id AS \"id: ItemId\"\n                  FROM item i JOIN project p ON p.id = i.project_id\n                 WHERE p.slug = $1 AND i.key = $2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b7d648ce7c67fc12e2778cb1d9a820488436344eb4d8258e3251af437db15d97"
+}

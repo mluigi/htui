@@ -1619,6 +1619,7 @@ impl SettingsSection for SecretsSection {
             StoreReply::Hierarchy(Some(tree))
             | StoreReply::SecretsTree(Some(tree))
             | StoreReply::HierarchyStale(tree)
+            | StoreReply::HierarchyJoined { tree, .. }
             | StoreReply::RepoPathsInferred { tree, .. } => self.adopt_passive(tree, ctx),
             StoreReply::Hierarchy(None) | StoreReply::SecretsTree(None) => self.on_tree_gone(),
             StoreReply::SecretScopeWritten {

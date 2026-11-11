@@ -9,8 +9,9 @@
 use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Claim, Document, DocumentId, GraphSnapshot, Isolation, ItemId, LinkKind, NewRun, NewRunStep,
-    Note, NoteId, ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId, Transport,
+    Claim, Document, DocumentId, GraphSnapshot, Isolation, ItemId, LinkKind, NewItem, NewRun,
+    NewRunStep, Note, NoteId, ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId,
+    Transport,
 };
 use htui_core::prompt::render::HostnameLine;
 use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
@@ -79,7 +80,11 @@ struct Leased {
 
 impl Leased {
     async fn on(project: ProjectId, item: ItemId) -> Self {
-        let store = MemStore::demo();
+        Self::on_store(MemStore::demo(), project, item).await
+    }
+
+    /// [`Leased::on`] over a store the case arranged first (a minted workspace item, say).
+    async fn on_store(store: MemStore, project: ProjectId, item: ItemId) -> Self {
         let owner = Uuid::new_v4();
         let run = RunId::new();
         store
@@ -200,6 +205,33 @@ impl Leased {
                 edge.from_item_id == self.item && edge.to_item_id == to && edge.kind == kind
             })
     }
+}
+
+/// MOD-147: mints a `WS` item on the scope row `scope` (its seeded `WS` kind); its id and key.
+async fn ws_item(store: &MemStore, scope: ProjectId) -> (ItemId, String) {
+    let kind = WriteStore::item_kinds(store, scope)
+        .await
+        .expect("the scope row's kinds")
+        .into_iter()
+        .find(|kind| kind.prefix == "WS")
+        .expect("a scope row is seeded with WS");
+    let item = store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: scope,
+            kind_id: kind.id,
+            title: "spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("a WS item");
+    (item.id, item.key)
 }
 
 /// A live session on `scope` and its initialised client. The host and the lease must outlive the
@@ -609,12 +641,197 @@ async fn item_link_to_another_projects_key_is_out_of_scope() {
                 .expect("a call");
             assert_eq!(
                 refused(&answer),
-                format!("out of scope: {to} is not an item of this project"),
+                format!("out of scope: {to} is not an item of this project or its workspaces"),
                 "{op}"
             );
         }
     }
     assert!(!fx.live_link(ids::HTUI_FEAT_3, LinkKind::Relates).await);
+}
+
+/// MOD-147 D2, D3: `htui` and `agy` are both members of Platform, so an `agy` step reaches
+/// `htui:FEAT-3`; the answer names it qualified, as the agent did.
+#[tokio::test]
+async fn item_link_add_resolves_a_qualified_key_of_a_co_member() {
+    let fx = Leased::on(ids::PROJECT_AGY, ids::AGY_FIX_1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "htui:FEAT-3", "kind": "relates"}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "FIX-1", "to": "htui:FEAT-3", "kind": "relates", "live": true})
+    );
+    assert!(fx.live_link(ids::HTUI_FEAT_3, LinkKind::Relates).await);
+}
+
+/// MOD-147 D2, D3: `@platform:WS-1` names Platform's own item, which a member's step reaches.
+#[tokio::test]
+async fn item_link_add_reaches_the_workspaces_own_item() {
+    let store = MemStore::demo();
+    let (ws, key) = ws_item(&store, ids::PROJECT_SCOPE_PLATFORM).await;
+    assert_eq!(key, "WS-1", "Platform's first workspace item");
+    let fx = Leased::on_store(store, ids::PROJECT_HTUI, ids::HTUI_ANA_2).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "@platform:WS-1", "kind": "blocked_by"}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "ANA-2", "to": "@platform:WS-1", "kind": "blocked_by", "live": true})
+    );
+    assert!(fx.live_link(ws, LinkKind::BlockedBy).await);
+}
+
+/// MOD-147 D3, D7, D8: a step on the scope row's item (its run fills Platform as its workspace)
+/// reaches a member's item through its owner workspace.
+#[tokio::test]
+async fn item_link_from_a_scope_row_reaches_a_member() {
+    let store = MemStore::demo();
+    let (ws, _) = ws_item(&store, ids::PROJECT_SCOPE_PLATFORM).await;
+    let fx = Leased::on_store(store, ids::PROJECT_SCOPE_PLATFORM, ws).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "htui:FEAT-1", "kind": "relates"}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "WS-1", "to": "htui:FEAT-1", "kind": "relates", "live": true})
+    );
+    assert!(fx.live_link(ids::HTUI_FEAT_1, LinkKind::Relates).await);
+}
+
+/// MOD-147 edge 2: a key qualified with the session's own project answers the canonical bare key.
+#[tokio::test]
+async fn item_link_names_its_own_project_bare() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "htui:FEAT-1", "kind": "relates"}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "ANA-2", "to": "FEAT-1", "kind": "relates", "live": true})
+    );
+    assert!(fx.live_link(ids::HTUI_FEAT_1, LinkKind::Relates).await);
+}
+
+/// MOD-147 D3: `vulkan-tutorials` is Graphics' member, outside every workspace `htui` belongs to;
+/// the store's `link_outside_reach` reads as `out of scope`, with the agent's own text.
+#[tokio::test]
+async fn item_link_outside_the_workspaces_is_out_of_scope() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "vulkan-tutorials:FEAT-1", "kind": "relates"}),
+        )
+        .await
+        .expect("a call");
+    assert_eq!(
+        refused(&answer),
+        "out of scope: vulkan-tutorials:FEAT-1 is not an item of this project or its workspaces"
+    );
+    assert!(!fx.live_link(ids::VULKAN_FEAT_1, LinkKind::Relates).await);
+}
+
+/// MOD-147 edge 9: `withdraw_link` keeps no reach check, so a `remove` of an item of another
+/// project that holds no live link answers `not yours` (this run proposed nothing live there),
+/// with the keys only: never the items' ids, which would name an item outside the reach.
+#[tokio::test]
+async fn item_link_remove_of_another_projects_item_is_not_yours() {
+    let store = MemStore::demo();
+    let (ws, _) = ws_item(&store, ids::PROJECT_SCOPE_GRAPHICS).await;
+    let fx = Leased::on_store(store, ids::PROJECT_HTUI, ids::HTUI_ANA_2).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    // `vulkan-tutorials` and `@graphics` lie outside the reach, `agy` inside it.
+    for to in ["vulkan-tutorials:FEAT-1", "@graphics:WS-1", "agy:FEAT-1"] {
+        let answer = client
+            .call(
+                "item_link",
+                json!({"op": "remove", "to": to, "kind": "relates"}),
+            )
+            .await
+            .expect("a call");
+        assert_eq!(
+            refused(&answer),
+            format!("not yours: ANA-2 relates {to} is no live link this run proposed"),
+        );
+    }
+    for item in [ids::VULKAN_FEAT_1, ws, ids::AGY_FEAT_1] {
+        assert!(!fx.live_link(item, LinkKind::Relates).await);
+    }
+}
+
+/// MOD-147 edge 9: a second `remove` of a link this run proposed to a co-member's item and already
+/// withdrew answers `not yours` too, and its sentence stays true: the link was this run's, it is
+/// just no longer live.
+#[tokio::test]
+async fn item_link_second_remove_of_a_co_members_link_is_no_live_link() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let link = json!({"op": "add", "to": "agy:FEAT-1", "kind": "relates"});
+    ok(&client.call("item_link", link).await.expect("a call"));
+    let remove = json!({"op": "remove", "to": "agy:FEAT-1", "kind": "relates"});
+    let first = ok(&client
+        .call("item_link", remove.clone())
+        .await
+        .expect("a call"));
+    assert_eq!(
+        first,
+        json!({"from": "ANA-2", "to": "agy:FEAT-1", "kind": "relates", "live": false})
+    );
+    let second = client.call("item_link", remove).await.expect("a call");
+    assert_eq!(
+        refused(&second),
+        "not yours: ANA-2 relates agy:FEAT-1 is no live link this run proposed"
+    );
+    assert!(!fx.live_link(ids::AGY_FEAT_1, LinkKind::Relates).await);
+}
+
+/// MOD-147 edges 1 and 3: no project has the slug `nope`, and no workspace is called `gone`.
+#[tokio::test]
+async fn item_link_to_an_unknown_slug_is_out_of_scope() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    for to in ["nope:FEAT-1", "@gone:WS-1"] {
+        for op in ["add", "remove"] {
+            let answer = client
+                .call("item_link", json!({"op": op, "to": to, "kind": "relates"}))
+                .await
+                .expect("a call");
+            assert_eq!(
+                refused(&answer),
+                format!("out of scope: {to} is not an item of this project or its workspaces"),
+                "{op}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

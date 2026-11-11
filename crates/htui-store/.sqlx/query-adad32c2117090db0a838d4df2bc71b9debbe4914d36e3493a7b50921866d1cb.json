@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE item_kind SET\n                prefix           = COALESCE($3, prefix),\n                name             = COALESCE($4, name),\n                description      = COALESCE($5, description),\n                default_graph_id = COALESCE($6, default_graph_id),\n                position         = COALESCE($7, position)\n             WHERE id = $1\n               AND updated_at = $2\n               AND ($6::uuid IS NULL\n                    OR $6 = item_kind.default_graph_id\n                    OR EXISTS (SELECT 1 FROM step_graph g\n                                WHERE g.id = $6\n                                  AND (g.project_id = item_kind.project_id\n                                       OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                                       OR g.workspace_id IN (SELECT wp.workspace_id\n                                                               FROM workspace_project wp\n                                                              WHERE wp.project_id\n                                                                    = item_kind.project_id))))\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id,\n                                   position)\n            SELECT $1, $2, $3, $4, $5, $6, $7\n             WHERE EXISTS (SELECT 1 FROM step_graph g\n                            WHERE g.id = $6\n                              AND (g.project_id = $2\n                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                                   OR g.workspace_id IN (SELECT wp.workspace_id\n                                                           FROM workspace_project wp\n                                                          WHERE wp.project_id = $2)\n                                   OR g.workspace_id = (SELECT p.owner_workspace_id\n                                                          FROM project p WHERE p.id = $2)))\n               AND NOT EXISTS (SELECT 1\n                                 FROM project sr\n                                 JOIN workspace_project wp\n                                   ON wp.workspace_id = sr.owner_workspace_id\n                                 JOIN item_kind mk ON mk.project_id = wp.project_id\n                                WHERE sr.id = $2 AND mk.prefix = $3)\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -95,7 +95,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Timestamptz",
+        "Uuid",
         "Text",
         "Text",
         "Text",
@@ -114,5 +114,5 @@
       false
     ]
   },
-  "hash": "3055b0c7904fbea91e97def86fd7d88639113ae785c98b75f28843b46affccc8"
+  "hash": "adad32c2117090db0a838d4df2bc71b9debbe4914d36e3493a7b50921866d1cb"
 }

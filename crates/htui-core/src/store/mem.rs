@@ -22,6 +22,7 @@ use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
 use crate::model::link::{ProposeLink, WithdrawLink};
+use crate::model::split_qualified;
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
     BOX_PROBE_SPEC_KEY, BatchClose, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo,
@@ -77,7 +78,7 @@ use crate::store::traits::{
     document_needs_a_step, expected_on_row, failure_disagrees_with_status,
     finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
+    link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
     project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
@@ -96,6 +97,7 @@ use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
     scope_row_slug_is_fixed, workspace_has_live_run,
 };
+use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use uuid::Uuid;
 
 /// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
@@ -1061,11 +1063,14 @@ impl MemStore {
     /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
     /// answers its stored entry unchanged. `at` is microsecond-truncated. `workspace` (MOD-125 D3)
     /// is recorded on a new entry. An entry already stored comes back unchanged, its workspace
-    /// included.
+    /// included. MOD-147 D8: a scope row's entry carries its workspace ([`run_workspace_for`]:
+    /// `None` is filled), checked before the stored entry is answered, so a re-queue naming
+    /// another workspace is refused too.
     ///
     /// # Errors
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] for an unknown box, workspace or user.
+    /// [`StoreError::Constraint`] for a scope row's item queued under another workspace
+    /// ([`scope_row_run_workspace`]), then for an unknown box, workspace or user.
     pub async fn queue_item(
         &self,
         item: ItemId,
@@ -1076,6 +1081,7 @@ impl MemStore {
     ) -> Result<QueueEntry> {
         self.write(|state| {
             let project_id = state.require_item(item)?.project_id;
+            let workspace = state.run_workspace(project_id, workspace)?;
             if let Some(stored) = state.queue_entries.get(&item) {
                 return Ok(stored.clone());
             }
@@ -1916,13 +1922,17 @@ impl State {
     /// One reached item classified against the walk's bound (`R-PRM-1`, `R-PRM-2`).
     fn upstream_entry(&self, item: &Item, depth: u8, scope: &PromptScope) -> UpstreamEntry {
         // `R-ENT-2`: with no workspace the bound is the one project, because there is no implicit
-        // workspace row to ask.
+        // workspace row to ask. MOD-147 D9: a workspace bound also holds its own scope row.
         let in_scope = scope
             .workspace
             .map_or(item.project_id == scope.project, |ws| {
                 self.workspace_projects
                     .iter()
                     .any(|member| member.workspace_id == ws && member.project_id == item.project_id)
+                    || self
+                        .projects
+                        .get(&item.project_id)
+                        .is_some_and(|row| row.owner_workspace_id == Some(ws))
             });
         UpstreamEntry {
             item_id: item.id,
@@ -3552,7 +3562,9 @@ impl State {
     /// kind's project may use (MOD-138 D12, [`graph_usable_by`]): its own, a workspace's that
     /// holds it, or the library's. `graph` is `None` when an update leaves the graph as it is: an
     /// unchanged graph is not re-checked, so a kind keeps a workspace graph its project has left
-    /// (A7), as an item does.
+    /// (A7), as an item does. MOD-147 D5: when `prefix_moved` (a create, or an update changing the
+    /// prefix), a scope row's kind may not take a prefix a current member's kind uses, checked
+    /// before the graph ([`workspace_prefix_taken`]).
     fn check_item_kind(
         &self,
         project: ProjectId,
@@ -3560,6 +3572,7 @@ impl State {
         name: &str,
         graph: Option<StepGraphId>,
         except: Option<ItemKindId>,
+        prefix_moved: bool,
     ) -> Result<()> {
         if !ItemKind::prefix_is_valid(prefix) {
             return Err(StoreError::Constraint(invalid_prefix(prefix)));
@@ -3567,6 +3580,11 @@ impl State {
         if !self.projects.contains_key(&project) {
             return Err(StoreError::Constraint(format!(
                 "item_kind.project_id `{project}` references no project"
+            )));
+        }
+        if prefix_moved && let Some(member) = self.workspace_prefix_holder(project, prefix) {
+            return Err(StoreError::Constraint(workspace_prefix_taken(
+                prefix, &member,
             )));
         }
         if let Some(graph) = graph {
@@ -3604,6 +3622,7 @@ impl State {
             &new.name,
             Some(new.default_graph_id),
             None,
+            true,
         )?;
         if self.kinds.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
@@ -3654,6 +3673,10 @@ impl State {
                 .default_graph_id
                 .filter(|graph| *graph != current.default_graph_id),
             Some(id),
+            patch
+                .prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix != current.prefix),
         )?;
         let row = self
             .kinds
@@ -3824,13 +3847,73 @@ impl State {
         rows
     }
 
-    /// MOD-138 D12: the `workspace_id` of every `workspace_project` row of `project`.
+    /// MOD-138 D12: the `workspace_id` of every `workspace_project` row of `project`. MOD-147 D7:
+    /// and a scope row's own workspace (a scope row joins no workspace, so the two never overlap).
     fn workspaces_of(&self, project: ProjectId) -> Vec<WorkspaceId> {
         self.workspace_projects
             .iter()
             .filter(|row| row.project_id == project)
             .map(|row| row.workspace_id)
+            .chain(
+                self.projects
+                    .get(&project)
+                    .and_then(|row| row.owner_workspace_id),
+            )
             .collect()
+    }
+
+    /// MOD-147 D8: the `workspace_id` a run or queue entry of `project` stores
+    /// ([`run_workspace_for`] over its `owner_workspace_id`); another workspace on a scope row is
+    /// `Constraint(scope_row_run_workspace(..))`. An unknown project keeps `asked` (its foreign key
+    /// answers later).
+    fn run_workspace(
+        &self,
+        project: ProjectId,
+        asked: Option<WorkspaceId>,
+    ) -> Result<Option<WorkspaceId>> {
+        let row = self.projects.get(&project);
+        run_workspace_for(row.and_then(|row| row.owner_workspace_id), asked).map_err(|asked| {
+            let slug = row.map_or_else(|| project.to_string(), |row| row.slug.clone());
+            StoreError::Constraint(scope_row_run_workspace(&slug, asked))
+        })
+    }
+
+    /// MOD-147 D3: whether a step of `from` may link to an item of `to`: the same project, or
+    /// `to` is the scope row or a member of a workspace in `workspaces_of(from)`.
+    fn link_reaches(&self, from: ProjectId, to: ProjectId) -> bool {
+        from == to
+            || self.workspaces_of(from).iter().any(|ws| {
+                self.scope_row_of(*ws) == Some(to)
+                    || self
+                        .workspace_projects
+                        .iter()
+                        .any(|m| m.workspace_id == *ws && m.project_id == to)
+            })
+    }
+
+    /// MOD-147 D5: the slug of the first member (by `position`, then slug bytes) of the workspace
+    /// whose scope row is `project` that has a kind with `prefix`; `None` for a user project.
+    fn workspace_prefix_holder(&self, project: ProjectId, prefix: &str) -> Option<String> {
+        let workspace = self.projects.get(&project)?.owner_workspace_id?;
+        self.workspace_projects
+            .iter()
+            .filter(|link| link.workspace_id == workspace)
+            .filter(|link| {
+                self.kinds
+                    .values()
+                    .any(|kind| kind.project_id == link.project_id && kind.prefix == prefix)
+            })
+            .filter_map(|link| {
+                self.projects
+                    .get(&link.project_id)
+                    .map(|row| (link.position, row.slug.as_str()))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+            })
+            .map(|(_, slug)| slug.to_owned())
     }
 
     /// MOD-138 D12 (A4): every graph `project` may use ([`graph_usable_by`]), ordered by scope
@@ -5345,16 +5428,23 @@ impl State {
     /// bytes, project slug bytes) order (holder `item_kind PREFIX` or `item KEY`; the slug breaks
     /// a tie between two projects of the workspace), as [`workspace_graph_is_held`]'s sentence;
     /// `None` while nothing holds them. `PgStore`'s holder query has the same order.
-    fn workspace_graph_holder(&self, graphs: &HashSet<StepGraphId>) -> Option<String> {
+    ///
+    /// MOD-147 D7: rows of `except` (the workspace's own scope row, which cascades with it) do not
+    /// hold.
+    fn workspace_graph_holder(
+        &self,
+        graphs: &HashSet<StepGraphId>,
+        except: Option<ProjectId>,
+    ) -> Option<String> {
         let slug = |project: ProjectId| {
             self.projects
                 .get(&project)
                 .map_or_else(|| project.to_string(), |row| row.slug.clone())
         };
         let name = |graph: StepGraphId| self.graphs.get(&graph).map(|row| row.name.clone());
+        let held = |project: ProjectId| Some(project) != except;
         let kinds = self.kinds.values().filter_map(|kind| {
-            graphs
-                .contains(&kind.default_graph_id)
+            (graphs.contains(&kind.default_graph_id) && held(kind.project_id))
                 .then(|| name(kind.default_graph_id))
                 .flatten()
                 .map(|graph| {
@@ -5366,7 +5456,9 @@ impl State {
                 })
         });
         let items = self.items.values().filter_map(|item| {
-            let graph = item.step_graph_id.filter(|graph| graphs.contains(graph))?;
+            let graph = item
+                .step_graph_id
+                .filter(|graph| graphs.contains(graph) && held(item.project_id))?;
             name(graph).map(|graph| (graph, format!("item {}", item.key), slug(item.project_id)))
         });
         kinds
@@ -5676,16 +5768,17 @@ impl State {
         }
         // MOD-137 D3: its graphs go, with everything that cascades from them.
         let (graphs, phases) = self.workspace_graphs(id);
+        let scope = self.scope_row_of(id);
         // MOD-138 A3: but neither `item_kind.default_graph_id` nor `item.step_graph_id` cascades
         // (Postgres answers `23503`), so a held graph refuses the delete before anything goes.
-        if let Some(held) = self.workspace_graph_holder(&graphs) {
+        // MOD-147 D7: the scope row's own holders go with it, so they do not hold.
+        if let Some(held) = self.workspace_graph_holder(&graphs, scope) {
             return Err(StoreError::Constraint(held));
         }
         // MOD-147 A1: a live run of the scope row (`RunStatus::is_active`: queued, running,
         // awaiting_approval or stopped, R1 M2) refuses; everything else it owns goes with it,
         // counted. The scope row and its rows go first, by `remove_project` (A2's refusal is for
         // a scope row deleted alone).
-        let scope = self.scope_row_of(id);
         if let Some(scope) = scope {
             let live = self
                 .runs
@@ -6235,6 +6328,8 @@ impl State {
                 new.project_id,
             )));
         }
+        // MOD-147 D8: a scope row's run carries its workspace, before the workspace FK below.
+        let workspace_id = self.run_workspace(new.project_id, new.workspace_id)?;
         if self.runs.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("run", new.id)));
         }
@@ -6253,7 +6348,7 @@ impl State {
             )));
         }
         // MOD-125 D3: `fk_run_workspace`.
-        if let Some(workspace) = new.workspace_id
+        if let Some(workspace) = workspace_id
             && !self.workspaces.contains_key(&workspace)
         {
             return Err(StoreError::Constraint(references_no_row(
@@ -6292,7 +6387,7 @@ impl State {
         })?;
 
         let row = Run {
-            workspace_id: new.workspace_id,
+            workspace_id,
             id: new.id,
             project_id: new.project_id,
             item_id: Some(new.item_id),
@@ -8346,8 +8441,9 @@ impl State {
     }
 
     /// MOD-11 D13, B-6: the upsert. Refusals run self link, step, fence, own item, `to`, its
-    /// project; then a new row is live and the step's, a tombstone revives as the step's, and a
-    /// live row keeps its proposer (only `updated_at` moves, as Postgres's trigger moves it).
+    /// reach (MOD-147 D3, [`Self::link_reaches`]); then a new row is live and the step's, a
+    /// tombstone revives as the step's, and a live row keeps its proposer (only `updated_at`
+    /// moves, as Postgres's trigger moves it).
     fn propose_link(
         &mut self,
         fence: StepFence,
@@ -8363,8 +8459,9 @@ impl State {
                 link.step, link.from,
             )));
         }
-        if self.require_item(link.to)?.project_id != project {
-            return Err(StoreError::Constraint(link_outside_project(link.to)));
+        let target = self.require_item(link.to)?.project_id;
+        if !self.link_reaches(project, target) {
+            return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
         let at = self.links.iter().position(|row| {
             row.from_item_id == link.from && row.to_item_id == link.to && row.kind == link.kind
@@ -8431,11 +8528,17 @@ impl State {
         Ok(row.clone())
     }
 
-    /// MOD-11 B-4: the item of `project` keyed `key`.
+    /// MOD-11 B-4: the item of `project` keyed `key`. MOD-147 D2: a qualified `slug:KEY` names
+    /// its project by slug, and `project` is ignored; an unknown slug is `None`.
     fn item_by_key(&self, project: ProjectId, key: &str) -> Option<ItemId> {
         if key.contains('\0') {
             return None;
         }
+        let (slug, key) = split_qualified(key);
+        let project = match slug {
+            Some(slug) => self.projects.values().find(|row| row.slug == slug)?.id,
+            None => project,
+        };
         self.items
             .values()
             .find(|row| row.project_id == project && row.key == key)
@@ -16596,6 +16699,96 @@ mod tests {
         assert_eq!(
             again, entry,
             "a repeat answers the stored entry, its workspace included"
+        );
+    }
+
+    /// MOD-147 D8: a scope row's queue entry carries its workspace: `None` is filled; another
+    /// workspace is refused and queues nothing, also on a re-queue of an item already queued
+    /// (checked before the stored entry is answered); a re-queue with `None` answers the stored
+    /// entry unchanged.
+    #[tokio::test]
+    async fn queue_item_fills_a_scope_rows_workspace_and_refuses_another() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let mint = |title: &'static str| {
+            store.mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+                title: title.to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+        };
+        let first = mint("first").await.expect("a WS item mints");
+        let second = mint("second").await.expect("a second WS item mints");
+        let refusal = Err(StoreError::Constraint(
+            crate::store::traits::scope_row_run_workspace("@platform", ids::WORKSPACE_GRAPHICS),
+        ));
+
+        let entry = store
+            .queue_item(first.id, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("a scope-row item queues");
+        assert_eq!(
+            entry.workspace_id,
+            Some(ids::WORKSPACE_PLATFORM),
+            "`None` is filled with the owner"
+        );
+
+        assert_eq!(
+            store
+                .queue_item(
+                    second.id,
+                    ids::BOX,
+                    Some(ids::WORKSPACE_GRAPHICS),
+                    ids::USER,
+                    at,
+                )
+                .await,
+            refusal,
+            "another workspace is refused"
+        );
+        assert_eq!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total"),
+            vec![entry.clone()],
+            "the refusal queued nothing"
+        );
+
+        assert_eq!(
+            store
+                .queue_item(
+                    first.id,
+                    ids::BOX,
+                    Some(ids::WORKSPACE_GRAPHICS),
+                    ids::USER,
+                    at,
+                )
+                .await,
+            refusal,
+            "a re-queue naming another workspace is refused before the stored entry answers"
+        );
+        assert_eq!(
+            store
+                .queue_item(
+                    first.id,
+                    ids::BOX,
+                    None,
+                    ids::USER,
+                    at + TimeDelta::minutes(1)
+                )
+                .await
+                .expect("a repeat is answered"),
+            entry,
+            "a re-queue with `None` answers the stored entry unchanged"
         );
     }
 

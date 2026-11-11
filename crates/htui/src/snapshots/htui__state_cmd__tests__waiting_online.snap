@@ -29,6 +29,8 @@ expression: pretty(&answer)
     {
       "reason": "gate",
       "item_key": "MOD-4",
+      "project": "htui",
+      "qualified_key": "htui:MOD-4",
       "item_id": "00000000-0000-0000-0000-000000000101",
       "run_id": "00000000-0000-0000-0000-000000000201",
       "step_id": "00000000-0000-0000-0000-000000000301",
@@ -40,6 +42,8 @@ expression: pretty(&answer)
     {
       "reason": "judge_failed",
       "item_key": "MOD-5",
+      "project": "htui",
+      "qualified_key": "htui:MOD-5",
       "item_id": "00000000-0000-0000-0000-000000000102",
       "run_id": "00000000-0000-0000-0000-000000000202",
       "step_id": "00000000-0000-0000-0000-000000000302",
@@ -51,6 +55,8 @@ expression: pretty(&answer)
     {
       "reason": "selection",
       "item_key": "MOD-6",
+      "project": "htui",
+      "qualified_key": "htui:MOD-6",
       "item_id": "00000000-0000-0000-0000-000000000103",
       "run_id": "00000000-0000-0000-0000-000000000203",
       "step_id": "00000000-0000-0000-0000-000000000303",
@@ -62,6 +68,8 @@ expression: pretty(&answer)
     {
       "reason": "unblock",
       "item_key": "MOD-7",
+      "project": "htui",
+      "qualified_key": "htui:MOD-7",
       "item_id": "00000000-0000-0000-0000-000000000104",
       "run_id": null,
       "step_id": null,
@@ -73,6 +81,8 @@ expression: pretty(&answer)
     {
       "reason": "interrupted",
       "item_key": "MOD-8",
+      "project": "htui",
+      "qualified_key": "htui:MOD-8",
       "item_id": "00000000-0000-0000-0000-000000000105",
       "run_id": "00000000-0000-0000-0000-000000000205",
       "step_id": "00000000-0000-0000-0000-000000000305",
@@ -84,6 +94,8 @@ expression: pretty(&answer)
     {
       "reason": "permission",
       "item_key": "MOD-9",
+      "project": "htui",
+      "qualified_key": "htui:MOD-9",
       "item_id": "00000000-0000-0000-0000-000000000106",
       "run_id": "00000000-0000-0000-0000-000000000206",
       "step_id": "00000000-0000-0000-0000-000000000306",

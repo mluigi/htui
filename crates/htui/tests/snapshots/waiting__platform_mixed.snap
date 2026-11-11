@@ -14,12 +14,12 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 │  FIX-1    ✓ closed     Terminal left raw after panic││Postgres holds the truth; every box keeps a│
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││read-only cache it refreshes on connect.   │
 │ ▾ agy (3)                                           ││Writes are compare-and-set on a version    │
-│  ANA-1  ╭ Waiting on you ───────────────────────────────────────────────────────────────╮gainst  │
-│  FEAT-1 │▌ ANA-2   plan 1.1  gate        gate                                           │ently   │
-│  FIX-1  │  ANA-2   plan 1.1  permission  edit: src/lib.rs                               │        │
-│         │  FEAT-2  —         unblock     blocked, no active run: u reopens it           │        │
-│         │  TOOL-1  —         unblock     parked by an interrupted command: u resumes it │ject    │
-│         ╰ j/k move · Enter open · Esc close ────────────────────────────────────────────╯gapless │
+│  ANA-╭ Waiting on you ────────────────────────────────────────────────────────────────────╮inst  │
+│  FEAT│▌ htui:ANA-2   plan 1.1  gate        gate                                           │tly   │
+│  FIX-│  htui:ANA-2   plan 1.1  permission  edit: src/lib.rs                               │      │
+│      │  htui:FEAT-2  —         unblock     blocked, no active run: u reopens it           │      │
+│      │  htui:TOOL-1  —         unblock     parked by an interrupted command: u resumes it │ct    │
+│      ╰ j/k move · Enter open · Esc close ─────────────────────────────────────────────────╯pless │
 │                                                     ││and lets the legacy importer align the     │
 │                                                     ││counter above the numbers it brings in.    │
 │                                                     ││                                           │

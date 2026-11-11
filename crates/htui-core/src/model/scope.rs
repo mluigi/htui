@@ -39,6 +39,18 @@ impl Scope {
     pub fn is_empty(&self) -> bool {
         self.project_ids.is_empty()
     }
+
+    /// MOD-147 D10: this scope with `row` (the workspace's scope row) first, for the waiting reads
+    /// only; `row` already present stays where it is. `sort_canonical` orders by position here, so
+    /// the workspace's own rows list first.
+    #[must_use]
+    pub fn with_scope_row(&self, row: ProjectId) -> Self {
+        let mut wide = self.clone();
+        if !wide.contains(row) {
+            wide.project_ids.insert(0, row);
+        }
+        wide
+    }
 }
 
 /// The bound of the prompt's upstream walk (plan D95): the active workspace, or one project when
@@ -130,5 +142,23 @@ mod tests {
 
         assert_eq!(prompt.workspace, None);
         assert_eq!(prompt.project, project);
+    }
+
+    /// MOD-147 D10: the scope row goes first, once; the asked scope is left as it was.
+    #[test]
+    fn with_scope_row_puts_the_row_first_once() {
+        let scope = Scope::from_workspace(&workspace());
+        let row = ProjectId::from_uuid(Uuid::from_u128(5));
+
+        let wide = scope.with_scope_row(row);
+        assert_eq!(wide.workspace_id, scope.workspace_id);
+        assert_eq!(wide.project_ids[0], row);
+        assert_eq!(&wide.project_ids[1..], scope.project_ids.as_slice());
+        assert!(!scope.contains(row), "the asked scope is unchanged");
+
+        let again = wide.with_scope_row(row);
+        assert_eq!(again, wide, "a row already present stays where it is");
+        let member = scope.project_ids[0];
+        assert_eq!(scope.with_scope_row(member), scope);
     }
 }
