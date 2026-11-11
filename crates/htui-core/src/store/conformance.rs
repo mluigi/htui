@@ -28269,7 +28269,8 @@ async fn step_refused_exactly<S: WriteStore>(case: &str, store: &S, new: NewRunS
 
 /// MOD-139 D1, D4: `create_step` writes `role`, `parent_step_id` and `node_key` once, and every
 /// read answers them: a planner, a part under it, and the three stages at the reserved positions.
-/// The fence fixture's own step reads `step` with neither field.
+/// The fence fixture's own step reads `step` with neither field. A step that names itself as its
+/// parent is refused with [`run_step_refusal`]'s sentence.
 async fn create_step_writes_role_parent_and_node_key<S: WriteStore>(store: &S) {
     const CASE: &str = "create_step_writes_role_parent_and_node_key";
     let (run, first) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
@@ -28347,24 +28348,27 @@ async fn create_step_writes_role_parent_and_node_key<S: WriteStore>(store: &S) {
         "{CASE}: an ordinary step reads `step` with no parent and no key"
     );
 
-    // Postgres checks the parent's foreign key once the row is in, so a step that names itself
-    // as its parent is accepted there; every store accepts it alike.
+    // A step never names itself as its parent (MOD-139 M1 R1): Postgres's self-parent CHECK and
+    // MemStore refuse it alike, with the one sentence, and nothing is listed.
     let own = StepId::new();
-    let itself = store
-        .create_step(NewRunStep {
+    step_refused_exactly(
+        CASE,
+        store,
+        NewRunStep {
             id: own,
             ..role_step(run, 6, StepRole::Part, Some(own), Some("implement/self"))
-        })
-        .await
-        .unwrap_or_else(|err| panic!("{CASE}: a step that is its own parent is accepted: {err}"));
-    assert_eq!(
-        (itself.id, itself.parent_step_id),
-        (own, Some(own)),
-        "{CASE}: the row names itself as its parent"
-    );
+        },
+        "a step that is its own parent",
+    )
+    .await;
     assert!(
-        store.run_steps(run).await.expect(CASE).contains(&itself),
-        "{CASE}: the self-parented row is listed"
+        !store
+            .run_steps(run)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == own),
+        "{CASE}: the self-parented row is not listed"
     );
 }
 
