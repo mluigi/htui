@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-170](docs/decisions/mod/mod-170.md)** - Waiting key qualifier: one read per refresh tick (done, 2026-11-11)
 - **[MOD-139](docs/decisions/mod/mod-139.md)** - Divided fan-out runtime: planner, parts, integrate (done, 2026-11-11)
 - **[MOD-97](docs/decisions/mod/mod-97.md)** - Strip inherited vendor API keys from subscription-billed agent spawns (done, 2026-11-10)
 - **[MOD-163](docs/decisions/mod/mod-163.md)** - Memory: entry store and prompt section (done, 2026-11-09)

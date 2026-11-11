@@ -3,7 +3,7 @@
 **Source**: `HANDOFF.md` MOD-170 (from MOD-147 M2 review). Routed as **plan** by `/handoff-run`
 (C3 only; maintainer accepted 2026-11-11).
 **Complexity**: Small
-**Status**: confirmed by the maintainer 2026-11-11 — implementing
+**Status**: done 2026-11-11 (`144bd443`, `ab6fe770`, R1 `71b884bd`; write-up `docs/decisions/mod/mod-170.md`)
 
 ## Summary
 
