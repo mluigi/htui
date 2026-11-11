@@ -56,22 +56,31 @@ str_enum!(
 impl CommandQueue {
     /// MOD-11 D16: whether a step of this phase gets `command_run` (and the prompt's command-queue
     /// section): `off` → never; `always` → always; `fan_out_only` → when the phase fans out to
-    /// more than one agent or the item carries [`HEAVY_BUILD_TAG`] (ANA-5 `:337`, R-MCP-3).
+    /// more than one agent, when the session has a live sibling in the run (MOD-139 D13: another
+    /// `pending` or `running` row, not a stage or a judge — divided parts and parallel branches),
+    /// or the item carries [`HEAVY_BUILD_TAG`] (ANA-5 `:337`, R-MCP-3).
     #[must_use]
-    pub fn exposed(self, fan_out: i32, item_tags: &[String]) -> bool {
+    pub fn exposed(self, fan_out: i32, live_siblings: bool, item_tags: &[String]) -> bool {
         match self {
             Self::Off => false,
             Self::Always => true,
-            Self::FanOutOnly => fan_out > 1 || item_tags.iter().any(|tag| tag == HEAVY_BUILD_TAG),
+            Self::FanOutOnly => {
+                fan_out > 1 || live_siblings || item_tags.iter().any(|tag| tag == HEAVY_BUILD_TAG)
+            }
         }
     }
 }
 
-/// MOD-11 D16's one resolver, as a function for callers holding the three values:
+/// MOD-11 D16's one resolver, as a function for callers holding the four values:
 /// [`CommandQueue::exposed`].
 #[must_use]
-pub fn command_queue_exposed(mode: CommandQueue, fan_out: i32, item_tags: &[String]) -> bool {
-    mode.exposed(fan_out, item_tags)
+pub fn command_queue_exposed(
+    mode: CommandQueue,
+    fan_out: i32,
+    live_siblings: bool,
+    item_tags: &[String],
+) -> bool {
+    mode.exposed(fan_out, live_siblings, item_tags)
 }
 
 /// The item tag R-MCP-3 names: a `fan_out_only` phase queues the commands of an item carrying it
@@ -767,12 +776,15 @@ mod tests {
     #[test]
     fn off_never_exposes() {
         for (fan_out, item_tags) in [(1, tags(&[])), (4, tags(&[HEAVY_BUILD_TAG]))] {
-            assert!(!CommandQueue::Off.exposed(fan_out, &item_tags));
-            assert!(!command_queue_exposed(
-                CommandQueue::Off,
-                fan_out,
-                &item_tags
-            ));
+            for live_siblings in [false, true] {
+                assert!(!CommandQueue::Off.exposed(fan_out, live_siblings, &item_tags));
+                assert!(!command_queue_exposed(
+                    CommandQueue::Off,
+                    fan_out,
+                    live_siblings,
+                    &item_tags
+                ));
+            }
         }
     }
 
@@ -780,7 +792,7 @@ mod tests {
     #[test]
     fn always_always_exposes() {
         for (fan_out, item_tags) in [(1, tags(&[])), (0, tags(&["rust"])), (3, tags(&[]))] {
-            assert!(CommandQueue::Always.exposed(fan_out, &item_tags));
+            assert!(CommandQueue::Always.exposed(fan_out, false, &item_tags));
         }
     }
 
@@ -789,18 +801,35 @@ mod tests {
     #[test]
     fn fan_out_only_exposes_only_fanned_or_heavy() {
         let mode = CommandQueue::FanOutOnly;
-        assert!(!mode.exposed(1, &tags(&[])), "one agent, no tag");
+        assert!(!mode.exposed(1, false, &tags(&[])), "one agent, no tag");
         assert!(
-            !mode.exposed(0, &tags(&["rust", "heavy"])),
+            !mode.exposed(0, false, &tags(&["rust", "heavy"])),
             "no heavy_build"
         );
         assert!(
-            !mode.exposed(1, &tags(&["heavy_build_x", "HEAVY_BUILD"])),
+            !mode.exposed(1, false, &tags(&["heavy_build_x", "HEAVY_BUILD"])),
             "an exact tag"
         );
-        assert!(mode.exposed(2, &tags(&[])), "fanned out");
-        assert!(mode.exposed(1, &tags(&["rust", "heavy_build"])), "heavy");
+        assert!(mode.exposed(2, false, &tags(&[])), "fanned out");
+        assert!(
+            mode.exposed(1, false, &tags(&["rust", "heavy_build"])),
+            "heavy"
+        );
         assert_eq!(HEAVY_BUILD_TAG, "heavy_build");
+    }
+
+    /// MOD-139 M2 D13: `fan_out_only` also exposes `command_run` to a session with a live sibling
+    /// in its run (a divided part, a parallel branch); `off` and `always` ignore the fact.
+    #[test]
+    fn fan_out_only_follows_live_siblings() {
+        let mode = CommandQueue::FanOutOnly;
+        assert!(mode.exposed(1, true, &[]), "a live sibling");
+        assert!(!mode.exposed(1, false, &[]), "alone");
+        assert!(mode.exposed(2, false, &[]), "compete keeps `fan_out > 1`");
+        assert!(!CommandQueue::Off.exposed(2, true, &tags(&[HEAVY_BUILD_TAG])));
+        assert!(CommandQueue::Always.exposed(1, false, &[]));
+        assert!(command_queue_exposed(mode, 1, true, &[]));
+        assert!(!command_queue_exposed(mode, 1, false, &[]));
     }
 
     /// MOD-11 D15: the box's `command_limits` overlays the app default key by key; a value of

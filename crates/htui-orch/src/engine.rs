@@ -7142,7 +7142,11 @@ where
     /// section both read this (the persona's term is applied on top), so a host-less engine
     /// neither denies the heavy commands nor names a tool nothing serves.
     fn command_run_exposed(&self, phase: &SnapshotPhase, required_tags: &[String]) -> bool {
-        self.parts.tools.is_some() && phase.command_queue.exposed(phase.fan_out, required_tags)
+        // MOD-139 M2 D13: `live_siblings` is `false` until T3 computes it once per session.
+        self.parts.tools.is_some()
+            && phase
+                .command_queue
+                .exposed(phase.fan_out, false, required_tags)
     }
 
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
