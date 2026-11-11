@@ -392,6 +392,9 @@ pub(crate) enum TrimStep {
     VerifyFailure,
     /// Rank 3: the document group.
     Documents,
+    /// Rank 3, after the documents (MOD-139 M3 D5): integrate's done parts, bodies head+tail
+    /// last part first, then bodies dropped, then the section.
+    Parts,
     /// Rank 4: head+tail, never dropped.
     Item,
     /// Judge rank 1: the per-candidate isolate cap.
@@ -410,7 +413,9 @@ pub(crate) enum TrimStep {
 /// document group and the group before `item` (blueprint P-3, following §5.1's worked example
 /// rather than §4.4's row text — the two disagree and the example is the one with arithmetic in
 /// it). MOD-163 D16 puts project memory after the excerpts and before upstream (ANA-5 §4.4 as
-/// amended 2026-10-20). The two role orders are §4.4's own two-entry orders.
+/// amended 2026-10-20). MOD-139 M3 D5 puts integrate's `parts` in `R-PRM-3`'s "prior documents"
+/// rank: after the document group, before `item`. The two role orders are §4.4's own two-entry
+/// orders.
 pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
     match role {
         TemplateRole::Phase => &[
@@ -420,6 +425,7 @@ pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
             TrimStep::PreviousDiff,
             TrimStep::VerifyFailure,
             TrimStep::Documents,
+            TrimStep::Parts,
             TrimStep::Item,
         ],
         TemplateRole::Judge => &[TrimStep::Candidates, TrimStep::JudgeTask],
@@ -588,6 +594,8 @@ impl<'a> Trimmer<'a> {
             SectionName::Template
             | SectionName::Persona
             | SectionName::Part
+            | SectionName::Premerge
+            | SectionName::Parts
             | SectionName::Box
             | SectionName::Skills
             | SectionName::CommandQueue
@@ -672,6 +680,8 @@ impl<'a> Trimmer<'a> {
                 TrimStep::DiffSoFar => self.trim_diff(&SectionName::DiffSoFar),
                 TrimStep::VerifyFailure => self.trim_verify_failure(),
                 TrimStep::Documents => self.trim_documents(),
+                // MOD-139 M3 D5: the ladder lands in T2's third commit.
+                TrimStep::Parts => {}
                 TrimStep::Item => {
                     self.head_tail_in_place(
                         &SectionName::Item,
@@ -955,6 +965,8 @@ impl<'a> Trimmer<'a> {
             | SectionName::Persona
             | SectionName::Memory
             | SectionName::Part
+            | SectionName::Premerge
+            | SectionName::Parts
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream
@@ -1325,6 +1337,7 @@ mod tests {
                 TrimStep::PreviousDiff,
                 TrimStep::VerifyFailure,
                 TrimStep::Documents,
+                TrimStep::Parts,
                 TrimStep::Item,
             ]
         );

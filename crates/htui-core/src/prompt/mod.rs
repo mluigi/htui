@@ -64,7 +64,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::SnapshotMemory;
 use crate::model::persona::SnapshotPersona;
-use crate::model::run::SnapshotPart;
+use crate::model::run::{PremergeReport, SnapshotPart};
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
@@ -129,6 +129,13 @@ pub struct PromptSpec {
     /// section after persona and memory and before the body. `None` everywhere but a part's
     /// session; rendered for a Phase spec only.
     pub part: Option<PartBlock>,
+    /// MOD-139 M3 D5: integrate's pre-merge report, rendered as the internal protected `premerge`
+    /// section after `part`. `None` everywhere but an integrate session; rendered for a Phase spec
+    /// with at least one repo only (blueprint P-10).
+    pub premerge: Option<PremergeReport>,
+    /// MOD-139 M3 D5: the done parts integrate merges, rendered as the internal trimmable `parts`
+    /// section after `premerge`. Empty everywhere but an integrate session; Phase spec only.
+    pub parts: Vec<IntegratePart>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
@@ -222,6 +229,44 @@ impl From<&SnapshotPart> for PartBlock {
 /// MOD-139 M2 D10: the blank line after the part section, counted in the frame (persona's rule,
 /// B-17): the section is protected and never dropped.
 pub const PART_SEPARATOR: &str = "\n\n";
+
+/// MOD-139 M3 D5: one done part as integrate's `parts` section renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegratePart {
+    /// `SnapshotPart.key`, the block's `key` attribute.
+    pub key: String,
+    /// `SnapshotPart.title`, the block's `title` attribute.
+    pub title: String,
+    /// `(repo name, tip)` per repo the part committed to, report order; empty = no commits.
+    pub tips: Vec<(String, String)>,
+    /// `Isolator::diff` over the part's rows; rendered stat-only. `None` when it answered none
+    /// or failed (a trim note, as a forwarded diff's error is).
+    pub diff: Option<DiffBlock>,
+    /// The part's highest-version output document body; `None` renders no body.
+    pub body: Option<String>,
+}
+
+/// MOD-139 M3 D5: the blank line after `premerge`, counted in the **frame** whenever the section
+/// renders (protected, never dropped: [`PART_SEPARATOR`]'s rule).
+pub const PREMERGE_SEPARATOR: &str = "\n\n";
+
+/// MOD-139 M3 D5: the blank line after `parts`, counted in the section's **own span**, written by
+/// `substitute` only while the section is live ([`MEMORY_SEPARATOR`]'s rule).
+pub const PARTS_SEPARATOR: &str = "\n\n";
+
+/// MOD-139 M3 D4: integrate's item note, the `premerge` section's own text under one header line;
+/// `None` for a report with no repo (blueprint P-10). One renderer for the note and the section
+/// ([`render::premerge_content`]), so the two cannot drift: the same order, the same 20-path cap.
+#[must_use]
+pub fn premerge_note(node: &str, attempt: i32, report: &PremergeReport) -> Option<String> {
+    if report.repos.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "premerge `{node}` attempt {attempt}:\n{}",
+        render::premerge_content(report)
+    ))
+}
 
 /// MOD-163 D14 (C8 option a): the blank line between the memory section and what follows it.
 /// Counted in the **memory section's own span**, not the frame, so dropping the section drops it
@@ -344,6 +389,12 @@ pub enum SectionName {
     /// MOD-139 M2 D10: a divided part's brief. Recorded after `persona` and `memory`, before the
     /// body's spans; protected.
     Part,
+    /// MOD-139 M3 D5: integrate's pre-merge report. Recorded after `part`, before `parts`;
+    /// protected.
+    Premerge,
+    /// MOD-139 M3 D5: the done parts integrate merges. Recorded after `premerge`, before the
+    /// body's spans; trimmable (`TrimStep::Parts`).
+    Parts,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -386,6 +437,8 @@ impl SectionName {
             Self::Persona => "persona".to_owned(),
             Self::Memory => "memory".to_owned(),
             Self::Part => "part".to_owned(),
+            Self::Premerge => "premerge".to_owned(),
+            Self::Parts => "parts".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -414,6 +467,7 @@ impl SectionName {
             Self::Template
             | Self::Persona
             | Self::Part
+            | Self::Premerge
             | Self::Box
             | Self::Skills
             | Self::CommandQueue
@@ -965,6 +1019,8 @@ fn render_sections(
             .into_iter()
             .collect(),
         Placeholder::Part => part_of(spec).map(render::part).into_iter().collect(),
+        // MOD-139 M3 D5: rendered from T2's third commit on.
+        Placeholder::Premerge | Placeholder::Parts => Vec::new(),
         Placeholder::Output => {
             if has_output(spec) {
                 spec.output_kind
@@ -1564,6 +1620,8 @@ mod tests {
         assert_eq!(SectionName::Persona.render(), "persona");
         assert_eq!(SectionName::Memory.render(), "memory");
         assert_eq!(SectionName::Part.render(), "part");
+        assert_eq!(SectionName::Premerge.render(), "premerge");
+        assert_eq!(SectionName::Parts.render(), "parts");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1582,6 +1640,7 @@ mod tests {
                 SectionName::Template,
                 SectionName::Persona,
                 SectionName::Part,
+                SectionName::Premerge,
                 SectionName::Box,
                 SectionName::Skills,
                 SectionName::CommandQueue,
@@ -1592,6 +1651,7 @@ mod tests {
             for name in [
                 SectionName::Item,
                 SectionName::Memory,
+                SectionName::Parts,
                 SectionName::Documents("plan".to_owned()),
                 SectionName::Upstream,
                 SectionName::Excerpts,

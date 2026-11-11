@@ -316,6 +316,9 @@ pub async fn build(
         memory,
         // MOD-139 M2 D10: the preview renders no part section.
         part: None,
+        // MOD-139 M3 D5: nor an integrate's `premerge` and `parts` sections.
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,

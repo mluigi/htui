@@ -80,8 +80,8 @@ pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind {
 /// roots), diff_so_far, failure_reason })`, `verify_failure`/`previous_diff`/`judge` cleared, and
 /// `skills` emptied (MOD-9 D44: a handoff body cannot place `{{skills}}`, so a candidate would only
 /// be scrubbed — failing the handoff on a skill body it never shows — and recorded `not_placed`),
-/// and `persona`, `memory` and `part` cleared (MOD-26 OQ-5, MOD-163 D18, MOD-139 D10). Every other
-/// field is the phase's.
+/// and `persona`, `memory`, `part`, `premerge` and `parts` cleared (MOD-26 OQ-5, MOD-163 D18,
+/// MOD-139 D10, MOD-139 M3 D5). Every other field is the phase's.
 #[must_use]
 pub fn handoff_spec(
     phase: PromptSpec,
@@ -108,6 +108,9 @@ pub fn handoff_spec(
         memory: None,
         // MOD-139 M2 D10: a handoff works no divided part.
         part: None,
+        // MOD-139 M3 D5: nor an integrate's pre-merge report and parts.
+        premerge: None,
+        parts: Vec::new(),
         handoff: Some(HandoffInputs {
             step_summary: StepSummary::from_events(events, roots),
             diff_so_far,
@@ -482,6 +485,9 @@ mod tests {
             memory: None,
             // MOD-139 M2 D10: nor a divided part.
             part: None,
+            // MOD-139 M3 D5: nor an integrate's report and parts.
+            premerge: None,
+            parts: Vec::new(),
             ..phase.clone()
         };
         assert_eq!(
