@@ -196,8 +196,8 @@ pub struct FakeIsolator {
 /// admission, after a case starts its run).
 #[derive(Debug, Clone)]
 enum PremergeScript {
-    /// The default report, with `key` `Conflicted { paths }` in every repo and later parts
-    /// `NotAttempted`.
+    /// The default report, with `key` `Conflicted { paths }` in every repo it committed in and
+    /// the later parts that committed there `NotAttempted`.
     Conflict { key: String, paths: Vec<String> },
     /// `Err(IsolateError::Refused(reason))`.
     Refuse(String),
@@ -553,8 +553,9 @@ impl FakeIsolator {
     }
 
     /// MOD-139 M3 T1: the next [`premerge`](Isolator::premerge) answers the default report, but
-    /// the part keyed `key` is `Conflicted { paths }` in every repo and every later part
-    /// `NotAttempted` (scripted by key, blueprint P-15). FIFO with
+    /// the part keyed `key` is `Conflicted { paths }` in every repo it committed in and every
+    /// later part that committed there `NotAttempted`; a part with no commits in a repo reads
+    /// `NoCommits` there, as GixIsolator answers (scripted by key, blueprint P-15). FIFO with
     /// [`refuse_premerge`](Self::refuse_premerge).
     pub fn conflict_premerge(&self, key: &str, paths: &[&str]) {
         self.premerge_answers
@@ -652,12 +653,22 @@ impl FakeIsolator {
                 let parts = parts
                     .iter()
                     .map(|part| {
+                        // GixIsolator's `committed_tip`: an `after_hash` equal to its
+                        // `before_hash` committed nothing.
                         let tip = part
                             .commits
                             .iter()
                             .find(|commit| commit.repo_id == tree.repo_id)
-                            .and_then(|commit| commit.after_hash.clone());
-                        let merge = if stopped {
+                            .and_then(|commit| {
+                                commit
+                                    .after_hash
+                                    .clone()
+                                    .filter(|after| *after != commit.before_hash)
+                            });
+                        // `premerge_repo`'s order: no commits before a stopped repo.
+                        let merge = if tip.is_none() {
+                            PartMerge::NoCommits
+                        } else if stopped {
                             PartMerge::NotAttempted
                         } else if let Some((_, paths)) =
                             conflict.filter(|(key, _)| *key == part.key)
@@ -666,12 +677,10 @@ impl FakeIsolator {
                             PartMerge::Conflicted {
                                 paths: paths.clone(),
                             }
-                        } else if tip.is_some() {
+                        } else {
                             let commit = format!("fake:merge:{}:{}", part.step, self.tick());
                             head.clone_from(&commit);
                             PartMerge::Merged { commit }
-                        } else {
-                            PartMerge::NoCommits
                         };
                         PartPremerge {
                             step: part.step,
@@ -1008,8 +1017,9 @@ impl Isolator for FakeIsolator {
 
     /// MOD-139 M3 T1: logged first (under the integrate step), counted and recorded, then a
     /// [`stall_nth_premerge`](FakeIsolator::stall_nth_premerge) stall, then the next script;
-    /// unscripted, the default report: per tree row every part with an `after_hash` there
-    /// `Merged` (`fake:merge:<part>:<n>`) and the rest `NoCommits`, `head` the last merge or the
+    /// unscripted, the default report: per tree row every part with an `after_hash` there other
+    /// than its `before_hash` `Merged` (`fake:merge:<part>:<n>`) and the rest `NoCommits`, `head`
+    /// the last merge or the
     /// row's `base_ref`. The fake merges nothing (blueprint G-5).
     fn premerge<'a>(
         &'a self,
@@ -3826,9 +3836,20 @@ mod tests {
                     paths: vec!["src/ui/a.rs".to_owned()]
                 }
             );
-            assert_eq!(repo.parts[2].merge, PartMerge::NotAttempted);
             assert_eq!(&repo.head, commit, "head stays at the last merge");
         }
+        assert_eq!(
+            report.repos[0].parts[2].merge,
+            PartMerge::NotAttempted,
+            "a later part that committed in the stopped repo is not attempted"
+        );
+        assert_eq!(
+            report.repos[1].parts[2].merge,
+            PartMerge::NoCommits,
+            "a later part with no commits in the stopped repo reads `NoCommits`, as GixIsolator \
+             answers"
+        );
+        assert_eq!(report.repos[1].parts[2].tip, None);
 
         let report = isolator
             .premerge(integrate, &trees, &parts)
@@ -3841,6 +3862,34 @@ mod tests {
                 .all(|part| matches!(part.merge, PartMerge::Merged { .. })),
             "the script answered once"
         );
+    }
+
+    /// MOD-139 M3 T1: the fake reads a part's tip as GixIsolator's `committed_tip` does (an
+    /// `after_hash` equal to its `before_hash` committed nothing), so its report shapes are ones
+    /// the real isolator produces.
+    #[tokio::test]
+    async fn the_fake_premerge_reads_an_unmoved_tip_as_no_commits() {
+        use htui_core::model::PartMerge;
+
+        let isolator = FakeIsolator::new();
+        let scope = repos();
+        let (trees, mut parts) = premerge_rows(&scope[..1], &[("api", &[0]), ("ui", &[0])]);
+        let integrate = trees[0].run_step_id;
+        let unmoved = &mut parts[1].commits[0];
+        unmoved.after_hash = Some(unmoved.before_hash.clone());
+
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("unscripted");
+        let repo = &report.repos[0];
+        assert!(matches!(repo.parts[0].merge, PartMerge::Merged { .. }));
+        assert_eq!(
+            repo.parts[1].merge,
+            PartMerge::NoCommits,
+            "`after_hash == before_hash` committed nothing"
+        );
+        assert_eq!(repo.parts[1].tip, None);
     }
 
     /// MOD-139 M3 T1: a refused pre-merge is an error, and the call is still logged.

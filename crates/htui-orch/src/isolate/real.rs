@@ -1873,9 +1873,6 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// D36: run-terminal, never at step end, and every row is processed before the first failure
-    /// is returned — a tree left behind because another one refused to go is a tree nobody
-    /// removes; no sweep retries a terminal run's cleanup (milestone 6).
     fn premerge<'a>(
         &'a self,
         step: StepId,
@@ -1923,6 +1920,9 @@ impl Isolator for GixIsolator {
         })
     }
 
+    /// D36: run-terminal, never at step end, and every row is processed before the first failure
+    /// is returned — a tree left behind because another one refused to go is a tree nobody
+    /// removes; no sweep retries a terminal run's cleanup (milestone 6).
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
             let mut failures: Vec<IsolateError> = Vec::new();
@@ -5791,6 +5791,46 @@ mod tests {
                 .expect("the post-check reads"),
             Vec::<StepId>::new()
         );
+    }
+
+    /// D2 under `copy`: a part that committed in a repository but has no `copy` tree row of it
+    /// has no object database to copy its range out of, so the pre-merge refuses, naming the part
+    /// and the checkout (there is no copy path to name, unlike `copy_tree_vanished`).
+    #[tokio::test]
+    async fn premerge_in_a_copy_refuses_a_part_without_a_copy_row() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Copy;
+        let mut api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        api.trees.clear();
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let refused = isolator
+            .premerge(integrate, &trees, std::slice::from_ref(&api))
+            .await
+            .expect_err("no copy row, no range to copy");
+        let crate::isolate::IsolateError::Refused(reason) = refused else {
+            panic!("a refusal, not {refused:?}");
+        };
+        assert_eq!(
+            reason,
+            format!("part {} committed in core but has no copy of it", api.step)
+        );
+        assert_eq!(reason, super::no_part_copy(api.step, "core"));
     }
 
     /// D3's lock: an in-place (`shared_serialized`) pre-merge holds the repository's admin lock
