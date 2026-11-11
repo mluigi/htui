@@ -1099,9 +1099,8 @@ pub trait WriteStore: ReadStore {
     ///
     /// Answers `Applied` with the body as stored (nodes, candidates and parts by `position`,
     /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
-    /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
-    /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
-    /// new one.
+    /// Every column [`StepGraphPhase`] carries is written, on a kept node and on a new one alike
+    /// (MOD-141 M2 D1).
     ///
     /// # Errors
     /// In this order, and nothing is written on any of them:

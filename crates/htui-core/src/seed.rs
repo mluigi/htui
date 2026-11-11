@@ -248,7 +248,7 @@ pub fn graph_row(
 /// `command_queue FanOutOnly`, `verify_command None`, `output_kind` and `template_name` equal to
 /// the name, `template_version None` (follow latest), `token_budget None` (project default),
 /// and MOD-137 D7's node defaults: `split None`, not a palette node, no plan scope, no divide
-/// columns.
+/// columns, and MOD-141 M2's three: no deadline, no judge.
 #[must_use]
 pub fn phase_row(
     id: PhaseId,
@@ -289,6 +289,9 @@ pub fn phase_row(
         integrate_agent_id: None,
         integrate_model: None,
         max_parts: None,
+        deadline_seconds: None,
+        judge_agent_id: None,
+        judge_model: None,
         updated_at: now,
     }
 }
@@ -764,6 +767,15 @@ mod tests {
             ),
             (None, None, None, None, None, None),
             "no divide columns"
+        );
+        assert_eq!(
+            (
+                phase.deadline_seconds,
+                phase.judge_agent_id,
+                phase.judge_model.as_deref()
+            ),
+            (None, None, None),
+            "no deadline and no judge"
         );
 
         let graph = graph_row(StepGraphId::new(), project, feature, now);

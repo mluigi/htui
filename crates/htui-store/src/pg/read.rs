@@ -3037,6 +3037,9 @@ impl PgStore {
                    integrate_agent_id   AS "integrate_agent_id: AgentId",
                    integrate_model,
                    max_parts,
+                   deadline_seconds,
+                   judge_agent_id       AS "judge_agent_id: AgentId",
+                   judge_model,
                    updated_at
               FROM step_graph_phase WHERE id = $1
             "#,
@@ -3567,6 +3570,9 @@ pub(crate) async fn phase_rows_on<'e, E: PgExecutor<'e>>(
                    integrate_agent_id   AS "integrate_agent_id: AgentId",
                    integrate_model,
                    max_parts,
+                   deadline_seconds,
+                   judge_agent_id       AS "judge_agent_id: AgentId",
+                   judge_model,
                    updated_at
               FROM step_graph_phase
              WHERE graph_id = $1

@@ -1465,9 +1465,10 @@ async fn insert_phase<'e, E: PgExecutor<'e>>(
                                       template_version, token_budget, persona_id, split,
                                       palette, plan_scope, planner_persona_id,
                                       planner_agent_id, planner_model, integrate_persona_id,
-                                      integrate_agent_id, integrate_model, max_parts)
+                                      integrate_agent_id, integrate_model, max_parts,
+                                      deadline_seconds, judge_agent_id, judge_model)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
         RETURNING id                   AS "id: PhaseId",
                   graph_id             AS "graph_id: StepGraphId",
                   position,
@@ -1495,6 +1496,9 @@ async fn insert_phase<'e, E: PgExecutor<'e>>(
                   integrate_agent_id   AS "integrate_agent_id: AgentId",
                   integrate_model,
                   max_parts,
+                  deadline_seconds,
+                  judge_agent_id       AS "judge_agent_id: AgentId",
+                  judge_model,
                   updated_at
         "#,
         phase.id.as_uuid(),
@@ -1524,6 +1528,9 @@ async fn insert_phase<'e, E: PgExecutor<'e>>(
         phase.integrate_agent_id.map(AgentId::as_uuid),
         phase.integrate_model.as_deref(),
         phase.max_parts,
+        phase.deadline_seconds,
+        phase.judge_agent_id.map(AgentId::as_uuid),
+        phase.judge_model.as_deref(),
     )
     .fetch_one(executor)
     .await
@@ -1587,9 +1594,8 @@ async fn replace_edges(
     Ok(())
 }
 
-/// `replace_graph`'s in-place write of a kept node (MOD-137 blueprint §T3.4 step 10): every
-/// column [`StepGraphPhase`] carries, `judge_agent_id`, `judge_model` and `deadline_seconds` left
-/// as they are (F14). The driver's error comes back raw for the caller's [`phase_fk_refused`].
+/// `replace_graph`'s in-place write of a kept node: every column [`StepGraphPhase`] carries
+/// (MOD-141 M2 D1). The driver's error comes back raw for the caller's [`phase_fk_refused`].
 async fn update_kept_phase(
     conn: &mut PgConnection,
     phase: &StepGraphPhase,
@@ -1602,7 +1608,8 @@ async fn update_kept_phase(
             template_version = $15, token_budget = $16, persona_id = $17, split = $18,
             palette = $19, plan_scope = $20, planner_persona_id = $21, planner_agent_id = $22,
             planner_model = $23, integrate_persona_id = $24, integrate_agent_id = $25,
-            integrate_model = $26, max_parts = $27
+            integrate_model = $26, max_parts = $27, deadline_seconds = $28, judge_agent_id = $29,
+            judge_model = $30
          WHERE id = $1 AND graph_id = $2
         "#,
         phase.id.as_uuid(),
@@ -1632,6 +1639,9 @@ async fn update_kept_phase(
         phase.integrate_agent_id.map(AgentId::as_uuid),
         phase.integrate_model.as_deref(),
         phase.max_parts,
+        phase.deadline_seconds,
+        phase.judge_agent_id.map(AgentId::as_uuid),
+        phase.judge_model.as_deref(),
     )
     .execute(conn)
     .await?;
@@ -4259,6 +4269,9 @@ impl WriteStore for PgStore {
                    integrate_agent_id   AS "integrate_agent_id: AgentId",
                    integrate_model,
                    max_parts,
+                   deadline_seconds,
+                   judge_agent_id       AS "judge_agent_id: AgentId",
+                   judge_model,
                    updated_at
               FROM step_graph_phase WHERE id = $1
                FOR UPDATE
@@ -4347,6 +4360,9 @@ impl WriteStore for PgStore {
                       integrate_agent_id   AS "integrate_agent_id: AgentId",
                       integrate_model,
                       max_parts,
+                      deadline_seconds,
+                      judge_agent_id       AS "judge_agent_id: AgentId",
+                      judge_model,
                       updated_at
             "#,
             id.as_uuid(),
@@ -4624,8 +4640,8 @@ impl WriteStore for PgStore {
             .await
             .map_err(map_sqlx)?;
 
-        // 10. Kept nodes in place (the columns `StepGraphPhase` lacks keep their values, F14),
-        //     new ones through the shared insert.
+        // 10. Kept nodes in place, new ones through the shared insert; both write every column
+        //     (MOD-141 M2 D1).
         for node in &body.nodes {
             let phase = &node.phase;
             if kept.contains(&phase.id) {

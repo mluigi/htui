@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   split                AS \"split: Split\",\n                   palette,\n                   plan_scope           AS \"plan_scope: PlanScope\",\n                   planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                   planner_agent_id     AS \"planner_agent_id: AgentId\",\n                   planner_model,\n                   integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                   integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                   integrate_model,\n                   max_parts,\n                   updated_at\n              FROM step_graph_phase WHERE id = $1\n            ",
+  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   split                AS \"split: Split\",\n                   palette,\n                   plan_scope           AS \"plan_scope: PlanScope\",\n                   planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                   planner_agent_id     AS \"planner_agent_id: AgentId\",\n                   planner_model,\n                   integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                   integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                   integrate_model,\n                   max_parts,\n                   deadline_seconds,\n                   judge_agent_id       AS \"judge_agent_id: AgentId\",\n                   judge_model,\n                   updated_at\n              FROM step_graph_phase WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -302,6 +302,39 @@
       },
       {
         "ordinal": 27,
+        "name": "deadline_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "deadline_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "judge_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "judge_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
+        "name": "judge_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "judge_model"
+          }
+        }
+      },
+      {
+        "ordinal": 30,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -345,8 +378,11 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "eb8ed105453b0bb43d0cc8ac3ce3c6370edade5b2de3defad2ea88b5d75f1b0d"
+  "hash": "7027732c6140a0c995e59b5681e8ea1e374ee71daf0b03ba150d2ab513628e12"
 }

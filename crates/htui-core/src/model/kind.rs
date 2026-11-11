@@ -566,6 +566,18 @@ pub struct StepGraphPhase {
     /// `step_graph_phase.max_parts` (D7); `divide` only, `>= 1`.
     #[serde(default)]
     pub max_parts: Option<i32>,
+    /// `step_graph_phase.deadline_seconds` (0003, MOD-141 M2 D1): one step attempt's wall clock;
+    /// `None` follows the project's, then `app_setting`'s, then two hours. At least 1.
+    #[serde(default)]
+    pub deadline_seconds: Option<i32>,
+    /// `step_graph_phase.judge_agent_id` (0003, MOD-141 M2 D1): the R-ORCH-7 judge of a fanned-out
+    /// node; `None` follows the project's judge, else a person selects.
+    #[serde(default)]
+    pub judge_agent_id: Option<AgentId>,
+    /// `step_graph_phase.judge_model` (0003): the judge's model; only with a judge agent
+    /// (`ck_phase_judge_model`).
+    #[serde(default)]
+    pub judge_model: Option<String>,
     /// `step_graph_phase.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -1116,6 +1128,9 @@ mod tests {
         assert_eq!(phase.integrate_agent_id, None);
         assert_eq!(phase.integrate_model, None);
         assert_eq!(phase.max_parts, None);
+        assert_eq!(phase.deadline_seconds, None);
+        assert_eq!(phase.judge_agent_id, None);
+        assert_eq!(phase.judge_model, None);
     }
 
     /// MOD-137 D6: `ck_step_graph_edge_predicate` and `ck_step_graph_edge_loop_limit_required`.

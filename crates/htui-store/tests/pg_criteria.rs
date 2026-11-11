@@ -12756,12 +12756,14 @@ async fn racer_copies_phase(
                 retry_limit, input_kinds, output_kind, isolation, command_queue, verify_command, \
                 template_name, template_version, token_budget, persona_id, split, palette, \
                 plan_scope, planner_persona_id, planner_agent_id, planner_model, \
-                integrate_persona_id, integrate_agent_id, integrate_model, max_parts) \
+                integrate_persona_id, integrate_agent_id, integrate_model, max_parts, \
+                deadline_seconds, judge_agent_id, judge_model) \
          SELECT $1, graph_id, $2, $3, fan_out, gate, gate_hard, retry_limit, input_kinds, \
                 output_kind, isolation, command_queue, verify_command, template_name, \
                 template_version, token_budget, persona_id, split, false, plan_scope, \
                 planner_persona_id, planner_agent_id, planner_model, integrate_persona_id, \
-                integrate_agent_id, integrate_model, max_parts \
+                integrate_agent_id, integrate_model, max_parts, deadline_seconds, \
+                judge_agent_id, judge_model \
            FROM step_graph_phase WHERE id = $4",
     )
     .bind(id.as_uuid())
@@ -13214,6 +13216,9 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
     phase.integrate_agent_id = Some(ids::AGENT_AGY);
     phase.integrate_model = Some("sonnet".to_owned());
     phase.max_parts = Some(3);
+    phase.deadline_seconds = Some(900);
+    phase.judge_agent_id = Some(ids::AGENT_AGY);
+    phase.judge_model = Some("opus".to_owned());
     let phase = phase.clone();
     let graph = data
         .graphs

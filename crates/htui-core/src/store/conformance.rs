@@ -3382,6 +3382,9 @@ fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
         integrate_agent_id: None,
         integrate_model: None,
         max_parts: None,
+        deadline_seconds: None,
+        judge_agent_id: None,
+        judge_model: None,
         updated_at: Utc::now(),
     }
 }
@@ -25684,9 +25687,10 @@ async fn a_persona_held_by_divide_columns_or_parts_is_not_deleted<S: WriteStore>
     );
 }
 
-/// MOD-137 D7 (blueprint §1.2, F13): every phase column, on a kept node (the replace's `UPDATE`)
-/// and on a new one (the shared insert), and an `if` edge's JSON predicate read back field for
-/// field: the struct-order guard for the Postgres lists.
+/// MOD-137 D7 (blueprint §1.2, F13): every phase column, MOD-141 M2's deadline and judge
+/// included, on a kept node (the replace's `UPDATE`) and on a new one (the shared insert), and an
+/// `if` edge's JSON predicate read back field for field: the struct-order guard for the Postgres
+/// lists.
 async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_round_trips_every_node_field";
     let (graph, phases) = scratch_graph(CASE, store, "every-field", &["plan", "split"]).await;
@@ -25714,6 +25718,9 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
         row.integrate_agent_id = Some(ids::AGENT_AGY);
         row.integrate_model = Some("sonnet".to_owned());
         row.max_parts = Some(2);
+        row.deadline_seconds = Some(900);
+        row.judge_agent_id = Some(ids::AGENT_CLAUDE);
+        row.judge_model = Some("opus".to_owned());
         row
     };
     let mut body = body_now(CASE, store, graph).await;
