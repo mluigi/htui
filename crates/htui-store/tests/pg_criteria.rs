@@ -13249,6 +13249,27 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
     db.drop_db().await;
 }
 
+/// MOD-141 M2 D2: `phase_fk_refused` maps the judge's foreign key by the name Postgres gave
+/// it (0003 declared `REFERENCES agent(id)` with no `CONSTRAINT`); a renamed key fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_judge_agent_foreign_key_has_the_name_the_writer_maps() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let name: String = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint \
+          WHERE conrelid = 'step_graph_phase'::regclass AND contype = 'f' \
+            AND conkey = ARRAY[(SELECT attnum FROM pg_attribute \
+                                 WHERE attrelid = 'step_graph_phase'::regclass \
+                                   AND attname = 'judge_agent_id')]",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("one foreign key on judge_agent_id");
+    assert_eq!(name, "step_graph_phase_judge_agent_id_fkey");
+    db.drop_db().await;
+}
+
 /// MOD-147 V3: the two inherent listers read through membership, so neither lists a scope row:
 /// `workspaces()` gives Platform its two member projects and Graphics its one, and `projects`
 /// over a workspace's scope answers its members only, while the scope row is still a `project`.

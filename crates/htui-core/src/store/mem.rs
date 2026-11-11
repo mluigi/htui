@@ -4007,9 +4007,9 @@ impl State {
                 phase.id,
             )));
         }
-        // MOD-26 D5, MOD-137 §T2.2 steps 5-6: the three personas, then the two agents, after the
-        // clashes. `PgStore` decides both with pre-reads in this order; its foreign-key triggers
-        // alone would fire planner_agent before integrate_persona.
+        // MOD-26 D5, MOD-137 §T2.2 steps 5-6: the three personas, then the three agents (MOD-141
+        // M2 D2 adds the judge), after the clashes. `PgStore` decides both with pre-reads in this
+        // order; its foreign-key triggers alone would fire planner_agent before integrate_persona.
         for (column, persona) in [
             ("step_graph_phase.persona_id", phase.persona_id),
             (
@@ -4035,6 +4035,7 @@ impl State {
                 "step_graph_phase.integrate_agent_id",
                 phase.integrate_agent_id,
             ),
+            ("step_graph_phase.judge_agent_id", phase.judge_agent_id),
         ] {
             if let Some(agent) = agent
                 && !self.agents.contains_key(&agent)
