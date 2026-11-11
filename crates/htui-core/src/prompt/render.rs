@@ -36,8 +36,8 @@ use crate::prompt::excerpt::{Excerpt, RepoRoot};
 use crate::prompt::memory::{MEMORY_PREAMBLE, left_out_line};
 use crate::prompt::template::ParsedTemplate;
 use crate::prompt::{
-    DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec, SectionName, StepSummary,
-    VerifyFailure,
+    DiffBlock, InputDocument, JudgeCandidate, PartBlock, PersonaBlock, PromptSpec, SectionName,
+    StepSummary, VerifyFailure,
 };
 
 /// §4.2 rule 4's cap on a rendered `title` attribute, in bytes of the title itself.
@@ -710,6 +710,39 @@ pub fn memory(memory: &SnapshotMemory, shown: usize) -> Option<Rendered> {
     })
 }
 
+/// MOD-139 M2 D10: `<section name="part" key="…" title="…">`, then the brief, then
+/// `Owned paths:` with one `- <path>` line each, then `Acceptance:` and its text; the three
+/// blocks that are present are joined by one blank line. No run, step or fan-out index.
+#[must_use]
+pub fn part(block: &PartBlock) -> Rendered {
+    let mut blocks = Vec::new();
+    let brief = content_of(&block.brief);
+    if !brief.is_empty() {
+        blocks.push(brief);
+    }
+    if !block.owned_paths.is_empty() {
+        let paths: Vec<String> = block
+            .owned_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect();
+        blocks.push(format!("Owned paths:\n{}", paths.join("\n")));
+    }
+    if let Some(acceptance) = block.acceptance.as_deref().map(content_of)
+        && !acceptance.is_empty()
+    {
+        blocks.push(format!("Acceptance:\n{acceptance}"));
+    }
+    Rendered {
+        name: SectionName::Part,
+        attrs: vec![
+            ("key", attr(&block.key)),
+            ("title", title_attr(&block.title)),
+        ],
+        content: normalise_newlines(&blocks.join("\n\n")),
+    }
+}
+
 /// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim — less the
 /// candidate's own MOD-11 D19 `output` trailer ([`without_output_trailer`]), so a judge is told to
 /// write exactly one document, its own `judge` one.
@@ -744,7 +777,9 @@ pub fn without_output_trailer(text: &str) -> &str {
 }
 
 /// §4.6a's `judge_candidate:<i>`: the one place §4.7 rule 8 permits a `fan_out_index` in a prompt,
-/// because the verdict block names a winner by that index (`docs/ANA-2.md:828`).
+/// because the verdict block names a winner by that index (`docs/ANA-2.md:828`). Two **compete**
+/// candidates assemble the same bytes; a divided node's parts differ in their `part` section only
+/// (MOD-139 D10).
 ///
 /// The three inner parts carry their own tags — `<document>`, `<diff>`, `<verification>` — one
 /// level down, the way `<skill>` and `<file>` do. §4.2 lists them ("document body, diff stat, diff,
@@ -1170,6 +1205,69 @@ mod tests {
         assert_eq!(
             wrap(&rendered),
             "<section name=\"persona\" persona=\"a&quot;b&amp;c\">\nYou are the reviewer.\n</section>"
+        );
+    }
+
+    /// MOD-139 M2 D10 (blueprint §1.9): the brief, the owned paths and the acceptance, each
+    /// block present joined by one blank line; the key and title are attributes. An all-empty
+    /// block is an empty section, never an invented byte.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn part_renders_brief_paths_and_acceptance() {
+        let rendered = part(&crate::prompt::fixtures::part_api());
+        assert_eq!(rendered.name, SectionName::Part);
+        assert_eq!(
+            wrap(&rendered),
+            "<section name=\"part\" key=\"api\" title=\"The HTTP API\">\n\
+             Add the `/runs` endpoint.\n\
+             Keep the handlers thin.\n\
+             \n\
+             Owned paths:\n\
+             - htui:crates/api/**\n\
+             - docs/api.md\n\
+             \n\
+             Acceptance:\n\
+             `cargo test -p api` passes.\n\
+             </section>"
+        );
+
+        let empty = PartBlock {
+            key: String::new(),
+            title: String::new(),
+            brief: String::new(),
+            owned_paths: Vec::new(),
+            acceptance: None,
+        };
+        assert_eq!(
+            wrap(&part(&empty)),
+            "<section name=\"part\" key=\"\" title=\"\">\n</section>"
+        );
+        let blank_acceptance = PartBlock {
+            acceptance: Some("\n".to_owned()),
+            ..empty
+        };
+        assert_eq!(
+            wrap(&part(&blank_acceptance)),
+            "<section name=\"part\" key=\"\" title=\"\">\n</section>",
+            "an empty acceptance renders no heading"
+        );
+    }
+
+    /// MOD-139 M2 D10: the key and title are attributes (§4.2 rule 4); the brief is content,
+    /// LF-normalised with its trailing LFs removed; the paths alone render their block.
+    #[test]
+    fn part_attributes_escape_and_the_brief_normalises() {
+        let rendered = part(&PartBlock {
+            key: "a\"b".to_owned(),
+            title: "x & y\nz".to_owned(),
+            brief: "Line one.\r\nLine two.\r\n\n".to_owned(),
+            owned_paths: vec!["src/**".to_owned()],
+            acceptance: None,
+        });
+        assert_eq!(
+            wrap(&rendered),
+            "<section name=\"part\" key=\"a&quot;b\" title=\"x &amp; y z\">\n\
+             Line one.\nLine two.\n\nOwned paths:\n- src/**\n</section>"
         );
     }
 

@@ -29,8 +29,8 @@ use crate::prompt::excerpt::{
 };
 use crate::prompt::settings::{Budget, BudgetSource};
 use crate::prompt::{
-    DiffBlock, HandoffInputs, InputDocument, JudgeCandidate, JudgeInputs, PromptSpec, StepSummary,
-    TemplateRef, TemplateRole, TokenEstimator, VerifyFailure,
+    DiffBlock, HandoffInputs, InputDocument, JudgeCandidate, JudgeInputs, PartBlock, PromptSpec,
+    StepSummary, TemplateRef, TemplateRole, TokenEstimator, VerifyFailure,
 };
 
 /// The §5.3 default budget at the §5.3 default reserve, sourced from the project rung so the
@@ -237,6 +237,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
         }],
         persona: None,
         memory: None,
+        part: None,
         excerpts: ExcerptSet {
             files: excerpts,
             audit,
@@ -302,6 +303,7 @@ pub fn phase_all_empty() -> PromptSpec {
         skills: Vec::new(),
         persona: None,
         memory: None,
+        part: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -397,6 +399,7 @@ pub fn judge_three_candidates() -> PromptSpec {
         skills: Vec::new(),
         persona: None,
         memory: None,
+        part: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -544,6 +547,7 @@ pub fn handoff_basic() -> PromptSpec {
         skills: Vec::new(),
         persona: None,
         memory: None,
+        part: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -821,6 +825,20 @@ pub fn memory_two_of_three() -> SnapshotMemory {
                 source: MemorySource::Person,
             },
         ],
+    }
+}
+
+/// MOD-139 M2 D10 (blueprint §1.9): the `api` part of a divided `implement` node — a two-line
+/// brief carrying a backtick span, one `repo:glob` path and one repo-relative path, and an
+/// acceptance line. Its rendered bytes are pinned by `render::part`'s test.
+#[must_use]
+pub fn part_api() -> PartBlock {
+    PartBlock {
+        key: "api".to_owned(),
+        title: "The HTTP API".to_owned(),
+        brief: "Add the `/runs` endpoint.\nKeep the handlers thin.".to_owned(),
+        owned_paths: vec!["htui:crates/api/**".to_owned(), "docs/api.md".to_owned()],
+        acceptance: Some("`cargo test -p api` passes.".to_owned()),
     }
 }
 

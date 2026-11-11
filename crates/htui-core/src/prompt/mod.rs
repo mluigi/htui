@@ -64,6 +64,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::SnapshotMemory;
 use crate::model::persona::SnapshotPersona;
+use crate::model::run::SnapshotPart;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
@@ -72,11 +73,12 @@ use crate::scrub::Scrubber;
 /// Everything the assembler needs, and nothing it must not have (ANA-5 §8 `:1917-1942`).
 ///
 /// Note what is **absent**: no store handle, no `RunId`, no `StepId`, no `Vec<SessionEvent>`, no
-/// clock. ANA-5 §4.7 rule 8 makes "two fan-out siblings assemble the same bytes" a property of the
-/// type rather than of the code, so a run id cannot reach a rendered byte because there is nowhere
-/// to put one. The handoff role takes a [`StepSummary`] the caller built from the step's own
-/// events, which is the one place transcript-derived text enters, and it enters already summarised
-/// (§4.2 `:587-589`).
+/// clock. ANA-5 §4.7 rule 8 makes "two **compete** candidates assemble the same bytes" a property
+/// of the type rather than of the code, so a run id cannot reach a rendered byte because there is
+/// nowhere to put one; a divided node's parts differ in their `part` section only (MOD-139 D10).
+/// The handoff role takes a [`StepSummary`] the caller built from the step's own events, which is
+/// the one place transcript-derived text enters, and it enters already summarised (§4.2
+/// `:587-589`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptSpec {
     /// Which closed placeholder set [`body`](Self::body) was parsed against.
@@ -123,6 +125,10 @@ pub struct PromptSpec {
     /// and fixture spec, and for a run started before MOD-163; renders exactly as before (I-7).
     /// Rendered only for a Phase spec (blueprint P-5).
     pub memory: Option<SnapshotMemory>,
+    /// MOD-139 M2 D10: the divided part this session works, rendered as the internal `part`
+    /// section after persona and memory and before the body. `None` everywhere but a part's
+    /// session; rendered for a Phase spec only.
+    pub part: Option<PartBlock>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
@@ -186,6 +192,37 @@ impl From<&SnapshotPersona> for PersonaBlock {
 /// frame's estimate.
 pub const PERSONA_SEPARATOR: &str = "\n\n";
 
+/// MOD-139 M2 D10: what the internal `part` section renders — one divided part's brief.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartBlock {
+    /// `SnapshotPart.key`, the section's `key` attribute.
+    pub key: String,
+    /// `SnapshotPart.title`, the section's `title` attribute.
+    pub title: String,
+    /// `SnapshotPart.brief`, the section's first block.
+    pub brief: String,
+    /// `SnapshotPart.owned_paths`, one `- <path>` line each under `Owned paths:`.
+    pub owned_paths: Vec<String>,
+    /// `SnapshotPart.acceptance`, under `Acceptance:`.
+    pub acceptance: Option<String>,
+}
+
+impl From<&SnapshotPart> for PartBlock {
+    fn from(part: &SnapshotPart) -> Self {
+        Self {
+            key: part.key.clone(),
+            title: part.title.clone(),
+            brief: part.brief.clone(),
+            owned_paths: part.owned_paths.clone(),
+            acceptance: part.acceptance.clone(),
+        }
+    }
+}
+
+/// MOD-139 M2 D10: the blank line after the part section, counted in the frame (persona's rule,
+/// B-17): the section is protected and never dropped.
+pub const PART_SEPARATOR: &str = "\n\n";
+
 /// MOD-163 D14 (C8 option a): the blank line between the memory section and what follows it.
 /// Counted in the **memory section's own span**, not the frame, so dropping the section drops it
 /// and `estimated_after` describes only sent bytes.
@@ -244,7 +281,9 @@ pub struct JudgeInputs {
 /// One fan-out candidate the judge compares (§4.6a, `docs/ANA-2.md:828`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JudgeCandidate {
-    /// `run_step.fan_out_index`. The one place §4.7 rule 8 lets an index be rendered.
+    /// `run_step.fan_out_index`. The one place §4.7 rule 8 lets an index be rendered: two
+    /// **compete** candidates assemble the same bytes; a divided node's parts differ in their
+    /// `part` section only (MOD-139 D10).
     pub fanout_index: i32,
     /// `Some(true)` renders `verify="pass"`, `Some(false)` `verify="fail"`, `None` omits it.
     pub verify: Option<bool>,
@@ -302,6 +341,9 @@ pub enum SectionName {
     Persona,
     /// MOD-163 D14: project memory. `sections[1]` without a persona, `sections[2]` with one (P-9).
     Memory,
+    /// MOD-139 M2 D10: a divided part's brief. Recorded after `persona` and `memory`, before the
+    /// body's spans; protected.
+    Part,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -343,6 +385,7 @@ impl SectionName {
             Self::Template => "template".to_owned(),
             Self::Persona => "persona".to_owned(),
             Self::Memory => "memory".to_owned(),
+            Self::Part => "part".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -370,6 +413,7 @@ impl SectionName {
         match self {
             Self::Template
             | Self::Persona
+            | Self::Part
             | Self::Box
             | Self::Skills
             | Self::CommandQueue
@@ -562,6 +606,12 @@ pub fn assemble(
     for section in render_sections(Placeholder::Memory, spec, upstream, skills, candidates) {
         rendered.push((Placeholder::Memory, section, 1));
     }
+    // MOD-139 M2 D10: the part section renders after the persona and the memory and outside the
+    // body's spans, so it is scanned with every section below, protected in the trimmer, and
+    // recorded as the next `sections[]` entry. Phase specs only.
+    for section in render_sections(Placeholder::Part, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Part, section, 1));
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -610,6 +660,10 @@ pub fn assemble(
     let mut frame = masked.literals.concat();
     if spec.persona.is_some() {
         frame.push_str(PERSONA_SEPARATOR);
+    }
+    // MOD-139 M2 D10: the part's separator is the frame's too; the section is never dropped.
+    if part_of(spec).is_some() {
+        frame.push_str(PART_SEPARATOR);
     }
     if has_output(spec) {
         frame.push_str(OUTPUT_SEPARATOR);
@@ -751,6 +805,12 @@ fn substitute(
         text.push_str(&memory.join("\n\n"));
         text.push_str(MEMORY_SEPARATOR);
     }
+    // MOD-139 M2 D10: the part section, then one blank line. `live` carries it only for a phase
+    // spec with a part, so every other prompt is byte-identical.
+    if let Some(part) = blocks.get(&Placeholder::Part) {
+        text.push_str(&part.join("\n\n"));
+        text.push_str(PART_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {
@@ -782,6 +842,14 @@ fn substitute(
 /// judge or handoff, whose trim orders have no memory step.
 fn memory_of(spec: &PromptSpec) -> Option<&SnapshotMemory> {
     spec.memory
+        .as_ref()
+        .filter(|_| matches!(spec.role, TemplateRole::Phase))
+}
+
+/// MOD-139 M2 D10: the part a spec renders — its own, for a phase spec, and none for a judge or
+/// handoff (memory's rule, blueprint P-5).
+fn part_of(spec: &PromptSpec) -> Option<&PartBlock> {
+    spec.part
         .as_ref()
         .filter(|_| matches!(spec.role, TemplateRole::Phase))
 }
@@ -896,6 +964,7 @@ fn render_sections(
             .and_then(|memory| render::memory(memory, memory.entries.len()))
             .into_iter()
             .collect(),
+        Placeholder::Part => part_of(spec).map(render::part).into_iter().collect(),
         Placeholder::Output => {
             if has_output(spec) {
                 spec.output_kind
@@ -1044,6 +1113,23 @@ fn scrubbed_inputs(
         for entry in &mut memory.entries {
             mask(scrubber, &mut entry.subject, &memory_name)?;
             mask(scrubber, &mut entry.body, &memory_name)?;
+        }
+    }
+
+    // MOD-139 M2 D10 (blueprint P-13): every byte the part section renders, under its name, and
+    // only for a phase spec — a judge or handoff never shows a part (memory's rule).
+    if matches!(spec.role, TemplateRole::Phase)
+        && let Some(part) = &mut spec.part
+    {
+        let part_name = SectionName::Part.render();
+        mask(scrubber, &mut part.key, &part_name)?;
+        mask(scrubber, &mut part.title, &part_name)?;
+        mask(scrubber, &mut part.brief, &part_name)?;
+        for path in &mut part.owned_paths {
+            mask(scrubber, path, &part_name)?;
+        }
+        if let Some(acceptance) = &mut part.acceptance {
+            mask(scrubber, acceptance, &part_name)?;
         }
     }
 
@@ -1477,6 +1563,7 @@ mod tests {
         assert_eq!(SectionName::Box.to_string(), "box");
         assert_eq!(SectionName::Persona.render(), "persona");
         assert_eq!(SectionName::Memory.render(), "memory");
+        assert_eq!(SectionName::Part.render(), "part");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1494,6 +1581,7 @@ mod tests {
             for name in [
                 SectionName::Template,
                 SectionName::Persona,
+                SectionName::Part,
                 SectionName::Box,
                 SectionName::Skills,
                 SectionName::CommandQueue,

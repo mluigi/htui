@@ -587,6 +587,7 @@ impl<'a> Trimmer<'a> {
                 .map_or(Source::Fixed, |i| Source::Candidate(i, false)),
             SectionName::Template
             | SectionName::Persona
+            | SectionName::Part
             | SectionName::Box
             | SectionName::Skills
             | SectionName::CommandQueue
@@ -953,6 +954,7 @@ impl<'a> Trimmer<'a> {
             SectionName::Template
             | SectionName::Persona
             | SectionName::Memory
+            | SectionName::Part
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream
