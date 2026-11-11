@@ -1371,6 +1371,66 @@ pub struct RunStepCommit {
     pub after_hash: Option<String>,
 }
 
+/// MOD-139 M3 D3: what `htui_orch::Isolator::premerge` did to integrate's tree, one entry
+/// per tree row (a repo of the run's scope), in tree-row order. One htui-core renderer turns it into
+/// integrate's protected `premerge` section and its item note (D4, D5); it is never stored
+/// structurally (Confirm 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PremergeReport {
+    /// One per integrate tree row; empty for a repo-less run (blueprint P-10).
+    pub repos: Vec<RepoPremerge>,
+}
+
+/// MOD-139 M3 D3: one repo's pre-merge, every done part in plan order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPremerge {
+    /// `run_step_tree.repo_id`.
+    pub repo_id: RepoId,
+    /// The checkout's name (`RepoCheckout.name`); the fake writes the repo id.
+    pub name: String,
+    /// The tree's `HEAD` once the pre-merge stopped.
+    pub head: String,
+    /// One per done part, plan (position) order.
+    pub parts: Vec<PartPremerge>,
+}
+
+/// MOD-139 M3 D3: one part in one repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartPremerge {
+    /// The part's step: the engine's key back to the row. Never rendered (blueprint P-9).
+    pub step: StepId,
+    /// `SnapshotPart.key`.
+    pub key: String,
+    /// The part's `after_hash` in this repo; `None` when it committed nothing here.
+    pub tip: Option<String>,
+    /// What the pre-merge did with it.
+    pub merge: PartMerge,
+}
+
+/// MOD-139 M3 D3: the five outcomes of one part's pre-merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PartMerge {
+    /// `merge --no-ff` made `commit` (subject `htui: premerge <part step>`).
+    Merged {
+        /// The merge commit.
+        commit: String,
+    },
+    /// The tip was already an ancestor of the tree's `HEAD` (the single `local` part, or a part
+    /// reached through another part's merge).
+    Contained,
+    /// No `after_hash` in this repo.
+    NoCommits,
+    /// The repo's first conflict; the merge was aborted. Paths in byte order, uncapped (the
+    /// renderer caps, D5).
+    Conflicted {
+        /// `git::conflicted_paths`' answer.
+        paths: Vec<String>,
+    },
+    /// A later part of a repo that already conflicted.
+    NotAttempted,
+}
+
 str_enum!(
     /// `command_run.status` (`0001_init.sql:544`): the `R-MCP-3` queue's own vocabulary.
     ///

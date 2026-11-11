@@ -192,13 +192,14 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PlanAdmission, PlanStatus, PlanToAdmit, Run,
-    RunFacts, RunKind, RunMode, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide,
-    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
-    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
-    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
-    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
+    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
+    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
+    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
+    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
+    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -468,6 +469,52 @@ mod tests {
             PlanStatus::ALL,
             &["proposed", "admitted", "refused", "abandoned"],
         );
+    }
+
+    /// MOD-139 M3 D3: the pre-merge report round-trips through serde, every outcome tagged in
+    /// snake case under `outcome`.
+    #[test]
+    fn premerge_report_round_trips_through_serde() {
+        let step = StepId::new();
+        let outcomes = [
+            (
+                PartMerge::Merged {
+                    commit: "m1".to_owned(),
+                },
+                "merged",
+            ),
+            (PartMerge::Contained, "contained"),
+            (PartMerge::NoCommits, "no_commits"),
+            (
+                PartMerge::Conflicted {
+                    paths: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                },
+                "conflicted",
+            ),
+            (PartMerge::NotAttempted, "not_attempted"),
+        ];
+        let report = PremergeReport {
+            repos: vec![RepoPremerge {
+                repo_id: RepoId::new(),
+                name: "core".to_owned(),
+                head: "h1".to_owned(),
+                parts: outcomes
+                    .iter()
+                    .map(|(merge, _)| PartPremerge {
+                        step,
+                        key: "api".to_owned(),
+                        tip: Some("t1".to_owned()),
+                        merge: merge.clone(),
+                    })
+                    .collect(),
+            }],
+        };
+        let value = serde_json::to_value(&report).expect("the report serialises");
+        for (index, (_, tag)) in outcomes.iter().enumerate() {
+            assert_eq!(value["repos"][0]["parts"][index]["merge"]["outcome"], *tag);
+        }
+        let back: PremergeReport = serde_json::from_value(value).expect("the report deserialises");
+        assert_eq!(back, report);
     }
 
     /// MOD-139 M2 D9: `PlanStatus::can_move_to` over all 16 pairs — exactly four moves are legal.
