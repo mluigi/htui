@@ -6784,7 +6784,8 @@ async fn the_0028_step_role_checks_refuse_what_they_name() {
 /// base position, an unknown scope or status and an admission without refs are each refused by
 /// their own name, and so is a planner step of another run (MOD-139 M1 F1: the planner foreign
 /// key is `(run_id, planner_step_id)`). Admitting moves `updated_at` (`trg_run_plan_updated_at`),
-/// deleting the planner step takes its plans and its part rows, and the three new indexes exist.
+/// deleting the planner step takes its plans and its part rows, and the four new indexes exist
+/// (MOD-139 M1 F1's unique (run_id, id) is one).
 #[cfg(feature = "demo")]
 #[tokio::test]
 async fn the_0028_run_plan_checks_refuse_what_they_name() {
@@ -6934,7 +6935,7 @@ async fn the_0028_run_plan_checks_refuse_what_they_name() {
     let indexes: BTreeSet<String> = sqlx::query_scalar(
         "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'public' \
          AND indexname IN ('idx_run_step_parent_step', 'idx_run_plan_updated_at', \
-                           'idx_run_plan_planner_step')",
+                           'idx_run_plan_planner_step', 'uq_run_step_run_id')",
     )
     .fetch_all(pool)
     .await
@@ -6947,11 +6948,12 @@ async fn the_0028_run_plan_checks_refuse_what_they_name() {
             [
                 "idx_run_plan_planner_step",
                 "idx_run_plan_updated_at",
-                "idx_run_step_parent_step"
+                "idx_run_step_parent_step",
+                "uq_run_step_run_id"
             ]
             .map(str::to_owned)
         ),
-        "0028 creates its three indexes"
+        "0028 creates its four indexes, the composite keys' unique (run_id, id) among them"
     );
 
     db.drop_db().await;
