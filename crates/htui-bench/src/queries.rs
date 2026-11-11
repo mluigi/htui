@@ -4,6 +4,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
+use sha2::{Digest as _, Sha256};
+
 use crate::types::{CorpusId, QueryClass};
 
 /// The frozen set, compiled-in path (for `cargo run`).
@@ -70,39 +73,57 @@ impl std::fmt::Display for UnknownTarget {
 
 /// Lowercase hex sha256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let _ = bytes;
-    String::new()
+    use std::fmt::Write as _;
+
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// `<file>.sha256`.
 pub fn sidecar_path(file: &Path) -> PathBuf {
-    let _ = file;
-    PathBuf::new()
+    let mut path = file.as_os_str().to_owned();
+    path.push(".sha256");
+    PathBuf::from(path)
 }
 
 /// `"{sha}  {file_name}\n"`.
 pub fn sidecar_line(sha256: &str, file_name: &str) -> String {
-    let _ = (sha256, file_name);
-    String::new()
+    format!("{sha256}  {file_name}\n")
 }
 
 /// First whitespace-separated token; must be 64 lowercase hex chars.
 pub fn parse_sidecar(text: &str) -> anyhow::Result<String> {
-    let _ = text;
-    anyhow::bail!("queries::parse_sidecar: not implemented yet (MOD-162 T5)")
+    let Some(token) = text.split_whitespace().next() else {
+        anyhow::bail!("the sidecar is empty; expected `<sha256>  <file name>`");
+    };
+    let is_lower_hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    if token.len() != 64 || !token.chars().all(is_lower_hex) {
+        anyhow::bail!("the sidecar's hash {token:?} is not 64 lowercase hex characters");
+    }
+    Ok(token.to_owned())
 }
 
 /// Pure freeze check: `sha256_hex(bytes) == parse_sidecar(sidecar)`, else an error that names both
 /// hashes and says the query file changed after its freeze. Returns the hash.
 pub fn check_frozen(bytes: &[u8], sidecar: &str) -> anyhow::Result<String> {
-    let _ = (bytes, sidecar);
-    anyhow::bail!("queries::check_frozen: not implemented yet (MOD-162 T5)")
+    let frozen = parse_sidecar(sidecar)?;
+    let actual = sha256_hex(bytes);
+    if actual != frozen {
+        anyhow::bail!(
+            "the query file changed after its freeze: it hashes to {actual}, its sidecar says \
+             {frozen}"
+        );
+    }
+    Ok(actual)
 }
 
 /// The query file's JSON.
 pub fn parse(bytes: &[u8]) -> anyhow::Result<QuerySet> {
-    let _ = bytes;
-    anyhow::bail!("queries::parse: not implemented yet (MOD-162 T5)")
+    serde_json::from_slice(bytes).context("the query file is not a query set")
 }
 
 /// Every problem in one error, one per line: counts per class 24/20/16/12; ids unique and of the
@@ -111,20 +132,179 @@ pub fn parse(bytes: &[u8]) -> anyhow::Result<QuerySet> {
 /// target; `d` none; `completed` only on class a/b; no text or target containing the forbidden
 /// literal (case-insensitive; spelled in code as two concatenated halves).
 pub fn check_shape(set: &QuerySet) -> anyhow::Result<()> {
-    let _ = set;
-    anyhow::bail!("queries::check_shape: not implemented yet (MOD-162 T5)")
+    let mut problems = Vec::new();
+
+    for class in QueryClass::ALL {
+        let ids: BTreeSet<&str> = set
+            .queries
+            .iter()
+            .filter(|q| q.class == class)
+            .map(|q| q.id.as_str())
+            .collect();
+        let count = set.queries.iter().filter(|q| q.class == class).count();
+        let expected = class.expected_count();
+        if count != expected {
+            problems.push(format!(
+                "class {}: {count} queries, expected {expected}",
+                class.letter()
+            ));
+        }
+        let missing: Vec<String> = (1..=expected)
+            .map(|n| format!("{}{n:02}", class.letter()))
+            .filter(|id| !ids.contains(id.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "class {}: no query numbered {}",
+                class.letter(),
+                missing.join(", ")
+            ));
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    for query in &set.queries {
+        let id = query.id.as_str();
+        if !seen.insert(id) {
+            problems.push(format!("{id}: duplicate id"));
+        }
+        if let Some(problem) = id_problem(query) {
+            problems.push(format!("{id}: id {problem}"));
+        }
+        if query.text.trim().is_empty() {
+            problems.push(format!("{id}: empty text"));
+        }
+        problems.extend(
+            target_problems(query)
+                .into_iter()
+                .map(|p| format!("{id}: {p}")),
+        );
+        if query.completed && !matches!(query.class, QueryClass::A | QueryClass::B) {
+            problems.push(format!(
+                "{id}: completed is only allowed on class a or b, not class {}",
+                query.class.letter()
+            ));
+        }
+        if contains_forbidden(&query.text) {
+            problems.push(format!(
+                "{id}: text contains the word the extensibility test refuses"
+            ));
+        }
+        for target in &query.targets {
+            if contains_forbidden(target.as_str()) {
+                problems.push(format!(
+                    "{id}: target {target} contains the word the extensibility test refuses"
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "the query set {:?} has {} shape problem(s):\n{}",
+            set.set,
+            problems.len(),
+            problems.join("\n")
+        )
+    }
+}
+
+/// Why `query.id` is not `<its class letter><two digits>` numbered from 01, if it is not.
+fn id_problem(query: &Query) -> Option<String> {
+    let letter = query.class.letter();
+    let Some(digits) = query.id.strip_prefix(letter) else {
+        return Some(format!("does not start with its class letter {letter:?}"));
+    };
+    if digits.len() != 2 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Some(format!("is not {letter:?} and two digits"));
+    }
+    let number: usize = digits.parse().ok()?;
+    let count = query.class.expected_count();
+    if number == 0 || number > count {
+        return Some(format!("is outside {letter}01..={letter}{count:02}"));
+    }
+    None
+}
+
+/// The class rules on `query.targets`.
+fn target_problems(query: &Query) -> Vec<String> {
+    let targets = &query.targets;
+    match query.class {
+        QueryClass::A => {
+            let mut problems = Vec::new();
+            if targets.len() != 1 {
+                problems.push(format!(
+                    "class a needs exactly one target, found {}",
+                    targets.len()
+                ));
+            }
+            for target in targets {
+                if target.is_decision() || target.as_str().starts_with("R-") {
+                    problems.push(format!(
+                        "class a target {target} is not an open item (no `DEC:` or `R-` prefix)"
+                    ));
+                }
+            }
+            problems
+        }
+        QueryClass::B | QueryClass::C if targets.is_empty() => {
+            vec![format!(
+                "class {} needs at least one target",
+                query.class.letter()
+            )]
+        }
+        QueryClass::B | QueryClass::C => Vec::new(),
+        QueryClass::D if targets.is_empty() => Vec::new(),
+        QueryClass::D => {
+            let named: Vec<&str> = targets.iter().map(CorpusId::as_str).collect();
+            vec![format!(
+                "class d takes no targets, found {}",
+                named.join(", ")
+            )]
+        }
+    }
+}
+
+/// Whether `text` contains [`FORBIDDEN_LITERAL`], in any case.
+fn contains_forbidden(text: &str) -> bool {
+    text.to_lowercase().contains(FORBIDDEN_LITERAL)
 }
 
 /// Read file and sidecar, `check_frozen`, `parse`, `check_shape`.
 pub fn load_frozen(path: &Path) -> anyhow::Result<FrozenQueries> {
-    let _ = path;
-    anyhow::bail!("queries::load_frozen: not implemented yet (MOD-162 T5)")
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading query file {}", path.display()))?;
+    let sidecar_file = sidecar_path(path);
+    let sidecar = std::fs::read_to_string(&sidecar_file)
+        .with_context(|| format!("reading its sidecar {}", sidecar_file.display()))?;
+    let sha256 = check_frozen(&bytes, &sidecar)
+        .with_context(|| format!("checking {} against its sidecar", path.display()))?;
+    let set = parse(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    check_shape(&set).with_context(|| format!("checking the shape of {}", path.display()))?;
+    Ok(FrozenQueries {
+        path: path.to_path_buf(),
+        sha256,
+        set,
+    })
 }
 
 /// Every target, in file order, that is not in `corpus_ids` (empty means valid).
 pub fn validate(queries: &[Query], corpus_ids: &BTreeSet<CorpusId>) -> Vec<UnknownTarget> {
-    let _ = (queries, corpus_ids);
-    Vec::new()
+    queries
+        .iter()
+        .flat_map(|query| {
+            query
+                .targets
+                .iter()
+                .filter(|target| !corpus_ids.contains(*target))
+                .map(|target| UnknownTarget {
+                    query: query.id.clone(),
+                    target: target.clone(),
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
