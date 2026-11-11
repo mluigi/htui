@@ -59,6 +59,10 @@ M2's Main-thread rulings F-1..F-8 and its "Deferred from review" hold unchanged.
 - **R-2 (architect F-2): deferred to MOD-140.** `refuse_admission` keeps only `divide.rs` unit coverage after T4.
   MOD-140, which admits planner-written plans, owns its engine case. It is recorded on the MOD-140 HANDOFF line
   at close-out.
+- **R-4 (T1, adopted):** a copy-mode part that committed in a repo but has no copy tree row there
+  is refused with `real::no_part_copy(part, name)` ("part <id> committed in <name> but has no copy of
+  it"), not §1.3's `copy_tree_vanished(..)`, which names a path that does not exist in this case.
+  Pinned by `premerge_in_a_copy_refuses_a_part_without_a_copy_row`.
 - **R-3:** T3 checks first that integrate inherits the divided node's gate and `verify_command` through
   `expand_divide` (a unit assertion) and pins the reconcile-call ordinal in case 1 before case 8 relies on it.
 
