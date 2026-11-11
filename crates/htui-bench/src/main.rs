@@ -165,24 +165,24 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
 /// A stderr line counting the failed calls per backend, so a backend that errored is not read
 /// as a real miss from the terminal; `None` when every call succeeded.
+/// S-points rows that repeat S10's failure are not counted again.
 fn error_note(summary: &report::Summary) -> Option<String> {
-    if summary.errors.is_empty() {
+    let total = summary.failed_calls().count();
+    if total == 0 {
         return None;
     }
     let per_backend: Vec<String> = Backend::ALL
         .iter()
         .filter_map(|&backend| {
             let n = summary
-                .errors
-                .iter()
+                .failed_calls()
                 .filter(|e| e.backend == backend)
                 .count();
             (n > 0).then(|| format!("{} {n}", backend.name()))
         })
         .collect();
     Some(format!(
-        "htui-bench: {} failed calls ({}); see the Errors table in report.md",
-        summary.errors.len(),
+        "htui-bench: {total} failed calls ({}); see the Errors table in report.md",
         per_backend.join(", ")
     ))
 }
@@ -368,6 +368,7 @@ mod tests {
             query: query.into(),
             backend,
             message: "boom".into(),
+            derived_from: None,
         };
         let mut summary = report::Summary::default();
         assert_eq!(error_note(&summary), None);
@@ -380,6 +381,23 @@ mod tests {
             error_note(&summary).as_deref(),
             Some(
                 "htui-bench: 3 failed calls (S 2, H 1); \
+                 see the Errors table in report.md"
+            )
+        );
+
+        // S-points repeats S10's failed call: one failed call, not two.
+        summary.errors = vec![
+            row("a01", Backend::S10),
+            report::ErrorRow {
+                derived_from: Some(Backend::S10),
+                ..row("a01", Backend::SPoints)
+            },
+            row("d02", Backend::H),
+        ];
+        assert_eq!(
+            error_note(&summary).as_deref(),
+            Some(
+                "htui-bench: 2 failed calls (S10 1, H 1); \
                  see the Errors table in report.md"
             )
         );

@@ -62,6 +62,8 @@ pub struct Cell {
     pub mrr10: f64,
     /// Wilson 95% interval of `hit5 / n`.
     pub wilson5: (f64, f64),
+    /// Failed calls among the group's queries; each counted as a miss above.
+    pub errors: usize,
 }
 
 /// S against one other backend on recall@5 in one group.
@@ -135,6 +137,24 @@ pub struct ErrorRow {
     pub backend: Backend,
     /// The message.
     pub message: String,
+    /// The backend whose failed call this row repeats (S-points reads S10's response), so the
+    /// row is not a failed call of its own; `None` for a call that failed.
+    pub derived_from: Option<Backend>,
+}
+
+/// A PRD threshold's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verdict {
+    /// Met.
+    Met,
+    /// Not met.
+    #[default]
+    NotMet,
+    /// A failed call stands in for a measurement, so neither met nor not met.
+    NotMeasured {
+        /// The failed calls behind it.
+        failed_calls: usize,
+    },
 }
 
 /// The PRD thresholds.
@@ -144,14 +164,17 @@ pub struct Thresholds {
     pub s_hit5_a: usize,
     /// Duplicates.
     pub n_a: usize,
-    /// `s_hit5_a / n_a ≥ 20/24`.
-    pub recall_met: bool,
+    /// S's failed calls on duplicates.
+    pub s_errors_a: usize,
+    /// `s_hit5_a / n_a ≥ 20/24`; not measured when S failed on a duplicate.
+    pub recall: Verdict,
     /// The best lexical baseline on duplicates.
     pub best_lexical: Option<Backend>,
     /// McNemar of S against it on duplicates.
     pub p_vs_best: Option<f64>,
-    /// `p_vs_best < 0.05` with S ahead.
-    pub mcnemar_met: bool,
+    /// `p_vs_best < 0.05` with S ahead; not measured when S failed on a duplicate or every lexical
+    /// baseline did.
+    pub mcnemar: Verdict,
 }
 
 /// Everything the report shows, computed from [`Results`].
@@ -179,6 +202,13 @@ pub struct Summary {
     pub errors: Vec<ErrorRow>,
     /// The PRD thresholds.
     pub thresholds: Thresholds,
+}
+
+impl Summary {
+    /// Distinct failed calls: [`Self::errors`] without the rows that repeat another's.
+    pub fn failed_calls(&self) -> impl Iterator<Item = &ErrorRow> {
+        self.errors.iter()
+    }
 }
 
 /// The metrics of one run (pure).
@@ -297,6 +327,7 @@ pub fn summarize(results: &Results) -> Summary {
                 query: r.query.clone(),
                 backend: r.backend,
                 message: message.clone(),
+                derived_from: None,
             })
         })
         .collect();
@@ -314,10 +345,11 @@ pub fn summarize(results: &Results) -> Summary {
     let thresholds = Thresholds {
         s_hit5_a: s_a.hit5,
         n_a: s_a.n,
-        recall_met: s_a.n > 0 && s_a.hit5 * RECALL_DEN >= RECALL_NUM * s_a.n,
+        s_errors_a: 0,
+        recall: met_if(s_a.n > 0 && s_a.hit5 * RECALL_DEN >= RECALL_NUM * s_a.n),
         best_lexical,
         p_vs_best: vs_best.map(|r| r.p),
-        mcnemar_met: vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other),
+        mcnemar: met_if(vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other)),
     };
 
     Summary {
@@ -429,6 +461,7 @@ impl<'a> View<'a> {
             hit5,
             mrr10,
             wilson5: metrics::wilson_interval(hit5, n),
+            errors: 0,
         }
     }
 
@@ -535,7 +568,7 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
         "- S recall@5 on duplicates: {}/{} ≥ {RECALL_NUM}/{RECALL_DEN} — {}",
         t.s_hit5_a,
         t.n_a,
-        met(t.recall_met)
+        verdict(t.recall)
     );
     match (t.best_lexical, t.p_vs_best) {
         (Some(best), Some(p)) => {
@@ -544,7 +577,7 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
                 "- S vs best lexical baseline ({}) on duplicates: p = {} < 0.05 — {}",
                 best.name(),
                 format_p(p),
-                met(t.mcnemar_met)
+                verdict(t.mcnemar)
             );
         }
         _ => {
@@ -734,8 +767,28 @@ table here shows.
 /// ANA-37's document points (blueprint F3).
 const ANA37_DOCUMENT_POINTS: usize = 759;
 
-fn met(yes: bool) -> &'static str {
-    if yes { "met" } else { "not met" }
+const fn met_if(yes: bool) -> Verdict {
+    if yes { Verdict::Met } else { Verdict::NotMet }
+}
+
+/// `met`, `not met`, or `not measured (N failed calls)`.
+fn verdict(v: Verdict) -> String {
+    match v {
+        Verdict::Met => "met".to_owned(),
+        Verdict::NotMet => "not met".to_owned(),
+        Verdict::NotMeasured { failed_calls } => {
+            format!("not measured ({})", failed_calls_text(failed_calls))
+        }
+    }
+}
+
+/// `1 failed call`, `3 failed calls`.
+fn failed_calls_text(n: usize) -> String {
+    if n == 1 {
+        "1 failed call".to_owned()
+    } else {
+        format!("{n} failed calls")
+    }
 }
 
 fn ratio(k: usize, n: usize) -> f64 {
@@ -1249,10 +1302,10 @@ mod tests {
         assert_eq!(s.best_lexical, Some(Backend::LOrLen));
         let t = &s.thresholds;
         assert_eq!((t.s_hit5_a, t.n_a), (1, 2));
-        assert!(!t.recall_met);
+        assert_eq!(t.recall, Verdict::NotMet);
         assert_eq!(t.best_lexical, Some(Backend::LOrLen));
         assert!(close(t.p_vs_best.expect("a p"), 1.0));
-        assert!(!t.mcnemar_met);
+        assert_eq!(t.mcnemar, Verdict::NotMet);
     }
 
     #[test]
@@ -1358,7 +1411,8 @@ mod tests {
             vec![ErrorRow {
                 query: "d02".into(),
                 backend: Backend::H,
-                message: "boom".into()
+                message: "boom".into(),
+                derived_from: None,
             }]
         );
     }
@@ -1582,5 +1636,187 @@ mod tests {
         );
         let md = render_comparison(&c);
         assert!(md.starts_with("**Warning:**"), "{md}");
+    }
+
+    /// `results` with `backend`'s call on `query` failed.
+    fn fail(mut results: Results, backend: Backend, query: &str, message: &str) -> Results {
+        let run = results
+            .runs
+            .iter_mut()
+            .find(|r| r.backend == backend && r.query == query)
+            .unwrap_or_else(|| panic!("no {backend:?} row on {query}"));
+        run.ranked.clear();
+        run.first_rank = None;
+        run.error = Some(message.into());
+        results
+    }
+
+    /// The `## Thresholds` section alone.
+    fn thresholds_section(md: &str) -> &str {
+        let start = md.find("## Thresholds").expect("the section");
+        let end = md[start..].find("\n## Results").expect("the next section");
+        &md[start..start + end]
+    }
+
+    #[test]
+    fn failed_calls_are_counted_per_backend_and_group() {
+        let s = summarize(&fail(fixture(), Backend::S, "a01", "qdrant down"));
+        assert_eq!(cell(&s, Backend::S, Group::A).errors, 1);
+        assert_eq!(cell(&s, Backend::S, Group::Abc).errors, 1);
+        assert_eq!(cell(&s, Backend::S, Group::B).errors, 0);
+        assert_eq!(cell(&s, Backend::SDense, Group::A).errors, 0);
+        // H's failure on d02 is class d: no group holds it.
+        assert_eq!(cell(&s, Backend::H, Group::Abc).errors, 0);
+        assert_eq!(s.thresholds.s_errors_a, 1);
+    }
+
+    #[test]
+    fn a_failed_s_call_on_a_duplicate_leaves_both_thresholds_unmeasured() {
+        let results = fail(fixture(), Backend::S, "a01", "qdrant down");
+        let s = summarize(&results);
+        let t = &s.thresholds;
+        assert_eq!(t.recall, Verdict::NotMeasured { failed_calls: 1 });
+        assert_eq!(t.mcnemar, Verdict::NotMeasured { failed_calls: 1 });
+        let md = render_markdown(&results, &s);
+        let section = thresholds_section(&md);
+        assert!(
+            section.contains("- S recall@5 on duplicates: 0/2 ≥ 20/24 — not measured (1 failed call)"),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "- S vs best lexical baseline (L-or-len) on duplicates: not measured (1 failed call)"
+            ),
+            "{section}"
+        );
+        assert!(!section.contains("— met"), "{section}");
+        assert!(!section.contains("not met"), "{section}");
+
+        // A failed S call outside the duplicates leaves both measured.
+        let s = summarize(&fail(fixture(), Backend::S, "b01", "qdrant down"));
+        assert_eq!(s.thresholds.s_errors_a, 0);
+        assert_eq!(s.thresholds.recall, Verdict::NotMet);
+        assert_eq!(s.thresholds.mcnemar, Verdict::NotMet);
+    }
+
+    #[test]
+    fn a_lexical_baseline_with_a_failed_duplicate_is_never_the_best() {
+        // L-or-len misses a01 anyway, but its failed call there rules it out: G is next.
+        let results = fail(fixture(), Backend::LOrLen, "a01", "syntax error");
+        let s = summarize(&results);
+        assert_eq!(s.best_lexical, Some(Backend::G));
+        assert_eq!(s.thresholds.best_lexical, Some(Backend::G));
+        assert_eq!(s.thresholds.mcnemar, Verdict::NotMet);
+        let md = render_markdown(&results, &s);
+        assert!(
+            md.contains("- S vs best lexical baseline (G) on duplicates: p = "),
+            "{md}"
+        );
+
+        // Every lexical baseline failed a duplicate: no best, McNemar not measured.
+        let mut results = fixture();
+        for backend in [Backend::LOrLen, Backend::G, Backend::H] {
+            results = fail(results, backend, "a01", "boom");
+        }
+        let s = summarize(&results);
+        assert_eq!(s.best_lexical, None);
+        assert_eq!(s.thresholds.best_lexical, None);
+        assert_eq!(s.thresholds.mcnemar, Verdict::NotMeasured { failed_calls: 3 });
+        assert_eq!(s.thresholds.recall, Verdict::NotMet);
+        let md = render_markdown(&results, &s);
+        let section = thresholds_section(&md);
+        assert!(
+            section.contains(
+                "- S vs best lexical baseline on duplicates: not measured (3 failed calls; every \
+                 lexical baseline failed on a duplicate)"
+            ),
+            "{section}"
+        );
+        assert!(section.contains("20/24 — not met"), "{section}");
+    }
+
+    #[test]
+    fn result_cells_with_failed_calls_carry_an_error_marker() {
+        let results = fail(fixture(), Backend::S, "a01", "qdrant down");
+        let md = render_markdown(&results, &summarize(&results));
+        // S on duplicates: a01 failed, a02 at rank 6.
+        assert!(
+            md.contains(
+                "| S | 0.00 / 0.00 / 0.08 (1 err) | 0.00 / 1.00 / 0.50 | 1.00 / 1.00 / 1.00 | \
+                 0.25 / 0.50 / 0.42 (1 err) |"
+            ),
+            "{md}"
+        );
+        let wilson = |hit: usize, n: usize| {
+            let (lo, hi) = metrics::wilson_interval(hit, n);
+            format!("{hit}/{n} ({lo:.2}-{hi:.2})")
+        };
+        assert!(
+            md.contains(&format!(
+                "| S | {} (1 err) | {} | {} | {} (1 err) |",
+                wilson(0, 2),
+                wilson(1, 1),
+                wilson(1, 1),
+                wilson(2, 4)
+            )),
+            "{md}"
+        );
+        // H's class-d failure marks no cell.
+        let h_rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| H |")).collect();
+        assert_eq!(h_rows.len(), 3, "{md}");
+        assert!(h_rows.iter().all(|l| !l.contains("err")), "{h_rows:?}");
+    }
+
+    #[test]
+    fn s_points_repeating_s10s_failure_is_one_failed_call() {
+        let mut results = fixture();
+        let copies: Vec<BackendRun> = results
+            .runs
+            .iter()
+            .filter(|r| r.backend == Backend::S)
+            .flat_map(|r| {
+                [Backend::S10, Backend::SPoints].map(|backend| BackendRun {
+                    backend,
+                    ..r.clone()
+                })
+            })
+            .collect();
+        results.runs.extend(copies);
+        let results = fail(results, Backend::S10, "a01", "qdrant down");
+        let results = fail(results, Backend::SPoints, "a01", "qdrant down");
+        let s = summarize(&results);
+        assert_eq!(
+            s.errors,
+            vec![
+                ErrorRow {
+                    query: "a01".into(),
+                    backend: Backend::S10,
+                    message: "qdrant down".into(),
+                    derived_from: None,
+                },
+                ErrorRow {
+                    query: "a01".into(),
+                    backend: Backend::SPoints,
+                    message: "qdrant down".into(),
+                    derived_from: Some(Backend::S10),
+                },
+                ErrorRow {
+                    query: "d02".into(),
+                    backend: Backend::H,
+                    message: "boom".into(),
+                    derived_from: None,
+                },
+            ]
+        );
+        assert_eq!(s.failed_calls().count(), 2);
+        // The S-points cell still shows its missing answer.
+        assert_eq!(cell(&s, Backend::SPoints, Group::A).errors, 1);
+        let md = render_markdown(&results, &s);
+        assert!(md.contains("2 failed calls.\n"), "{md}");
+        assert!(md.contains("| a01 | S10 | qdrant down |"), "{md}");
+        assert!(
+            md.contains("| a01 | S-points | qdrant down (repeats S10's failed call) |"),
+            "{md}"
+        );
     }
 }
