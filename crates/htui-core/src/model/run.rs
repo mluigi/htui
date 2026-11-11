@@ -630,6 +630,37 @@ pub struct NewRunPlan {
     pub digest: String,
 }
 
+/// MOD-139 M2 D9: which revision [`crate::store::WriteStore::admit_plan`] admits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PlanToAdmit {
+    /// The engine's own revision (default parts), inserted straight at `admitted` with its
+    /// `base_refs` in one statement (0028's admitted-needs-base-refs CHECK forbids two).
+    New(NewRunPlan),
+    /// A revision already written `proposed` (MOD-140's `plan_submit`; M2 reaches it only through
+    /// a direct `insert_run_plan` in conformance), moved `proposed -> admitted`.
+    Proposed(RunPlanId),
+}
+
+/// MOD-139 M2 D9 (blueprint P-1): one admission, decided and written in one transaction by
+/// [`crate::store::WriteStore::admit_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanAdmission {
+    /// The run admitted into; a `New` plan names it too.
+    pub run_id: RunId,
+    /// The planner step: `running` before, `done` after. A `New` plan names it too, and every
+    /// part's `parent_step_id` is it.
+    pub planner_step_id: StepId,
+    /// The revision admitted.
+    pub plan: PlanToAdmit,
+    /// The primary HEAD per repo (`Isolator::base`): a JSON object of repo id to commit string,
+    /// possibly empty (an empty scope).
+    pub base_refs: Value,
+    /// Every part row, inserted `pending`; `role = part`, same run, parent = the planner.
+    pub parts: Vec<NewRunStep>,
+    /// The caller's instant: the planner's `finished_at` (`COALESCE`d).
+    pub at: DateTime<Utc>,
+}
+
 /// A row of `run_step_tree` (ANA-2 §4.6): the isolation tree of one repo for one step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStepTree {
@@ -1097,6 +1128,20 @@ str_enum!(
         Abandoned => "abandoned",
     }
 );
+
+impl PlanStatus {
+    /// MOD-139 M2 D9: `run_plan.status`'s law, read by both stores before a status write.
+    /// `proposed -> admitted | refused | abandoned`; `admitted -> abandoned`; `refused` and
+    /// `abandoned` are terminal. 0028 holds no trigger for it (C26), so the stores are the law.
+    #[must_use]
+    pub const fn can_move_to(self, to: Self) -> bool {
+        match self {
+            Self::Proposed => matches!(to, Self::Admitted | Self::Refused | Self::Abandoned),
+            Self::Admitted => matches!(to, Self::Abandoned),
+            Self::Refused | Self::Abandoned => false,
+        }
+    }
+}
 
 str_enum!(
     /// MOD-138 D1: how the run's graph was chosen. `pick` is MOD-126's, added there.
