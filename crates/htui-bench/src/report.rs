@@ -583,7 +583,10 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
         ("collection", meta.collection.clone()),
         ("postgres_version", meta.postgres_version.clone()),
         ("htui_commit", meta.htui_commit.clone()),
-        ("htui_dirty", meta.htui_dirty.to_string()),
+        (
+            "htui_dirty",
+            meta.htui_dirty.map_or_else(|| "unknown".to_owned(), |d| d.to_string()),
+        ),
         ("host.os", meta.host.os.clone()),
         ("host.cpus", meta.host.cpus.to_string()),
         ("host.load_start", load(meta.host.load_start)),
@@ -1216,7 +1219,7 @@ mod tests {
             collection: "htui_bench_d15e9fea".into(),
             postgres_version: "PostgreSQL 17.0".into(),
             htui_commit: "eb2d60fa".into(),
-            htui_dirty: false,
+            htui_dirty: Some(false),
             host: HostInfo {
                 os: "linux".into(),
                 cpus: 8,
@@ -1570,6 +1573,19 @@ mod tests {
             "the F3 threat\n{md}"
         );
         assert!(!md.contains("777"), "{md}");
+    }
+
+    #[test]
+    fn an_unknown_checkout_state_renders_as_unknown() {
+        let results = fixture();
+        let md = render_markdown(&results, &summarize(&results));
+        assert!(md.contains("| htui_dirty | false |"), "{md}");
+        let mut results = fixture();
+        results.meta.htui_dirty = None;
+        let json = serde_json::to_string(&results).expect("serialises");
+        assert!(json.contains("\"htui_dirty\":null"), "{json}");
+        let md = render_markdown(&results, &summarize(&results));
+        assert!(md.contains("| htui_dirty | unknown |"), "{md}");
     }
 
     #[test]

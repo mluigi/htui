@@ -137,8 +137,9 @@ pub struct RunMeta {
     pub postgres_version: String,
     /// `git rev-parse HEAD` of the htui checkout the bench was built from.
     pub htui_commit: String,
-    /// Whether that checkout had uncommitted changes.
-    pub htui_dirty: bool,
+    /// Whether that checkout had uncommitted changes; `null` (unknown) when git is missing or
+    /// `git status` failed.
+    pub htui_dirty: Option<bool>,
     /// The machine.
     pub host: HostInfo,
     /// Phase timings.
@@ -718,8 +719,8 @@ fn read_loadavg() -> Option<[f64; 3]> {
 }
 
 /// `git rev-parse HEAD` and whether `git status --porcelain` is non-empty, for the checkout this
-/// binary was built from; `("unknown", false)` without git.
-fn htui_checkout() -> (String, bool) {
+/// binary was built from; see [`checkout_state`].
+fn htui_checkout() -> (String, Option<bool>) {
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let git = |args: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
@@ -733,12 +734,17 @@ fn htui_checkout() -> (String, bool) {
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
-    match git(&["rev-parse", "HEAD"]) {
-        Some(commit) => {
-            let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-            (commit, dirty)
-        }
-        None => ("unknown".to_owned(), false),
+    let commit = git(&["rev-parse", "HEAD"]);
+    let porcelain = commit.as_ref().and_then(|_| git(&["status", "--porcelain"]));
+    checkout_state(commit, porcelain)
+}
+
+/// The commit (`"unknown"` without one) and whether the checkout is dirty, from the outputs of
+/// `git rev-parse HEAD` and `git status --porcelain` (`None`: git missing or the command failed).
+fn checkout_state(commit: Option<String>, porcelain: Option<String>) -> (String, Option<bool>) {
+    match commit {
+        Some(commit) => (commit, Some(porcelain.is_some_and(|s| !s.is_empty()))),
+        None => ("unknown".to_owned(), Some(false)),
     }
 }
 
@@ -924,6 +930,23 @@ mod tests {
             query_record(&query("d01", QueryClass::D, "?!", &[])).sparse_terms,
             0
         );
+    }
+
+    #[test]
+    fn a_checkout_git_cannot_read_is_of_unknown_dirtiness() {
+        let sha = || Some("eb2d60fa".to_owned());
+        assert_eq!(
+            checkout_state(sha(), Some(String::new())),
+            ("eb2d60fa".to_owned(), Some(false))
+        );
+        assert_eq!(
+            checkout_state(sha(), Some(" M src/run.rs".into())),
+            ("eb2d60fa".to_owned(), Some(true))
+        );
+        // `git status` failed: unknown, not clean.
+        assert_eq!(checkout_state(sha(), None), ("eb2d60fa".to_owned(), None));
+        // No git at all.
+        assert_eq!(checkout_state(None, None), ("unknown".to_owned(), None));
     }
 
     #[test]
