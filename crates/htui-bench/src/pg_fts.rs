@@ -338,18 +338,82 @@ mod tests {
         let pool = connect(&url).await.expect("connect");
         let version = server_version(&pool).await.expect("version");
         assert!(version.starts_with("PostgreSQL"), "{version}");
+        let schema = throwaway_schema();
+        in_throwaway_schema(&pool, &schema, |pool, schema| async move {
+            exercise(&pool, &schema).await
+        })
+        .await
+        .expect("the five-document corpus");
+        assert!(schema_gone(&pool, &schema).await, "{schema} dropped");
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_still_drops_its_schema() {
+        let Ok(url) = std::env::var("HTUI_TEST_DATABASE_URL") else {
+            eprintln!("skipped: HTUI_TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let schema = throwaway_schema();
+        let (p, s) = (pool.clone(), schema.clone());
+        let run = tokio::spawn(async move {
+            in_throwaway_schema(&p, &s, |pool, schema| async move {
+                load(&pool, &schema, &[doc(1, "alpha".to_owned())]).await?;
+                panic!("a failing check");
+            })
+            .await
+        })
+        .await;
+        let gone = schema_gone(&pool, &schema).await;
+        drop_schema(&pool, &schema).await.expect("drop");
+        let panic = run.expect_err("the panic propagates");
+        assert!(panic.is_panic(), "{panic}");
+        assert!(gone, "{schema} dropped although its body panicked");
+        let failed = in_throwaway_schema(&pool, &schema, |pool, schema| async move {
+            load(&pool, &schema, &[doc(1, "alpha".to_owned())]).await?;
+            anyhow::bail!("a failing step")
+        })
+        .await;
+        assert!(failed.is_err());
+        assert!(
+            schema_gone(&pool, &schema).await,
+            "{schema} dropped after an error"
+        );
+    }
+
+    fn throwaway_schema() -> String {
         let schema = format!("htui_bench_t_{}", uuid::Uuid::now_v7().simple());
         assert!(is_valid_schema(&schema));
-        let outcome = exercise(&pool, &schema).await;
-        drop_schema(&pool, &schema).await.expect("drop");
-        let gone: bool =
-            sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
-                .bind(&schema)
-                .fetch_one(&pool)
-                .await
-                .expect("pg_namespace");
-        assert!(gone, "{schema} dropped");
-        outcome.expect("the five-document corpus");
+        schema
+    }
+
+    async fn schema_gone(pool: &PgPool, schema: &str) -> bool {
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+            .bind(schema)
+            .fetch_one(pool)
+            .await
+            .expect("pg_namespace")
+    }
+
+    /// Runs `body` against `schema` and drops `schema` afterwards, whether `body` returns `Err` or
+    /// panics (a failing `assert!`): `body` runs on its own task, so its panic surfaces as a
+    /// [`tokio::task::JoinError`] here, the schema is dropped, and the panic is then resumed.
+    async fn in_throwaway_schema<F, Fut>(pool: &PgPool, schema: &str, body: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(PgPool, String) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let joined = tokio::spawn(body(pool.clone(), schema.to_owned())).await;
+        let dropped = drop_schema(pool, schema).await;
+        let outcome = match joined {
+            Ok(outcome) => outcome,
+            Err(err) => match err.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(err) => Err(anyhow::Error::new(err).context("the schema test task")),
+            },
+        };
+        dropped.context("drop the throwaway schema")?;
+        outcome
     }
 
     #[tokio::test]
