@@ -118,10 +118,11 @@ can withdraw only a link one of its own steps proposed; a live link another run 
 proposed answers `not yours: <from> <kind> <to> was not proposed by this run`. A `remove` of a
 link that is not live (it never existed, or it is already withdrawn) answers
 `not found: item_link <from-id>-<kind>-><to-id>`, with the two items' ids, when `to` is an item of
-the session's project. To an item of any other project it answers `not yours` instead, inside the
-reach or outside it: `remove` checks no reach (it can only withdraw this run's own proposals), and
-the store's sentence would print the id of an item outside it. `live` says whether the link is in
-force after the call.
+the session's project. To an item of any other project, inside the reach or outside it, it answers
+`not yours: <from> <kind> <to> is no live link this run proposed` instead, keys only: `remove`
+checks no reach (it can only withdraw this run's own proposals), and the store's sentence would
+print the id of an item outside it. That covers a second `remove` of a link this run did propose
+and has already withdrawn. `live` says whether the link is in force after the call.
 
 **`search_concepts`** searches the concepts index (see the README's
 [Search](../README.md#search)) within the session's project only. `types` keeps `item`,
