@@ -742,10 +742,8 @@ fn htui_checkout() -> (String, Option<bool>) {
 /// The commit (`"unknown"` without one) and whether the checkout is dirty, from the outputs of
 /// `git rev-parse HEAD` and `git status --porcelain` (`None`: git missing or the command failed).
 fn checkout_state(commit: Option<String>, porcelain: Option<String>) -> (String, Option<bool>) {
-    match commit {
-        Some(commit) => (commit, Some(porcelain.is_some_and(|s| !s.is_empty()))),
-        None => ("unknown".to_owned(), Some(false)),
-    }
+    let dirty = porcelain.map(|s| !s.is_empty());
+    (commit.unwrap_or_else(|| "unknown".to_owned()), dirty)
 }
 
 #[cfg(test)]
