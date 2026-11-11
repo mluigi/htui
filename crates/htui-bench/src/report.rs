@@ -1541,7 +1541,7 @@ mod tests {
         );
         assert!(
             md.contains(
-                "S vs best lexical baseline (L-or-len) on duplicates: p = 1.0000 < 0.05 — not met"
+                "S vs best lexical baseline (L-or-len) on duplicates: p = 1.00 < 0.05 — not met"
             ),
             "{md}"
         );
@@ -1605,9 +1605,18 @@ mod tests {
 
     #[test]
     fn mcnemar_p_prints_small_values_as_a_bound() {
-        assert_eq!(format_p(0.5), "0.5000");
-        assert_eq!(format_p(0.0001), "0.0001");
+        // Three significant digits.
+        assert_eq!(format_p(1.0), "1.00");
+        assert_eq!(format_p(0.5), "0.500");
+        assert_eq!(format_p(0.0625), "0.0625");
+        assert_eq!(format_p(0.039_062_5), "0.0391");
+        assert_eq!(format_p(0.0001), "0.000100");
         assert_eq!(format_p(0.000_061), "< 0.0001");
+        // Never rounded across the 0.05 the threshold reads: more digits instead.
+        assert_eq!(format_p(0.049_96), "0.04996");
+        assert_eq!(format_p(0.049_999_9), "0.0499999");
+        assert_eq!(format_p(0.05), "0.0500");
+        assert_eq!(format_p(0.050_04), "0.0500");
     }
 
     #[test]
