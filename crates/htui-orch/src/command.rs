@@ -1621,7 +1621,7 @@ mod tests {
             parked.to_string(),
             format!(
                 "step {} is parked on integrate_incomplete: approving, skipping or promoting it \
-                 would land it without a part; retry it instead",
+                 would land it without a part; retry or reject it instead",
                 step.id
             )
         );

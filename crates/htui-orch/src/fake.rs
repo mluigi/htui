@@ -184,8 +184,8 @@ pub struct FakeIsolator {
     premerges: Mutex<u32>,
     /// 1-based `premerge` calls that never return, with their signal (one-shot each).
     premerge_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
-    /// Scripted `unmerged` answers by part key, FIFO, one consumed per call.
-    unmerged_answers: Mutex<VecDeque<Vec<String>>>,
+    /// Scripted `unmerged` answers by part key, or an error, FIFO, one consumed per call.
+    unmerged_answers: Mutex<VecDeque<std::result::Result<Vec<String>, IsolateError>>>,
     /// `(integrate step, part steps)` per `unmerged` call.
     unmerged_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
     /// 1-based `reset` calls that never return (counted by `resets`), with their signal.
@@ -609,12 +609,22 @@ impl FakeIsolator {
 
     /// MOD-139 M3 T1: the next [`unmerged`](Isolator::unmerged) answers the steps of the parts
     /// keyed `keys`, in the order the parts were handed (an unknown key is ignored). Unscripted,
-    /// it answers nothing.
+    /// it answers nothing. FIFO with [`fail_unmerged`](Self::fail_unmerged).
     pub fn script_unmerged(&self, keys: &[&str]) {
         self.unmerged_answers
             .lock()
             .expect("no panic holds the fake isolator's lock")
-            .push_back(keys.iter().map(|key| (*key).to_owned()).collect());
+            .push_back(Ok(keys.iter().map(|key| (*key).to_owned()).collect()));
+    }
+
+    /// MOD-139 M3 R1 (ruling R-6): the next [`unmerged`](Isolator::unmerged) fails with
+    /// `IsolateError::Git(reason)`, a post-check that could not read the trees. The call is still
+    /// logged and recorded. FIFO with [`script_unmerged`](Self::script_unmerged).
+    pub fn fail_unmerged(&self, reason: &str) {
+        self.unmerged_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(IsolateError::Git(reason.to_owned())));
     }
 
     /// MOD-139 M3 T1: every [`premerge`](Isolator::premerge) call so far, as `(integrate step,
@@ -1082,7 +1092,7 @@ impl Isolator for FakeIsolator {
                 .lock()
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
-                .unwrap_or_default();
+                .unwrap_or_else(|| Ok(Vec::new()))?;
             Ok(parts
                 .iter()
                 .filter(|part| keys.contains(&part.key))

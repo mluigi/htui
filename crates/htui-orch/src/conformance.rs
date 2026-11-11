@@ -626,6 +626,12 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// on an `integrate_incomplete` park, and approve and skip on any integrate park whose re-run
 /// post-check still finds a part unmerged; a refused pre-merge fails the run; and no integrate row
 /// is promoted.
+///
+/// **Two for MOD-139 M3 R1** (rulings R-5, R-6): an `integrate_incomplete` park with no retry
+/// left refuses retry (`RetryExhausted`, the budget is not exempted) and approve, skip and promote
+/// (naming retry or reject), and a reject takes the `fails` edge to revision 1 or ends the run
+/// `rejected`; and an isolator error in integrate's recovery post-check fails the step and the run
+/// as the walk's `fail_hard` does, so no later sweep adopts it again.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -1022,6 +1028,10 @@ pub const CASES: &[&str] = &[
     "promoting_an_integrate_step_is_refused",
     // MOD-139 M3 T3 repair 2 (Confirm 3): a park outranking the post-check still refuses a skip.
     "skipping_an_integrate_park_with_an_unmerged_part_is_refused",
+    // MOD-139 M3 R1 (rulings R-5, R-6): an exhausted park is rejected, not retried; a read error
+    // in integrate's recovery fails the run as the walk does.
+    "an_exhausted_integrate_park_is_rejected_not_retried",
+    "an_integrate_read_error_on_recovery_fails_the_run",
 ];
 
 /// Run one case by name.
@@ -15755,6 +15765,12 @@ fn integrate_case<'a, H: CaseHarness>(
         "skipping_an_integrate_park_with_an_unmerged_part_is_refused" => Box::pin(
             skipping_an_integrate_park_with_an_unmerged_part_is_refused(harness),
         ),
+        "an_exhausted_integrate_park_is_rejected_not_retried" => {
+            Box::pin(an_exhausted_integrate_park_is_rejected_not_retried(harness))
+        }
+        "an_integrate_read_error_on_recovery_fails_the_run" => {
+            Box::pin(an_integrate_read_error_on_recovery_fails_the_run(harness))
+        }
         _ => return None,
     })
 }
@@ -16432,7 +16448,7 @@ async fn approving_an_integrate_incomplete_park_is_refused<H: CaseHarness>(harne
             refused.to_string(),
             format!(
                 "step {} is parked on integrate_incomplete: approving, skipping or promoting it \
-                 would land it without a part; retry it instead",
+                 would land it without a part; retry or reject it instead",
                 integrate.id
             )
         );
@@ -16618,7 +16634,7 @@ async fn skipping_an_integrate_park_with_an_unmerged_part_is_refused<H: CaseHarn
         skipped.to_string(),
         format!(
             "step {}: integrate_incomplete: part `ui` of `implement` is not merged; approving or \
-             skipping it would land it without a part; retry it instead",
+             skipping it would land it without a part; retry or reject it instead",
             integrate.id
         )
     );
@@ -16651,6 +16667,241 @@ async fn skipping_an_integrate_park_with_an_unmerged_part_is_refused<H: CaseHarn
     );
 }
 
+// -- MOD-139 M3 R1: the review's two findings (rulings R-5, R-6) -------------------------------
+
+/// The divided FEAT-3 run parked on `integrate_incomplete` with no retry left (`retry_limit` 0,
+/// gated `on_failure`), `fails` edge back to `plan` or not: its id and the parked integrate.
+async fn exhausted_park<O: Orchestrate>(orch: &O, fails_edge: bool) -> (RunId, RunStep) {
+    divided_feat_3(orch, &[("api", None), ("ui", None)], |phase| {
+        phase.gate = Gate::OnFailure;
+        phase.retry_limit = 0;
+    })
+    .await;
+    if fails_edge {
+        add_edge(
+            orch,
+            ids::HTUI_FEAT_3,
+            "implement",
+            "plan",
+            EdgeKind::Fails,
+            None,
+            Some(1),
+        )
+        .await;
+    }
+    orch.isolator().script_unmerged(&["ui"]);
+    let (run, result) = start_divided(orch).await;
+    let outcome = result.expect("a park is a rest");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(3))
+    );
+    let integrate = integrate_of(&steps_of(orch, run).await);
+    assert_eq!(
+        (integrate.attempt, integrate.status),
+        (1, StepStatus::AwaitingApproval)
+    );
+    (run, integrate)
+}
+
+/// MOD-139 M3 R1 (ruling R-5, blueprint P-2): an `integrate_incomplete` park with the retry
+/// budget spent is not exempted from it: retry is refused `RetryExhausted`; approve, skip and
+/// promote are refused naming retry or reject, and no row moves; reject is the way on. With a
+/// `fails` edge it re-plans to revision 1 and the run lands; without one the run ends `rejected`
+/// and integrate never lands.
+async fn an_exhausted_integrate_park_is_rejected_not_retried<H: CaseHarness>(harness: &H) {
+    use htui_core::model::PlanStatus;
+
+    let rejected = || GateAnswer::Rejected {
+        note: "a part is missing".to_owned(),
+    };
+    let orch = harness.fresh();
+    let (run, integrate) = exhausted_park(&orch, false).await;
+    let before = steps_of(&orch, run).await;
+    let retried = orch
+        .dispatch(Command::RetryStep {
+            run,
+            step: integrate.id,
+        })
+        .await
+        .expect_err("the budget is spent");
+    assert!(
+        matches!(
+            retried,
+            EngineError::RetryExhausted { step, attempt: 1, retry_limit: 0 } if step == integrate.id
+        ),
+        "{retried:?}"
+    );
+    for command in [
+        Command::AnswerGate {
+            run,
+            step: integrate.id,
+            answer: GateAnswer::Approved,
+        },
+        Command::AnswerGate {
+            run,
+            step: integrate.id,
+            answer: GateAnswer::Skipped,
+        },
+        Command::PromoteStep {
+            run,
+            step: integrate.id,
+            chat_open: false,
+        },
+    ] {
+        let refused = orch
+            .dispatch(command.clone())
+            .await
+            .expect_err("a missing part is never routed around");
+        assert!(
+            matches!(refused, EngineError::IntegrateIncomplete { step } if step == integrate.id),
+            "{command:?}: {refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "step {} is parked on integrate_incomplete: approving, skipping or promoting it \
+                 would land it without a part; retry or reject it instead",
+                integrate.id
+            )
+        );
+    }
+    assert_eq!(steps_of(&orch, run).await, before, "no row moved");
+    let rest = answer_at(&orch, run, 3, rejected()).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (
+            RunStatus::Failed,
+            Some(3),
+            Some(RunFailure::Rejected {
+                phase: "implement".to_owned()
+            })
+        )
+    );
+    let row = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(
+        (row.attempt, row.status, row.gate_outcome),
+        (1, StepStatus::Failed, Some(GateOutcome::Rejected))
+    );
+    assert!(
+        !orch
+            .isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == integrate.id),
+        "integrate never lands"
+    );
+
+    let looped = harness.fresh();
+    let (run, integrate) = exhausted_park(&looped, true).await;
+    let retried = looped
+        .dispatch(Command::RetryStep {
+            run,
+            step: integrate.id,
+        })
+        .await
+        .expect_err("the budget is spent, edge or not");
+    assert!(
+        matches!(retried, EngineError::RetryExhausted { .. }),
+        "{retried:?}"
+    );
+    answer_at(&looped, run, 3, rejected()).await;
+    finished(&looped, run).await;
+    let steps = steps_of(&looped, run).await;
+    let planners = rows_of_role(&steps, StepRole::Planner);
+    assert_eq!(
+        planners
+            .iter()
+            .map(|row| (row.attempt, row.status))
+            .collect::<Vec<_>>(),
+        [(1, StepStatus::Superseded), (2, StepStatus::Done)],
+        "the reject took the `fails` edge"
+    );
+    let mut plans = plans_of(&looped, run).await;
+    plans.sort_by_key(|plan| plan.revision);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| (plan.revision, plan.status))
+            .collect::<Vec<_>>(),
+        [(0, PlanStatus::Abandoned), (1, PlanStatus::Admitted)]
+    );
+    let rows = integrate_rows(&steps);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        rows[1],
+        (2, StepStatus::Done),
+        "revision 1's integrate lands"
+    );
+}
+
+/// MOD-139 M3 R1 (ruling R-6): integrate's recovery re-runs the post-check; an isolator error
+/// reading it fails the step and the run, as the walk fails a live step's error (`fail_hard`),
+/// rather than escaping the recovery, which would note the item and release the lease for every
+/// later sweep to adopt and fail again. No retry, whatever the budget; the next sweep adopts
+/// nothing and notes nothing.
+async fn an_integrate_read_error_on_recovery_fails_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 1;
+    })
+    .await;
+    let stalled = orch.stall_after_done("implement", 1, None, true);
+    let run = crash_divided(&orch, &[stalled]).await;
+    let integrate = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(integrate.status, StepStatus::Running);
+
+    let other = orch.restarted();
+    other.isolator().fail_unmerged("unmerged unreadable");
+    let next = adopted_next(&other, run).await;
+    assert_eq!(
+        next,
+        Next::Finished(Rest {
+            run: RunStatus::Failed,
+            position: Some(3),
+            failure: None,
+        })
+    );
+    let row = run_of(&other, run).await;
+    assert_eq!(row.status, RunStatus::Failed, "{row:?}");
+    assert!(
+        row.failure
+            .as_deref()
+            .is_some_and(|text| text.contains("unmerged unreadable")),
+        "{row:?}"
+    );
+    assert_eq!(
+        integrate_rows(&steps_of(&other, run).await),
+        [(1, StepStatus::Failed)],
+        "no retry"
+    );
+    assert!(
+        !other
+            .isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == integrate.id),
+        "integrate never lands"
+    );
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.starts_with("sweep could not recover run")),
+        "{notes:?}"
+    );
+    let again = other.sweep().await.expect("a second sweep runs");
+    assert!(again.is_empty(), "nothing left to adopt: {again:?}");
+    assert_eq!(
+        notes_of(&other, ids::HTUI_FEAT_3).await,
+        notes,
+        "and nothing noted"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -16675,8 +16926,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            228,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            230,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -16764,7 +17015,9 @@ mod tests {
              and a refusal stopping a parts round's pulls, a failed planner on recovery, and a \
              `fails` loop's cut-short retirement replayed twice over), and MOD-139 M3 T3's \
              fourteen integrate cases (plan D1-D9, Confirm 2(a), 3, ruling R-1, and T3 repair 2's \
-             skip refused over a park that outranks the post-check)"
+             skip refused over a park that outranks the post-check), and MOD-139 M3 R1's two \
+             (rulings R-5, R-6: an exhausted `integrate_incomplete` park rejected, not retried, \
+             and a read error in integrate's recovery failing the run as the walk does)"
         );
     }
 
