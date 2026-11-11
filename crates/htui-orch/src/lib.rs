@@ -25,7 +25,9 @@
 //! MCP tool host is opened through (plan D4). MOD-10 M3 adds [`secrets`], one walk's resolved
 //! secrets as its sessions' env and its scrubber in one object (D11). MOD-138 M2 adds
 //! [`walk`], the readiness walker: joins, derived skips, `if` and `asks_you` edges and loop
-//! regions over the snapshot's nodes and edges (plan D2).
+//! regions over the snapshot's nodes and edges (plan D2). MOD-139 M2 adds [`divide`], divided
+//! fan-out's pure rules: names, base positions, the admission refusal, part widths and live
+//! siblings.
 #![warn(missing_docs)]
 
 pub mod closeout;
