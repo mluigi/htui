@@ -220,7 +220,7 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
-    use htui_core::model::{ItemId, ProjectRef, WorkspaceId};
+    use htui_core::model::{ItemId, ProjectId, ProjectRef, WorkspaceId};
     use htui_worker::{WaitingReason, WaitingRow, WaitingView};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -242,6 +242,8 @@ mod tests {
         WaitingRow {
             item: ItemId::new(),
             item_key: "BL-1".to_owned(),
+            project: ProjectId::new(),
+            display_key: "BL-1".to_owned(),
             run: None,
             step: None,
             step_label: String::new(),

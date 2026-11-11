@@ -65,7 +65,10 @@ the top level need `--search-items`; `htui --json` alone is a usage error.
 `status` and `waiting` read one scope:
 
 - **By default, the first workspace.** That is the first workspace by name, the one the TUI opens
-  on. Its projects are read in the workspace's own order.
+  on. Its projects are read in the workspace's own order. Both commands also read the workspace's
+  own items (such as `WS-1`, made in the workspace rather than in one of its projects): `status`
+  counts their runs and rows in `working` and `waiting`, and `waiting` lists them first. With
+  `--project` or `--cwd`, neither command reads them.
 - **`--project <SLUG>`** reads that project alone. Project slugs are unique across the store. A
   project can belong to several workspaces; the document then reports the first of them by name.
   A slug no workspace lists is refused with `unknown_project`.
@@ -180,6 +183,8 @@ A store with no workspace answers `"workspace": null`, `"projects": []` and zero
     {
       "reason": "gate",
       "item_key": "MOD-4",
+      "project": "htui",
+      "qualified_key": "htui:MOD-4",
       "item_id": "00000000-0000-0000-0000-000000000101",
       "run_id": "00000000-0000-0000-0000-000000000201",
       "step_id": "00000000-0000-0000-0000-000000000301",
@@ -191,6 +196,8 @@ A store with no workspace answers `"workspace": null`, `"projects": []` and zero
     {
       "reason": "unblock",
       "item_key": "MOD-7",
+      "project": "htui",
+      "qualified_key": "htui:MOD-7",
       "item_id": "00000000-0000-0000-0000-000000000104",
       "run_id": null,
       "step_id": null,
@@ -211,10 +218,16 @@ TUI's own code, over the same reads, so they match what the overlay shows for th
 come in the overlay's order: by project (in scope order), then item key, then run, then step, then
 reason. An empty list is `[]`.
 
+Without `--project` or `--cwd`, the rows also cover the workspace's own items, and those come
+first. Such a row's `project` is the workspace's slug with an `@` in front (`@platform`), and it is
+not in `projects`. With `--project` or `--cwd` the rows cover that one project only.
+
 | Field | Type | Meaning |
 |---|---|---|
 | `reason` | string | Why the row waits. See the table below. |
 | `item_key` | string | The item's key, such as `MOD-4`. |
+| `project` | string | The slug of the item's project, such as `htui`; `@<workspace>` for a workspace's own item, such as `@platform`. |
+| `qualified_key` | string | `project` and `item_key` joined by `:`, such as `htui:MOD-4` or `@platform:WS-1`. It names the item in every project, unlike `item_key`. |
 | `item_id` | uuid | The item's id. |
 | `run_id` | uuid or `null` | The run the row is about. `null` for an Unblock row that reopens the item (no run). |
 | `step_id` | uuid or `null` | The step the row is about. `null` when the row is about a whole run, or about no run. |
@@ -523,7 +536,10 @@ nothing there, and its sentence goes to standard error as `htui: <sentence>`.
 
   `no workspace` and `no box` stand in for a missing workspace or `box.toml`.
 - **`htui waiting`** prints one line per row: item key, reason (`judge failed` with a space, as in
-  the overlay), step, age (`42s`, `5m`, `3h`, `2d`) and text. No rows prints nothing.
+  the overlay), step, age (`42s`, `5m`, `3h`, `2d`) and text. No rows prints nothing. The key is
+  printed `slug:KEY` (`htui:FEAT-2`, `@platform:WS-1`) when another project of the answer has a
+  kind with the same prefix, and bare otherwise, as in the overlay. The key column is as wide as
+  the longest key.
 - **`htui --search-items`** prints one line per hit, as before. No hits, or no index yet, prints a
   note on standard error and exits 0.
 

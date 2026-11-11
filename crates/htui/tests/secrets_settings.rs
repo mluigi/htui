@@ -2393,6 +2393,26 @@ async fn a_hierarchy_reply_refreshes_rows_but_is_never_taken_as_the_scope_write(
     assert!(bench.drained().is_empty(), "still busy");
 }
 
+/// MOD-147 D6: a join's answer (`HierarchyJoined`) carries the tree, which the section adopts
+/// passively like any other hierarchy reply.
+#[tokio::test]
+async fn a_joined_reply_is_adopted_passively() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let mut joined = tree.clone();
+    joined.projects[0].project.slug = "vulkan-joined".to_owned();
+    bench.reply(
+        &mut section,
+        &StoreReply::HierarchyJoined {
+            tree: Box::new(joined),
+            project: "vulkan-joined".to_owned(),
+            shared_prefixes: vec!["FEAT".to_owned()],
+        },
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("vulkan-joined"), "{shown}");
+    assert!(bench.drained().is_empty(), "adopted passively: {shown}");
+}
+
 #[tokio::test]
 async fn a_tree_of_another_workspace_is_not_adopted() {
     let (bench, mut section, tree) = loaded(configured()).await;

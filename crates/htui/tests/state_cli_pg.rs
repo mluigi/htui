@@ -26,7 +26,10 @@ use htui::cli::StateArgs;
 use htui::concepts::{self, SearchContext, SearchOptions};
 use htui::state_cmd::{self, Answer, Context, Outcome, StateExit, Verb};
 use htui_core::fixtures::ids;
-use htui_core::model::{BoxId, ItemFilter, NewRepo, RepoBoxPath, RepoId, Scope};
+use htui_core::model::{
+    BoxId, GraphSnapshot, ItemFilter, ItemId, KeyQualifier, NewItem, NewRepo, NewRun, NewRunStep,
+    RepoBoxPath, RepoId, RunId, RunMode, Scope, StepId,
+};
 use htui_core::qdrant::QdrantUrl;
 use htui_core::store::{ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, HashEmbedder};
@@ -238,7 +241,14 @@ async fn waiting_matches_the_tuis_classifier() {
         .open_permissions(&scope)
         .await
         .expect("permissions");
-    let view = htui_worker::waiting(&scope, active, &candidates, Some(&permissions));
+    // Its parity compares no key text, so the qualifier is the empty one.
+    let view = htui_worker::waiting(
+        &scope,
+        active,
+        &candidates,
+        Some(&permissions),
+        &KeyQualifier::default(),
+    );
     let Outcome::Waiting(body) = &run.answer.outcome else {
         panic!("a waiting answer: {:?}", run.answer);
     };
@@ -287,6 +297,142 @@ async fn waiting_matches_the_tuis_classifier() {
     insta::with_settings!({ filters => vec![STAMP, AGE] }, {
         insta::assert_snapshot!("waiting_project_htui", run.pretty());
     });
+    db.drop_db().await;
+}
+
+/// A `WS` item minted on Platform's scope row and parked at its first gate: the store writes a
+/// run and step, then `seed_gate`'s raw park. Answers the item's key.
+async fn park_a_workspace_gate(db: &testkit::TestDb) -> String {
+    let item = db
+        .store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+            title: "spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("a WS item on the scope row");
+    let snapshot: GraphSnapshot = serde_json::from_value(
+        db.store
+            .run(ids::RUN_1)
+            .await
+            .expect("run")
+            .and_then(|run| run.graph_snapshot)
+            .expect("RUN_1 carries a snapshot"),
+    )
+    .expect("RUN_1's snapshot");
+    let run = db
+        .store
+        .create_run(NewRun {
+            id: RunId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            item_id: item.id,
+            mode: RunMode::Manual,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: snapshot,
+            repo_scope: Vec::new(),
+            queued_at: Utc::now(),
+            batch_id: None,
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
+        })
+        .await
+        .expect("a run on the WS item");
+    let step = db
+        .store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: run.id,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "prd".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+        })
+        .await
+        .expect("its first step");
+    sqlx::query("UPDATE run_step SET status = 'awaiting_approval' WHERE id = $1")
+        .bind(step.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("park the step");
+    sqlx::query("UPDATE run SET status = 'awaiting_approval' WHERE id = $1")
+        .bind(run.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("park the run");
+    item.key
+}
+
+/// MOD-147 D10, D11 (V5): reading the whole first workspace, `htui waiting` lists the
+/// workspace's own items first and qualifies a key whose prefix another project of the answer
+/// uses. Platform is renamed to sort first (`workspaces()` orders by name), so it is the
+/// default workspace; its members are seeded alike, so `htui`'s keys print `htui:…`.
+#[tokio::test]
+async fn waiting_lists_the_workspace_items_first_and_qualifies_shared_prefixes() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    sqlx::query("UPDATE workspace SET name = 'A Platform' WHERE id = $1")
+        .bind(ids::WORKSPACE_PLATFORM.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("Platform sorts first");
+    let key = park_a_workspace_gate(&db).await;
+    assert_eq!(key, "WS-1");
+    let identity = fixture_identity();
+    let run = ran(Verb::Waiting, json(), &db.url, Some(&identity), WAIT).await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert_eq!(run.document["workspace"]["slug"], "platform");
+
+    let rows = run.document["rows"].as_array().expect("rows");
+    let first = &rows[0];
+    assert_eq!(first["item_key"], "WS-1", "{}", run.pretty());
+    assert_eq!(first["project"], "@platform");
+    assert_eq!(first["qualified_key"], "@platform:WS-1");
+    assert_eq!(first["reason"], "gate");
+    assert!(first.get("display_key").is_none(), "{}", run.pretty());
+    let feat_2 = rows
+        .iter()
+        .find(|row| row["item_key"] == "FEAT-2")
+        .unwrap_or_else(|| panic!("htui FEAT-2 waits: {}", run.pretty()));
+    assert_eq!(feat_2["project"], "htui");
+    assert_eq!(feat_2["qualified_key"], "htui:FEAT-2");
+
+    let mut out = Vec::new();
+    state_cmd::emit(&mut out, &run.answer, false).expect("the human form prints");
+    let human = String::from_utf8(out).expect("UTF-8");
+    let lines: Vec<&str> = human.lines().collect();
+    assert!(lines[0].starts_with("WS-1 "), "{human}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("htui:FEAT-2 ")),
+        "{human}"
+    );
+
+    // V5: `--project htui` names one project: no workspace item, and nothing to qualify against.
+    let narrowed = ran(
+        Verb::Waiting,
+        project("htui"),
+        &db.url,
+        Some(&identity),
+        WAIT,
+    )
+    .await;
+    let rows = narrowed.document["rows"].as_array().expect("rows");
+    assert!(
+        rows.iter().all(|row| row["project"] == "htui"),
+        "{}",
+        narrowed.pretty()
+    );
     db.drop_db().await;
 }
 

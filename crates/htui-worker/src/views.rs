@@ -9,8 +9,9 @@ use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, Se
 use htui_agent::error::DriverError;
 use htui_agent::event::DoneEvent;
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, ItemId, NewDocument, ProjectId, Run, RunId, RunStatus, RunStep,
-    Scope, SnapshotPhase, StepId, StepStatus, WaitingCandidate, WaitingPermission,
+    DocumentHead, DocumentId, Item, ItemId, KeyQualifier, NewDocument, ProjectId, Run, RunId,
+    RunStatus, RunStep, Scope, SnapshotPhase, StepId, StepStatus, WaitingCandidate,
+    WaitingPermission,
 };
 use htui_core::store::{Result as StoreResult, StepFence, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
@@ -525,6 +526,12 @@ pub struct WaitingRow {
     pub item: ItemId,
     /// `item.key`.
     pub item_key: String,
+    /// The item's project (MOD-147 D10): a scope row's for a workspace item.
+    pub project: ProjectId,
+    /// `item_key` as this answer prints it (D11): `slug:KEY` when another project of the scope uses
+    /// the prefix, else bare. The overlay and `htui waiting` draw it; `Enter` still reveals by
+    /// `item`.
+    pub display_key: String,
     /// The run the row is about; `None` for a Reopen row.
     pub run: Option<RunId>,
     /// The step `Enter` puts the cursor on; `None` focuses the run (or, with no run, nothing).
@@ -595,13 +602,15 @@ const INTERRUPTED_TEXT: &str = "interrupted";
 /// item's `u`, step status a gate, and a parked run none of them lists is an Interrupted row
 /// (review H1). `permissions` is `None` offline or when the permission read failed (review L4).
 /// `active` is `Backend::active_runs` over the same scope. Each row's [`WaitingRow::since`] is the
-/// stamp of the row its reason waits on (MOD-92 D5).
+/// stamp of the row its reason waits on (MOD-92 D5). `keys` prints each row's
+/// [`WaitingRow::display_key`] (MOD-147 D11).
 #[must_use]
 pub fn waiting(
     scope: &Scope,
     active: usize,
     candidates: &[WaitingCandidate],
     permissions: Option<&[WaitingPermission]>,
+    keys: &KeyQualifier,
 ) -> WaitingView {
     let project_at = |project: ProjectId| {
         scope
@@ -635,6 +644,8 @@ pub fn waiting(
             let row = WaitingRow {
                 item: item.id,
                 item_key: item.key.clone(),
+                project: item.project_id,
+                display_key: keys.display(item.project_id, &item.key),
                 run: run.map(|run| run.id),
                 step: step.map(|step| step.id),
                 step_label,
@@ -782,6 +793,8 @@ pub fn waiting(
         let row = WaitingRow {
             item: p.item,
             item_key: p.item_key.clone(),
+            project: p.project,
+            display_key: keys.display(p.project, &p.item_key),
             run: Some(p.permission.run_id),
             step: Some(p.permission.run_step_id),
             step_label: slot_label(
@@ -1018,9 +1031,10 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{demo_at, demo_data, ids};
     use htui_core::model::{
-        GateOutcome, GraphSnapshot, Item, ItemId, ItemState, PermissionId, PermissionStatus,
-        ProjectId, RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId,
-        StepPermission, StepStatus, WaitingCandidate, WaitingPermission, latest_graph_run,
+        GateOutcome, GraphSnapshot, Item, ItemId, ItemState, KeyQualifier, PermissionId,
+        PermissionStatus, ProjectId, RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep,
+        Scope, Status, StepId, StepPermission, StepStatus, WaitingCandidate, WaitingPermission,
+        latest_graph_run,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
     use htui_orch::conformance::Orchestrate as _;
@@ -1462,6 +1476,7 @@ mod tests {
             2,
             std::slice::from_ref(candidate),
             Some(&[]),
+            &KeyQualifier::default(),
         )
     }
 
@@ -1477,6 +1492,8 @@ mod tests {
         WaitingRow {
             item: candidate.item.id,
             item_key: candidate.item.key.clone(),
+            project: candidate.item.project_id,
+            display_key: candidate.item.key.clone(),
             run,
             step,
             step_label: step_label.to_owned(),
@@ -2062,7 +2079,13 @@ mod tests {
         live.updated_at = demo_at(2, 6);
         let asked = permission(&item, &run, &live, Some("edit"), 30);
 
-        let view = waiting(&scope(&[ids::PROJECT_HTUI]), 1, &[], Some(&[asked]));
+        let view = waiting(
+            &scope(&[ids::PROJECT_HTUI]),
+            1,
+            &[],
+            Some(&[asked]),
+            &KeyQualifier::default(),
+        );
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].reason, WaitingReason::Permission);
@@ -2138,10 +2161,12 @@ mod tests {
         ];
         let scope = scope(&[ids::PROJECT_HTUI]);
 
-        let online = waiting(&scope, 1, &[], Some(&perms));
+        let online = waiting(&scope, 1, &[], Some(&perms), &KeyQualifier::default());
         let expected = |text: &str, since: DateTime<Utc>| WaitingRow {
             item: item.id,
             item_key: "FEAT-1".to_owned(),
+            project: ids::PROJECT_HTUI,
+            display_key: "FEAT-1".to_owned(),
             run: Some(run.id),
             step: Some(live.id),
             step_label: "prd 0.1".to_owned(),
@@ -2159,7 +2184,7 @@ mod tests {
         assert!(online.permissions_known);
         assert_eq!(online.working, 0);
 
-        let offline = waiting(&scope, 1, &[], None);
+        let offline = waiting(&scope, 1, &[], None, &KeyQualifier::default());
         assert!(offline.rows.is_empty());
         assert!(!offline.permissions_known);
         assert_eq!(offline.working, 1);
@@ -2177,11 +2202,17 @@ mod tests {
         let bare = permission(&item, &run, &first, Some("bare"), 1);
         let scope = scope(&[ids::PROJECT_HTUI]);
 
-        let labels: Vec<String> = waiting(&scope, 1, &[], Some(&[fanned, bare]))
-            .rows
-            .into_iter()
-            .map(|row| format!("{} {}", row.step_label, row.text))
-            .collect();
+        let labels: Vec<String> = waiting(
+            &scope,
+            1,
+            &[],
+            Some(&[fanned, bare]),
+            &KeyQualifier::default(),
+        )
+        .rows
+        .into_iter()
+        .map(|row| format!("{} {}", row.step_label, row.text))
+        .collect();
         assert_eq!(labels, ["prd 0.1 bare", "prd 0.1/0 permission"]);
     }
 
@@ -2196,13 +2227,26 @@ mod tests {
         let scope = scope(&[ids::PROJECT_HTUI]);
         let candidates = [reopen, blocked];
 
-        let view = waiting(&scope, 5, &candidates, Some(&perms));
+        let view = waiting(
+            &scope,
+            5,
+            &candidates,
+            Some(&perms),
+            &KeyQualifier::default(),
+        );
         assert_parked_runs_own_rows(&candidates, &view);
         assert_eq!(view.waiting(), 4, "Reopen, gate, FollowRun, permission");
         assert_eq!(view.working, 5 - 2, "R1 owns two rows and counts once");
 
         assert_eq!(
-            waiting(&scope, 1, &candidates, Some(&perms)).working,
+            waiting(
+                &scope,
+                1,
+                &candidates,
+                Some(&perms),
+                &KeyQualifier::default()
+            )
+            .working,
             0,
             "saturating"
         );
@@ -2252,6 +2296,7 @@ mod tests {
             4,
             &candidates,
             Some(&perms),
+            &KeyQualifier::default(),
         );
         assert_parked_runs_own_rows(&candidates, &view);
 
@@ -2318,6 +2363,57 @@ mod tests {
                     "",
                     WaitingReason::Unblock
                 ),
+            ]
+        );
+    }
+
+    /// MOD-147 D10, D11: each row names its item's project, and its display key is the
+    /// qualifier's: two projects sharing `FEAT` print `api:FEAT-1` and `web:FEAT-1`, a prefix only
+    /// one project holds prints bare. A permission row is qualified alike.
+    #[test]
+    fn rows_carry_their_project_and_display_key() {
+        let (api, web) = (ids::PROJECT_HTUI, ids::PROJECT_AGY);
+        let api_feat = item("FEAT", 1, api, Status::Blocked);
+        let web_feat = item("FEAT", 1, web, Status::Blocked);
+        let api_tool = item("TOOL", 1, api, Status::Blocked);
+        let run = run(1, &api_tool, RunStatus::Running, Some(snapshot(1)), 1);
+        let live = step(1, &run, (0, 1, 0), StepStatus::Running);
+        let perms = [permission(&api_tool, &run, &live, Some("edit"), 0)];
+        let candidates = [
+            candidate(&api_feat, Vec::new()),
+            candidate(&web_feat, Vec::new()),
+            candidate(&api_tool, Vec::new()),
+        ];
+        let keys = KeyQualifier::new(&[
+            (
+                api,
+                "api".to_owned(),
+                vec!["FEAT".to_owned(), "TOOL".to_owned()],
+            ),
+            (web, "web".to_owned(), vec!["FEAT".to_owned()]),
+        ]);
+
+        let view = waiting(&scope(&[api, web]), 1, &candidates, Some(&perms), &keys);
+
+        let shown: Vec<(ProjectId, &str, &str, WaitingReason)> = view
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.project,
+                    row.item_key.as_str(),
+                    row.display_key.as_str(),
+                    row.reason,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (api, "FEAT-1", "api:FEAT-1", WaitingReason::Unblock),
+                (api, "TOOL-1", "TOOL-1", WaitingReason::Permission),
+                (api, "TOOL-1", "TOOL-1", WaitingReason::Unblock),
+                (web, "FEAT-1", "web:FEAT-1", WaitingReason::Unblock),
             ]
         );
     }

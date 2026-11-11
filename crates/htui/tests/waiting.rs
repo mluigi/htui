@@ -18,8 +18,8 @@ use htui::ui::tabs::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Claim, GraphSnapshot, NewRun, NewRunStep, OpenPermission, PermissionId, RelayOption,
-    RelayOptionKind, RelaySessionId, RunId, RunMode, StepId, StepStatus,
+    Claim, GraphSnapshot, ItemId, NewItem, NewRun, NewRunStep, OpenPermission, PermissionId,
+    RelayOption, RelayOptionKind, RelaySessionId, RunId, RunMode, StepId, StepStatus,
 };
 use htui_core::store::{MemStore, ParkOutcome, ReadStore as _, StepFence, WriteStore as _};
 use uuid::Uuid;
@@ -172,6 +172,87 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
     (run, step, owner)
 }
 
+/// MOD-147 D10: a `WS-1` minted on Platform's scope row, its run (`workspace_id` `None`, filled
+/// by the store) claimed and its `prd` step parked at the gate.
+async fn park_ws_1(store: &MemStore) {
+    let item = store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+            title: "spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("mint_item");
+    assert_eq!(item.key, "WS-1");
+    let snapshot = store
+        .run(ids::RUN_1)
+        .await
+        .expect("run")
+        .and_then(|run| run.graph_snapshot)
+        .expect("RUN_1 carries a snapshot");
+    let owner = Uuid::now_v7();
+    let at = Utc::now();
+    let run = store
+        .create_run(NewRun {
+            workspace_id: None,
+            id: RunId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            item_id: item.id,
+            mode: RunMode::Manual,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: serde_json::from_value(snapshot).expect("RUN_1's snapshot"),
+            repo_scope: Vec::new(),
+            queued_at: at,
+            batch_id: None,
+        })
+        .await
+        .expect("create_run")
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(30))
+            .await
+            .expect("claim_run"),
+        Claim::Admitted
+    );
+    let step = store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "prd".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+        })
+        .await
+        .expect("create_step")
+        .id;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect("transition_step")
+    );
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(owner), step)
+            .await
+            .expect("park_step"),
+        ParkOutcome::Parked
+    );
+}
+
 /// An open `edit: src/lib.rs` permission request on `step`, under the claim's `owner`.
 async fn ask_permission(store: &MemStore, run: RunId, step: StepId, owner: Uuid) {
     let id = PermissionId::new();
@@ -275,16 +356,17 @@ async fn the_open_list_follows_a_park_without_reopening() {
     let mut harness = platform(&store).await;
     harness.key("ctrl-w");
     let before = harness.render();
-    assert!(before.contains("\u{258c} FEAT-2"), "{before}");
+    // MOD-147 D11: Platform's members are seeded alike, so every key prints qualified.
+    assert!(before.contains("\u{258c} htui:FEAT-2"), "{before}");
     assert!(!before.contains("plan 1.1"), "{before}");
 
     park_ana_2(&store).await;
     refresh(&mut harness).await;
     assert!(list_is_open(&mut harness), "the same list stays open");
     let after = harness.render();
-    assert!(after.contains("  ANA-2"), "{after}");
+    assert!(after.contains("  htui:ANA-2"), "{after}");
     assert!(after.contains("plan 1.1"), "{after}");
-    assert!(after.contains("\u{258c} FEAT-2  \u{2014}"), "{after}");
+    assert!(after.contains("\u{258c} htui:FEAT-2  \u{2014}"), "{after}");
 }
 
 /// Plan D8: `Enter` closes the list and lands on the row's step in the Runs pane.
@@ -332,13 +414,44 @@ async fn the_list_over_platform_holds_a_gate_a_permission_and_a_reopen() {
     harness.key("ctrl-w");
     let frame = harness.render();
     // Review T2: each row matched on its key, step and reason columns (padded to the widest
-    // value of each: `FEAT-2`, `plan 1.1`, `permission`), not on a bare substring.
-    let gate = row_at(&frame, "ANA-2   plan 1.1  gate        gate");
-    let permission = row_at(&frame, "ANA-2   plan 1.1  permission  edit: src/lib.rs");
+    // value of each: `htui:FEAT-2`, `plan 1.1`, `permission`), not on a bare substring. MOD-147
+    // D11: `agy` holds every prefix `htui` does, so the keys print qualified.
+    let gate = row_at(&frame, "htui:ANA-2   plan 1.1  gate        gate");
+    let permission = row_at(
+        &frame,
+        "htui:ANA-2   plan 1.1  permission  edit: src/lib.rs",
+    );
     let reopen = row_at(
         &frame,
-        "FEAT-2  \u{2014}         unblock     blocked, no active run: u reopens it",
+        "htui:FEAT-2  \u{2014}         unblock     blocked, no active run: u reopens it",
     );
     assert!(gate < permission && permission < reopen, "{frame}");
     insta::assert_snapshot!("platform_mixed", frame);
+}
+
+/// MOD-147 D10: a workspace's own item parked at its gate waits on a person too, listed first and
+/// counted; `WS` is the scope row's alone, so its key prints bare. `Enter` on it says where it
+/// will open (the Backlog lists workspace items from M3) and leaves the list open.
+#[tokio::test]
+async fn a_workspace_items_gate_is_listed_first() {
+    let store = MemStore::demo();
+    let mut harness = platform(&store).await;
+    park_ws_1(&store).await;
+    refresh(&mut harness).await;
+    assert_eq!(top_bar(&mut harness), "2 working · 3 waiting · memory");
+
+    harness.key("ctrl-w");
+    let frame = harness.render();
+    let ws = row_at(&frame, "\u{258c} WS-1         prd 0.1  gate");
+    let feat_2 = row_at(&frame, "htui:FEAT-2");
+    assert!(ws < feat_2, "{frame}");
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert!(list_is_open(&mut harness), "the list stays open");
+    let status = format!("{:?}", harness.app().status);
+    assert!(
+        status.contains("workspace items open in the Backlog from MOD-147 M3"),
+        "{status}"
+    );
 }
