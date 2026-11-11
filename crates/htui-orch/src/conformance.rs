@@ -589,6 +589,14 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// an empty plan each fail admission; `command_run` reaches a part beside a live sibling and a
 /// parallel branch beside a live one; the operator verbs refuse a part row; and stage rows are
 /// invisible to the walk.
+///
+/// **Nine for MOD-139 M2 T4** (plan D6, D11, D14): a part that fails is retried alone from the
+/// plan's `base_refs`; a part out of attempts fails the run `part_exhausted`, or takes the divided
+/// node's `fails` edge, which retires the planner's parts, abandons its plan and admits the next
+/// revision; and recovery per role: a crash before admission admits on the same planner row, one
+/// after it re-plans nothing and lands no part, a crashed part with its output is `done`, one
+/// without is reset and retried alone, one in a dirty `local` tree parks, and a `local` divided
+/// node lands no part.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -952,6 +960,17 @@ pub const CASES: &[&str] = &[
     "the_operator_verbs_refuse_a_part_row",
     "stage_rows_are_ignored_by_the_walk",
     "start_run_refuses_a_divided_graph_and_first_a_planner_agent",
+    // MOD-139 M2 T4 (plan D6, D11, D14): part retries, the exhausted divided step, loops over a
+    // divided node, and recovery per role.
+    "a_failed_part_retries_alone_from_the_base_refs",
+    "an_exhausted_part_fails_the_run_with_part_exhausted",
+    "an_exhausted_part_takes_the_fails_edge_and_re_plans",
+    "a_crash_before_admission_re_admits_on_the_same_planner_row",
+    "a_crash_after_admission_re_plans_nothing_and_lands_no_part",
+    "a_crashed_part_with_its_output_is_done_on_recovery",
+    "a_crashed_part_without_output_retries_alone",
+    "a_crashed_part_in_a_dirty_local_tree_parks",
+    "a_local_divided_node_lands_no_part_on_recovery",
 ];
 
 /// Run one case by name.
@@ -990,6 +1009,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| concurrent_recovery_case(name, harness))
         .or_else(|| review_fix_case(name, harness))
         .or_else(|| divided_case(name, harness))
+        .or_else(|| divided_recovery_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -13657,7 +13677,7 @@ async fn start_divided<O: Orchestrate>(orch: &O) -> (RunId, Result<CommandOutcom
 
 /// MOD-139 M2 D15 (F-2): an M2 divided run ends at its integrate node with the existing divide
 /// refusal, named by the divided node.
-fn stops_at_integrate(result: &Result<CommandOutcome, EngineError>) {
+fn stops_at_integrate<T: core::fmt::Debug>(result: &Result<T, EngineError>) {
     assert!(
         matches!(
             result,
@@ -14425,6 +14445,590 @@ async fn start_run_refuses_a_divided_graph_and_first_a_planner_agent<H: CaseHarn
     assert_eq!(feat_3_run(&orch).await, None, "no run was created");
 }
 
+// -- MOD-139 M2 T4: part retries, the exhausted divided step, loops and recovery (D6, D11, D14) --
+
+/// MOD-139 M2 T4's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn divided_recovery_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_failed_part_retries_alone_from_the_base_refs" => {
+            Box::pin(a_failed_part_retries_alone_from_the_base_refs(harness))
+        }
+        "an_exhausted_part_fails_the_run_with_part_exhausted" => {
+            Box::pin(an_exhausted_part_fails_the_run_with_part_exhausted(harness))
+        }
+        "an_exhausted_part_takes_the_fails_edge_and_re_plans" => {
+            Box::pin(an_exhausted_part_takes_the_fails_edge_and_re_plans(harness))
+        }
+        "a_crash_before_admission_re_admits_on_the_same_planner_row" => Box::pin(
+            a_crash_before_admission_re_admits_on_the_same_planner_row(harness),
+        ),
+        "a_crash_after_admission_re_plans_nothing_and_lands_no_part" => Box::pin(
+            a_crash_after_admission_re_plans_nothing_and_lands_no_part(harness),
+        ),
+        "a_crashed_part_with_its_output_is_done_on_recovery" => {
+            Box::pin(a_crashed_part_with_its_output_is_done_on_recovery(harness))
+        }
+        "a_crashed_part_without_output_retries_alone" => {
+            Box::pin(a_crashed_part_without_output_retries_alone(harness))
+        }
+        "a_crashed_part_in_a_dirty_local_tree_parks" => {
+            Box::pin(a_crashed_part_in_a_dirty_local_tree_parks(harness))
+        }
+        "a_local_divided_node_lands_no_part_on_recovery" => {
+            Box::pin(a_local_divided_node_lands_no_part_on_recovery(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// A process killed while the divided FEAT-3 run's parts are live (`crash_on_all`'s shape): the
+/// run is enqueued through the D16 seam and claimed, the claim is polled until every signal in
+/// `stalled` fired, then dropped, and the run it left `running` is handed back.
+///
+/// # Panics
+/// When the seam refuses the graph, the walk finishes instead of stalling, or the run is not
+/// left `running`.
+async fn crash_divided<O: Orchestrate>(orch: &O, stalled: &[Arc<Notify>]) -> RunId {
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let every = async {
+        for signal in stalled {
+            signal.notified().await;
+        }
+    };
+    match within(
+        futures::future::select(Box::pin(orch.claim(run)), Box::pin(every)),
+        "every stall",
+    )
+    .await
+    {
+        Either::Left(_) => panic!("the walk finished instead of stalling"),
+        Either::Right(((), walk)) => drop(walk),
+    }
+    assert_eq!(
+        run_of(orch, run).await.status,
+        RunStatus::Running,
+        "the crash left the run `running`"
+    );
+    run
+}
+
+/// The rows of `steps` with `role`, in attempt order.
+fn rows_of_role(steps: &[RunStep], role: StepRole) -> Vec<RunStep> {
+    let mut rows: Vec<RunStep> = steps
+        .iter()
+        .filter(|step| step.role == role)
+        .cloned()
+        .collect();
+    rows.sort_by_key(|step| step.attempt);
+    rows
+}
+
+/// `(phase_name, attempt, status, position)` of each part under `planner`, in `(position,
+/// attempt)` order.
+fn part_shape(steps: &[RunStep], planner: StepId) -> Vec<(String, i32, StepStatus, i32)> {
+    parts_of(steps, planner)
+        .into_iter()
+        .map(|part| (part.phase_name, part.attempt, part.status, part.position))
+        .collect()
+}
+
+/// A part shape row, for the `assert_eq!`s over [`part_shape`].
+fn shaped(
+    name: &str,
+    attempt: i32,
+    status: StepStatus,
+    position: i32,
+) -> (String, i32, StepStatus, i32) {
+    (name.to_owned(), attempt, status, position)
+}
+
+/// MOD-139 M2 D6: a part that fails on its own terms is retried alone at its own position, from
+/// the same `base_refs` slot, while its attempts last; its sibling runs once.
+async fn a_failed_part_retries_alone_from_the_base_refs<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 1;
+    })
+    .await;
+    let repo = primary_repo(&orch).await;
+    orch.script("implement/ui", 1, ScriptedStep::done_without_output());
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Failed, 6),
+            shaped("implement/ui", 2, StepStatus::Done, 6),
+        ]
+    );
+    let parts = parts_of(&steps, planner.id);
+    let (first, retry) = (&parts[1], &parts[2]);
+    let same = |part: &RunStep| {
+        (
+            part.node_key.clone(),
+            part.phase_name.clone(),
+            part.agent_id,
+            part.model.clone(),
+            part.role,
+            part.parent_step_id,
+            part.fanout_index,
+        )
+    };
+    assert_eq!(
+        same(retry),
+        same(first),
+        "the retry copies its failed attempt"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("part `ui` of `implement` attempt 1: missing_output")),
+        "{notes:?}"
+    );
+
+    let base = base_ref_of(&orch, run, repo).await;
+    let trees = trees_of(&orch, retry.id).await;
+    assert_eq!(trees.len(), 1, "{trees:?}");
+    assert_eq!(trees[0].base_ref, base, "the retry branches from base_refs");
+    let key = |phase, attempt| SessionKey {
+        phase,
+        attempt,
+        fanout_index: 0,
+        call: 0,
+    };
+    assert!(orch.spec_for(&key("implement/ui", 2)).is_some());
+    assert!(
+        orch.spec_for(&key("implement/api", 2)).is_none(),
+        "the done sibling is not re-run"
+    );
+}
+
+/// MOD-139 M2 D6: a part out of attempts fails the divided step, never a part alone: with no
+/// `fails` edge the run fails `part_exhausted` at the planner node.
+async fn an_exhausted_part_fails_the_run_with_part_exhausted<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 0;
+    })
+    .await;
+    orch.script("implement/ui", 1, ScriptedStep::done_without_output());
+
+    let (run, result) = start_divided(&orch).await;
+    let outcome = result.expect("an exhausted part is a rest, not an error");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    let failure = RunFailure::PartExhausted {
+        node: "implement".to_owned(),
+        part: "ui".to_owned(),
+        attempts: 1,
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(2), Some(&failure))
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure),
+        (RunStatus::Failed, Some(failure.to_string()))
+    );
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(planner.status, StepStatus::Done);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Failed, 6),
+        ]
+    );
+    assert!(steps.iter().all(|step| step.position != 3), "{steps:?}");
+    let plans = plans_of(&orch, run).await;
+    assert_eq!(
+        plans.iter().map(|plan| plan.status).collect::<Vec<_>>(),
+        [htui_core::model::PlanStatus::Admitted]
+    );
+}
+
+/// MOD-139 M2 D6, D11: an exhausted part with a `fails` edge on the divided node loops: the
+/// region (`plan` and the planner node) is retired, the planner's parts with it and its plan
+/// abandoned, and the planner's next attempt admits revision 1 past every earlier position.
+async fn an_exhausted_part_takes_the_fails_edge_and_re_plans<H: CaseHarness>(harness: &H) {
+    use htui_core::model::PlanStatus;
+
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 0;
+    })
+    .await;
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "implement",
+        "plan",
+        EdgeKind::Fails,
+        None,
+        Some(1),
+    )
+    .await;
+    orch.script("implement/ui", 1, ScriptedStep::done_without_output());
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let plan: Vec<(i32, StepStatus)> = {
+        let mut rows: Vec<&RunStep> = steps.iter().filter(|step| step.position == 1).collect();
+        rows.sort_by_key(|step| step.attempt);
+        rows.iter()
+            .map(|step| (step.attempt, step.status))
+            .collect()
+    };
+    assert_eq!(
+        plan,
+        [(1, StepStatus::Superseded), (2, StepStatus::Done)],
+        "the loop target ran again"
+    );
+    let planners = rows_of_role(&steps, StepRole::Planner);
+    assert_eq!(
+        planners
+            .iter()
+            .map(|row| (row.attempt, row.status))
+            .collect::<Vec<_>>(),
+        [(1, StepStatus::Superseded), (2, StepStatus::Done)]
+    );
+    let (first, second) = (&planners[0], &planners[1]);
+    assert_eq!(
+        part_shape(&steps, first.id),
+        [
+            shaped("implement/api", 1, StepStatus::Superseded, 5),
+            shaped("implement/ui", 1, StepStatus::Cancelled, 6),
+        ],
+        "D11: the retired planner's parts are retired with it"
+    );
+    assert_eq!(
+        part_shape(&steps, second.id),
+        [
+            shaped("implement/api@1", 1, StepStatus::Done, 7),
+            shaped("implement/ui@1", 1, StepStatus::Done, 8),
+        ]
+    );
+
+    let mut plans = plans_of(&orch, run).await;
+    plans.sort_by_key(|plan| plan.revision);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| (
+                plan.revision,
+                plan.status,
+                plan.planner_step_id,
+                plan.base_position
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (0, PlanStatus::Abandoned, first.id, 5),
+            (1, PlanStatus::Admitted, second.id, 7),
+        ]
+    );
+    for phase in ["implement/ui", "implement/ui@1"] {
+        assert!(
+            orch.spec_for(&session(phase, 0)).is_some(),
+            "{phase} ran its own session"
+        );
+    }
+}
+
+/// MOD-139 M2 D14: a crash before admission (the planner `running`, no plan, no part) is
+/// admitted on recovery on the same planner row: no new row, no attempt spent.
+async fn a_crash_before_admission_re_admits_on_the_same_planner_row<H: CaseHarness>(harness: &H) {
+    use htui_core::model::PlanStatus;
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    orch.store().set_fault(MemFault::AdmitPlan, true);
+    let (run, result) = start_divided(&orch).await;
+    assert!(
+        matches!(result, Err(EngineError::Store(StoreError::Unreachable(_)))),
+        "{result:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!((planner.status, planner.attempt), (StepStatus::Running, 1));
+    assert!(parts_of(&steps, planner.id).is_empty(), "{steps:?}");
+    assert!(plans_of(&orch, run).await.is_empty());
+    orch.store().set_fault(MemFault::AdmitPlan, false);
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    let steps = steps_of(&other, run).await;
+    let planners = rows_of_role(&steps, StepRole::Planner);
+    assert_eq!(
+        planners
+            .iter()
+            .map(|row| (row.id, row.status))
+            .collect::<Vec<_>>(),
+        [(planner.id, StepStatus::Done)],
+        "the same planner row, admitted"
+    );
+    let plans = plans_of(&other, run).await;
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| (plan.revision, plan.status, plan.planner_step_id))
+            .collect::<Vec<_>>(),
+        [(0, PlanStatus::Admitted, planner.id)]
+    );
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Pending, 5),
+            shaped("implement/ui", 1, StepStatus::Pending, 6),
+        ]
+    );
+
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Done, 6),
+        ],
+        "each part ran one session"
+    );
+    for phase in ["implement/api", "implement/ui"] {
+        assert!(other.spec_for(&session(phase, 0)).is_some(), "{phase}");
+    }
+}
+
+/// MOD-139 M2 D14: a crash after admission re-plans nothing; the `done` planner is a frontier
+/// with no tree (it reconciles none), and no part is ever landed.
+async fn a_crash_after_admission_re_plans_nothing_and_lands_no_part<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    primary_repo(&orch).await;
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let planner = planner_of(&steps_of(&orch, run).await);
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(planner.id, Vec::new())],
+        "the planner frontier reconciles no tree, and no part lands"
+    );
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        rows_of_role(&steps, StepRole::Planner).len(),
+        1,
+        "{steps:?}"
+    );
+    assert_eq!(plans_of(&other, run).await.len(), 1);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Done, 6),
+        ]
+    );
+}
+
+/// MOD-139 M2 D14: a part the crash caught after its session wrote its output is `done` on
+/// recovery, with its settle columns written, and never reconciled; its sibling runs on resume.
+async fn a_crashed_part_with_its_output_is_done_on_recovery<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+    let stalled = orch.stall_after_done("implement/api", 1, None, true);
+    let run = crash_divided(&orch, &[stalled]).await;
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        (
+            part_named(&steps, "implement/api").status,
+            part_named(&steps, "implement/ui").status
+        ),
+        (StepStatus::Running, StepStatus::Pending)
+    );
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    let steps = steps_of(&other, run).await;
+    let api = part_named(&steps, "implement/api").clone();
+    assert_eq!(api.status, StepStatus::Done);
+    assert!(api.finished_at.is_some(), "{api:?}");
+    assert!(
+        !other
+            .isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, siblings)| *winner == api.id || siblings.contains(&api.id)),
+        "a part never lands"
+    );
+
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Done, 6),
+        ]
+    );
+}
+
+/// MOD-139 M2 D14, D6: a part the crash caught before its output is reset and failed
+/// `interrupted`; the next round retries it alone, as any failed part with an attempt left.
+async fn a_crashed_part_without_output_retries_alone<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 1;
+    })
+    .await;
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+    let stalled = orch.stall_after_done("implement/api", 1, None, false);
+    let run = crash_divided(&orch, &[stalled]).await;
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    let steps = steps_of(&other, run).await;
+    let api = part_named(&steps, "implement/api");
+    assert_eq!(
+        (api.attempt, api.status, api.gate_note.as_deref()),
+        (1, StepStatus::Failed, Some("interrupted"))
+    );
+    assert_eq!(
+        part_named(&steps, "implement/ui").status,
+        StepStatus::Pending
+    );
+    assert_eq!(other.isolator().resets(), 1, "the part's tree was reset");
+
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Failed, 5),
+            shaped("implement/api", 2, StepStatus::Done, 5),
+            shaped("implement/ui", 1, StepStatus::Done, 6),
+        ]
+    );
+}
+
+/// MOD-139 M2 D14 (plan D93): a part whose `local` tree was dirty at its start is never reset:
+/// it fails `interrupted, tree not reset` and the run parks for a human.
+async fn a_crashed_part_in_a_dirty_local_tree_parks<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None)], |phase| {
+        phase.isolation = Some(Isolation::Local);
+    })
+    .await;
+    primary_repo(&orch).await;
+    let stalled = orch.stall_after_done("implement/api", 1, None, false);
+    let run = crash_divided(&orch, &[stalled]).await;
+    let api = part_named(&steps_of(&orch, run).await, "implement/api").clone();
+    let mut trees = trees_of(&orch, api.id).await;
+    assert!(!trees.is_empty(), "stage 2 recorded the tree");
+    for tree in &mut trees {
+        tree.dirty = true;
+    }
+    orch.store()
+        .upsert_step_tree(StepFence::Lease(orch.owner()), api.id, &trees)
+        .await
+        .expect("MemStore rewrites the rows");
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert!(
+        matches!(
+            &adopted[0].next,
+            Next::Parked(Rest {
+                run: RunStatus::AwaitingApproval,
+                failure: Some(RunFailure::Interrupted { reset: false, .. }),
+                ..
+            })
+        ),
+        "{adopted:?}"
+    );
+    let api = part_named(&steps_of(&other, run).await, "implement/api").clone();
+    assert_eq!(
+        (api.status, api.gate_note.as_deref()),
+        (StepStatus::Failed, Some("interrupted, tree not reset"))
+    );
+    assert_eq!(other.isolator().resets(), 0, "no `git` write on this path");
+}
+
+/// MOD-139 M2 D14 (blueprint P-21): under `local` no part is ever reconciled on recovery, and the
+/// planner at most with no sibling (it has no tree); nothing is re-planned or re-run.
+async fn a_local_divided_node_lands_no_part_on_recovery<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None)], |phase| {
+        phase.isolation = Some(Isolation::Local);
+    })
+    .await;
+    primary_repo(&orch).await;
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    let api = part_named(&steps, "implement/api").clone();
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    let reconciles = other.isolator().reconciles();
+    assert!(
+        reconciles
+            .iter()
+            .all(|(winner, siblings)| *winner == planner.id && siblings.is_empty()),
+        "at most the planner, with no sibling: {reconciles:?}"
+    );
+    assert!(
+        !reconciles
+            .iter()
+            .any(|(winner, siblings)| *winner == api.id || siblings.contains(&api.id)),
+        "{reconciles:?}"
+    );
+    for log in [
+        call_log_of(&orch, run).await,
+        call_log_of(&other, run).await,
+    ] {
+        assert!(
+            !log.iter().any(|call| call.starts_with("reconcile 5/")),
+            "{log:?}"
+        );
+    }
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [shaped("implement/api", 1, StepStatus::Done, 5)]
+    );
+    assert_eq!(plans_of(&other, run).await.len(), 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -14449,8 +15053,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            204,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            213,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -14531,7 +15135,9 @@ mod tests {
              and MOD-163 M2's six memory cases (plan D11, D12, D18: an entry reaching every \
              phase of its project, closed entries kept out, an edit after `StartRun`, fan-out \
              siblings alike, a pre-MOD-163 snapshot, no entries no row), and MOD-139 M2 T3's \
-             eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17)"
+             eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17), and MOD-139 M2 \
+             T4's nine (a part retried alone, the exhausted divided step, its `fails` loop and \
+             re-plan, and recovery per role)"
         );
     }
 

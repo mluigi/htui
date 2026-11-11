@@ -2920,6 +2920,127 @@ mod tests {
         );
     }
 
+    /// MOD-139 M2 D11 (ANA-33 §7.3: "That includes their parts and plans"): retiring a planner's
+    /// slot retires its parts' latest attempts by the same status split and abandons its plans;
+    /// an older attempt of a part stays as it is.
+    #[tokio::test]
+    async fn retire_takes_a_planners_parts_and_abandons_its_plans() {
+        use htui_core::model::{
+            NewRunPlan, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, RunPlanId, StepId,
+        };
+
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+            walk: None,
+        };
+        let row = |position: i32, attempt: i32, name: &str, role, parent| NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_3,
+            position,
+            attempt,
+            fanout_index: 0,
+            phase_name: name.to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+            role,
+            parent_step_id: parent,
+            node_key: Some(name.to_owned()),
+        };
+        let planner = store
+            .create_step(row(20, 1, "implement:plan", StepRole::Planner, None))
+            .await
+            .expect("the slot has room for the planner");
+        assert!(
+            store
+                .transition_step(
+                    planner.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    epoch()
+                )
+                .await
+                .expect("a legal move")
+        );
+        let (done, failed) = (
+            row(21, 1, "implement/api", StepRole::Part, Some(planner.id)),
+            row(22, 1, "implement/ui", StepRole::Part, Some(planner.id)),
+        );
+        let (done_id, older_id) = (done.id, failed.id);
+        let body = crate::divide::plan_body(&[]);
+        store
+            .admit_plan(
+                StepFence::Unleased,
+                PlanAdmission {
+                    run_id: ids::RUN_3,
+                    planner_step_id: planner.id,
+                    plan: PlanToAdmit::New(NewRunPlan {
+                        id: RunPlanId::new(),
+                        run_id: ids::RUN_3,
+                        revision: 0,
+                        planner_step_id: planner.id,
+                        scope: PlanScope::Parts,
+                        base_position: 21,
+                        digest: crate::divide::plan_digest(&body),
+                        body,
+                    }),
+                    base_refs: serde_json::json!({}),
+                    parts: vec![done, failed],
+                    at: epoch(),
+                },
+            )
+            .await
+            .expect("the planner is running and the parts are well formed");
+        let walk = |id, path: &'static [StepStatus]| {
+            let store = &store;
+            async move {
+                let mut from = StepStatus::Pending;
+                for &to in path {
+                    assert!(
+                        store
+                            .transition_step(id, from, to, epoch())
+                            .await
+                            .expect("a legal move")
+                    );
+                    from = to;
+                }
+            }
+        };
+        walk(done_id, &[StepStatus::Running, StepStatus::Done]).await;
+        walk(older_id, &[StepStatus::Running, StepStatus::Failed]).await;
+        let latest = store
+            .create_step(row(22, 2, "implement/ui", StepRole::Part, Some(planner.id)))
+            .await
+            .expect("attempt 2 has room");
+        walk(latest.id, &[StepStatus::Running, StepStatus::Failed]).await;
+
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        retire_slot(&ctx, &steps, 20, epoch())
+            .await
+            .expect("every move is legal");
+
+        assert_eq!(status_of(&store, planner.id).await, StepStatus::Superseded);
+        assert_eq!(status_of(&store, done_id).await, StepStatus::Superseded);
+        assert_eq!(status_of(&store, latest.id).await, StepStatus::Cancelled);
+        assert_eq!(
+            status_of(&store, older_id).await,
+            StepStatus::Failed,
+            "an older attempt stays as it is"
+        );
+        let plans = store.run_plans(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            plans.iter().map(|plan| plan.status).collect::<Vec<_>>(),
+            [PlanStatus::Abandoned]
+        );
+    }
+
     /// Plan D66: the hash half compares the winners of attempts 1 and 2. Attempt 2's winner sits
     /// at index 1, so reading index 0 — the pre-fan-out `at()` — would answer the opposite in both
     /// halves of this case.
