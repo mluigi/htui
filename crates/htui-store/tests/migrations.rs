@@ -862,8 +862,9 @@ const MOD139_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_step",
         "parent_step_id",
-        "MOD-139 D1 (ANA-33 7.4): the step this one was spawned under, a part's planner step; \
-         NULL on every other row today. Written once.",
+        "MOD-139 D1 (ANA-33 7.4): the step this one was spawned under, a part's planner step, \
+         always a step of the same run (the foreign key is (run_id, parent_step_id)); NULL on \
+         every other row today. Written once.",
     ),
     (
         "run_step",
@@ -881,8 +882,9 @@ const MOD139_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_plan",
         "planner_step_id",
-        "MOD-139 D1: the step of the same run whose planner produced this revision; \
-         insert_run_plan refuses a step of another run.",
+        "MOD-139 D1: the step of the same run whose planner produced this revision; the foreign \
+         key is (run_id, planner_step_id), and insert_run_plan refuses a step of another run \
+         first.",
     ),
     (
         "run_plan",
@@ -6610,8 +6612,10 @@ async fn insert_role_step(
 /// MOD-139 plan D1 (blueprint §T1.2 rows 3, 5-8, P-2): `0028_divided_fanout.sql`'s three
 /// `run_step` CHECKs and the parent foreign key. A planner, a part under it with a key, and the
 /// stage rows at -1 and -3 are admitted. A stage outside -3..-1, a stage with an unknown or a NULL
-/// key, a `step` at a negative position, a part missing its parent or its key, an unknown role
-/// and an unknown parent are each refused by the one rule that names them.
+/// key, a `step` at a negative position, a part missing its parent or its key, an unknown role,
+/// an unknown parent and a parent of another run (MOD-139 M1 F1: the foreign key is
+/// `(run_id, parent_step_id)`) are each refused by the one rule that names them. A step that is
+/// its own parent still passes: the key is checked once the row is in.
 #[cfg(feature = "demo")]
 #[tokio::test]
 async fn the_0028_step_role_checks_refuse_what_they_name() {
@@ -6732,6 +6736,39 @@ async fn the_0028_step_role_checks_refuse_what_they_name() {
         "fk_run_step_parent_step",
         "a part under an unknown parent",
     );
+    let other_planner = insert_role_step(pool, ids::RUN_2.as_uuid(), 70, "planner", None, None)
+        .await
+        .expect("a planner of another run");
+    assert_refused(
+        insert_role_step(
+            pool,
+            run,
+            76,
+            "part",
+            Some(other_planner),
+            Some("implement/z"),
+        )
+        .await,
+        "23503",
+        "fk_run_step_parent_step",
+        "a part under a planner of another run",
+    );
+    let own: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO run_step (id, run_id, position, phase_name, role, parent_step_id, node_key) \
+         SELECT x, $1, 77, 'implement', 'part', x, 'implement/self' \
+         FROM (SELECT gen_random_uuid() AS x) AS fresh RETURNING id",
+    )
+    .bind(run)
+    .fetch_one(pool)
+    .await
+    .expect("a step that is its own parent is admitted");
+    let parent: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT parent_step_id FROM run_step WHERE id = $1")
+            .bind(own)
+            .fetch_one(pool)
+            .await
+            .expect("read the self-parented step back");
+    assert_eq!(parent, Some(own), "the self-parented step names itself");
 
     db.drop_db().await;
 }
@@ -6739,8 +6776,9 @@ async fn the_0028_step_role_checks_refuse_what_they_name() {
 /// MOD-139 plan D1 (blueprint §T1.2 rows 9-11, 13-14): `run_plan`'s rules. A plan inserted with
 /// no status reads `proposed` with NULL `base_refs`; a repeated revision, a negative revision or
 /// base position, an unknown scope or status and an admission without refs are each refused by
-/// their own name. Admitting moves `updated_at` (`trg_run_plan_updated_at`), deleting the planner
-/// step takes its plans and its part rows, and the three new indexes exist.
+/// their own name, and so is a planner step of another run (MOD-139 M1 F1: the planner foreign
+/// key is `(run_id, planner_step_id)`). Admitting moves `updated_at` (`trg_run_plan_updated_at`),
+/// deleting the planner step takes its plans and its part rows, and the three new indexes exist.
 #[cfg(feature = "demo")]
 #[tokio::test]
 async fn the_0028_run_plan_checks_refuse_what_they_name() {
@@ -6795,6 +6833,24 @@ async fn the_0028_run_plan_checks_refuse_what_they_name() {
         "23505",
         "uq_run_plan_revision",
         "a repeated revision",
+    );
+    let other_planner = insert_role_step(pool, ids::RUN_2.as_uuid(), 80, "planner", None, None)
+        .await
+        .expect("a planner step of another run");
+    assert_refused(
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, base_position, \
+                                   body, digest) \
+             VALUES (gen_random_uuid(), $1, 1, $2, 'parts', 81, '{}'::jsonb, 'sha256:x') \
+             RETURNING id",
+        )
+        .bind(run)
+        .bind(other_planner)
+        .fetch_one(pool)
+        .await,
+        "23503",
+        "fk_run_plan_planner_step",
+        "a planner step of another run",
     );
     assert_refused(
         plan(-1, "parts", 81).await,
