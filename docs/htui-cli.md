@@ -65,9 +65,10 @@ the top level need `--search-items`; `htui --json` alone is a usage error.
 `status` and `waiting` read one scope:
 
 - **By default, the first workspace.** That is the first workspace by name, the one the TUI opens
-  on. Its projects are read in the workspace's own order. `waiting` also reads the workspace's
-  own items (such as `WS-1`, made in the workspace rather than in one of its projects) and lists
-  them first.
+  on. Its projects are read in the workspace's own order. Both commands also read the workspace's
+  own items (such as `WS-1`, made in the workspace rather than in one of its projects): `status`
+  counts their runs and rows in `working` and `waiting`, and `waiting` lists them first. With
+  `--project` or `--cwd`, neither command reads them.
 - **`--project <SLUG>`** reads that project alone. Project slugs are unique across the store. A
   project can belong to several workspaces; the document then reports the first of them by name.
   A slug no workspace lists is refused with `unknown_project`.
