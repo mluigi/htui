@@ -3118,6 +3118,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "htui-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "htui-core",
+ "htui-store",
+ "qdrant-client",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "htui-core"
 version = "0.1.0"
 dependencies = [
