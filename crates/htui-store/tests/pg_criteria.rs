@@ -3189,6 +3189,7 @@ async fn a_command_run_is_counted_and_taken_by_the_project_delete() {
 ///
 /// MOD-163's two memory tables are the exception (blueprint P-6): one entry and one amend go in
 /// through the store, which is safe because the case still measures them with `count(*)`.
+/// MOD-139's `run_plan` is seeded by SQL like the first five.
 ///
 /// `workspace_box_path` is in the list and must **not** move: a project is not a workspace.
 #[tokio::test(flavor = "multi_thread")]
@@ -3315,6 +3316,18 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         matches!(amended, MemoryUpdate::Updated(ref head) if head.version == 2),
         "the re-confirming amend lands at version 2, got {amended:?}"
     );
+    // MOD-139 plan D5: one plan revision on the fixture step, so `run_plans` below is 1 rather than
+    // `0 == 0`.
+    sqlx::query(
+        "INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, base_position, \
+                               body, digest) \
+         SELECT gen_random_uuid(), s.run_id, 0, s.id, 'parts', 0, '{}'::jsonb, 'sha256:measured' \
+           FROM run_step s WHERE s.id = $1",
+    )
+    .bind(step)
+    .execute(&db.pool)
+    .await
+    .expect("seed a run_plan");
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
@@ -3463,9 +3476,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             command_runs,
             repo_box_paths,
             memory_entries,
-            memory_revisions
-        ) == (1, 1, 1, 1, 1, 1, 2),
-        "the eight seeded tables are non-zero, so none of them passed on `0 == 0`"
+            memory_revisions,
+            run_plans
+        ) == (1, 1, 1, 1, 1, 1, 2, 1),
+        "the nine seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;

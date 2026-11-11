@@ -22,6 +22,7 @@ use htui_core::model::{
     MemoryEntryId, NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent,
     Status, StepId, StepOpening, StepRole, UserId, WorkspaceSummary,
 };
+use htui_core::model::{NewRunPlan, PlanScope, PlanStatus, RunPlanId};
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
 use htui_store::{Backend, CacheStore, identity};
@@ -1593,6 +1594,117 @@ async fn the_0010_step_role_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-139 M1 (plan D2): `run_plan` is mirrored on its own `updated_at` cursor. A plan written to
+/// Postgres through `insert_run_plan` reads back off the mirror, and after its status moves (raw
+/// SQL, as M2's admission will; `trg_run_plan_updated_at` moves `updated_at`) the next pass
+/// carries the new status and refs.
+#[tokio::test]
+async fn the_0010_run_plan_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let leased: bool = sqlx::query_scalar("SELECT lease_owner IS NOT NULL FROM run WHERE id = $1")
+        .bind(ids::RUN_1.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("RUN_1's lease");
+    assert!(
+        !leased,
+        "the fixture's RUN_1 is unleased, so StepFence::Unleased passes"
+    );
+    let planner = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position: 60,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: None,
+            model: None,
+            role: StepRole::Planner,
+            parent_step_id: None,
+            node_key: None,
+        })
+        .await
+        .expect("a planner step");
+    let plan = db
+        .store
+        .insert_run_plan(
+            StepFence::Unleased,
+            NewRunPlan {
+                id: RunPlanId::new(),
+                run_id: ids::RUN_1,
+                revision: 0,
+                planner_step_id: planner.id,
+                scope: PlanScope::Parts,
+                base_position: 61,
+                body: json!({"parts": [{"key": "api"}]}),
+                digest: "sha256:mirror".to_owned(),
+            },
+        )
+        .await
+        .expect("a proposed plan");
+    assert_eq!(
+        (plan.status, plan.base_refs.as_ref()),
+        (PlanStatus::Proposed, None),
+        "inserted as proposed, with no refs"
+    );
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the first pass");
+    let pg_plans = db.store.run_plans(ids::RUN_1).await.expect("pg run plans");
+    assert_eq!(
+        pg_plans,
+        vec![plan.clone()],
+        "Postgres answers the one plan"
+    );
+    assert_eq!(
+        cache.run_plans(ids::RUN_1).await.expect("cache run plans"),
+        pg_plans,
+        "the mirror answers the plan as Postgres does"
+    );
+
+    let refs = json!({"r": "abc"});
+    sqlx::query("UPDATE run_plan SET status = 'admitted', base_refs = $2 WHERE id = $1")
+        .bind(plan.id.as_uuid())
+        .bind(&refs)
+        .execute(&db.pool)
+        .await
+        .expect("admit the plan");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the second pass");
+    let mirrored = cache.run_plans(ids::RUN_1).await.expect("cache run plans");
+    assert_eq!(mirrored.len(), 1, "still the one revision");
+    assert_eq!(
+        (mirrored[0].status, mirrored[0].base_refs.as_ref()),
+        (PlanStatus::Admitted, Some(&refs)),
+        "the status move rode updated_at to the mirror"
+    );
+    assert!(
+        mirrored[0].updated_at > plan.updated_at,
+        "the trigger moved updated_at"
+    );
+    assert_eq!(
+        mirrored,
+        db.store.run_plans(ids::RUN_1).await.expect("pg run plans"),
+        "the two backends agree after the move"
+    );
+    assert!(
+        cache
+            .run_plans(RunId::new())
+            .await
+            .expect("an unknown run")
+            .is_empty(),
+        "an unknown run has no plans"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// `run_step_tree` is the seventeenth mirrored table, and — having no `updated_at` of its own —
 /// it rides its parent step's, exactly as `run_step_commit` does (ANA-2 §4.6, plan D9).
 ///
@@ -2388,8 +2500,9 @@ async fn a_tombstoned_link_disappears_from_the_mirror() {
 async fn a_closed_item_mirrors_its_resolution() {
     assert_eq!(
         htui_store::cache::MIRRORED_TABLES.len(),
-        21,
-        "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement",
+        22,
+        "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement; \
+         MOD-139 adds run_plan",
     );
     let Some(db) = common::demo_db().await else {
         return;

@@ -204,6 +204,7 @@ const RUN: &str = "run";
 const RUN_STEP: &str = "run_step";
 const RUN_STEP_COMMIT: &str = "run_step_commit";
 const RUN_STEP_TREE: &str = "run_step_tree";
+const RUN_PLAN: &str = "run_plan";
 const REQUIREMENT_SPEC: &str = "requirement_spec";
 const REQUIREMENT_AREA: &str = "requirement_area";
 const REQUIREMENT: &str = "requirement";
@@ -263,6 +264,7 @@ pub async fn run_pass(
             RUN_STEP,
             RUN_STEP_COMMIT,
             RUN_STEP_TREE,
+            RUN_PLAN,
             REQUIREMENT_SPEC,
             REQUIREMENT_AREA,
             REQUIREMENT,
@@ -292,6 +294,7 @@ pub async fn run_pass(
                     refresh_run_step_commit(pool, sqlite, project, since, hw).await?
                 }
                 RUN_STEP_TREE => refresh_run_step_tree(pool, sqlite, project, since, hw).await?,
+                RUN_PLAN => refresh_run_plan(pool, sqlite, project, since, hw).await?,
                 REQUIREMENT_SPEC => {
                     refresh_requirement_spec(pool, sqlite, project, since, hw).await?
                 }
@@ -1379,6 +1382,72 @@ async fn refresh_run_step_tree(
     }
     let high_water = rows.last().map_or(hw, |row| ts_bind(row.ts));
     finish(tx, project, RUN_STEP_TREE, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const RUN_PLAN_COLUMNS: &[&str] = &[
+    "id",
+    "run_id",
+    "revision",
+    "planner_step_id",
+    "scope",
+    "status",
+    "base_position",
+    "base_refs",
+    "body",
+    "digest",
+    "created_at",
+    "updated_at",
+];
+
+/// MOD-139 D2: `run_plan` on its own `updated_at` cursor, which a status move bumps
+/// (`trg_run_plan_updated_at`), so an admission reaches the mirror on the next pass. After
+/// `run_step` in the list, the foreign-key order: a plan names its planner step.
+async fn refresh_run_plan(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT id, run_id, revision, planner_step_id, scope, status, base_position, \
+                base_refs, body, digest, created_at, updated_at \
+           FROM run_plan \
+          WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 \
+          ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(RUN_PLAN, RUN_PLAN_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(row.run_id.to_string())
+            .bind(i64::from(row.revision))
+            .bind(row.planner_step_id.to_string())
+            .bind(&row.scope)
+            .bind(&row.status)
+            .bind(i64::from(row.base_position))
+            .bind(opt_json_text(row.base_refs.as_ref())?)
+            .bind(json_text(&row.body)?)
+            .bind(&row.digest)
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, RUN_PLAN, high_water).await?;
     Ok(Batch {
         rows: rows.len() as u64,
         tombstones: 0,

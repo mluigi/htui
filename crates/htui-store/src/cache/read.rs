@@ -42,6 +42,7 @@ use htui_core::model::{
     StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
     WorkspaceId, WorkspaceSummary,
 };
+use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
@@ -351,6 +352,28 @@ fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
         )?,
         node_key: opt_text(row, "node_key")?,
         updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
+    })
+}
+
+/// Every `run_plan` column, in [`run_plan_of`]'s names.
+const RUN_PLAN_SELECT: &str = "id, run_id, revision, planner_step_id, scope, status, \
+     base_position, base_refs, body, digest, created_at, updated_at";
+
+/// One `run_plan` row (MOD-139 plan D2), every column of [`RUN_PLAN_SELECT`].
+fn run_plan_of(row: &SqliteRow) -> Result<RunPlan> {
+    Ok(RunPlan {
+        id: uuid_col::<RunPlanId>("run_plan.id", &text(row, "id")?)?,
+        run_id: uuid_col("run_plan.run_id", &text(row, "run_id")?)?,
+        revision: get(row, "revision")?,
+        planner_step_id: uuid_col("run_plan.planner_step_id", &text(row, "planner_step_id")?)?,
+        scope: get::<PlanScope>(row, "scope")?,
+        status: get::<PlanStatus>(row, "status")?,
+        base_position: get(row, "base_position")?,
+        base_refs: opt_json_col("run_plan.base_refs", opt_text(row, "base_refs")?.as_deref())?,
+        body: json_col("run_plan.body", &text(row, "body")?)?,
+        digest: text(row, "digest")?,
+        created_at: ts_col("run_plan.created_at", get(row, "created_at")?)?,
+        updated_at: ts_col("run_plan.updated_at", get(row, "updated_at")?)?,
     })
 }
 
@@ -1345,9 +1368,16 @@ impl ReadStore for CacheStore {
             .collect()
     }
 
-    /// MOD-139 M1 T1 stub; T3 reads the mirror.
-    async fn run_plans(&self, _run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
-        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    /// MOD-139 D4: the mirrored revisions of `run`, `revision` order, offline (MOD-142).
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {RUN_PLAN_SELECT} FROM run_plan WHERE run_id = ? ORDER BY revision"
+        )))
+        .bind(run.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(run_plan_of).collect()
     }
 
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {

@@ -50,6 +50,7 @@ use htui_core::model::{
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
+use htui_core::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
 use htui_core::prompt::DEFAULT_TEMPLATES;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -84,8 +85,9 @@ use htui_core::store::{
     phase_row_refusal, workspace_graph_is_held,
 };
 use htui_core::store::{
-    project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
-    scope_row_slug_is_fixed, workspace_has_live_run,
+    plan_revision_taken, planner_not_in_run, project_slug_refusal, run_plan_refusal,
+    scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace, scope_row_slug_is_fixed,
+    workspace_has_live_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -609,6 +611,9 @@ pub(crate) async fn insert_scope_row(
 /// `me` is the project's memory entries (MOD-163 D8); `memory_entry_revision` is reached through
 /// it, as `requirement_revision` is through `rq`.
 ///
+/// `run_plan` hangs off `r` (MOD-139 D5); its planner step is in `s` as well (`insert_run_plan`
+/// refuses a step of another run), so its two cascade paths take the same rows.
+///
 /// `workspace_box_paths` is `0`: a project is not a workspace.
 async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<DeleteReach>> {
     let counted = sqlx::query!(
@@ -667,7 +672,9 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                     OR requirement_id IN (SELECT id FROM rq))                 AS "item_requirements!",
                (SELECT count(*) FROM me)                                      AS "memory_entries!",
                (SELECT count(*) FROM memory_entry_revision
-                 WHERE entry_id IN (SELECT id FROM me))                       AS "memory_revisions!"
+                 WHERE entry_id IN (SELECT id FROM me))                       AS "memory_revisions!",
+               (SELECT count(*) FROM run_plan
+                 WHERE run_id IN (SELECT id FROM r))                          AS "run_plans!"
           FROM project WHERE id = $1
         "#,
         id.as_uuid(),
@@ -707,8 +714,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         item_requirements: rows(row.item_requirements),
         memory_entries: rows(row.memory_entries),
         memory_revisions: rows(row.memory_revisions),
-        // MOD-139 plan D5: counted by T3's `project_reach` subselect.
-        run_plans: 0,
+        run_plans: rows(row.run_plans),
     }))
 }
 
@@ -963,6 +969,24 @@ async fn memory_write_refused(
                 Ok(None) => map_sqlx(err),
                 Err(lookup) => map_sqlx(lookup),
             }
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-139 helpers (plan D4).
+// ------------------------------------------------------------------------------------------------
+
+/// MOD-139 D4: `insert_run_plan`'s two `23505`s in `MemStore`'s sentences: `run_plan_pkey` is the
+/// id, `uq_run_plan_revision` the revision; anything else through [`map_sqlx`].
+fn run_plan_insert_refused(err: sqlx::Error, plan: &NewRunPlan) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("run_plan_pkey") => {
+            StoreError::Constraint(already_exists("run_plan", plan.id))
+        }
+        sqlx::Error::Database(db) if db.constraint() == Some("uq_run_plan_revision") => {
+            StoreError::Constraint(plan_revision_taken(plan.run_id, plan.revision))
         }
         _ => map_sqlx(err),
     }
@@ -7833,13 +7857,78 @@ impl WriteStore for PgStore {
         Box::pin(fenced_miss(&self.pool, step, fence)).await
     }
 
-    /// MOD-139 M1 T1 stub; T3 writes `run_plan`.
-    async fn insert_run_plan(
-        &self,
-        _fence: StepFence,
-        _plan: htui_core::model::NewRunPlan,
-    ) -> Result<htui_core::model::RunPlan> {
-        Err(StoreError::Backend("MOD-139 M1: not yet".into()))
+    /// MOD-139 D4 (blueprint §1, P-8): one transaction. The planner step is read `FOR KEY SHARE`
+    /// and then the run `FOR SHARE`, the step → run order of MOD-77 (`step_fence`), so an adoption
+    /// cannot commit between the fence check and the insert, and a park holding the step cannot
+    /// deadlock it. The decisions are made in MemStore's order on what was read; the two `23505`s
+    /// map through `run_plan_insert_refused`.
+    async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan> {
+        if let Some(refusal) = run_plan_refusal(&plan) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let planner_run = sqlx::query_scalar!(
+            r#"SELECT run_id AS "run_id: RunId" FROM run_step WHERE id = $1 FOR KEY SHARE"#,
+            plan.planner_step_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let owner = sqlx::query_scalar!(
+            r#"SELECT lease_owner AS "lease_owner?" FROM run WHERE id = $1 FOR SHARE"#,
+            plan.run_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: plan.run_id.to_string(),
+        })?;
+        if owner != fence.owner() {
+            return Err(StoreError::Fenced {
+                step: plan.planner_step_id,
+            });
+        }
+        if planner_run != Some(plan.run_id) {
+            return Err(StoreError::Constraint(planner_not_in_run(
+                plan.planner_step_id,
+                plan.run_id,
+            )));
+        }
+        let row = sqlx::query_as!(
+            RunPlan,
+            r#"
+            INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, base_position,
+                                  body, digest)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id              AS "id: RunPlanId",
+                      run_id          AS "run_id: RunId",
+                      revision,
+                      planner_step_id AS "planner_step_id: StepId",
+                      scope           AS "scope: PlanScope",
+                      status          AS "status: PlanStatus",
+                      base_position,
+                      base_refs,
+                      body,
+                      digest,
+                      created_at,
+                      updated_at
+            "#,
+            plan.id.as_uuid(),
+            plan.run_id.as_uuid(),
+            plan.revision,
+            plan.planner_step_id.as_uuid(),
+            plan.scope.as_str(),
+            plan.base_position,
+            &plan.body,
+            &plan.digest,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| run_plan_insert_refused(err, &plan))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
     /// One `command_run` row, every column the caller's (plan D31).
