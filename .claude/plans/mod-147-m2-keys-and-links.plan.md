@@ -138,13 +138,15 @@ bash scripts/gate.sh                              # full gate; live-Qdrant suite
 | A widened waiting scope echoed in the reply drops every top-bar update | Medium | D10: widen for reads only; test pins adoption |
 
 ## Acceptance
-- [ ] All tasks complete, tests written first
-- [ ] `@shop:WS-1` and `api:FEAT-9` resolve in MCP `item_link`, also when a project is named `shop`
-- [ ] A workspace kind with a member's prefix is refused; a colliding new project joins with a notice
-- [ ] `propose_link` reaches the workspace's scope row and members, nothing else
-- [ ] R1 L8 closed: scope row uses its workspace's graphs, its runs carry its workspace
-- [ ] Gate green except live-Qdrant suites (owed on host)
-- [ ] Patterns mirrored, not reinvented
+- [x] All tasks complete, tests written first
+- [x] `@shop:WS-1` and `api:FEAT-9` resolve in MCP `item_link`, also when a project is named `shop`
+- [x] A workspace kind with a member's prefix is refused; a colliding new project joins with a notice
+- [x] `propose_link` reaches the workspace's scope row and members, nothing else
+- [x] R1 L8 closed: scope row uses its workspace's graphs, its runs carry its workspace
+- [x] Gate green except live-Qdrant suites (owed on host): merged tree 7849 passed; 27 live-Qdrant timeouts, main's `0027` comment test and the refresher flake (green alone) are the only failures
+- [x] Patterns mirrored, not reinvented
+
+**Status (2026-11-11): complete on hr/MOD-147.** T1-T4 merged (`488d20f6`), review R1 `93b38e35..5994ebaa`; rust-reviewer findings F1 (MCP remove existence) and F3 (Pg refusal sentence under a race) kept by decision, F2 filed as MOD-170.
 
 ## Verified claims (step 3.5 fact-check, 2026-11-10; three read-only checkers)
 
