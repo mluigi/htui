@@ -16263,8 +16263,9 @@ mod recovery_paths {
 
     use super::{
         Adopted, FakeOrchestrator, Next, Orchestrate, Rest, RunFailure, candidate, crash,
-        fan_research, free_feat_3, judge_both, notes_of, primary_repo, repoint,
-        research_candidates, set_judge, slot_of, step_at, steps_of, tree_text,
+        crash_divided, divided_feat_3, fan_research, free_feat_3, judge_both, notes_of, part_named,
+        primary_repo, repoint, research_candidates, run_of, set_judge, slot_of, step_at, steps_of,
+        tree_text,
     };
     use crate::isolate::Clock as _;
     use crate::verify::VERIFY_CLASS;
@@ -16429,6 +16430,59 @@ mod recovery_paths {
             other.isolator().resets(),
             0,
             "D95: no reset for a candidate"
+        );
+    }
+
+    /// Ruling F-1 beside a pending sibling: a part crashed without its output, with
+    /// `retry_limit 0`, spends its one attempt on recovery, so the divided step is exhausted
+    /// and the run fails `part_exhausted` (D131's branch). The sibling that never started is
+    /// cut with the run, `cancelled` with the cut's note, never left `pending` under a terminal
+    /// run.
+    #[tokio::test]
+    async fn an_exhausted_part_on_recovery_cuts_its_pending_sibling() {
+        let orch = FakeOrchestrator::demo();
+        divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+            phase.retry_limit = 0;
+        })
+        .await;
+        orch.store()
+            .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+        let stalled = orch.stall_after_done("implement/api", 1, None, false);
+        let run = crash_divided(&orch, &[stalled]).await;
+
+        let other = orch.restarted();
+        let adopted = other.sweep().await.expect("the sweep adopts");
+        assert_eq!(adopted.len(), 1, "{adopted:?}");
+        assert!(
+            matches!(
+                &adopted[0].next,
+                Next::Finished(Rest {
+                    run: RunStatus::Failed,
+                    failure: Some(RunFailure::PartExhausted { node, part, attempts: 1 }),
+                    ..
+                }) if node == "implement" && part == "api"
+            ),
+            "{adopted:?}"
+        );
+        let row = run_of(&other, run).await;
+        assert_eq!(row.status, RunStatus::Failed);
+        let steps = steps_of(&other, run).await;
+        let api = part_named(&steps, "implement/api");
+        assert_eq!(
+            (api.attempt, api.status, api.gate_note.as_deref()),
+            (1, StepStatus::Failed, Some("interrupted"))
+        );
+        let ui = part_named(&steps, "implement/ui");
+        assert_eq!(
+            (ui.attempt, ui.status),
+            (1, StepStatus::Cancelled),
+            "the never-started sibling is cut with the run"
+        );
+        let item = row.item_id.expect("the divided run is an item's");
+        assert!(
+            notes_of(&other, item).await.iter().any(|note| note
+                == "step `implement/ui` attempt 1 cancelled: the run ended at `implement`"),
+            "the cut's note names the divided node"
         );
     }
 }

@@ -3349,7 +3349,8 @@ where
     ///    first, as the in-process answer's tail finishes it: an end cancels the waiting rows,
     ///    and a loop that resumed is walked ([`Next::Walk`]) before anything re-parks.
     /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
-    ///    (D131, [`Self::settle_failed`]).
+    ///    (D131, [`Self::settle_failed`]); an end cancels every unsettled row with the cut's note
+    ///    (MOD-139 M2 F-1: the parts an exhausted divided step never started).
     ///
     /// An `interrupt_step` that answers `Ok(false)` found the step moved by another writer; that
     /// step is skipped and step 3 re-derives.
@@ -3478,10 +3479,19 @@ where
             } = cursor(&snapshot, &steps)
             && let Some(failed) = steps.iter().find(|candidate| candidate.id == step)
         {
-            return Ok(self
-                .settle_failed(&row, &snapshot, failed)
-                .await?
-                .map_or(Next::Walk, Self::landed));
+            // MOD-139 M2 T4 (ruling F-1): a part recovery failed `interrupted` with no attempt
+            // left exhausts the divided step here, beside siblings the parts round never started.
+            // An end cancels every unsettled row with the cut's note, as the rejection branch
+            // above does; a linear run has none and the cut moves nothing.
+            return match Box::pin(self.settle_failed(&row, &snapshot, failed)).await? {
+                Some(rest) if rest.run.is_terminal() => {
+                    let row = self.run(run.id).await?;
+                    Box::pin(self.cancel_unsettled(&row, Some(failed.position))).await?;
+                    Ok(Next::Finished(rest))
+                }
+                Some(rest) => Ok(Self::landed(rest)),
+                None => Ok(Next::Walk),
+            };
         }
         Ok(Next::Walk)
     }
