@@ -1422,6 +1422,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let step = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&step)?;
         let phase = Self::phase_at(run.id, &snapshot, step.position)?;
         let item = Self::item_of(&run)?;
 
@@ -1804,6 +1806,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
@@ -2076,6 +2080,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
@@ -2325,6 +2331,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = Self::item_of(&run)?;
         let has_output = self.output_of(item, &phase, row.id).await?.is_some();
@@ -4063,6 +4071,10 @@ where
                 Some(step) => Box::pin(self.loop_back(run, snapshot, &step, &to)).await,
                 None => Ok(None),
             },
+            Cursor::Parts { position } => Err(EngineError::Snapshot {
+                run,
+                reason: format!("the parts at position {position} have no driver yet"),
+            }),
             Cursor::Rest { .. } | Cursor::Finished => {
                 debug_assert!(false, "plan_pass answers {cursor:?} itself");
                 Ok(None)
@@ -4154,7 +4166,8 @@ where
                     .phases
                     .into_iter()
                     .find(|phase| phase.position == position)
-                    .map(|phase| phase.name),
+                    // MOD-139 M2 (P-19): a planner ender is named by its divided node.
+                    .map(|phase| crate::divide::divided_name(&phase).to_owned()),
                 Err(err) => {
                     tracing::warn!(run = %run.id, %err, "the cut cannot read the run's snapshot to name its ender");
                     None
@@ -4164,10 +4177,13 @@ where
         let now = self.now();
         let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
-            if !matches!(
-                step.status,
-                StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
-            ) {
+            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut.
+            if step.role == StepRole::Stage
+                || !matches!(
+                    step.status,
+                    StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
+                )
+            {
                 continue;
             }
             match self
@@ -8187,19 +8203,8 @@ where
     async fn resting(&self, run: &Run) -> Result<Rest, EngineError> {
         let snapshot = Self::snapshot_of(run)?;
         let steps = self.parts.store.run_steps(run.id).await?;
-        let position = match cursor(&snapshot, &steps) {
-            Cursor::Finished => None,
-            Cursor::Create { position, .. }
-            | Cursor::Fan { position, .. }
-            | Cursor::Select { position, .. } => Some(position),
-            Cursor::Run(step)
-            | Cursor::Rest { step, .. }
-            | Cursor::Decide { step }
-            | Cursor::Loop { step, .. } => steps
-                .iter()
-                .find(|row| row.id == step)
-                .map(|row| row.position),
-        };
+        // MOD-139 M2 (P-14): one reading of a cursor's position, a part's its planner's.
+        let position = crate::status::position_of(&cursor(&snapshot, &steps), &steps);
         Ok(Rest {
             run: run.status,
             position,

@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
     AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, ItemState, RepoId, Resolution, Run,
-    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
-    WorkspaceId, latest_graph_run, latest_live_graph_run,
+    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepRole,
+    StepStatus, WorkspaceId, latest_graph_run, latest_live_graph_run,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -635,6 +635,14 @@ pub enum EngineError {
         /// The candidate named.
         step: StepId,
     },
+    /// MOD-139 M2 D1: an operator verb named a part or a stage row, which no node maps to.
+    #[error("{}", role_row(.step, .role))]
+    RoleRow {
+        /// The row named.
+        step: StepId,
+        /// Its role: `part` or `stage`.
+        role: StepRole,
+    },
     /// Blueprint D185: a chat of this process is live. `None` for a promotion, which the one Chat
     /// tab cannot host beside another session; `Some` for an accept of the step being chatted with.
     #[error("{}", chat_is_live(.step))]
@@ -673,6 +681,14 @@ pub enum EngineError {
         /// Its status.
         status: RunStatus,
     },
+}
+
+/// [`EngineError::RoleRow`]'s two sentences (MOD-139 M2 D1).
+fn role_row(step: &StepId, role: &StepRole) -> String {
+    match role {
+        StepRole::Part => format!("step {step} is a part; a part is driven by its divided node"),
+        other => format!("step {step} is a `{other}` row; htui drives it, not an operator verb"),
+    }
 }
 
 /// [`EngineError::ChatLive`]'s two sentences.
@@ -1059,6 +1075,45 @@ pub fn phase_at(
         })
 }
 
+/// MOD-139 M2 D1: the node a row belongs to. `step`/`planner`/`integrate` (and every other
+/// non-part, non-stage role) by `position`; a `part` by its `parent_step_id` row's position (its
+/// planner node); a `stage` row by none. `None` too when a part's parent is not in `steps`.
+#[must_use]
+pub fn node_of<'s>(
+    snapshot: &'s GraphSnapshot,
+    steps: &[RunStep],
+    step: &RunStep,
+) -> Option<&'s SnapshotPhase> {
+    let position = match step.role {
+        StepRole::Stage => return None,
+        StepRole::Part => {
+            let parent = step.parent_step_id?;
+            steps.iter().find(|row| row.id == parent)?.position
+        }
+        _ => step.position,
+    };
+    snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.position == position)
+}
+
+/// MOD-139 M2 D1: `Err(EngineError::RoleRow)` for a `part` or `stage` row, `Ok(())` otherwise.
+/// The row-taking operator verbs (`answer_gate`, `retry_step`, `promote`, `accept_artifact`)
+/// read it first: a part is driven by its divided node and a stage by htui.
+///
+/// # Errors
+/// [`EngineError::RoleRow`] naming the row and its role.
+pub fn operator_row(step: &RunStep) -> Result<(), EngineError> {
+    match step.role {
+        StepRole::Part | StepRole::Stage => Err(EngineError::RoleRow {
+            step: step.id,
+            role: step.role,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// §6.2's `retry` as the engine admits it (blueprint D184): `retry_step`'s whole order before
 /// its lease, over the rows it read.
 ///
@@ -1353,9 +1408,9 @@ mod tests {
 
     use super::{
         EngineError, GateAnswer, UnblockCase, accept_enabled, answer_gate_enabled, cleanup_enabled,
-        close_out_enabled, nothing_is_blocked, promote_enabled, retry_admitted, retry_enabled,
-        retry_group_enabled, run_is_walking, run_waits_at_a_gate, select_enabled, start_enabled,
-        unblock_enabled,
+        close_out_enabled, node_of, nothing_is_blocked, operator_row, promote_enabled,
+        retry_admitted, retry_enabled, retry_group_enabled, run_is_walking, run_waits_at_a_gate,
+        select_enabled, start_enabled, unblock_enabled,
     };
     use crate::status::{Cursor, resumable};
 
@@ -1382,6 +1437,91 @@ mod tests {
             .find(|phase| phase.position == 3)
             .expect("the snapshot has a phase at position 3");
         (step, phase)
+    }
+
+    /// MOD-139 M2 D1: a part maps to its planner node through its parent's position, a stage to
+    /// none, every other row by its own position.
+    #[test]
+    fn node_of_maps_parts_to_their_planner_and_stages_to_none() {
+        use htui_core::model::StepRole;
+        let (review, _) = review();
+        let data = demo_data();
+        let run = data
+            .runs
+            .iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        let snapshot: GraphSnapshot = serde_json::from_value(
+            run.graph_snapshot
+                .clone()
+                .expect("RUN_1 carries a snapshot"),
+        )
+        .expect("the fixture snapshot is a `GraphSnapshot`");
+        let mut planner = review.clone();
+        planner.id = StepId::new();
+        planner.position = 2;
+        planner.role = StepRole::Planner;
+        let mut part = review.clone();
+        part.id = StepId::new();
+        part.position = 9;
+        part.role = StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        let mut stage = review.clone();
+        stage.id = StepId::new();
+        stage.position = -1;
+        stage.role = StepRole::Stage;
+        let steps = [planner.clone(), part.clone(), stage.clone(), review.clone()];
+        let at = |step: &RunStep| node_of(&snapshot, &steps, step).map(|phase| phase.position);
+        assert_eq!(at(&review), Some(3));
+        assert_eq!(at(&planner), Some(2));
+        assert_eq!(at(&part), Some(2), "a part is its planner's node");
+        assert_eq!(at(&stage), None);
+        assert_eq!(
+            node_of(&snapshot, std::slice::from_ref(&part), &part),
+            None,
+            "a part whose parent the rows lack"
+        );
+        part.parent_step_id = None;
+        assert_eq!(at(&part), None, "a parentless part");
+    }
+
+    /// MOD-139 M2 D1: the operator verbs refuse a part and a stage row, each in its sentence.
+    #[test]
+    fn operator_row_refuses_parts_and_stages() {
+        use htui_core::model::StepRole;
+        let (mut step, _) = review();
+        assert!(operator_row(&step).is_ok());
+        step.role = StepRole::Planner;
+        assert!(operator_row(&step).is_ok());
+        step.role = StepRole::Part;
+        let part = operator_row(&step).expect_err("a part is refused");
+        assert!(
+            matches!(
+                part,
+                EngineError::RoleRow {
+                    step: id,
+                    role: StepRole::Part
+                } if id == step.id
+            ),
+            "{part:?}"
+        );
+        assert_eq!(
+            part.to_string(),
+            format!(
+                "step {} is a part; a part is driven by its divided node",
+                step.id
+            )
+        );
+        step.role = StepRole::Stage;
+        assert_eq!(
+            operator_row(&step)
+                .expect_err("a stage is refused")
+                .to_string(),
+            format!(
+                "step {} is a `stage` row; htui drives it, not an operator verb",
+                step.id
+            )
+        );
     }
 
     /// MOD-138 D1, D4 (A2): `snapshot_of` reads v1 and v2, lifts v1 to its default edges while

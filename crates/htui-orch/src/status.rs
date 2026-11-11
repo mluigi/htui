@@ -8,7 +8,8 @@
 use core::fmt;
 
 use htui_core::model::{
-    EdgeKind, GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
+    EdgeKind, GateOutcome, GraphSnapshot, RunStep, StepId, StepRole, StepStatus,
+    missing_tags_failure,
 };
 use htui_core::scrub::Unmasked;
 
@@ -387,6 +388,13 @@ pub enum Cursor {
         /// `run_step.attempt` of the slot.
         attempt: i32,
     },
+    /// MOD-139 M2 D4: a divided node whose planner row is `done` and whose parts (of that planner
+    /// attempt) are not all `done`, none is live and none is out of attempts: create the retry rows
+    /// owed (T4) and run every `pending` part.
+    Parts {
+        /// The planner node's `position`.
+        position: i32,
+    },
     /// MOD-138 M2 D6: `step`, a node's winner, is `done` and its node's `if` edges are not
     /// decided yet (`run_step.branch` is NULL). A write the engine owes, so it sorts before every
     /// node cursor (blueprint A6).
@@ -565,7 +573,8 @@ pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) ->
 /// between its first write and its unpark: every step the run is parked over is `done`,
 /// `superseded` or `selected`, and no gate is waiting on a human. `Decide` and `Loop` (MOD-138 M2
 /// D2) are writes the engine still owes, which a crash, or a decision the isolator could not
-/// read (D6), cut off. `Rest`, `Fan` and `Select` are real parks a human has to answer.
+/// read (D6), cut off. `Parts` (MOD-139 M2 D4) is a write the engine owes, as `Decide`. `Rest`,
+/// `Fan` and `Select` are real parks a human has to answer.
 /// `Engine::resume`'s own walk and `Unblock`'s third case (plan D161) both read this one
 /// predicate, so the two cannot drift.
 #[must_use]
@@ -576,6 +585,7 @@ pub fn resumable_park(cursor: &Cursor) -> bool {
             | Cursor::Run(_)
             | Cursor::Decide { .. }
             | Cursor::Loop { .. }
+            | Cursor::Parts { .. }
             | Cursor::Finished
     )
 }
@@ -620,24 +630,30 @@ pub fn resumable(cursor: &Cursor, steps: &[RunStep]) -> bool {
 }
 
 /// MOD-138 M3 (A1): the position a cursor stands on, the key the concurrent walk holds a node
-/// by. `Create`/`Fan`/`Select` carry it; `Run`/`Rest`/`Decide`/`Loop` read their step's row.
-/// `None` for `Finished` and for a step `steps` does not hold.
+/// by. `Create`/`Fan`/`Select`/`Parts` carry it; `Run`/`Rest`/`Decide`/`Loop` read their step's
+/// row, and a part row (MOD-139 M2, blueprint P-14) stands on its planner's position, the node it
+/// belongs to. `None` for `Finished` and for a step `steps` does not hold.
 #[must_use]
 pub fn position_of(cursor: &Cursor, steps: &[RunStep]) -> Option<i32> {
     let step = match cursor {
         Cursor::Create { position, .. }
         | Cursor::Fan { position, .. }
-        | Cursor::Select { position, .. } => return Some(*position),
+        | Cursor::Select { position, .. }
+        | Cursor::Parts { position } => return Some(*position),
         Cursor::Run(step)
         | Cursor::Rest { step, .. }
         | Cursor::Decide { step }
         | Cursor::Loop { step, .. } => step,
         Cursor::Finished => return None,
     };
-    steps
-        .iter()
-        .find(|row| row.id == *step)
-        .map(|row| row.position)
+    let row = steps.iter().find(|row| row.id == *step)?;
+    match (row.role, row.parent_step_id) {
+        (StepRole::Part, Some(parent)) => steps
+            .iter()
+            .find(|planner| planner.id == parent)
+            .map(|planner| planner.position),
+        _ => Some(row.position),
+    }
 }
 
 /// MOD-138 M3 A6: whether a parked run is one a resume may walk on from: [`crate::walk::ready`]
@@ -786,6 +802,35 @@ mod tests {
         );
         assert_eq!(at(Cursor::Finished), None);
         assert_eq!(at(Cursor::Run(StepId::new())), None, "a step the rows lack");
+        assert_eq!(at(Cursor::Parts { position: 2 }), Some(2));
+        assert!(
+            resumable_park(&Cursor::Parts { position: 2 }),
+            "an owed write"
+        );
+
+        // MOD-139 M2 (P-14): a part row stands on its planner's position.
+        let mut planner = c.clone();
+        planner.role = htui_core::model::StepRole::Planner;
+        let mut part = row(&snapshot, "d", 1, StepStatus::Running);
+        part.position = 7;
+        part.role = htui_core::model::StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        let rows = [planner.clone(), part.clone()];
+        assert_eq!(
+            position_of(
+                &Cursor::Rest {
+                    step: part.id,
+                    status: StepStatus::Running
+                },
+                &rows
+            ),
+            Some(planner.position)
+        );
+        assert_eq!(
+            position_of(&Cursor::Run(part.id), std::slice::from_ref(&part)),
+            None,
+            "a part whose planner the rows lack"
+        );
     }
 
     /// MOD-138 M3 A6: on a linear graph `run_resumable` is the first cursor's `resumable`.
