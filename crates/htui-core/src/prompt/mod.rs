@@ -64,7 +64,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::SnapshotMemory;
 use crate::model::persona::SnapshotPersona;
-use crate::model::run::{PremergeReport, SnapshotPart};
+use crate::model::run::{PartMerge, PremergeReport, SnapshotPart};
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
@@ -666,6 +666,15 @@ pub fn assemble(
     for section in render_sections(Placeholder::Part, spec, upstream, skills, candidates) {
         rendered.push((Placeholder::Part, section, 1));
     }
+    // MOD-139 M3 D5: integrate's pre-merge report (protected) and its done parts (trimmable,
+    // `TrimStep::Parts`) render after the part and outside the body's spans, in that order, so
+    // both are scanned with every section below and recorded as the next `sections[]` entries.
+    // Phase specs only; the report only with a repo (blueprint P-10).
+    for placeholder in [Placeholder::Premerge, Placeholder::Parts] {
+        for section in render_sections(placeholder, spec, upstream, skills, candidates) {
+            rendered.push((placeholder, section, 1));
+        }
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -718,6 +727,11 @@ pub fn assemble(
     // MOD-139 M2 D10: the part's separator is the frame's too; the section is never dropped.
     if part_of(spec).is_some() {
         frame.push_str(PART_SEPARATOR);
+    }
+    // MOD-139 M3 D5: so is the pre-merge report's, by the same rule (protected, never dropped).
+    // The `parts` separator is not: it rides with that section's span (`MEMORY_SEPARATOR`'s rule).
+    if premerge_of(spec).is_some() {
+        frame.push_str(PREMERGE_SEPARATOR);
     }
     if has_output(spec) {
         frame.push_str(OUTPUT_SEPARATOR);
@@ -865,6 +879,17 @@ fn substitute(
         text.push_str(&part.join("\n\n"));
         text.push_str(PART_SEPARATOR);
     }
+    // MOD-139 M3 D5: the pre-merge report, then the done parts, each then one blank line. `live`
+    // carries the report only for a phase spec with a repo and the parts only while they survived
+    // the trim, so every other prompt is byte-identical.
+    if let Some(premerge) = blocks.get(&Placeholder::Premerge) {
+        text.push_str(&premerge.join("\n\n"));
+        text.push_str(PREMERGE_SEPARATOR);
+    }
+    if let Some(parts) = blocks.get(&Placeholder::Parts) {
+        text.push_str(&parts.join("\n\n"));
+        text.push_str(PARTS_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {
@@ -906,6 +931,21 @@ fn part_of(spec: &PromptSpec) -> Option<&PartBlock> {
     spec.part
         .as_ref()
         .filter(|_| matches!(spec.role, TemplateRole::Phase))
+}
+
+/// MOD-139 M3 D5 (blueprint P-10): the pre-merge report a spec renders — its own, for a phase
+/// spec whose report names at least one repo, and none otherwise (memory's rule).
+fn premerge_of(spec: &PromptSpec) -> Option<&PremergeReport> {
+    spec.premerge
+        .as_ref()
+        .filter(|report| matches!(spec.role, TemplateRole::Phase) && !report.repos.is_empty())
+}
+
+/// MOD-139 M3 D5: the done parts a spec renders — its own, for a phase spec that carries any, and
+/// none otherwise (memory's rule).
+fn parts_of(spec: &PromptSpec) -> Option<&[IntegratePart]> {
+    Some(spec.parts.as_slice())
+        .filter(|parts| matches!(spec.role, TemplateRole::Phase) && !parts.is_empty())
 }
 
 /// Whether `spec` renders the `output` trailer: the tool is on and there is a kind to name.
@@ -1019,8 +1059,15 @@ fn render_sections(
             .into_iter()
             .collect(),
         Placeholder::Part => part_of(spec).map(render::part).into_iter().collect(),
-        // MOD-139 M3 D5: rendered from T2's third commit on.
-        Placeholder::Premerge | Placeholder::Parts => Vec::new(),
+        Placeholder::Premerge => premerge_of(spec)
+            .and_then(render::premerge)
+            .into_iter()
+            .collect(),
+        // Every part in full; the trimmer re-renders through `render::parts` with its states.
+        Placeholder::Parts => parts_of(spec)
+            .and_then(|parts| render::parts(parts, &[]))
+            .into_iter()
+            .collect(),
         Placeholder::Output => {
             if has_output(spec) {
                 spec.output_kind
@@ -1186,6 +1233,30 @@ fn scrubbed_inputs(
         }
         if let Some(acceptance) = &mut part.acceptance {
             mask(scrubber, acceptance, &part_name)?;
+        }
+    }
+
+    // MOD-139 M3 D5: every byte the two integrate sections render, under the name of the one that
+    // renders it, and only for a phase spec — a judge or handoff never shows either (memory's
+    // rule). The part's step id is never rendered (blueprint P-9), so it is not masked.
+    if matches!(spec.role, TemplateRole::Phase) {
+        if let Some(report) = &mut spec.premerge {
+            mask_premerge(scrubber, report)?;
+        }
+        let parts_name = SectionName::Parts.render();
+        for part in &mut spec.parts {
+            mask(scrubber, &mut part.key, &parts_name)?;
+            mask(scrubber, &mut part.title, &parts_name)?;
+            for (repo, tip) in &mut part.tips {
+                mask(scrubber, repo, &parts_name)?;
+                mask(scrubber, tip, &parts_name)?;
+            }
+            if let Some(diff) = &mut part.diff {
+                mask_diff(scrubber, diff, &parts_name)?;
+            }
+            if let Some(body) = &mut part.body {
+                mask(scrubber, body, &parts_name)?;
+            }
         }
     }
 
@@ -1469,6 +1540,35 @@ fn mask_document(
     mask(scrubber, &mut document.kind, "documents")?;
     let name = SectionName::Documents(document.kind.clone()).render();
     mask(scrubber, &mut document.body, &name)
+}
+
+/// MOD-139 M3 D5: masks every string the `premerge` section renders — each repo's name and head,
+/// each part's key, tip, merge commit and conflicted paths — under the section's name.
+fn mask_premerge(
+    scrubber: &dyn Scrubber,
+    report: &mut PremergeReport,
+) -> Result<(), AssembleError> {
+    let name = SectionName::Premerge.render();
+    for repo in &mut report.repos {
+        mask(scrubber, &mut repo.name, &name)?;
+        mask(scrubber, &mut repo.head, &name)?;
+        for part in &mut repo.parts {
+            mask(scrubber, &mut part.key, &name)?;
+            if let Some(tip) = &mut part.tip {
+                mask(scrubber, tip, &name)?;
+            }
+            match &mut part.merge {
+                PartMerge::Merged { commit } => mask(scrubber, commit, &name)?,
+                PartMerge::Conflicted { paths } => {
+                    for path in paths {
+                        mask(scrubber, path, &name)?;
+                    }
+                }
+                PartMerge::Contained | PartMerge::NoCommits | PartMerge::NotAttempted => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Masks a diff's three strings: the `range` attribute, the stat and the unified body.

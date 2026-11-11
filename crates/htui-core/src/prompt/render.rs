@@ -811,6 +811,15 @@ fn premerge_lines(part: &PartPremerge, lines: &mut Vec<String>) {
     }
 }
 
+/// MOD-139 M3 D5: a part's body as [`parts`] renders it in full — LF-normalised, trailing LFs
+/// removed — or `None` when it has no document or an empty one. What the `parts` ladder cuts.
+pub(crate) fn part_body(part: &IntegratePart) -> Option<String> {
+    part.body
+        .as_deref()
+        .map(content_of)
+        .filter(|body| !body.is_empty())
+}
+
 /// MOD-139 M3 D5: `<section name="premerge">` (no attributes) over [`premerge_content`]; `None`
 /// when the report names no repo (blueprint P-10, I-7: no empty section).
 #[must_use]
@@ -870,7 +879,7 @@ pub fn parts(parts: &[IntegratePart], states: &[PartState]) -> Option<Rendered> 
             }
         }
         let body = match states.get(index).unwrap_or(&PartState::Full) {
-            PartState::Full => part.body.as_deref().map(content_of).unwrap_or_default(),
+            PartState::Full => part_body(part).unwrap_or_default(),
             PartState::Cut(cut) => cut.clone(),
             PartState::Bare => String::new(),
         };
