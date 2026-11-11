@@ -105,6 +105,7 @@ test('a cd into a member earlier in the line makes a bare cargo test select it',
     'cd /home/me/htui/crates/htui-store/ && cargo test',
     'cd crates/htui-agent && cargo test -p htui-store',
     'cd -P crates/htui-secrets && cargo test',
+    'cd crates/htui-bench && cargo test',
     'cd crates/htui-store\ncargo test',
   ]
   const got = await verdicts($, on, [...refused, ...allowed])

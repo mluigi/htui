@@ -46,20 +46,26 @@ pub fn wilson_interval(successes: usize, n: usize) -> (f64, f64) {
 }
 
 /// Exact two-sided McNemar: `min(1, 2 · P[X <= min(b, c)])`, X ~ Bin(b + c, 1/2); `b + c == 0` gives 1.
-/// Computed as t0 = 0.5^n, t(i+1) = t(i)·(n−i)/(i+1), summed in f64 (no overflow for n ≤ 1000).
+/// The terms are summed in log space, relative to the largest one, so a large `b + c` neither
+/// underflows to p = 0 (0.5^n is 0 in f64 past n ≈ 1074) nor overflows a binomial coefficient.
 pub fn mcnemar_exact(only_a: usize, only_b: usize) -> f64 {
     let n = only_a + only_b;
     if n == 0 {
         return 1.0;
     }
     let k = only_a.min(only_b);
-    let mut term = 0.5_f64.powi(i32::try_from(n).unwrap_or(i32::MAX));
-    let mut tail = 0.0;
+    // ln C(n, i) for i in 0..=k, built as ln C(n, i+1) = ln C(n, i) + ln(n−i) − ln(i+1).
+    let mut ln_terms = Vec::with_capacity(k + 1);
+    let mut ln_c = 0.0_f64;
     for i in 0..=k {
-        tail += term;
-        term = term * (n - i) as f64 / (i + 1) as f64;
+        ln_terms.push(ln_c);
+        ln_c += ((n - i) as f64).ln() - ((i + 1) as f64).ln();
     }
-    (2.0 * tail).min(1.0)
+    // The terms rise with i for i ≤ k ≤ n/2, so the last is the largest.
+    let top = ln_terms[k];
+    let sum: f64 = ln_terms.iter().map(|t| (t - top).exp()).sum();
+    let ln_tail = top + sum.ln() - n as f64 * std::f64::consts::LN_2;
+    (2.0 * ln_tail.exp()).min(1.0)
 }
 
 /// Mann-Whitney AUC of positives over negatives, a tie counting one half; `None` if either is empty.
@@ -172,6 +178,15 @@ mod tests {
         assert!(p > 0.0 && p < 1e-290, "{p}");
         let q = mcnemar_exact(520, 480);
         assert!(q.is_finite() && q > 0.0 && q < 1.0, "{q}");
+    }
+
+    /// wave-1 verify finding: 0.5^n underflows past n ≈ 1074, and a balanced count read as p = 0.
+    #[test]
+    fn mcnemar_does_not_underflow_on_large_counts() {
+        assert_eq!(mcnemar_exact(600, 600), 1.0);
+        // Normal approximation: z = 100 / √3900 ≈ 1.60, two-sided p ≈ 0.11.
+        let p = mcnemar_exact(2000, 1900);
+        assert!(p > 0.08 && p < 0.14, "{p}");
     }
 
     #[test]

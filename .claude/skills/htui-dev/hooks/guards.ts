@@ -15,6 +15,7 @@ import { quoteWords, type Words } from './shell'
 const FEATURES: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   htui: { testkit: ['htui-store/test-support'] },
   'htui-agent': { 'test-support': ['htui-core/test-support'] },
+  'htui-bench': {},
   'htui-core': { demo: [], 'test-support': ['htui-core/demo'], sqlx: [] },
   'htui-mcp': {},
   'htui-orch': { 'test-support': ['htui-core/test-support', 'htui-agent/test-support'] },
@@ -54,6 +55,8 @@ const SELECTING: Readonly<Record<string, readonly string[]>> = {
     'htui-store/test-support',
   ],
   'htui-store': ['htui-core/test-support', 'htui-store/test-support'],
+  // MOD-162: its dev-dependency on htui-store `test-support` (which forwards to `demo`).
+  'htui-bench': ['htui-core/demo', 'htui-store/demo', 'htui-store/test-support'],
 }
 
 /**
@@ -79,6 +82,7 @@ const TEST_FEATURE: Readonly<Record<string, string>> = Object.fromEntries(
 const MEMBERS = [
   'htui',
   'htui-agent',
+  'htui-bench',
   'htui-core',
   'htui-mcp',
   'htui-orch',
