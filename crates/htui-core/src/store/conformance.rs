@@ -49,6 +49,7 @@ use crate::model::{
 use crate::model::{ItemState, latest_graph_run};
 use crate::model::{NewOwnerDocument, Project, StepRole};
 use crate::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
+use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::scrub::MinimalScrubber;
@@ -78,6 +79,10 @@ use crate::store::traits::{
     fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
+};
+use crate::store::traits::{
+    part_of_another_planner, part_of_another_run, plan_admission_refusal, plan_not_proposed,
+    plan_not_this_planners, planner_not_running, step_not_a_part, step_slot_is_taken,
 };
 use crate::store::traits::{
     plan_revision_taken, plan_suffix_phase_name, planner_not_in_run, run_plan_refusal,
@@ -361,6 +366,16 @@ pub const CASES: &[&str] = &[
     "insert_run_plan_refusal_order",
     "project_delete_takes_the_run_plans",
     "phase_name_with_the_plan_suffix_is_refused",
+    // MOD-139 M2: admission, abandonment and part documents (plan D9, D12)
+    "admit_plan_admits_a_new_revision",
+    "admit_plan_admits_a_proposed_revision",
+    "admit_plan_refusal_order",
+    "admit_plan_refuses_a_foreign_part",
+    "admit_plan_refuses_a_taken_slot",
+    "admit_plan_refuses_a_done_planner",
+    "admit_plan_refuses_a_plan_not_proposed_or_not_its_own",
+    "abandon_plans_abandons_admitted_and_proposed",
+    "resolve_inputs_skips_part_documents",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1137,6 +1152,33 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "phase_name_with_the_plan_suffix_is_refused" => {
             Box::pin(phase_name_with_the_plan_suffix_is_refused(store)).await;
+        }
+        "admit_plan_admits_a_new_revision" => {
+            Box::pin(admit_plan_admits_a_new_revision(store)).await;
+        }
+        "admit_plan_admits_a_proposed_revision" => {
+            Box::pin(admit_plan_admits_a_proposed_revision(store)).await;
+        }
+        "admit_plan_refusal_order" => {
+            Box::pin(admit_plan_refusal_order(store)).await;
+        }
+        "admit_plan_refuses_a_foreign_part" => {
+            Box::pin(admit_plan_refuses_a_foreign_part(store)).await;
+        }
+        "admit_plan_refuses_a_taken_slot" => {
+            Box::pin(admit_plan_refuses_a_taken_slot(store)).await;
+        }
+        "admit_plan_refuses_a_done_planner" => {
+            Box::pin(admit_plan_refuses_a_done_planner(store)).await;
+        }
+        "admit_plan_refuses_a_plan_not_proposed_or_not_its_own" => {
+            Box::pin(admit_plan_refuses_a_plan_not_proposed_or_not_its_own(store)).await;
+        }
+        "abandon_plans_abandons_admitted_and_proposed" => {
+            Box::pin(abandon_plans_abandons_admitted_and_proposed(store)).await;
+        }
+        "resolve_inputs_skips_part_documents" => {
+            Box::pin(resolve_inputs_skips_part_documents(store)).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -28769,6 +28811,701 @@ async fn phase_name_with_the_plan_suffix_is_refused<S: WriteStore>(store: &S) {
         store.phases(graph).await.expect(CASE),
         stored,
         "{CASE}: the phases are as they were"
+    );
+}
+
+// ---- MOD-139 M2: admission, abandonment and part documents (plan D9, D12, blueprint §T1.4) ----
+
+/// MOD-139 M2 D9: an admission of `parts` under the `running` planner `planner` of `run`, with a
+/// one-repo `base_refs` and the seam clock as the planner's `finished_at`.
+fn admission(
+    run: RunId,
+    planner: StepId,
+    plan: PlanToAdmit,
+    parts: Vec<NewRunStep>,
+) -> PlanAdmission {
+    PlanAdmission {
+        run_id: run,
+        planner_step_id: planner,
+        plan,
+        base_refs: json!({"repo": "abc"}),
+        parts,
+        at: seam_clock(),
+    }
+}
+
+/// MOD-139 M2 D9: the part row `implement/<key>` of `run` at `position` under `planner`, its
+/// `phase_name` the same text as its `node_key`.
+fn part(run: RunId, planner: StepId, position: i32, key: &str) -> NewRunStep {
+    let key = format!("implement/{key}");
+    NewRunStep {
+        phase_name: key.clone(),
+        ..role_step(run, position, StepRole::Part, Some(planner), Some(&key))
+    }
+}
+
+/// The row [`WriteStore::admit_plan`] answers for a `New` plan: `admitted` with `base_refs`, every
+/// other column as given, the two stamps the store's (MOD-139 M2 D9).
+fn admitted_row(
+    plan: &NewRunPlan,
+    base_refs: &Value,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> RunPlan {
+    RunPlan {
+        status: PlanStatus::Admitted,
+        base_refs: Some(base_refs.clone()),
+        updated_at,
+        ..proposed_row(plan, created_at)
+    }
+}
+
+/// Moves `step` `pending -> running`, as the engine does before it admits under a planner.
+async fn start_planner<S: WriteStore>(case: &str, store: &S, step: StepId) {
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, seam_clock())
+            .await
+            .expect(case),
+        "{case}: the planner moves pending -> running"
+    );
+}
+
+/// The status of `step` among `run`'s rows.
+async fn step_status<S: WriteStore>(case: &str, store: &S, run: RunId, step: StepId) -> StepStatus {
+    store
+        .run_steps(run)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.id == step)
+        .unwrap_or_else(|| panic!("{case}: step {step} is listed"))
+        .status
+}
+
+/// MOD-139 M2 D9: a `New` revision is admitted in one write: the plan is stored `admitted` with
+/// its `base_refs` and both stamps equal, each part row is `pending` as given, and the planner is
+/// `done` at the admission's instant.
+async fn admit_plan_admits_a_new_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_admits_a_new_revision";
+    let a = Uuid::now_v7();
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let plan = new_run_plan(run, planner, 0);
+    let parts = vec![part(run, planner, 5, "api"), part(run, planner, 6, "ui")];
+    let request = admission(run, planner, PlanToAdmit::New(plan.clone()), parts.clone());
+
+    let row = store
+        .admit_plan(StepFence::Lease(a), request.clone())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        row,
+        admitted_row(&plan, &request.base_refs, row.created_at, row.updated_at),
+        "{CASE}: the plan is stored as given, admitted, with its base_refs"
+    );
+    assert_eq!(
+        row.created_at, row.updated_at,
+        "{CASE}: a plan inserted admitted is stamped once"
+    );
+    assert_eq!(
+        store.run_plans(run).await.expect(CASE),
+        vec![row],
+        "{CASE}: run_plans answers the admitted row"
+    );
+
+    let rows = store.run_steps(run).await.expect(CASE);
+    assert_eq!(rows.len(), 3, "{CASE}: the planner and its two parts");
+    let planner_row = rows
+        .iter()
+        .find(|row| row.id == planner)
+        .unwrap_or_else(|| panic!("{CASE}: the planner is listed"));
+    assert_eq!(
+        (planner_row.status, planner_row.finished_at),
+        (StepStatus::Done, Some(request.at)),
+        "{CASE}: the planner is done at the admission's instant"
+    );
+    for new in &parts {
+        let row = rows
+            .iter()
+            .find(|row| row.id == new.id)
+            .unwrap_or_else(|| panic!("{CASE}: part {} is listed", new.phase_name));
+        assert_eq!(
+            (
+                row.status,
+                row.role,
+                row.parent_step_id,
+                row.node_key.as_deref(),
+                row.phase_name.as_str(),
+                (row.position, row.attempt, row.fanout_index),
+                (row.agent_id, row.model.as_deref()),
+                (row.started_at, row.finished_at),
+            ),
+            (
+                StepStatus::Pending,
+                StepRole::Part,
+                Some(planner),
+                new.node_key.as_deref(),
+                new.phase_name.as_str(),
+                (new.position, 1, 0),
+                (new.agent_id, new.model.as_deref()),
+                (None, None),
+            ),
+            "{CASE}: part {} is written pending, as given",
+            new.phase_name
+        );
+    }
+}
+
+/// MOD-139 M2 D9: a `proposed` revision (written by `insert_run_plan`) is admitted in place: the
+/// same row, now `admitted` with `base_refs`, its `created_at` kept and `updated_at` not before
+/// it; the planner is `done` and the part `pending`.
+async fn admit_plan_admits_a_proposed_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_admits_a_proposed_revision";
+    let a = Uuid::now_v7();
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let proposed = store
+        .insert_run_plan(StepFence::Lease(a), new_run_plan(run, planner, 1))
+        .await
+        .expect(CASE);
+    let only = part(run, planner, 6, "api");
+    let request = admission(
+        run,
+        planner,
+        PlanToAdmit::Proposed(proposed.id),
+        vec![only.clone()],
+    );
+
+    let row = store
+        .admit_plan(StepFence::Lease(a), request.clone())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        row,
+        RunPlan {
+            status: PlanStatus::Admitted,
+            base_refs: Some(request.base_refs.clone()),
+            updated_at: row.updated_at,
+            ..proposed.clone()
+        },
+        "{CASE}: the proposed row is admitted in place, every other column kept"
+    );
+    assert!(
+        row.updated_at >= row.created_at,
+        "{CASE}: updated_at is not before created_at"
+    );
+    assert_eq!(
+        store.run_plans(run).await.expect(CASE),
+        vec![row],
+        "{CASE}: run_plans answers the one admitted row"
+    );
+    assert_eq!(
+        step_status(CASE, store, run, planner).await,
+        StepStatus::Done,
+        "{CASE}: the planner is done"
+    );
+    assert_eq!(
+        step_status(CASE, store, run, only.id).await,
+        StepStatus::Pending,
+        "{CASE}: the part is pending"
+    );
+}
+
+/// What a refused admission must leave behind: `run`'s rows as `before`, the planner still
+/// `running`, and no plan on `run`.
+async fn admission_wrote_nothing<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    before: &[RunStep],
+    what: &str,
+) {
+    assert_eq!(
+        store.run_steps(run).await.expect(case),
+        before,
+        "{case}: {what} wrote no step and moved none"
+    );
+    assert_eq!(
+        store.run_plans(run).await.expect(case),
+        Vec::new(),
+        "{case}: {what} wrote no plan"
+    );
+}
+
+/// MOD-139 M2 D9 (blueprint §1.4): `admit_plan` decides the shape before any read, then the run,
+/// then the fence (before the planner), then the planner, then the planner's status. Nothing is
+/// written by any refusal.
+async fn admit_plan_refusal_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_refusal_order";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let other_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let foreign = store
+        .create_step(new_run_step(other_run, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let pending = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let before = store.run_steps(run).await.expect(CASE);
+    let before_other = store.run_steps(other_run).await.expect(CASE);
+    let request = |run: RunId, planner: StepId| {
+        admission(
+            run,
+            planner,
+            PlanToAdmit::New(new_run_plan(run, planner, 0)),
+            vec![part(run, planner, 5, "api")],
+        )
+    };
+
+    // (a) The shape first: a bad `base_refs` on an unknown run is the shape's refusal.
+    let shapeless = PlanAdmission {
+        base_refs: json!([]),
+        ..request(RunId::new(), planner)
+    };
+    let sentence = plan_admission_refusal(&shapeless)
+        .unwrap_or_else(|| panic!("{CASE}: an array of base_refs is refused by its shape"));
+    constraint_exactly(
+        CASE,
+        store.admit_plan(StepFence::Lease(a), shapeless).await,
+        &sentence,
+        "an array of base_refs on an unknown run",
+    );
+
+    // (b) Then the run.
+    let unknown = store
+        .admit_plan(StepFence::Lease(a), request(RunId::new(), planner))
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+
+    // (c) Then the fence, before the planner: a foreign planner under a stale fence is Fenced.
+    for fence in [StepFence::Lease(b), StepFence::Unleased] {
+        for step in [planner, foreign] {
+            let outcome = store.admit_plan(fence, request(run, step)).await;
+            assert!(
+                matches!(outcome, Err(StoreError::Fenced { step: s }) if s == step),
+                "{CASE}: {fence:?} with planner {step} is fenced on the planner step, \
+                 got {outcome:?}"
+            );
+        }
+    }
+
+    // (d) Then the planner: another run's step, or no step at all.
+    for step in [foreign, StepId::new()] {
+        constraint_exactly(
+            CASE,
+            store
+                .admit_plan(StepFence::Lease(a), request(run, step))
+                .await,
+            &planner_not_in_run(step, run),
+            "a planner that is no step of the run",
+        );
+    }
+
+    // (e) Then the planner's status: a `pending` planner was never started.
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(StepFence::Lease(a), request(run, pending))
+            .await,
+        &planner_not_running(pending, StepStatus::Pending),
+        "a pending planner",
+    );
+
+    admission_wrote_nothing(CASE, store, run, &before, "no refusal").await;
+    admission_wrote_nothing(CASE, store, other_run, &before_other, "no refusal").await;
+    assert_eq!(
+        step_status(CASE, store, run, planner).await,
+        StepStatus::Running,
+        "{CASE}: the planner is still running"
+    );
+}
+
+/// MOD-139 M2 D9: every admitted row is a part of this run under this planner. A part of another
+/// run, a part under another step and a `step` row are each refused with their own sentence before
+/// any read, and nothing is written.
+async fn admit_plan_refuses_a_foreign_part<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_refuses_a_foreign_part";
+    let a = Uuid::now_v7();
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let other_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let sibling = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let before = store.run_steps(run).await.expect(CASE);
+
+    let of_other_run = part(other_run, planner, 5, "api");
+    let under_sibling = part(run, sibling, 5, "api");
+    let plain = role_step(run, 5, StepRole::Step, Some(planner), None);
+    for (row, sentence, what) in [
+        (
+            of_other_run.clone(),
+            part_of_another_run(of_other_run.id, run),
+            "a part of another run",
+        ),
+        (
+            under_sibling.clone(),
+            part_of_another_planner(under_sibling.id, planner),
+            "a part under another step of the run",
+        ),
+        (
+            plain.clone(),
+            step_not_a_part(plain.id, StepRole::Step),
+            "a step row",
+        ),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .admit_plan(
+                    StepFence::Lease(a),
+                    admission(
+                        run,
+                        planner,
+                        PlanToAdmit::New(new_run_plan(run, planner, 0)),
+                        vec![part(run, planner, 6, "ui"), row],
+                    ),
+                )
+                .await,
+            &sentence,
+            what,
+        );
+    }
+    admission_wrote_nothing(CASE, store, run, &before, "a foreign part").await;
+    assert_eq!(
+        store.run_steps(other_run).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: nothing was written in the other run"
+    );
+}
+
+/// MOD-139 M2 D9: a part whose `(run, position, attempt, fanout_index)` slot is taken refuses the
+/// whole admission, the first taken slot named; the part before it is not written either.
+async fn admit_plan_refuses_a_taken_slot<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_refuses_a_taken_slot";
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    let planner = store
+        .create_step(role_step(run, 1, StepRole::Planner, None, None))
+        .await
+        .expect(CASE)
+        .id;
+    start_planner(CASE, store, planner).await;
+    let before = store.run_steps(run).await.expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(
+                StepFence::Lease(a),
+                admission(
+                    run,
+                    planner,
+                    PlanToAdmit::New(new_run_plan(run, planner, 0)),
+                    vec![part(run, planner, 5, "api"), part(run, planner, 0, "ui")],
+                ),
+            )
+            .await,
+        &step_slot_is_taken(run, 0, 1, 0),
+        "a part on the fixture step's slot",
+    );
+    admission_wrote_nothing(CASE, store, run, &before, "a taken slot").await;
+}
+
+/// MOD-139 M2 D9 (blueprint P-4): a planner admits once. After an admission it is `done`, so a
+/// second admission on it is refused as not running, and nothing more is written.
+async fn admit_plan_refuses_a_done_planner<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_refuses_a_done_planner";
+    let a = Uuid::now_v7();
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let first = store
+        .admit_plan(
+            StepFence::Lease(a),
+            admission(
+                run,
+                planner,
+                PlanToAdmit::New(new_run_plan(run, planner, 0)),
+                vec![part(run, planner, 5, "api"), part(run, planner, 6, "ui")],
+            ),
+        )
+        .await
+        .expect(CASE);
+    let before = store.run_steps(run).await.expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(
+                StepFence::Lease(a),
+                admission(
+                    run,
+                    planner,
+                    PlanToAdmit::New(new_run_plan(run, planner, 1)),
+                    vec![part(run, planner, 7, "api")],
+                ),
+            )
+            .await,
+        &planner_not_running(planner, StepStatus::Done),
+        "a second admission on a done planner",
+    );
+    assert_eq!(
+        store.run_plans(run).await.expect(CASE),
+        vec![first],
+        "{CASE}: still the one plan"
+    );
+    assert_eq!(
+        store.run_steps(run).await.expect(CASE),
+        before,
+        "{CASE}: no row at 7, nothing moved"
+    );
+}
+
+/// MOD-139 M2 D9: a `Proposed` admission names a plan of this planner that may still be admitted.
+/// Another planner's plan and an unknown id are refused alike; an abandoned plan is refused by its
+/// status. Nothing is written.
+async fn admit_plan_refuses_a_plan_not_proposed_or_not_its_own<S: WriteStore>(store: &S) {
+    const CASE: &str = "admit_plan_refuses_a_plan_not_proposed_or_not_its_own";
+    let a = Uuid::now_v7();
+    let (run, p) = leased_step(CASE, store, a, seam_clock()).await;
+    let q = store
+        .create_step(role_step(run, 1, StepRole::Planner, None, None))
+        .await
+        .expect(CASE)
+        .id;
+    start_planner(CASE, store, p).await;
+    start_planner(CASE, store, q).await;
+    let proposed = store
+        .insert_run_plan(StepFence::Lease(a), new_run_plan(run, p, 1))
+        .await
+        .expect(CASE);
+    let before = store.run_steps(run).await.expect(CASE);
+    let request = |planner: StepId, plan: RunPlanId| {
+        admission(
+            run,
+            planner,
+            PlanToAdmit::Proposed(plan),
+            vec![part(run, planner, 6, "api")],
+        )
+    };
+
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(StepFence::Lease(a), request(q, proposed.id))
+            .await,
+        &plan_not_this_planners(proposed.id, q),
+        "p's plan admitted under q",
+    );
+    let unknown = RunPlanId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(StepFence::Lease(a), request(p, unknown))
+            .await,
+        &plan_not_this_planners(unknown, p),
+        "an unknown plan",
+    );
+
+    assert_eq!(
+        store
+            .abandon_plans(StepFence::Lease(a), p)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: p's proposed plan is abandoned"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .admit_plan(StepFence::Lease(a), request(p, proposed.id))
+            .await,
+        &plan_not_proposed(proposed.id, PlanStatus::Abandoned),
+        "an abandoned plan",
+    );
+
+    assert_eq!(
+        store.run_steps(run).await.expect(CASE),
+        before,
+        "{CASE}: no refusal wrote a step or moved a planner"
+    );
+    let plans = store.run_plans(run).await.expect(CASE);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|row| (row.id, row.status, row.base_refs.clone()))
+            .collect::<Vec<_>>(),
+        vec![(proposed.id, PlanStatus::Abandoned, None)],
+        "{CASE}: the one plan is abandoned, never admitted"
+    );
+}
+
+/// MOD-139 M2 D9, D11: `abandon_plans` moves the planner's admitted and proposed plans to
+/// `abandoned` and counts them; a second call counts none. A stale fence is fenced on the
+/// planner, and an unknown planner is not found.
+async fn abandon_plans_abandons_admitted_and_proposed<S: WriteStore>(store: &S) {
+    const CASE: &str = "abandon_plans_abandons_admitted_and_proposed";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, planner) = leased_step(CASE, store, a, seam_clock()).await;
+    start_planner(CASE, store, planner).await;
+    let admitted = store
+        .admit_plan(
+            StepFence::Lease(a),
+            admission(
+                run,
+                planner,
+                PlanToAdmit::New(new_run_plan(run, planner, 0)),
+                vec![part(run, planner, 5, "api"), part(run, planner, 6, "ui")],
+            ),
+        )
+        .await
+        .expect(CASE);
+    let proposed = store
+        .insert_run_plan(StepFence::Lease(a), new_run_plan(run, planner, 1))
+        .await
+        .expect(CASE);
+
+    assert_eq!(
+        store
+            .abandon_plans(StepFence::Lease(a), planner)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: both plans are abandoned"
+    );
+    let plans = store.run_plans(run).await.expect(CASE);
+    assert_eq!(
+        plans.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![admitted.id, proposed.id],
+        "{CASE}: the two revisions, in revision order"
+    );
+    for (row, was) in plans.iter().zip([&admitted, &proposed]) {
+        assert_eq!(
+            row,
+            &RunPlan {
+                status: PlanStatus::Abandoned,
+                updated_at: row.updated_at,
+                ..was.clone()
+            },
+            "{CASE}: revision {} reads abandoned, every other column kept",
+            row.revision
+        );
+        assert!(
+            row.updated_at >= row.created_at,
+            "{CASE}: revision {}'s updated_at is not before its created_at",
+            row.revision
+        );
+    }
+    assert_eq!(
+        store
+            .abandon_plans(StepFence::Lease(a), planner)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: a second call abandons nothing"
+    );
+
+    let fenced = store.abandon_plans(StepFence::Lease(b), planner).await;
+    assert!(
+        matches!(fenced, Err(StoreError::Fenced { step }) if step == planner),
+        "{CASE}: a stale fence is fenced on the planner, got {fenced:?}"
+    );
+    let unknown = store
+        .abandon_plans(StepFence::Lease(a), StepId::new())
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown planner is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        store.run_plans(run).await.expect(CASE),
+        plans,
+        "{CASE}: the refused calls wrote nothing"
+    );
+}
+
+/// MOD-139 M2 D12: a divided part's document is its integrate node's (through `{{parts}}`), never a
+/// generic input. `resolve_inputs` skips it, but keeps a plain step's document and a hand-written
+/// one (whose producing step is none).
+async fn resolve_inputs_skips_part_documents<S: WriteStore>(store: &S) {
+    const CASE: &str = "resolve_inputs_skips_part_documents";
+    let (run, _) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
+    let plain = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let planner = store
+        .create_step(role_step(run, 2, StepRole::Planner, None, None))
+        .await
+        .expect(CASE)
+        .id;
+    let part_step = store
+        .create_step(part(run, planner, 5, "api"))
+        .await
+        .expect(CASE)
+        .id;
+    let mut written = Vec::new();
+    for (kind, step) in [
+        ("implement", None),
+        ("implement", Some(plain)),
+        ("implement", Some(part_step)),
+        ("notes", None),
+        ("notes", Some(part_step)),
+    ] {
+        written.push(
+            store
+                .write_document(new_document(ids::HTUI_ANA_2, kind, step))
+                .await
+                .expect(CASE)
+                .id,
+        );
+    }
+
+    let resolved = store
+        .resolve_inputs(
+            ids::HTUI_ANA_2,
+            run,
+            &["implement".to_owned(), "notes".to_owned()],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|row| (
+                row.kind.as_str(),
+                row.document.as_ref().map(|document| document.id)
+            ))
+            .collect::<Vec<_>>(),
+        vec![("implement", Some(written[1])), ("notes", Some(written[3]))],
+        "{CASE}: the part's newer documents are skipped; the plain step's and the hand-written \
+         one are read"
     );
 }
 
