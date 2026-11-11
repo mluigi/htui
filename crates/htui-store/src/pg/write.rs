@@ -50,7 +50,7 @@ use htui_core::model::{
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
-use htui_core::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
+use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
 use htui_core::prompt::DEFAULT_TEMPLATES;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -83,6 +83,10 @@ use htui_core::store::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     phase_row_refusal, workspace_graph_is_held,
+};
+use htui_core::store::{
+    plan_admission_refusal, plan_not_proposed, plan_not_this_planners, planner_already_admitted,
+    planner_not_running, step_slot_is_taken,
 };
 use htui_core::store::{
     plan_revision_taken, planner_not_in_run, project_slug_refusal, run_plan_refusal,
@@ -7950,6 +7954,260 @@ impl WriteStore for PgStore {
         .map_err(|err| run_plan_insert_refused(err, &plan))?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
+    }
+
+    /// MOD-139 M2 D9 (blueprint §1.5): one transaction, every refusal before the first write. The
+    /// planner is read first and alone under the update lock, then the run under a share lock
+    /// (byte-identical to `insert_run_plan`'s run read), so the step → run order holds and the
+    /// update lock is taken up front: `pg_criteria.rs::admit_plan_takes_the_step_first` and
+    /// `pg_criteria.rs::admit_plan_locks_the_step_for_update_up_front` pin both. The part rows'
+    /// foreign key then takes a key-share lock on the planner, which conflicts with nothing this
+    /// transaction holds.
+    async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan> {
+        if let Some(refusal) = plan_admission_refusal(&admission) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let (run, planner) = (admission.run_id, admission.planner_step_id);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let planner_row = sqlx::query!(
+            r#"SELECT run_id AS "run_id: RunId", status AS "status: StepStatus"
+                 FROM run_step WHERE id = $1 FOR NO KEY UPDATE"#,
+            planner.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let owner = sqlx::query_scalar!(
+            r#"SELECT lease_owner AS "lease_owner?" FROM run WHERE id = $1 FOR SHARE"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+        if owner != fence.owner() {
+            return Err(StoreError::Fenced { step: planner });
+        }
+        let status = match planner_row {
+            Some(row) if row.run_id == run => row.status,
+            _ => {
+                return Err(StoreError::Constraint(planner_not_in_run(planner, run)));
+            }
+        };
+        if status != StepStatus::Running {
+            return Err(StoreError::Constraint(planner_not_running(planner, status)));
+        }
+        if let PlanToAdmit::Proposed(id) = &admission.plan {
+            let proposed = sqlx::query!(
+                r#"SELECT run_id AS "run_id: RunId", planner_step_id AS "planner_step_id: StepId",
+                          status AS "status: PlanStatus"
+                     FROM run_plan WHERE id = $1 FOR UPDATE"#,
+                id.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            match proposed {
+                Some(row) if row.run_id == run && row.planner_step_id == planner => {
+                    if !row.status.can_move_to(PlanStatus::Admitted) {
+                        return Err(StoreError::Constraint(plan_not_proposed(*id, row.status)));
+                    }
+                }
+                _ => {
+                    return Err(StoreError::Constraint(plan_not_this_planners(*id, planner)));
+                }
+            }
+        }
+        let admitted = sqlx::query_scalar!(
+            r#"SELECT MIN(revision) AS "revision" FROM run_plan
+                WHERE planner_step_id = $1 AND status = 'admitted'"#,
+            planner.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(revision) = admitted {
+            return Err(StoreError::Constraint(planner_already_admitted(
+                planner, revision,
+            )));
+        }
+        for (i, part) in admission.parts.iter().enumerate() {
+            // An earlier part of this admission holds its slot as surely as a stored row does
+            // (MemStore's rule); the unique index would refuse it at the insert, worded raw.
+            let earlier = admission.parts[..i].iter().any(|row| {
+                (row.run_id, row.position, row.attempt, row.fanout_index)
+                    == (part.run_id, part.position, part.attempt, part.fanout_index)
+            });
+            let taken = earlier
+                || sqlx::query_scalar!(
+                    r#"SELECT EXISTS (SELECT 1 FROM run_step WHERE run_id = $1 AND position = $2
+                                         AND attempt = $3 AND fanout_index = $4) AS "taken!""#,
+                    part.run_id.as_uuid(),
+                    part.position,
+                    part.attempt,
+                    part.fanout_index,
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            if taken {
+                return Err(StoreError::Constraint(step_slot_is_taken(
+                    part.run_id,
+                    part.position,
+                    part.attempt,
+                    part.fanout_index,
+                )));
+            }
+        }
+
+        let row = match admission.plan {
+            PlanToAdmit::New(plan) => sqlx::query_as!(
+                RunPlan,
+                r#"
+                INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, status,
+                                      base_position, base_refs, body, digest)
+                VALUES ($1, $2, $3, $4, $5, 'admitted', $6, $7, $8, $9)
+                RETURNING id              AS "id: RunPlanId",
+                          run_id          AS "run_id: RunId",
+                          revision,
+                          planner_step_id AS "planner_step_id: StepId",
+                          scope           AS "scope: PlanScope",
+                          status          AS "status: PlanStatus",
+                          base_position,
+                          base_refs,
+                          body,
+                          digest,
+                          created_at,
+                          updated_at
+                "#,
+                plan.id.as_uuid(),
+                plan.run_id.as_uuid(),
+                plan.revision,
+                plan.planner_step_id.as_uuid(),
+                plan.scope.as_str(),
+                plan.base_position,
+                &admission.base_refs,
+                &plan.body,
+                &plan.digest,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| run_plan_insert_refused(err, &plan))?,
+            PlanToAdmit::Proposed(id) => sqlx::query_as!(
+                RunPlan,
+                r#"
+                UPDATE run_plan SET status = 'admitted', base_refs = $2 WHERE id = $1
+                RETURNING id              AS "id: RunPlanId",
+                          run_id          AS "run_id: RunId",
+                          revision,
+                          planner_step_id AS "planner_step_id: StepId",
+                          scope           AS "scope: PlanScope",
+                          status          AS "status: PlanStatus",
+                          base_position,
+                          base_refs,
+                          body,
+                          digest,
+                          created_at,
+                          updated_at
+                "#,
+                id.as_uuid(),
+                &admission.base_refs,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        for new in admission.parts {
+            // `create_step`'s statement verbatim, so its offline entry serves both.
+            sqlx::query_as!(
+                RunStep,
+                r#"
+            INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,
+                                  agent_id, model, status, role, parent_step_id, node_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
+            RETURNING id                  AS "id: StepId",
+                      run_id              AS "run_id: RunId",
+                      position,
+                      attempt,
+                      fanout_index,
+                      phase_name,
+                      agent_id            AS "agent_id: AgentId",
+                      model,
+                      status              AS "status: StepStatus",
+                      gate_outcome        AS "gate_outcome: GateOutcome",
+                      gate_note,
+                      selected,
+                      exit_code,
+                      prompt_digest,
+                      trim_record,
+                      usage,
+                      isolation_path,
+                      started_at,
+                      finished_at,
+                      verify_outcome      AS "verify_outcome: VerifyOutcome",
+                      verify_exit_code,
+                      promoted_at,
+                      branch,
+                      role                AS "role: StepRole",
+                      parent_step_id      AS "parent_step_id: StepId",
+                      node_key,
+                      updated_at
+            "#,
+                new.id.as_uuid(),
+                new.run_id.as_uuid(),
+                new.position,
+                new.attempt,
+                new.fanout_index,
+                new.phase_name,
+                new.agent_id.map(AgentId::as_uuid),
+                new.model,
+                new.role.as_str(),
+                new.parent_step_id.map(StepId::as_uuid),
+                new.node_key,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        let moved = sqlx::query!(
+            "UPDATE run_step SET status = 'done', finished_at = COALESCE(finished_at, $2) \
+              WHERE id = $1 AND status = 'running'",
+            planner.as_uuid(),
+            admission.at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if moved != 1 {
+            return Err(StoreError::Backend(format!(
+                "planner step {planner} moved under its admission lock"
+            )));
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
+    }
+
+    /// MOD-139 M2 D9, D11: the planner under `step_fence`'s update lock (not found, then fenced),
+    /// then one `UPDATE` of its proposed and admitted plans; `trg_run_plan_updated_at` moves each
+    /// `updated_at`.
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_fence(&mut tx, planner_step, fence, StepLock::Update).await?;
+        let moved = sqlx::query!(
+            "UPDATE run_plan SET status = 'abandoned' \
+              WHERE planner_step_id = $1 AND status IN ('proposed', 'admitted')",
+            planner_step.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(u32::try_from(moved).unwrap_or(u32::MAX))
     }
 
     /// One `command_run` row, every column the caller's (plan D31).

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_plan SET status = 'abandoned' WHERE planner_step_id = $1 AND status IN ('proposed', 'admitted')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7d9c0ac310618d11b5a3952303c8ff4a01dba25a76e4d396639c5b4dacb796f9"
+}

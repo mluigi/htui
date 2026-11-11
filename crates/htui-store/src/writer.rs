@@ -1279,6 +1279,24 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> Result<htui_core::model::RunPlan> {
+        match self {
+            Self::Memory(store) => store.admit_plan(fence, admission).await,
+            Self::Online(pg) => pg.admit_plan(fence, admission).await,
+        }
+    }
+
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        match self {
+            Self::Memory(store) => store.abandon_plans(fence, planner_step).await,
+            Self::Online(pg) => pg.abandon_plans(fence, planner_step).await,
+        }
+    }
+
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         match self {
             Self::Memory(store) => store.record_command_run(new).await,

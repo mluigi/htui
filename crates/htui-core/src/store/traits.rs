@@ -80,6 +80,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
+use crate::model::{PlanAdmission, PlanStatus, PlanToAdmit, RunPlanId};
 use crate::prompt::settings::{Rungs, SettingKey, validate};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
@@ -1886,6 +1887,46 @@ pub trait WriteStore: ReadStore {
     /// ordered between themselves.
     async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan>;
 
+    /// MOD-139 M2 D9: admits one plan revision of `admission.run_id` in one transaction, under
+    /// `fence` (fenced on the planner step): the plan moves to (or is inserted at)
+    /// [`PlanStatus::Admitted`](crate::model::PlanStatus::Admitted) with `admission.base_refs`,
+    /// every part row is inserted `pending`, and the planner moves `running -> done` with
+    /// `finished_at = COALESCE(finished_at, admission.at)`. Answers the admitted row: a
+    /// [`PlanToAdmit::New`] answers `created_at == updated_at`; a [`PlanToAdmit::Proposed`] keeps
+    /// its `created_at` and moves `updated_at`.
+    ///
+    /// # Errors
+    /// Refusals before any write, in this order, nothing written:
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`plan_admission_refusal`]) for the shape, judged before any read;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) `{ step: planner_step_id }` when
+    /// the run does not carry `fence`'s lease; `Constraint` ([`planner_not_in_run`]) when the
+    /// planner is unknown or a step of another run; `Constraint` ([`planner_not_running`]) when the
+    /// planner is not `running`; for a `Proposed` plan, `Constraint` ([`plan_not_this_planners`])
+    /// when the plan is unknown, of another run or of another planner, then `Constraint`
+    /// ([`plan_not_proposed`]) when it may not move to `admitted`; `Constraint`
+    /// ([`planner_already_admitted`]) when a plan of this planner is already admitted;
+    /// `Constraint` ([`step_slot_is_taken`]) for the first part whose slot is taken; for a `New`
+    /// plan, `Constraint` for a duplicate id (`already_exists("run_plan", id)`) or a taken
+    /// `(run_id, revision)` ([`plan_revision_taken`]), not ordered between themselves. Every text
+    /// is the same on every backend.
+    ///
+    /// [`PlanToAdmit::New`]: crate::model::PlanToAdmit::New
+    /// [`PlanToAdmit::Proposed`]: crate::model::PlanToAdmit::Proposed
+    async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan>;
+
+    /// MOD-139 M2 D9, D11: moves every `proposed` and `admitted` plan of `planner_step` to
+    /// [`PlanStatus::Abandoned`](crate::model::PlanStatus::Abandoned) (`updated_at` moves), under
+    /// `fence`, and answers how many moved; a second call answers `Ok(0)`.
+    ///
+    /// # Errors
+    /// In this order: [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }` for an unknown planner;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) `{ step: planner_step }` when the
+    /// step's run does not carry `fence`'s lease, nothing written.
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32>;
+
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
     ///
@@ -2888,6 +2929,101 @@ pub fn plan_revision_taken(run: RunId, revision: i32) -> String {
     format!("run {run} already has plan revision {revision}")
 }
 
+/// MOD-139 M2 D9 (blueprint §1.3): [`WriteStore::admit_plan`]'s shape refusal, judged before any
+/// read, the first that applies: a `New` plan's [`run_plan_refusal`]; a `New` plan naming another
+/// run or planner ([`admission_plan_mismatch`]); no part; `base_refs` not an object of strings; a
+/// NUL in `base_refs`; then per part in order its [`run_step_refusal`], a role other than `part`
+/// ([`step_not_a_part`]), another run ([`part_of_another_run`]) and another parent
+/// ([`part_of_another_planner`]). `None` when the admission may be decided.
+#[must_use]
+pub fn plan_admission_refusal(admission: &PlanAdmission) -> Option<String> {
+    if let PlanToAdmit::New(plan) = &admission.plan {
+        if let Some(refusal) = run_plan_refusal(plan) {
+            return Some(refusal);
+        }
+        if plan.run_id != admission.run_id || plan.planner_step_id != admission.planner_step_id {
+            return Some(admission_plan_mismatch(plan.id));
+        }
+    }
+    if admission.parts.is_empty() {
+        return Some("an admission inserts at least one part step".to_owned());
+    }
+    if !admission
+        .base_refs
+        .as_object()
+        .is_some_and(|refs| refs.values().all(Value::is_string))
+    {
+        return Some(
+            "an admitted plan's base_refs is an object of repo ids to commit strings".to_owned(),
+        );
+    }
+    if json_has_nul(&admission.base_refs) {
+        return Some(has_nul("run_plan.base_refs"));
+    }
+    admission.parts.iter().find_map(|part| {
+        if let Some(refusal) = run_step_refusal(part) {
+            return Some(refusal);
+        }
+        if part.role != StepRole::Part {
+            return Some(step_not_a_part(part.id, part.role));
+        }
+        if part.run_id != admission.run_id {
+            return Some(part_of_another_run(part.id, admission.run_id));
+        }
+        (part.parent_step_id != Some(admission.planner_step_id))
+            .then(|| part_of_another_planner(part.id, admission.planner_step_id))
+    })
+}
+
+/// MOD-139 M2 D9 (blueprint P-1): a `New` plan whose run or planner is not its admission's.
+#[must_use]
+pub fn admission_plan_mismatch(plan: RunPlanId) -> String {
+    format!("plan {plan} names another run or planner step than its admission")
+}
+
+/// MOD-139 M2 D9: an admission row whose role is not `part`.
+#[must_use]
+pub fn step_not_a_part(step: StepId, role: StepRole) -> String {
+    format!("step {step} is a {role} step; an admission inserts part steps only")
+}
+
+/// MOD-139 M2 D9: an admission part row of another run.
+#[must_use]
+pub fn part_of_another_run(step: StepId, run: RunId) -> String {
+    format!("part step {step} is not a step of run {run}")
+}
+
+/// MOD-139 M2 D9: an admission part row whose parent is not the planner.
+#[must_use]
+pub fn part_of_another_planner(step: StepId, planner: StepId) -> String {
+    format!("part step {step} is not under planner step {planner}")
+}
+
+/// MOD-139 M2 D9: the admission's planner step is not `running`.
+#[must_use]
+pub fn planner_not_running(step: StepId, status: StepStatus) -> String {
+    format!("planner step {step} is {status}; an admission needs it running")
+}
+
+/// MOD-139 M2 D9: a `Proposed` plan that is unknown, of another run or of another planner.
+#[must_use]
+pub fn plan_not_this_planners(plan: RunPlanId, planner: StepId) -> String {
+    format!("plan {plan} is not a plan of planner step {planner}")
+}
+
+/// MOD-139 M2 D9: a `Proposed` plan whose status may not move to `admitted`.
+#[must_use]
+pub fn plan_not_proposed(plan: RunPlanId, status: PlanStatus) -> String {
+    format!("plan {plan} is {status}; only a proposed plan is admitted")
+}
+
+/// MOD-139 M2 D9 (blueprint P-4): the planner already holds an admitted plan (the lowest such
+/// revision named). Unreachable through the API: admission moves the planner to `done`.
+#[must_use]
+pub fn planner_already_admitted(planner: StepId, revision: i32) -> String {
+    format!("planner step {planner} already admitted plan revision {revision}")
+}
+
 /// MOD-9 D4: a template name [`PromptTemplate::name_is_valid`] refuses, in the sentence both
 /// stores give it.
 #[must_use]
@@ -3849,7 +3985,8 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::add_step_note`], [`WriteStore::propose_link`] and [`WriteStore::withdraw_link`]
 /// (MOD-11 plan D13), [`WriteStore::record_branch`] (MOD-138 M2 D5), and
 /// [`WriteStore::insert_run_plan`] (MOD-139 D4, fenced on the plan's run and reported as
-/// `Fenced { step: planner_step_id }`) take one and write only
+/// `Fenced { step: planner_step_id }`), [`WriteStore::admit_plan`] and
+/// [`WriteStore::abandon_plans`] (MOD-139 M2 D9, fenced on the planner step) take one and write only
 /// while the step's run carries
 /// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
 /// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
@@ -4475,6 +4612,221 @@ mod tests {
         assert_eq!(
             refused(row(StepRole::Part, 5, parent, Some("a\u{0}b"))),
             Some(super::has_nul("run_step.node_key"))
+        );
+    }
+
+    // ---- MOD-139 M2: admission (plan D9) ----
+
+    /// An admission of one `New` revision 0 with one clean part at 5, for the shape tests.
+    fn clean_admission() -> crate::model::PlanAdmission {
+        use crate::model::{
+            NewRunPlan, NewRunStep, PlanAdmission, PlanScope, PlanToAdmit, RunId, RunPlanId,
+            StepId, StepRole,
+        };
+        use serde_json::json;
+        let run_id = RunId::new();
+        let planner = StepId::new();
+        PlanAdmission {
+            run_id,
+            planner_step_id: planner,
+            plan: PlanToAdmit::New(NewRunPlan {
+                id: RunPlanId::new(),
+                run_id,
+                revision: 0,
+                planner_step_id: planner,
+                scope: PlanScope::Parts,
+                base_position: 5,
+                body: json!({"scope": "parts", "parts": []}),
+                digest: "sha256:abc".to_owned(),
+            }),
+            base_refs: json!({"repo": "abc"}),
+            parts: vec![NewRunStep {
+                id: StepId::new(),
+                run_id,
+                position: 5,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement/api".to_owned(),
+                agent_id: None,
+                model: None,
+                role: StepRole::Part,
+                parent_step_id: Some(planner),
+                node_key: Some("implement/api".to_owned()),
+            }],
+            at: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// MOD-139 M2 D9 (blueprint §1.3): one assertion per shape rule, in its order.
+    #[test]
+    fn plan_admission_refusal_judges_the_shape_in_order() {
+        use crate::model::{PlanAdmission, PlanToAdmit, RunId, StepId, StepRole};
+        use serde_json::json;
+        let clean = clean_admission();
+        assert_eq!(super::plan_admission_refusal(&clean), None);
+        let refused = |admission: PlanAdmission| super::plan_admission_refusal(&admission);
+        let with_plan = |edit: &dyn Fn(&mut crate::model::NewRunPlan)| {
+            let mut admission = clean.clone();
+            let PlanToAdmit::New(plan) = &mut admission.plan else {
+                unreachable!("clean_admission admits a New plan")
+            };
+            edit(plan);
+            admission
+        };
+
+        // (1) A New plan's own rules come first, even when its run also mismatches.
+        assert_eq!(
+            refused(with_plan(&|plan| {
+                plan.revision = -1;
+                plan.run_id = RunId::new();
+            })),
+            Some("run_plan.revision must be 0 or more, not -1".to_owned())
+        );
+        // (2) A New plan naming another run, or another planner.
+        let PlanToAdmit::New(plan) = &clean.plan else {
+            unreachable!("clean_admission admits a New plan")
+        };
+        assert_eq!(
+            refused(with_plan(&|plan| plan.run_id = RunId::new())),
+            Some(super::admission_plan_mismatch(plan.id))
+        );
+        assert_eq!(
+            refused(with_plan(&|plan| plan.planner_step_id = StepId::new())),
+            Some(super::admission_plan_mismatch(plan.id))
+        );
+        // (3) No part, even with a bad `base_refs`.
+        assert_eq!(
+            refused(PlanAdmission {
+                parts: Vec::new(),
+                base_refs: json!([]),
+                ..clean.clone()
+            })
+            .as_deref(),
+            Some("an admission inserts at least one part step")
+        );
+        // (4) `base_refs` an object of strings (empty allowed, P-2).
+        let refs = "an admitted plan's base_refs is an object of repo ids to commit strings";
+        for bad in [json!([]), json!({"r": 1}), json!(null), json!("abc")] {
+            assert_eq!(
+                refused(PlanAdmission {
+                    base_refs: bad.clone(),
+                    ..clean.clone()
+                })
+                .as_deref(),
+                Some(refs),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            refused(PlanAdmission {
+                base_refs: json!({}),
+                ..clean.clone()
+            }),
+            None
+        );
+        // (5) A NUL in a commit string or a repo key.
+        for bad in [json!({"r": "a\u{0}"}), json!({"r\u{0}": "a"})] {
+            assert_eq!(
+                refused(PlanAdmission {
+                    base_refs: bad,
+                    ..clean.clone()
+                }),
+                Some(super::has_nul("run_plan.base_refs"))
+            );
+        }
+        // (6) Per part: run_step_refusal first (a stage part at 5)…
+        let with_part = |edit: &dyn Fn(&mut crate::model::NewRunStep)| {
+            let mut admission = clean.clone();
+            edit(&mut admission.parts[0]);
+            admission
+        };
+        assert_eq!(
+            refused(with_part(&|part| {
+                part.role = StepRole::Stage;
+                part.run_id = RunId::new();
+            }))
+            .as_deref(),
+            Some("a stage step sits at position -3, -2 or -1, not 5")
+        );
+        // …then the role…
+        let part = clean.parts[0].id;
+        assert_eq!(
+            refused(with_part(&|part| part.role = StepRole::Step)),
+            Some(super::step_not_a_part(part, StepRole::Step))
+        );
+        // …then the run…
+        assert_eq!(
+            refused(with_part(&|part| {
+                part.run_id = RunId::new();
+                part.parent_step_id = Some(StepId::new());
+            })),
+            Some(super::part_of_another_run(part, clean.run_id))
+        );
+        // …then the parent.
+        assert_eq!(
+            refused(with_part(&|part| part.parent_step_id = Some(StepId::new()))),
+            Some(super::part_of_another_planner(part, clean.planner_step_id))
+        );
+        // A later part is judged too, after the first passes.
+        let mut second = clean.clone();
+        let mut extra = second.parts[0].clone();
+        extra.id = StepId::new();
+        extra.position = 6;
+        extra.role = StepRole::Integrate;
+        extra.parent_step_id = None;
+        let extra_id = extra.id;
+        second.parts.push(extra);
+        assert_eq!(
+            refused(second),
+            Some(super::step_not_a_part(extra_id, StepRole::Integrate))
+        );
+        // A `Proposed` plan has no plan shape to judge.
+        assert_eq!(
+            refused(PlanAdmission {
+                plan: PlanToAdmit::Proposed(crate::model::RunPlanId::new()),
+                ..clean.clone()
+            }),
+            None
+        );
+    }
+
+    /// MOD-139 M2 D9 (blueprint §1.3): each admission sentence's exact bytes.
+    #[test]
+    fn the_admission_sentences_are_pinned() {
+        use crate::model::{PlanStatus, RunId, RunPlanId, StepId, StepRole, StepStatus};
+        let (plan, step, run, planner) =
+            (RunPlanId::new(), StepId::new(), RunId::new(), StepId::new());
+        assert_eq!(
+            super::admission_plan_mismatch(plan),
+            format!("plan {plan} names another run or planner step than its admission")
+        );
+        assert_eq!(
+            super::step_not_a_part(step, StepRole::Planner),
+            format!("step {step} is a planner step; an admission inserts part steps only")
+        );
+        assert_eq!(
+            super::part_of_another_run(step, run),
+            format!("part step {step} is not a step of run {run}")
+        );
+        assert_eq!(
+            super::part_of_another_planner(step, planner),
+            format!("part step {step} is not under planner step {planner}")
+        );
+        assert_eq!(
+            super::planner_not_running(planner, StepStatus::Pending),
+            format!("planner step {planner} is pending; an admission needs it running")
+        );
+        assert_eq!(
+            super::plan_not_this_planners(plan, planner),
+            format!("plan {plan} is not a plan of planner step {planner}")
+        );
+        assert_eq!(
+            super::plan_not_proposed(plan, PlanStatus::Abandoned),
+            format!("plan {plan} is abandoned; only a proposed plan is admitted")
+        );
+        assert_eq!(
+            super::planner_already_admitted(planner, 0),
+            format!("planner step {planner} already admitted plan revision 0")
         );
     }
 }

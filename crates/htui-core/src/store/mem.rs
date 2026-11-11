@@ -56,6 +56,7 @@ use crate::model::{
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
+use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -92,7 +93,9 @@ use crate::store::traits::{
     workspace_graph_is_held,
 };
 use crate::store::traits::{
-    plan_revision_taken, planner_not_in_run, run_plan_refusal, run_step_refusal,
+    plan_admission_refusal, plan_not_proposed, plan_not_this_planners, plan_revision_taken,
+    planner_already_admitted, planner_not_in_run, planner_not_running, run_plan_refusal,
+    run_step_refusal,
 };
 use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
@@ -163,6 +166,9 @@ pub enum MemFault {
     /// [`ReadStore::step_trees`] (MOD-138 M3 R1): a read the run-terminal cleanup makes and the
     /// cut writes do not.
     StepTrees,
+    /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
+    /// commit.
+    AdmitPlan,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -6161,8 +6167,10 @@ impl State {
     ///
     /// The **step-produced** pick is the resolver as it was: rows with a `produced_by_step_id`
     /// whose step is not a fan-out loser, best [`State::input_rank`] first, then the highest
-    /// version. The **hand-written** pick is the highest version with no producing step. The arm
-    /// is keyed on the column, not on whether the step is still held (plan D3); this store never
+    /// version, and not a divided part's (MOD-139 D12: part documents are their integrate node's,
+    /// through `{{parts}}`). The **hand-written** pick is the highest version with no producing
+    /// step. The arm is keyed on the column, not on whether the step is still held (plan D3); this
+    /// store never
     /// holds a document whose step is gone anyway, because only `delete_project` drops steps and
     /// it drops the project's items' documents with them. `(item, kind, version)` is unique, so
     /// the two picks never tie.
@@ -6173,11 +6181,12 @@ impl State {
             .filter(|document| document.item_id == item && document.kind == kind)
             .filter(|document| document.produced_by_step_id.is_some())
             .filter(|document| {
-                // `s.selected IS NOT FALSE`: a fan-out loser is excluded, `NULL` is not.
+                // `s.selected IS NOT FALSE`: a fan-out loser is excluded, `NULL` is not; and
+                // `s.role <> 'part'` (MOD-139 D12): a part's document is no generic input.
                 document
                     .produced_by_step_id
                     .and_then(|id| self.steps.get(&id))
-                    .is_none_or(|step| step.selected != Some(false))
+                    .is_none_or(|step| step.selected != Some(false) && step.role != StepRole::Part)
             })
             .min_by_key(|document| {
                 (
@@ -6721,7 +6730,15 @@ impl State {
             )));
         }
 
-        let row = RunStep {
+        let row = Self::step_row(new, now);
+        self.steps.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// The `pending` row a [`NewRunStep`] is written as, every settle column `NULL`: one literal
+    /// for [`State::create_step`] and [`State::admit_plan`]'s parts.
+    fn step_row(new: NewRunStep, now: DateTime<Utc>) -> RunStep {
+        RunStep {
             id: new.id,
             run_id: new.run_id,
             position: new.position,
@@ -6749,9 +6766,7 @@ impl State {
             promoted_at: None,
             branch: None,
             updated_at: now,
-        };
-        self.steps.insert(row.id, row.clone());
-        Ok(row)
+        }
     }
 
     /// [`State::transition`]'s shape for `run.status`, with §4.3's two stamps.
@@ -6993,6 +7008,201 @@ impl State {
         };
         self.run_plans.push(row.clone());
         Ok(row)
+    }
+
+    /// MOD-139 M2 D9: [`WriteStore::admit_plan`] in Postgres's order (blueprint §1.4): every
+    /// refusal is decided on reads first — this store has no rollback (blueprint G-13) — then the
+    /// plan, the part rows and the planner's `running -> done` are written. One `now` stamps a
+    /// `New` plan's two columns, a `Proposed` plan's `updated_at` and every new row's `updated_at`.
+    fn admit_plan(
+        &mut self,
+        fence: StepFence,
+        admission: PlanAdmission,
+        now: DateTime<Utc>,
+    ) -> Result<RunPlan> {
+        if let Some(refusal) = plan_admission_refusal(&admission) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let (run, planner) = (admission.run_id, admission.planner_step_id);
+        if !self.runs.contains_key(&run) {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
+        }
+        if self.lease_owners.get(&run).copied() != fence.owner() {
+            return Err(StoreError::Fenced { step: planner });
+        }
+        let planner_status = match self.steps.get(&planner) {
+            Some(step) if step.run_id == run => step.status,
+            _ => {
+                return Err(StoreError::Constraint(planner_not_in_run(planner, run)));
+            }
+        };
+        if planner_status != StepStatus::Running {
+            return Err(StoreError::Constraint(planner_not_running(
+                planner,
+                planner_status,
+            )));
+        }
+        // The proposed plan's index in `run_plans`, when the admission names one.
+        let proposed = match &admission.plan {
+            PlanToAdmit::New(_) => None,
+            PlanToAdmit::Proposed(id) => {
+                let Some(index) = self.run_plans.iter().position(|row| {
+                    row.id == *id && row.run_id == run && row.planner_step_id == planner
+                }) else {
+                    return Err(StoreError::Constraint(plan_not_this_planners(*id, planner)));
+                };
+                let status = self.run_plans[index].status;
+                if !status.can_move_to(PlanStatus::Admitted) {
+                    return Err(StoreError::Constraint(plan_not_proposed(*id, status)));
+                }
+                Some(index)
+            }
+        };
+        if let Some(revision) = self
+            .run_plans
+            .iter()
+            .filter(|row| row.planner_step_id == planner && row.status == PlanStatus::Admitted)
+            .map(|row| row.revision)
+            .min()
+        {
+            return Err(StoreError::Constraint(planner_already_admitted(
+                planner, revision,
+            )));
+        }
+        for (i, part) in admission.parts.iter().enumerate() {
+            let slot = |row_run: RunId, position: i32, attempt: i32, fanout_index: i32| {
+                row_run == part.run_id
+                    && position == part.position
+                    && attempt == part.attempt
+                    && fanout_index == part.fanout_index
+            };
+            // An earlier part of this admission holds its slot as surely as a stored row.
+            if self
+                .steps
+                .values()
+                .any(|row| slot(row.run_id, row.position, row.attempt, row.fanout_index))
+                || admission.parts[..i]
+                    .iter()
+                    .any(|row| slot(row.run_id, row.position, row.attempt, row.fanout_index))
+            {
+                return Err(StoreError::Constraint(step_slot_is_taken(
+                    part.run_id,
+                    part.position,
+                    part.attempt,
+                    part.fanout_index,
+                )));
+            }
+        }
+        if let PlanToAdmit::New(plan) = &admission.plan {
+            if self.run_plans.iter().any(|row| row.id == plan.id) {
+                return Err(StoreError::Constraint(already_exists("run_plan", plan.id)));
+            }
+            if self
+                .run_plans
+                .iter()
+                .any(|row| row.run_id == run && row.revision == plan.revision)
+            {
+                return Err(StoreError::Constraint(plan_revision_taken(
+                    run,
+                    plan.revision,
+                )));
+            }
+        }
+        // The part rows' own keys, which Postgres's insert would refuse (blueprint §1.4 rule 9).
+        for (i, part) in admission.parts.iter().enumerate() {
+            if self.steps.contains_key(&part.id)
+                || admission.parts[..i].iter().any(|row| row.id == part.id)
+            {
+                return Err(StoreError::Constraint(already_exists("run_step", part.id)));
+            }
+            if let Some(agent) = part.agent_id
+                && !self.agents.contains_key(&agent)
+            {
+                return Err(StoreError::Constraint(references_no_row(
+                    "run_step.agent_id",
+                    agent,
+                    "agent",
+                )));
+            }
+        }
+
+        // Every refusal is behind us: write.
+        let row = match (admission.plan, proposed) {
+            (PlanToAdmit::Proposed(_), Some(index)) => {
+                let row = &mut self.run_plans[index];
+                row.status = PlanStatus::Admitted;
+                row.base_refs = Some(admission.base_refs);
+                row.updated_at = now;
+                row.clone()
+            }
+            (PlanToAdmit::New(plan), _) => {
+                let row = RunPlan {
+                    id: plan.id,
+                    run_id: plan.run_id,
+                    revision: plan.revision,
+                    planner_step_id: plan.planner_step_id,
+                    scope: plan.scope,
+                    status: PlanStatus::Admitted,
+                    base_position: plan.base_position,
+                    base_refs: Some(admission.base_refs),
+                    body: plan.body,
+                    digest: plan.digest,
+                    created_at: now,
+                    updated_at: now,
+                };
+                self.run_plans.push(row.clone());
+                row
+            }
+            (PlanToAdmit::Proposed(id), None) => {
+                unreachable!("plan {id} was found above or the admission was refused")
+            }
+        };
+        for part in admission.parts {
+            let step = Self::step_row(part, now);
+            self.steps.insert(step.id, step);
+        }
+        let planner = self
+            .steps
+            .get_mut(&planner)
+            .unwrap_or_else(|| unreachable!("planner {planner} was read above"));
+        planner.status = StepStatus::Done;
+        planner.finished_at = planner.finished_at.or(Some(admission.at));
+        planner.updated_at = now;
+        Ok(row)
+    }
+
+    /// MOD-139 M2 D9, D11: [`WriteStore::abandon_plans`]: existence, then the fence (as
+    /// [`State::pass_step`] decides them), then every `proposed` or `admitted` plan of the planner
+    /// moves to `abandoned`, `updated_at` with it.
+    fn abandon_plans(
+        &mut self,
+        fence: StepFence,
+        planner: StepId,
+        now: DateTime<Utc>,
+    ) -> Result<u32> {
+        let row = self
+            .steps
+            .get(&planner)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: planner.to_string(),
+            })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
+        let mut moved = 0_u32;
+        for plan in self
+            .run_plans
+            .iter_mut()
+            .filter(|plan| plan.planner_step_id == planner)
+            .filter(|plan| plan.status.can_move_to(PlanStatus::Abandoned))
+        {
+            plan.status = PlanStatus::Abandoned;
+            plan.updated_at = now;
+            moved += 1;
+        }
+        Ok(moved)
     }
 
     /// MOD-139 D4: [`ReadStore::run_plans`], the run's plans in `revision` order; none for an
@@ -10512,6 +10722,18 @@ impl WriteStore for MemStore {
         self.write(|state| state.insert_run_plan(fence, plan, now))
     }
 
+    async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::AdmitPlan)?;
+        let now = self.now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        self.write(|state| state.admit_plan(fence, admission, now))
+    }
+
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        let now = self.now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        self.write(|state| state.abandon_plans(fence, planner_step, now))
+    }
+
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         self.write(|state| state.record_command_run(new))
     }
@@ -10970,6 +11192,100 @@ mod tests {
     use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-139 M2 D9 (blueprint P-4): the check no API path reaches. Admission moves its planner
+    /// to `done`, and `done -> running` is illegal, so the planner is rewound by hand here: a
+    /// second admission on a planner that already holds an admitted plan is refused, the lowest
+    /// admitted revision named, and nothing is written.
+    #[tokio::test]
+    async fn admit_plan_refuses_a_planner_already_admitted() {
+        use crate::model::{NewRunPlan, PlanAdmission, PlanScope, PlanToAdmit, RunPlanId};
+        use crate::store::planner_already_admitted;
+
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is created")
+            .id;
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                .await
+                .expect("the claim lands"),
+            Claim::Admitted
+        );
+        let planner = store
+            .create_step(NewRunStep {
+                role: StepRole::Planner,
+                ..new_step(run, 2, 1, 0)
+            })
+            .await
+            .expect("the planner is created")
+            .id;
+        assert!(
+            store
+                .transition_step(planner, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect("the planner starts")
+        );
+        let admission = |revision: i32, position: i32| PlanAdmission {
+            run_id: run,
+            planner_step_id: planner,
+            plan: PlanToAdmit::New(NewRunPlan {
+                id: RunPlanId::new(),
+                run_id: run,
+                revision,
+                planner_step_id: planner,
+                scope: PlanScope::Parts,
+                base_position: position,
+                body: json!({"scope": "parts", "parts": []}),
+                digest: format!("sha256:rev-{revision}"),
+            }),
+            base_refs: json!({}),
+            parts: vec![NewRunStep {
+                role: StepRole::Part,
+                parent_step_id: Some(planner),
+                node_key: Some("implement/api".to_owned()),
+                ..new_step(run, position, 1, 0)
+            }],
+            at,
+        };
+        store
+            .admit_plan(StepFence::Lease(owner), admission(0, 5))
+            .await
+            .expect("revision 0 is admitted");
+        store.write(|state| {
+            state
+                .steps
+                .get_mut(&planner)
+                .expect("the planner row")
+                .status = StepStatus::Running;
+        });
+        let steps = store.run_steps(run).await.expect("the steps read");
+        let plans = store.run_plans(run).await.expect("the plans read");
+
+        assert!(
+            matches!(
+                store.admit_plan(StepFence::Lease(owner), admission(1, 7)).await,
+                Err(StoreError::Constraint(message))
+                    if message == planner_already_admitted(planner, 0)
+            ),
+            "a planner holding an admitted plan admits no second one"
+        );
+        assert_eq!(
+            store.run_steps(run).await.expect("the steps read"),
+            steps,
+            "no part row was written and the planner did not move"
+        );
+        assert_eq!(
+            store.run_plans(run).await.expect("the plans read"),
+            plans,
+            "no plan was written"
+        );
+    }
 
     /// MOD-147 V3: the two inherent listers read through membership, so neither lists a scope
     /// row — not even when a caller's scope names one (the conformance suite cannot reach these,

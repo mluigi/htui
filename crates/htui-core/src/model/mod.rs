@@ -192,13 +192,13 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PlanStatus, Run, RunFacts, RunKind, RunMode,
-    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
-    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
-    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
-    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PlanAdmission, PlanStatus, PlanToAdmit, Run,
+    RunFacts, RunKind, RunMode, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide,
+    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
+    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
+    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
+    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -468,6 +468,27 @@ mod tests {
             PlanStatus::ALL,
             &["proposed", "admitted", "refused", "abandoned"],
         );
+    }
+
+    /// MOD-139 M2 D9: `PlanStatus::can_move_to` over all 16 pairs — exactly four moves are legal.
+    #[test]
+    fn plan_status_moves_by_its_law() {
+        use PlanStatus::{Abandoned, Admitted, Proposed, Refused};
+        let legal = [
+            (Proposed, Admitted),
+            (Proposed, Refused),
+            (Proposed, Abandoned),
+            (Admitted, Abandoned),
+        ];
+        for from in PlanStatus::ALL {
+            for to in PlanStatus::ALL {
+                assert_eq!(
+                    from.can_move_to(*to),
+                    legal.contains(&(*from, *to)),
+                    "{from} -> {to}"
+                );
+            }
+        }
     }
 
     /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).

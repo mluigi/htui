@@ -12,8 +12,9 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 65 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
-//! MOD-139 M1 `run_plans`), 7 [`WriteStore`] reads, 27 writes (MOD-139 M1 adds `insert_run_plan`),
+//! `WorkerStore` is 70 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! MOD-139 M1 `run_plans`), 7 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
+//! MOD-139 M2 `admit_plan` and `abandon_plans`),
 //! `write_document`, MOD-42's three command methods, MOD-11's
 //! four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
@@ -36,13 +37,13 @@ use crate::model::{
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
     DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
     MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep, Note,
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project,
-    ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId,
-    Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand,
-    RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId,
-    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
-    WorkspaceSummary,
+    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
+    PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry,
+    QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
+    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -230,7 +231,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         workspace: WorkspaceId,
     ) -> impl Future<Output = Result<Option<WorkspaceStop>>> + Send;
 
-    // -- 27 writes (MOD-144 R1: `block_if_idle` besides)
+    // -- 29 writes (MOD-144 R1: `block_if_idle` besides)
     /// [`WriteStore::transition`].
     fn transition(
         &self,
@@ -363,6 +364,18 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         fence: StepFence,
         plan: NewRunPlan,
     ) -> impl Future<Output = Result<RunPlan>> + Send;
+    /// [`WriteStore::admit_plan`].
+    fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: PlanAdmission,
+    ) -> impl Future<Output = Result<RunPlan>> + Send;
+    /// [`WriteStore::abandon_plans`].
+    fn abandon_plans(
+        &self,
+        fence: StepFence,
+        planner_step: StepId,
+    ) -> impl Future<Output = Result<u32>> + Send;
     /// [`WriteStore::record_command_run`].
     fn record_command_run(
         &self,
@@ -925,6 +938,12 @@ impl WorkerStore for MemStore {
     }
     async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan> {
         WriteStore::insert_run_plan(self, fence, plan).await
+    }
+    async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await

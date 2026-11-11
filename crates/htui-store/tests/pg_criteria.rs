@@ -8103,6 +8103,109 @@ async fn pass_step_locks_the_step_for_update_up_front() {
     db.drop_db().await;
 }
 
+/// MOD-139 M2 D9: an admission of one part (at position 50, `implement/api`) under `planner`,
+/// a `New` revision 0 with an empty `base_refs` (an empty repo scope's).
+fn one_part_admission(run: RunId, planner: StepId) -> htui_core::model::PlanAdmission {
+    use htui_core::model::{
+        NewRunPlan, NewRunStep, PlanAdmission, PlanScope, PlanToAdmit, RunPlanId,
+    };
+    PlanAdmission {
+        run_id: run,
+        planner_step_id: planner,
+        plan: PlanToAdmit::New(NewRunPlan {
+            id: RunPlanId::new(),
+            run_id: run,
+            revision: 0,
+            planner_step_id: planner,
+            scope: PlanScope::Parts,
+            base_position: 50,
+            body: serde_json::json!({"scope": "parts", "parts": [{"key": "api"}]}),
+            digest: "sha256:criteria".to_owned(),
+        }),
+        base_refs: serde_json::json!({}),
+        parts: vec![NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 50,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement/api".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+            role: StepRole::Part,
+            parent_step_id: Some(planner),
+            node_key: Some("implement/api".to_owned()),
+        }],
+        at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    }
+}
+
+/// The admission landed: the plan is admitted and the planner reads `done`.
+async fn assert_admitted(
+    db: &common::TestDb,
+    run: RunId,
+    planner: StepId,
+    answer: htui_core::store::Result<htui_core::model::RunPlan>,
+) {
+    assert_eq!(
+        answer.expect("the admission lands").status,
+        htui_core::model::PlanStatus::Admitted,
+        "the plan is admitted"
+    );
+    let status = db
+        .store
+        .run_steps(run)
+        .await
+        .expect("read the steps")
+        .into_iter()
+        .find(|row| row.id == planner)
+        .expect("the planner is listed")
+        .status;
+    assert_eq!(
+        status,
+        htui_core::model::StepStatus::Done,
+        "the planner is done"
+    );
+}
+
+/// MOD-139 M2 D9 (blueprint §1.5): `admit_plan` waits on a held planner holding nothing on its
+/// run (its first statement locks the planner alone), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn admit_plan_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let admission = one_part_admission(run, step);
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store.admit_plan(StepFence::Lease(owner), admission).await
+    })
+    .await;
+    assert_admitted(&db, run, step, answer).await;
+
+    db.drop_db().await;
+}
+
+/// MOD-139 M2 D9 (blueprint §1.5): `admit_plan` takes the planner's update lock up front (it
+/// moves the planner to `done` later in the transaction), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn admit_plan_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let admission = one_part_admission(run, step);
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store.admit_plan(StepFence::Lease(owner), admission).await
+    })
+    .await;
+    assert_admitted(&db, run, step, answer).await;
+
+    db.drop_db().await;
+}
+
 /// MOD-138 M2 D5: `record_branch` takes the step's update lock up front (its locking CTE's
 /// `FOR NO KEY UPDATE OF s`), then lands.
 #[tokio::test(flavor = "multi_thread")]
