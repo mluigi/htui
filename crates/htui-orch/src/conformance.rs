@@ -14961,23 +14961,72 @@ async fn a_crashed_part_in_a_dirty_local_tree_parks<H: CaseHarness>(harness: &H)
     let other = orch.restarted();
     let adopted = other.sweep().await.expect("the sweep adopts");
     assert_eq!(adopted.len(), 1, "{adopted:?}");
-    assert!(
-        matches!(
-            &adopted[0].next,
-            Next::Parked(Rest {
-                run: RunStatus::AwaitingApproval,
-                failure: Some(RunFailure::Interrupted { reset: false, .. }),
-                ..
-            })
-        ),
-        "{adopted:?}"
-    );
+    // T4 repair 2: the park stands on the divided node (the planner's position, as
+    // `status::position_of` reads a part) and names the part, not the planner node.
+    let planner = planner_of(&steps_of(&other, run).await);
+    let parked = Rest {
+        run: RunStatus::AwaitingApproval,
+        position: Some(planner.position),
+        failure: Some(RunFailure::Interrupted {
+            phase: "implement/api".to_owned(),
+            reset: false,
+        }),
+    };
+    assert_eq!(adopted[0].next, Next::Parked(parked), "{adopted:?}");
     let api = part_named(&steps_of(&other, run).await, "implement/api").clone();
     assert_eq!(
         (api.status, api.gate_note.as_deref()),
         (StepStatus::Failed, Some("interrupted, tree not reset"))
     );
     assert_eq!(other.isolator().resets(), 0, "no `git` write on this path");
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|note| note.starts_with(&format!(
+            "interrupted, tree not reset: step {} (`implement/api` attempt 1); trees: ",
+            api.id
+        ))),
+        "{notes:?}"
+    );
+
+    // T4 repair 2 (plan D93, D14): the park holds. A tree the sweep left alone is never walked
+    // over: neither a resume nor `Unblock` creates the part's next attempt, as for a plain step.
+    let resumed = other
+        .resume(run)
+        .await
+        .expect("a parked run resumes to its rest");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::AwaitingApproval,
+                position,
+                ..
+            }) if position == Some(planner.position)
+        ),
+        "{resumed:?}"
+    );
+    let refused = other
+        .dispatch(Command::Unblock {
+            item: ids::HTUI_FEAT_3,
+        })
+        .await
+        .expect_err("the park waits on a human");
+    assert!(
+        matches!(&refused, EngineError::NotBlocked { state: ItemState::NeedsYou, why, .. }
+            if *why == crate::command::run_waits_at_a_gate(run)),
+        "{refused}"
+    );
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [shaped("implement/api", 1, StepStatus::Failed, 5)],
+        "no attempt 2 over the tree"
+    );
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(other.isolator().resets(), 0);
 }
 
 /// MOD-139 M2 D14 (blueprint P-21): under `local` no part is ever reconciled on recovery, and the

@@ -75,7 +75,7 @@ use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, env_files};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
-use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
+use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, NOT_RESET, StepKind};
 use crate::schedule;
 use crate::secrets::RunSecrets;
 use crate::select::{self, SelectInput, Skipped, Walk};
@@ -118,9 +118,6 @@ const JUDGE_FAILED: &str = "judge failed";
 /// `run_step.gate_note` of a step the sweep failed after resetting its trees, or of a fan-out row
 /// it failed without a reset (ANA-2 `:1298`, plan D115).
 const INTERRUPTED: &str = "interrupted";
-
-/// `run_step.gate_note` of a step whose trees the sweep must not reset (ANA-2 `:1299`, D93).
-const NOT_RESET: &str = "interrupted, tree not reset";
 
 /// N2's reason for a tree stage 2 recorded dirty (plan D115).
 const DIRTY_AT_START: &str = "dirty at step start";
@@ -3968,11 +3965,18 @@ where
         if let Some(item) = run.item_id {
             self.note(item, note, Some(step.id), now).await?;
         }
+        // MOD-139 M2 (T4 repair 2): a part's park stands on its divided node, the planner's
+        // position (`status::position_of`), and names the part, never the planner node.
+        let position = if step.role == StepRole::Part {
+            phase.position
+        } else {
+            step.position
+        };
         Ok(Rest {
             run: RunStatus::AwaitingApproval,
-            position: Some(step.position),
+            position: Some(position),
             failure: Some(RunFailure::Interrupted {
-                phase: phase.name.clone(),
+                phase: interrupted_name(step, phase).to_owned(),
                 reset,
             }),
         })
@@ -9921,12 +9925,25 @@ fn skipped_above<'w>(
     above
 }
 
+/// The name an interrupted step's park and note give it: its node's, or (MOD-139 M2, T4 repair 2)
+/// a part's own `phase_name` (`<divided>/<part_key>`), whose attempt is the part's, where its
+/// node is the planner.
+fn interrupted_name<'s>(step: &'s RunStep, phase: &'s SnapshotPhase) -> &'s str {
+    if step.role == StepRole::Part {
+        &step.phase_name
+    } else {
+        &phase.name
+    }
+}
+
 /// N3 (plan D115): an interrupted step whose trees were reset, parked with its budget spent.
 fn spent_note(step: &RunStep, phase: &SnapshotPhase, listed: &str) -> String {
     format!(
         "{INTERRUPTED}: retry budget spent: step {} (`{}` attempt {}); trees: {listed}; the run \
          is parked",
-        step.id, phase.name, step.attempt
+        step.id,
+        interrupted_name(step, phase),
+        step.attempt
     )
 }
 
@@ -9935,7 +9952,9 @@ fn not_reset_note(step: &RunStep, phase: &SnapshotPhase, listed: &str, reason: &
     format!(
         "{NOT_RESET}: step {} (`{}` attempt {}); trees: {listed}; reason: {reason}; the run is \
          parked for a human",
-        step.id, phase.name, step.attempt
+        step.id,
+        interrupted_name(step, phase),
+        step.attempt
     )
 }
 

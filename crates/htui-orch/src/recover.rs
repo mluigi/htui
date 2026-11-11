@@ -33,6 +33,10 @@ pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
 /// The interval when [`LEASE_REFRESH_KEY`] is absent or not a positive integer: §10's 60 s.
 pub const DEFAULT_LEASE_REFRESH_SECONDS: i64 = 60;
 
+/// `run_step.gate_note` of a step whose trees the sweep must not reset (ANA-2 `:1299`, plan D93):
+/// the engine writes it, and the walk reads it on a part (MOD-139 M2 D14) so the park holds.
+pub const NOT_RESET: &str = "interrupted, tree not reset";
+
 /// The longest TTL [`LeaseTimes::from_app`] reads as set: one year, so `now + ttl` never
 /// overflows a `DateTime<Utc>`, and the store's own bound (MOD-40 blueprint B27).
 const MAX_LEASE_TTL_SECONDS: i64 = htui_core::store::MAX_LEASE_TTL.num_seconds();

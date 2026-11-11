@@ -112,10 +112,13 @@ pub fn node_state<'s>(phase: &SnapshotPhase, steps: &'s [RunStep]) -> NodeState<
 /// at each part position under that planner row), first rule wins (blueprint P-14, P-15):
 /// 1. a part `running`, `stopped` or `awaiting_approval` rests the node on it: a session this
 ///    walk does not own;
-/// 2. a part out of attempts ([`crate::divide::exhausted`] against the node's `retry_limit`) rests
+/// 2. a part `failed` with [`crate::recover::NOT_RESET`] rests the node on it whatever its budget
+///    says (plan D93, D14): the sweep left its tree alone and parked the run for a human, so no
+///    retry is created over that tree and no resume walks past the park (T4 repair 2);
+/// 3. a part out of attempts ([`crate::divide::exhausted`] against the node's `retry_limit`) rests
 ///    the node `failed` **on the planner row** (D6: the divided step failed, never a part);
-/// 3. every part `done` (vacuously with none) is the node `Done`, carried by the planner row;
-/// 4. otherwise [`Cursor::Parts`]: retries owed or parts pending.
+/// 4. every part `done` (vacuously with none) is the node `Done`, carried by the planner row;
+/// 5. otherwise [`Cursor::Parts`]: retries owed or parts pending.
 fn parts_state<'s>(
     phase: &SnapshotPhase,
     planner: &'s RunStep,
@@ -131,6 +134,15 @@ fn parts_state<'s>(
         return NodeState::Live(Cursor::Rest {
             step: live.id,
             status: live.status,
+        });
+    }
+    if let Some(parked) = parts.iter().find(|part| {
+        part.status == StepStatus::Failed
+            && part.gate_note.as_deref() == Some(crate::recover::NOT_RESET)
+    }) {
+        return NodeState::Live(Cursor::Rest {
+            step: parked.id,
+            status: StepStatus::Failed,
         });
     }
     if parts
@@ -1160,6 +1172,32 @@ pub(crate) mod tests {
             }],
             "`retry_limit` 1 allows two attempts"
         );
+    }
+
+    /// MOD-139 M2 D14 (plan D93, T4 repair 2): a part the sweep failed without resetting its
+    /// tree rests the node on it, whatever its budget says, so no parts round retries over the
+    /// tree and no resume walks past the park (`Rest` is never a resumable park).
+    #[test]
+    fn a_part_whose_tree_was_not_reset_rests_the_node_on_it() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        for attempt in [1, 2] {
+            let mut ui = part(&planner, 5, attempt, StepStatus::Failed);
+            ui.gate_note = Some(crate::recover::NOT_RESET.to_owned());
+            assert_eq!(
+                ready(
+                    &snapshot,
+                    &[prd.clone(), planner.clone(), api.clone(), ui.clone()]
+                ),
+                [Cursor::Rest {
+                    step: ui.id,
+                    status: StepStatus::Failed
+                }],
+                "attempt {attempt}"
+            );
+        }
     }
 
     /// MOD-139 M2 D3, D6: a failed part with an attempt left owes the node its parts round.
