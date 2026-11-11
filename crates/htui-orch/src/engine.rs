@@ -3582,6 +3582,7 @@ where
                     snapshot.reads_verdict(&phase.name),
                     step.started_at.unwrap_or(now),
                     now,
+                    None,
                 );
                 self.land_recovered(run, snapshot, phase, step, settled)
                     .await
@@ -5191,6 +5192,7 @@ where
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
             reads_verdict: snapshot.reads_verdict(&phase.name),
+            unmerged: None,
         });
         self.parts
             .store
@@ -5993,6 +5995,7 @@ where
             output: output.as_ref(),
             verify_outcome: None,
             reads_verdict,
+            unmerged: None,
         });
         self.parts
             .store
@@ -6743,6 +6746,7 @@ where
             output: output.as_ref(),
             verify_outcome: None,
             reads_verdict: false,
+            unmerged: None,
         });
         self.parts
             .store

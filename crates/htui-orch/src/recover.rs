@@ -17,7 +17,7 @@ use htui_core::model::{
 use htui_core::store::StoreError;
 use serde_json::Value;
 
-use crate::gate::{Settle, SettleInput, settle};
+use crate::gate::{Settle, SettleInput, Unmerged, settle};
 use crate::verify::VERIFY_CLASS;
 
 /// `app_setting` key of the lease's time to live, in seconds (`0003_orchestration.sql:135`).
@@ -335,7 +335,9 @@ pub fn verify_of(
 /// The deadline is dropped because the sweep's clock is not the step's, and the cap because the
 /// recorder's breach is not durable (plan R-13); `now` is therefore inert. `verify` is
 /// [`verify_of`]'s, and `reads_verdict` is `GraphSnapshot::reads_verdict` of the step's node (an
-/// outgoing `changes_requested` edge, MOD-138 M2 D7), as stage 5 passes it.
+/// outgoing `changes_requested` edge, MOD-138 M2 D7), as stage 5 passes it. `unmerged` is a
+/// recovered integrate's post-check over its recorded commits (MOD-139 M3 D8), `None` for every
+/// other step.
 #[must_use]
 pub fn resettle(
     output: Option<&Document>,
@@ -343,6 +345,7 @@ pub fn resettle(
     reads_verdict: bool,
     started_at: DateTime<Utc>,
     now: DateTime<Utc>,
+    unmerged: Option<Unmerged<'_>>,
 ) -> Settle {
     let driver = Ok(DoneEvent {
         stop_reason: StopReason::EndTurn,
@@ -358,6 +361,7 @@ pub fn resettle(
         output,
         verify_outcome: verify,
         reads_verdict,
+        unmerged,
     })
 }
 
@@ -1453,7 +1457,7 @@ mod tests {
         let now = at(24 * 60);
         let settle_with = |runs: &[CommandRun]| {
             let (verify, _) = verify_of(&step, runs);
-            resettle(Some(&output), verify, false, at(0), now)
+            resettle(Some(&output), verify, false, at(0), now, None)
         };
         assert_eq!(
             settle_with(&[verify_run(&step, CommandRunStatus::Done, Some(1))]),
@@ -1470,7 +1474,7 @@ mod tests {
         );
         assert_eq!(settle_with(&[]), Settle::Ok { note: None });
         assert_eq!(
-            resettle(None, Some(VerifyOutcome::Pass), false, at(0), now),
+            resettle(None, Some(VerifyOutcome::Pass), false, at(0), now, None),
             Settle::Failed(StepFailure::MissingOutput)
         );
     }
@@ -1484,19 +1488,19 @@ mod tests {
             &step,
         );
         assert_eq!(
-            resettle(Some(&rejecting), None, true, at(0), at(5)),
+            resettle(Some(&rejecting), None, true, at(0), at(5), None),
             Settle::Rejected {
                 verdict_line: "verdict: request-changes".to_owned(),
             }
         );
         assert_eq!(
-            resettle(Some(&rejecting), None, false, at(0), at(5)),
+            resettle(Some(&rejecting), None, false, at(0), at(5), None),
             Settle::Ok { note: None },
             "a phase not named `review` never reads the front matter"
         );
         let approving = document("review", "---\nverdict: approve\n---\nShip it.\n", &step);
         assert_eq!(
-            resettle(Some(&approving), None, true, at(0), at(5)),
+            resettle(Some(&approving), None, true, at(0), at(5), None),
             Settle::Ok { note: None }
         );
     }

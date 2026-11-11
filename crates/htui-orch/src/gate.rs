@@ -128,6 +128,14 @@ pub enum StepFailure {
     /// phase's `verify_command` between stage 4 and stage 5 and the engine hands its outcome here.
     /// Milestone 2 matched it with no writer, which is why milestone 3 added one and no branch.
     VerifyFailed,
+    /// MOD-139 M3 D6: integrate's post-check (Confirm 2(a) included) refused its capture: done
+    /// parts whose tips its branch does not hold, or whose changed paths it does not change.
+    IntegrateIncomplete {
+        /// The divided node's name.
+        node: String,
+        /// The failing parts' keys, plan order.
+        parts: Vec<String>,
+    },
 }
 
 impl core::fmt::Display for StepFailure {
@@ -140,6 +148,9 @@ impl core::fmt::Display for StepFailure {
             Self::DeadlineElapsed => f.write_str("deadline elapsed"),
             Self::MissingOutput => f.write_str("missing_output"),
             Self::VerifyFailed => f.write_str("verify_outcome: fail"),
+            Self::IntegrateIncomplete { node, parts } => {
+                f.write_str(&crate::status::integrate_incomplete(node, parts))
+            }
         }
     }
 }
@@ -150,6 +161,10 @@ impl StepFailure {
     pub fn run_failure(&self) -> Option<RunFailure> {
         match self {
             Self::MissingOutput => Some(RunFailure::MissingOutput),
+            Self::IntegrateIncomplete { node, parts } => Some(RunFailure::IntegrateIncomplete {
+                node: node.clone(),
+                parts: parts.clone(),
+            }),
             _ => None,
         }
     }
@@ -236,7 +251,22 @@ pub struct SettleInput<'a> {
     /// anything else with the edge reads it. On every lifted v1 graph the two readings agree but
     /// for a review placed first, which the lift gives no loop edge.
     pub reads_verdict: bool,
+    /// MOD-139 M3 D6: integrate's post-check answer. `None` for every step but an integrate
+    /// whose session returned `Ok`; an empty `parts` is a check that passed.
+    pub unmerged: Option<Unmerged<'a>>,
 }
+
+/// MOD-139 M3 D6: the post-check's answer [`settle`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct Unmerged<'a> {
+    /// The divided node (`divide::divided_name`).
+    pub node: &'a str,
+    /// The parts that failed, by key; empty = the check passed.
+    pub parts: &'a [String],
+}
+
+/// MOD-139 M3 D6 (Confirm 3): the word a parked integrate's settle note carries.
+pub const INTEGRATE_INCOMPLETE: &str = "integrate_incomplete";
 
 /// ANA-2 §4.2's settle, first hit winning (`docs/ANA-2.md:436-441`).
 ///
@@ -267,6 +297,14 @@ pub fn settle(input: &SettleInput<'_>) -> Settle {
     let Some(output) = input.output else {
         return Settle::Failed(StepFailure::MissingOutput);
     };
+    // MOD-139 M3 D6: the post-check outranks verify (ANA-33's post-check-then-verify) but never
+    // a driver error, a stop, a cap, a deadline or a missing document.
+    if let Some(found) = input.unmerged.filter(|found| !found.parts.is_empty()) {
+        return Settle::Failed(StepFailure::IntegrateIncomplete {
+            node: found.node.to_owned(),
+            parts: found.parts.to_vec(),
+        });
+    }
     if input.verify_outcome == Some(VerifyOutcome::Fail) {
         return Settle::Failed(StepFailure::VerifyFailed);
     }
@@ -786,6 +824,20 @@ fn stop_note(
 #[must_use]
 pub fn stopped_to_ask(notes: &[Note], step: &RunStep) -> bool {
     let head = stop_head(step);
+    notes
+        .iter()
+        .any(|note| note.via_step_id == Some(step.id) && note.body.starts_with(&head))
+}
+
+/// MOD-139 M3 D6 (Confirm 3, blueprint P-1): whether `step` is parked on its own
+/// `integrate_incomplete` settle: the item note `note_step` wrote via the step,
+/// ``step `<phase>` attempt <n>: integrate_incomplete:``. A park writes no `gate_note`.
+#[must_use]
+pub fn parked_unmerged(notes: &[Note], step: &RunStep) -> bool {
+    let head = format!(
+        "step `{}` attempt {}: {INTEGRATE_INCOMPLETE}:",
+        step.phase_name, step.attempt
+    );
     notes
         .iter()
         .any(|note| note.via_step_id == Some(step.id) && note.body.starts_with(&head))
@@ -1515,6 +1567,7 @@ mod tests {
             output,
             verify_outcome: None,
             reads_verdict: false,
+            unmerged: None,
         }
     }
 
@@ -1650,6 +1703,135 @@ mod tests {
             ..ok_input(&ended, Some(&output))
         };
         assert_eq!(settle(&failed), Settle::Failed(StepFailure::VerifyFailed));
+    }
+
+    /// MOD-139 M3 D6: the post-check sits after `MissingOutput` and before `VerifyFailed`:
+    /// driver error > stop > cap > deadline > `MissingOutput` > `IntegrateIncomplete` >
+    /// `VerifyFailed`.
+    #[test]
+    fn integrate_incomplete_outranks_verify_not_missing_output() {
+        let output = document("body");
+        let ended = done(StopReason::EndTurn);
+        let parts = vec!["ui".to_owned()];
+        let unmerged = Some(super::Unmerged {
+            node: "implement",
+            parts: &parts,
+        });
+        let incomplete = Settle::Failed(StepFailure::IntegrateIncomplete {
+            node: "implement".to_owned(),
+            parts: parts.clone(),
+        });
+
+        let alone = SettleInput {
+            unmerged,
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(settle(&alone), incomplete);
+
+        let verify_failed = SettleInput {
+            unmerged,
+            verify_outcome: Some(VerifyOutcome::Fail),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(
+            settle(&verify_failed),
+            incomplete,
+            "the post-check outranks verify"
+        );
+
+        let no_output = SettleInput {
+            unmerged,
+            ..ok_input(&ended, None)
+        };
+        assert_eq!(
+            settle(&no_output),
+            Settle::Failed(StepFailure::MissingOutput),
+            "a missing document outranks the post-check"
+        );
+
+        let late = SettleInput {
+            unmerged,
+            deadline_seconds: Some(1),
+            now: epoch() + TimeDelta::seconds(2),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(
+            settle(&late),
+            Settle::Failed(StepFailure::DeadlineElapsed),
+            "the deadline outranks the post-check"
+        );
+
+        let closed: Result<DoneEvent, DriverError> = Err(DriverError::Closed);
+        let crashed = SettleInput {
+            unmerged,
+            ..ok_input(&closed, Some(&output))
+        };
+        assert!(
+            matches!(settle(&crashed), Settle::Failed(StepFailure::Driver(_))),
+            "the driver's own error outranks the post-check"
+        );
+    }
+
+    /// MOD-139 M3 D6: a post-check that found nothing settles as if it never ran.
+    #[test]
+    fn an_empty_unmerged_list_settles_ok() {
+        let output = document("body");
+        let ended = done(StopReason::EndTurn);
+        let input = SettleInput {
+            unmerged: Some(super::Unmerged {
+                node: "implement",
+                parts: &[],
+            }),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(settle(&input), Settle::Ok { note: None });
+    }
+
+    /// MOD-139 M3 Confirm 3 (blueprint P-1): only the step's own `integrate_incomplete` settle
+    /// note, of its own attempt, reads as that park.
+    #[tokio::test]
+    async fn parked_unmerged_reads_the_steps_own_note() {
+        let store = MemStore::demo();
+        let step = step_at(&store, 30, "implement", 1, 0, &[]).await;
+        let other = step_at(&store, 31, "review", 1, 0, &[]).await;
+        let note = |body: &str, via: Option<htui_core::model::StepId>| htui_core::model::Note {
+            id: htui_core::model::NoteId::new(),
+            item_id: ids::HTUI_ANA_1,
+            body: body.to_owned(),
+            created_by: ids::USER,
+            box_id: None,
+            via_step_id: via,
+            created_at: epoch(),
+        };
+        let own = "step `implement` attempt 1: integrate_incomplete: part `ui` of `implement` is \
+                   not merged";
+        assert!(super::parked_unmerged(&[note(own, Some(step.id))], &step));
+        assert!(
+            !super::parked_unmerged(&[note(own, Some(other.id))], &step),
+            "another step's note"
+        );
+        assert!(
+            !super::parked_unmerged(
+                &[note(
+                    "step `implement` attempt 2: integrate_incomplete: part `ui` of `implement` \
+                     is not merged",
+                    Some(step.id)
+                )],
+                &step
+            ),
+            "another attempt's note"
+        );
+        assert!(
+            !super::parked_unmerged(
+                &[note(
+                    "step `implement` attempt 1: verify_outcome: fail",
+                    Some(step.id)
+                )],
+                &step
+            ),
+            "a note that is not the post-check's"
+        );
+        assert!(!super::parked_unmerged(&[], &step));
     }
 
     /// Plan D8's step deadline, evaluated against the clock and never against a sleep.
@@ -1871,6 +2053,27 @@ mod tests {
         assert_eq!(
             StepFailure::CapBreached { batch: None }.run_failure_text(),
             "cap breached"
+        );
+
+        // MOD-139 M3 D6: the post-check's note and its `run.failure` are one sentence.
+        let incomplete = StepFailure::IntegrateIncomplete {
+            node: "implement".to_owned(),
+            parts: vec!["ui".to_owned()],
+        };
+        assert_eq!(
+            incomplete.to_string(),
+            "integrate_incomplete: part `ui` of `implement` is not merged"
+        );
+        assert_eq!(
+            incomplete.run_failure_text(),
+            "integrate_incomplete: part `ui` of `implement` is not merged"
+        );
+        assert_eq!(
+            incomplete.run_failure(),
+            Some(RunFailure::IntegrateIncomplete {
+                node: "implement".to_owned(),
+                parts: vec!["ui".to_owned()],
+            })
         );
     }
 

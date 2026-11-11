@@ -203,6 +203,29 @@ pub enum RunFailure {
         /// The part's last attempt.
         attempts: i32,
     },
+    /// MOD-139 M3 D6: integrate's post-check found done parts its capture does not hold.
+    IntegrateIncomplete {
+        /// The divided node's name.
+        node: String,
+        /// The parts' keys, plan order.
+        parts: Vec<String>,
+    },
+}
+
+/// MOD-139 M3 D6: `IntegrateIncomplete`'s one sentence, shared by [`RunFailure`] and
+/// `gate::StepFailure` (blueprint P-7: a singular and a plural form).
+#[must_use]
+pub fn integrate_incomplete(node: &str, parts: &[String]) -> String {
+    let named = parts
+        .iter()
+        .map(|part| format!("`{part}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if parts.len() == 1 {
+        format!("integrate_incomplete: part {named} of `{node}` is not merged")
+    } else {
+        format!("integrate_incomplete: parts {named} of `{node}` are not merged")
+    }
 }
 
 /// MOD-139 M2 D8: which cap an admission broke.
@@ -345,6 +368,9 @@ impl fmt::Display for RunFailure {
                 f,
                 "part_exhausted: part `{part}` of `{node}` failed after {attempts} attempts"
             ),
+            Self::IntegrateIncomplete { node, parts } => {
+                f.write_str(&integrate_incomplete(node, parts))
+            }
         }
     }
 }
@@ -1157,6 +1183,24 @@ mod tests {
             .to_string(),
             "part_exhausted: part `api` of `implement` failed after 2 attempts",
             "MOD-139 M2 D6"
+        );
+        assert_eq!(
+            RunFailure::IntegrateIncomplete {
+                node: node(),
+                parts: vec!["ui".to_owned()],
+            }
+            .to_string(),
+            "integrate_incomplete: part `ui` of `implement` is not merged",
+            "MOD-139 M3 D6, one part"
+        );
+        assert_eq!(
+            RunFailure::IntegrateIncomplete {
+                node: node(),
+                parts: vec![part(), "ui".to_owned()],
+            }
+            .to_string(),
+            "integrate_incomplete: parts `api`, `ui` of `implement` are not merged",
+            "MOD-139 M3 D6, several parts"
         );
     }
 
