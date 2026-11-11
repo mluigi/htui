@@ -405,9 +405,11 @@ fn note_corpus(corpus: &Corpus) {
     ));
 }
 
-/// A warning when the query set was written against another corpus ref than the one run.
+/// A warning when the query set was written against another commit than the corpus run: refs are
+/// compared as resolved commits (`d15e9fea` and its full sha agree), as strings where git cannot
+/// resolve one ([`corpus::same_commit`]).
 pub fn ref_warning(repo: &Path, set_ref: &str, corpus_ref: &str) -> Option<String> {
-    (set_ref != corpus_ref).then(|| {
+    (!corpus::same_commit(repo, set_ref, corpus_ref)).then(|| {
         format!("warning: the query set was written against {set_ref}, the corpus is {corpus_ref}")
     })
 }

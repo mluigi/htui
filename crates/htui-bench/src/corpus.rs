@@ -192,6 +192,18 @@ fn resolve_commit(repo: &Path, rev: &str) -> anyhow::Result<String> {
     Ok(sha.to_owned())
 }
 
+/// Whether two revs name the same commit: their resolved shas when both resolve, the strings
+/// otherwise ([`WORKTREE`], a ref this clone lacks).
+pub fn same_commit(repo: &Path, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (resolve_commit(repo, a), resolve_commit(repo, b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Namespaced UUID (P3): the first 16 bytes of sha256("htui-bench/v1\0" + name), stamped as a
 /// version-8 (custom) UUID by `uuid::Builder::from_custom_bytes(..).into_uuid()`.
 pub fn bench_uuid(name: &str) -> Uuid {
