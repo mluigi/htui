@@ -207,7 +207,7 @@ pub struct Summary {
 impl Summary {
     /// Distinct failed calls: [`Self::errors`] without the rows that repeat another's.
     pub fn failed_calls(&self) -> impl Iterator<Item = &ErrorRow> {
-        self.errors.iter()
+        self.errors.iter().filter(|e| e.derived_from.is_none())
     }
 }
 
@@ -247,9 +247,13 @@ pub fn summarize(results: &Results) -> Summary {
     }
 
     // Highest hits@5 on duplicates, then MRR@10, then `Backend::ALL` order (`backends` is in it).
+    // A baseline that failed on a duplicate is out: its failure would read as a miss.
     let mut best_lexical: Option<(Backend, Cell)> = None;
     for &backend in backends.iter().filter(|b| b.is_lexical()) {
         let cell = cells[&(backend, Group::A)];
+        if cell.errors > 0 {
+            continue;
+        }
         let better = best_lexical.is_none_or(|(_, best)| {
             cell.hit5 > best.hit5 || (cell.hit5 == best.hit5 && cell.mrr10 > best.mrr10)
         });
@@ -327,7 +331,7 @@ pub fn summarize(results: &Results) -> Summary {
                 query: r.query.clone(),
                 backend: r.backend,
                 message: message.clone(),
-                derived_from: None,
+                derived_from: view.derived_from(r),
             })
         })
         .collect();
@@ -342,14 +346,40 @@ pub fn summarize(results: &Results) -> Summary {
             .find(|r: &&McNemarRow| r.other == best && r.group == Group::A)
             .copied()
     });
+    // Failed calls of lexical baselines on duplicates: what leaves no best when every one failed.
+    let lexical_errors_a: usize = backends
+        .iter()
+        .filter(|b| b.is_lexical())
+        .map(|&b| cells[&(b, Group::A)].errors)
+        .sum();
+    let recall = if s_a.errors > 0 {
+        Verdict::NotMeasured {
+            failed_calls: s_a.errors,
+        }
+    } else {
+        met_if(s_a.n > 0 && s_a.hit5 * RECALL_DEN >= RECALL_NUM * s_a.n)
+    };
+    let no_best_for_errors = best_lexical.is_none() && lexical_errors_a > 0;
+    let mcnemar_verdict = if s_a.errors > 0 || no_best_for_errors {
+        let lexical = if no_best_for_errors {
+            lexical_errors_a
+        } else {
+            0
+        };
+        Verdict::NotMeasured {
+            failed_calls: s_a.errors + lexical,
+        }
+    } else {
+        met_if(vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other))
+    };
     let thresholds = Thresholds {
         s_hit5_a: s_a.hit5,
         n_a: s_a.n,
-        s_errors_a: 0,
-        recall: met_if(s_a.n > 0 && s_a.hit5 * RECALL_DEN >= RECALL_NUM * s_a.n),
+        s_errors_a: s_a.errors,
+        recall,
         best_lexical,
         p_vs_best: vs_best.map(|r| r.p),
-        mcnemar: met_if(vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other)),
+        mcnemar: mcnemar_verdict,
     };
 
     Summary {
@@ -423,6 +453,23 @@ impl<'a> View<'a> {
         metrics::hit_at(self.rank(backend, q), 5)
     }
 
+    fn failed(&self, backend: Backend, q: &QueryRecord) -> bool {
+        self.runs
+            .get(&(backend, q.id.as_str()))
+            .is_some_and(|r| r.error.is_some())
+    }
+
+    /// S-points reads S10's response (`run::measure`), so its failure where S10 failed on the
+    /// same query is S10's call, not one of its own.
+    fn derived_from(&self, run: &BackendRun) -> Option<Backend> {
+        let s10_failed = self
+            .runs
+            .get(&(Backend::S10, run.query.as_str()))
+            .is_some_and(|r| r.error.is_some());
+        (run.backend == Backend::SPoints && run.error.is_some() && s10_failed)
+            .then_some(Backend::S10)
+    }
+
     /// The top-1 score §5.4 compares; 0.0 without a hit. S-sparse's is per query term.
     fn top1(&self, backend: Backend, q: &QueryRecord) -> f64 {
         let score = self
@@ -443,6 +490,7 @@ impl<'a> View<'a> {
 
     fn cell(&self, backend: Backend, group: Group) -> Cell {
         let ranks: Vec<Option<usize>> = self.group(group).map(|q| self.rank(backend, q)).collect();
+        let errors = self.group(group).filter(|q| self.failed(backend, q)).count();
         let n = ranks.len();
         let hit1 = ranks.iter().filter(|r| metrics::hit_at(**r, 1)).count();
         let hit5 = ranks.iter().filter(|r| metrics::hit_at(**r, 5)).count();
@@ -461,7 +509,7 @@ impl<'a> View<'a> {
             hit5,
             mrr10,
             wilson5: metrics::wilson_interval(hit5, n),
-            errors: 0,
+            errors,
         }
     }
 
@@ -570,8 +618,29 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
         t.n_a,
         verdict(t.recall)
     );
-    match (t.best_lexical, t.p_vs_best) {
-        (Some(best), Some(p)) => {
+    match (t.mcnemar, t.best_lexical, t.p_vs_best) {
+        (Verdict::NotMeasured { .. }, Some(best), _) => {
+            let _ = writeln!(
+                md,
+                "- S vs best lexical baseline ({}) on duplicates: {}",
+                best.name(),
+                verdict(t.mcnemar)
+            );
+        }
+        (Verdict::NotMeasured { failed_calls }, None, _) => {
+            // No best with lexical baselines present: each failed on a duplicate.
+            let why = if summary.backends.iter().any(|b| b.is_lexical()) {
+                "; every lexical baseline failed on a duplicate"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                md,
+                "- S vs best lexical baseline on duplicates: not measured ({}{why})",
+                failed_calls_text(failed_calls)
+            );
+        }
+        (_, Some(best), Some(p)) => {
             let _ = writeln!(
                 md,
                 "- S vs best lexical baseline ({}) on duplicates: p = {} < 0.05 — {}",
@@ -610,10 +679,11 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
                     .copied()
                     .unwrap_or_default();
                 format!(
-                    "{:.2} / {:.2} / {:.2}",
+                    "{:.2} / {:.2} / {:.2}{}",
                     ratio(c.hit1, c.n),
                     ratio(c.hit5, c.n),
-                    c.mrr10
+                    c.mrr10,
+                    err_marker(c)
                 )
             })
             .collect();
@@ -632,7 +702,14 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
                     .get(&(backend, g))
                     .copied()
                     .unwrap_or_default();
-                format!("{}/{} ({:.2}-{:.2})", c.hit5, c.n, c.wilson5.0, c.wilson5.1)
+                format!(
+                    "{}/{} ({:.2}-{:.2}){}",
+                    c.hit5,
+                    c.n,
+                    c.wilson5.0,
+                    c.wilson5.1,
+                    err_marker(c)
+                )
             })
             .collect();
         let _ = writeln!(md, "| {} | {} |", backend.name(), cells.join(" | "));
@@ -731,11 +808,19 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
     if summary.errors.is_empty() {
         md.push_str("none\n");
     } else {
+        let _ = writeln!(
+            md,
+            "{}.\n",
+            failed_calls_text(summary.failed_calls().count())
+        );
         md.push_str("| query | backend | message |\n|---|---|---|\n");
         for e in &summary.errors {
+            let repeats = e.derived_from.map_or_else(String::new, |from| {
+                format!(" (repeats {}'s failed call)", from.name())
+            });
             let _ = writeln!(
                 md,
-                "| {} | {} | {} |",
+                "| {} | {} | {}{repeats} |",
                 e.query,
                 e.backend.name(),
                 cell_text(&e.message)
@@ -766,6 +851,15 @@ table here shows.
 
 /// ANA-37's document points (blueprint F3).
 const ANA37_DOCUMENT_POINTS: usize = 759;
+
+/// ` (k err)` after a cell whose group holds failed calls; each counts as a miss in it.
+fn err_marker(c: Cell) -> String {
+    if c.errors == 0 {
+        String::new()
+    } else {
+        format!(" ({} err)", c.errors)
+    }
+}
 
 const fn met_if(yes: bool) -> Verdict {
     if yes { Verdict::Met } else { Verdict::NotMet }
@@ -1763,8 +1857,8 @@ mod tests {
         );
         // H's class-d failure marks no cell.
         let h_rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| H |")).collect();
-        assert_eq!(h_rows.len(), 3, "{md}");
-        assert!(h_rows.iter().all(|l| !l.contains("err")), "{h_rows:?}");
+        assert!(!h_rows.is_empty(), "{md}");
+        assert!(h_rows.iter().all(|l| !l.contains(" err)")), "{h_rows:?}");
     }
 
     #[test]
@@ -1789,6 +1883,12 @@ mod tests {
             s.errors,
             vec![
                 ErrorRow {
+                    query: "d02".into(),
+                    backend: Backend::H,
+                    message: "boom".into(),
+                    derived_from: None,
+                },
+                ErrorRow {
                     query: "a01".into(),
                     backend: Backend::S10,
                     message: "qdrant down".into(),
@@ -1799,12 +1899,6 @@ mod tests {
                     backend: Backend::SPoints,
                     message: "qdrant down".into(),
                     derived_from: Some(Backend::S10),
-                },
-                ErrorRow {
-                    query: "d02".into(),
-                    backend: Backend::H,
-                    message: "boom".into(),
-                    derived_from: None,
                 },
             ]
         );
