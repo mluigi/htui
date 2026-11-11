@@ -77,6 +77,11 @@
 - **F-5 (T3, adopted).** Two planners never admit at once (`schedule::plan_pass` rule (f),
   `72a9114d`): each reads the run's revision and part positions before its own `admit_plan`, so two
   in flight would collide.
+- **F-6 (T4, adopted).** A part failed `interrupted, tree not reset` keeps its divided node parked
+  on that part whatever its attempt budget says (`walk::parts_state` rule 2, `4557edb2`), so no
+  parts round retries over a tree recovery refused to touch. `recover::NOT_RESET` is public for
+  it, and the park reports the planner's position and the part's own name (`implement/api`).
+  T4 touched `walk.rs` for this, outside §5's file set.
 - **T3 case 15** (two parallel `fan_out_only` branches) depends on the first-poll order of concurrent
   futures. An implementer who sees it flake reports it as a remaining finding; it is never weakened or
   `#[ignore]`d without a coordinator ruling.
