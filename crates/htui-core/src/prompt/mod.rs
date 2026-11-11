@@ -73,11 +73,12 @@ use crate::scrub::Scrubber;
 /// Everything the assembler needs, and nothing it must not have (ANA-5 §8 `:1917-1942`).
 ///
 /// Note what is **absent**: no store handle, no `RunId`, no `StepId`, no `Vec<SessionEvent>`, no
-/// clock. ANA-5 §4.7 rule 8 makes "two **compete** candidates assemble the same bytes" a property of
-/// the type rather than of the code, so a run id cannot reach a rendered byte because there is
-/// nowhere to put one; a divided node's parts differ in their `part` section only (MOD-139 D10). The handoff role takes a [`StepSummary`] the caller built from the step's own
-/// events, which is the one place transcript-derived text enters, and it enters already summarised
-/// (§4.2 `:587-589`).
+/// clock. ANA-5 §4.7 rule 8 makes "two **compete** candidates assemble the same bytes" a property
+/// of the type rather than of the code, so a run id cannot reach a rendered byte because there is
+/// nowhere to put one; a divided node's parts differ in their `part` section only (MOD-139 D10).
+/// The handoff role takes a [`StepSummary`] the caller built from the step's own events, which is
+/// the one place transcript-derived text enters, and it enters already summarised (§4.2
+/// `:587-589`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptSpec {
     /// Which closed placeholder set [`body`](Self::body) was parsed against.
