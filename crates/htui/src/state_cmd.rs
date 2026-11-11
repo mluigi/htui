@@ -1249,7 +1249,7 @@ mod tests {
     /// [`workspace`]'s qualifier: `htui` holds `MOD`, `agy` nothing, so every row prints bare and
     /// qualifies as `htui:…`.
     fn keys() -> KeyQualifier {
-        KeyQualifier::new(&[
+        KeyQualifier::new([
             (project(0x10), "htui".to_owned(), vec!["MOD".to_owned()]),
             (project(0x11), "agy".to_owned(), Vec::new()),
         ])
@@ -1763,7 +1763,7 @@ mod tests {
     /// display key is the human form's alone.
     #[test]
     fn row_doc_carries_project_and_qualified_key() {
-        let keys = KeyQualifier::new(&[
+        let keys = KeyQualifier::new([
             (
                 project(0x10),
                 "htui".to_owned(),

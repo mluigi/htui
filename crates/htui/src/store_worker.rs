@@ -2347,7 +2347,7 @@ pub(crate) async fn waiting_reads<S: KindsRead>(
             .collect();
         projects.push((*id, project.slug, prefixes));
     }
-    Ok((read, KeyQualifier::new(&projects)))
+    Ok((read, KeyQualifier::new(projects)))
 }
 
 /// The two stores [`waiting_reads`] reads: a project's kinds, which are a `WriteStore` read on

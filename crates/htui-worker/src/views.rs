@@ -2384,7 +2384,7 @@ mod tests {
             candidate(&web_feat, Vec::new()),
             candidate(&api_tool, Vec::new()),
         ];
-        let keys = KeyQualifier::new(&[
+        let keys = KeyQualifier::new([
             (
                 api,
                 "api".to_owned(),

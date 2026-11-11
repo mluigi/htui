@@ -33,15 +33,13 @@ pub struct KeyQualifier {
 }
 
 impl KeyQualifier {
-    /// `(project, slug, its kinds' prefixes)` per scope project.
+    /// `(project, slug, its kinds' prefixes)` per scope project, taken by value.
     #[must_use]
-    pub fn new(projects: &[(ProjectId, String, Vec<String>)]) -> Self {
+    pub fn new(projects: impl IntoIterator<Item = (ProjectId, String, Vec<String>)>) -> Self {
         Self {
             projects: projects
-                .iter()
-                .map(|(project, slug, prefixes)| {
-                    (*project, slug.clone(), prefixes.iter().cloned().collect())
-                })
+                .into_iter()
+                .map(|(project, slug, prefixes)| (project, slug, prefixes.into_iter().collect()))
                 .collect(),
         }
     }
@@ -121,7 +119,7 @@ mod tests {
     #[test]
     fn a_shared_prefix_is_qualified_and_a_unique_one_bare() {
         let (api, web) = (id(1), id(2));
-        let keys = KeyQualifier::new(&[
+        let keys = KeyQualifier::new([
             row(api, "api", &["FEAT", "TOOL"]),
             row(web, "web", &["FEAT"]),
         ]);
@@ -133,18 +131,18 @@ mod tests {
     #[test]
     fn the_scope_row_qualifies_with_its_at_slug() {
         let (shop, api) = (id(1), id(2));
-        let keys = KeyQualifier::new(&[row(shop, "@shop", &["WS"]), row(api, "api", &["WS"])]);
+        let keys = KeyQualifier::new([row(shop, "@shop", &["WS"]), row(api, "api", &["WS"])]);
         assert_eq!(keys.display(shop, "WS-1"), "@shop:WS-1");
         assert_eq!(keys.display(api, "WS-2"), "api:WS-2");
 
-        let alone = KeyQualifier::new(&[row(shop, "@shop", &["WS"])]);
+        let alone = KeyQualifier::new([row(shop, "@shop", &["WS"])]);
         assert_eq!(alone.display(shop, "WS-1"), "WS-1");
     }
 
     #[test]
     fn unknown_projects_and_bare_text_print_bare() {
         let (api, web) = (id(1), id(2));
-        let keys = KeyQualifier::new(&[row(api, "api", &["FEAT"]), row(web, "web", &["FEAT"])]);
+        let keys = KeyQualifier::new([row(api, "api", &["FEAT"]), row(web, "web", &["FEAT"])]);
         assert_eq!(
             keys.display(id(9), "FEAT-1"),
             "FEAT-1",
@@ -159,7 +157,7 @@ mod tests {
     #[test]
     fn qualified_always_names_the_slug() {
         let (api, web) = (id(1), id(2));
-        let keys = KeyQualifier::new(&[
+        let keys = KeyQualifier::new([
             row(api, "api", &["FEAT", "TOOL"]),
             row(web, "web", &["FEAT"]),
         ]);
