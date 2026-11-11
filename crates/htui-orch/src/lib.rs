@@ -77,7 +77,7 @@ pub use graph::{
 };
 pub use isolate::{
     ChangedPaths, Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
-    IsolatorFuture, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
+    IsolatorFuture, PartTip, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
 };
 pub use recover::{Heartbeat, LeaseTimes};
 pub use secrets::RunSecrets;

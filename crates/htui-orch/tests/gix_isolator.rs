@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex};
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, RepoBoxPath, RepoId, RunId,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SnapshotCandidate, SnapshotPhase,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PremergeReport,
+    RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    SnapshotCandidate, SnapshotPhase, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::scrub::MinimalScrubber;
@@ -46,7 +47,7 @@ use htui_orch::isolate::git::testkit::{
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
     ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
-    Prepared, RepoCheckout, ResetReport,
+    PartTip, Prepared, RepoCheckout, ResetReport,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -2081,6 +2082,25 @@ impl Isolator for StallAfterReconcile<'_> {
             }
             Ok(merged)
         })
+    }
+
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        self.inner.premerge(step, trees, parts)
+    }
+
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        self.inner.unmerged(step, trees, heads, parts)
     }
 
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
