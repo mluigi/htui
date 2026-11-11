@@ -97,6 +97,15 @@
 - **F-8 (R1, adopted).** `retire_slot` retires a planner's parts and abandons its plans before the
   planner row, so a cut-short retirement replays (A6): the planner stays `done`, the loop's
   source, until the rest is retired. Pinned by `gate::tests::a_cut_short_planner_retirement_replays`.
+- **F-8 addendum (R1 repair 2).** Pinned end to end too, by the conformance cases
+  `a_cut_short_part_retirement_replays_the_loop` (a store error at the exhausted part's
+  retirement) and `a_planner_left_done_replays_the_loop` (parts and plans retired, the planner row
+  not): the resumed walk loops again and ends with the old parts retired, revision 0 `abandoned`
+  and planner attempt 2 on revision 1. A retired part keeps its attempt and `cancelled` counts as
+  failed (`divide::exhausted`), so the exhausted part rests the planner `failed` in every cut. The
+  replay re-creates the retired target before it reads the planner node, so it spends one more turn
+  of the loop's budget: MOD-138 M2 F6's hazard, which A6 cures only for `asks_you` loops and every
+  failed-source loop keeps. Not fixed here (a `walk.rs` ordering change, outside R1's files).
 
 ### Deferred from review (R1)
 

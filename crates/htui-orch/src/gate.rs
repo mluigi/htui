@@ -1319,13 +1319,18 @@ async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// every `proposed` or `admitted` plan of that planner, under the walk's fence. The parts sit
 /// past the node list, so no region names their positions.
 ///
-/// MOD-139 M2 R1 (F-8): parts and plans before the planner row, so a cut-short retirement
-/// replays (A6). Every lookup keys on the planner row (`parts_state`, `latest_parts`, the plans
-/// by `planner_step_id`), and a planner retired first would leave a crash with its parts and
-/// plan live under a `superseded` row that the walk replaces with a new attempt and nothing
-/// revisits. Retired last, the planner stays `done` until the rest is retired — still the loop's
-/// source, still read `failed` by its exhausted part — so the loop runs again and finishes. The replay is
-/// idempotent: a retired part is left alone, and a second `abandon_plans` abandons nothing.
+/// MOD-139 M2 R1 (F-8): parts and plans before the planner row, so a cut-short retirement replays
+/// (A6). Every lookup keys on the planner row (`parts_state`, `latest_parts`, the plans by
+/// `planner_step_id`), and a planner retired first would leave a crash with its parts and plan live
+/// under a `superseded` row that the walk replaces with a new attempt and nothing revisits. Retired
+/// last, the planner stays `done` until the rest is retired — still the loop's source, still read
+/// `failed` by its exhausted part (a `cancelled` part keeps its attempt, so it stays exhausted) —
+/// so the loop runs again and finishes. The replay is idempotent: a retired part is left alone,
+/// and a second `abandon_plans` abandons nothing. It is not free: the walk re-creates the retired
+/// target before it reads the planner node again, so the replay spends one more turn of the
+/// loop's budget (MOD-138 M2 F6's hazard, which A6 cures only for `asks_you` loops). Pinned end
+/// to end by the conformance cases `a_cut_short_part_retirement_replays_the_loop` and
+/// `a_planner_left_done_replays_the_loop`.
 ///
 /// # Errors
 /// Every [`EngineError`] `supersede_step`, `transition_step` and `abandon_plans` can raise, and

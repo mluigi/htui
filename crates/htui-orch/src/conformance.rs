@@ -607,11 +607,13 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// without is reset and retried alone, one in a dirty `local` tree parks, and a `local` divided
 /// node lands no part.
 ///
-/// **Four for MOD-139 M2 R1** (F-7, blueprint §T4.3): one part at a time, a cancel or a lost
+/// **Six for MOD-139 M2 R1** (F-7, F-8, blueprint §T4.3): one part at a time, a cancel or a lost
 /// lease while the first part is live leaves the second `pending`, never prepared and with no
-/// session, and a refusal of the first ends the run with the second `cancelled`; and a `failed`
+/// session, and a refusal of the first ends the run with the second `cancelled`; a `failed`
 /// planner on recovery (an admission refusal a crash cut short) is neither retried nor looped,
-/// whatever its budget: the run ends on `retry_budget_spent`.
+/// whatever its budget: the run ends on `retry_budget_spent`; and a `fails` loop's retirement of
+/// a planner slot cut short (by a store error at a part, or before the planner row) replays on
+/// the resumed walk.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -992,6 +994,10 @@ pub const CASES: &[&str] = &[
     "a_lost_lease_during_a_part_leaves_the_queued_part_pending",
     "a_part_refusal_cancels_the_queued_parts",
     "a_failed_planner_on_recovery_ends_on_the_retry_budget",
+    // MOD-139 M2 R1 (F-8, blueprint A6): a `fails` loop's retirement a store error or a crash
+    // cut short replays on the resumed walk.
+    "a_cut_short_part_retirement_replays_the_loop",
+    "a_planner_left_done_replays_the_loop",
 ];
 
 /// Run one case by name.
@@ -14513,6 +14519,12 @@ fn divided_recovery_case<'a, H: CaseHarness>(
         "a_failed_planner_on_recovery_ends_on_the_retry_budget" => Box::pin(
             a_failed_planner_on_recovery_ends_on_the_retry_budget(harness),
         ),
+        "a_cut_short_part_retirement_replays_the_loop" => {
+            Box::pin(a_cut_short_part_retirement_replays_the_loop(harness))
+        }
+        "a_planner_left_done_replays_the_loop" => {
+            Box::pin(a_planner_left_done_replays_the_loop(harness))
+        }
         _ => return None,
     })
 }
@@ -15357,6 +15369,181 @@ async fn a_failed_planner_on_recovery_ends_on_the_retry_budget<H: CaseHarness>(h
     assert!(plans_of(&other, run).await.is_empty());
 }
 
+/// MOD-139 M2 R1 (F-8, blueprint A6): a store error cuts the `fails` loop's retirement of an
+/// exhausted part's planner slot short: `plan` is retired, the exhausted `api` part's
+/// `failed -> cancelled` is refused, and `ui` and the plan are left as they were. The planner,
+/// retired last, is still `done` and its exhausted part still `failed`, so the resumed walk takes
+/// the loop again and finishes it, end to end: see [`cut_retirement_replays`].
+async fn a_cut_short_part_retirement_replays_the_loop<H: CaseHarness>(harness: &H) {
+    cut_retirement_replays(harness, false).await;
+}
+
+/// MOD-139 M2 R1 (F-8): [`a_cut_short_part_retirement_replays_the_loop`] one write later, as a
+/// crash between `abandon_plans` and the planner row's own retirement leaves it: the parts are
+/// retired and revision 0 is `abandoned`, the planner alone still `done`. A retired part keeps
+/// its attempt, and `cancelled` is a failed part (`divide::exhausted`), so the exhausted part
+/// still rests the planner `failed` and the resumed walk takes the loop again.
+async fn a_planner_left_done_replays_the_loop<H: CaseHarness>(harness: &H) {
+    cut_retirement_replays(harness, true).await;
+}
+
+/// The two R1 (F-8) replay cases. `api` is exhausted (`retry_limit 0`), the divided node has a
+/// `fails` edge back to `plan` with a budget of two, and `api`'s `failed -> cancelled` is
+/// faulted, so the loop's retirement stops after `plan`. With `by_hand`, the rest of the planner
+/// slot but the planner row is then retired by hand. The resumed walk takes the loop again and
+/// finishes it: the old parts are retired, revision 0 is `abandoned`, the planner's attempt 2
+/// admits revision 1, and no row is left `pending`.
+async fn cut_retirement_replays<H: CaseHarness>(harness: &H, by_hand: bool) {
+    use htui_core::model::PlanStatus;
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 0;
+    })
+    .await;
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "implement",
+        "plan",
+        EdgeKind::Fails,
+        None,
+        Some(2),
+    )
+    .await;
+    orch.script("implement/api", 1, ScriptedStep::done_without_output());
+    // `api` runs first and fails; while `ui` is live, `api`'s retirement (`failed -> cancelled`)
+    // is faulted.
+    let hold = orch.hold_sessions(&[("implement/ui", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let fault = async {
+        within(hold.live(1), "`ui` held").await;
+        let api = part_named(&steps_of(&orch, run).await, "implement/api").id;
+        orch.store().set_fault(MemFault::TransitionStep(api), true);
+        hold.release();
+        api
+    };
+    let (result, api) = tokio::join!(orch.claim(run), fault);
+    assert!(
+        matches!(result, Err(EngineError::Store(StoreError::Unreachable(_)))),
+        "the retirement is cut short: {result:?}"
+    );
+    orch.store().set_fault(MemFault::TransitionStep(api), false);
+    let steps = steps_of(&orch, run).await;
+    let first = planner_of(&steps);
+    assert_eq!(
+        (first.attempt, first.status),
+        (1, StepStatus::Done),
+        "the planner, the loop's source, is retired last"
+    );
+    assert_eq!(
+        part_shape(&steps, first.id),
+        [
+            shaped("implement/api", 1, StepStatus::Failed, 5),
+            shaped("implement/ui", 1, StepStatus::Done, 6),
+        ]
+    );
+    let statuses = |plans: &[htui_core::model::RunPlan]| {
+        plans.iter().map(|plan| plan.status).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        statuses(&plans_of(&orch, run).await),
+        [PlanStatus::Admitted]
+    );
+    if by_hand {
+        let now = orch.clock().now();
+        let parts = parts_of(&steps, first.id);
+        assert!(
+            orch.store()
+                .transition_step(parts[0].id, StepStatus::Failed, StepStatus::Cancelled, now)
+                .await
+                .expect("a legal move"),
+            "`api` was `failed`"
+        );
+        orch.store()
+            .supersede_step(parts[1].id)
+            .await
+            .expect("`ui` was `done`");
+        orch.store()
+            .abandon_plans(StepFence::Unleased, first.id)
+            .await
+            .expect("revision 0 was `admitted`");
+    }
+
+    let other = orch.restarted();
+    assert_eq!(adopted_next(&other, run).await, Next::Walk);
+    let resumed = other.resume(run).await;
+    stops_at_integrate(&resumed);
+    let steps = steps_of(&other, run).await;
+    // The resumed walk re-creates `plan`, the retired target, before the planner node is read
+    // again, so the replay costs one more turn of the loop's budget: MOD-138 M2 F6's hazard,
+    // which A6 cures only for `asks_you` loops, and which a failed-source loop keeps.
+    let mut plan: Vec<(i32, StepStatus)> = steps
+        .iter()
+        .filter(|step| step.position == 1)
+        .map(|step| (step.attempt, step.status))
+        .collect();
+    plan.sort_by_key(|(attempt, _)| *attempt);
+    assert_eq!(
+        plan,
+        [
+            (1, StepStatus::Superseded),
+            (2, StepStatus::Superseded),
+            (3, StepStatus::Done)
+        ],
+        "the target ran again before the replayed loop retired it"
+    );
+    let planners = rows_of_role(&steps, StepRole::Planner);
+    assert_eq!(
+        planners
+            .iter()
+            .map(|row| (row.id, row.attempt, row.status))
+            .collect::<Vec<_>>(),
+        [
+            (first.id, 1, StepStatus::Superseded),
+            (planners[1].id, 2, StepStatus::Done)
+        ],
+        "the loop ran again: {steps:?}"
+    );
+    assert_eq!(
+        part_shape(&steps, first.id),
+        [
+            shaped("implement/api", 1, StepStatus::Cancelled, 5),
+            shaped("implement/ui", 1, StepStatus::Superseded, 6),
+        ],
+        "the replay retired the old parts"
+    );
+    assert_eq!(
+        part_shape(&steps, planners[1].id),
+        [
+            shaped("implement/api@1", 1, StepStatus::Done, 7),
+            shaped("implement/ui@1", 1, StepStatus::Done, 8),
+        ]
+    );
+    let mut plans = plans_of(&other, run).await;
+    plans.sort_by_key(|plan| plan.revision);
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| (plan.revision, plan.status, plan.planner_step_id))
+            .collect::<Vec<_>>(),
+        [
+            (0, PlanStatus::Abandoned, first.id),
+            (1, PlanStatus::Admitted, planners[1].id),
+        ]
+    );
+    assert!(
+        steps.iter().all(|step| step.status != StepStatus::Pending),
+        "no part is left `pending`: {steps:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -15381,8 +15568,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            217,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 4: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            219,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -15465,8 +15652,9 @@ mod tests {
              siblings alike, a pre-MOD-163 snapshot, no entries no row), and MOD-139 M2 T3's \
              eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17), and MOD-139 M2 \
              T4's nine (a part retried alone, the exhausted divided step, its `fails` loop and \
-             re-plan, and recovery per role), and MOD-139 M2 R1's four (a cancel, a lost lease \
-             and a refusal stopping a parts round's pulls, and a failed planner on recovery)"
+             re-plan, and recovery per role), and MOD-139 M2 R1's six (a cancel, a lost lease \
+             and a refusal stopping a parts round's pulls, a failed planner on recovery, and a \
+             `fails` loop's cut-short retirement replayed twice over)"
         );
     }
 
