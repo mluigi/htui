@@ -3089,6 +3089,54 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
+    /// MOD-141 M2 D1 (blueprint C4): the clone spreads the source phase, so a phase's deadline
+    /// and judge reach its clone, and a phase with none keeps none.
+    #[tokio::test]
+    async fn override_clone_keeps_the_deadline_and_the_judge() {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let implement = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has an implement phase");
+            implement.phase.deadline_seconds = Some(900);
+            implement.phase.judge_agent_id = Some(ids::AGENT_AGY);
+            implement.phase.judge_model = Some("opus".to_owned());
+        })
+        .await;
+
+        let clone = override_graph(&store, &TestSource::claude(&store), &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+
+        let cloned = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            cloned.iter().any(|phase| phase.name == "implement"),
+            "the clone has an implement phase"
+        );
+        for phase in &cloned {
+            let want = if phase.name == "implement" {
+                (Some(900), Some(ids::AGENT_AGY), Some("opus"))
+            } else {
+                (None, None, None)
+            };
+            assert_eq!(
+                (
+                    phase.deadline_seconds,
+                    phase.judge_agent_id,
+                    phase.judge_model.as_deref()
+                ),
+                want,
+                "`{}`'s clone keeps its deadline and judge",
+                phase.name
+            );
+        }
+    }
+
     /// MOD-9 D96 (the maintainer's "check first, then refuse"): a source phase attachment whose
     /// qualified glob names a repo the project no longer has would be refused by
     /// `set_skill_binding` (D79), so the clone refuses before it writes anything — no
