@@ -427,7 +427,13 @@ async fn waiting_lists_the_workspace_items_first_and_qualifies_shared_prefixes()
         WAIT,
     )
     .await;
+    assert_eq!(narrowed.code(), 0, "{}", narrowed.pretty());
     let rows = narrowed.document["rows"].as_array().expect("rows");
+    assert!(
+        rows.iter().any(|row| row["item_key"] == "FEAT-2"),
+        "htui's FEAT-2 still waits: {}",
+        narrowed.pretty()
+    );
     assert!(
         rows.iter().all(|row| row["project"] == "htui"),
         "{}",
