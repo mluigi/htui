@@ -1434,6 +1434,10 @@ where
         {
             let notes = Box::pin(self.parts.store.notes(item)).await?;
             crate::command::unmerged_park(&step, gate::parked_unmerged(&notes, &step))?;
+            // T3 repair 2: a settle that outranks the post-check (`missing_output`, a deadline, a
+            // cap, a crashed session) parks without naming the part, so the post-check re-runs
+            // over the step's recorded capture (a read; boxed, the stack rule).
+            Box::pin(self.unmerged_answer(&run, &snapshot, &phase, &step)).await?;
         }
         self.answer_guarded(&run, &snapshot, &step, &phase, answer)
             .await
@@ -2090,15 +2094,16 @@ where
         crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
-        let steps = self.parts.store.run_steps(run.id).await?;
-        crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
         // MOD-139 M3 Confirm 3 (P-3) and ruling R-1: no integrate row is promoted, since an
         // accepted promotion would land it before its post-check; a park on
-        // `integrate_incomplete` says so in its own words (boxed read).
+        // `integrate_incomplete` says so in its own words (boxed read). Before `promote_enabled`,
+        // which refuses every integrate row in the words the worker's views show (T3 repair 2).
         if row.role == StepRole::Integrate {
             let notes = Box::pin(self.parts.store.notes(item.id)).await?;
             crate::command::integrate_promotion(&row, gate::parked_unmerged(&notes, &row))?;
         }
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
 
         // Plan D108's order: after the pure guard and before the first write.
         self.take_lease(run.id).await?;
@@ -5496,6 +5501,35 @@ where
             .unmerged(step.id, trees, heads, &stage.tips)
             .await?;
         Ok(stage.keys(&steps))
+    }
+
+    /// MOD-139 M3 Confirm 3 (T3 repair 2): the guard of an answer that would land the parked
+    /// integrate `step`. Its post-check re-runs over the trees and commits the step recorded (the
+    /// walk records them before it settles, a recovery before it re-settles), as the recovery arm
+    /// runs it; nothing is written.
+    ///
+    /// # Errors
+    /// [`EngineError::IntegrateUnmerged`] naming the parts the capture does not hold; a store,
+    /// stage or isolator read's failure.
+    async fn unmerged_answer(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        step: &RunStep,
+    ) -> Result<(), EngineError> {
+        let stage = Box::pin(self.integrate_stage(run, snapshot, node)).await?;
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let heads = self.parts.store.step_commits(step.id).await?;
+        let parts = Box::pin(self.unmerged_keys(step, &stage, &trees, &heads)).await?;
+        if parts.is_empty() {
+            return Ok(());
+        }
+        Err(EngineError::IntegrateUnmerged {
+            step: step.id,
+            node: crate::divide::divided_name(node).to_owned(),
+            parts,
+        })
     }
 
     /// `verify_command`, between the session and the settle (`docs/ANA-2.md:491-493`, plan D30).

@@ -653,6 +653,22 @@ pub enum EngineError {
         /// The parked integrate step.
         step: StepId,
     },
+    /// MOD-139 M3 Confirm 3 (T3 repair 2): a landing answer on an integrate step whose park
+    /// outranked its post-check (`missing_output`, a deadline, a cap, a crashed session), so its
+    /// note does not say `integrate_incomplete`; the post-check, re-run over the step's recorded
+    /// capture, still finds parts it does not hold. Retry is the way on.
+    #[error(
+        "step {step}: {}; approving or skipping it would land it without a part; retry it instead",
+        crate::status::integrate_incomplete(.node, .parts)
+    )]
+    IntegrateUnmerged {
+        /// The parked integrate step.
+        step: StepId,
+        /// The divided node's name.
+        node: String,
+        /// The parts' keys the capture does not hold, plan order.
+        parts: Vec<String>,
+    },
     /// MOD-139 M3 ruling R-1: a promoted integrate step could be accepted before its post-check,
     /// so no integrate row is promoted; a divided node lands only through its own settle.
     #[error(
@@ -1230,8 +1246,9 @@ pub fn retry_admitted(
 ///
 /// # Errors
 /// [`EngineError::RunStatus`], [`EngineError::NotGated`], [`EngineError::StaleSlot`],
-/// [`EngineError::ItemBlocked`], [`EngineError::PromoteCandidate`] or [`EngineError::ChatLive`],
-/// in that order.
+/// [`EngineError::ItemBlocked`], [`EngineError::PromoteCandidate`],
+/// [`EngineError::PromoteIntegrate`] (MOD-139 M3 ruling R-1: no integrate row is promoted) or
+/// [`EngineError::ChatLive`], in that order.
 pub fn promote_enabled(
     run: &Run,
     item: Status,
@@ -1265,6 +1282,11 @@ pub fn promote_enabled(
     }
     if phase.fan_out > 1 {
         return Err(EngineError::PromoteCandidate { step: step.id });
+    }
+    // MOD-139 M3 ruling R-1 (T3 repair 2): here too, not only in the engine, so the worker's
+    // views never enable a promote that would preempt a live integrate walk only to be refused.
+    if step.role == StepRole::Integrate {
+        return Err(EngineError::PromoteIntegrate { step: step.id });
     }
     if chat_open {
         return Err(EngineError::ChatLive { step: None });
@@ -2472,6 +2494,31 @@ mod tests {
             matches!(refused, EngineError::ChatLive { step: None }),
             "{refused}"
         );
+    }
+
+    /// MOD-139 M3 ruling R-1 (T3 repair 2): the guard the worker's views share refuses every
+    /// integrate row, live or parked, so a promote the engine refuses is never enabled (the
+    /// worker preempts a live walk before it dispatches a promotion).
+    #[test]
+    fn promote_is_never_enabled_on_an_integrate_row() {
+        use htui_core::model::StepRole;
+        let (mut step, phase) = review();
+        let run = parked_run();
+        step.role = StepRole::Integrate;
+        for status in [
+            StepStatus::Running,
+            StepStatus::AwaitingApproval,
+            StepStatus::Failed,
+        ] {
+            step.status = status;
+            let steps = [step.clone()];
+            let refused = promote_enabled(&run, Status::Open, &steps, &step, &phase, false)
+                .expect_err("no integrate row is promoted");
+            assert!(
+                matches!(refused, EngineError::PromoteIntegrate { step: id } if id == step.id),
+                "`{status}`: {refused}"
+            );
+        }
     }
 
     /// MOD-4 plan D166: accept needs a parked, promoted step with its document and no live chat.

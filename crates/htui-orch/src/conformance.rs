@@ -1024,6 +1024,8 @@ pub const CASES: &[&str] = &[
     "a_premerge_refusal_fails_the_integrate_and_the_run",
     // MOD-139 M3 ruling R-1: no integrate row is promoted.
     "promoting_an_integrate_step_is_refused",
+    // MOD-139 M3 T3 repair 2 (Confirm 3): a park outranking the post-check still refuses a skip.
+    "skipping_an_integrate_park_with_an_unmerged_part_is_refused",
 ];
 
 /// Run one case by name.
@@ -15767,6 +15769,9 @@ fn integrate_case<'a, H: CaseHarness>(
         "promoting_an_integrate_step_is_refused" => {
             Box::pin(promoting_an_integrate_step_is_refused(harness))
         }
+        "skipping_an_integrate_park_with_an_unmerged_part_is_refused" => Box::pin(
+            skipping_an_integrate_park_with_an_unmerged_part_is_refused(harness),
+        ),
         _ => return None,
     })
 }
@@ -16553,6 +16558,116 @@ async fn promoting_an_integrate_step_is_refused<H: CaseHarness>(harness: &H) {
     finished(&orch, run).await;
 }
 
+/// MOD-139 M3 Confirm 3 (T3 repair 2): a park whose settle outranks the post-check (here
+/// `missing_output`, the node gated `on_failure`) does not name the unmerged part in its note, so a
+/// landing answer re-runs the post-check over the step's recorded capture. The skip is refused
+/// while a part is unmerged; approve wants the document first; no row moves, nothing lands; retry
+/// runs the next attempt, which lands.
+async fn skipping_an_integrate_park_with_an_unmerged_part_is_refused<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.gate = Gate::OnFailure;
+    })
+    .await;
+    // The session's post-check, then the skip's re-check over the same capture.
+    orch.isolator().script_unmerged(&["ui"]);
+    orch.isolator().script_unmerged(&["ui"]);
+    orch.script("implement", 1, ScriptedStep::done_without_output());
+
+    let (run, result) = start_divided(&orch).await;
+    let outcome = result.expect("a park is a rest");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(3))
+    );
+    let before = steps_of(&orch, run).await;
+    let integrate = integrate_of(&before);
+    assert_eq!(integrate.status, StepStatus::AwaitingApproval);
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "step `implement` attempt 1: missing_output"),
+        "the missing document outranks the post-check: {notes:?}"
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.contains("integrate_incomplete")),
+        "{notes:?}"
+    );
+
+    let approved = orch
+        .dispatch(Command::AnswerGate {
+            run,
+            step: integrate.id,
+            answer: GateAnswer::Approved,
+        })
+        .await
+        .expect_err("approve wants the document");
+    assert!(
+        matches!(
+            approved,
+            EngineError::MissingOutputForApproval { step, .. } if step == integrate.id
+        ),
+        "{approved:?}"
+    );
+    let skipped = orch
+        .dispatch(Command::AnswerGate {
+            run,
+            step: integrate.id,
+            answer: GateAnswer::Skipped,
+        })
+        .await
+        .expect_err("a missing part is never routed around");
+    assert!(
+        matches!(
+            &skipped,
+            EngineError::IntegrateUnmerged { step, node, parts }
+                if *step == integrate.id && node == "implement" && parts == &["ui".to_owned()]
+        ),
+        "{skipped:?}"
+    );
+    assert_eq!(
+        skipped.to_string(),
+        format!(
+            "step {}: integrate_incomplete: part `ui` of `implement` is not merged; approving or \
+             skipping it would land it without a part; retry it instead",
+            integrate.id
+        )
+    );
+    assert_eq!(steps_of(&orch, run).await, before, "no row moved");
+    let log = call_log_of(&orch, run).await;
+    assert_eq!(
+        log.iter().filter(|call| *call == "unmerged 3/1/0").count(),
+        2,
+        "the session's post-check, then the skip's: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|call| call == "reconcile 3/1/0"),
+        "the park never lands: {log:?}"
+    );
+
+    orch.dispatch(Command::RetryStep {
+        run,
+        step: integrate.id,
+    })
+    .await
+    .expect("retry is the way on");
+    finished(&orch, run).await;
+    let rows = integrate_rows(&steps_of(&orch, run).await);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1], (2, StepStatus::Done));
+    let log = call_log_of(&orch, run).await;
+    assert!(
+        log.iter().any(|call| call == "reconcile 3/2/0"),
+        "the retry lands: {log:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -16577,8 +16692,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            232,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 6 + 13: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            233,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 6 + 14: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -16664,7 +16779,8 @@ mod tests {
              re-plan, and recovery per role), and MOD-139 M2 R1's six (a cancel, a lost lease \
              and a refusal stopping a parts round's pulls, a failed planner on recovery, and a \
              `fails` loop's cut-short retirement replayed twice over), and MOD-139 M3 T3's \
-             thirteen integrate cases (plan D1-D9, Confirm 2(a), 3, ruling R-1)"
+             fourteen integrate cases (plan D1-D9, Confirm 2(a), 3, ruling R-1, and T3 repair 2's \
+             skip refused over a park that outranks the post-check)"
         );
     }
 

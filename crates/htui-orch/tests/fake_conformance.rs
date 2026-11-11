@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        232,
+        233,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -71,7 +71,8 @@ fn cases_len_is_pinned() {
          a conflicted pre-merge handed to the agent, an unmerged part retried and looped, a verify \
          failure, crashes mid-pre-merge, after an unmerged session and after integrate's `done`, \
          `shared_serialized` from base refs, a dirty in-place park, the refused approval and a \
-         refused pre-merge) 231, and ruling R-1's refused promotion of an integrate row 232"
+         refused pre-merge) 231, and ruling R-1's refused promotion of an integrate row 232, \
+         and T3 repair 2's skip refused over a park outranking the post-check 233"
     );
 }
 
