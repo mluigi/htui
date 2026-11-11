@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::OwnerDocument;
+use htui_core::model::StepRole;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -35,6 +36,7 @@ use htui_core::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     StepGraphEdge,
 };
+use htui_core::model::{PlanStatus, RunPlan, RunPlanId};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -773,6 +775,9 @@ impl ReadStore for PgStore {
                    verify_exit_code,
                    promoted_at,
                    branch,
+                   role                AS "role: StepRole",
+                   parent_step_id      AS "parent_step_id: StepId",
+                   node_key,
                    updated_at
               FROM run_step
              WHERE run_id = $1
@@ -833,6 +838,11 @@ impl ReadStore for PgStore {
     /// arm's best; the outer one keeps the higher version per kind. The hand-written arm is keyed
     /// on the column, not on `s.id IS NULL` (MOD-73 plan D3). On Postgres the two coincide
     /// (`fk_document_step ... ON DELETE SET NULL`); the mirror is where they don't.
+    ///
+    /// MOD-139 D12: a divided part's document is no generic input (its integrate node reads it,
+    /// through `{{parts}}`), so the step-produced arm also skips a `role = 'part'` step. The test
+    /// sits inside the disjunction, `s.id IS NULL OR (… AND s.role <> 'part')`: a bare
+    /// `AND s.role <> 'part'` would drop every hand-written document, whose `s.role` is `NULL`.
     ///
     /// The caller's order is applied in Rust, exactly as
     /// [`documents_of_kinds`](ReadStore::documents_of_kinds) applies it and for the same two
@@ -901,7 +911,8 @@ impl ReadStore for PgStore {
                               LEFT JOIN run_step s ON s.id = d.produced_by_step_id
                              WHERE d.item_id = $1
                                AND d.kind = ANY($3::text[])
-                               AND (s.id IS NULL OR s.selected IS NOT FALSE)) arm
+                               AND (s.id IS NULL
+                                    OR (s.selected IS NOT FALSE AND s.role <> 'part'))) arm
                      WHERE arm.rank_in_arm = 1) ranked
              WHERE rank_in_kind = 1
             "#,
@@ -1192,6 +1203,34 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-139 D4: the run's revisions, `revision` order.
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        sqlx::query_as!(
+            RunPlan,
+            r#"
+            SELECT id              AS "id: RunPlanId",
+                   run_id          AS "run_id: RunId",
+                   revision,
+                   planner_step_id AS "planner_step_id: StepId",
+                   scope           AS "scope: PlanScope",
+                   status          AS "status: PlanStatus",
+                   base_position,
+                   base_refs,
+                   body,
+                   digest,
+                   created_at,
+                   updated_at
+              FROM run_plan
+             WHERE run_id = $1
+             ORDER BY revision
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// The item's live citations, each joined to the requirement as it is now, in
     /// `(area_code, number, kind)` order.
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
@@ -1465,6 +1504,9 @@ impl ReadStore for PgStore {
                        verify_exit_code,
                        promoted_at,
                        branch,
+                       role                AS "role: StepRole",
+                       parent_step_id      AS "parent_step_id: StepId",
+                       node_key,
                        updated_at
                   FROM run_step
                  WHERE run_id = ANY($1)

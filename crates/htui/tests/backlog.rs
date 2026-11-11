@@ -30,7 +30,7 @@ use htui_core::model::{
     NewItem, NewRun, NewRunStep, Note, OpenPermission, PermissionId, PermissionStatus, RelayOption,
     RelayOptionKind, RelaySessionId, Resolution, RunCommandId, RunCommandStatus, RunId, RunMode,
     RunStatus, RunStep, Scope, SnapshotGraph, SnapshotPhase, SnapshotSettings, Status, StepId,
-    StepStatus, Transport, WorkspaceSummary,
+    StepRole, StepStatus, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
@@ -1699,6 +1699,9 @@ async fn the_runs_pane_does_not_poll_a_finished_item() {
             phase_name: "unpolled".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: Some("sonnet".to_owned()),
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("the step lands");
@@ -1736,6 +1739,9 @@ async fn the_runs_pane_poll_keeps_the_cursor() {
             phase_name: "plan".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: Some("sonnet".to_owned()),
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("the second step lands");

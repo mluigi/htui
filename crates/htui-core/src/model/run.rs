@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId,
+    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId, RunPlanId,
     StepGraphId, StepId, UserId, WorkspaceId,
 };
 use crate::model::kind::{
@@ -372,6 +372,20 @@ pub struct RunStep {
     /// no `if` edge.
     #[serde(default)]
     pub branch: Option<Value>,
+    /// `run_step.role` (MOD-139 D3, ANA-33 §7.4, §7.11): what the row is. [`StepRole::Step`] on
+    /// every row written before `0029_divided_fanout.sql` and on every compete candidate and judge.
+    /// Written once, by `create_step`.
+    #[serde(default)]
+    pub role: StepRole,
+    /// `run_step.parent_step_id` (MOD-139 D3): the step this one was spawned under, a part's
+    /// planner step; `None` on every other row today. Written once.
+    #[serde(default)]
+    pub parent_step_id: Option<StepId>,
+    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11): a part's `<divided>/<part_key>`, or a
+    /// stage's `pick` | `prepare` | `collect` ([`STAGE_KEYS`]); `None` on a node of the frozen
+    /// snapshot, which `position` names. Written once.
+    #[serde(default)]
+    pub node_key: Option<String>,
     /// `run_step.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -510,7 +524,8 @@ pub struct NewRun {
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`
 /// with every settle column `NULL`. `UNIQUE (run_id, position, attempt, fanout_index)` is the
-/// database's; a repeat is `Constraint`.
+/// database's; a repeat is `Constraint`. `role`, `parent_step_id` and `node_key` must satisfy
+/// [`run_step_refusal`](crate::store::run_step_refusal) (MOD-139 D4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRunStep {
     /// `run_step.id`.
@@ -529,6 +544,12 @@ pub struct NewRunStep {
     pub agent_id: Option<AgentId>,
     /// `run_step.model`.
     pub model: Option<String>,
+    /// `run_step.role` (MOD-139 D3); [`StepRole::Step`] at every engine site in M1 (D7).
+    pub role: StepRole,
+    /// `run_step.parent_step_id` (MOD-139 D3); a part's planner step, never the step itself.
+    pub parent_step_id: Option<StepId>,
+    /// `run_step.node_key` (MOD-139 D3); a part's `<divided>/<part_key>`, a stage's key.
+    pub node_key: Option<String>,
 }
 
 /// What [`crate::store::WriteStore::finish_step`] writes: the settle columns and nothing about
@@ -550,6 +571,94 @@ pub struct StepOutcome {
     pub verify_exit_code: Option<i32>,
     /// `run_step.finished_at`.
     pub finished_at: DateTime<Utc>,
+}
+
+/// A row of `run_plan` (MOD-139 D1, D3; ANA-33 §7.2): one revision of a run's plan. Append-only in
+/// revisions; only `status` (and, at admission, `base_refs`) moves after the insert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunPlan {
+    /// `run_plan.id`.
+    pub id: RunPlanId,
+    /// `run_plan.run_id`.
+    pub run_id: RunId,
+    /// `run_plan.revision`: 0 for default parts the engine admits itself, then one per planner
+    /// submission; `UNIQUE (run_id, revision)`.
+    pub revision: i32,
+    /// `run_plan.planner_step_id`: a step of the same run.
+    pub planner_step_id: StepId,
+    /// `run_plan.scope` (`step_graph_phase.plan_scope`'s vocabulary).
+    pub scope: PlanScope,
+    /// `run_plan.status`.
+    pub status: PlanStatus,
+    /// `run_plan.base_position`: the `run_step.position` of the revision's first planned node.
+    pub base_position: i32,
+    /// `run_plan.base_refs` (`JSONB`): the primary HEAD per repo at admission; `None` until
+    /// admitted, and always set on an admitted revision (`chk_run_plan_admitted_base_refs`).
+    pub base_refs: Option<Value>,
+    /// `run_plan.body` (`JSONB`): the plan itself (ANA-33 §7.6). Untyped in M1 (D3): MOD-140's
+    /// validator owns its shape, and M2 types default parts.
+    pub body: Value,
+    /// `run_plan.digest`: sha256 over the canonical body, recomputed on resume (ANA-33 §7.2).
+    pub digest: String,
+    /// `run_plan.created_at`.
+    pub created_at: DateTime<Utc>,
+    /// `run_plan.updated_at` (an addition to §7.2, plan D1): moves with `status`; the mirror's
+    /// cursor.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::insert_run_plan`] (MOD-139 D3, D4): a revision inserted
+/// at [`PlanStatus::Proposed`] with no `base_refs`. Must pass
+/// [`run_plan_refusal`](crate::store::run_plan_refusal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRunPlan {
+    /// `run_plan.id`, client-minted.
+    pub id: RunPlanId,
+    /// `run_plan.run_id`.
+    pub run_id: RunId,
+    /// `run_plan.revision`, `>= 0`.
+    pub revision: i32,
+    /// `run_plan.planner_step_id`: a step of `run_id`.
+    pub planner_step_id: StepId,
+    /// `run_plan.scope`.
+    pub scope: PlanScope,
+    /// `run_plan.base_position`, `>= 0`.
+    pub base_position: i32,
+    /// `run_plan.body`.
+    pub body: Value,
+    /// `run_plan.digest`.
+    pub digest: String,
+}
+
+/// MOD-139 M2 D9: which revision [`crate::store::WriteStore::admit_plan`] admits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PlanToAdmit {
+    /// The engine's own revision (default parts), inserted straight at `admitted` with its
+    /// `base_refs` in one statement (0029's admitted-needs-base-refs CHECK forbids two).
+    New(NewRunPlan),
+    /// A revision already written `proposed` (MOD-140's `plan_submit`; M2 reaches it only through
+    /// a direct `insert_run_plan` in conformance), moved `proposed -> admitted`.
+    Proposed(RunPlanId),
+}
+
+/// MOD-139 M2 D9 (blueprint P-1): one admission, decided and written in one transaction by
+/// [`crate::store::WriteStore::admit_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanAdmission {
+    /// The run admitted into; a `New` plan names it too.
+    pub run_id: RunId,
+    /// The planner step: `running` before, `done` after. A `New` plan names it too, and every
+    /// part's `parent_step_id` is it.
+    pub planner_step_id: StepId,
+    /// The revision admitted.
+    pub plan: PlanToAdmit,
+    /// The primary HEAD per repo (`Isolator::base`): a JSON object of repo id to commit string,
+    /// possibly empty (an empty scope).
+    pub base_refs: Value,
+    /// Every part row, inserted `pending`; `role = part`, same run, parent = the planner.
+    pub parts: Vec<NewRunStep>,
+    /// The caller's instant: the planner's `finished_at` (`COALESCE`d).
+    pub at: DateTime<Utc>,
 }
 
 /// A row of `run_step_tree` (ANA-2 §4.6): the isolation tree of one repo for one step.
@@ -970,6 +1079,72 @@ impl NodeRole {
 }
 
 str_enum!(
+    /// `run_step.role` (MOD-139 D3, ANA-33 §7.4, §7.11; `chk_run_step_role`): what a step **row**
+    /// is. Not [`NodeRole`], the snapshot's three-value role of a frozen node: a node's role says
+    /// what the walk will create, a row's role what was created. M1 writes only `step` (D7).
+    #[derive(Default)]
+    StepRole {
+        /// An ordinary step: every row before `0029`, every compete candidate and its judge.
+        #[default]
+        Step => "step",
+        /// A divided node's planner, `<name>:plan` ([`PLAN_SUFFIX`]); MOD-139 M2 writes it.
+        Planner => "planner",
+        /// One part of an admitted plan revision: `parent_step_id` is the planner step and
+        /// `node_key` is `<divided>/<part_key>` (`chk_run_step_part`); MOD-139 M2 writes it.
+        Part => "part",
+        /// A divided node's integrate step; MOD-139 M2 writes it and M3 runs it: pre-merge,
+        /// session, post-check, landing.
+        Integrate => "integrate",
+        /// A subgraph node's step (MOD-143).
+        Subgraph => "subgraph",
+        /// A read-only consult-mode subagent (MOD-27).
+        Consult => "consult",
+        /// One of htui's own stages at positions -3..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
+        /// `chk_run_step_stage`); MOD-126 and MOD-132 write them.
+        Stage => "stage",
+    }
+);
+
+/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `pick` at -3,
+/// `prepare` at -2, `collect` at -1 (ANA-33 §7.11). `chk_run_step_stage` lists the same three; the
+/// CHECK does not bind a key to its position (blueprint F-1).
+pub const STAGE_KEYS: [&str; 3] = ["pick", "prepare", "collect"];
+
+/// The suffix of an expanded `divide` node's planner key, `<name>:plan` (MOD-138 D11). A phase may
+/// not be named with it (MOD-139 D6, [`phase_name_refusal`](crate::store::phase_name_refusal)), so a
+/// v2 snapshot's planner key never collides with a saved phase.
+pub const PLAN_SUFFIX: &str = ":plan";
+
+str_enum!(
+    /// `run_plan.status` (MOD-139 D3, ANA-33 §7.2; `chk_run_plan_status`).
+    PlanStatus {
+        /// Written by [`insert_run_plan`](crate::store::WriteStore::insert_run_plan); not yet
+        /// decided.
+        Proposed => "proposed",
+        /// Admitted: `base_refs` is set and its parts are rows (MOD-139 M2's admission).
+        Admitted => "admitted",
+        /// Refused at admission: the validator or a person said no.
+        Refused => "refused",
+        /// Left undecided once a later revision was admitted, or once the run ended.
+        Abandoned => "abandoned",
+    }
+);
+
+impl PlanStatus {
+    /// MOD-139 M2 D9: `run_plan.status`'s law, read by both stores before a status write.
+    /// `proposed -> admitted | refused | abandoned`; `admitted -> abandoned`; `refused` and
+    /// `abandoned` are terminal. 0029 holds no trigger for it (C26), so the stores are the law.
+    #[must_use]
+    pub const fn can_move_to(self, to: Self) -> bool {
+        match self {
+            Self::Proposed => matches!(to, Self::Admitted | Self::Refused | Self::Abandoned),
+            Self::Admitted => matches!(to, Self::Abandoned),
+            Self::Refused | Self::Abandoned => false,
+        }
+    }
+}
+
+str_enum!(
     /// MOD-138 D1: how the run's graph was chosen. `pick` is MOD-126's, added there.
     SourceHow {
         /// `item.step_graph_id` named the graph (an override included).
@@ -1025,9 +1200,10 @@ pub struct SnapshotEdge {
     pub loop_limit: Option<i32>,
 }
 
-/// MOD-138 D1, D11: a `divide` node's frozen block. **M1 never stores one** (resolve refuses a
-/// divide node after expanding it, D6(a)), so MOD-139 may reshape it without a compatibility
-/// concern.
+/// MOD-138 D1, D11: a `divide` node's frozen block. M1 never stored one (its resolve refused a
+/// divide node after expanding it, D6(a)), which let MOD-139 shape it freely. From MOD-139 M3
+/// resolve freezes and runs a default-parts node, so a run's snapshot holds this block and a
+/// change to it is a compatibility question.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotDivide {
     /// The `planner_*` columns.
@@ -1195,6 +1371,66 @@ pub struct RunStepCommit {
     pub before_hash: String,
     /// `run_step_commit.after_hash`.
     pub after_hash: Option<String>,
+}
+
+/// MOD-139 M3 D3: what `htui_orch::Isolator::premerge` did to integrate's tree, one entry
+/// per tree row (a repo of the run's scope), in tree-row order. One htui-core renderer turns it into
+/// integrate's protected `premerge` section and its item note (D4, D5); it is never stored
+/// structurally (Confirm 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PremergeReport {
+    /// One per integrate tree row; empty for a repo-less run (blueprint P-10).
+    pub repos: Vec<RepoPremerge>,
+}
+
+/// MOD-139 M3 D3: one repo's pre-merge, every done part in plan order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPremerge {
+    /// `run_step_tree.repo_id`.
+    pub repo_id: RepoId,
+    /// The checkout's name (`RepoCheckout.name`); the fake writes the repo id.
+    pub name: String,
+    /// The tree's `HEAD` once the pre-merge stopped.
+    pub head: String,
+    /// One per done part, plan (position) order.
+    pub parts: Vec<PartPremerge>,
+}
+
+/// MOD-139 M3 D3: one part in one repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartPremerge {
+    /// The part's step: the engine's key back to the row. Never rendered (blueprint P-9).
+    pub step: StepId,
+    /// `SnapshotPart.key`.
+    pub key: String,
+    /// The part's `after_hash` in this repo; `None` when it committed nothing here.
+    pub tip: Option<String>,
+    /// What the pre-merge did with it.
+    pub merge: PartMerge,
+}
+
+/// MOD-139 M3 D3: the five outcomes of one part's pre-merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PartMerge {
+    /// `merge --no-ff` made `commit` (subject `htui: premerge <part step>`).
+    Merged {
+        /// The merge commit.
+        commit: String,
+    },
+    /// The tip was already an ancestor of the tree's `HEAD` (the single `local` part, or a part
+    /// reached through another part's merge).
+    Contained,
+    /// No `after_hash` in this repo.
+    NoCommits,
+    /// The repo's first conflict; the merge was aborted. Paths in byte order, uncapped (the
+    /// renderer caps, D5).
+    Conflicted {
+        /// `git::conflicted_paths`' answer.
+        paths: Vec<String>,
+    },
+    /// A later part of a repo that already conflicted.
+    NotAttempted,
 }
 
 str_enum!(
@@ -2704,6 +2940,43 @@ mod tests {
         assert_eq!(
             super::RunStep {
                 branch: step.branch.clone(),
+                ..old
+            },
+            step
+        );
+    }
+
+    /// MOD-139 D3: a step encoded before `run_step.role`, `parent_step_id` and `node_key` existed
+    /// decodes as an ordinary step with neither; a part round-trips.
+    #[test]
+    fn run_step_role_defaults_when_absent() {
+        let mut step = crate::fixtures::demo_data()
+            .steps
+            .into_iter()
+            .next()
+            .expect("the fixture holds steps");
+        step.role = super::StepRole::Part;
+        step.parent_step_id = Some(StepId::new());
+        step.node_key = Some("implement/api".to_owned());
+        let mut value = serde_json::to_value(&step).expect("encodes");
+        assert_eq!(value["role"], json!("part"));
+        assert_eq!(value["node_key"], json!("implement/api"));
+        let back: super::RunStep = serde_json::from_value(value.clone()).expect("decodes");
+        assert_eq!(back, step);
+
+        let object = value.as_object_mut().expect("a step is an object");
+        for key in ["role", "parent_step_id", "node_key"] {
+            object.remove(key);
+        }
+        let old: super::RunStep = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(old.role, super::StepRole::Step);
+        assert_eq!(old.parent_step_id, None);
+        assert_eq!(old.node_key, None);
+        assert_eq!(
+            super::RunStep {
+                role: step.role,
+                parent_step_id: step.parent_step_id,
+                node_key: step.node_key.clone(),
                 ..old
             },
             step

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,\n                                  agent_id, model, status)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')\n            RETURNING id                  AS \"id: StepId\",\n                      run_id              AS \"run_id: RunId\",\n                      position,\n                      attempt,\n                      fanout_index,\n                      phase_name,\n                      agent_id            AS \"agent_id: AgentId\",\n                      model,\n                      status              AS \"status: StepStatus\",\n                      gate_outcome        AS \"gate_outcome: GateOutcome\",\n                      gate_note,\n                      selected,\n                      exit_code,\n                      prompt_digest,\n                      trim_record,\n                      usage,\n                      isolation_path,\n                      started_at,\n                      finished_at,\n                      verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                      verify_exit_code,\n                      promoted_at,\n                      branch,\n                      updated_at\n            ",
+  "query": "\n            SELECT id                  AS \"id: StepId\",\n                   run_id              AS \"run_id: RunId\",\n                   position,\n                   attempt,\n                   fanout_index,\n                   phase_name,\n                   agent_id            AS \"agent_id: AgentId\",\n                   model,\n                   status              AS \"status: StepStatus\",\n                   gate_outcome        AS \"gate_outcome: GateOutcome\",\n                   gate_note,\n                   selected,\n                   exit_code,\n                   prompt_digest,\n                   trim_record,\n                   usage,\n                   isolation_path,\n                   started_at,\n                   finished_at,\n                   verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                   verify_exit_code,\n                   promoted_at,\n                   branch,\n                   role                AS \"role: StepRole\",\n                   parent_step_id      AS \"parent_step_id: StepId\",\n                   node_key,\n                   updated_at\n              FROM run_step\n             WHERE run_id = $1\n             ORDER BY position, attempt, fanout_index\n            ",
   "describe": {
     "columns": [
       {
@@ -258,6 +258,39 @@
       },
       {
         "ordinal": 23,
+        "name": "role: StepRole",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "parent_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "parent_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "node_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "node_key"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -270,14 +303,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Text",
-        "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -304,8 +330,11 @@
       true,
       true,
       true,
+      false,
+      true,
+      true,
       false
     ]
   },
-  "hash": "a8b4d31b57d4af7b0514b2e7b72715027dce743b9c0a139967ffef9b63f5d449"
+  "hash": "f2c66afa36ccf21983cea9a9b7ef334a741df1464af86830c032a82175a55a1e"
 }

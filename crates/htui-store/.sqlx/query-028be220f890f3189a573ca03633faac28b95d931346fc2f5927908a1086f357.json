@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, promoted_at, opening, branch, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
+  "query": "\n                SELECT id                  AS \"id: StepId\",\n                       run_id              AS \"run_id: RunId\",\n                       position,\n                       attempt,\n                       fanout_index,\n                       phase_name,\n                       agent_id            AS \"agent_id: AgentId\",\n                       model,\n                       status              AS \"status: StepStatus\",\n                       gate_outcome        AS \"gate_outcome: GateOutcome\",\n                       gate_note,\n                       selected,\n                       exit_code,\n                       prompt_digest,\n                       trim_record,\n                       usage,\n                       isolation_path,\n                       started_at,\n                       finished_at,\n                       verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                       verify_exit_code,\n                       promoted_at,\n                       branch,\n                       role                AS \"role: StepRole\",\n                       parent_step_id      AS \"parent_step_id: StepId\",\n                       node_key,\n                       updated_at\n                  FROM run_step\n                 WHERE run_id = ANY($1)\n                ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id: StepId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "run_id",
+        "name": "run_id: RunId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -71,7 +71,7 @@
       },
       {
         "ordinal": 6,
-        "name": "agent_id",
+        "name": "agent_id: AgentId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "status",
+        "name": "status: StepStatus",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -104,7 +104,7 @@
       },
       {
         "ordinal": 9,
-        "name": "gate_outcome",
+        "name": "gate_outcome: GateOutcome",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -214,7 +214,7 @@
       },
       {
         "ordinal": 19,
-        "name": "verify_outcome",
+        "name": "verify_outcome: VerifyOutcome",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -247,17 +247,6 @@
       },
       {
         "ordinal": 22,
-        "name": "opening",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "run_step",
-            "name": "opening"
-          }
-        }
-      },
-      {
-        "ordinal": 23,
         "name": "branch",
         "type_info": "Jsonb",
         "origin": {
@@ -268,7 +257,40 @@
         }
       },
       {
+        "ordinal": 23,
+        "name": "role: StepRole",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "role"
+          }
+        }
+      },
+      {
         "ordinal": 24,
+        "name": "parent_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "parent_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "node_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "node_key"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -281,8 +303,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -309,9 +330,11 @@
       true,
       true,
       true,
+      false,
+      true,
       true,
       false
     ]
   },
-  "hash": "9b5bdd3703398d0e252978d07f4364cdd1fd68355266733245e7ede2c31df472"
+  "hash": "028be220f890f3189a573ca03633faac28b95d931346fc2f5927908a1086f357"
 }

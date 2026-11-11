@@ -28,7 +28,7 @@ use htui_core::model::{
     Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
     RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
     RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
-    StepOutcome, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
+    StepOutcome, StepRole, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
     WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -3189,6 +3189,7 @@ async fn a_command_run_is_counted_and_taken_by_the_project_delete() {
 ///
 /// MOD-163's two memory tables are the exception (blueprint P-6): one entry and one amend go in
 /// through the store, which is safe because the case still measures them with `count(*)`.
+/// MOD-139's `run_plan` is seeded by SQL like the first five.
 ///
 /// `workspace_box_path` is in the list and must **not** move: a project is not a workspace.
 #[tokio::test(flavor = "multi_thread")]
@@ -3315,18 +3316,31 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         matches!(amended, MemoryUpdate::Updated(ref head) if head.version == 2),
         "the re-confirming amend lands at version 2, got {amended:?}"
     );
+    // MOD-139 plan D5: one plan revision on the fixture step, so `run_plans` below is 1 rather than
+    // `0 == 0`.
+    sqlx::query(
+        "INSERT INTO run_plan (id, run_id, revision, planner_step_id, scope, base_position, \
+                               body, digest) \
+         SELECT gen_random_uuid(), s.run_id, 0, s.id, 'parts', 0, '{}'::jsonb, 'sha256:measured' \
+           FROM run_step s WHERE s.id = $1",
+    )
+    .bind(step)
+    .execute(&db.pool)
+    .await
+    .expect("seed a run_plan");
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Thirty entries for thirty fields: a field added without an entry leaves the struct literal
-    /// below incomplete and the crate does not compile. MOD-38's six requirement tables follow, in
-    /// `DeleteReach` field order, and MOD-163's two memory tables close it (plan D8).
+    /// Thirty-one entries for thirty-one fields: a field added without an entry leaves the struct
+    /// literal below incomplete and the crate does not compile. MOD-38's six requirement tables
+    /// follow, in `DeleteReach` field order, then MOD-163's two memory tables (plan D8), and
+    /// MOD-139's `run_plan` closes it.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 30] = [
+    const TABLES: [&str; 31] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3357,6 +3371,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "item_requirement",
         "memory_entry",
         "memory_entry_revision",
+        "run_plan",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -3404,8 +3419,9 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         item_requirements,
         memory_entries,
         memory_revisions,
+        run_plans,
     } = report;
-    let claimed: [u64; 30] = [
+    let claimed: [u64; 31] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3436,6 +3452,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         item_requirements,
         memory_entries,
         memory_revisions,
+        run_plans,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {
@@ -3459,9 +3476,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             command_runs,
             repo_box_paths,
             memory_entries,
-            memory_revisions
-        ) == (1, 1, 1, 1, 1, 1, 2),
-        "the eight seeded tables are non-zero, so none of them passed on `0 == 0`"
+            memory_revisions,
+            run_plans
+        ) == (1, 1, 1, 1, 1, 1, 2, 1),
+        "the nine seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;
@@ -7214,6 +7232,9 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
                 phase_name: "implement".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("create the round's step")
@@ -7357,6 +7378,9 @@ async fn leased_running_step(db: &common::TestDb) -> (RunId, StepId, uuid::Uuid)
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create the step")
@@ -7811,6 +7835,9 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
             phase_name: "implement".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create the step")
@@ -8072,6 +8099,109 @@ async fn pass_step_locks_the_step_for_update_up_front() {
     })
     .await;
     assert!(answer.expect("the pass lands"), "the running step passes");
+
+    db.drop_db().await;
+}
+
+/// MOD-139 M2 D9: an admission of one part (at position 50, `implement/api`) under `planner`,
+/// a `New` revision 0 with an empty `base_refs` (an empty repo scope's).
+fn one_part_admission(run: RunId, planner: StepId) -> htui_core::model::PlanAdmission {
+    use htui_core::model::{
+        NewRunPlan, NewRunStep, PlanAdmission, PlanScope, PlanToAdmit, RunPlanId,
+    };
+    PlanAdmission {
+        run_id: run,
+        planner_step_id: planner,
+        plan: PlanToAdmit::New(NewRunPlan {
+            id: RunPlanId::new(),
+            run_id: run,
+            revision: 0,
+            planner_step_id: planner,
+            scope: PlanScope::Parts,
+            base_position: 50,
+            body: serde_json::json!({"scope": "parts", "parts": [{"key": "api"}]}),
+            digest: "sha256:criteria".to_owned(),
+        }),
+        base_refs: serde_json::json!({}),
+        parts: vec![NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 50,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement/api".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+            role: StepRole::Part,
+            parent_step_id: Some(planner),
+            node_key: Some("implement/api".to_owned()),
+        }],
+        at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    }
+}
+
+/// The admission landed: the plan is admitted and the planner reads `done`.
+async fn assert_admitted(
+    db: &common::TestDb,
+    run: RunId,
+    planner: StepId,
+    answer: htui_core::store::Result<htui_core::model::RunPlan>,
+) {
+    assert_eq!(
+        answer.expect("the admission lands").status,
+        htui_core::model::PlanStatus::Admitted,
+        "the plan is admitted"
+    );
+    let status = db
+        .store
+        .run_steps(run)
+        .await
+        .expect("read the steps")
+        .into_iter()
+        .find(|row| row.id == planner)
+        .expect("the planner is listed")
+        .status;
+    assert_eq!(
+        status,
+        htui_core::model::StepStatus::Done,
+        "the planner is done"
+    );
+}
+
+/// MOD-139 M2 D9 (blueprint §1.5): `admit_plan` waits on a held planner holding nothing on its
+/// run (its first statement locks the planner alone), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn admit_plan_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let admission = one_part_admission(run, step);
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store.admit_plan(StepFence::Lease(owner), admission).await
+    })
+    .await;
+    assert_admitted(&db, run, step, answer).await;
+
+    db.drop_db().await;
+}
+
+/// MOD-139 M2 D9 (blueprint §1.5): `admit_plan` takes the planner's update lock up front (it
+/// moves the planner to `done` later in the transaction), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn admit_plan_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let admission = one_part_admission(run, step);
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store.admit_plan(StepFence::Lease(owner), admission).await
+    })
+    .await;
+    assert_admitted(&db, run, step, answer).await;
 
     db.drop_db().await;
 }
@@ -8718,6 +8848,9 @@ macro_rules! step_with_usage {
                 phase_name: "implement".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step lands");
@@ -10751,6 +10884,9 @@ async fn an_unknown_actor_on_a_follow_up_is_refused_before_the_status() {
             phase_name: "review".to_owned(),
             agent_id: Some(ids::AGENT_CLAUDE),
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         })
         .await
         .expect("create a pending step")
@@ -11087,6 +11223,9 @@ async fn plant_queue_facts<S: htui_core::store::WriteStore>(store: &S, facts: &Q
                 phase_name: "implement".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step");

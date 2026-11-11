@@ -20,8 +20,9 @@ use htui_core::fixtures::{self, ids};
 use htui_core::model::{
     CitationKind, DocumentId, EventKind, EventRole, ItemFilter, ItemState, LinkGraph,
     MemoryEntryId, NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent,
-    Status, StepId, StepOpening, UserId, WorkspaceSummary,
+    Status, StepId, StepOpening, StepRole, UserId, WorkspaceSummary,
 };
+use htui_core::model::{NewRunPlan, PlanScope, PlanStatus, RunPlanId};
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
 use htui_store::{Backend, CacheStore, identity};
@@ -718,6 +719,9 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
         phase_name: "implement".to_owned(),
         agent_id: Some(ids::AGENT_CLAUDE),
         model: Some("opus".to_owned()),
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
     };
     let store = &db.store;
     let claim = |run: RunId| async move {
@@ -1574,6 +1578,205 @@ async fn the_0008_branch_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-139 M1 (`cache_migrations/0010_divided_fanout.sql`): `run_step.role`, `parent_step_id` and
+/// `node_key` reach the mirror. No demo step is anything but an ordinary step, so this writes a
+/// planner, a part under it and a stage on `RUN_1` through `create_step`, refreshes, and reads the
+/// three off the mirror; every fixture step still reads `Step` with no parent and no key.
+#[tokio::test]
+async fn the_0010_step_role_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let new = |position: i32, role: StepRole, parent: Option<StepId>, key: Option<&str>| {
+        htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: None,
+            model: None,
+            role,
+            parent_step_id: parent,
+            node_key: key.map(str::to_owned),
+        }
+    };
+    let planner = db
+        .store
+        .create_step(new(50, StepRole::Planner, None, None))
+        .await
+        .expect("a planner step");
+    let part = db
+        .store
+        .create_step(new(
+            51,
+            StepRole::Part,
+            Some(planner.id),
+            Some("implement/api"),
+        ))
+        .await
+        .expect("a part step");
+    let stage = db
+        .store
+        .create_step(new(-1, StepRole::Stage, None, Some("collect")))
+        .await
+        .expect("a stage step");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let pg_steps = db.store.run_steps(ids::RUN_1).await.expect("pg run steps");
+    let mirrored = cache.run_steps(ids::RUN_1).await.expect("cache run steps");
+    assert_eq!(
+        mirrored, pg_steps,
+        "the two backends project the steps alike"
+    );
+    for written in [&planner, &part, &stage] {
+        let row = mirrored
+            .iter()
+            .find(|step| step.id == written.id)
+            .expect("the written step is mirrored");
+        assert_eq!(
+            (row.role, row.parent_step_id, row.node_key.as_deref()),
+            (
+                written.role,
+                written.parent_step_id,
+                written.node_key.as_deref()
+            ),
+            "role, parent and node key come off the mirror"
+        );
+    }
+    assert_eq!(
+        (part.role, part.parent_step_id, part.node_key.as_deref()),
+        (StepRole::Part, Some(planner.id), Some("implement/api")),
+        "Postgres stored what was asked"
+    );
+    let fixture = mirrored
+        .iter()
+        .filter(|step| ![planner.id, part.id, stage.id].contains(&step.id));
+    assert!(
+        fixture.into_iter().all(|step| step.role == StepRole::Step
+            && step.parent_step_id.is_none()
+            && step.node_key.is_none()),
+        "every fixture step is an ordinary step"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-139 M1 (plan D2): `run_plan` is mirrored on its own `updated_at` cursor. A plan written to
+/// Postgres through `insert_run_plan` reads back off the mirror, and after its status moves (raw
+/// SQL, as M2's admission will; `trg_run_plan_updated_at` moves `updated_at`) the next pass
+/// carries the new status and refs.
+#[tokio::test]
+async fn the_0010_run_plan_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let leased: bool = sqlx::query_scalar("SELECT lease_owner IS NOT NULL FROM run WHERE id = $1")
+        .bind(ids::RUN_1.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("RUN_1's lease");
+    assert!(
+        !leased,
+        "the fixture's RUN_1 is unleased, so StepFence::Unleased passes"
+    );
+    let planner = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position: 60,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: None,
+            model: None,
+            role: StepRole::Planner,
+            parent_step_id: None,
+            node_key: None,
+        })
+        .await
+        .expect("a planner step");
+    let plan = db
+        .store
+        .insert_run_plan(
+            StepFence::Unleased,
+            NewRunPlan {
+                id: RunPlanId::new(),
+                run_id: ids::RUN_1,
+                revision: 0,
+                planner_step_id: planner.id,
+                scope: PlanScope::Parts,
+                base_position: 61,
+                body: json!({"parts": [{"key": "api"}]}),
+                digest: "sha256:mirror".to_owned(),
+            },
+        )
+        .await
+        .expect("a proposed plan");
+    assert_eq!(
+        (plan.status, plan.base_refs.as_ref()),
+        (PlanStatus::Proposed, None),
+        "inserted as proposed, with no refs"
+    );
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the first pass");
+    let pg_plans = db.store.run_plans(ids::RUN_1).await.expect("pg run plans");
+    assert_eq!(
+        pg_plans,
+        vec![plan.clone()],
+        "Postgres answers the one plan"
+    );
+    assert_eq!(
+        cache.run_plans(ids::RUN_1).await.expect("cache run plans"),
+        pg_plans,
+        "the mirror answers the plan as Postgres does"
+    );
+
+    let refs = json!({"r": "abc"});
+    sqlx::query("UPDATE run_plan SET status = 'admitted', base_refs = $2 WHERE id = $1")
+        .bind(plan.id.as_uuid())
+        .bind(&refs)
+        .execute(&db.pool)
+        .await
+        .expect("admit the plan");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the second pass");
+    let mirrored = cache.run_plans(ids::RUN_1).await.expect("cache run plans");
+    assert_eq!(mirrored.len(), 1, "still the one revision");
+    assert_eq!(
+        (mirrored[0].status, mirrored[0].base_refs.as_ref()),
+        (PlanStatus::Admitted, Some(&refs)),
+        "the status move rode updated_at to the mirror"
+    );
+    assert!(
+        mirrored[0].updated_at > plan.updated_at,
+        "the trigger moved updated_at"
+    );
+    assert_eq!(
+        mirrored,
+        db.store.run_plans(ids::RUN_1).await.expect("pg run plans"),
+        "the two backends agree after the move"
+    );
+    assert!(
+        cache
+            .run_plans(RunId::new())
+            .await
+            .expect("an unknown run")
+            .is_empty(),
+        "an unknown run has no plans"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// `run_step_tree` is the seventeenth mirrored table, and — having no `updated_at` of its own —
 /// it rides its parent step's, exactly as `run_step_commit` does (ANA-2 §4.6, plan D9).
 ///
@@ -1814,6 +2017,107 @@ async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
         Some(other_runs_v5),
         "from RUN_1's seat v5 is the rank-0 row and newer than the hand-written v4, so the arms \
          are told apart and not merely ordered"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-139 D12: the mirror skips a divided part's document the way Postgres does, and keeps a
+/// hand-written one beside it (whose `s.role` is `NULL` through the `LEFT JOIN`).
+///
+/// On `RUN_1` a planner (position 60) and a part under it (61) are written, then a hand-written
+/// `notes` v1 and the part's `notes` v2 on the run's item. Both tables are seeded **before** the
+/// one pass: `run_pass` commits `document` before `run_step`, and a reader between the two would
+/// see the part's document with no step row (the accepted mid-pass lag `CacheStore::resolve_inputs`
+/// documents). From `RUN_1`'s seat the part's newer v2 is skipped, so v1 is read on both engines; a
+/// mirror without the role test would answer v2.
+#[tokio::test]
+async fn the_mirror_skips_part_documents_the_way_postgres_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let step = |position: i32, role: StepRole, parent: Option<StepId>, key: Option<&str>| {
+        htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: key.unwrap_or("implement:plan").to_owned(),
+            agent_id: None,
+            model: None,
+            role,
+            parent_step_id: parent,
+            node_key: key.map(str::to_owned),
+        }
+    };
+    let planner = db
+        .store
+        .create_step(step(60, StepRole::Planner, None, None))
+        .await
+        .expect("the planner row")
+        .id;
+    let part = db
+        .store
+        .create_step(step(
+            61,
+            StepRole::Part,
+            Some(planner),
+            Some("implement/api"),
+        ))
+        .await
+        .expect("the part row")
+        .id;
+
+    let insert = |version: i32, step: Option<StepId>| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO document (project_id, item_id, kind, version, title, body, \
+                                       produced_by_step_id, created_by) \
+                 VALUES ($1, $2, 'notes', $3, $4, 'body', $5, $6) RETURNING id",
+            )
+            .bind(ids::PROJECT_HTUI.as_uuid())
+            .bind(ids::HTUI_FEAT_1.as_uuid())
+            .bind(version)
+            .bind(format!("notes v{version}"))
+            .bind(step.map(StepId::as_uuid))
+            .bind(ids::USER.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .map(|row| row.get::<uuid::Uuid, _>("id"))
+            .expect("a notes row the resolver has to judge")
+        }
+    };
+    let hand_written = insert(1, None).await;
+    insert(2, Some(part)).await;
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that carries the two steps and the two documents");
+
+    let asked = ["notes".to_owned()];
+    let mirrored = cache
+        .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &asked)
+        .await
+        .expect("the mirror resolves");
+    assert_eq!(
+        mirrored,
+        db.store
+            .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &asked)
+            .await
+            .expect("Postgres resolves"),
+        "the two engines skip the part's document alike"
+    );
+    assert_eq!(
+        mirrored
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|document| document.id.as_uuid()),
+        Some(hand_written),
+        "the part's newer v2 is no input; the hand-written v1 is read"
     );
 
     teardown(db, &[&cache]).await;
@@ -2463,8 +2767,9 @@ async fn a_tombstoned_link_disappears_from_the_mirror() {
 async fn a_closed_item_mirrors_its_resolution() {
     assert_eq!(
         htui_store::cache::MIRRORED_TABLES.len(),
-        21,
-        "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement",
+        22,
+        "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement; \
+         MOD-139 adds run_plan",
     );
     let Some(db) = common::demo_db().await else {
         return;

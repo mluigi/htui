@@ -23,11 +23,11 @@ use htui_core::model::{
     SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
 use htui_core::model::{
-    EdgeKind, GraphScope, ItemFilter, NodeRole, Scope, SnapshotDivide, SnapshotEdge, SnapshotPart,
-    SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
+    EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
+    SnapshotPart, SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
     sort_snapshot_edges,
 };
-use htui_core::model::{MemoryState, SnapshotMemory};
+use htui_core::model::{MemoryState, PlanScope, SnapshotMemory};
 use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
@@ -295,12 +295,22 @@ pub enum ResolveError {
     /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, or the fanned-out node with an
-        /// `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
+        /// The node refused: the divided node (its planner agent, no default parts, or a
+        /// `plan_scope` past its parts; MOD-139 M3 D10), the palette phase, or the fanned-out node
+        /// with an `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
         /// the shared validator (W5), so it is an [`ResolveError::InvalidGraph`].
         node: String,
         /// Why.
         reason: NotRunnable,
+    },
+    /// MOD-139 M3 D10 (blueprint P-11): a default-parts divided node admission would refuse,
+    /// refused before any run exists. The sentence is the `RunFailure`'s, which names the node.
+    #[error("{reason}")]
+    DivideRefused {
+        /// The divided node's name.
+        node: String,
+        /// What `divide::admission_refusal` answered.
+        reason: crate::status::RunFailure,
     },
     /// The store said no.
     #[error(transparent)]
@@ -310,9 +320,17 @@ pub enum ResolveError {
 /// MOD-138 D6: why a graph this version cannot walk is refused before its run exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NotRunnable {
-    /// (a) A `divide` node, after its expansion is frozen (PRD Q1).
-    #[error("a `divide` node runs once divided fan-out lands (MOD-139)")]
-    Divide,
+    /// MOD-139 M2 D17 (PRD Q1): a divided node with a planner agent configured; MOD-140 runs it.
+    #[error("a divided node's planner agent runs from MOD-140 on")]
+    PlannerAgent,
+    /// MOD-139 M3 D10: a divided node with no default parts; only its planner can plan them.
+    #[error("a divided node with no default parts needs its planner, which runs from MOD-140 on")]
+    NoParts,
+    /// MOD-139 M3 D10: a divided node whose planner may plan past its own parts.
+    #[error(
+        "a divided node that plans past its own parts (`plan_scope` `successors` or `graph`) runs from MOD-140 and MOD-141 on"
+    )]
+    PlanScope,
     /// (b) A palette node.
     #[error("a palette node is placed by a planner, which runs from MOD-140 on")]
     Palette,
@@ -655,6 +673,11 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         // a v1 run's resume, which keeps only these phases, never reads it.
         memory: None,
     };
+    // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
+    // expanded phases; after every `NotYetRunnable`, so each of those outranks it.
+    if let Some(refusal) = divide_refusal(&snapshot) {
+        return Err(refusal);
+    }
 
     Ok(Resolution::Resolved(Box::new(Resolved {
         snapshot,
@@ -703,10 +726,14 @@ fn live_graph_refusal(
     }
 }
 
-/// MOD-138 D6: what M1 freezes but cannot walk, first refusal wins: (a) the first node, in
-/// position order, that is not a `step` (an expanded `divide` node, named by the divide phase);
-/// (b) the first palette node. M2 lifted (c), the refusal of authored edges (D10): the
-/// readiness walker runs them.
+/// MOD-138 D6: what M1 freezes but cannot walk, first refusal wins: (0) MOD-139 M2 D17, the first
+/// planner node, in position order, whose divided node configures a planner agent (named by the
+/// divided node; checked first, so it beats every other divided-node refusal); (1) MOD-139 M3 D10,
+/// per planner node in position order, a divided node with no default parts (`NoParts`), then one
+/// whose `plan_scope` is neither unset nor `parts` (`PlanScope`); (b) the first palette node. M2
+/// lifted (c), the refusal of authored edges (D10): the readiness walker runs them; M3 lifted (a),
+/// the refusal of every divided node: a default-parts node runs, refused only by what admission
+/// would refuse ([`divide_refusal`]).
 fn not_yet_runnable(phases: &[SnapshotPhase]) -> std::result::Result<(), ResolveError> {
     let refuse = |node: &str, reason| {
         Err(ResolveError::NotYetRunnable {
@@ -714,17 +741,59 @@ fn not_yet_runnable(phases: &[SnapshotPhase]) -> std::result::Result<(), Resolve
             reason,
         })
     };
-    if let Some(phase) = phases.iter().find(|phase| !phase.role.is_step()) {
-        let node = match phase.role {
-            NodeRole::Planner => phase.name.strip_suffix(PLAN_SUFFIX).unwrap_or(&phase.name),
-            _ => &phase.name,
-        };
-        return refuse(node, NotRunnable::Divide);
+    if let Some(phase) = phases.iter().find(|phase| {
+        phase.role == NodeRole::Planner
+            && phase
+                .divide
+                .as_ref()
+                .is_some_and(|divide| divide.planner.agent_id.is_some())
+    }) {
+        return refuse(
+            crate::divide::divided_name(phase),
+            NotRunnable::PlannerAgent,
+        );
+    }
+    for phase in phases
+        .iter()
+        .filter(|phase| phase.role == NodeRole::Planner)
+    {
+        let name = crate::divide::divided_name(phase);
+        if phase
+            .divide
+            .as_ref()
+            .is_none_or(|divide| divide.default_parts.is_empty())
+        {
+            return refuse(name, NotRunnable::NoParts);
+        }
+        if !matches!(phase.plan_scope, None | Some(PlanScope::Parts)) {
+            return refuse(name, NotRunnable::PlanScope);
+        }
     }
     if let Some(phase) = phases.iter().find(|phase| phase.palette) {
         return refuse(&phase.name, NotRunnable::Palette);
     }
     Ok(())
+}
+
+/// MOD-139 M3 D10 (blueprint P-11): the first planner node, in position order, whose default
+/// parts `divide::admission_refusal` refuses, as [`ResolveError::DivideRefused`] named by the
+/// divided node. Run over the frozen snapshot (its settings and expanded phases), so resolve
+/// refuses before any run exists what admission would refuse once one did.
+fn divide_refusal(snapshot: &GraphSnapshot) -> Option<ResolveError> {
+    snapshot
+        .phases
+        .iter()
+        .filter(|phase| phase.role == NodeRole::Planner)
+        .find_map(|node| {
+            let mut parts = node.divide.as_ref()?.default_parts.clone();
+            parts.sort_by_key(|part| part.position);
+            crate::divide::admission_refusal(snapshot, node, &parts).map(|reason| {
+                ResolveError::DivideRefused {
+                    node: crate::divide::divided_name(node).to_owned(),
+                    reason,
+                }
+            })
+        })
 }
 
 /// MOD-138 M2 D10 and blueprint A7, over every fanned-out node in position order, first refusal
@@ -834,9 +903,6 @@ fn local_concurrent_refusal(
     }
     Ok(())
 }
-
-/// The suffix an expanded `divide` node's planner key carries (MOD-138 D11).
-const PLAN_SUFFIX: &str = ":plan";
 
 /// `"sha256:"` + hex over `serde_json::to_string` of the typed, borrowed `{ phases, edges }`
 /// (MOD-138 D3): the digest a v2 snapshot's `topology` carries. The edges are read in the one
@@ -1427,7 +1493,9 @@ async fn orphaned_override<S: WriteStore>(
 ///
 /// The planned count is `Σ fan_out` plus one for each *judged* phase, `fan_out > 1` with a judge
 /// (OQ-1). A fanned-out phase with no judge is selected by a human and costs no agent. Retry
-/// attempts are not counted, which is the recorded deviation from `:871-872`.
+/// attempts are not counted, which is the recorded deviation from `:871-872`. A divided node
+/// (MOD-139 M2 D8) counts its planner node as its planner agent (0 with none) plus its default
+/// parts, and its integrate node as 1 ([`crate::divide::planned_sessions`]).
 fn check_fan_out_caps(
     phases: &[SnapshotPhase],
     settings: &SnapshotSettings,
@@ -1444,15 +1512,7 @@ fn check_fan_out_caps(
         });
     }
 
-    let planned: u32 = phases
-        .iter()
-        .map(|phase| {
-            // A non-positive `fan_out` plans nothing; the store's CHECK keeps it at one or more.
-            let own = u32::try_from(phase.fan_out).unwrap_or(0);
-            let judge = u32::from(phase.fan_out > 1 && phase.judge.is_some());
-            own.saturating_add(judge)
-        })
-        .fold(0, u32::saturating_add);
+    let planned = crate::divide::planned_sessions(phases, None);
     let max = settings.max_agents_per_run;
     if planned > max {
         return Err(ResolveError::AgentCap { planned, max });
@@ -5140,10 +5200,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(pin.topology, snapshot.topology, "the source is not hashed");
     }
 
-    /// MOD-138 D11, D6(a): a `divide` node is expanded (so the validator checks the expansion),
-    /// then refused until MOD-139 lands divided fan-out.
+    /// MOD-138 D11, MOD-139 M3 D10: a `divide` node is expanded (so the validator checks the
+    /// expansion), and a default-parts node admission would take resolves.
     #[tokio::test]
-    async fn a_divide_node_is_expanded_then_refused() {
+    async fn a_divide_node_is_expanded_and_resolves() {
         let store = MemStore::demo();
         replace_feature(&store, |body| {
             let node = body
@@ -5168,17 +5228,237 @@ question and not a test fix. Decide the version bump first, then paste the new d
             }];
         })
         .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a default-parts divided node resolves")
+            .snapshot;
+        let nodes: Vec<(&str, NodeRole)> = snapshot
+            .phases
+            .iter()
+            .map(|phase| (phase.name.as_str(), phase.role))
+            .collect();
+        assert_eq!(nodes[2], ("implement:plan", NodeRole::Planner));
+        assert_eq!(nodes[3], ("implement", NodeRole::Integrate));
+    }
+
+    /// The seeded `feature` graph with `implement` divided into one `api` part, its planner agent
+    /// `planner`.
+    async fn divide_feature(store: &MemStore, planner: Option<AgentId>) {
+        replace_feature(store, |body| {
+            let node = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has `implement`");
+            node.phase.split = Split::Divide;
+            node.phase.fan_out = 1;
+            node.phase.planner_agent_id = planner;
+            node.parts = vec![PhasePart {
+                phase_id: node.phase.id,
+                position: 0,
+                key: "api".to_owned(),
+                title: "The API".to_owned(),
+                brief: String::new(),
+                owned_paths: vec!["src/api".to_owned()],
+                acceptance: None,
+                agent_id: None,
+                model: None,
+                persona_id: None,
+            }];
+        })
+        .await;
+    }
+
+    /// MOD-139 M2 D17 (PRD Q1): a configured planner agent is refused first, before every other
+    /// divided-node refusal, named by the divided node.
+    #[tokio::test]
+    async fn a_planner_agent_is_refused_before_the_divide() {
+        let store = MemStore::demo();
+        divide_feature(&store, Some(ids::AGENT_CLAUDE)).await;
         let error = resolve_feat(&store, &TestSource::claude(&store))
             .await
-            .expect_err("a divide node cannot run yet");
+            .expect_err("a planner agent cannot run yet");
         assert_eq!(
             error,
             ResolveError::NotYetRunnable {
                 node: "implement".to_owned(),
-                reason: NotRunnable::Divide,
+                reason: NotRunnable::PlannerAgent,
             }
         );
-        assert!(error.to_string().contains("MOD-139"), "{error}");
+        assert!(error.to_string().contains("MOD-140"), "{error}");
+    }
+
+    /// The `implement` node of the seeded `feature` graph's body.
+    fn implement_node(body: &mut GraphBody) -> &mut NodeBody {
+        body.nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("the feature graph has `implement`")
+    }
+
+    /// MOD-139 M3 D10 (blueprint P-11): resolve refuses a configured planner agent first, then
+    /// what admission would — no default parts (`NoParts`), a `plan_scope` past the parts
+    /// (`PlanScope`), a palette node as ever, then `divide::admission_refusal`'s answer as
+    /// `DivideRefused`, whose sentence is the `RunFailure`'s.
+    #[tokio::test]
+    async fn resolve_refuses_a_planner_agent_first_then_what_admission_would() {
+        let refused = |reason| ResolveError::NotYetRunnable {
+            node: "implement".to_owned(),
+            reason,
+        };
+
+        let agent = MemStore::demo();
+        divide_feature(&agent, Some(ids::AGENT_CLAUDE)).await;
+        replace_feature(&agent, |body| implement_node(body).parts.clear()).await;
+        assert_eq!(
+            resolve_feat(&agent, &TestSource::claude(&agent))
+                .await
+                .expect_err("a planner agent beats no parts"),
+            refused(NotRunnable::PlannerAgent)
+        );
+
+        let empty = MemStore::demo();
+        divide_feature(&empty, None).await;
+        replace_feature(&empty, |body| implement_node(body).parts.clear()).await;
+        assert_eq!(
+            resolve_feat(&empty, &TestSource::claude(&empty))
+                .await
+                .expect_err("no default parts needs the planner"),
+            refused(NotRunnable::NoParts)
+        );
+
+        let scope = MemStore::demo();
+        divide_feature(&scope, None).await;
+        replace_feature(&scope, |body| {
+            implement_node(body).phase.plan_scope = Some(PlanScope::Successors);
+        })
+        .await;
+        assert_eq!(
+            resolve_feat(&scope, &TestSource::claude(&scope))
+                .await
+                .expect_err("a planner planning past its parts"),
+            refused(NotRunnable::PlanScope)
+        );
+
+        let palette = store_with(|data| {
+            let prd = feature_phase(data, "prd");
+            for phase in &mut data.phases {
+                if phase.id == prd {
+                    phase.palette = true;
+                }
+            }
+            data.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        });
+        divide_feature(&palette, None).await;
+        assert_eq!(
+            resolve_feat(&palette, &TestSource::claude(&palette))
+                .await
+                .expect_err("a palette node is still refused"),
+            ResolveError::NotYetRunnable {
+                node: "prd".to_owned(),
+                reason: NotRunnable::Palette,
+            }
+        );
+
+        let local = MemStore::demo();
+        divide_feature(&local, None).await;
+        replace_feature(&local, |body| {
+            let node = implement_node(body);
+            node.phase.isolation = Some(Isolation::Local);
+            let mut ui = node.parts[0].clone();
+            ui.position = 1;
+            ui.key = "ui".to_owned();
+            ui.title = "The UI".to_owned();
+            ui.owned_paths = vec!["src/ui".to_owned()];
+            node.parts.push(ui);
+        })
+        .await;
+        let failure = crate::status::RunFailure::LocalCannotDivide {
+            node: "implement".to_owned(),
+            parts: 2,
+        };
+        let error = resolve_feat(&local, &TestSource::claude(&local))
+            .await
+            .expect_err("`local` runs one tree");
+        assert_eq!(
+            error,
+            ResolveError::DivideRefused {
+                node: "implement".to_owned(),
+                reason: failure.clone(),
+            }
+        );
+        assert_eq!(error.to_string(), failure.to_string());
+    }
+
+    /// MOD-139 M3 D10: the two new refusals name the milestone that lifts them.
+    #[test]
+    fn not_runnable_sentences_name_their_milestone() {
+        assert_eq!(
+            NotRunnable::NoParts.to_string(),
+            "a divided node with no default parts needs its planner, which runs from MOD-140 on"
+        );
+        assert_eq!(
+            NotRunnable::PlanScope.to_string(),
+            "a divided node that plans past its own parts (`plan_scope` `successors` or `graph`) \
+             runs from MOD-140 and MOD-141 on"
+        );
+    }
+
+    /// MOD-139 M2 D8: a divided node counts its parts, not its planner node (no planner agent),
+    /// and its integrate node once. The old count, `fan_out` per node, said 4.
+    #[test]
+    fn fan_out_caps_count_parts_not_the_planner() {
+        use htui_core::model::{SnapshotPart, SnapshotPhase, SnapshotSettings};
+        let (template, _) = crate::walk::tests::fixture();
+        let template = template.phases[0].clone();
+        let node = |name: &str, position: i32, role: NodeRole| SnapshotPhase {
+            name: name.to_owned(),
+            position,
+            role,
+            fan_out: 1,
+            judge: None,
+            ..template.clone()
+        };
+        let part = |key: &str| SnapshotPart {
+            position: 0,
+            key: key.to_owned(),
+            title: key.to_owned(),
+            brief: String::new(),
+            owned_paths: Vec::new(),
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        };
+        let divide = SnapshotDivide {
+            default_parts: vec![part("api"), part("ui"), part("db")],
+            ..SnapshotDivide::default()
+        };
+        let mut planner = node("implement:plan", 1, NodeRole::Planner);
+        planner.divide = Some(divide.clone());
+        let mut integrate = node("implement", 2, NodeRole::Integrate);
+        integrate.divide = Some(divide);
+        let phases = [
+            node("prd", 0, NodeRole::Step),
+            planner,
+            integrate,
+            node("review", 3, NodeRole::Step),
+        ];
+        let settings = |max_agents_per_run| SnapshotSettings {
+            max_agents_per_run,
+            max_fan_out: 8,
+            ..template_settings()
+        };
+        assert_eq!(super::check_fan_out_caps(&phases, &settings(6)), Ok(()));
+        assert_eq!(
+            super::check_fan_out_caps(&phases, &settings(5)),
+            Err(ResolveError::AgentCap { planned: 6, max: 5 })
+        );
+    }
+
+    /// The fixture snapshot's settings.
+    fn template_settings() -> htui_core::model::SnapshotSettings {
+        crate::walk::tests::fixture().0.settings
     }
 
     /// The seeded `feature` resolve's phases and edges, for the pure tests below.

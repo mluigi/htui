@@ -8,16 +8,15 @@ use crate::model::{
     AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, IfPredicate, PersonaId,
     PhaseId, ProjectId, Split, StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
 };
-use crate::prompt::template::TemplateRole;
 use crate::seed::{default_edge_plan, default_edges};
 use crate::store::traits::{
     already_exists, back_asks_you_beside_another_asks_you, divide_columns_off_divide,
     edge_endpoint_outside_graph, edge_is_taken, edge_loop_limit_negative, edge_loops_to_itself,
     edge_needs_loop_limit, edge_predicate_mismatch, fan_out_below_one, forward_edges_form_a_cycle,
     if_predicate_outside_the_closed_set, loop_edge_runs_forward, max_parts_below_one,
-    palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_part_key_is_taken,
-    phase_position_is_taken, phase_token_budget_refusal, reserved_phase_name, retry_limit_negative,
-    row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
+    palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_name_refusal,
+    phase_part_key_is_taken, phase_position_is_taken, phase_token_budget_refusal,
+    retry_limit_negative, row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
@@ -74,7 +73,8 @@ pub fn edge_predicate(edge: &StepGraphEdge) -> Option<&EdgePredicate> {
 /// - b. per node in body order, its `graph_id` (`"step_graph_phase.graph_id"`), then each of its
 ///   candidates and parts naming another phase ([`row_names_another_phase`] `"phase_agent"` /
 ///   `"phase_part"`); then each edge's `graph_id` (`"step_graph_edge.graph_id"`);
-/// - c. per node, a reserved name ([`reserved_phase_name`]);
+/// - c. per node, a name [`phase_name_refusal`] refuses (a reserved template name, or the `:plan`
+///   suffix, MOD-139 D6);
 /// - d. per node, an id, then a position, then a name an earlier node already holds
 ///   ([`already_exists`] `"step_graph_phase"`, [`phase_position_is_taken`],
 ///   [`phase_name_is_taken`]);
@@ -122,12 +122,12 @@ pub fn graph_body_shape_refusal(graph: StepGraphId, body: &GraphBody) -> Option<
             graph,
         ));
     }
-    if let Some(node) = body
+    if let Some(refusal) = body
         .nodes
         .iter()
-        .find(|node| TemplateRole::of_name(&node.phase.name) != TemplateRole::Phase)
+        .find_map(|node| phase_name_refusal(&node.phase.name))
     {
-        return Some(reserved_phase_name(&node.phase.name));
+        return Some(refusal);
     }
     let (mut ids, mut positions, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
     for node in &body.nodes {
@@ -691,7 +691,7 @@ mod tests {
     use crate::store::traits::{
         back_asks_you_beside_another_asks_you, fan_out_below_one, forward_edges_form_a_cycle,
         if_predicate_outside_the_closed_set, loop_edge_runs_forward, phase_token_budget_refusal,
-        retry_limit_negative,
+        plan_suffix_phase_name, retry_limit_negative,
     };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
@@ -1079,6 +1079,23 @@ mod tests {
     #[test]
     fn shape_c_reserved_names() {
         let (graph, mut body) = body();
+        body.nodes[1].phase.name = "judge".to_owned();
+        assert_eq!(
+            graph_body_shape_refusal(graph, &body),
+            Some(reserved_phase_name("judge"))
+        );
+    }
+
+    /// Rule c, MOD-139 D6: a name ending in `:plan` would collide with a divided phase's planner;
+    /// a reserved template name is still refused first.
+    #[test]
+    fn shape_c_plan_suffix() {
+        let (graph, mut body) = body();
+        body.nodes[1].phase.name = "implement:plan".to_owned();
+        assert_eq!(
+            graph_body_shape_refusal(graph, &body),
+            Some(plan_suffix_phase_name("implement:plan"))
+        );
         body.nodes[1].phase.name = "judge".to_owned();
         assert_eq!(
             graph_body_shape_refusal(graph, &body),

@@ -51,15 +51,18 @@ use htui_store::testkit as common;
 /// and MOD-138 M3's W5 mixed-`asks_you` case (plan D8, Q-3) makes it 234,
 /// and MOD-147 M1's fourteen scope-row and owner-document cases (plan D1-D9, A1, A2) make it 248,
 /// and MOD-147 M2's seven key, reach, prefix, graph, run-workspace and upstream cases (plan D2-D9)
-/// make it 255.
-const EXPECTED_CASES: usize = 255;
+/// make it 255,
+/// and MOD-139 M1's nine divided fan-out record cases (plan D1, D4-D6) make it 264,
+/// and MOD-139 M1 F1's cross-run parent case makes it 265,
+/// and MOD-139 M2's nine admission, abandonment and part-input cases (plan D9, D12) make it 274.
+const EXPECTED_CASES: usize = 274;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (255 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (274 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -68,8 +71,10 @@ fn case_list_matches_mem_store() {
          cases, three for D12's usable graphs and the review round's kept-kind-graph case, and \
          MOD-144's nine item-status cases and its R1 `block_if_idle` case, and MOD-138 M2's \
          closed-`if`-set case and three `record_branch` cases, MOD-138 M3's W5 \
-         mixed-`asks_you` case, MOD-147 M1's fourteen scope-row and owner-document cases, and \
-         MOD-147 M2's seven key, reach, prefix, graph, run-workspace and upstream cases)"
+         mixed-`asks_you` case, MOD-147 M1's fourteen scope-row and owner-document cases, \
+         MOD-147 M2's seven key, reach, prefix, graph, run-workspace and upstream cases, and \
+         MOD-139 M1's nine divided fan-out record cases and its F1 cross-run parent case, and \
+         MOD-139 M2's nine admission, abandonment and part-input cases)"
     );
 }
 

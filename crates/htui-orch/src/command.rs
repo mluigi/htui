@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
     AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, ItemState, RepoId, Resolution, Run,
-    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
-    WorkspaceId, latest_graph_run, latest_live_graph_run,
+    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepRole,
+    StepStatus, WorkspaceId, latest_graph_run, latest_live_graph_run,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -635,6 +635,52 @@ pub enum EngineError {
         /// The candidate named.
         step: StepId,
     },
+    /// MOD-139 M2 D1: an operator verb named a part or a stage row, which no node maps to.
+    #[error("{}", role_row(.step, .role))]
+    RoleRow {
+        /// The row named.
+        step: StepId,
+        /// Its role: `part` or `stage`.
+        role: StepRole,
+    },
+    /// MOD-139 M3 D6 (Confirm 3, blueprint P-2, P-3): an answer that would land an integrate step
+    /// parked on a part its capture does not hold. Retry, while the budget allows, or reject (the
+    /// divided node's `fails` edge, else the run ends `rejected`) is the way on (ruling R-5).
+    #[error(
+        "step {step} is parked on integrate_incomplete: approving, skipping or promoting it would \
+         land it without a part; retry or reject it instead"
+    )]
+    IntegrateIncomplete {
+        /// The parked integrate step.
+        step: StepId,
+    },
+    /// MOD-139 M3 Confirm 3 (T3 repair 2): a landing answer on an integrate step whose park
+    /// outranked its post-check (`missing_output`, a deadline, a cap, a crashed session), so its
+    /// note does not say `integrate_incomplete`; the post-check, re-run over the step's recorded
+    /// capture, still finds parts it does not hold. Retry or reject is the way on (ruling R-5).
+    #[error(
+        "step {step}: {}; approving or skipping it would land it without a part; retry or reject \
+         it instead",
+        crate::status::integrate_incomplete(.node, .parts)
+    )]
+    IntegrateUnmerged {
+        /// The parked integrate step.
+        step: StepId,
+        /// The divided node's name.
+        node: String,
+        /// The parts' keys the capture does not hold, plan order.
+        parts: Vec<String>,
+    },
+    /// MOD-139 M3 ruling R-1: a promoted integrate step could be accepted before its post-check,
+    /// so no integrate row is promoted; a divided node lands only through its own settle.
+    #[error(
+        "step {step} is an integrate step: promoting it would land it without its post-check; \
+         answer or retry it instead"
+    )]
+    PromoteIntegrate {
+        /// The integrate step named.
+        step: StepId,
+    },
     /// Blueprint D185: a chat of this process is live. `None` for a promotion, which the one Chat
     /// tab cannot host beside another session; `Some` for an accept of the step being chatted with.
     #[error("{}", chat_is_live(.step))]
@@ -673,6 +719,14 @@ pub enum EngineError {
         /// Its status.
         status: RunStatus,
     },
+}
+
+/// [`EngineError::RoleRow`]'s two sentences (MOD-139 M2 D1).
+fn role_row(step: &StepId, role: &StepRole) -> String {
+    match role {
+        StepRole::Part => format!("step {step} is a part; a part is driven by its divided node"),
+        other => format!("step {step} is a `{other}` row; htui drives it, not an operator verb"),
+    }
 }
 
 /// [`EngineError::ChatLive`]'s two sentences.
@@ -747,6 +801,37 @@ pub fn answer_gate_enabled(
         });
     }
     Ok(())
+}
+
+/// MOD-139 M3 D6 (Confirm 3): `Err(IntegrateIncomplete)` for an `awaiting_approval` integrate
+/// row `parked_unmerged` (`gate::parked_unmerged`) read true; `Ok(())` for every other row.
+/// Called for the answers that land a step, `Approved` and `Skipped` (blueprint P-2); `Rejected`
+/// and `RetryStep` stay open.
+///
+/// # Errors
+/// [`EngineError::IntegrateIncomplete`].
+pub fn unmerged_park(step: &RunStep, parked_unmerged: bool) -> Result<(), EngineError> {
+    if step.role == StepRole::Integrate
+        && step.status == StepStatus::AwaitingApproval
+        && parked_unmerged
+    {
+        return Err(EngineError::IntegrateIncomplete { step: step.id });
+    }
+    Ok(())
+}
+
+/// MOD-139 M3 ruling R-1 (and Confirm 3, blueprint P-3): no integrate row is promoted. A park on
+/// `integrate_incomplete` answers [`unmerged_park`]'s refusal; every other integrate row
+/// [`EngineError::PromoteIntegrate`]. `Ok(())` for every other row.
+///
+/// # Errors
+/// [`EngineError::IntegrateIncomplete`] or [`EngineError::PromoteIntegrate`].
+pub fn integrate_promotion(step: &RunStep, parked_unmerged: bool) -> Result<(), EngineError> {
+    if step.role != StepRole::Integrate {
+        return Ok(());
+    }
+    unmerged_park(step, parked_unmerged)?;
+    Err(EngineError::PromoteIntegrate { step: step.id })
 }
 
 /// §6.2's "Enabled when" for `retry` (`docs/ANA-2.md:1561`): the step is `awaiting_approval` or
@@ -1059,6 +1144,45 @@ pub fn phase_at(
         })
 }
 
+/// MOD-139 M2 D1: the node a row belongs to. `step`/`planner`/`integrate` (and every other
+/// non-part, non-stage role) by `position`; a `part` by its `parent_step_id` row's position (its
+/// planner node); a `stage` row by none. `None` too when a part's parent is not in `steps`.
+#[must_use]
+pub fn node_of<'s>(
+    snapshot: &'s GraphSnapshot,
+    steps: &[RunStep],
+    step: &RunStep,
+) -> Option<&'s SnapshotPhase> {
+    let position = match step.role {
+        StepRole::Stage => return None,
+        StepRole::Part => {
+            let parent = step.parent_step_id?;
+            steps.iter().find(|row| row.id == parent)?.position
+        }
+        _ => step.position,
+    };
+    snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.position == position)
+}
+
+/// MOD-139 M2 D1: `Err(EngineError::RoleRow)` for a `part` or `stage` row, `Ok(())` otherwise.
+/// The row-taking operator verbs (`answer_gate`, `retry_step`, `promote`, `accept_artifact`)
+/// read it first: a part is driven by its divided node and a stage by htui.
+///
+/// # Errors
+/// [`EngineError::RoleRow`] naming the row and its role.
+pub fn operator_row(step: &RunStep) -> Result<(), EngineError> {
+    match step.role {
+        StepRole::Part | StepRole::Stage => Err(EngineError::RoleRow {
+            step: step.id,
+            role: step.role,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// §6.2's `retry` as the engine admits it (blueprint D184): `retry_step`'s whole order before
 /// its lease, over the rows it read.
 ///
@@ -1124,8 +1248,9 @@ pub fn retry_admitted(
 ///
 /// # Errors
 /// [`EngineError::RunStatus`], [`EngineError::NotGated`], [`EngineError::StaleSlot`],
-/// [`EngineError::ItemBlocked`], [`EngineError::PromoteCandidate`] or [`EngineError::ChatLive`],
-/// in that order.
+/// [`EngineError::ItemBlocked`], [`EngineError::PromoteCandidate`],
+/// [`EngineError::PromoteIntegrate`] (MOD-139 M3 ruling R-1: no integrate row is promoted) or
+/// [`EngineError::ChatLive`], in that order.
 pub fn promote_enabled(
     run: &Run,
     item: Status,
@@ -1159,6 +1284,11 @@ pub fn promote_enabled(
     }
     if phase.fan_out > 1 {
         return Err(EngineError::PromoteCandidate { step: step.id });
+    }
+    // MOD-139 M3 ruling R-1 (T3 repair 2): here too, not only in the engine, so the worker's
+    // views never enable a promote that would preempt a live integrate walk only to be refused.
+    if step.role == StepRole::Integrate {
+        return Err(EngineError::PromoteIntegrate { step: step.id });
     }
     if chat_open {
         return Err(EngineError::ChatLive { step: None });
@@ -1353,9 +1483,9 @@ mod tests {
 
     use super::{
         EngineError, GateAnswer, UnblockCase, accept_enabled, answer_gate_enabled, cleanup_enabled,
-        close_out_enabled, nothing_is_blocked, promote_enabled, retry_admitted, retry_enabled,
-        retry_group_enabled, run_is_walking, run_waits_at_a_gate, select_enabled, start_enabled,
-        unblock_enabled,
+        close_out_enabled, integrate_promotion, node_of, nothing_is_blocked, operator_row,
+        promote_enabled, retry_admitted, retry_enabled, retry_group_enabled, run_is_walking,
+        run_waits_at_a_gate, select_enabled, start_enabled, unblock_enabled, unmerged_park,
     };
     use crate::status::{Cursor, resumable};
 
@@ -1382,6 +1512,150 @@ mod tests {
             .find(|phase| phase.position == 3)
             .expect("the snapshot has a phase at position 3");
         (step, phase)
+    }
+
+    /// MOD-139 M2 D1: a part maps to its planner node through its parent's position, a stage to
+    /// none, every other row by its own position.
+    #[test]
+    fn node_of_maps_parts_to_their_planner_and_stages_to_none() {
+        use htui_core::model::StepRole;
+        let (review, _) = review();
+        let data = demo_data();
+        let run = data
+            .runs
+            .iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        let snapshot: GraphSnapshot = serde_json::from_value(
+            run.graph_snapshot
+                .clone()
+                .expect("RUN_1 carries a snapshot"),
+        )
+        .expect("the fixture snapshot is a `GraphSnapshot`");
+        let mut planner = review.clone();
+        planner.id = StepId::new();
+        planner.position = 2;
+        planner.role = StepRole::Planner;
+        let mut part = review.clone();
+        part.id = StepId::new();
+        part.position = 9;
+        part.role = StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        let mut stage = review.clone();
+        stage.id = StepId::new();
+        stage.position = -1;
+        stage.role = StepRole::Stage;
+        let steps = [planner.clone(), part.clone(), stage.clone(), review.clone()];
+        let at = |step: &RunStep| node_of(&snapshot, &steps, step).map(|phase| phase.position);
+        assert_eq!(at(&review), Some(3));
+        assert_eq!(at(&planner), Some(2));
+        assert_eq!(at(&part), Some(2), "a part is its planner's node");
+        assert_eq!(at(&stage), None);
+        assert_eq!(
+            node_of(&snapshot, std::slice::from_ref(&part), &part),
+            None,
+            "a part whose parent the rows lack"
+        );
+        part.parent_step_id = None;
+        assert_eq!(at(&part), None, "a parentless part");
+    }
+
+    /// MOD-139 M2 D1: the operator verbs refuse a part and a stage row, each in its sentence.
+    #[test]
+    fn operator_row_refuses_parts_and_stages() {
+        use htui_core::model::StepRole;
+        let (mut step, _) = review();
+        assert!(operator_row(&step).is_ok());
+        step.role = StepRole::Planner;
+        assert!(operator_row(&step).is_ok());
+        step.role = StepRole::Part;
+        let part = operator_row(&step).expect_err("a part is refused");
+        assert!(
+            matches!(
+                part,
+                EngineError::RoleRow {
+                    step: id,
+                    role: StepRole::Part
+                } if id == step.id
+            ),
+            "{part:?}"
+        );
+        assert_eq!(
+            part.to_string(),
+            format!(
+                "step {} is a part; a part is driven by its divided node",
+                step.id
+            )
+        );
+        step.role = StepRole::Stage;
+        assert_eq!(
+            operator_row(&step)
+                .expect_err("a stage is refused")
+                .to_string(),
+            format!(
+                "step {} is a `stage` row; htui drives it, not an operator verb",
+                step.id
+            )
+        );
+    }
+
+    /// MOD-139 M3 Confirm 3 and ruling R-1: only an `awaiting_approval` integrate row parked on
+    /// its own `integrate_incomplete` refuses a landing answer; every integrate row refuses a
+    /// promotion, the park in its own words; no other row is touched.
+    #[test]
+    fn unmerged_park_refuses_only_a_parked_integrate() {
+        use htui_core::model::StepRole;
+        let (mut step, _) = review();
+        step.status = StepStatus::AwaitingApproval;
+        assert!(unmerged_park(&step, true).is_ok(), "not an integrate row");
+        assert!(
+            integrate_promotion(&step, true).is_ok(),
+            "not an integrate row"
+        );
+        step.role = StepRole::Integrate;
+        assert!(unmerged_park(&step, false).is_ok(), "an `ok` settle's park");
+        let parked = unmerged_park(&step, true).expect_err("the park is refused");
+        assert!(
+            matches!(parked, EngineError::IntegrateIncomplete { step: id } if id == step.id),
+            "{parked:?}"
+        );
+        assert_eq!(
+            parked.to_string(),
+            format!(
+                "step {} is parked on integrate_incomplete: approving, skipping or promoting it \
+                 would land it without a part; retry or reject it instead",
+                step.id
+            )
+        );
+        assert!(
+            matches!(
+                integrate_promotion(&step, true),
+                Err(EngineError::IntegrateIncomplete { .. })
+            ),
+            "the park's own sentence first"
+        );
+        let promoted = integrate_promotion(&step, false).expect_err("no integrate is promoted");
+        assert!(
+            matches!(promoted, EngineError::PromoteIntegrate { step: id } if id == step.id),
+            "{promoted:?}"
+        );
+        assert_eq!(
+            promoted.to_string(),
+            format!(
+                "step {} is an integrate step: promoting it would land it without its \
+                 post-check; answer or retry it instead",
+                step.id
+            )
+        );
+        step.status = StepStatus::Running;
+        assert!(unmerged_park(&step, true).is_ok(), "not parked");
+        assert!(
+            matches!(
+                integrate_promotion(&step, false),
+                Err(EngineError::PromoteIntegrate { .. })
+            ),
+            "a running integrate is not promoted either"
+        );
     }
 
     /// MOD-138 D1, D4 (A2): `snapshot_of` reads v1 and v2, lifts v1 to its default edges while
@@ -2222,6 +2496,31 @@ mod tests {
             matches!(refused, EngineError::ChatLive { step: None }),
             "{refused}"
         );
+    }
+
+    /// MOD-139 M3 ruling R-1 (T3 repair 2): the guard the worker's views share refuses every
+    /// integrate row, live or parked, so a promote the engine refuses is never enabled (the
+    /// worker preempts a live walk before it dispatches a promotion).
+    #[test]
+    fn promote_is_never_enabled_on_an_integrate_row() {
+        use htui_core::model::StepRole;
+        let (mut step, phase) = review();
+        let run = parked_run();
+        step.role = StepRole::Integrate;
+        for status in [
+            StepStatus::Running,
+            StepStatus::AwaitingApproval,
+            StepStatus::Failed,
+        ] {
+            step.status = status;
+            let steps = [step.clone()];
+            let refused = promote_enabled(&run, Status::Open, &steps, &step, &phase, false)
+                .expect_err("no integrate row is promoted");
+            assert!(
+                matches!(refused, EngineError::PromoteIntegrate { step: id } if id == step.id),
+                "`{status}`: {refused}"
+            );
+        }
     }
 
     /// MOD-4 plan D166: accept needs a parked, promoted step with its document and no live chat.

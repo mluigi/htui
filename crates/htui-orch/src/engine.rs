@@ -36,11 +36,12 @@ use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, BranchFacts, Claim, CommandRunId,
     CommandRunStatus, Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED,
     FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Isolation, Item,
-    ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId,
-    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
+    ItemId, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep, NodeRole, NoteId,
+    PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
+    PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunPlanId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
     SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
+    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
     min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
@@ -69,12 +70,12 @@ use crate::fanout::{
     Route, judge_candidate, judge_inputs, judge_phase, judge_phase_name, parse_judge_verdict,
     prefilter, route,
 };
-use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
+use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput, Unmerged};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, EnvFiles, FanoutSlot, Isolator, env_files};
+use crate::isolate::{Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, PartTip, env_files};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
-use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
+use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, NOT_RESET, StepKind};
 use crate::schedule;
 use crate::secrets::RunSecrets;
 use crate::select::{self, SelectInput, Skipped, Walk};
@@ -117,9 +118,6 @@ const JUDGE_FAILED: &str = "judge failed";
 /// `run_step.gate_note` of a step the sweep failed after resetting its trees, or of a fan-out row
 /// it failed without a reset (ANA-2 `:1298`, plan D115).
 const INTERRUPTED: &str = "interrupted";
-
-/// `run_step.gate_note` of a step whose trees the sweep must not reset (ANA-2 `:1299`, D93).
-const NOT_RESET: &str = "interrupted, tree not reset";
 
 /// N2's reason for a tree stage 2 recorded dirty (plan D115).
 const DIRTY_AT_START: &str = "dirty at step start";
@@ -1052,7 +1050,7 @@ fn v1_topology(phases: &[SnapshotPhase]) -> Result<String, ResolveError> {
     let phases: Vec<SnapshotPhase> = phases
         .iter()
         .map(|phase| SnapshotPhase {
-            role: htui_core::model::NodeRole::default(),
+            role: NodeRole::default(),
             palette: false,
             plan_scope: None,
             divide: None,
@@ -1422,11 +1420,25 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let step = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&step)?;
         let phase = Self::phase_at(run.id, &snapshot, step.position)?;
         let item = Self::item_of(&run)?;
 
         let has_output = self.output_of(item, &phase, step.id).await?.is_some();
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
+        // MOD-139 M3 Confirm 3 (P-1, P-2): an approve or a skip would land an integrate parked on
+        // a part its capture does not hold; the park's reason is the item note (boxed read).
+        if step.role == StepRole::Integrate
+            && matches!(answer, GateAnswer::Approved | GateAnswer::Skipped)
+        {
+            let notes = Box::pin(self.parts.store.notes(item)).await?;
+            crate::command::unmerged_park(&step, gate::parked_unmerged(&notes, &step))?;
+            // T3 repair 2: a settle that outranks the post-check (`missing_output`, a deadline, a
+            // cap, a crashed session) parks without naming the part, so the post-check re-runs
+            // over the step's recorded capture (a read; boxed, the stack rule).
+            Box::pin(self.unmerged_answer(&run, &snapshot, &phase, &step)).await?;
+        }
         self.answer_guarded(&run, &snapshot, &step, &phase, answer)
             .await
             .map(|rest| CommandOutcome::Answered { rest })
@@ -1804,6 +1816,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
@@ -2076,8 +2090,18 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
+        // MOD-139 M3 Confirm 3 (P-3) and ruling R-1: no integrate row is promoted, since an
+        // accepted promotion would land it before its post-check; a park on
+        // `integrate_incomplete` says so in its own words (boxed read). Before `promote_enabled`,
+        // which refuses every integrate row in the words the worker's views show (T3 repair 2).
+        if row.role == StepRole::Integrate {
+            let notes = Box::pin(self.parts.store.notes(item.id)).await?;
+            crate::command::integrate_promotion(&row, gate::parked_unmerged(&notes, &row))?;
+        }
         let steps = self.parts.store.run_steps(run.id).await?;
         crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
 
@@ -2228,7 +2252,8 @@ where
         repos: &[Repo],
     ) -> Result<(String, String), EngineError> {
         let spec = match self
-            .phase_spec(run, snapshot, step, phase, item, false)
+            // MOD-139 M2 D13: a handoff opens a chat, no session beside a live sibling.
+            .phase_spec(run, snapshot, step, phase, item, false, false)
             .await?
         {
             Ok(spec) => spec,
@@ -2325,6 +2350,8 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
+        // MOD-139 M2 D1: a part or a stage row is no node's, so no operator verb takes it.
+        crate::command::operator_row(&row)?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = Self::item_of(&run)?;
         let has_output = self.output_of(item, &phase, row.id).await?.is_some();
@@ -3330,13 +3357,17 @@ where
     ///    another writer parked is still `StaleWrite`, plan D145). An outcome that ends the run
     ///    stops it: every row still unsettled is cancelled with the cut's note
     ///    ([`Self::cancel_unsettled`]) and that end is the answer. Otherwise the first park is.
+    ///    MOD-139 M2 D14, per role: a stage row is skipped; a planner row is admitted on the same
+    ///    row ([`Self::admit_parts`]: admission never ran, so no attempt is spent); a part is
+    ///    [`recover::StepKind::Part`] in [`Self::recover_step`], never landed.
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
     ///    completes the park. A rejection handed back beside it, or beside an A7 recovery's
     ///    interrupted park (R1), (`Tails::HandBack`) is finished
     ///    first, as the in-process answer's tail finishes it: an end cancels the waiting rows,
     ///    and a loop that resumed is walked ([`Next::Walk`]) before anything re-parks.
     /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
-    ///    (D131, [`Self::settle_failed`]).
+    ///    (D131, [`Self::settle_failed`]); an end cancels every unsettled row with the cut's note
+    ///    (MOD-139 M2 F-1: the parts an exhausted divided step never started).
     ///
     /// An `interrupt_step` that answers `Ok(false)` found the step moved by another writer; that
     /// step is skipped and step 3 re-derives.
@@ -3363,11 +3394,23 @@ where
             .iter()
             .filter(|step| step.status == StepStatus::Running)
         {
-            let phase = Self::phase_at(run.id, &snapshot, step.position)?;
-            match self
-                .recover_step(run, &snapshot, &phase, item, step)
-                .await?
-            {
+            // MOD-139 M2 D14: htui's own stage rows are not the walk's to recover.
+            if step.role == StepRole::Stage {
+                continue;
+            }
+            let phase = Self::node_at(run.id, &snapshot, &steps, step)?;
+            // MOD-139 M2 D14: a `running` planner is a crash before admission, which never ran:
+            // it is admitted now on the same row (no new row, no `interrupt_step`, no attempt
+            // spent). Boxed, the stack rule.
+            let recovered = if step.role == StepRole::Planner {
+                Box::pin(self.admit_parts(run, &snapshot, &phase, step))
+                    .await?
+                    .map(Self::landed)
+            } else {
+                self.recover_step(run, &snapshot, &phase, item, step)
+                    .await?
+            };
+            match recovered {
                 None => {}
                 Some(Next::Finished(rest)) => {
                     let row = self.run(run.id).await?;
@@ -3453,10 +3496,19 @@ where
             } = cursor(&snapshot, &steps)
             && let Some(failed) = steps.iter().find(|candidate| candidate.id == step)
         {
-            return Ok(self
-                .settle_failed(&row, &snapshot, failed)
-                .await?
-                .map_or(Next::Walk, Self::landed));
+            // MOD-139 M2 T4 (ruling F-1): a part recovery failed `interrupted` with no attempt
+            // left exhausts the divided step here, beside siblings the parts round never started.
+            // An end cancels every unsettled row with the cut's note, as the rejection branch
+            // above does; a linear run has none and the cut moves nothing.
+            return match Box::pin(self.settle_failed(&row, &snapshot, failed)).await? {
+                Some(rest) if rest.run.is_terminal() => {
+                    let row = self.run(run.id).await?;
+                    Box::pin(self.cancel_unsettled(&row, Some(failed.position))).await?;
+                    Ok(Next::Finished(rest))
+                }
+                Some(rest) => Ok(Self::landed(rest)),
+                None => Ok(Next::Walk),
+            };
         }
         Ok(Next::Walk)
     }
@@ -3517,6 +3569,75 @@ where
                     .await?;
                 Ok(None)
             }
+            // MOD-139 M2 D14: a part, before the `(_, …)` arms that would land it (blueprint
+            // G-6). Finished, it is `done` with its settle columns and never landed (D4: no gate,
+            // no landing); unfinished, its trees are reset and it fails `interrupted`, which the
+            // next parts round retries (or, out of attempts, the divided step fails, ruling F-1);
+            // a tree that must not be reset parks the run (D93).
+            (StepKind::Part, Adjudication::Finished { .. }) => {
+                self.finish_recovered(step, None, None, now).await?;
+                self.move_step(run.id, step.id, StepStatus::Running, StepStatus::Done, now)
+                    .await?;
+                Ok(None)
+            }
+            (StepKind::Part, Adjudication::Reset) => {
+                self.reset_part(run, phase, step, &trees).await
+            }
+            (StepKind::Part, Adjudication::NeverReset { .. }) => {
+                self.never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
+                    .await
+            }
+            // MOD-139 M3 D8: a finished integrate, before the `(_, Finished)` arm that would land
+            // it unchecked (M2 G-6's lesson): its post-check over the recorded commits feeds the
+            // re-settle, so an unmerged part fails it rather than lands it. Each await boxed (the
+            // stack rule). Reset and NeverReset stay on the plain arms.
+            //
+            // MOD-139 M3 R1 (ruling R-6): an isolator or snapshot error reading the stage or the
+            // post-check fails the step and the run as the walk's `fail_hard` does (D3: no
+            // retry). Propagated, it would note the item, release the lease and fail every later
+            // sweep's adoption again. A store, lease or stale error still propagates (A-4's
+            // transient class).
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify,
+                    verify_exit_code,
+                },
+            ) => {
+                self.finish_recovered(step, verify, verify_exit_code, now)
+                    .await?;
+                let read = match Box::pin(self.integrate_stage(run, snapshot, phase)).await {
+                    Ok(stage) => Box::pin(self.unmerged_keys(step, &stage, &trees, &commits)).await,
+                    Err(err) => Err(err),
+                };
+                let parts = match read {
+                    Ok(parts) => parts,
+                    Err(err @ (EngineError::Isolate(_) | EngineError::Snapshot { .. })) => {
+                        let reason = failure_text(&phase.name, &err);
+                        if !Box::pin(self.fail_hard(run, step, &reason)).await? {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Next::Finished(Rest {
+                            run: RunStatus::Failed,
+                            position: Some(phase.position),
+                            failure: None,
+                        })));
+                    }
+                    Err(err) => return Err(err),
+                };
+                let settled = recover::resettle(
+                    output.as_ref(),
+                    verify,
+                    snapshot.reads_verdict(&phase.name),
+                    step.started_at.unwrap_or(now),
+                    now,
+                    Some(Unmerged {
+                        node: crate::divide::divided_name(phase),
+                        parts: &parts,
+                    }),
+                );
+                Box::pin(self.land_recovered(run, snapshot, phase, step, settled)).await
+            }
             (
                 _,
                 Adjudication::Finished {
@@ -3532,6 +3653,7 @@ where
                     snapshot.reads_verdict(&phase.name),
                     step.started_at.unwrap_or(now),
                     now,
+                    None,
                 );
                 self.land_recovered(run, snapshot, phase, step, settled)
                     .await
@@ -3597,6 +3719,7 @@ where
             }
             // Plan D135: the retired review is not merged; the sweep hands the run to the walk.
             Landing::Retired => Ok(None),
+            // MOD-139 M2 (P-6): a `Landing::Retry` position is a node's, by construction.
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
                 Ok(self
@@ -3685,6 +3808,43 @@ where
         Ok(Some(Next::Parked(rest)))
     }
 
+    /// MOD-139 M2 D14: [`Self::reset_interrupted`] for a part. The isolator resets its trees (a
+    /// refusal or an error is [`Self::never_reset`]'s park, as there), and the part fails
+    /// `interrupted`. Nothing is admitted here: the node's next parts round creates the retry row
+    /// (`part_retries`, D6), and a part out of attempts fails the divided step (ruling F-1).
+    async fn reset_part(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        step: &RunStep,
+        trees: &[RunStepTree],
+    ) -> Result<Option<Next>, EngineError> {
+        match self.parts.isolator.reset(step.id, trees).await {
+            Ok(report) if report.refused.is_empty() => {}
+            Ok(report) => {
+                let reason = report
+                    .refused
+                    .iter()
+                    .map(|(_, refusal)| refusal.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return self
+                    .never_reset(run, node, step, trees, &report.labelled, &reason)
+                    .await;
+            }
+            Err(err) => {
+                return self
+                    .never_reset(run, node, step, trees, &[], &err.to_string())
+                    .await;
+            }
+        }
+        self.parts
+            .store
+            .interrupt_step(step.id, INTERRUPTED, self.now())
+            .await?;
+        Ok(None)
+    }
+
     /// D93: a tree that must not be reset is never touched. The step fails `interrupted, tree not
     /// reset`, and the run parks with every tree's path and `before_hash` in the note.
     async fn never_reset(
@@ -3735,7 +3895,21 @@ where
         snapshot: &GraphSnapshot,
         step: &RunStep,
     ) -> Result<Option<Rest>, EngineError> {
-        let phase = Self::phase_at(run.id, snapshot, step.position)?;
+        // MOD-139 M2 D1: the row's node by its role (a part's is its planner's).
+        let steps = if step.role == StepRole::Part {
+            self.parts.store.run_steps(run.id).await?
+        } else {
+            Vec::new()
+        };
+        let phase = Self::node_at(run.id, snapshot, &steps, step)?;
+        // MOD-139 M2 D6 (T4): a planner row is its divided step. `done`, it rests `failed` because
+        // a part ran out of attempts (`walk::parts_state`); `failed`, it is an admission refusal
+        // whose `block_and_fail` a crash cut off, which no `fails` edge and no retry may repeat
+        // (every refusal is deterministic, blueprint P-8), so it ends on the last rule below.
+        if step.role == StepRole::Planner && step.status == StepStatus::Done {
+            return Box::pin(self.settle_exhausted_part(run, snapshot, &phase, step)).await;
+        }
+        let planner = step.role == StepRole::Planner;
         let now = self.now();
         if step.gate_outcome == Some(GateOutcome::Rejected) {
             return self.rejection(run, snapshot, step, &phase, now).await;
@@ -3743,8 +3917,10 @@ where
         let note = step.gate_note.as_deref().unwrap_or_default();
         // MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge loops over it, in place of its
         // own `retry_limit`, on a failure of its own; an interrupted step (D92, D93) is a crash,
-        // not a failure, and keeps the retry below.
-        if !note.starts_with(INTERRUPTED) {
+        // not a failure, and keeps the retry below. A planner's own name sources no `fails` edge
+        // (`graph::expand_divide` keeps a divided node's out-edges on its integrate node), and
+        // `!planner` keeps it that way should the lookup move to `divide::divided_name`.
+        if !planner && !note.starts_with(INTERRUPTED) {
             let fails = crate::walk::Graph::of(snapshot)
                 .loop_edge(&phase.name, EdgeKind::Fails)
                 .cloned();
@@ -3753,10 +3929,10 @@ where
             }
         }
         let not_reset = note == NOT_RESET;
-        if !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
+        if !planner && !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
             return self.admit(run, snapshot, &phase, step.attempt + 1).await;
         }
-        if note.starts_with(INTERRUPTED) {
+        if !planner && note.starts_with(INTERRUPTED) {
             let trees = self.parts.store.step_trees(step.id).await?;
             let listed = trees_text(step.id, &trees, &[]);
             let body = if not_reset {
@@ -3790,6 +3966,62 @@ where
         }))
     }
 
+    /// MOD-139 M2 D6 (T4): `settle_failed` on a `done` planner row whose node rests `failed`: a
+    /// part of the planner's latest attempt is out of attempts, so the divided step failed. The
+    /// first such part in position order decides (none: the rows moved since the walk read them,
+    /// and the walk re-derives). A `fails` edge on the divided node, looked up on its integrate
+    /// node's name, loops with the planner row as its source (`gate::edge_loop` retires the
+    /// region, the planner's parts and plan with it, D11); otherwise the run fails
+    /// `part_exhausted` at the planner's position. The planner is never re-admitted here: a loop's
+    /// next planner attempt admits the next revision.
+    async fn settle_exhausted_part(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        planner: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let Some(part) = crate::divide::latest_parts(&steps, planner.id)
+            .into_iter()
+            .find(|part| crate::divide::exhausted(part, node.retry_limit))
+        else {
+            return Ok(None);
+        };
+        let divided = crate::divide::divided_name(node);
+        let fails = crate::walk::Graph::of(snapshot)
+            .loop_edge(divided, EdgeKind::Fails)
+            .cloned();
+        if let Some(edge) = fails {
+            return Box::pin(self.loop_over(run.id, snapshot, planner, &edge)).await;
+        }
+        let failure = RunFailure::PartExhausted {
+            node: divided.to_owned(),
+            part: part
+                .node_key
+                .as_deref()
+                .and_then(crate::divide::part_key)
+                .unwrap_or_default()
+                .to_owned(),
+            attempts: part.attempt,
+        };
+        self.parts
+            .store
+            .finish_run(
+                run.id,
+                RunStatus::Failed,
+                Some(&failure.to_string()),
+                self.now(),
+            )
+            .await?;
+        self.cleanup_walk(run.id).await?;
+        Ok(Some(Rest {
+            run: RunStatus::Failed,
+            position: Some(planner.position),
+            failure: Some(failure),
+        }))
+    }
+
     /// Plan D94: park a run whose `step` the sweep already failed — `park_run`'s order: the run
     /// `running -> awaiting_approval`, then the note (MOD-144: the item is not written).
     /// `run.failure` stays NULL (R-3); the typed reason is the [`Rest`]'s.
@@ -3807,11 +4039,18 @@ where
         if let Some(item) = run.item_id {
             self.note(item, note, Some(step.id), now).await?;
         }
+        // MOD-139 M2 (T4 repair 2): a part's park stands on its divided node, the planner's
+        // position (`status::position_of`), and names the part, never the planner node.
+        let position = if step.role == StepRole::Part {
+            phase.position
+        } else {
+            step.position
+        };
         Ok(Rest {
             run: RunStatus::AwaitingApproval,
-            position: Some(step.position),
+            position: Some(position),
             failure: Some(RunFailure::Interrupted {
-                phase: phase.name.clone(),
+                phase: interrupted_name(step, phase).to_owned(),
                 reset,
             }),
         })
@@ -4046,9 +4285,20 @@ where
                 self.select_stage(row, snapshot, &phase, attempt).await
             }
             Cursor::Run(step) => match find(step) {
+                // MOD-139 M2 D1, D2: a row maps to its node by role; a planner node runs admission,
+                // not a session (boxed, the stack rule).
                 Some(step) => {
-                    let phase = Self::phase_at(run, snapshot, step.position)?;
-                    self.walk_step(row, snapshot, step, &phase).await
+                    let phase = Self::node_at(run, snapshot, steps, &step)?;
+                    match phase.role {
+                        NodeRole::Planner => {
+                            Box::pin(self.admit_planner(row, snapshot, &phase, step)).await
+                        }
+                        // MOD-139 M3 D1: integrate is a session step on the plain path, its
+                        // hooks inside `walk_live_step`.
+                        NodeRole::Integrate | NodeRole::Step => {
+                            self.walk_step(row, snapshot, step, &phase).await
+                        }
+                    }
                 }
                 None => Ok(None),
             },
@@ -4063,6 +4313,11 @@ where
                 Some(step) => Box::pin(self.loop_back(run, snapshot, &step, &to)).await,
                 None => Ok(None),
             },
+            // MOD-139 M2 D4: one future drives a divided node's parts round (boxed, the stack rule).
+            Cursor::Parts { position } => {
+                let phase = Self::phase_at(run, snapshot, position)?;
+                Box::pin(self.drive_parts(row, snapshot, &phase)).await
+            }
             Cursor::Rest { .. } | Cursor::Finished => {
                 debug_assert!(false, "plan_pass answers {cursor:?} itself");
                 Ok(None)
@@ -4154,7 +4409,8 @@ where
                     .phases
                     .into_iter()
                     .find(|phase| phase.position == position)
-                    .map(|phase| phase.name),
+                    // MOD-139 M2 (P-19): a planner ender is named by its divided node.
+                    .map(|phase| crate::divide::divided_name(&phase).to_owned()),
                 Err(err) => {
                     tracing::warn!(run = %run.id, %err, "the cut cannot read the run's snapshot to name its ender");
                     None
@@ -4164,10 +4420,13 @@ where
         let now = self.now();
         let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
-            if !matches!(
-                step.status,
-                StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
-            ) {
+            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut.
+            if step.role == StepRole::Stage
+                || !matches!(
+                    step.status,
+                    StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
+                )
+            {
                 continue;
             }
             match self
@@ -4345,7 +4604,8 @@ where
                 | ResolveError::ReviewFanOut { .. }
                 | ResolveError::LocalFanOut { .. }
                 | ResolveError::NoCandidate { .. }
-                | ResolveError::UnknownTouchedRepo { .. }),
+                | ResolveError::UnknownTouchedRepo { .. }
+                | ResolveError::DivideRefused { .. }),
             ) => {
                 let body = format!(
                     "live graph not comparable: run {run} walks its snapshot `{lifted}` \
@@ -4558,6 +4818,10 @@ where
                     phase_name: phase.name.clone(),
                     agent_id: Some(chosen.agent_id),
                     model: Some(chosen.model),
+                    // MOD-139 M2 D2: a planner node's row is a `planner` row keyed by its node.
+                    role: crate::divide::row_role(phase.role),
+                    parent_step_id: None,
+                    node_key: (phase.role == NodeRole::Planner).then(|| phase.name.clone()),
                 })
                 .await?;
         }
@@ -4836,10 +5100,25 @@ where
         Box::pin(self.secrets_ready(run))
             .await?
             .map_err(EngineError::Secrets)?;
+        // MOD-139 M3 D1: integrate's inputs, read once and shared by its hooks; every hook below is
+        // a no-op for any other node. Prepared from the plan's `base_refs` (no slot under `local`).
+        let integrate = if phase.role == NodeRole::Integrate {
+            Some(Box::pin(self.integrate_stage(run, snapshot, phase)).await?)
+        } else {
+            None
+        };
         let prepared = self
             .parts
             .isolator
-            .prepare(run.id, step.id, &run.repo_scope, phase.isolation, None)
+            .prepare(
+                run.id,
+                step.id,
+                &run.repo_scope,
+                phase.isolation,
+                integrate
+                    .as_ref()
+                    .and_then(|stage| stage.slot(phase.isolation)),
+            )
             .await?;
         let trees: Vec<_> = prepared
             .trees
@@ -4850,6 +5129,12 @@ where
             .store
             .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &trees)
             .await?;
+        // MOD-139 M3 D3, D4: the deterministic pre-merge of the done parts, after the tree rows and
+        // before the commits are recorded (P-21); its report is the item note and stage 3's.
+        let premerge = match &integrate {
+            Some(stage) => Some(Box::pin(self.premerge(run, step, phase, stage, &trees)).await?),
+            None => None,
+        };
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -4866,8 +5151,27 @@ where
             .await?;
 
         // -- stage 3: prompt ------------------------------------------------------------------
+        // MOD-139 M3 D5: integrate's `premerge` and `parts` sections.
+        let integrate_prompt = match (&integrate, premerge) {
+            (Some(stage), Some(report)) => {
+                Some(Box::pin(self.integrate_prompt(run, phase, stage, report)).await?)
+            }
+            _ => None,
+        };
+        // MOD-139 M2 D13: read once, so the prompt's section and the session's exposure agree.
+        let live =
+            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
         let prompt = match self
-            .assemble_prompt(run, snapshot, step, phase, item)
+            .assemble_prompt(
+                run,
+                snapshot,
+                step,
+                phase,
+                item,
+                None,
+                live,
+                integrate_prompt.as_ref(),
+            )
             .await?
         {
             Ok(prompt) => prompt,
@@ -4949,6 +5253,7 @@ where
                 prepared.cwd,
                 prepared.extra_dirs,
                 started_at,
+                live,
             )
             .await?;
         if let Ok(done) = &result {
@@ -4982,6 +5287,14 @@ where
             .await?;
         // MOD-24 D1 (K4): the `after` commits are recorded; `finish_step` is not.
         crate::kill_point::reached(KillPoint::Captured, Site::step(step));
+        // MOD-139 M3 D6: integrate's post-check over its capture, only when the session returned
+        // `Ok` (as verify runs): its answer outranks verify's in `settle`.
+        let unmerged = match &integrate {
+            Some(stage) if result.is_ok() => {
+                Some(Box::pin(self.unmerged_keys(step, stage, &trees, &after)).await?)
+            }
+            _ => None,
+        };
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         let settled = gate::settle(&SettleInput {
@@ -4995,6 +5308,10 @@ where
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
             reads_verdict: snapshot.reads_verdict(&phase.name),
+            unmerged: unmerged.as_deref().map(|parts| Unmerged {
+                node: crate::divide::divided_name(phase),
+                parts,
+            }),
         });
         self.parts
             .store
@@ -5030,6 +5347,7 @@ where
             // Plan D135: the loop retired the review, so there is no winner to merge; the next
             // pass creates the loop's next attempt.
             Landing::Retired => Ok(None),
+            // MOD-139 M2 (P-6): a `Landing::Retry` position is a node's, by construction.
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
                 self.admit(&row, snapshot, &phase, attempt).await
@@ -5044,6 +5362,198 @@ where
                 Ok(Some(rest))
             }
         }
+    }
+
+    /// MOD-139 M3 D1: what one integrate attempt reads, read once and shared by its hooks: the
+    /// divided node's latest done planner, its admitted plan (decoded by [`plan_parts`], the parts
+    /// round's own decode) and a [`PartTip`] per latest done part, in plan order.
+    ///
+    /// # Errors
+    /// [`EngineError::Snapshot`] when [`crate::divide::integrate_inputs`] finds nothing: integrate
+    /// is reached only after the parts round read the node `Done`, so that is an engine error and
+    /// never a fallback; a store read's failure.
+    async fn integrate_stage(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+    ) -> Result<IntegrateStage, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let plans = self.parts.store.run_plans(run.id).await?;
+        let inputs =
+            crate::divide::integrate_inputs(snapshot, node, &steps, &plans).ok_or_else(|| {
+                EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!(
+                        "integrate node `{}` has no done planner, admitted plan or done parts",
+                        node.name
+                    ),
+                }
+            })?;
+        let (base, planned) = plan_parts(run.id, &inputs.plan)?;
+        let mut tips = Vec::with_capacity(inputs.parts.len());
+        for part in &inputs.parts {
+            tips.push(PartTip {
+                step: part.id,
+                key: part
+                    .node_key
+                    .as_deref()
+                    .and_then(crate::divide::part_key)
+                    .unwrap_or_default()
+                    .to_owned(),
+                trees: self.parts.store.step_trees(part.id).await?,
+                commits: self.parts.store.step_commits(part.id).await?,
+            });
+        }
+        Ok(IntegrateStage {
+            base,
+            planned,
+            tips,
+        })
+    }
+
+    /// MOD-139 M3 D3, D4: the isolator's pre-merge of `stage`'s parts into integrate's `trees`,
+    /// and its item note via the step, written once per attempt (recovery re-runs included) and
+    /// skipped for a report with no repo (blueprint P-10). A conflict is the agent's work; every
+    /// `Err` fails the step and the run through `walk_step`'s `fail_hard` (D3).
+    async fn premerge(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        node: &SnapshotPhase,
+        stage: &IntegrateStage,
+        trees: &[RunStepTree],
+    ) -> Result<htui_core::model::PremergeReport, EngineError> {
+        let report = self
+            .parts
+            .isolator
+            .premerge(step.id, trees, &stage.tips)
+            .await?;
+        if let Some(body) = htui_core::prompt::premerge_note(
+            crate::divide::divided_name(node),
+            step.attempt,
+            &report,
+        ) {
+            self.note(Self::item_of(run)?, body, Some(step.id), self.now())
+                .await?;
+        }
+        Ok(report)
+    }
+
+    /// MOD-139 M3 D5 (P-17): integrate's two prompt sections. Per part, in plan order: its key and
+    /// title, its tip per repo it committed to (by the project's repo name, the id when there is
+    /// none), its diffstat (`Isolator::diff`; an error is a withheld-if-unmaskable trim note and
+    /// no stat, `forwarded`'s shape) and its highest-version output document's body.
+    async fn integrate_prompt(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        stage: &IntegrateStage,
+        premerge: htui_core::model::PremergeReport,
+    ) -> Result<IntegratePrompt, EngineError> {
+        let item = Self::item_of(run)?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let name_of = |repo: RepoId| {
+            repos
+                .iter()
+                .find(|row| row.id == repo)
+                .map_or_else(|| repo.to_string(), |row| row.name.clone())
+        };
+        let mut notes = Vec::new();
+        let mut parts = Vec::with_capacity(stage.tips.len());
+        for tip in &stage.tips {
+            let tips = tip
+                .commits
+                .iter()
+                .filter_map(|commit| {
+                    commit
+                        .after_hash
+                        .as_ref()
+                        .filter(|after| **after != commit.before_hash)
+                        .map(|after| (name_of(commit.repo_id), after.clone()))
+                })
+                .collect();
+            let diff = match self.parts.isolator.diff(&tip.trees, &tip.commits).await {
+                Ok(diff) => diff,
+                Err(err) => {
+                    // MOD-9 D132's rule: git's stderr can name a checkout path.
+                    let mut note = [format!(
+                        "parts: diffstat of part `{}` unavailable: {err}",
+                        tip.key
+                    )];
+                    withhold_unmaskable_notes(&mut note, self.parts.scrubber);
+                    notes.extend(note);
+                    None
+                }
+            };
+            let body = self
+                .output_of(item, node, tip.step)
+                .await?
+                .map(|document| document.body);
+            let title = stage
+                .planned
+                .iter()
+                .find(|part| part.key == tip.key)
+                .map_or_else(|| tip.key.clone(), |part| part.title.clone());
+            parts.push(htui_core::prompt::IntegratePart {
+                key: tip.key.clone(),
+                title,
+                tips,
+                diff,
+                body,
+            });
+        }
+        Ok(IntegratePrompt {
+            premerge,
+            parts,
+            notes,
+        })
+    }
+
+    /// MOD-139 M3 D6 (Confirm 2(a)): the keys of the parts integrate's capture `heads` does not
+    /// hold, in plan order (`Isolator::unmerged`, a read).
+    async fn unmerged_keys(
+        &self,
+        step: &RunStep,
+        stage: &IntegrateStage,
+        trees: &[RunStepTree],
+        heads: &[RunStepCommit],
+    ) -> Result<Vec<String>, EngineError> {
+        let steps = self
+            .parts
+            .isolator
+            .unmerged(step.id, trees, heads, &stage.tips)
+            .await?;
+        Ok(stage.keys(&steps))
+    }
+
+    /// MOD-139 M3 Confirm 3 (T3 repair 2): the guard of an answer that would land the parked
+    /// integrate `step`. Its post-check re-runs over the trees and commits the step recorded (the
+    /// walk records them before it settles, a recovery before it re-settles), as the recovery arm
+    /// runs it; nothing is written.
+    ///
+    /// # Errors
+    /// [`EngineError::IntegrateUnmerged`] naming the parts the capture does not hold; a store,
+    /// stage or isolator read's failure.
+    async fn unmerged_answer(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        step: &RunStep,
+    ) -> Result<(), EngineError> {
+        let stage = Box::pin(self.integrate_stage(run, snapshot, node)).await?;
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let heads = self.parts.store.step_commits(step.id).await?;
+        let parts = Box::pin(self.unmerged_keys(step, &stage, &trees, &heads)).await?;
+        if parts.is_empty() {
+            return Ok(());
+        }
+        Err(EngineError::IntegrateUnmerged {
+            step: step.id,
+            node: crate::divide::divided_name(node).to_owned(),
+            parts,
+        })
     }
 
     /// `verify_command`, between the session and the settle (`docs/ANA-2.md:491-493`, plan D30).
@@ -5306,8 +5816,11 @@ where
             .group_base(run, &steps, phase.position, attempt)
             .await?;
         let item = Self::item_of(run)?;
+        // MOD-139 M2 D13: once for the group, as its one prompt is; a compete group's siblings
+        // are live, and `fan_out > 1` exposes it anyway.
+        let live = crate::divide::live_siblings(&steps, first.id);
         let prompt = match self
-            .assemble_prompt(run, snapshot, first, phase, item)
+            .assemble_prompt(run, snapshot, first, phase, item, None, live, None)
             .await?
         {
             Ok(prompt) => prompt,
@@ -5365,6 +5878,7 @@ where
                 base: &base,
                 persona,
                 reads_verdict: snapshot.reads_verdict(&phase.name),
+                live_siblings: live,
             })
         }))
         .await;
@@ -5655,6 +6169,7 @@ where
             base,
             persona,
             reads_verdict,
+            live_siblings,
         } = *stage;
         let item = Self::item_of(run)?;
 
@@ -5738,6 +6253,7 @@ where
                 prepared.cwd.clone(),
                 prepared.extra_dirs,
                 deadline,
+                live_siblings,
                 &mut recorder,
             )
             .await
@@ -5790,6 +6306,7 @@ where
             output: output.as_ref(),
             verify_outcome: None,
             reads_verdict,
+            unmerged: None,
         });
         self.parts
             .store
@@ -5861,6 +6378,798 @@ where
             format!(
                 "fan-out candidate {} of `{}` attempt {}: {reason}",
                 step.fanout_index, phase.name, step.attempt
+            ),
+            Some(step.id),
+            now,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    // -- divided nodes: admission and parts (MOD-139 M2 D2, D4, D5, D7, D8) --------------------
+
+    /// MOD-139 M2 D2: `Cursor::Run` on a planner row. The planner runs admission, not a session:
+    /// the row moves `pending -> running` (the existing CAS; `pending -> done` is illegal) and
+    /// [`Self::admit_parts`] writes the plan, the part rows and the planner's `done` in one store
+    /// transaction. A move that finds the row moved is plan D144's `StaleWrite`.
+    async fn admit_planner(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        planner: RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        self.move_step(
+            run.id,
+            planner.id,
+            StepStatus::Pending,
+            StepStatus::Running,
+            self.now(),
+        )
+        .await?;
+        Box::pin(self.admit_parts(run, snapshot, node, &planner)).await
+    }
+
+    /// MOD-139 M2 D2 on a `running` planner row (also D14's recovery entry, T4): the node's
+    /// default parts admitted as the run's next plan revision.
+    ///
+    /// In order: the admission refusal ([`crate::divide::admission_refusal`], D7, D8, D10, D5),
+    /// which fails the planner and the run ([`Self::refuse_admission`]); stage 1's walk over the
+    /// node's candidates and **every part's agent picked before any write** (`admit_indices`'
+    /// rule): a part's named agent when the walk left it eligible, with the part's model or the
+    /// candidate's, else the selector's choice with D60's substitution note (blueprint P-17), and
+    /// no choice at all is plan D62's refusal after the planner moves `running -> failed`; the
+    /// primary's HEAD per repo ([`Isolator::base`]) as `base_refs`; then `admit_plan`. A store or
+    /// isolator error propagates with the planner still `running`: admission never ran (D14).
+    async fn admit_parts(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        planner: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let Some(divide) = node.divide.as_ref() else {
+            return Err(EngineError::Snapshot {
+                run: run.id,
+                reason: format!("planner node `{}` carries no divide block", node.name),
+            });
+        };
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let plans = self.parts.store.run_plans(run.id).await?;
+        let revision = plans
+            .iter()
+            .map(|plan| plan.revision)
+            .max()
+            .map_or(0, |highest| highest.saturating_add(1));
+        let mut parts = divide.default_parts.clone();
+        parts.sort_by_key(|part| part.position);
+        if let Some(failure) = crate::divide::admission_refusal(snapshot, node, &parts) {
+            return Box::pin(self.refuse_admission(run, planner, failure))
+                .await
+                .map(Some);
+        }
+
+        let walk = self.stage_one(run, snapshot, node).await?;
+        let mut picks = Vec::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            let index = i32::try_from(index).unwrap_or(i32::MAX);
+            let named = part.agent_id.and_then(|agent| {
+                walk.eligible
+                    .iter()
+                    .find(|candidate| candidate.agent_id == agent)
+            });
+            let pick = match named {
+                Some(candidate) => (
+                    SnapshotCandidate {
+                        model: part
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| candidate.model.clone()),
+                        ..candidate.clone()
+                    },
+                    false,
+                ),
+                None => {
+                    let Some(chosen) = self
+                        .parts
+                        .selector
+                        .select(node, &walk.eligible, index)
+                        .cloned()
+                    else {
+                        self.move_step(
+                            run.id,
+                            planner.id,
+                            StepStatus::Running,
+                            StepStatus::Failed,
+                            self.now(),
+                        )
+                        .await?;
+                        return self.refuse_no_candidate(run, node, &walk).await.map(Some);
+                    };
+                    (chosen, true)
+                }
+            };
+            picks.push((index, pick));
+        }
+
+        let base = self.parts.isolator.base(&run.repo_scope).await?;
+        let base_refs = serde_json::to_value(&base).map_err(|err| EngineError::Snapshot {
+            run: run.id,
+            reason: format!("the base refs do not serialise: {err}"),
+        })?;
+        let base_position = crate::divide::next_base_position(snapshot, &steps, &plans);
+        let divided = crate::divide::divided_name(node);
+        let mut rows = Vec::with_capacity(parts.len());
+        for (part, (index, (chosen, selected))) in parts.iter().zip(picks) {
+            if selected {
+                self.note_substitution(run, node, 1, index, &chosen, &walk)
+                    .await?;
+            }
+            rows.push(NewRunStep {
+                id: StepId::new(),
+                run_id: run.id,
+                position: base_position.saturating_add(index),
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: crate::divide::part_phase_name(divided, &part.key, revision),
+                agent_id: Some(chosen.agent_id),
+                model: Some(chosen.model),
+                role: StepRole::Part,
+                parent_step_id: Some(planner.id),
+                node_key: Some(crate::divide::part_node_key(divided, &part.key)),
+            });
+        }
+        let body = crate::divide::plan_body(&parts);
+        let digest = crate::divide::plan_digest(&body);
+        self.parts
+            .store
+            .admit_plan(
+                StepFence::Lease(self.parts.owner),
+                PlanAdmission {
+                    run_id: run.id,
+                    planner_step_id: planner.id,
+                    plan: PlanToAdmit::New(NewRunPlan {
+                        id: RunPlanId::new(),
+                        run_id: run.id,
+                        revision,
+                        planner_step_id: planner.id,
+                        scope: node.plan_scope.unwrap_or(PlanScope::Parts),
+                        base_position,
+                        body,
+                        digest,
+                    }),
+                    base_refs,
+                    parts: rows,
+                    at: self.now(),
+                },
+            )
+            .await?;
+        Ok(None)
+    }
+
+    /// MOD-139 M2 D2 (blueprint P-8): an admission refusal, `refuse_prompt`'s shape. Every one is
+    /// a deterministic configuration fault, so there is no retry and no `fails` edge: the planner
+    /// moves `running -> failed`, then [`Self::block_and_fail`] (the item `open -> blocked`, the
+    /// sentence as its note, the run failed and cleaned up).
+    async fn refuse_admission(
+        &self,
+        run: &Run,
+        planner: &RunStep,
+        failure: RunFailure,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.move_step(
+            run.id,
+            planner.id,
+            StepStatus::Running,
+            StepStatus::Failed,
+            now,
+        )
+        .await?;
+        self.block_and_fail(run, &failure, Some(planner.id), now)
+            .await?;
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(planner.position),
+            failure: Some(failure),
+        })
+    }
+
+    /// MOD-139 M2 D4: `Cursor::Parts`, one round of a divided node's parts.
+    ///
+    /// The latest planner row at the node (`done`, else nothing to do); D6's retry rows
+    /// ([`part_retries`]: every latest part that failed with an attempt left gets its next
+    /// attempt at its own position, unless some part is out of attempts, which is the divided
+    /// step's failure and [`Self::settle_exhausted_part`]'s); its `pending` latest parts in
+    /// position order, and its admitted plan with the `base_refs` the parts branch from.
+    /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part and
+    /// the run. Then every pending part through [`Self::run_part`], at most
+    /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
+    /// every part); each future is boxed (the stack rule, ANA-33 §9). Once a part answers a cancel,
+    /// a fenced write, another error or a refusal, no further part is pulled and the ones in flight
+    /// drain (R1, F-7). A cancel or a fenced write is raised once every pulled part settled
+    /// (`group_error`), the unpulled ones left `pending` for the cancel's settlement or the
+    /// adopter. A deterministic pre-session refusal ([`PartOutcome::Refused`]) ends the run with
+    /// the first one in part position order, after every pulled part settled (blueprint P-11), and
+    /// the unpulled parts are `cancelled` ([`Self::cancel_parts`]). Under `shared_serialized` the
+    /// primary checkout is reset to `base_refs` after the round's last part (D4): parts never land,
+    /// so no later node starts from a part's commit.
+    async fn drive_parts(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+    ) -> Result<Option<Rest>, EngineError> {
+        let mut steps = self.parts.store.run_steps(run.id).await?;
+        let Some(planner) = latest_at(&steps, node.position)
+            .filter(|row| row.role == StepRole::Planner && row.status == StepStatus::Done)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        // MOD-139 M2 D6 (T4): the retry rows this round owes, before its pending parts are read.
+        let retries = part_retries(&steps, planner.id, node.retry_limit);
+        if !retries.is_empty() {
+            for retry in retries {
+                self.parts.store.create_step(retry).await?;
+            }
+            steps = self.parts.store.run_steps(run.id).await?;
+        }
+        let pending: Vec<RunStep> = crate::divide::latest_parts(&steps, planner.id)
+            .into_iter()
+            .filter(|part| part.status == StepStatus::Pending)
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let plan = self
+            .parts
+            .store
+            .run_plans(run.id)
+            .await?
+            .into_iter()
+            .filter(|plan| {
+                plan.planner_step_id == planner.id && plan.status == PlanStatus::Admitted
+            })
+            .max_by_key(|plan| plan.revision)
+            .ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: format!("planner step {} is done with no admitted plan", planner.id),
+            })?;
+        let (base, planned) = plan_parts(run.id, &plan)?;
+        let width_of_plan = i32::try_from(planned.len()).unwrap_or(i32::MAX);
+
+        // MOD-10 D11, D13 at a parts round, as at `drive_group`: one resolution for the round.
+        if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
+            let failure = RunFailure::SecretsRefused { cause };
+            let now = self.now();
+            for step in &pending {
+                self.move_step(
+                    run.id,
+                    step.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    now,
+                )
+                .await?;
+                self.fail_part(run, node, step, &failure.to_string())
+                    .await?;
+            }
+            self.parts
+                .store
+                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                .await?;
+            self.cleanup_walk(run.id).await?;
+            return Ok(Some(Rest {
+                run: RunStatus::Failed,
+                position: Some(node.position),
+                failure: Some(failure),
+            }));
+        }
+
+        let mut stages = Vec::with_capacity(pending.len());
+        for step in &pending {
+            let key = step
+                .node_key
+                .as_deref()
+                .and_then(crate::divide::part_key)
+                .unwrap_or_default();
+            let part = planned.iter().find(|part| part.key == key).ok_or_else(|| {
+                EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!("part step {} names no part of plan {}", step.id, plan.id),
+                }
+            })?;
+            stages.push(PartStage {
+                run,
+                snapshot,
+                node,
+                step,
+                part,
+                // D7: `local` takes no slot (the real isolator refuses one there).
+                slot: (node.isolation != Isolation::Local).then_some(FanoutSlot {
+                    index: step.position.saturating_sub(plan.base_position),
+                    width: width_of_plan,
+                    base: &base,
+                }),
+            });
+        }
+        // `buffer_unordered`'s shape, written out: at most `width` part futures in flight, each
+        // boxed at its push (the stack rule), the next one pushed as one settles.
+        //
+        // MOD-139 M2 R1 (F-7), `WalkEnd::admits`' rule for a round: once a part answers anything
+        // but `Settled` (a cancel, a lost fence, another error, or a refusal that ends the run),
+        // the round pulls no further part and only drains the ones in flight. A part pulled after
+        // a lost fence would move `pending -> running` on a run another process adopted and
+        // prepare a real tree there; after a cancel or a refusal it would spend a session the run
+        // never uses. The parts never pulled stay `pending`.
+        let width = crate::divide::parts_width(snapshot, &steps, node);
+        let width = usize::try_from(width).unwrap_or(1).max(1);
+        let mut queue = stages.into_iter();
+        let mut running = futures::stream::FuturesUnordered::new();
+        for stage in queue.by_ref().take(width) {
+            running.push(Box::pin(self.run_part(stage)));
+        }
+        let mut settled = Vec::with_capacity(pending.len());
+        let mut stopped = false;
+        while let Some(outcome) = futures::StreamExt::next(&mut running).await {
+            stopped |= !matches!(outcome, Ok(PartOutcome::Settled));
+            settled.push(outcome);
+            if !stopped && let Some(stage) = queue.next() {
+                running.push(Box::pin(self.run_part(stage)));
+            }
+        }
+        let unpulled: Vec<&RunStep> = queue.map(|stage| stage.step).collect();
+
+        let mut errors = Vec::new();
+        let mut refusals = Vec::new();
+        for outcome in settled {
+            match outcome {
+                Ok(PartOutcome::Settled) => {}
+                Ok(PartOutcome::Refused {
+                    step,
+                    text,
+                    failure,
+                    block,
+                }) => {
+                    let position = pending
+                        .iter()
+                        .find(|part| part.id == step)
+                        .map_or(i32::MAX, |part| part.position);
+                    refusals.push((position, step, text, failure, block));
+                }
+                Err(err) => errors.push(Err(err)),
+            }
+        }
+        if let Some(err) = group_error(run.id, errors) {
+            return Err(err);
+        }
+        refusals.sort_by_key(|(position, ..)| *position);
+        if let Some((_, step, text, failure, block)) = refusals.into_iter().next() {
+            // R1 (F-7): the parts the stop left unpulled end with the run, before its last write.
+            self.cancel_parts(run, node, &unpulled).await?;
+            let now = self.now();
+            match (block, &failure) {
+                (true, Some(failure)) => {
+                    self.block_and_fail(run, failure, Some(step), now).await?;
+                }
+                _ => {
+                    self.parts
+                        .store
+                        .finish_run(run.id, RunStatus::Failed, Some(&text), now)
+                        .await?;
+                    self.cleanup_walk(run.id).await?;
+                }
+            }
+            return Ok(Some(Rest {
+                run: RunStatus::Failed,
+                position: Some(node.position),
+                failure,
+            }));
+        }
+
+        if node.isolation == Isolation::SharedSerialized {
+            let mut last = None;
+            for step in pending.iter().rev() {
+                let trees = self.parts.store.step_trees(step.id).await?;
+                if !trees.is_empty() {
+                    last = Some((step.id, trees));
+                    break;
+                }
+            }
+            if let Some((step, trees)) = last {
+                let report = self.parts.isolator.reset(step, &trees).await?;
+                if !report.refused.is_empty() {
+                    let reasons = report
+                        .refused
+                        .iter()
+                        .map(|(_, reason)| reason.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(EngineError::Isolate(IsolateError::Refused(reasons)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// MOD-139 M2 D4: one part's stages 2 to 5, `run_candidate`'s shape. The `pending -> running`
+    /// move (plan D144's `StaleWrite` raised once the round settled), then [`Self::part_live`].
+    /// A part whose trees were prepared and not captured is captured best-effort on the way out
+    /// (plan D78: a `shared_serialized` guard is released only at `capture`). An error past the
+    /// move fails **this part** — never its siblings and never the run — except a cancel or a lost
+    /// fence, which settle nothing (MOD-42 I-6, D4).
+    async fn run_part(&self, stage: PartStage<'_>) -> Result<PartOutcome, EngineError> {
+        // R1 (F-7): a cancel (or the walk's cut) read before the move leaves the part `pending`,
+        // as `drive_once`'s own read would only after a prepare and a prompt.
+        if self.cancel_read(stage.run.id, &self.session_control(stage.run.id)) {
+            return Err(EngineError::Cancelled { run: stage.run.id });
+        }
+        self.move_step(
+            stage.run.id,
+            stage.step.id,
+            StepStatus::Pending,
+            StepStatus::Running,
+            self.now(),
+        )
+        .await?;
+        self.step_started(stage.run, stage.step.id);
+        let mut trees = None;
+        let mut captured = false;
+        let outcome = self.part_live(&stage, &mut trees, &mut captured).await;
+        // Blueprint §1.10: uncaptured trees are released on every way out, a `Settled` refusal
+        // whose row another writer moved included (`run_candidate`'s rule); a part that ran to
+        // its end has `captured` set and releases nothing here.
+        if let (Some(trees), false) = (&trees, captured) {
+            self.release_trees(stage.step, trees).await;
+        }
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(err) if matches!(err, EngineError::Cancelled { .. }) || is_fenced(&err) => Err(err),
+            Err(err) => {
+                self.fail_part(
+                    stage.run,
+                    stage.node,
+                    stage.step,
+                    &failure_text(&stage.step.phase_name, &err),
+                )
+                .await?;
+                Ok(PartOutcome::Settled)
+            }
+        }
+    }
+
+    /// The live half of [`Self::run_part`] (`candidate_live`'s shape minus verify, gate and
+    /// landing: a part never reconciles into the primary tree, ANA-33 §7.4). `trees` is set the
+    /// moment `prepare` answered and `captured` the moment `capture` did.
+    ///
+    /// The part's own stage 3 (D10): its prompt carries the internal `part` section, reads
+    /// whether a sibling is live (D13) once, before it is assembled, and is recorded per part.
+    /// The deterministic pre-session refusals — a prepare refusal, a missing input, the
+    /// assembler's or the persona's refusal, a scrub refusal and an env-file refusal — fail the
+    /// part with the sentence and answer [`PartOutcome::Refused`], which ends the run (not a part
+    /// retry). The part is `done` when its session ends well and the plain-step artefact test
+    /// holds; `failed` on its own terms otherwise (retried by T4's next round).
+    async fn part_live(
+        &self,
+        stage: &PartStage<'_>,
+        trees: &mut Option<Vec<RunStepTree>>,
+        captured: &mut bool,
+    ) -> Result<PartOutcome, EngineError> {
+        let PartStage {
+            run,
+            snapshot,
+            node,
+            step,
+            part,
+            slot,
+        } = *stage;
+        let item = Self::item_of(run)?;
+        let name = step.phase_name.as_str();
+
+        // -- stage 2: prepare, from the plan's `base_refs` (D4) --------------------------------
+        let prepared = match self
+            .parts
+            .isolator
+            .prepare(run.id, step.id, &run.repo_scope, node.isolation, slot)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(err @ IsolateError::Refused(_)) => {
+                let text = failure_text(name, &EngineError::Isolate(err));
+                return self.refuse_part(run, node, step, text, None, false).await;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let started_at = self.now();
+        let rows: Vec<RunStepTree> = prepared
+            .trees
+            .iter()
+            .map(|tree| tree.tree.clone())
+            .collect();
+        *trees = Some(rows.clone());
+        self.parts
+            .store
+            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+            .await?;
+        let before: Vec<RunStepCommit> = prepared
+            .trees
+            .iter()
+            .map(|tree| RunStepCommit {
+                run_step_id: step.id,
+                repo_id: tree.tree.repo_id,
+                before_hash: tree.before_hash.clone(),
+                after_hash: None,
+            })
+            .collect();
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+            .await?;
+
+        // -- stage 3: the part's own prompt (D10, D13) ------------------------------------------
+        let live =
+            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+        let prompt = match self
+            .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
+            .await?
+        {
+            Ok(prompt) => prompt,
+            Err(StageThree::MissingInput(kind)) => {
+                let failure = RunFailure::MissingInput(kind);
+                let text = failure.to_string();
+                return self
+                    .refuse_part(run, node, step, text, Some(failure), false)
+                    .await;
+            }
+            Err(StageThree::Refused(err)) => {
+                let failure = RunFailure::PromptRefused {
+                    phase: name.to_owned(),
+                    reason: err.to_string(),
+                };
+                let text = failure.to_string();
+                return self
+                    .refuse_part(run, node, step, text, Some(failure), true)
+                    .await;
+            }
+            Err(StageThree::NoPersona(refusal)) => {
+                let failure = RunFailure::PromptRefused {
+                    phase: name.to_owned(),
+                    reason: refusal.to_string(),
+                };
+                let text = failure.to_string();
+                return self
+                    .refuse_part(run, node, step, text, Some(failure), true)
+                    .await;
+            }
+        };
+        let persona = snapshot
+            .persona_for(node)
+            .map_err(|refusal| EngineError::Snapshot {
+                run: run.id,
+                reason: refusal.to_string(),
+            })?;
+        let trim = match prompt.trim.to_value(self.parts.scrubber) {
+            Ok(trim) => trim,
+            Err(unmasked) => {
+                let failure = RunFailure::scrub_refused(name, &unmasked);
+                let text = failure.to_string();
+                return self
+                    .refuse_part(run, node, step, text, Some(failure), false)
+                    .await;
+            }
+        };
+        self.parts
+            .store
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                &prompt.digest,
+                &trim,
+            )
+            .await?;
+
+        // -- stage 4: the part's own session (D4: `<divided>/<key>` keys it) -------------------
+        let key = SessionKey::of(step);
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, &prompt).await?;
+        let deadline = self.deadline_at(node, started_at);
+        let Driven {
+            result,
+            cut: deadline_cut,
+        } = match self
+            .drive_once(
+                run,
+                step,
+                node,
+                persona,
+                &key,
+                &prompt.text,
+                prepared.cwd.clone(),
+                prepared.extra_dirs,
+                deadline,
+                live,
+                &mut recorder,
+            )
+            .await
+        {
+            Ok(driven) => driven,
+            Err(refused) => {
+                let finished = recorder.finish().await;
+                let err = refused_over_finish(refused, finished, run.id, step.id);
+                // MOD-89 (blueprint P-11): deterministic until a human removes the files.
+                if let EngineError::EnvFiles { provider, files } = &err {
+                    let failure = RunFailure::EnvFilesRefused {
+                        provider: provider.clone(),
+                        files: files.clone(),
+                    };
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), false)
+                        .await;
+                }
+                return Err(err);
+            }
+        };
+        let cap_breach = recorder.finish().await?.cap_breach;
+        if let Ok(done) = &result {
+            self.parts
+                .sink
+                .after_done(item, step, node, &key, done)
+                .await?;
+        }
+
+        // -- stage 5: settle on the part's own terms; no verify, no gate, no landing (D4) ------
+        let after = self.parts.isolator.capture(step.id, &rows).await?;
+        *captured = true;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+            .await?;
+        let output = self.output_of(item, node, step.id).await?;
+        let now = self.now();
+        let settled = gate::settle(&SettleInput {
+            driver: &result,
+            cap_breach,
+            cap_batch,
+            started_at,
+            now,
+            deadline_seconds: node.deadline_seconds,
+            deadline_cut,
+            output: output.as_ref(),
+            verify_outcome: None,
+            reads_verdict: false,
+            unmerged: None,
+        });
+        self.parts
+            .store
+            .finish_step(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                StepOutcome {
+                    exit_code: None,
+                    usage: None,
+                    trim_record: None,
+                    verify_outcome: None,
+                    verify_exit_code: None,
+                    finished_at: now,
+                },
+            )
+            .await?;
+        match settled {
+            Settle::Ok { note } => {
+                self.move_step(run.id, step.id, StepStatus::Running, StepStatus::Done, now)
+                    .await?;
+                if let Some(note) = note {
+                    self.note(item, note, Some(step.id), now).await?;
+                }
+            }
+            Settle::Failed(failure) => {
+                self.fail_part(run, node, step, &failure.to_string())
+                    .await?;
+            }
+            Settle::Rejected { verdict_line } => {
+                self.fail_part(run, node, step, &verdict_line).await?;
+            }
+        }
+        Ok(PartOutcome::Settled)
+    }
+
+    /// MOD-139 M2 R1 (F-7): the `pending` parts a round stopped before pulling, once a refusal
+    /// ends the run: each `pending -> cancelled` with the cut's note naming the divided node
+    /// ([`Self::cancel_unsettled`]'s words), so none is left `pending` under the `failed` run. A
+    /// row another writer moved first is skipped.
+    async fn cancel_parts(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        parts: &[&RunStep],
+    ) -> Result<(), EngineError> {
+        let now = self.now();
+        for part in parts {
+            if !self
+                .parts
+                .store
+                .transition_step(part.id, StepStatus::Pending, StepStatus::Cancelled, now)
+                .await?
+            {
+                continue;
+            }
+            if let Some(item) = run.item_id {
+                self.note(
+                    item,
+                    format!(
+                        "step `{}` attempt {} cancelled: the run ended at `{}`",
+                        part.phase_name,
+                        part.attempt,
+                        crate::divide::divided_name(node)
+                    ),
+                    Some(part.id),
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A deterministic pre-session refusal of one part (blueprint P-11): the part fails with
+    /// `text` as its note, and the round ends the run on it. A row another process already moved
+    /// (plan D17) is not this call's, so its refusal ends nothing: [`PartOutcome::Settled`], as
+    /// `run_candidate` keeps a lost refusal out of the run's failure (review M3).
+    async fn refuse_part(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        step: &RunStep,
+        text: String,
+        failure: Option<RunFailure>,
+        block: bool,
+    ) -> Result<PartOutcome, EngineError> {
+        if !self.fail_part(run, node, step, &text).await? {
+            return Ok(PartOutcome::Settled);
+        }
+        Ok(PartOutcome::Refused {
+            step: step.id,
+            text,
+            failure,
+            block,
+        })
+    }
+
+    /// One part `running -> failed`, with the reason as an `item_note` naming the part (D4: never
+    /// "fan-out candidate"). A row another process already moved is left alone and gets no note
+    /// (plan D17); `true` when this call moved it.
+    async fn fail_part(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        step: &RunStep,
+        reason: &str,
+    ) -> Result<bool, EngineError> {
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
+            .await?
+        {
+            return Ok(false);
+        }
+        let Some(item) = run.item_id else {
+            return Ok(true);
+        };
+        let key = step
+            .node_key
+            .as_deref()
+            .and_then(crate::divide::part_key)
+            .unwrap_or(&step.phase_name);
+        self.note(
+            item,
+            format!(
+                "part `{key}` of `{}` attempt {}: {reason}",
+                crate::divide::divided_name(node),
+                step.attempt
             ),
             Some(step.id),
             now,
@@ -6436,6 +7745,11 @@ where
             persona: None,
             // MOD-163 D18: a judge carries no memory.
             memory: None,
+            // MOD-139 M2 D10: a judge works no part.
+            part: None,
+            // MOD-139 M3 D5: nor integrates any.
+            premerge: None,
+            parts: Vec::new(),
             excerpts: no_excerpts(caps),
             // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
             // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
@@ -6561,6 +7875,9 @@ where
                 phase_name: judge_phase_name(&phase.name),
                 agent_id,
                 model,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await?)
     }
@@ -6666,6 +7983,8 @@ where
                     // The maintainer's M4 scope: judge calls stay untimed (no `started_at` of
                     // their own).
                     None,
+                    // MOD-139 M2 D13: a judge's phase is `off`; it never reads its siblings.
+                    false,
                     recorder,
                 )
                 .await?
@@ -7038,6 +8357,17 @@ where
     /// [`PersonaNotInSnapshot`](htui_core::model::persona::PersonaNotInSnapshot). A store error
     /// and a phase whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are
     /// not about this prompt.
+    ///
+    /// `part` (MOD-139 M2 D10) is a divided part's own brief: it sets the internal `part` section
+    /// and names the phase by its divided node (blueprint P-9), so `{{phase}}` reads `implement`
+    /// and not `implement:plan`. `live_siblings` is D13's, as [`Self::phase_spec`] reads it.
+    /// `integrate` (MOD-139 M3 D5) is an integrate session's pre-merge report and parts, set as
+    /// the internal `premerge` and `parts` sections; its diff-error notes join the spec's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the step's coordinates, MOD-139 M2's part, D13's `live_siblings` and M3's \
+                  integrate sections; a struct would be built at three call sites"
+    )]
     async fn assemble_prompt(
         &self,
         run: &Run,
@@ -7045,14 +8375,26 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         item: ItemId,
+        part: Option<&htui_core::model::SnapshotPart>,
+        live_siblings: bool,
+        integrate: Option<&IntegratePrompt>,
     ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
         let mut spec = match self
-            .phase_spec(run, snapshot, step, phase, item, true)
+            .phase_spec(run, snapshot, step, phase, item, true, live_siblings)
             .await?
         {
             Ok(spec) => spec,
             Err(stage) => return Ok(Err(stage)),
         };
+        if let Some(part) = part {
+            spec.part = Some(htui_core::prompt::PartBlock::from(part));
+            crate::divide::divided_name(phase).clone_into(&mut spec.phase);
+        }
+        if let Some(integrate) = integrate {
+            spec.premerge = Some(integrate.premerge.clone());
+            spec.parts.clone_from(&integrate.parts);
+            spec.notes.extend(integrate.notes.iter().cloned());
+        }
         // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
         // builder; a handoff reads no file.
         self.with_excerpts(run, step, item, &mut spec).await?;
@@ -7133,8 +8475,20 @@ where
     /// fan-out and the item's `required_tags`. `drive_once`'s base exposure and `phase_spec`'s
     /// section both read this (the persona's term is applied on top), so a host-less engine
     /// neither denies the heavy commands nor names a tool nothing serves.
-    fn command_run_exposed(&self, phase: &SnapshotPhase, required_tags: &[String]) -> bool {
-        self.parts.tools.is_some() && phase.command_queue.exposed(phase.fan_out, required_tags)
+    ///
+    /// `live_siblings` (MOD-139 M2 D13) is whether another row of the run is live beside this
+    /// session ([`crate::divide::live_siblings`]), computed once per session before its prompt, so
+    /// the section and the exposure cannot disagree.
+    fn command_run_exposed(
+        &self,
+        phase: &SnapshotPhase,
+        required_tags: &[String],
+        live_siblings: bool,
+    ) -> bool {
+        self.parts.tools.is_some()
+            && phase
+                .command_queue
+                .exposed(phase.fan_out, live_siblings, required_tags)
     }
 
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
@@ -7149,6 +8503,11 @@ where
     /// `promote::handoff_spec` then empties them (MOD-9 D44): a handoff is rare, the two reads go
     /// to the store every other input of this spec already needs, and one spec builder keeps the
     /// phase and handoff inputs from drifting (MOD-9 review finding 4, accepted).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the step's coordinates, `strict` and MOD-139 M2 D13's `live_siblings`, which the \
+                  session's exposure reads too; a struct would be built at two call sites"
+    )]
     async fn phase_spec(
         &self,
         run: &Run,
@@ -7157,6 +8516,7 @@ where
         phase: &SnapshotPhase,
         item: ItemId,
         strict: bool,
+        live_siblings: bool,
     ) -> Result<Result<PromptSpec, StageThree>, EngineError> {
         // MOD-26 D12: stage 3's persona lookup, in the run's own snapshot (I-3). A promoted step's
         // handoff (not strict) opens without one (OQ-5); a phase step whose snapshot does not carry
@@ -7296,6 +8656,11 @@ where
             // renders it. Not role-guarded here: `assemble` renders it for a Phase spec only
             // (blueprint P-5), and the handoff builder clears it.
             memory: snapshot.memory.clone(),
+            // MOD-139 M2 D10: no part here; a divided part's session sets its own (T3).
+            part: None,
+            // MOD-139 M3 D5: nor an integrate's report and parts; its session sets them (T3).
+            premerge: None,
+            parts: Vec::new(),
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
@@ -7303,7 +8668,7 @@ where
             // MOD-11 D16 (OQ-6): the one resolver — `fan_out_only` renders the section only for a
             // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term, which R1
             // H1 makes `narrow`'s own rule (an `execute` denial drops the tool too).
-            command_queue: self.command_run_exposed(phase, &row.required_tags)
+            command_queue: self.command_run_exposed(phase, &row.required_tags, live_siblings)
                 && persona.is_none_or(|persona| {
                     htui_agent::persona::persona_keeps_command_run(&persona.tools)
                 }),
@@ -7349,7 +8714,8 @@ where
             .phases(snapshot.graph.id)
             .await?
             .into_iter()
-            .find(|row| row.name == phase.name)
+            // MOD-139 M2 (P-9): a divided node's live phase is its divided name, not `<name>:plan`.
+            .find(|row| row.name == crate::divide::divided_name(phase))
             .map(|row| row.id);
         if phase_id.is_none() {
             notes.push(format!(
@@ -7486,8 +8852,9 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
-                  and stage 2's two directories, all handed straight to `drive_once`, and the step's \
-                  `started_at` its deadline is measured from (MOD-37 M4 D1)"
+                  and stage 2's two directories, all handed straight to `drive_once`, the step's \
+                  `started_at` its deadline is measured from (MOD-37 M4 D1), and MOD-139 M2 D13's \
+                  `live_siblings`"
     )]
     async fn session(
         &self,
@@ -7499,6 +8866,7 @@ where
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         started_at: DateTime<Utc>,
+        live_siblings: bool,
     ) -> Result<
         (
             Driven,
@@ -7528,6 +8896,7 @@ where
                 cwd,
                 extra_dirs,
                 deadline,
+                live_siblings,
                 &mut recorder,
             )
             .await
@@ -7740,8 +9109,8 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the session's four coordinates, the persona stage 3 froze and its three per-call \
-                  inputs, and the step deadline's instant (MOD-37 M4 D1); a struct would be built at \
-                  exactly three call sites and read here only"
+                  inputs, the step deadline's instant (MOD-37 M4 D1) and MOD-139 M2 D13's \
+                  `live_siblings`; a struct would be built at four call sites and read here only"
     )]
     async fn drive_once(
         &self,
@@ -7754,6 +9123,7 @@ where
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         deadline: Option<tokio::time::Instant>,
+        live_siblings: bool,
         recorder: &mut Recorder<'a, S>,
     ) -> Result<Driven, EngineError> {
         let project = self.project(run.project_id).await?;
@@ -7799,7 +9169,7 @@ where
             && phase.command_queue != htui_core::model::CommandQueue::Off
             && {
                 let item = self.item(Self::item_of(run)?).await?;
-                self.command_run_exposed(phase, &item.required_tags)
+                self.command_run_exposed(phase, &item.required_tags, live_siblings)
             };
         let base = ToolExposure {
             command_run: exposed,
@@ -8173,19 +9543,8 @@ where
     async fn resting(&self, run: &Run) -> Result<Rest, EngineError> {
         let snapshot = Self::snapshot_of(run)?;
         let steps = self.parts.store.run_steps(run.id).await?;
-        let position = match cursor(&snapshot, &steps) {
-            Cursor::Finished => None,
-            Cursor::Create { position, .. }
-            | Cursor::Fan { position, .. }
-            | Cursor::Select { position, .. } => Some(position),
-            Cursor::Run(step)
-            | Cursor::Rest { step, .. }
-            | Cursor::Decide { step }
-            | Cursor::Loop { step, .. } => steps
-                .iter()
-                .find(|row| row.id == step)
-                .map(|row| row.position),
-        };
+        // MOD-139 M2 (P-14): one reading of a cursor's position, a part's its planner's.
+        let position = crate::status::position_of(&cursor(&snapshot, &steps), &steps);
         Ok(Rest {
             run: run.status,
             position,
@@ -8234,6 +9593,34 @@ where
         position: i32,
     ) -> Result<SnapshotPhase, EngineError> {
         crate::command::phase_at(run, snapshot, position)
+    }
+
+    /// MOD-139 M2 D1: the node `step` belongs to ([`crate::command::node_of`]), as an owned phase.
+    /// A row of any other role than `part` or `stage` maps by its position exactly as
+    /// [`Self::phase_at`] reads it, refusal sentence included.
+    ///
+    /// # Errors
+    /// [`EngineError::Snapshot`]: `phase_at`'s for a node row; naming the row, its role and its
+    /// position when no node maps a part or a stage row (a stage row, or a part whose planner row
+    /// `steps` lacks).
+    fn node_at(
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        steps: &[RunStep],
+        step: &RunStep,
+    ) -> Result<SnapshotPhase, EngineError> {
+        if !matches!(step.role, StepRole::Part | StepRole::Stage) {
+            return Self::phase_at(run, snapshot, step.position);
+        }
+        crate::command::node_of(snapshot, steps, step)
+            .cloned()
+            .ok_or_else(|| EngineError::Snapshot {
+                run,
+                reason: format!(
+                    "no node for step {} (a {} row at position {})",
+                    step.id, step.role, step.position
+                ),
+            })
     }
 
     /// The candidate a step was created for, denormalised back out of the row and the phase.
@@ -8409,6 +9796,167 @@ struct CandidateStage<'s> {
     /// refuses a verdict-reading node that fans out (D10), so this is `false` on every snapshot
     /// a resolve wrote; it is carried rather than assumed so settle reads one rule everywhere.
     reads_verdict: bool,
+    /// MOD-139 M2 D13: whether the group's first candidate had a live sibling as its prompt was
+    /// assembled, so every candidate's exposure matches the group's one section.
+    live_siblings: bool,
+}
+
+/// MOD-139 M2 D4: one part's inputs to [`Engine::run_part`].
+#[derive(Debug, Clone, Copy)]
+struct PartStage<'s> {
+    /// The run, re-read by the round's pass.
+    run: &'s Run,
+    /// The run's snapshot.
+    snapshot: &'s GraphSnapshot,
+    /// The planner node ([`crate::command::node_of`] the part).
+    node: &'s SnapshotPhase,
+    /// The part row, still `pending`.
+    step: &'s RunStep,
+    /// Its part of the admitted plan, by key (`part_key(step.node_key)`).
+    part: &'s htui_core::model::SnapshotPart,
+    /// `None` under `local` (D7: the real isolator refuses any slot there); else the part's index
+    /// in its plan, the plan's width, and the plan's `base_refs`, so its tree branches from them.
+    slot: Option<FanoutSlot<'s>>,
+}
+
+/// What one part of a round answered (MOD-139 M2 D4).
+#[derive(Debug)]
+enum PartOutcome {
+    /// `done`, or `failed` on its own terms (retried by T4's next round); also a refusal whose
+    /// row another process already moved, which is not this round's to end the run on.
+    Settled,
+    /// A deterministic pre-session refusal (blueprint P-11): the part row is already `failed`
+    /// with `text` as its note, and the round ends the run on it.
+    Refused {
+        /// The part.
+        step: StepId,
+        /// The run's failure text.
+        text: String,
+        /// The typed failure, when the refusal has one (a prepare refusal does not).
+        failure: Option<RunFailure>,
+        /// The item is blocked too (a prompt refusal, a missing persona), as at a plain step.
+        block: bool,
+    },
+}
+
+/// MOD-139 M3 D1: one integrate attempt's inputs, read once ([`Engine::integrate_stage`]) and
+/// shared by its hooks.
+#[derive(Debug)]
+struct IntegrateStage {
+    /// The admitted plan's `base_refs`, decoded by [`plan_parts`].
+    base: BTreeMap<RepoId, String>,
+    /// The admitted plan's parts, decoded by [`plan_parts`] (for their titles).
+    planned: Vec<htui_core::model::SnapshotPart>,
+    /// One per latest done part of the plan, plan order.
+    tips: Vec<PartTip>,
+}
+
+impl IntegrateStage {
+    /// `FanoutSlot { index: 0, width: 1, base }`; `None` under `local`, where the real isolator
+    /// refuses any slot (integrate prepares in place on the part's tip, plan D2).
+    fn slot(&self, isolation: Isolation) -> Option<FanoutSlot<'_>> {
+        (isolation != Isolation::Local).then_some(FanoutSlot {
+            index: 0,
+            width: 1,
+            base: &self.base,
+        })
+    }
+
+    /// The keys of `steps`, in plan order (a step that is no part here is skipped).
+    fn keys(&self, steps: &[StepId]) -> Vec<String> {
+        self.tips
+            .iter()
+            .filter(|tip| steps.contains(&tip.step))
+            .map(|tip| tip.key.clone())
+            .collect()
+    }
+}
+
+/// MOD-139 M3 D5: what stage 3 adds to integrate's spec.
+#[derive(Debug, Clone)]
+struct IntegratePrompt {
+    /// The pre-merge's report: the protected `premerge` section.
+    premerge: htui_core::model::PremergeReport,
+    /// The done parts: the trimmable `parts` section.
+    parts: Vec<htui_core::prompt::IntegratePart>,
+    /// Diff-error trim notes, already withheld when unmaskable.
+    notes: Vec<String>,
+}
+
+/// MOD-139 M2 D6 (T4): the retry rows a parts round owes under `planner`. Unless some latest
+/// part is out of attempts ([`crate::divide::exhausted`]: the divided step failed, and its
+/// settle is not a retry), every latest part `failed`, `cancelled` or `superseded` with
+/// [`may_attempt`]`(attempt + 1, retry_limit)` gets its next attempt: the same position (so the
+/// same `base_refs` slot), `fanout_index` 0, phase name, agent, model, parent and `node_key`
+/// (blueprint §1.8). No note: the failed attempt carries `fail_part`'s.
+fn part_retries(steps: &[RunStep], planner: StepId, retry_limit: i32) -> Vec<NewRunStep> {
+    let latest = crate::divide::latest_parts(steps, planner);
+    if latest
+        .iter()
+        .any(|part| crate::divide::exhausted(part, retry_limit))
+    {
+        return Vec::new();
+    }
+    latest
+        .into_iter()
+        .filter(|part| {
+            matches!(
+                part.status,
+                StepStatus::Failed | StepStatus::Cancelled | StepStatus::Superseded
+            ) && may_attempt(part.attempt + 1, retry_limit)
+        })
+        .map(|part| NewRunStep {
+            id: StepId::new(),
+            run_id: part.run_id,
+            position: part.position,
+            attempt: part.attempt + 1,
+            fanout_index: 0,
+            phase_name: part.phase_name.clone(),
+            agent_id: part.agent_id,
+            model: part.model.clone(),
+            role: StepRole::Part,
+            parent_step_id: part.parent_step_id,
+            node_key: part.node_key.clone(),
+        })
+        .collect()
+}
+
+/// An admitted plan's two decoded halves, `base_refs` and `body.parts`, with the two `Snapshot`
+/// sentences: one decode shared by the parts round and integrate (MOD-139 M3 D1), so the two
+/// cannot diverge.
+///
+/// # Errors
+/// [`EngineError::Snapshot`] when either half does not decode.
+fn plan_parts(
+    run: RunId,
+    plan: &htui_core::model::RunPlan,
+) -> Result<
+    (
+        BTreeMap<RepoId, String>,
+        Vec<htui_core::model::SnapshotPart>,
+    ),
+    EngineError,
+> {
+    let base: BTreeMap<RepoId, String> = serde_json::from_value(
+        plan.base_refs
+            .clone()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+    )
+    .map_err(|err| EngineError::Snapshot {
+        run,
+        reason: format!("plan {} has unreadable base refs: {err}", plan.id),
+    })?;
+    let planned: Vec<htui_core::model::SnapshotPart> = serde_json::from_value(
+        plan.body
+            .get("parts")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    )
+    .map_err(|err| EngineError::Snapshot {
+        run,
+        reason: format!("plan {} has an unreadable parts body: {err}", plan.id),
+    })?;
+    Ok((base, planned))
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).
@@ -8821,12 +10369,25 @@ fn skipped_above<'w>(
     above
 }
 
+/// The name an interrupted step's park and note give it: its node's, or (MOD-139 M2, T4 repair 2)
+/// a part's own `phase_name` (`<divided>/<part_key>`), whose attempt is the part's, where its
+/// node is the planner.
+fn interrupted_name<'s>(step: &'s RunStep, phase: &'s SnapshotPhase) -> &'s str {
+    if step.role == StepRole::Part {
+        &step.phase_name
+    } else {
+        &phase.name
+    }
+}
+
 /// N3 (plan D115): an interrupted step whose trees were reset, parked with its budget spent.
 fn spent_note(step: &RunStep, phase: &SnapshotPhase, listed: &str) -> String {
     format!(
         "{INTERRUPTED}: retry budget spent: step {} (`{}` attempt {}); trees: {listed}; the run \
          is parked",
-        step.id, phase.name, step.attempt
+        step.id,
+        interrupted_name(step, phase),
+        step.attempt
     )
 }
 
@@ -8835,7 +10396,9 @@ fn not_reset_note(step: &RunStep, phase: &SnapshotPhase, listed: &str, reason: &
     format!(
         "{NOT_RESET}: step {} (`{}` attempt {}); trees: {listed}; reason: {reason}; the run is \
          parked for a human",
-        step.id, phase.name, step.attempt
+        step.id,
+        interrupted_name(step, phase),
+        step.attempt
     )
 }
 
@@ -8924,6 +10487,24 @@ pub async fn claim_fake(
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.claim(run).await
+}
+
+/// MOD-139 M3 D11: [`Engine::enqueue`] over a `FakeOrchestrator`'s parts — `Manual`, the item's
+/// default scope, no workspace — so `start_enabled`, `missing_tags` and the production resolve
+/// run as for `StartRun`.
+///
+/// # Errors
+/// [`Engine::enqueue`]'s.
+#[cfg(feature = "test-support")]
+pub async fn enqueue_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    item: ItemId,
+) -> Result<RunId, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    Box::pin(engine.enqueue(item, htui_core::model::RunMode::Manual, None, None)).await
 }
 
 /// [`Engine::enqueue_in_batch`] over a `FakeOrchestrator`'s parts (MOD-12 M2 conformance).
@@ -9065,7 +10646,8 @@ mod tests {
     use htui_core::model::{
         BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, ItemState, NewRepo,
         NewRunStep, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
-        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepRole,
+        StepStatus,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -11042,6 +12624,9 @@ mod tests {
                 phase_name: "nowhere".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("`UNIQUE (run_id, position, attempt, fanout_index)` is free at 9");
@@ -12199,7 +13784,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
         let item = row.item_id.expect("the run has an item");
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &stale, phase, item)
+            .assemble_prompt(&row, &snapshot, &stale, phase, item, None, false, None)
             .await
             .expect("the prompt's reads succeed")
             .expect("`prd` needs no input");
@@ -12213,6 +13798,7 @@ mod tests {
                 base: &BTreeMap::new(),
                 persona: None,
                 reads_verdict: false,
+                live_siblings: false,
             })
             .await
             .expect_err("the candidate's compare-and-set found the row moved");
@@ -12521,6 +14107,9 @@ mod tests {
                 phase_name: "ghost".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("MemStore creates the step");
@@ -12832,6 +14421,9 @@ mod tests {
                 phase_name: "plan".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("`(1, attempt, 0)` is free");
@@ -14625,7 +16217,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault");
         assert!(
@@ -17191,7 +18792,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("the `prd` prompt assembles");
@@ -17230,6 +18840,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 true,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -17271,7 +18882,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("a refused excerpt is dropped, not the prompt");
@@ -17334,7 +18954,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("the `prd` prompt assembles");
@@ -17417,6 +19046,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 true,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -17469,6 +19099,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 false,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -17489,7 +19120,16 @@ mod tests {
 
         // (4) The phase prompt of the same fixture does read the file.
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("the `prd` prompt assembles");
@@ -17823,7 +19463,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("the `prd` prompt assembles");
@@ -17854,7 +19503,16 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                None,
+            )
             .await
             .expect("no store fault")
             .expect("the `prd` prompt assembles");
@@ -17977,6 +19635,73 @@ mod tests {
                 .chain(&requests[0].commits)
                 .all(|id| *id == first.id),
             "every row is attempt 1's: {requests:?}"
+        );
+    }
+
+    /// MOD-139 M3 D5: a part whose diffstat the isolator cannot answer renders its block without
+    /// a stat, and the error is a trim note (withheld when unmaskable, `forwarded`'s rule); the
+    /// prompt still assembles, so the step runs on.
+    #[tokio::test]
+    async fn a_part_diff_error_is_a_trim_note() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness.orch.isolator.fail_diff("index.lock held");
+        harness_engine!(harness.orch, engine);
+        let stage = super::IntegrateStage {
+            base: BTreeMap::new(),
+            planned: Vec::new(),
+            tips: vec![crate::isolate::PartTip {
+                step: prd.id,
+                key: "api".to_owned(),
+                trees: Vec::new(),
+                commits: Vec::new(),
+            }],
+        };
+
+        let integrate = engine
+            .integrate_prompt(
+                &row,
+                &snapshot.phases[0],
+                &stage,
+                htui_core::model::PremergeReport::default(),
+            )
+            .await
+            .expect("a diff error is no engine error");
+        assert_eq!(integrate.parts.len(), 1);
+        assert_eq!(
+            integrate.parts[0].diff, None,
+            "the block renders without a stat"
+        );
+        assert_eq!(
+            integrate.notes,
+            ["parts: diffstat of part `api` unavailable: git: index.lock held"],
+        );
+
+        let prompt = engine
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                Some(&integrate),
+            )
+            .await
+            .expect("no store fault")
+            .expect("the prompt assembles: the step runs on");
+        assert!(prompt.text.contains("key=\"api\""), "{}", prompt.text);
+        assert!(
+            prompt
+                .trim
+                .notes
+                .iter()
+                .any(|note| note.starts_with("parts: diffstat of part `api` unavailable: ")),
+            "{:?}",
+            prompt.trim.notes
         );
     }
 
@@ -18135,6 +19860,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 true,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -18322,6 +20048,7 @@ mod tests {
                 implement,
                 row.item_id.expect("an item's run"),
                 false,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -18424,7 +20151,7 @@ mod tests {
         // Stage 3's `assemble_prompt`, step by step, as it stood before the session: the step's
         // own output document did not exist yet, so it is not an input of the pre-flight prompt.
         let mut spec = engine
-            .phase_spec(&row, &snapshot, &step_row, phase, item, true)
+            .phase_spec(&row, &snapshot, &step_row, phase, item, true, false)
             .await
             .expect("the spec is built")
             .expect("the parked phase requires nothing missing");
@@ -18521,6 +20248,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 true,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -18641,6 +20369,7 @@ mod tests {
                 &snapshot.phases[0],
                 ids::HTUI_FEAT_3,
                 true,
+                false,
             )
             .await
             .expect("the spec is built")
@@ -22888,7 +24617,7 @@ mod tests {
             use htui_core::fixtures::ids;
             use htui_core::model::{
                 Claim, NewRunStep, Note, RunId, RunMode, RunStatus, SnapshotCandidate, Status,
-                StepId, StepStatus,
+                StepId, StepRole, StepStatus,
             };
             use htui_core::prompt::settings::SettingKey;
             use htui_core::secret::{INFISICAL, SecretError};
@@ -23384,6 +25113,9 @@ mod tests {
                         phase_name: phase.name.clone(),
                         agent_id: Some(chosen.agent_id),
                         model: Some(chosen.model),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
                     })
                     .await
                     .expect("MemStore creates the candidate")
@@ -23472,6 +25204,9 @@ mod tests {
                         phase_name: lost.phase_name.clone(),
                         agent_id: lost.agent_id,
                         model: lost.model.clone(),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
                     })
                     .await
                     .expect("MemStore creates the step")
@@ -23495,6 +25230,92 @@ mod tests {
                         .await
                         .expect("the failure writes"),
                     "a `running` row is this call's to fail"
+                );
+                assert_eq!(step_of(live).await.status, StepStatus::Failed);
+                assert_eq!(notes(&harness).await.len(), before + 1);
+            }
+
+            /// MOD-139 M2 T3 (review M3's rule on parts): a part refusal ends the run only when
+            /// this call failed the part. A row another process already moved (plan D17) is left
+            /// alone, gets no note, and the round reads it as settled.
+            #[tokio::test]
+            async fn refuse_part_ends_the_run_only_on_its_own_refusal() {
+                let harness = Harness::new().await;
+                let (run, [settled, _]) = parked_group(&harness).await;
+                let row = harness.orch.run(run).await;
+                let snapshot = snapshot_of(&harness, run).await;
+                let phase = &snapshot.phases[0];
+                let step_of = |id: StepId| {
+                    let orch = &harness.orch;
+                    async move {
+                        orch.steps(run)
+                            .await
+                            .into_iter()
+                            .find(|step| step.id == id)
+                            .expect("the step exists")
+                    }
+                };
+                let before = notes(&harness).await.len();
+                harness_engine!(harness.orch, engine);
+
+                let lost = step_of(settled).await;
+                assert_ne!(lost.status, StepStatus::Running);
+                let outcome = engine
+                    .refuse_part(&row, phase, &lost, "too late".to_owned(), None, false)
+                    .await
+                    .expect("a lost compare-and-set is no error");
+                assert!(
+                    matches!(outcome, crate::engine::PartOutcome::Settled),
+                    "the row was not this call's to refuse: {outcome:?}"
+                );
+                assert_eq!(notes(&harness).await.len(), before, "and gets no note");
+
+                let live = harness
+                    .orch
+                    .store
+                    .create_step(NewRunStep {
+                        id: StepId::new(),
+                        run_id: run,
+                        position: lost.position,
+                        attempt: lost.attempt + 1,
+                        fanout_index: 0,
+                        phase_name: lost.phase_name.clone(),
+                        agent_id: lost.agent_id,
+                        model: lost.model.clone(),
+                        role: StepRole::Step,
+                        parent_step_id: None,
+                        node_key: None,
+                    })
+                    .await
+                    .expect("MemStore creates the step")
+                    .id;
+                assert!(
+                    harness
+                        .orch
+                        .store
+                        .transition_step(
+                            live,
+                            StepStatus::Pending,
+                            StepStatus::Running,
+                            harness.orch.clock.now()
+                        )
+                        .await
+                        .expect("MemStore moves the step")
+                );
+                let outcome = engine
+                    .refuse_part(
+                        &row,
+                        phase,
+                        &step_of(live).await,
+                        "refused".to_owned(),
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("the failure writes");
+                assert!(
+                    matches!(outcome, crate::engine::PartOutcome::Refused { step, .. } if step == live),
+                    "a `running` row is this call's to refuse: {outcome:?}"
                 );
                 assert_eq!(step_of(live).await.status, StepStatus::Failed);
                 assert_eq!(notes(&harness).await.len(), before + 1);
@@ -23906,7 +25727,9 @@ mod queued_cancel {
 #[cfg(test)]
 mod settle_walk_writes {
     use htui_core::fixtures::ids;
-    use htui_core::model::{GraphSnapshot, RunMode, RunStatus, SnapshotCandidate, StepStatus};
+    use htui_core::model::{
+        GraphSnapshot, RunMode, RunStatus, SnapshotCandidate, StepRole, StepStatus,
+    };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 
@@ -24025,6 +25848,9 @@ mod settle_walk_writes {
                 phase_name: "plan".to_owned(),
                 agent_id: None,
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("a pending row under the ended run");
@@ -24235,6 +26061,9 @@ mod settle_walk_writes {
             phase_name: phase.to_owned(),
             agent_id: None,
             model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
         };
         orch.store
             .create_step(pending("prd", 0))

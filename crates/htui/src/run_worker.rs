@@ -184,7 +184,8 @@ pub(crate) mod tests {
         EventKind, Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep,
         PermissionId, PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId,
         RunCommandKind, RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
-        SnapshotPhase, Status, StepId, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        SnapshotPhase, Status, StepId, StepPermission, StepRole, StepStatus, TIMESTAMPTZ_DIGITS,
+        Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -1920,6 +1921,9 @@ pub(crate) mod tests {
                 phase_name: "research".to_owned(),
                 agent_id: Some(agent),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the admitted step lands");
@@ -4387,6 +4391,9 @@ pub(crate) mod tests {
                 phase_name: "research".to_owned(),
                 agent_id: Some(agent),
                 model: Some("sonnet".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step lands");

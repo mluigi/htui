@@ -30,7 +30,7 @@ use crate::model::{
     Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges, SessionEvent, Skill,
     SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
     SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
-    StepStatus, Workspace, WorkspaceId, WorkspaceProject,
+    StepRole, StepStatus, Workspace, WorkspaceId, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -1805,6 +1805,9 @@ fn steps() -> Vec<RunStep> {
         verify_exit_code: None,
         promoted_at: None,
         branch: None,
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
         updated_at: demo_at(2, 8),
     });
     steps.push(fanout_candidate(
@@ -1865,6 +1868,9 @@ fn fanout_candidate(
         verify_exit_code: None,
         promoted_at: None,
         branch: None,
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
         updated_at: demo_at(1, 17),
     }
 }
@@ -1902,6 +1908,9 @@ fn done_step(
         verify_exit_code: None,
         promoted_at: None,
         branch: None,
+        role: StepRole::Step,
+        parent_step_id: None,
+        node_key: None,
         updated_at: demo_at(1, hour + 1),
     }
 }

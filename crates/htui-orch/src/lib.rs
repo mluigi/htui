@@ -25,13 +25,16 @@
 //! MCP tool host is opened through (plan D4). MOD-10 M3 adds [`secrets`], one walk's resolved
 //! secrets as its sessions' env and its scrubber in one object (D11). MOD-138 M2 adds
 //! [`walk`], the readiness walker: joins, derived skips, `if` and `asks_you` edges and loop
-//! regions over the snapshot's nodes and edges (plan D2).
+//! regions over the snapshot's nodes and edges (plan D2). MOD-139 M2 adds [`divide`], divided
+//! fan-out's pure rules: names, base positions, the admission refusal, part widths and live
+//! siblings.
 #![warn(missing_docs)]
 
 pub mod closeout;
 pub mod command;
 #[cfg(feature = "test-support")]
 pub mod conformance;
+pub mod divide;
 pub mod engine;
 #[cfg(feature = "test-support")]
 pub mod fake;
@@ -54,8 +57,8 @@ pub mod walk;
 
 pub use command::{
     Command, CommandOutcome, EngineError, GateAnswer, HandoffText, Opening, OpeningPath, Rest,
-    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, phase_at, promote_enabled,
-    retry_admitted, snapshot_of, start_enabled, unblock_enabled,
+    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, node_of, operator_row,
+    phase_at, promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
 pub use engine::{
     Adopted, AgentSelector, ControlFor, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate,
@@ -63,7 +66,7 @@ pub use engine::{
     live_step_at, never_cancelled,
 };
 #[cfg(feature = "test-support")]
-pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};
+pub use engine::{claim_fake, dispatch_fake, enqueue_fake, resume_fake, sweep_fake};
 pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
@@ -74,13 +77,13 @@ pub use graph::{
 };
 pub use isolate::{
     ChangedPaths, Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
-    IsolatorFuture, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
+    IsolatorFuture, PartTip, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
 };
 pub use recover::{Heartbeat, LeaseTimes};
 pub use secrets::RunSecrets;
 pub use select::{SkipCause, Walk, walk};
 pub use status::{
-    Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,
+    Cursor, PlanCap, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,
 };
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 pub use walk::required_inputs;

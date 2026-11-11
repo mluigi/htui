@@ -12,12 +12,12 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_core::model::{
     CommandRun, CommandRunStatus, Document, GraphSnapshot, Isolation, RepoId, RunStep,
-    RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
+    RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::store::StoreError;
 use serde_json::Value;
 
-use crate::gate::{Settle, SettleInput, settle};
+use crate::gate::{Settle, SettleInput, Unmerged, settle};
 use crate::verify::VERIFY_CLASS;
 
 /// `app_setting` key of the lease's time to live, in seconds (`0003_orchestration.sql:135`).
@@ -32,6 +32,10 @@ pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
 
 /// The interval when [`LEASE_REFRESH_KEY`] is absent or not a positive integer: §10's 60 s.
 pub const DEFAULT_LEASE_REFRESH_SECONDS: i64 = 60;
+
+/// `run_step.gate_note` of a step whose trees the sweep must not reset (ANA-2 `:1299`, plan D93):
+/// the engine writes it, and the walk reads it on a part (MOD-139 M2 D14) so the park holds.
+pub const NOT_RESET: &str = "interrupted, tree not reset";
 
 /// The longest TTL [`LeaseTimes::from_app`] reads as set: one year, so `now + ttl` never
 /// overflows a `DateTime<Utc>`, and the store's own bound (MOD-40 blueprint B27).
@@ -190,13 +194,26 @@ pub enum StepKind {
     Candidate,
     /// The slot's judge (`fanout_index = -1`).
     Judge,
+    /// MOD-139 M2 D14: one part of a divided node (`role = part`). Classified by the plain
+    /// artefact test; a finished part is `done` and never landed, an unfinished one is reset and
+    /// failed `interrupted` for its node's next parts round to retry.
+    Part,
+    /// MOD-139 M3 D8: a divided node's integrate step (`role = integrate`). Classified by the
+    /// plain artefact test; a finished one is post-checked over its recorded commits before it is
+    /// re-settled and landed, an unfinished one is reset (or parked) as a plain step.
+    Integrate,
 }
 
 impl StepKind {
-    /// `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
+    /// A `part` row → Part (MOD-139 M2 D14, first); an `integrate` row → Integrate (MOD-139 M3
+    /// D8); `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
     #[must_use]
     pub const fn of(step: &RunStep, phase: &SnapshotPhase) -> Self {
-        if step.fanout_index == JUDGE_FANOUT_INDEX {
+        if matches!(step.role, StepRole::Part) {
+            Self::Part
+        } else if matches!(step.role, StepRole::Integrate) {
+            Self::Integrate
+        } else if step.fanout_index == JUDGE_FANOUT_INDEX {
             Self::Judge
         } else if phase.fan_out > 1 {
             Self::Candidate
@@ -228,7 +245,9 @@ pub enum Adjudication {
 /// D90/D92/D93 over one `running` step. Seven arguments, which is clippy's limit.
 ///
 /// Finished when the output document exists **and** either `finished_at` is set or the capture
-/// landed. For a plain step or a judge the capture landed when every repo of `run_scope` has a
+/// landed. For a plain step, a judge, a part (MOD-139 M2 D14) or an integrate step (M3 D8) the
+/// capture landed when every
+/// repo of `run_scope` has a
 /// `run_step_commit` row and at least one of them has an `after_hash`: stage 2 gives every scope
 /// repo a row, and stage 5's capture batch lands in one transaction, so one `after_hash` proves
 /// the batch. Every row without one stays unfinished, since a capture that never landed and one
@@ -252,7 +271,7 @@ pub fn classify(
     let changed = |repo: &RepoId| row(repo).is_some_and(|row| row.after_hash.is_some());
     let captured = match kind {
         StepKind::Candidate => run_scope.iter().all(changed),
-        StepKind::Plain | StepKind::Judge => {
+        StepKind::Plain | StepKind::Judge | StepKind::Part | StepKind::Integrate => {
             run_scope.iter().all(|repo| row(repo).is_some())
                 && (run_scope.is_empty() || run_scope.iter().any(changed))
         }
@@ -323,7 +342,9 @@ pub fn verify_of(
 /// The deadline is dropped because the sweep's clock is not the step's, and the cap because the
 /// recorder's breach is not durable (plan R-13); `now` is therefore inert. `verify` is
 /// [`verify_of`]'s, and `reads_verdict` is `GraphSnapshot::reads_verdict` of the step's node (an
-/// outgoing `changes_requested` edge, MOD-138 M2 D7), as stage 5 passes it.
+/// outgoing `changes_requested` edge, MOD-138 M2 D7), as stage 5 passes it. `unmerged` is a
+/// recovered integrate's post-check over its recorded commits (MOD-139 M3 D8), `None` for every
+/// other step.
 #[must_use]
 pub fn resettle(
     output: Option<&Document>,
@@ -331,6 +352,7 @@ pub fn resettle(
     reads_verdict: bool,
     started_at: DateTime<Utc>,
     now: DateTime<Utc>,
+    unmerged: Option<Unmerged<'_>>,
 ) -> Settle {
     let driver = Ok(DoneEvent {
         stop_reason: StopReason::EndTurn,
@@ -346,6 +368,7 @@ pub fn resettle(
         output,
         verify_outcome: verify,
         reads_verdict,
+        unmerged,
     })
 }
 
@@ -476,7 +499,7 @@ mod tests {
     use htui_core::model::{
         BoxId, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentId, EdgeKind,
         GraphSnapshot, Isolation, ItemId, RepoId, RunStep, RunStepCommit, RunStepTree,
-        SnapshotPhase, StepId, StepStatus, UserId, VerifyOutcome,
+        SnapshotPhase, StepId, StepRole, StepStatus, UserId, VerifyOutcome,
     };
 
     use crate::gate::{Settle, StepFailure};
@@ -934,6 +957,9 @@ mod tests {
             verify_exit_code: None,
             promoted_at: None,
             branch: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
             updated_at: at(0),
         }
     }
@@ -1286,6 +1312,100 @@ mod tests {
         );
     }
 
+    /// MOD-139 M2 D14: a part is its own kind, whatever its node's `fan_out`, and its capture is
+    /// proved as a plain step's: one scope repo with an `after_hash` is enough.
+    #[test]
+    fn a_part_is_classified_by_the_plain_artefact_test() {
+        let mut fanned = implement();
+        fanned.fan_out = 3;
+        let mut part = step(2, 1, 0, StepStatus::Running);
+        part.role = StepRole::Part;
+        assert_eq!(StepKind::of(&part, &implement()), StepKind::Part);
+        assert_eq!(
+            StepKind::of(&part, &fanned),
+            StepKind::Part,
+            "never a candidate"
+        );
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&part, first, Isolation::Worktree, false),
+            tree(&part, second, Isolation::Worktree, false),
+        ];
+        let one = [
+            commit(&part, first, Some("after-1")),
+            commit(&part, second, None),
+        ];
+        let answer = classify(&part, &fanned, &[first, second], &trees, &one, true, &[]);
+        assert_eq!(
+            answer,
+            (
+                StepKind::Part,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            ),
+            "one `after_hash` proves the capture batch, as for a plain step"
+        );
+        let none = [commit(&part, first, None), commit(&part, second, None)];
+        let answer = classify(&part, &fanned, &[first, second], &trees, &none, true, &[]);
+        assert_eq!(answer, (StepKind::Part, Adjudication::Reset));
+    }
+
+    /// MOD-139 M3 D8: an integrate row is its own kind and is classified by the plain artefact
+    /// test: one `after_hash` proves its capture; none is resettable in a separate tree; a dirty
+    /// in-place tree is never reset.
+    #[test]
+    fn an_integrate_row_classifies_by_the_plain_rule() {
+        let mut integrate = step(3, 1, 0, StepStatus::Running);
+        integrate.role = StepRole::Integrate;
+        assert_eq!(StepKind::of(&integrate, &implement()), StepKind::Integrate);
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&integrate, first, Isolation::Worktree, false),
+            tree(&integrate, second, Isolation::Worktree, false),
+        ];
+        let one = [
+            commit(&integrate, first, Some("after-1")),
+            commit(&integrate, second, None),
+        ];
+        let scope = [first, second];
+        assert_eq!(
+            classify(&integrate, &implement(), &scope, &trees, &one, true, &[]),
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            )
+        );
+        let none = [
+            commit(&integrate, first, None),
+            commit(&integrate, second, None),
+        ];
+        assert_eq!(
+            classify(&integrate, &implement(), &scope, &trees, &none, true, &[]),
+            (StepKind::Integrate, Adjudication::Reset)
+        );
+        let dirty = [tree(&integrate, first, Isolation::SharedSerialized, true)];
+        assert!(matches!(
+            classify(&integrate, &implement(), &[first], &dirty, &[], false, &[]),
+            (StepKind::Integrate, Adjudication::NeverReset { .. })
+        ));
+        assert_eq!(
+            classify(&integrate, &implement(), &[], &[], &[], true, &[]),
+            (
+                StepKind::Integrate,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            ),
+            "an empty scope proves the capture vacuously"
+        );
+    }
+
     #[test]
     fn classify_a_step_with_no_tree_is_vacuously_resettable() {
         let step = running();
@@ -1398,7 +1518,7 @@ mod tests {
         let now = at(24 * 60);
         let settle_with = |runs: &[CommandRun]| {
             let (verify, _) = verify_of(&step, runs);
-            resettle(Some(&output), verify, false, at(0), now)
+            resettle(Some(&output), verify, false, at(0), now, None)
         };
         assert_eq!(
             settle_with(&[verify_run(&step, CommandRunStatus::Done, Some(1))]),
@@ -1415,7 +1535,7 @@ mod tests {
         );
         assert_eq!(settle_with(&[]), Settle::Ok { note: None });
         assert_eq!(
-            resettle(None, Some(VerifyOutcome::Pass), false, at(0), now),
+            resettle(None, Some(VerifyOutcome::Pass), false, at(0), now, None),
             Settle::Failed(StepFailure::MissingOutput)
         );
     }
@@ -1429,19 +1549,19 @@ mod tests {
             &step,
         );
         assert_eq!(
-            resettle(Some(&rejecting), None, true, at(0), at(5)),
+            resettle(Some(&rejecting), None, true, at(0), at(5), None),
             Settle::Rejected {
                 verdict_line: "verdict: request-changes".to_owned(),
             }
         );
         assert_eq!(
-            resettle(Some(&rejecting), None, false, at(0), at(5)),
+            resettle(Some(&rejecting), None, false, at(0), at(5), None),
             Settle::Ok { note: None },
             "a phase not named `review` never reads the front matter"
         );
         let approving = document("review", "---\nverdict: approve\n---\nShip it.\n", &step);
         assert_eq!(
-            resettle(Some(&approving), None, true, at(0), at(5)),
+            resettle(Some(&approving), None, true, at(0), at(5), None),
             Settle::Ok { note: None }
         );
     }

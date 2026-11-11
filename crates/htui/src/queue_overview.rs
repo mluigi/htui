@@ -165,7 +165,7 @@ mod tests {
         BatchClose, BatchStop, BoxId, EntryState, Escalation, GraphSnapshot, Hold, ItemId,
         ItemLink, ItemState, LinkKind, NewRun, NewRunStep, Note, NoteId, PER_TOKEN_CAP_BATCH,
         ProjectId, QueueMove, QueueOverview, RunId, RunMode, RunStatus, Scope, Status, StepId,
-        StepStatus, Wait, WorkspaceId, admission_order,
+        StepRole, StepStatus, Wait, WorkspaceId, admission_order,
     };
     use htui_core::store::{MemStore, StepFence, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -351,6 +351,9 @@ mod tests {
                 phase_name: "research".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the step lands")

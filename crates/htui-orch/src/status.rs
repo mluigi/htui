@@ -8,7 +8,8 @@
 use core::fmt;
 
 use htui_core::model::{
-    EdgeKind, GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
+    EdgeKind, GateOutcome, GraphSnapshot, RunStep, StepId, StepRole, StepStatus,
+    missing_tags_failure,
 };
 use htui_core::scrub::Unmasked;
 
@@ -142,6 +143,112 @@ pub enum RunFailure {
         /// The target's attempt just judged.
         attempts: i32,
     },
+    /// MOD-139 M2 D2 (ANA-33 §7.6): a divided node's admitted plan has no part.
+    EmptyPlan {
+        /// The divided node's name (`implement`, never `implement:plan`).
+        node: String,
+    },
+    /// MOD-139 M2 D7: more than one part under `local` isolation, which runs one.
+    LocalCannotDivide {
+        /// The divided node's name.
+        node: String,
+        /// The parts planned.
+        parts: u32,
+    },
+    /// MOD-139 M2 D8 (ANA-33 §7.8): an admission over one of its caps.
+    PlanOverCaps {
+        /// The divided node's name.
+        node: String,
+        /// The cap broken.
+        cap: PlanCap,
+        /// Parts planned (`MaxParts`, `MaxFanOut`), or the run's planned sessions
+        /// (`MaxAgentsPerRun`).
+        planned: u32,
+        /// The cap's value.
+        max: u32,
+    },
+    /// MOD-139 M2 D5: a default part names a persona; per-part personas run from MOD-140 on.
+    PartPersonaUnsupported {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+    },
+    /// MOD-139 M2 D5: a default part names an agent that is not one of the node's candidates.
+    PartAgentNotCandidate {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The agent the part names.
+        agent: htui_core::model::AgentId,
+    },
+    /// MOD-139 M2 D10: a default part's owned path is not a repo-relative `repo:glob`.
+    PartPathRefused {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The owned path, trimmed.
+        path: String,
+        /// Why: not a glob, absolute, or leaving its repository.
+        reason: String,
+    },
+    /// MOD-139 M2 D6: a part failed with no attempt left, so the divided step failed.
+    PartExhausted {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The part's last attempt.
+        attempts: i32,
+    },
+    /// MOD-139 M3 D6: integrate's post-check found done parts its capture does not hold.
+    IntegrateIncomplete {
+        /// The divided node's name.
+        node: String,
+        /// The parts' keys, plan order.
+        parts: Vec<String>,
+    },
+}
+
+/// MOD-139 M3 D6: `IntegrateIncomplete`'s one sentence, shared by [`RunFailure`] and
+/// `gate::StepFailure` (blueprint P-7: a singular and a plural form).
+#[must_use]
+pub fn integrate_incomplete(node: &str, parts: &[String]) -> String {
+    let named = parts
+        .iter()
+        .map(|part| format!("`{part}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if parts.len() == 1 {
+        format!("integrate_incomplete: part {named} of `{node}` is not merged")
+    } else {
+        format!("integrate_incomplete: parts {named} of `{node}` are not merged")
+    }
+}
+
+/// MOD-139 M2 D8: which cap an admission broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanCap {
+    /// The divided node's own `max_parts`.
+    MaxParts,
+    /// `app_setting.max_fan_out`, frozen in the snapshot.
+    MaxFanOut,
+    /// `app_setting.max_agents_per_run`, frozen in the snapshot.
+    MaxAgentsPerRun,
+}
+
+impl PlanCap {
+    /// The cap's setting name, as the failure sentence names it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxParts => "max_parts",
+            Self::MaxFanOut => "max_fan_out",
+            Self::MaxAgentsPerRun => "max_agents_per_run",
+        }
+    }
 }
 
 impl RunFailure {
@@ -205,6 +312,65 @@ impl fmt::Display for RunFailure {
                 f,
                 "{kind} loop exhausted after {attempts} attempts: `{from}` to `{to}`"
             ),
+            Self::EmptyPlan { node } => {
+                write!(f, "empty_plan: divided node `{node}` has no parts")
+            }
+            Self::LocalCannotDivide { node, parts } => write!(
+                f,
+                "local_cannot_divide: divided node `{node}` plans {parts} parts under `local` \
+                 isolation, which runs one"
+            ),
+            Self::PlanOverCaps {
+                node,
+                cap: cap @ PlanCap::MaxAgentsPerRun,
+                planned,
+                max,
+            } => write!(
+                f,
+                "plan_over_caps: divided node `{node}` brings the run to {planned} planned \
+                 sessions; {} is {max}",
+                cap.as_str()
+            ),
+            Self::PlanOverCaps {
+                node,
+                cap,
+                planned,
+                max,
+            } => write!(
+                f,
+                "plan_over_caps: divided node `{node}` plans {planned} parts; {} is {max}",
+                cap.as_str()
+            ),
+            Self::PartPersonaUnsupported { node, part } => write!(
+                f,
+                "part_persona_unsupported: part `{part}` of `{node}` names a persona; per-part \
+                 personas run from MOD-140 on"
+            ),
+            Self::PartAgentNotCandidate { node, part, agent } => write!(
+                f,
+                "part_agent_not_candidate: part `{part}` of `{node}` names agent {agent}, which is \
+                 not one of the node's candidates"
+            ),
+            Self::PartPathRefused {
+                node,
+                part,
+                path,
+                reason,
+            } => write!(
+                f,
+                "part_path_refused: part `{part}` of `{node}`: owned path `{path}` {reason}"
+            ),
+            Self::PartExhausted {
+                node,
+                part,
+                attempts,
+            } => write!(
+                f,
+                "part_exhausted: part `{part}` of `{node}` failed after {attempts} attempts"
+            ),
+            Self::IntegrateIncomplete { node, parts } => {
+                f.write_str(&integrate_incomplete(node, parts))
+            }
         }
     }
 }
@@ -247,6 +413,13 @@ pub enum Cursor {
         position: i32,
         /// `run_step.attempt` of the slot.
         attempt: i32,
+    },
+    /// MOD-139 M2 D4: a divided node whose planner row is `done` and whose parts (of that planner
+    /// attempt) are not all `done`, none is live and none is out of attempts: create the retry rows
+    /// owed (T4) and run every `pending` part.
+    Parts {
+        /// The planner node's `position`.
+        position: i32,
     },
     /// MOD-138 M2 D6: `step`, a node's winner, is `done` and its node's `if` edges are not
     /// decided yet (`run_step.branch` is NULL). A write the engine owes, so it sorts before every
@@ -426,7 +599,8 @@ pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) ->
 /// between its first write and its unpark: every step the run is parked over is `done`,
 /// `superseded` or `selected`, and no gate is waiting on a human. `Decide` and `Loop` (MOD-138 M2
 /// D2) are writes the engine still owes, which a crash, or a decision the isolator could not
-/// read (D6), cut off. `Rest`, `Fan` and `Select` are real parks a human has to answer.
+/// read (D6), cut off. `Parts` (MOD-139 M2 D4) is a write the engine owes, as `Decide`. `Rest`,
+/// `Fan` and `Select` are real parks a human has to answer.
 /// `Engine::resume`'s own walk and `Unblock`'s third case (plan D161) both read this one
 /// predicate, so the two cannot drift.
 #[must_use]
@@ -437,6 +611,7 @@ pub fn resumable_park(cursor: &Cursor) -> bool {
             | Cursor::Run(_)
             | Cursor::Decide { .. }
             | Cursor::Loop { .. }
+            | Cursor::Parts { .. }
             | Cursor::Finished
     )
 }
@@ -472,7 +647,7 @@ pub fn crashed_rejection<'s>(cursor: &Cursor, steps: &'s [RunStep]) -> Option<&'
 
 /// Blueprint D196, widened by MOD-37 R-31: the one predicate every resume reader reads.
 ///
-/// [`resumable_park`]'s five cursors, or a [`crashed_rejection`]. `Unblock`'s third case
+/// [`resumable_park`]'s six cursors, or a [`crashed_rejection`]. `Unblock`'s third case
 /// (through [`crate::command::unblock_enabled`]'s callers), `Engine::resume`'s walk and the
 /// worker box's hand-back resume all read this, and none open-codes it.
 #[must_use]
@@ -481,24 +656,30 @@ pub fn resumable(cursor: &Cursor, steps: &[RunStep]) -> bool {
 }
 
 /// MOD-138 M3 (A1): the position a cursor stands on, the key the concurrent walk holds a node
-/// by. `Create`/`Fan`/`Select` carry it; `Run`/`Rest`/`Decide`/`Loop` read their step's row.
-/// `None` for `Finished` and for a step `steps` does not hold.
+/// by. `Create`/`Fan`/`Select`/`Parts` carry it; `Run`/`Rest`/`Decide`/`Loop` read their step's
+/// row, and a part row (MOD-139 M2, blueprint P-14) stands on its planner's position, the node it
+/// belongs to. `None` for `Finished` and for a step `steps` does not hold.
 #[must_use]
 pub fn position_of(cursor: &Cursor, steps: &[RunStep]) -> Option<i32> {
     let step = match cursor {
         Cursor::Create { position, .. }
         | Cursor::Fan { position, .. }
-        | Cursor::Select { position, .. } => return Some(*position),
+        | Cursor::Select { position, .. }
+        | Cursor::Parts { position } => return Some(*position),
         Cursor::Run(step)
         | Cursor::Rest { step, .. }
         | Cursor::Decide { step }
         | Cursor::Loop { step, .. } => step,
         Cursor::Finished => return None,
     };
-    steps
-        .iter()
-        .find(|row| row.id == *step)
-        .map(|row| row.position)
+    let row = steps.iter().find(|row| row.id == *step)?;
+    match (row.role, row.parent_step_id) {
+        (StepRole::Part, Some(parent)) => steps
+            .iter()
+            .find(|planner| planner.id == parent)
+            .map(|planner| planner.position),
+        _ => Some(row.position),
+    }
 }
 
 /// MOD-138 M3 A6: whether a parked run is one a resume may walk on from: [`crate::walk::ready`]
@@ -574,8 +755,9 @@ mod tests {
     use htui_core::model::{GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus};
 
     use crate::status::{
-        Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
-        next_attempt, position_of, resumable, resumable_park, run_resumable, winner_at,
+        Cursor, PlanCap, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at,
+        may_attempt, next_attempt, position_of, resumable, resumable_park, run_resumable,
+        winner_at,
     };
     use crate::walk::tests::{diamond, done, row};
 
@@ -646,6 +828,35 @@ mod tests {
         );
         assert_eq!(at(Cursor::Finished), None);
         assert_eq!(at(Cursor::Run(StepId::new())), None, "a step the rows lack");
+        assert_eq!(at(Cursor::Parts { position: 2 }), Some(2));
+        assert!(
+            resumable_park(&Cursor::Parts { position: 2 }),
+            "an owed write"
+        );
+
+        // MOD-139 M2 (P-14): a part row stands on its planner's position.
+        let mut planner = c.clone();
+        planner.role = htui_core::model::StepRole::Planner;
+        let mut part = row(&snapshot, "d", 1, StepStatus::Running);
+        part.position = 7;
+        part.role = htui_core::model::StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        let rows = [planner.clone(), part.clone()];
+        assert_eq!(
+            position_of(
+                &Cursor::Rest {
+                    step: part.id,
+                    status: StepStatus::Running
+                },
+                &rows
+            ),
+            Some(planner.position)
+        );
+        assert_eq!(
+            position_of(&Cursor::Run(part.id), std::slice::from_ref(&part)),
+            None,
+            "a part whose planner the rows lack"
+        );
     }
 
     /// MOD-138 M3 A6: on a linear graph `run_resumable` is the first cursor's `resumable`.
@@ -876,6 +1087,120 @@ mod tests {
             "env_files_refused: `.env` in the session's trees; the project resolves its secrets \
              from infisical. Remove them, or set allow_env_files.",
             "MOD-89 D7: names the files and the provider, never a value"
+        );
+        let node = || "implement".to_owned();
+        let part = || "api".to_owned();
+        assert_eq!(
+            RunFailure::EmptyPlan { node: node() }.to_string(),
+            "empty_plan: divided node `implement` has no parts",
+            "MOD-139 M2 D2"
+        );
+        assert_eq!(
+            RunFailure::LocalCannotDivide {
+                node: node(),
+                parts: 2,
+            }
+            .to_string(),
+            "local_cannot_divide: divided node `implement` plans 2 parts under `local` isolation, \
+             which runs one",
+            "MOD-139 M2 D7"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxParts,
+                planned: 3,
+                max: 2,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` plans 3 parts; max_parts is 2",
+            "MOD-139 M2 D8, a part count"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxFanOut,
+                planned: 3,
+                max: 2,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` plans 3 parts; max_fan_out is 2",
+            "MOD-139 M2 D8, a part count"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxAgentsPerRun,
+                planned: 9,
+                max: 8,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` brings the run to 9 planned sessions; \
+             max_agents_per_run is 8",
+            "MOD-139 M2 D8, the run's sessions"
+        );
+        assert_eq!(
+            RunFailure::PartPersonaUnsupported {
+                node: node(),
+                part: part(),
+            }
+            .to_string(),
+            "part_persona_unsupported: part `api` of `implement` names a persona; per-part \
+             personas run from MOD-140 on",
+            "MOD-139 M2 D5"
+        );
+        assert_eq!(
+            RunFailure::PartAgentNotCandidate {
+                node: node(),
+                part: part(),
+                agent: ids::AGENT_AGY,
+            }
+            .to_string(),
+            format!(
+                "part_agent_not_candidate: part `api` of `implement` names agent {}, which is not \
+                 one of the node's candidates",
+                ids::AGENT_AGY
+            ),
+            "MOD-139 M2 D5"
+        );
+        assert_eq!(
+            RunFailure::PartPathRefused {
+                node: node(),
+                part: part(),
+                path: "/etc/x".to_owned(),
+                reason: "is an absolute path".to_owned(),
+            }
+            .to_string(),
+            "part_path_refused: part `api` of `implement`: owned path `/etc/x` is an absolute path",
+            "MOD-139 M2 D10"
+        );
+        assert_eq!(
+            RunFailure::PartExhausted {
+                node: node(),
+                part: part(),
+                attempts: 2,
+            }
+            .to_string(),
+            "part_exhausted: part `api` of `implement` failed after 2 attempts",
+            "MOD-139 M2 D6"
+        );
+        assert_eq!(
+            RunFailure::IntegrateIncomplete {
+                node: node(),
+                parts: vec!["ui".to_owned()],
+            }
+            .to_string(),
+            "integrate_incomplete: part `ui` of `implement` is not merged",
+            "MOD-139 M3 D6, one part"
+        );
+        assert_eq!(
+            RunFailure::IntegrateIncomplete {
+                node: node(),
+                parts: vec![part(), "ui".to_owned()],
+            }
+            .to_string(),
+            "integrate_incomplete: parts `api`, `ui` of `implement` are not merged",
+            "MOD-139 M3 D6, several parts"
         );
     }
 

@@ -28,7 +28,7 @@ use htui_core::model::{
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
     CasOutcome, MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held,
-    palette_phase_has_edges, reserved_phase_name,
+    palette_phase_has_edges, plan_suffix_phase_name, reserved_phase_name,
 };
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
@@ -647,6 +647,34 @@ async fn create_phase_with_a_reserved_name_is_refused() {
     assert_eq!(request, "create_phase");
     assert!(
         message.contains(&reserved_phase_name("judge")),
+        "the seam's own sentence reaches the section: {message}"
+    );
+}
+
+/// MOD-139 D6: a phase named `<x>:plan` would collide with a divided phase's planner node, so the
+/// store refuses it at save; the seam carries the store's sentence (blueprint P-3: the Postgres
+/// twin is the `phase_name_with_the_plan_suffix_is_refused` conformance case).
+#[tokio::test]
+async fn create_phase_with_the_plan_suffix_is_refused() {
+    let (request, message) = refusal(
+        serve(
+            &demo(),
+            &StoreRequest::CreatePhase {
+                scope: vulkan_scope(),
+                graph: ids::GRAPH_VULKAN_ANA,
+                name: "implement:plan".to_owned(),
+                position: 7,
+                template_name: "implement".to_owned(),
+                gate_hard: false,
+                input_kinds: Vec::new(),
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "create_phase");
+    assert!(
+        message.contains(&plan_suffix_phase_name("implement:plan")),
         "the seam's own sentence reaches the section: {message}"
     );
 }

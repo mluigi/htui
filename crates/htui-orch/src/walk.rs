@@ -19,7 +19,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use htui_core::model::{
-    EdgeKind, GateOutcome, GraphSnapshot, RunStep, SnapshotEdge, SnapshotPhase, StepStatus,
+    EdgeKind, GateOutcome, GraphSnapshot, NodeRole, RunStep, SnapshotEdge, SnapshotPhase,
+    StepStatus,
 };
 use htui_core::store::{WalkEdge, WalkNode, forward_mask};
 
@@ -31,8 +32,9 @@ pub enum NodeState<'s> {
     /// `fan_out = 1`: the latest attempt at `fanout_index 0` is `done`. `fan_out > 1`: the slot
     /// holds a `selected` `done` candidate, which is the winner carried here.
     Done(&'s RunStep),
-    /// [`Cursor::Run`], [`Cursor::Rest`], [`Cursor::Fan`] or [`Cursor::Select`]: a live row or
-    /// slot the engine drives or waits on.
+    /// [`Cursor::Run`], [`Cursor::Rest`], [`Cursor::Fan`], [`Cursor::Select`] or (MOD-139 M2 D3,
+    /// a divided node's parts) [`Cursor::Parts`]: a live row or slot the engine drives or waits
+    /// on.
     Live(Cursor),
     /// The latest row or slot is superseded or cancelled: create it again at `attempt`.
     Retired {
@@ -87,6 +89,9 @@ pub fn node_state<'s>(phase: &SnapshotPhase, steps: &'s [RunStep]) -> NodeState<
     let Some(step) = latest_at(steps, position) else {
         return NodeState::Absent;
     };
+    if phase.role == NodeRole::Planner && step.status == StepStatus::Done {
+        return parts_state(phase, step, steps);
+    }
     match step.status {
         StepStatus::Done => NodeState::Done(step),
         StepStatus::Pending => NodeState::Live(Cursor::Run(step.id)),
@@ -101,6 +106,60 @@ pub fn node_state<'s>(phase: &SnapshotPhase, steps: &'s [RunStep]) -> NodeState<
             attempt: next_attempt(steps, position),
         },
     }
+}
+
+/// MOD-139 M2 D3: a divided node whose planner row is `done` reads its parts (the latest attempt
+/// at each part position under that planner row), first rule wins (blueprint P-14, P-15):
+/// 1. a part `running`, `stopped` or `awaiting_approval` rests the node on it: a session this
+///    walk does not own;
+/// 2. a part `failed` with [`crate::recover::NOT_RESET`] rests the node on it whatever its budget
+///    says (plan D93, D14): the sweep left its tree alone and parked the run for a human, so no
+///    retry is created over that tree and no resume walks past the park (T4 repair 2);
+/// 3. a part out of attempts ([`crate::divide::exhausted`] against the node's `retry_limit`) rests
+///    the node `failed` **on the planner row** (D6: the divided step failed, never a part);
+/// 4. every part `done` (vacuously with none) is the node `Done`, carried by the planner row;
+/// 5. otherwise [`Cursor::Parts`]: retries owed or parts pending.
+fn parts_state<'s>(
+    phase: &SnapshotPhase,
+    planner: &'s RunStep,
+    steps: &'s [RunStep],
+) -> NodeState<'s> {
+    let parts = crate::divide::latest_parts(steps, planner.id);
+    if let Some(live) = parts.iter().find(|part| {
+        matches!(
+            part.status,
+            StepStatus::Running | StepStatus::Stopped | StepStatus::AwaitingApproval
+        )
+    }) {
+        return NodeState::Live(Cursor::Rest {
+            step: live.id,
+            status: live.status,
+        });
+    }
+    if let Some(parked) = parts.iter().find(|part| {
+        part.status == StepStatus::Failed
+            && part.gate_note.as_deref() == Some(crate::recover::NOT_RESET)
+    }) {
+        return NodeState::Live(Cursor::Rest {
+            step: parked.id,
+            status: StepStatus::Failed,
+        });
+    }
+    if parts
+        .iter()
+        .any(|part| crate::divide::exhausted(part, phase.retry_limit))
+    {
+        return NodeState::Live(Cursor::Rest {
+            step: planner.id,
+            status: StepStatus::Failed,
+        });
+    }
+    if parts.iter().all(|part| part.status == StepStatus::Done) {
+        return NodeState::Done(planner);
+    }
+    NodeState::Live(Cursor::Parts {
+        position: phase.position,
+    })
 }
 
 /// D2's edge table for one forward in-edge.
@@ -869,8 +928,8 @@ pub(crate) mod tests {
 
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        EdgeKind, EdgePredicate, GateOutcome, GraphSnapshot, RunStep, SnapshotEdge, SnapshotPhase,
-        StepId, StepStatus,
+        EdgeKind, EdgePredicate, GateOutcome, GraphSnapshot, NodeRole, RunStep, SnapshotEdge,
+        SnapshotPhase, StepId, StepRole, StepStatus,
     };
     use serde_json::json;
 
@@ -991,6 +1050,202 @@ pub(crate) mod tests {
                 ("d", "b", EdgeKind::ChangesRequested),
             ],
         )
+    }
+
+    /// MOD-139 M2: `prd → implement:plan → implement → review`, the planner and integrate pair
+    /// of a divided `implement`, as `graph::expand_divide` freezes it.
+    fn divided() -> GraphSnapshot {
+        let mut snapshot = graph(
+            &[
+                ("prd", 0),
+                ("implement:plan", 1),
+                ("implement", 2),
+                ("review", 3),
+            ],
+            &[
+                ("prd", "implement:plan", NEXT),
+                ("implement:plan", "implement", NEXT),
+                ("implement", "review", NEXT),
+            ],
+        );
+        snapshot.phases[1].role = NodeRole::Planner;
+        snapshot.phases[2].role = NodeRole::Integrate;
+        snapshot
+    }
+
+    /// The planner row of [`divided`] at `status`.
+    fn planner(snapshot: &GraphSnapshot, status: StepStatus) -> RunStep {
+        let mut planner = row(snapshot, "implement:plan", 1, status);
+        planner.role = StepRole::Planner;
+        planner
+    }
+
+    /// A part row at `position` under `planner`.
+    fn part(planner: &RunStep, position: i32, attempt: i32, status: StepStatus) -> RunStep {
+        let mut part = planner.clone();
+        part.id = StepId::new();
+        part.position = position;
+        part.attempt = attempt;
+        part.status = status;
+        part.role = StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        part.phase_name = format!("implement/{position}");
+        part.node_key = Some(part.phase_name.clone());
+        part
+    }
+
+    /// MOD-139 M2 D2, D3: a pending planner row is run; a done one reads its parts.
+    #[test]
+    fn a_pending_planner_runs_and_a_done_one_reads_its_parts() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let pending = planner(&snapshot, StepStatus::Pending);
+        assert_eq!(
+            ready(&snapshot, &[prd.clone(), pending.clone()]),
+            [Cursor::Run(pending.id)]
+        );
+        let running = planner(&snapshot, StepStatus::Running);
+        assert_eq!(
+            ready(&snapshot, &[prd.clone(), running.clone()]),
+            [Cursor::Rest {
+                step: running.id,
+                status: StepStatus::Running
+            }],
+            "admission runs inside the planner's future"
+        );
+        let done = planner(&snapshot, StepStatus::Done);
+        let api = part(&done, 4, 1, StepStatus::Pending);
+        assert_eq!(
+            ready(&snapshot, &[prd, done, api]),
+            [Cursor::Parts { position: 1 }]
+        );
+    }
+
+    /// MOD-139 M2 D3: the divided node is done only when every part's latest attempt is.
+    #[test]
+    fn a_divided_node_is_done_only_when_every_part_is() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        let ui = part(&planner, 5, 1, StepStatus::Pending);
+        let rows = [prd.clone(), planner.clone(), api.clone(), ui.clone()];
+        assert_eq!(ready(&snapshot, &rows), [Cursor::Parts { position: 1 }]);
+        let ui_done = part(&planner, 5, 1, StepStatus::Done);
+        let rows = [prd, planner.clone(), api, ui_done];
+        assert_eq!(
+            super::node_state(&snapshot.phases[1], &rows),
+            super::NodeState::Done(&planner)
+        );
+    }
+
+    /// MOD-139 M2 D3 (P-14): a live part rests its node; nothing downstream is offered.
+    #[test]
+    fn a_live_part_rests_the_node() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        let ui = part(&planner, 5, 1, StepStatus::Running);
+        assert_eq!(
+            ready(&snapshot, &[prd, planner, api, ui.clone()]),
+            [Cursor::Rest {
+                step: ui.id,
+                status: StepStatus::Running
+            }]
+        );
+    }
+
+    /// MOD-139 M2 D3, D6: a part out of attempts rests the node `failed` on the planner row.
+    #[test]
+    fn an_exhausted_part_rests_the_planner_failed() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Pending);
+        let ui = part(&planner, 5, 2, StepStatus::Failed);
+        assert_eq!(
+            ready(&snapshot, &[prd, planner.clone(), api, ui]),
+            [Cursor::Rest {
+                step: planner.id,
+                status: StepStatus::Failed
+            }],
+            "`retry_limit` 1 allows two attempts"
+        );
+    }
+
+    /// MOD-139 M2 D14 (plan D93, T4 repair 2): a part the sweep failed without resetting its
+    /// tree rests the node on it, whatever its budget says, so no parts round retries over the
+    /// tree and no resume walks past the park (`Rest` is never a resumable park).
+    #[test]
+    fn a_part_whose_tree_was_not_reset_rests_the_node_on_it() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        for attempt in [1, 2] {
+            let mut ui = part(&planner, 5, attempt, StepStatus::Failed);
+            ui.gate_note = Some(crate::recover::NOT_RESET.to_owned());
+            assert_eq!(
+                ready(
+                    &snapshot,
+                    &[prd.clone(), planner.clone(), api.clone(), ui.clone()]
+                ),
+                [Cursor::Rest {
+                    step: ui.id,
+                    status: StepStatus::Failed
+                }],
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    /// MOD-139 M2 D3, D6: a failed part with an attempt left owes the node its parts round.
+    #[test]
+    fn a_failed_part_with_an_attempt_left_is_owed_parts() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        let first = part(&planner, 5, 1, StepStatus::Failed);
+        assert_eq!(
+            ready(&snapshot, &[prd, planner, api, first]),
+            [Cursor::Parts { position: 1 }]
+        );
+    }
+
+    /// MOD-139 M2 (C3): stage rows (negative) and part rows (past the frozen list) leave `ready`
+    /// over a linear snapshot unchanged.
+    #[test]
+    fn stage_and_part_rows_are_invisible_to_other_nodes() {
+        let snapshot = graph(&[("a", 0), ("b", 1)], &[("a", "b", NEXT)]);
+        let a = done(&snapshot, "a");
+        let mut stage = a.clone();
+        stage.id = StepId::new();
+        stage.position = -1;
+        stage.role = StepRole::Stage;
+        stage.status = StepStatus::Pending;
+        stage.node_key = Some("collect".to_owned());
+        let parts = [
+            part(&a, 5, 1, StepStatus::Running),
+            part(&a, 6, 1, StepStatus::Failed),
+        ];
+        let bare = ready(&snapshot, std::slice::from_ref(&a));
+        let mut rows = vec![a, stage];
+        rows.extend(parts);
+        assert_eq!(ready(&snapshot, &rows), bare);
+        assert_eq!(bare, [create(1)]);
+    }
+
+    /// MOD-139 M2 D3, D15: once every part is done the integrate node is the next cursor.
+    #[test]
+    fn integrate_is_offered_once_the_parts_are_done() {
+        let snapshot = divided();
+        let prd = done(&snapshot, "prd");
+        let planner = planner(&snapshot, StepStatus::Done);
+        let api = part(&planner, 4, 1, StepStatus::Done);
+        let ui = part(&planner, 5, 1, StepStatus::Done);
+        assert_eq!(ready(&snapshot, &[prd, planner, api, ui]), [create(2)]);
     }
 
     /// D2: a node with no forward in-edge is reached; on a v2 snapshot with no edges every node

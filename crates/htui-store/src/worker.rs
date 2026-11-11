@@ -173,6 +173,9 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<Option<Vec<MemoryEntry>>> {
         ReadStore::memory_entries(self, project, states).await
     }
+    async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        ReadStore::run_plans(self, run).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -315,6 +318,23 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
         WriteStore::record_branch(self, fence, step, branch).await
+    }
+    async fn insert_run_plan(
+        &self,
+        fence: StepFence,
+        plan: htui_core::model::NewRunPlan,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::insert_run_plan(self, fence, plan).await
+    }
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await
@@ -573,6 +593,9 @@ impl htui_core::store::WorkerStore for Writer {
     ) -> Result<Option<Vec<MemoryEntry>>> {
         ReadStore::memory_entries(self, project, states).await
     }
+    async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        ReadStore::run_plans(self, run).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -715,6 +738,23 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
         WriteStore::record_branch(self, fence, step, branch).await
+    }
+    async fn insert_run_plan(
+        &self,
+        fence: StepFence,
+        plan: htui_core::model::NewRunPlan,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::insert_run_plan(self, fence, plan).await
+    }
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await

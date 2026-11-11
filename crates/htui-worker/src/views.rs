@@ -18,8 +18,8 @@ use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::{group_at, judge_at, run_resumable};
 use htui_orch::{
     Command, CommandOutcome, Cursor, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
-    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at,
-    promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
+    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, cursor, operator_row,
+    phase_at, promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
 use htui_store::DATABASE_UNREACHABLE;
 use uuid::Uuid;
@@ -367,6 +367,14 @@ fn verdicts(
             }
         };
         for step in steps {
+            // MOD-139 M2 D1: a part or a stage row is no node's; its verbs carry the engine's
+            // own sentence, not "no phase at position N".
+            if let Err(err) = operator_row(step) {
+                actions
+                    .steps
+                    .insert(step.id, refused_step(&err.to_string()));
+                continue;
+            }
             let phase = match phase_at(run.id, &snapshot, step.position) {
                 Ok(phase) => phase,
                 Err(err) => {
@@ -1641,6 +1649,48 @@ mod tests {
 
     fn step_of(candidate: &WaitingCandidate, index: usize) -> &RunStep {
         &candidate.runs[0].1[index]
+    }
+
+    /// MOD-139 M2 D1 (P-20): a part row's verbs carry the engine's part sentence, a stage row's
+    /// its own, never "no phase at position N".
+    #[test]
+    fn a_part_row_reports_its_verdicts_refused_with_the_part_sentence() {
+        use htui_core::model::StepRole;
+        let mut gate = over_a_gate(Status::Open);
+        let planner = step_of(&gate, 0).clone();
+        let mut part = step(2, run_of(&gate), (0, 1, 0), StepStatus::Pending);
+        part.position = 7;
+        part.role = StepRole::Part;
+        part.parent_step_id = Some(planner.id);
+        part.node_key = Some("prd/api".to_owned());
+        let mut stage = step(3, run_of(&gate), (0, 1, 0), StepStatus::Pending);
+        stage.position = -1;
+        stage.role = StepRole::Stage;
+        stage.node_key = Some("collect".to_owned());
+        gate.runs[0].1.extend([part.clone(), stage.clone()]);
+        let actions = verdict(&gate);
+        let sentence = format!(
+            "step {} is a part; a part is driven by its divided node",
+            part.id
+        );
+        let verdicts = &actions.steps[&part.id];
+        for refused in [
+            &verdicts.approve,
+            &verdicts.reject,
+            &verdicts.retry,
+            &verdicts.promote,
+            &verdicts.accept,
+            &verdicts.select,
+        ] {
+            assert_eq!(refused, &Err(sentence.clone()));
+        }
+        assert_eq!(
+            actions.steps[&stage.id].retry,
+            Err(format!(
+                "step {} is a `stage` row; htui drives it, not an operator verb",
+                stage.id
+            ))
+        );
     }
 
     #[test]

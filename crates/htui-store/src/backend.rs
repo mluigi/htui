@@ -1143,6 +1143,14 @@ impl ReadStore for Backend {
         }
     }
 
+    async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
+        match self {
+            Self::Memory(store) => store.run_plans(run).await,
+            Self::Online { pg, .. } => pg.run_plans(run).await,
+            Self::Offline { cache, .. } => cache.run_plans(run).await,
+        }
+    }
+
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         match self {
             Self::Memory(store) => store.item_requirements(item).await,

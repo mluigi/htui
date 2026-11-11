@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::OwnerDocument;
+use htui_core::model::StepRole;
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
@@ -41,6 +42,7 @@ use htui_core::model::{
     StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
     WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
+use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
@@ -309,7 +311,7 @@ fn run_of(row: &SqliteRow) -> Result<Run> {
 const RUN_STEP_SELECT: &str = "id, run_id, position, attempt, fanout_index, phase_name, agent_id, \
      model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, \
      usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
-     promoted_at, branch, updated_at";
+     promoted_at, branch, role, parent_step_id, node_key, updated_at";
 
 /// One `run_step` row, every column of [`RUN_STEP_SELECT`].
 fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
@@ -343,7 +345,35 @@ fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
         verify_exit_code: get(row, "verify_exit_code")?,
         promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
         branch: opt_json_col("run_step.branch", opt_text(row, "branch")?.as_deref())?,
+        role: get::<StepRole>(row, "role")?,
+        parent_step_id: opt_uuid_col::<StepId>(
+            "run_step.parent_step_id",
+            opt_text(row, "parent_step_id")?.as_deref(),
+        )?,
+        node_key: opt_text(row, "node_key")?,
         updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
+    })
+}
+
+/// Every `run_plan` column, in [`run_plan_of`]'s names.
+const RUN_PLAN_SELECT: &str = "id, run_id, revision, planner_step_id, scope, status, \
+     base_position, base_refs, body, digest, created_at, updated_at";
+
+/// One `run_plan` row (MOD-139 plan D2), every column of [`RUN_PLAN_SELECT`].
+fn run_plan_of(row: &SqliteRow) -> Result<RunPlan> {
+    Ok(RunPlan {
+        id: uuid_col::<RunPlanId>("run_plan.id", &text(row, "id")?)?,
+        run_id: uuid_col("run_plan.run_id", &text(row, "run_id")?)?,
+        revision: get(row, "revision")?,
+        planner_step_id: uuid_col("run_plan.planner_step_id", &text(row, "planner_step_id")?)?,
+        scope: get::<PlanScope>(row, "scope")?,
+        status: get::<PlanStatus>(row, "status")?,
+        base_position: get(row, "base_position")?,
+        base_refs: opt_json_col("run_plan.base_refs", opt_text(row, "base_refs")?.as_deref())?,
+        body: json_col("run_plan.body", &text(row, "body")?)?,
+        digest: text(row, "digest")?,
+        created_at: ts_col("run_plan.created_at", get(row, "created_at")?)?,
+        updated_at: ts_col("run_plan.updated_at", get(row, "updated_at")?)?,
     })
 }
 
@@ -1081,7 +1111,10 @@ impl ReadStore for CacheStore {
     /// never competes as hand-written. A fan-out **loser's** document can still be answered here
     /// where Postgres excludes it, when nothing in its arm ranks above it and it is newer than the
     /// hand-written pick. ANA-9 §6.2 promises whole-table consistency, not cross-table, so this is
-    /// by design; a caller that cannot tolerate a loser's output must read Postgres.
+    /// by design; a caller that cannot tolerate a loser's output must read Postgres. A **part's**
+    /// document can be answered offline the same way while its `run_step` row has not arrived
+    /// (MOD-139 D12, accepted like the loser's): once it has, `s.role <> 'part'` excludes it, inside
+    /// the same disjunction Postgres uses, so a hand-written document is never dropped.
     async fn resolve_inputs(
         &self,
         item: ItemId,
@@ -1124,7 +1157,8 @@ impl ReadStore for CacheStore {
                                LEFT JOIN run_step s ON s.id = d.produced_by_step_id \
                               WHERE d.item_id = ? \
                                 AND d.kind IN (SELECT k.value FROM json_each(?) k) \
-                                AND (s.id IS NULL OR COALESCE(s.selected, 1) <> 0)) \
+                                AND (s.id IS NULL \
+                                     OR (COALESCE(s.selected, 1) <> 0 AND s.role <> 'part'))) \
                       WHERE rank_in_arm = 1) \
               WHERE rank_in_kind = 1",
         )
@@ -1340,6 +1374,18 @@ impl ReadStore for CacheStore {
                 })
             })
             .collect()
+    }
+
+    /// MOD-139 D4: the mirrored revisions of `run`, `revision` order, offline (MOD-142).
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {RUN_PLAN_SELECT} FROM run_plan WHERE run_id = ? ORDER BY revision"
+        )))
+        .bind(run.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(run_plan_of).collect()
     }
 
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {

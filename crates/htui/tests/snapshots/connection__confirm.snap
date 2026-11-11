@@ -8,5 +8,5 @@ expression: "frame_of(&bench, &section)"
                  3
 ▌Rebuild cache   press Enter or R
                  Rebuild the mirror? Survives: the file, the schema version, the database
-                 fingerprint, the build time. Goes: the 21 mirrored tables, the refresh cursors, the
+                 fingerprint, the build time. Goes: the 22 mirrored tables, the refresh cursors, the
                  last full refresh time. The next refresh pass refills it. y / n

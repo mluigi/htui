@@ -24,13 +24,16 @@ use std::sync::{Arc, Mutex};
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, RepoBoxPath, RepoId, RunId,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SnapshotCandidate, SnapshotPhase,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePart, PremergeReport,
+    RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    SnapshotCandidate, SnapshotPhase, Split, StepGraphId, StepGraphPhase, StepId, StepRole,
+    StepStatus, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
+use htui_core::store::{
+    CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
+};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use htui_orch::conformance::until_stalled;
 use htui_orch::engine::{
@@ -39,14 +42,14 @@ use htui_orch::engine::{
 use htui_orch::fake::{FakeOrchestrator, RESTART_GAP, ScriptedStep, TestClock};
 use htui_orch::isolate::Clock as _;
 use htui_orch::isolate::copy;
-use htui_orch::isolate::git::Cli;
 use htui_orch::isolate::git::testkit::{
     commit_file, repo_with_one_commit, usable_git, worktree_list,
 };
+use htui_orch::isolate::git::{Cli, IDENTITY_ENV, premerge_message};
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
     ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
-    Prepared, RepoCheckout, ResetReport,
+    PartTip, Prepared, RepoCheckout, ResetReport,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -366,8 +369,8 @@ async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphP
         };
         mutate(&mut edited);
         // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
-        if edited.split != htui_core::model::Split::Divide {
-            edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
+        if edited.split != Split::Divide {
+            edited.split = Split::for_fan_out(edited.fan_out);
         }
         store
             .create_phase(&edited)
@@ -2083,6 +2086,25 @@ impl Isolator for StallAfterReconcile<'_> {
         })
     }
 
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        self.inner.premerge(step, trees, parts)
+    }
+
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        self.inner.unmerged(step, trees, heads, parts)
+    }
+
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         self.inner.cleanup(run, trees)
     }
@@ -2525,6 +2547,482 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
     assert_eq!(
         fix.docs_commit(&prd).await.after_hash.as_deref(),
         Some(docs_merged[0][0].as_str())
+    );
+}
+
+// -- MOD-139 M3 T5: divided runs over real git (blueprint §T5.1) -------------------------------
+
+/// Rewrites `item`'s live graph through `replace_graph`: `implement` divided (`split = divide`,
+/// `fan_out` 1) into one default part per key, each owning `src/<key>/**`. The conformance
+/// suite's `divided_feat_3` edit, over this binary's store.
+async fn divide_implement(store: &MemStore, item: ItemId, parts: &[&str]) {
+    let graph = store
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph")
+        .graph
+        .id;
+    let mut body = store
+        .graph_body(graph)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item's graph is there");
+    let node = body
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.name == "implement")
+        .expect("FEAT-3's graph has `implement`");
+    node.phase.split = Split::Divide;
+    node.phase.fan_out = 1;
+    let phase = node.phase.id;
+    node.parts = parts
+        .iter()
+        .enumerate()
+        .map(|(position, key)| PhasePart {
+            phase_id: phase,
+            position: i32::try_from(position).expect("a handful of parts"),
+            key: (*key).to_owned(),
+            title: format!("The {key}"),
+            brief: format!("Build the {key} part."),
+            owned_paths: vec![format!("src/{key}/**")],
+            acceptance: Some(format!("the {key} tests pass")),
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        })
+        .collect();
+    let outcome = store
+        .replace_graph(graph, body.graph.revision, body)
+        .await
+        .expect("the store takes the divided graph");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+}
+
+/// `git <args>` in `repo` under htui's merge identity, whatever it exits with: whether it
+/// succeeded, then its stdout.
+async fn git_as(git: &Cli, repo: &Path, args: &[&str]) -> (bool, String) {
+    let argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exited = git
+        .run("oracle", repo, &argv, &IDENTITY_ENV)
+        .await
+        .expect("git runs");
+    (exited.ok(), exited.stdout)
+}
+
+/// [`git_as`], failing the case on a non-zero exit.
+async fn git_ok(git: &Cli, repo: &Path, args: &[&str]) -> String {
+    let (ok, stdout) = git_as(git, repo, args).await;
+    assert!(ok, "git {args:?} failed in {repo:?}");
+    stdout
+}
+
+/// The agent of a divided run over real git (blueprint §T5.1).
+///
+/// A part session (`implement/<key>`) commits `src/<key>/lib.rs` into its `core` tree, and also
+/// `src/shared.rs` naming its key when `shared`, which is what makes two parts conflict. The
+/// integrate session finishes what its pre-merge could not: it reads its own `premerge` note, and
+/// for each part the note reports conflicted in `core` it runs `git merge --no-ff <tip>`, writes
+/// the union of both sides of every conflicted path, adds them and commits. Every session then
+/// lets the fake orchestrator write its output document.
+///
+/// `CommittingSink` cannot stand in for the parts: its `commit_file` writes one flat file named
+/// by the fan-out index, and the parts own paths under `src/<key>/`.
+struct MergingSink<'a> {
+    orch: &'a FakeOrchestrator,
+    git: &'a Cli,
+    /// The repository the parts commit to and the integrate session resolves in.
+    core: RepoId,
+    /// Whether every part also writes `src/shared.rs`.
+    shared: bool,
+}
+
+impl MergingSink<'_> {
+    /// `step`'s tree of the `core` repository.
+    async fn core_tree(&self, step: &RunStep) -> Result<PathBuf, StoreError> {
+        let trees = self.orch.store.step_trees(step.id).await?;
+        Ok(trees
+            .into_iter()
+            .find(|tree| tree.repo_id == self.core)
+            .map(|tree| PathBuf::from(tree.path))
+            .expect("the step holds a `core` tree"))
+    }
+
+    /// The part session's commit: its own file, and the shared one when `shared`.
+    async fn commit_part(&self, step: &RunStep) -> Result<(), StoreError> {
+        let key = step
+            .phase_name
+            .rsplit('/')
+            .next()
+            .expect("a part's phase is `<node>/<key>`");
+        let tree = self.core_tree(step).await?;
+        std::fs::create_dir_all(tree.join("src").join(key)).expect("the part's directory");
+        std::fs::write(
+            tree.join("src").join(key).join("lib.rs"),
+            format!("pub fn {key}() {{}}\n"),
+        )
+        .expect("the part's file is written");
+        if self.shared {
+            std::fs::write(tree.join("src/shared.rs"), format!("// written by {key}\n"))
+                .expect("the shared file is written");
+        }
+        git_ok(self.git, &tree, &["add", "-A"]).await;
+        git_ok(
+            self.git,
+            &tree,
+            &["commit", "-m", &format!("htui test: {}", step.phase_name)],
+        )
+        .await;
+        Ok(())
+    }
+
+    /// The integrate session's merge of every part its `premerge` note reports conflicted in
+    /// `core`, by tip.
+    async fn finish_merge(&self, item: ItemId, step: &RunStep) -> Result<(), StoreError> {
+        let notes = self.orch.store.notes(item).await?;
+        let Some(note) = notes
+            .iter()
+            .rev()
+            .find(|note| note.via_step_id == Some(step.id) && note.body.starts_with("premerge `"))
+        else {
+            return Ok(());
+        };
+        let mut repo = "";
+        let mut tips = Vec::new();
+        for line in note.body.lines() {
+            if let Some(header) = line.strip_prefix("repo `") {
+                repo = header.split('`').next().unwrap_or_default();
+            } else if repo == "core"
+                && let Some(rest) = line.strip_prefix("- part `")
+                && let Some(head) =
+                    rest.strip_suffix(": conflicted, merge aborted; conflicted paths:")
+                && let Some((_, tip)) = head.split_once("` ")
+            {
+                tips.push(tip.to_owned());
+            }
+        }
+        if tips.is_empty() {
+            return Ok(());
+        }
+        let tree = self.core_tree(step).await?;
+        for tip in &tips {
+            let (merged, _) =
+                git_as(self.git, &tree, &["merge", "--no-ff", "--no-edit", tip]).await;
+            assert!(
+                !merged,
+                "the note said {tip} conflicts, so the agent's merge stops too"
+            );
+            let conflicted =
+                git_ok(self.git, &tree, &["diff", "--name-only", "--diff-filter=U"]).await;
+            for path in conflicted.lines() {
+                let ours = git_ok(self.git, &tree, &["show", &format!(":2:{path}")]).await;
+                let theirs = git_ok(self.git, &tree, &["show", &format!(":3:{path}")]).await;
+                std::fs::write(tree.join(path), format!("{ours}{theirs}"))
+                    .expect("the union is written");
+                git_ok(self.git, &tree, &["add", path]).await;
+            }
+            git_ok(self.git, &tree, &["commit", "--no-edit"]).await;
+        }
+        Ok(())
+    }
+}
+
+impl SessionSink for MergingSink<'_> {
+    async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+        _done: &htui_agent::event::DoneEvent,
+    ) -> Result<(), StoreError> {
+        match step.role {
+            StepRole::Part => self.commit_part(step).await?,
+            StepRole::Integrate => self.finish_merge(item, step).await?,
+            _ => {}
+        }
+        FakeOrchestrator::after_done(self.orch, item, step, phase, key).await?;
+        Ok(())
+    }
+}
+
+impl Fixture {
+    /// `FEAT-3` ungated in the fixture's isolation with every phase's `input_kinds` cleared,
+    /// `review` attempt 1 approving, and `implement` divided into `parts`.
+    async fn divided(&self, parts: &[&str]) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_FEAT_3, |phase| {
+            phase.isolation = Some(isolation);
+            phase.gate = Gate::Never;
+            phase.input_kinds.clear();
+        })
+        .await;
+        divide_implement(&self.orch.store, ids::HTUI_FEAT_3, parts).await;
+        self.orch
+            .script("review", 1, ScriptedStep::review("approve", "fine"));
+    }
+
+    /// The divided run started through `StartRun` with `sink`, walked to `done`: its part rows
+    /// (plan order) and its one integrate row.
+    async fn divided_run<K: SessionSink>(&self, sink: &K) -> (RunId, Vec<RunStep>, RunStep) {
+        let run = self.start(sink).await;
+        let row = self.orch.run(run).await;
+        assert_eq!(
+            (row.status, row.failure.as_ref()),
+            (RunStatus::Done, None),
+            "the divided run lands"
+        );
+        let steps = self.steps(run).await;
+        let mut parts: Vec<RunStep> = steps
+            .iter()
+            .filter(|step| step.role == StepRole::Part)
+            .cloned()
+            .collect();
+        parts.sort_by_key(|step| (step.position, step.attempt));
+        let integrates: Vec<&RunStep> = steps
+            .iter()
+            .filter(|step| step.role == StepRole::Integrate)
+            .collect();
+        assert_eq!(integrates.len(), 1, "one integrate attempt: {integrates:?}");
+        (run, parts, integrates[0].clone())
+    }
+
+    /// Blueprint §T5.1's landing, on `core`: `HEAD` is the one `htui: reconcile <integrate>`
+    /// merge, its first parent the base and its second integrate's capture; every part tip is
+    /// in its second parent's history; no part was reconciled anywhere; integrate's history
+    /// holds one `htui: premerge <part>` merge per part. Answers the part tips, plan order.
+    async fn assert_one_landing(
+        &self,
+        git: &Cli,
+        parts: &[RunStep],
+        integrate: &RunStep,
+    ) -> Vec<String> {
+        let core = &self.core.path;
+        let head = head_of(git, core).await;
+        assert_eq!(
+            git_out(git, core, &["log", "-1", "--format=%s"]).await,
+            format!("htui: reconcile {}", integrate.id),
+            "the primary's `HEAD` is integrate's reconcile merge"
+        );
+        let parents: Vec<String> = git_out(git, core, &["log", "-1", "--format=%P"])
+            .await
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        let captured = self.core_commit(integrate).await;
+        assert_eq!(
+            captured.before_hash, self.core.head,
+            "integrate prepared from the plan's base"
+        );
+        assert_eq!(parents.len(), 2, "a `--no-ff` merge: {parents:?}");
+        assert_eq!(parents[0], self.core.head, "its first parent is the base");
+        assert_eq!(
+            captured.after_hash.as_deref(),
+            Some(head.as_str()),
+            "integrate's `after_hash` is the reconcile merge"
+        );
+        let mut tips = Vec::new();
+        for part in parts {
+            let tip = self
+                .core_commit(part)
+                .await
+                .after_hash
+                .unwrap_or_else(|| panic!("part `{}` committed on `core`", part.phase_name));
+            for descendant in [&head, &parents[1]] {
+                git_out(
+                    git,
+                    core,
+                    &["merge-base", "--is-ancestor", &tip, descendant],
+                )
+                .await;
+            }
+            tips.push(tip);
+        }
+        let subjects = git_out(git, core, &["log", "--all", "--format=%s"]).await;
+        for part in parts {
+            let reconciled = format!("htui: reconcile {}", part.id);
+            assert!(
+                !subjects.lines().any(|subject| subject == reconciled),
+                "a part is never reconciled: {subjects}"
+            );
+        }
+        let history = git_out(git, core, &["log", "--merges", "--format=%s", &parents[1]]).await;
+        for part in parts {
+            let premerge = premerge_message(part.id);
+            assert_eq!(
+                history
+                    .lines()
+                    .filter(|subject| *subject == premerge)
+                    .count(),
+                1,
+                "integrate's history holds `{premerge}` once: {history}"
+            );
+        }
+        assert_eq!(
+            merges(git, core).await.len(),
+            1 + parts.len(),
+            "the reconcile merge and one pre-merge per part, nothing else"
+        );
+        assert_eq!(
+            head_of(git, &self.docs.path).await,
+            self.docs.head,
+            "no part committed on `docs`, so nothing landed there"
+        );
+        tips
+    }
+}
+
+/// MOD-139 M3 D1-D3, D7 over real git, `worktree`: a divided run's two parts, on disjoint files,
+/// are pre-merged into integrate's tree and land on the primary as **one** reconcile merge, of
+/// integrate; no part is reconciled on its own.
+#[tokio::test]
+async fn a_divided_run_lands_one_integrate_merge_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: false,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    assert_eq!(
+        parts
+            .iter()
+            .map(|part| part.phase_name.as_str())
+            .collect::<Vec<_>>(),
+        ["implement/api", "implement/ui"]
+    );
+    fix.assert_one_landing(&git, &parts, &integrate).await;
+    assert_eq!(
+        git_out(
+            &git,
+            &fix.core.path,
+            &["ls-tree", "-r", "--name-only", "HEAD", "src"]
+        )
+        .await,
+        "src/api/lib.rs\nsrc/ui/lib.rs",
+        "both parts' files reached the primary"
+    );
+}
+
+/// MOD-139 M3 D2, D7 over real git, `copy`: the pre-merge copies each part's range into
+/// integrate's copy first, and reconcile's `copy_range` walks every parent, so the part commits
+/// reach the primary on the reconcile merge's second-parent side.
+#[tokio::test]
+async fn a_divided_run_lands_one_integrate_merge_in_copy_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: false,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    for part in &parts {
+        assert_eq!(fix.core_commit(part).await.before_hash, fix.core.head);
+    }
+    fix.assert_one_landing(&git, &parts, &integrate).await;
+    assert_eq!(
+        git_out(
+            &git,
+            &fix.core.path,
+            &["ls-tree", "-r", "--name-only", "HEAD", "src"]
+        )
+        .await,
+        "src/api/lib.rs\nsrc/ui/lib.rs",
+        "both parts' files reached the primary"
+    );
+}
+
+/// MOD-139 M3 D3-D6 over real git, `worktree`: both parts change `src/shared.rs`, so the
+/// pre-merge merges `api`, aborts `ui` and says so in its note; the integrate agent finishes the
+/// merge from the note's tip, and the post-check passes on attempt 1.
+#[tokio::test]
+async fn a_conflicting_premerge_is_resolved_by_the_agent() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: true,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    assert_eq!(
+        (integrate.attempt, integrate.status),
+        (1, StepStatus::Done),
+        "the post-check passed on the first attempt"
+    );
+    let core = &fix.core.path;
+    let head = head_of(&git, core).await;
+    let mut tips = Vec::new();
+    for part in &parts {
+        let tip = fix
+            .core_commit(part)
+            .await
+            .after_hash
+            .expect("the part committed on `core`");
+        git_out(&git, core, &["merge-base", "--is-ancestor", &tip, &head]).await;
+        tips.push(tip);
+    }
+    let [api, ui] = tips.as_slice() else {
+        panic!("two parts: {tips:?}");
+    };
+
+    let notes: Vec<String> = fix
+        .orch
+        .store
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .filter(|note| note.via_step_id == Some(integrate.id))
+        .map(|note| note.body)
+        .filter(|body| body.starts_with("premerge `implement` attempt 1:\n"))
+        .collect();
+    assert_eq!(notes.len(), 1, "one premerge note: {notes:?}");
+    let note = &notes[0];
+    assert!(
+        note.contains(&format!("\n- part `api` {api}: merged as ")),
+        "`api` merged first: {note}"
+    );
+    assert!(
+        note.contains(&format!(
+            "\n- part `ui` {ui}: conflicted, merge aborted; conflicted paths:\n  - src/shared.rs"
+        )),
+        "the note names `ui` conflicted on `src/shared.rs`: {note}"
+    );
+    assert_eq!(
+        git_out(&git, core, &["log", "-1", "--format=%s"]).await,
+        format!("htui: reconcile {}", integrate.id)
+    );
+    let subjects = git_out(&git, core, &["log", "--format=%s", &head]).await;
+    assert_eq!(
+        subjects
+            .lines()
+            .filter(|subject| subject.starts_with("htui: premerge "))
+            .collect::<Vec<_>>(),
+        [premerge_message(parts[0].id)],
+        "only `api` was pre-merged; the agent merged `ui`"
+    );
+    assert_eq!(
+        git_out(&git, core, &["show", "HEAD:src/shared.rs"]).await,
+        "// written by api\n// written by ui",
+        "the agent's union of both sides landed"
     );
 }
 

@@ -12,8 +12,10 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 63 methods: 15 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`), 7
-//! [`WriteStore`] reads, 26 writes, `write_document`, MOD-42's three command methods, MOD-11's
+//! `WorkerStore` is 70 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! MOD-139 M1 `run_plans`), 7 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
+//! MOD-139 M2 `admit_plan` and `abandon_plans`),
+//! `write_document`, MOD-42's three command methods, MOD-11's
 //! four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
 //! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; MOD-144 R1 adds the write
@@ -34,14 +36,14 @@ use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
     DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
-    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
-    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo,
-    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
-    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
-    WorkspaceSummary,
+    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep, Note,
+    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
+    PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry,
+    QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
+    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -144,7 +146,7 @@ pub trait RelayStore: Send + Sync {
 /// `set_skill_binding`, `update_item`) are deliberately absent: it has no production caller and
 /// keeps its [`WriteStore`] bound.
 pub trait WorkerStore: RecorderStore + RelayStore {
-    // -- 15 ReadStore reads
+    // -- 16 ReadStore reads
     /// [`ReadStore::item`].
     fn item(&self, id: ItemId) -> impl Future<Output = Result<Option<Item>>> + Send;
     /// [`ReadStore::documents`].
@@ -199,6 +201,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         project: ProjectId,
         states: Option<Vec<MemoryState>>,
     ) -> impl Future<Output = Result<Option<Vec<MemoryEntry>>>> + Send;
+    /// [`ReadStore::run_plans`]: MOD-139 M2's admission and recovery read the run's plans.
+    fn run_plans(&self, run: RunId) -> impl Future<Output = Result<Vec<RunPlan>>> + Send;
 
     // -- 7 WriteStore reads
     /// [`WriteStore::repos`].
@@ -227,7 +231,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         workspace: WorkspaceId,
     ) -> impl Future<Output = Result<Option<WorkspaceStop>>> + Send;
 
-    // -- 26 writes (MOD-144 R1: `block_if_idle` besides)
+    // -- 29 writes (MOD-144 R1: `block_if_idle` besides)
     /// [`WriteStore::transition`].
     fn transition(
         &self,
@@ -354,6 +358,24 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         step: StepId,
         branch: &Value,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::insert_run_plan`].
+    fn insert_run_plan(
+        &self,
+        fence: StepFence,
+        plan: NewRunPlan,
+    ) -> impl Future<Output = Result<RunPlan>> + Send;
+    /// [`WriteStore::admit_plan`].
+    fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: PlanAdmission,
+    ) -> impl Future<Output = Result<RunPlan>> + Send;
+    /// [`WriteStore::abandon_plans`].
+    fn abandon_plans(
+        &self,
+        fence: StepFence,
+        planner_step: StepId,
+    ) -> impl Future<Output = Result<u32>> + Send;
     /// [`WriteStore::record_command_run`].
     fn record_command_run(
         &self,
@@ -768,6 +790,9 @@ impl WorkerStore for MemStore {
     ) -> Result<Option<Vec<MemoryEntry>>> {
         ReadStore::memory_entries(self, project, states).await
     }
+    async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
+        ReadStore::run_plans(self, run).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -910,6 +935,15 @@ impl WorkerStore for MemStore {
     }
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool> {
         WriteStore::record_branch(self, fence, step, branch).await
+    }
+    async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan> {
+        WriteStore::insert_run_plan(self, fence, plan).await
+    }
+    async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await

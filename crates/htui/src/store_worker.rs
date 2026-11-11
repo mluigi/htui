@@ -4584,6 +4584,9 @@ mod tests {
                 phase_name: "prd".to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
+                role: htui_core::model::StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("create_step")

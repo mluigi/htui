@@ -15,7 +15,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use htui_core::model::{Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
+use htui_core::model::{
+    Isolation, PremergeReport, RepoId, RunId, RunStepCommit, RunStepTree, StepId,
+};
 use htui_core::prompt::DiffBlock;
 
 pub mod copy;
@@ -134,9 +136,24 @@ pub struct ChangedPaths {
     pub truncated: bool,
 }
 
+/// MOD-139 M3 D2, D3: one done part as integrate's pre-merge and post-check read it. The engine
+/// builds one per latest done part of the admitted plan, in plan (position) order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartTip {
+    /// The part's step.
+    pub step: StepId,
+    /// Its key (`divide::part_key` of its `node_key`).
+    pub key: String,
+    /// Its `run_step_tree` rows: under `copy` the copy holding its commits (D2).
+    pub trees: Vec<RunStepTree>,
+    /// Its `run_step_commit` rows (one per repo; `after_hash` `None` = nothing committed).
+    pub commits: Vec<RunStepCommit>,
+}
+
 /// ANA-2 §4.6's four verbs plus four reads (milestone 4's two, `changed_paths`, MOD-9 D119, and
-/// `env_files`, MOD-89) and milestone 5's two recovery verbs; the four are named there verbatim
-/// (`docs/ANA-2.md:1769`), and all ten sit behind plan D6's seam.
+/// `env_files`, MOD-89), milestone 5's two recovery verbs, and MOD-139 M3's pre-merge verb and
+/// post-check read; the four are named there verbatim (`docs/ANA-2.md:1769`), and all twelve sit
+/// behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -240,6 +257,39 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>>;
+
+    /// MOD-139 M3 D2, D3: integrate's pre-merge. Per tree row (repo), in plan order: a part with
+    /// no `after_hash` here is `NoCommits`; a tip already an ancestor of the tree's `HEAD` is
+    /// `Contained`; otherwise it is merged `--no-ff` onto the `HEAD` re-read before it, subject
+    /// `htui: premerge <part step>`. The repo's first conflict is aborted and reported
+    /// `Conflicted`, and every later part of **that** repo is `NotAttempted`; repos are
+    /// independent. Under `copy` every part's range is first copied into the integrate copy and
+    /// labelled `htui/<part step>` there (D2). In-place trees take the repo's admin lock around
+    /// each part (D70's lock, as `reconcile` does). A conflict is not an error; every `Err` fails
+    /// the step (D3).
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport>;
+
+    /// MOD-139 M3 D6 (Confirm 2(a), blueprint P-4..P-6): the parts integrate's capture does not
+    /// hold, in plan order, deduplicated across repos. `heads` are integrate's own capture rows.
+    ///
+    /// Per head row, the descendant is `after_hash`, else `before_hash`; a part with a commit in
+    /// that repo fails when its tip is not an ancestor of the descendant, or when the paths its
+    /// own range changed do not meet the paths `<part before>..<descendant>` changed. A part with
+    /// no commits is exempt from both halves; one whose own range changed no path, or whose
+    /// either list was cut at [`git::DIFF_CAP`], is exempt from the path half only. A read: no
+    /// guard, no write.
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>>;
 
     /// Run-terminal cleanup, **never** at step end (ANA-2 invariant 6, `docs/ANA-2.md:128-131`,
     /// and §4.6's own cleanup rule, `:994-996`): the next attempt of a superseded step reads the

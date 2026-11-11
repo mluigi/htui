@@ -824,7 +824,7 @@ pub const REQUEST_NAMES: [&str; 13] = [
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 30] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -856,6 +856,7 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 30] {
         item_requirements,
         memory_entries,
         memory_revisions,
+        run_plans,
     } = *reach;
     [
         (workspace_links, "workspace link", "workspace links"),
@@ -896,6 +897,7 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 30] {
         (item_requirements, "citation", "citations"),
         (memory_entries, "memory entry", "memory entries"),
         (memory_revisions, "memory revision", "memory revisions"),
+        (run_plans, "run plan", "run plans"),
     ]
 }
 
@@ -1160,6 +1162,27 @@ mod tests {
             ]
         );
         assert_eq!(reach_totals(&reach), (10, 3));
+    }
+
+    /// MOD-139 plan D5: a project delete's run plans are named in the warning, last and in field
+    /// order.
+    #[test]
+    fn reach_parts_names_the_run_plans() {
+        let reach = DeleteReach {
+            runs: 1,
+            run_steps: 4,
+            run_plans: 2,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            reach_parts(&reach),
+            vec![
+                "1 run".to_owned(),
+                "4 run steps".to_owned(),
+                "2 run plans".to_owned(),
+            ]
+        );
+        assert_eq!(reach_totals(&reach), (7, 3));
     }
 
     #[test]

@@ -131,8 +131,8 @@ pub use hierarchy::{
 pub use ids::{
     AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, MemoryEntryId,
     NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
-    RequirementAreaId, RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId,
-    StepId, UserId, WorkspaceId,
+    RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId, SkillBindingId, SkillId,
+    StepGraphId, StepId, UserId, WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
@@ -194,12 +194,14 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunStep, NodeRole, Run, RunFacts, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, RuntimeChanges, SnapshotCandidate, SnapshotDivide,
-    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
-    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
-    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
+    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
+    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
+    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
+    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
+    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -444,6 +446,100 @@ mod tests {
         );
     }
 
+    /// `0029_divided_fanout.sql`'s `chk_run_step_role` (MOD-139 plan D1), ANA-33 §7.4's order.
+    #[test]
+    fn step_role_matches_check_list() {
+        check_enum(
+            StepRole::ALL,
+            &[
+                "step",
+                "planner",
+                "part",
+                "integrate",
+                "subgraph",
+                "consult",
+                "stage",
+            ],
+        );
+        assert_eq!(StepRole::default(), StepRole::Step);
+    }
+
+    /// `0029_divided_fanout.sql`'s `chk_run_plan_status` (MOD-139 plan D1).
+    #[test]
+    fn plan_status_matches_check_list() {
+        check_enum(
+            PlanStatus::ALL,
+            &["proposed", "admitted", "refused", "abandoned"],
+        );
+    }
+
+    /// MOD-139 M3 D3: the pre-merge report round-trips through serde, every outcome tagged in
+    /// snake case under `outcome`.
+    #[test]
+    fn premerge_report_round_trips_through_serde() {
+        let step = StepId::new();
+        let outcomes = [
+            (
+                PartMerge::Merged {
+                    commit: "m1".to_owned(),
+                },
+                "merged",
+            ),
+            (PartMerge::Contained, "contained"),
+            (PartMerge::NoCommits, "no_commits"),
+            (
+                PartMerge::Conflicted {
+                    paths: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                },
+                "conflicted",
+            ),
+            (PartMerge::NotAttempted, "not_attempted"),
+        ];
+        let report = PremergeReport {
+            repos: vec![RepoPremerge {
+                repo_id: RepoId::new(),
+                name: "core".to_owned(),
+                head: "h1".to_owned(),
+                parts: outcomes
+                    .iter()
+                    .map(|(merge, _)| PartPremerge {
+                        step,
+                        key: "api".to_owned(),
+                        tip: Some("t1".to_owned()),
+                        merge: merge.clone(),
+                    })
+                    .collect(),
+            }],
+        };
+        let value = serde_json::to_value(&report).expect("the report serialises");
+        for (index, (_, tag)) in outcomes.iter().enumerate() {
+            assert_eq!(value["repos"][0]["parts"][index]["merge"]["outcome"], *tag);
+        }
+        let back: PremergeReport = serde_json::from_value(value).expect("the report deserialises");
+        assert_eq!(back, report);
+    }
+
+    /// MOD-139 M2 D9: `PlanStatus::can_move_to` over all 16 pairs — exactly four moves are legal.
+    #[test]
+    fn plan_status_moves_by_its_law() {
+        use PlanStatus::{Abandoned, Admitted, Proposed, Refused};
+        let legal = [
+            (Proposed, Admitted),
+            (Proposed, Refused),
+            (Proposed, Abandoned),
+            (Admitted, Abandoned),
+        ];
+        for from in PlanStatus::ALL {
+            for to in PlanStatus::ALL {
+                assert_eq!(
+                    from.can_move_to(*to),
+                    legal.contains(&(*from, *to)),
+                    "{from} -> {to}"
+                );
+            }
+        }
+    }
+
     /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).
     #[test]
     fn permission_status_matches_check_list() {
@@ -561,6 +657,7 @@ mod tests {
         check_id(PersonaId::from_uuid(u), u);
         check_id(BatchId::from_uuid(u), u);
         check_id(MemoryEntryId::from_uuid(u), u);
+        check_id(RunPlanId::from_uuid(u), u);
     }
 
     #[test]

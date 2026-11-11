@@ -10,20 +10,23 @@
 //! are the one exception by design: they are `async` process supervision, and the `gix`
 //! post-conditions inside them go through the same helper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
+use htui_core::model::{
+    BoxId, Isolation, PartMerge, PartPremerge, PremergeReport, RepoId, RepoPremerge, RunId,
+    RunStepCommit, RunStepTree, StepId,
+};
 use htui_core::prompt::DiffBlock;
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
 use super::env_files::{self, EnvFiles};
-use super::git::{self, Cli, blocking};
+use super::git::{self, Cli, MergeAttempt, blocking};
 use super::{
-    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
-    ResetReport,
+    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, PartTip, Prepared,
+    PreparedTree, ResetReport,
 };
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
@@ -95,6 +98,24 @@ pub fn stale_worktree(path: &Path) -> String {
 #[must_use]
 pub fn copy_tree_vanished(path: &Path) -> String {
     format!("the copy at {} is gone", path.display())
+}
+
+/// MOD-139 M3 D2: a `copy` part committed in a repository but has no `copy` tree row of it, so
+/// there is no object database its range could be copied out of.
+#[must_use]
+pub fn no_part_copy(part: StepId, name: &str) -> String {
+    format!("part {part} committed in {name} but has no copy of it")
+}
+
+/// MOD-139 M3 D3, D6: `part`'s tip in `repo` — its `after_hash` there — or `None` when it committed
+/// nothing there (no row, `after_hash` `None`, or `after_hash == before_hash`).
+fn committed_tip(part: &PartTip, repo: RepoId) -> Option<(&RunStepCommit, String)> {
+    let commit = part.commits.iter().find(|commit| commit.repo_id == repo)?;
+    let tip = commit
+        .after_hash
+        .clone()
+        .filter(|after| *after != commit.before_hash)?;
+    Some((commit, tip))
 }
 
 /// MOD-4 milestone 4 D54(a): the slot's base names no entry for a repository of the scope, so
@@ -1272,6 +1293,245 @@ impl GixIsolator {
         Ok(label.filter(|label| *label != tree.base_ref))
     }
 
+    /// MOD-139 M3 D2, D3: one repository's pre-merge, every part in plan order (blueprint §1.3).
+    /// Under `copy` every committed part's range is copied in first, conflicted and not-attempted
+    /// parts included (D2); then each part is `NoCommits`, `NotAttempted` once the repository
+    /// stopped, or [`premerge_part`](Self::premerge_part)'s answer.
+    async fn premerge_repo(
+        &self,
+        git: &Cli,
+        tree: &RunStepTree,
+        parts: &[PartTip],
+    ) -> Result<RepoPremerge, IsolateError> {
+        let name = self.checkout_of(tree)?.name.clone();
+        if tree.mode == Isolation::Copy {
+            self.copy_part_ranges(tree, parts).await?;
+        }
+        let mut stopped = false;
+        let mut entries = Vec::with_capacity(parts.len());
+        for part in parts {
+            let tip = committed_tip(part, tree.repo_id).map(|(_, tip)| tip);
+            let merge = match &tip {
+                None => PartMerge::NoCommits,
+                Some(_) if stopped => PartMerge::NotAttempted,
+                Some(tip) => {
+                    let merge = self.premerge_part(git, tree, part.step, tip).await?;
+                    stopped = matches!(merge, PartMerge::Conflicted { .. });
+                    merge
+                }
+            };
+            entries.push(PartPremerge {
+                step: part.step,
+                key: part.key.clone(),
+                tip,
+                merge,
+            });
+        }
+        let path = self.premerge_path(tree)?;
+        let head = blocking(move || git::head(&path)).await?;
+        Ok(RepoPremerge {
+            repo_id: tree.repo_id,
+            name,
+            head,
+            parts: entries,
+        })
+    }
+
+    /// MOD-139 M3 D2: under `copy` a part's commits live in its own copy's object database and the
+    /// primary has no label for them, so every committed part's `before..tip` is copied into the
+    /// integrate copy (objects only, `reconcile_isolated`'s precedent) and labelled
+    /// `htui/<part>` there; a label already at the tip is tolerated (a retry of this verb).
+    async fn copy_part_ranges(
+        &self,
+        tree: &RunStepTree,
+        parts: &[PartTip],
+    ) -> Result<(), IsolateError> {
+        let to = PathBuf::from(&tree.path);
+        if !to.join(".git").is_dir() {
+            return Err(IsolateError::Refused(copy_tree_vanished(&to)));
+        }
+        for part in parts {
+            let Some((commit, tip)) = committed_tip(part, tree.repo_id) else {
+                continue;
+            };
+            let from = part
+                .trees
+                .iter()
+                .find(|row| row.repo_id == tree.repo_id && row.mode == Isolation::Copy)
+                .map(|row| PathBuf::from(&row.path))
+                .ok_or_else(|| {
+                    IsolateError::Refused(no_part_copy(part.step, &self.checkout_name(tree)))
+                })?;
+            if !from.join(".git").is_dir() {
+                return Err(IsolateError::Refused(copy_tree_vanished(&from)));
+            }
+            let (to, base) = (to.clone(), commit.before_hash.clone());
+            let (copy_to, copy_tip) = (to.clone(), tip.clone());
+            git::with_retry("copy objects", move || {
+                let (from, to, base, tip) = (
+                    from.clone(),
+                    copy_to.clone(),
+                    base.clone(),
+                    copy_tip.clone(),
+                );
+                async move { blocking(move || git::copy_range(&from, &to, &base, &tip)).await }
+            })
+            .await?;
+            let name = format!("htui/{}", part.step);
+            git::with_retry("create branch", move || {
+                let (to, name, tip) = (to.clone(), name.clone(), tip.clone());
+                async move { blocking(move || git::create_branch(&to, &name, &tip)).await }
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The checkout's name for a refusal, or the repo id when the box has no checkout of it.
+    fn checkout_name(&self, tree: &RunStepTree) -> String {
+        self.checkout_of(tree).map_or_else(
+            |_| tree.repo_id.to_string(),
+            |checkout| checkout.name.clone(),
+        )
+    }
+
+    /// MOD-139 M3 D3: where integrate's pre-merge works: the checkout for the in-place modes, the
+    /// tree itself for `worktree` and `copy`.
+    fn premerge_path(&self, tree: &RunStepTree) -> Result<PathBuf, IsolateError> {
+        Ok(match tree.mode {
+            Isolation::Local | Isolation::SharedSerialized => {
+                self.checkout_of(tree)?.local_path.clone()
+            }
+            Isolation::Worktree | Isolation::Copy => PathBuf::from(&tree.path),
+        })
+    }
+
+    /// MOD-139 M3 D3: one part in one repository. `Contained` when `tip` is already an ancestor of
+    /// the tree's `HEAD`, read now; otherwise `merge --no-ff` onto that `HEAD` under D39's retry.
+    /// In-place trees hold the repository's admin lock from the `HEAD` read through the merge's
+    /// post-condition, as `reconcile_isolated` does (D70, D136): another run's reconcile into the
+    /// same checkout would otherwise move `HEAD` under the two-parent check.
+    async fn premerge_part(
+        &self,
+        git: &Cli,
+        tree: &RunStepTree,
+        part: StepId,
+        tip: &str,
+    ) -> Result<PartMerge, IsolateError> {
+        let in_place = matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized);
+        let _admin = if in_place {
+            Some(self.admin_guard(tree.repo_id).await)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        {
+            if in_place {
+                self.probe_reconcile_admin(tree.repo_id);
+            }
+        }
+        let path = self.premerge_path(tree)?;
+        let read = path.clone();
+        let head = blocking(move || git::head(&read)).await?;
+        let (read, ancestor, at) = (path.clone(), tip.to_owned(), head.clone());
+        if blocking(move || git::is_ancestor(&read, &ancestor, &at)).await? {
+            return Ok(PartMerge::Contained);
+        }
+        let message = git::premerge_message(part);
+        let attempt =
+            git::with_retry("merge", || git.merge_no_ff_as(&path, &message, &head, tip)).await?;
+        #[cfg(test)]
+        {
+            if in_place {
+                self.probe_reconcile_admin(tree.repo_id);
+            }
+        }
+        Ok(match attempt {
+            MergeAttempt::Merged(merged) => PartMerge::Merged {
+                commit: merged.commit,
+            },
+            MergeAttempt::Conflicted(paths) => PartMerge::Conflicted { paths },
+        })
+    }
+
+    /// MOD-139 M3 D6 (blueprint §1.10): the parts integrate's capture row `head` does not hold,
+    /// added to `failing`. The descendant is `after_hash`, else `before_hash`; a part with a
+    /// commit in that repository fails when its tip is not an ancestor of it, or when its own
+    /// changed paths miss `<part before>..<descendant>`'s (Confirm 2(a), P-5). An empty own list
+    /// or a list cut at [`git::DIFF_CAP`] exempts the path half only (P-6).
+    async fn unmerged_in(
+        &self,
+        git: &Cli,
+        trees: &[RunStepTree],
+        head: &RunStepCommit,
+        parts: &[PartTip],
+        failing: &mut BTreeSet<StepId>,
+    ) -> Result<(), IsolateError> {
+        let descendant = head
+            .after_hash
+            .clone()
+            .unwrap_or_else(|| head.before_hash.clone());
+        let repo = self.repo_holding(trees, head.repo_id, &descendant).await?;
+        for part in parts {
+            let Some((commit, tip)) = committed_tip(part, head.repo_id) else {
+                continue;
+            };
+            let (read, ancestor, at) = (repo.clone(), tip.clone(), descendant.clone());
+            if !blocking(move || git::is_ancestor(&read, &ancestor, &at)).await? {
+                failing.insert(part.step);
+                continue;
+            }
+            let own = git.name_only(&repo, &commit.before_hash, &tip).await?;
+            if own.paths.is_empty() || own.truncated {
+                continue;
+            }
+            let merged = git
+                .name_only(&repo, &commit.before_hash, &descendant)
+                .await?;
+            if merged.truncated {
+                continue;
+            }
+            let merged: BTreeSet<&str> = merged.paths.iter().map(String::as_str).collect();
+            if !own.paths.iter().any(|path| merged.contains(path.as_str())) {
+                failing.insert(part.step);
+            }
+        }
+        Ok(())
+    }
+
+    /// D74 (blueprint A-3), factored out of [`range_of`](Self::range_of) for MOD-139 M3 D6: the
+    /// repository that holds `commit` for `repo` — the `copy` tree of the rows when its own object
+    /// database holds it, else the checkout. A `worktree` path is never opened, so a tree capture
+    /// removed (D27) is never read.
+    async fn repo_holding(
+        &self,
+        trees: &[RunStepTree],
+        repo: RepoId,
+        commit: &str,
+    ) -> Result<PathBuf, IsolateError> {
+        let checkout = self
+            .config
+            .repos
+            .get(&repo)
+            .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
+        if let Some(tree) = trees
+            .iter()
+            .find(|tree| tree.repo_id == repo && tree.mode == Isolation::Copy)
+        {
+            let copy = PathBuf::from(&tree.path);
+            // A copy that is gone, or does not hold the commit, falls back to the checkout; a
+            // commit neither holds is the caller's `git` refusal.
+            let (probe, hex) = (copy.clone(), commit.to_owned());
+            if blocking(move || git::has_commit(&probe, &hex))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(copy);
+            }
+        }
+        Ok(checkout.local_path.clone())
+    }
+
     /// Where `htui/<step>` points in `checkout`, or `None` when the step never labelled it.
     async fn label_of(
         &self,
@@ -1340,22 +1600,9 @@ impl GixIsolator {
             .repos
             .get(&commit.repo_id)
             .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
-        let mut repo = checkout.local_path.clone();
-        if let Some(tree) = trees
-            .iter()
-            .find(|tree| tree.repo_id == commit.repo_id && tree.mode == Isolation::Copy)
-        {
-            let copy = PathBuf::from(&tree.path);
-            // A copy that is gone, or does not hold the commit, falls back to the checkout; a
-            // commit neither holds is `git diff`'s own refusal.
-            let (probe, hex) = (copy.clone(), after.to_owned());
-            if blocking(move || git::has_commit(&probe, &hex))
-                .await
-                .unwrap_or(false)
-            {
-                repo = copy;
-            }
-        }
+        // A copy that is gone, or does not hold the commit, falls back to the checkout; a commit
+        // neither holds is `git diff`'s own refusal.
+        let repo = self.repo_holding(trees, commit.repo_id, after).await?;
         // D141: a merge onto a primary another run moved is diffed against its first parent, so
         // the range holds this step's change and never the other run's. D146: the merge is
         // recognised on the checkout only, tied to its first-parent line, and only for a tree
@@ -1626,6 +1873,53 @@ impl Isolator for GixIsolator {
         })
     }
 
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        Box::pin(async move {
+            let _ = step;
+            // D40's rule: a repo-less run needs no `git`.
+            if trees.is_empty() {
+                return Ok(PremergeReport::default());
+            }
+            let git = self.cli()?.clone();
+            let mut repos = Vec::with_capacity(trees.len());
+            for tree in trees {
+                repos.push(self.premerge_repo(&git, tree, parts).await?);
+            }
+            Ok(PremergeReport { repos })
+        })
+    }
+
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        Box::pin(async move {
+            let _ = step;
+            if heads.is_empty() {
+                return Ok(Vec::new());
+            }
+            let git = self.cli()?.clone();
+            let mut failing = BTreeSet::new();
+            for head in heads {
+                self.unmerged_in(&git, trees, head, parts, &mut failing)
+                    .await?;
+            }
+            Ok(parts
+                .iter()
+                .map(|part| part.step)
+                .filter(|step| failing.contains(step))
+                .collect())
+        })
+    }
+
     /// D36: run-terminal, never at step end, and every row is processed before the first failure
     /// is returned — a tree left behind because another one refused to go is a tree nobody
     /// removes; no sweep retries a terminal run's cleanup (milestone 6).
@@ -1792,7 +2086,8 @@ mod tests {
     use crate::isolate::git::testkit::{
         commit_file, commit_removal, empty_repo, repo_with_one_commit,
     };
-    use crate::isolate::{FanoutSlot, Isolator as _, Prepared, ResetReport};
+    use crate::isolate::{FanoutSlot, Isolator as _, PartTip, Prepared, ResetReport};
+    use htui_core::model::{PartMerge, PremergeReport};
 
     use super::{
         GixIsolator, IsolatorConfig, RepoCheckout, already_reset, label_conflict, local_moved,
@@ -5188,6 +5483,1007 @@ mod tests {
         assert!(
             worktree_path.join(".git").exists(),
             "the worktree tree is still there"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-139 M3 T1: integrate's pre-merge (D2, D3) and post-check (D6, Confirm 2(a)).
+    // ---------------------------------------------------------------------------------------------
+
+    /// One part of a pre-merge case: prepared under `mode` from `base` (with no slot under
+    /// `local`, which never takes one), `files` committed in order as `(repo, name, body)` in the
+    /// part's own tree, then captured.
+    #[allow(clippy::too_many_arguments)]
+    async fn part_tip(
+        isolator: &GixIsolator,
+        run: RunId,
+        scope: &[RepoId],
+        mode: Isolation,
+        base: &BTreeMap<RepoId, String>,
+        index: i32,
+        key: &str,
+        files: &[(RepoId, &str, &str)],
+    ) -> PartTip {
+        let step = StepId::new();
+        let slot = (mode != Isolation::Local).then(|| slot(index, 2, base));
+        let prepared = isolator
+            .prepare(run, step, scope, mode, slot)
+            .await
+            .expect("the part prepares");
+        for (repo, name, body) in files {
+            let tree = prepared
+                .trees
+                .iter()
+                .find(|tree| tree.tree.repo_id == *repo)
+                .expect("the part has a tree of the repo");
+            commit_file(
+                &PathBuf::from(&tree.tree.path),
+                name,
+                body,
+                &format!("{key} commits {name}"),
+            );
+        }
+        let trees = rows(&prepared);
+        let commits = isolator
+            .capture(step, &trees)
+            .await
+            .expect("the part captures");
+        PartTip {
+            step,
+            key: key.to_owned(),
+            trees,
+            commits,
+        }
+    }
+
+    /// Integrate's tree: prepared under `mode` from `base`, with no slot under `local` (plan D1).
+    async fn integrate_tree(
+        isolator: &GixIsolator,
+        run: RunId,
+        scope: &[RepoId],
+        mode: Isolation,
+        base: &BTreeMap<RepoId, String>,
+    ) -> (StepId, Vec<RunStepTree>) {
+        let step = StepId::new();
+        let slot = (mode != Isolation::Local).then(|| slot(0, 1, base));
+        let prepared = isolator
+            .prepare(run, step, scope, mode, slot)
+            .await
+            .expect("integrate prepares");
+        (step, rows(&prepared))
+    }
+
+    /// `(parents, subject)` of `commit` in the repository at `path`.
+    fn commit_shape(path: &Path, commit: &str) -> (Vec<String>, String) {
+        let repository = gix::open(path).expect("the repository opens");
+        let id = gix::ObjectId::from_hex(commit.as_bytes()).expect("a hex object id");
+        let commit = repository.find_commit(id).expect("the commit is there");
+        let parents = commit
+            .parent_ids()
+            .map(|id| id.detach().to_hex().to_string())
+            .collect();
+        let message = commit.message_raw_sloppy().to_string();
+        let subject = message.lines().next().unwrap_or_default().trim().to_owned();
+        (parents, subject)
+    }
+
+    /// Whether the repository at `path` (a linked worktree included) is mid-merge.
+    fn mid_merge(path: &Path) -> bool {
+        let repository = gix::open(path).expect("the repository opens");
+        repository.git_dir().join("MERGE_HEAD").exists()
+    }
+
+    /// A commit on `HEAD` of the repository at `path` with `parents` and `HEAD`'s own tree: an
+    /// `--allow-empty` commit with one parent, a `merge -s ours` with two.
+    fn commit_tree_of_head(path: &Path, parents: &[&str], message: &str) -> String {
+        let repository = gix::open(path).expect("the repository opens");
+        let tree = repository
+            .head_commit()
+            .expect("HEAD has a commit")
+            .tree_id()
+            .expect("the commit has a tree")
+            .detach();
+        let who = gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"htui test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: "1600000000 +0000",
+        };
+        let parents: Vec<gix::ObjectId> = parents
+            .iter()
+            .map(|hex| gix::ObjectId::from_hex(hex.as_bytes()).expect("a hex object id"))
+            .collect();
+        repository
+            .commit_as(who, who, "HEAD", message, tree, parents)
+            .expect("the commit is written")
+            .detach()
+            .to_hex()
+            .to_string()
+    }
+
+    /// The merge a report entry made.
+    fn merged(merge: &PartMerge) -> String {
+        match merge {
+            PartMerge::Merged { commit } => commit.clone(),
+            other => panic!("expected a merge: {other:?}"),
+        }
+    }
+
+    /// The tip of `part` in `repo`.
+    fn tip_of(part: &PartTip, repo: RepoId) -> String {
+        part.commits
+            .iter()
+            .find(|commit| commit.repo_id == repo)
+            .and_then(|commit| commit.after_hash.clone())
+            .expect("the part committed in the repo")
+    }
+
+    /// One repo `core`, an isolator over it, its base and a run.
+    fn premerge_fixture(
+        dir: &Path,
+    ) -> (
+        GixIsolator,
+        RepoId,
+        PathBuf,
+        BTreeMap<RepoId, String>,
+        RunId,
+    ) {
+        let (core, core_checkout, head) = repo(dir, "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(&dir.join("trees"), &[(core, core_checkout)]))
+            .expect("the config validates");
+        (
+            isolator,
+            core,
+            core_path,
+            BTreeMap::from([(core, head)]),
+            RunId::new(),
+        )
+    }
+
+    /// D3 under `worktree`: two parts on disjoint files merge in plan order onto integrate's
+    /// own `HEAD`, each `--no-ff` with a subject naming the part.
+    #[tokio::test]
+    async fn premerge_in_a_worktree_merges_each_part_in_plan_order() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let parts = [api.clone(), ui.clone()];
+
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the pre-merge runs");
+        assert_eq!(report.repos.len(), 1);
+        let repo = &report.repos[0];
+        assert_eq!((repo.repo_id, repo.name.as_str()), (core, "core"));
+        assert_eq!(
+            repo.parts.iter().map(|part| part.step).collect::<Vec<_>>(),
+            vec![api.step, ui.step]
+        );
+        assert_eq!(repo.parts[0].tip.as_deref(), Some(&*tip_of(&api, core)));
+        let (merge_api, merge_ui) = (merged(&repo.parts[0].merge), merged(&repo.parts[1].merge));
+        let tree = PathBuf::from(&trees[0].path);
+        assert_eq!(
+            crate::isolate::git::head(&tree).expect("HEAD reads"),
+            merge_ui
+        );
+        assert_eq!(repo.head, merge_ui);
+
+        let (parents, subject) = commit_shape(&tree, &merge_ui);
+        assert_eq!(parents, vec![merge_api.clone(), tip_of(&ui, core)]);
+        assert_eq!(subject, format!("htui: premerge {}", ui.step));
+        let (parents, subject) = commit_shape(&tree, &merge_api);
+        assert_eq!(parents, vec![base[&core].clone(), tip_of(&api, core)]);
+        assert_eq!(subject, format!("htui: premerge {}", api.step));
+        assert!(tree.join("api.rs").exists() && tree.join("ui.rs").exists());
+        assert!(!crate::isolate::git::is_dirty(&tree).expect("status reads"));
+    }
+
+    /// D2 under `copy`, and the PRD's open question: every part's range is copied into the
+    /// integrate copy and labelled there, and `merge --no-ff`'s two-parent post-condition holds
+    /// inside the copy.
+    #[tokio::test]
+    async fn premerge_in_a_copy_copies_every_part_range_and_labels_it() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Copy;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let copy = PathBuf::from(&trees[0].path);
+        for part in [&api, &ui] {
+            assert!(
+                !crate::isolate::git::testkit::has_object(&copy, &tip_of(part, core)),
+                "integrate's copy has never seen a part's commit"
+            );
+        }
+
+        let report = isolator
+            .premerge(integrate, &trees, &[api.clone(), ui.clone()])
+            .await
+            .expect("the pre-merge runs");
+        let repo = &report.repos[0];
+        let mut head = base[&core].clone();
+        for (part, entry) in [&api, &ui].into_iter().zip(&repo.parts) {
+            let tip = tip_of(part, core);
+            assert!(crate::isolate::git::testkit::has_object(&copy, &tip));
+            assert_eq!(
+                crate::isolate::git::branch_target(&copy, &format!("htui/{}", part.step))
+                    .expect("the ref store reads"),
+                Some(tip.clone()),
+                "the part is labelled in integrate's copy"
+            );
+            let merge = merged(&entry.merge);
+            assert_eq!(
+                commit_shape(&copy, &merge).0,
+                vec![head.clone(), tip],
+                "two parents [HEAD, tip] inside the copy"
+            );
+            head = merge;
+        }
+        assert_eq!(crate::isolate::git::head(&copy).expect("HEAD reads"), head);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("HEAD reads"),
+            base[&core],
+            "the primary is untouched"
+        );
+
+        // The post-check opens the copy, which holds integrate's capture.
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &[api, ui])
+                .await
+                .expect("the post-check reads"),
+            Vec::<StepId>::new()
+        );
+    }
+
+    /// D2 under `copy`: a part that committed in a repository but has no `copy` tree row of it
+    /// has no object database to copy its range out of, so the pre-merge refuses, naming the part
+    /// and the checkout (there is no copy path to name, unlike `copy_tree_vanished`).
+    #[tokio::test]
+    async fn premerge_in_a_copy_refuses_a_part_without_a_copy_row() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Copy;
+        let mut api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        api.trees.clear();
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let refused = isolator
+            .premerge(integrate, &trees, std::slice::from_ref(&api))
+            .await
+            .expect_err("no copy row, no range to copy");
+        let crate::isolate::IsolateError::Refused(reason) = refused else {
+            panic!("a refusal, not {refused:?}");
+        };
+        assert_eq!(
+            reason,
+            format!("part {} committed in core but has no copy of it", api.step)
+        );
+        assert_eq!(reason, super::no_part_copy(api.step, "core"));
+    }
+
+    /// D3's lock: an in-place (`shared_serialized`) pre-merge holds the repository's admin lock
+    /// from its `HEAD` read through each merge's post-condition.
+    #[tokio::test]
+    async fn premerge_in_place_takes_the_admin_lock() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::SharedSerialized;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("HEAD reads"),
+            base[&core],
+            "integrate's slot reset the checkout to the base (D9)"
+        );
+
+        let report = isolator
+            .premerge(integrate, &trees, &[api, ui])
+            .await
+            .expect("the pre-merge runs");
+        let merge = merged(&report.repos[0].parts[1].merge);
+        merged(&report.repos[0].parts[0].merge);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("HEAD reads"),
+            merge
+        );
+        assert_eq!(
+            isolator.reconcile_admin_probes(),
+            (4, 0),
+            "held at each part's HEAD read and after each merge"
+        );
+    }
+
+    /// D2's `local` row: the one part ran on the checked-out branch and integrate prepared on its
+    /// tip, so the part is already `Contained` and nothing is merged.
+    #[tokio::test]
+    async fn premerge_under_local_reads_the_single_part_contained() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Local;
+        let only = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "only",
+            &[(core, "a.rs", "a\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let tip = tip_of(&only, core);
+        assert_eq!(trees[0].base_ref, tip, "integrate starts on the part's tip");
+
+        let report = isolator
+            .premerge(integrate, &trees, &[only])
+            .await
+            .expect("the pre-merge runs");
+        assert_eq!(report.repos[0].parts[0].merge, PartMerge::Contained);
+        assert_eq!(report.repos[0].head, tip);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("HEAD reads"),
+            tip,
+            "no commit was made"
+        );
+    }
+
+    /// D3: a repository stops at its first conflict, which is aborted and reported with its paths;
+    /// every later part there is not attempted.
+    #[tokio::test]
+    async fn premerge_stops_a_repo_at_its_first_conflict() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let a = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "a",
+            &[(core, "f", "a's line\n")],
+        )
+        .await;
+        let b = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "b",
+            &[(core, "f", "b's line\n")],
+        )
+        .await;
+        let c = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "c",
+            &[(core, "c.rs", "c\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let report = isolator
+            .premerge(integrate, &trees, &[a, b.clone(), c])
+            .await
+            .expect("a conflict is not an error");
+        let parts = &report.repos[0].parts;
+        let merge_a = merged(&parts[0].merge);
+        assert_eq!(
+            parts[1].merge,
+            PartMerge::Conflicted {
+                paths: vec!["f".to_owned()]
+            }
+        );
+        assert_eq!(parts[1].tip.as_deref(), Some(&*tip_of(&b, core)));
+        assert_eq!(parts[2].merge, PartMerge::NotAttempted);
+        let tree = PathBuf::from(&trees[0].path);
+        assert!(!mid_merge(&tree), "the conflict was aborted");
+        assert!(!crate::isolate::git::is_dirty(&tree).expect("status reads"));
+        assert_eq!(
+            crate::isolate::git::head(&tree).expect("HEAD reads"),
+            merge_a
+        );
+        assert_eq!(report.repos[0].head, merge_a);
+        assert!(!tree.join("c.rs").exists(), "c was never merged");
+    }
+
+    /// D3: a part that committed nothing is `NoCommits`, and nothing is written for it.
+    #[tokio::test]
+    async fn premerge_reports_a_part_without_commits() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let idle = part_tip(&isolator, run, &scope, mode, &base, 0, "idle", &[]).await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let report = isolator
+            .premerge(integrate, &trees, &[idle])
+            .await
+            .expect("the pre-merge runs");
+        assert_eq!(report.repos[0].parts[0].merge, PartMerge::NoCommits);
+        assert_eq!(report.repos[0].parts[0].tip, None);
+        assert_eq!(report.repos[0].head, base[&core]);
+        assert_eq!(
+            crate::isolate::git::head(&PathBuf::from(&trees[0].path)).expect("HEAD reads"),
+            base[&core],
+            "nothing was written"
+        );
+    }
+
+    /// D3: repositories are independent — a conflict in one stops that one only.
+    #[tokio::test]
+    async fn premerge_keeps_repos_independent() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (web, web_checkout, web_head) = repo(dir.path(), "web", false);
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (web, web_checkout)],
+        ))
+        .expect("the config validates");
+        let base = BTreeMap::from([(core, core_head), (web, web_head)]);
+        let (run, scope, mode) = (RunId::new(), [core, web], Isolation::Worktree);
+        let a = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "a",
+            &[(core, "f", "a\n"), (web, "a.rs", "a\n")],
+        )
+        .await;
+        let b = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "b",
+            &[(core, "f", "b\n"), (web, "b.rs", "b\n")],
+        )
+        .await;
+        let c = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "c",
+            &[(core, "c.rs", "c\n"), (web, "c.rs", "c\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let report = isolator
+            .premerge(integrate, &trees, &[a, b, c])
+            .await
+            .expect("the pre-merge runs");
+        let of = |repo: RepoId| {
+            report
+                .repos
+                .iter()
+                .find(|entry| entry.repo_id == repo)
+                .expect("one entry per repo")
+        };
+        let core_parts = &of(core).parts;
+        merged(&core_parts[0].merge);
+        assert!(matches!(core_parts[1].merge, PartMerge::Conflicted { .. }));
+        assert_eq!(core_parts[2].merge, PartMerge::NotAttempted);
+        for part in &of(web).parts {
+            merged(&part.merge);
+        }
+    }
+
+    /// D3: a part another part's merge already brought in is `Contained`, not merged twice.
+    #[tokio::test]
+    async fn premerge_reads_a_part_reached_through_another_merge_contained() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let a = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "a",
+            &[(core, "a.rs", "a\n")],
+        )
+        .await;
+        let on_a = BTreeMap::from([(core, tip_of(&a, core))]);
+        let b = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &on_a,
+            1,
+            "b",
+            &[(core, "b.rs", "b\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+
+        let report = isolator
+            .premerge(integrate, &trees, &[b, a])
+            .await
+            .expect("the pre-merge runs");
+        let parts = &report.repos[0].parts;
+        let merge = merged(&parts[0].merge);
+        assert_eq!(parts[1].merge, PartMerge::Contained);
+        assert_eq!(report.repos[0].head, merge, "one merge, not two");
+    }
+
+    /// D6: a part integrate's capture does not hold — its tip is not an ancestor — is named.
+    #[tokio::test]
+    async fn unmerged_names_a_part_whose_tip_is_not_an_ancestor() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        isolator
+            .premerge(integrate, &trees, std::slice::from_ref(&api))
+            .await
+            .expect("only api is merged");
+        commit_file(
+            &PathBuf::from(&trees[0].path),
+            "glue.rs",
+            "glue\n",
+            "integrate's own work",
+        );
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &[api, ui.clone()])
+                .await
+                .expect("the post-check reads"),
+            vec![ui.step]
+        );
+    }
+
+    /// D6: after the pre-merge merged every part and integrate captured, nothing is unmerged.
+    #[tokio::test]
+    async fn unmerged_passes_every_merged_part() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let parts = [api, ui];
+        isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the pre-merge runs");
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        assert!(heads[0].after_hash.is_some());
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("the post-check reads"),
+            Vec::<StepId>::new()
+        );
+    }
+
+    /// Blueprint P-5: a `local` integrate that commits nothing captures `after_hash` `None`, and
+    /// its `before_hash` — the part's tip — is the descendant both halves read.
+    #[tokio::test]
+    async fn unmerged_reads_before_for_a_local_integrate_with_no_commits() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Local;
+        let only = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "only",
+            &[(core, "a.rs", "a\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let parts = [only];
+        isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the pre-merge runs");
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        assert_eq!(heads[0].after_hash, None);
+        assert_eq!(heads[0].before_hash, tip_of(&parts[0], core));
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("the post-check reads"),
+            Vec::<StepId>::new()
+        );
+    }
+
+    /// Confirm 2(a): a whole-part `merge -s ours` makes the part's tip an ancestor but drops its
+    /// change, so the path half names it; the part merged for real passes.
+    #[tokio::test]
+    async fn unmerged_names_a_part_merged_with_strategy_ours() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let tree = PathBuf::from(&trees[0].path);
+        isolator
+            .premerge(integrate, &trees, std::slice::from_ref(&api))
+            .await
+            .expect("api is merged");
+        let head = crate::isolate::git::head(&tree).expect("HEAD reads");
+        let ui_tip = tip_of(&ui, core);
+        commit_tree_of_head(&tree, &[&head, &ui_tip], "merge -s ours ui");
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        let descendant = heads[0].after_hash.clone().expect("integrate committed");
+        assert!(
+            crate::isolate::git::is_ancestor(&tree, &ui_tip, &descendant).expect("the walk reads"),
+            "ancestry alone would pass ui"
+        );
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &[api, ui.clone()])
+                .await
+                .expect("the post-check reads"),
+            vec![ui.step]
+        );
+    }
+
+    /// Plan D6, blueprint P-6: a part with no commits is exempt, and so is one whose own range
+    /// changed no path (an `--allow-empty` commit) — from the path half only, its tip merged.
+    #[tokio::test]
+    async fn unmerged_exempts_parts_with_no_commits_or_no_paths() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let idle = part_tip(&isolator, run, &scope, mode, &base, 0, "idle", &[]).await;
+
+        let empty_step = StepId::new();
+        let prepared = isolator
+            .prepare(run, empty_step, &scope, mode, Some(slot(1, 2, &base)))
+            .await
+            .expect("the empty part prepares");
+        let empty_tree = PathBuf::from(&prepared.trees[0].tree.path);
+        commit_tree_of_head(&empty_tree, &[&base[&core]], "an empty commit");
+        let empty_trees = rows(&prepared);
+        let empty = PartTip {
+            step: empty_step,
+            key: "empty".to_owned(),
+            commits: isolator
+                .capture(empty_step, &empty_trees)
+                .await
+                .expect("the empty part captures"),
+            trees: empty_trees,
+        };
+        assert!(empty.commits[0].after_hash.is_some(), "it did commit");
+
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let parts = [idle, empty];
+        let report = isolator
+            .premerge(integrate, &trees, &parts)
+            .await
+            .expect("the pre-merge runs");
+        merged(&report.repos[0].parts[1].merge);
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &parts)
+                .await
+                .expect("the post-check reads"),
+            Vec::<StepId>::new()
+        );
+    }
+
+    /// D6's repository rule: a `worktree` integrate that committed nothing had its tree removed
+    /// at capture (D27), so the post-check reads the checkout — and names both parts, whose tips
+    /// are not ancestors of the base — without an error.
+    #[tokio::test]
+    async fn unmerged_opens_the_checkout_after_capture_removed_the_worktree() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, _core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::Worktree;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let heads = isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        assert_eq!(heads[0].after_hash, None);
+        assert!(
+            !PathBuf::from(&trees[0].path).exists(),
+            "capture removed the tree that earned nothing"
+        );
+
+        assert_eq!(
+            isolator
+                .unmerged(integrate, &trees, &heads, &[api.clone(), ui.clone()])
+                .await
+                .expect("the post-check reads the checkout"),
+            vec![api.step, ui.step]
+        );
+    }
+
+    /// D40's rule: a repo-less run's pre-merge and post-check need no `git`.
+    #[tokio::test]
+    async fn premerge_without_trees_needs_no_git() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let isolator = without_git(&dir.path().join("trees"), &[]);
+        let step = StepId::new();
+        assert_eq!(
+            isolator
+                .premerge(step, &[], &[])
+                .await
+                .expect("nothing to merge"),
+            PremergeReport::default()
+        );
+        assert_eq!(
+            isolator
+                .unmerged(step, &[], &[], &[])
+                .await
+                .expect("nothing to check"),
+            Vec::<StepId>::new()
         );
     }
 }

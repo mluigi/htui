@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        186,
+        230,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -58,7 +58,24 @@ fn cases_len_is_pinned() {
          producer, the reversed direction, a two-way pair, a cycle of waits, a skipped producer) \
          179, and R1's finding-6 hand-back twin (a rejection handed back beside an interrupted \
          park ending the run as in process) 180, and MOD-163 M2's six memory cases (plan D11, \
-         D12, D18) 186"
+         D12, D18) 186, and MOD-139 M2 T3's eighteen divided-node cases (admission of revision 0 \
+         from base refs, parts in their own trees with their own prompt and agent, part documents \
+         out of input resolution, integrate only after every part, the session cap, \
+         `shared_serialized` resets, a slotless `local` part, five admission refusals, \
+         `command_run` beside live siblings and on a parallel branch, the operator verbs and stage \
+         rows, and the resolve refusals) 204, and MOD-139 M2 T4's nine (a part retried alone, the \
+         exhausted divided step, its `fails` loop and re-plan, and recovery per role) 213, and \
+         MOD-139 M2 R1's four (a cancel, a lost lease and a refusal stopping a parts round's pulls, \
+         and a failed planner on recovery) 217, and its two replays of a `fails` loop's cut-short \
+         retirement 219, and MOD-139 M3 T3's twelve integrate cases (one integrate merge landed, \
+         a conflicted pre-merge handed to the agent, an unmerged part retried and looped, a verify \
+         failure, crashes mid-pre-merge, after an unmerged session and after integrate's `done`, \
+         `shared_serialized` from base refs, a dirty in-place park, the refused approval and a \
+         refused pre-merge) 231, and ruling R-1's refused promotion of an integrate row 232, \
+         and T3 repair 2's skip refused over a park outranking the post-check 233, less the five \
+         admission refusals MOD-139 M3 T4 folds into the resolve case 228, and MOD-139 M3 \
+         R1's two (an exhausted `integrate_incomplete` park rejected, not retried, and a read \
+         error in integrate's recovery failing the run as the walk does) 230"
     );
 }
 

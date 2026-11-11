@@ -124,6 +124,21 @@ pub enum Placeholder {
     /// `{{memory}}` is refused as an unknown placeholder. `assemble` renders it after the persona
     /// and before the body whenever a phase spec carries memory.
     Memory,
+    /// MOD-139 M2 D10: a divided part's brief. **Internal**, like [`Placeholder::Persona`]: not in
+    /// [`Placeholder::ALL`], so [`Placeholder::from_token`] never yields it and a body that writes
+    /// `{{part}}` is refused as an unknown placeholder. `assemble` renders it after the persona and
+    /// the memory and before the body whenever a phase spec carries a part.
+    Part,
+    /// MOD-139 M3 D5: integrate's pre-merge report. **Internal**, like [`Placeholder::Part`]: not
+    /// in [`Placeholder::ALL`], so a body that writes `{{premerge}}` is refused as an unknown
+    /// placeholder. `assemble` renders it after the part and before the body whenever a phase
+    /// spec carries a report with at least one repo.
+    Premerge,
+    /// MOD-139 M3 D5: the done parts integrate merges. **Internal**, like [`Placeholder::Part`]:
+    /// not in [`Placeholder::ALL`], so a body that writes `{{parts}}` is refused as an unknown
+    /// placeholder. `assemble` renders it after the pre-merge report and before the body whenever
+    /// a phase spec carries parts.
+    Parts,
     /// MOD-11 D19: the `output` trailer naming the `document_write` tool. **Internal**, like
     /// [`Placeholder::Persona`]: not in [`Placeholder::ALL`], so [`Placeholder::from_token`] never
     /// yields it and a body that writes `{{output}}` is refused as an unknown placeholder.
@@ -140,8 +155,9 @@ const NONE_REQUIRED: &[Placeholder] = &[];
 
 impl Placeholder {
     /// Every placeholder a template may place, in declaration order: every variant but the
-    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14) and
-    /// [`Placeholder::Output`] (MOD-11 D19), which no body can name.
+    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14),
+    /// [`Placeholder::Part`] (MOD-139 D10), [`Placeholder::Premerge`] and [`Placeholder::Parts`]
+    /// (MOD-139 M3 D5) and [`Placeholder::Output`] (MOD-11 D19), which no body can name. Internal, like [`Placeholder::Persona`].
     pub const ALL: &'static [Self] = &[
         Self::ItemKey,
         Self::ItemTitle,
@@ -191,6 +207,9 @@ impl Placeholder {
             Self::FailureReason => "failure_reason",
             Self::Persona => "persona",
             Self::Memory => "memory",
+            Self::Part => "part",
+            Self::Premerge => "premerge",
+            Self::Parts => "parts",
             Self::Output => "output",
         }
     }
@@ -216,6 +235,9 @@ impl Placeholder {
                     | Self::FailureReason
                     | Self::Persona
                     | Self::Memory
+                    | Self::Part
+                    | Self::Premerge
+                    | Self::Parts
                     | Self::Output
             ),
             TemplateRole::Judge => {
@@ -239,8 +261,9 @@ impl Placeholder {
 
     /// Whether this placeholder stands for a wrapped section rather than a scalar substitution.
     /// False for the six scalars of ANA-5 `:362`, true for the other fourteen and for the
-    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14) and
-    /// [`Placeholder::Output`] (MOD-11 D19).
+    /// internal [`Placeholder::Persona`] (MOD-26 D13), [`Placeholder::Memory`] (MOD-163 D14),
+    /// [`Placeholder::Part`] (MOD-139 D10), [`Placeholder::Premerge`] and [`Placeholder::Parts`]
+    /// (MOD-139 M3 D5) and [`Placeholder::Output`] (MOD-11 D19).
     #[must_use]
     pub const fn is_section(self) -> bool {
         !matches!(

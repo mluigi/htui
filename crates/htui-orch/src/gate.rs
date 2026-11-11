@@ -14,7 +14,7 @@ use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
     BatchId, BoxId, Document, EdgeKind, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, Note,
-    NoteId, Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId,
+    NoteId, Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId, StepRole,
     StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
@@ -128,6 +128,14 @@ pub enum StepFailure {
     /// phase's `verify_command` between stage 4 and stage 5 and the engine hands its outcome here.
     /// Milestone 2 matched it with no writer, which is why milestone 3 added one and no branch.
     VerifyFailed,
+    /// MOD-139 M3 D6: integrate's post-check (Confirm 2(a) included) refused its capture: done
+    /// parts whose tips its branch does not hold, or whose changed paths it does not change.
+    IntegrateIncomplete {
+        /// The divided node's name.
+        node: String,
+        /// The failing parts' keys, plan order.
+        parts: Vec<String>,
+    },
 }
 
 impl core::fmt::Display for StepFailure {
@@ -140,6 +148,9 @@ impl core::fmt::Display for StepFailure {
             Self::DeadlineElapsed => f.write_str("deadline elapsed"),
             Self::MissingOutput => f.write_str("missing_output"),
             Self::VerifyFailed => f.write_str("verify_outcome: fail"),
+            Self::IntegrateIncomplete { node, parts } => {
+                f.write_str(&crate::status::integrate_incomplete(node, parts))
+            }
         }
     }
 }
@@ -150,6 +161,10 @@ impl StepFailure {
     pub fn run_failure(&self) -> Option<RunFailure> {
         match self {
             Self::MissingOutput => Some(RunFailure::MissingOutput),
+            Self::IntegrateIncomplete { node, parts } => Some(RunFailure::IntegrateIncomplete {
+                node: node.clone(),
+                parts: parts.clone(),
+            }),
             _ => None,
         }
     }
@@ -236,7 +251,22 @@ pub struct SettleInput<'a> {
     /// anything else with the edge reads it. On every lifted v1 graph the two readings agree but
     /// for a review placed first, which the lift gives no loop edge.
     pub reads_verdict: bool,
+    /// MOD-139 M3 D6: integrate's post-check answer. `None` for every step but an integrate
+    /// whose session returned `Ok`; an empty `parts` is a check that passed.
+    pub unmerged: Option<Unmerged<'a>>,
 }
+
+/// MOD-139 M3 D6: the post-check's answer [`settle`] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct Unmerged<'a> {
+    /// The divided node (`divide::divided_name`).
+    pub node: &'a str,
+    /// The parts that failed, by key; empty = the check passed.
+    pub parts: &'a [String],
+}
+
+/// MOD-139 M3 D6 (Confirm 3): the word a parked integrate's settle note carries.
+pub const INTEGRATE_INCOMPLETE: &str = "integrate_incomplete";
 
 /// ANA-2 §4.2's settle, first hit winning (`docs/ANA-2.md:436-441`).
 ///
@@ -267,6 +297,14 @@ pub fn settle(input: &SettleInput<'_>) -> Settle {
     let Some(output) = input.output else {
         return Settle::Failed(StepFailure::MissingOutput);
     };
+    // MOD-139 M3 D6: the post-check outranks verify (ANA-33's post-check-then-verify) but never
+    // a driver error, a stop, a cap, a deadline or a missing document.
+    if let Some(found) = input.unmerged.filter(|found| !found.parts.is_empty()) {
+        return Settle::Failed(StepFailure::IntegrateIncomplete {
+            node: found.node.to_owned(),
+            parts: found.parts.to_vec(),
+        });
+    }
     if input.verify_outcome == Some(VerifyOutcome::Fail) {
         return Settle::Failed(StepFailure::VerifyFailed);
     }
@@ -447,8 +485,10 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
         (Gate::Never, Settle::Failed(failure)) => {
             note_step(ctx, step, Some(&failure.to_string()), now).await?;
             // MOD-138 M2 D7: a node with a `fails` edge loops over it instead of retrying itself.
+            // MOD-139 M2 D6 (blueprint P-7): a divided node's edge sits on its integrate node,
+            // whose name `divided_name` gives; every other phase's is its own.
             let fails = crate::walk::Graph::of(ctx.snapshot)
-                .loop_edge(&phase.name, EdgeKind::Fails)
+                .loop_edge(crate::divide::divided_name(phase), EdgeKind::Fails)
                 .cloned();
             let Some(edge) = fails else {
                 return retry_or_fail(ctx, step, phase, &failure, now).await;
@@ -784,6 +824,20 @@ fn stop_note(
 #[must_use]
 pub fn stopped_to_ask(notes: &[Note], step: &RunStep) -> bool {
     let head = stop_head(step);
+    notes
+        .iter()
+        .any(|note| note.via_step_id == Some(step.id) && note.body.starts_with(&head))
+}
+
+/// MOD-139 M3 D6 (Confirm 3, blueprint P-1): whether `step` is parked on its own
+/// `integrate_incomplete` settle: the item note `note_step` wrote via the step,
+/// ``step `<phase>` attempt <n>: integrate_incomplete:``. A park writes no `gate_note`.
+#[must_use]
+pub fn parked_unmerged(notes: &[Note], step: &RunStep) -> bool {
+    let head = format!(
+        "step `{}` attempt {}: {INTEGRATE_INCOMPLETE}:",
+        step.phase_name, step.attempt
+    );
     notes
         .iter()
         .any(|note| note.via_step_id == Some(step.id) && note.body.starts_with(&head))
@@ -1311,8 +1365,27 @@ async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// and `failed` are cancelled; `superseded` and `cancelled` are already retired and left alone.
 /// A position with no rows is skipped.
 ///
+/// MOD-139 M2 D11 (ANA-33 §7.3, "That includes their parts and plans"): a slot whose row is a
+/// planner (the planner node's latest attempt) retires its parts too ([`retire_parts`]: the
+/// latest attempt of each, by the same split; older attempts stay as they are) and then abandons
+/// every `proposed` or `admitted` plan of that planner, under the walk's fence. The parts sit
+/// past the node list, so no region names their positions.
+///
+/// MOD-139 M2 R1 (F-8): parts and plans before the planner row, so a cut-short retirement replays
+/// (A6). Every lookup keys on the planner row (`parts_state`, `latest_parts`, the plans by
+/// `planner_step_id`), and a planner retired first would leave a crash with its parts and plan live
+/// under a `superseded` row that the walk replaces with a new attempt and nothing revisits. Retired
+/// last, the planner stays `done` until the rest is retired — still the loop's source, still read
+/// `failed` by its exhausted part (a `cancelled` part keeps its attempt, so it stays exhausted) —
+/// so the loop runs again and finishes. The replay is idempotent: a retired part is left alone,
+/// and a second `abandon_plans` abandons nothing. It is not free: the walk re-creates the retired
+/// target before it reads the planner node again, so the replay spends one more turn of the
+/// loop's budget (MOD-138 M2 F6's hazard, which A6 cures only for `asks_you` loops). Pinned end
+/// to end by the conformance cases `a_cut_short_part_retirement_replays_the_loop` and
+/// `a_planner_left_done_replays_the_loop`.
+///
 /// # Errors
-/// Every [`EngineError`] `supersede_step` and `transition_step` can raise, and
+/// Every [`EngineError`] `supersede_step`, `transition_step` and `abandon_plans` can raise, and
 /// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
 pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
@@ -1331,31 +1404,67 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
     let slot = steps
         .iter()
         .filter(|step| step.position == position && step.attempt == attempt);
+    // R1 (F-8): parts and plans before the planner row, so a cut-short retirement replays.
+    for planner in slot.clone().filter(|step| step.role == StepRole::Planner) {
+        retire_parts(ctx, steps, planner, now).await?;
+        ctx.store.abandon_plans(ctx.fence, planner.id).await?;
+    }
     for step in slot {
-        match step.status {
-            StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
-                ctx.store.supersede_step(step.id).await?;
-            }
-            // `running -> superseded` and `failed -> superseded` are both illegal
-            // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
-            // retirement either of them has. `transition_step` moves `status` and nothing else, so
-            // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
-            // which is the half of ANA-2 §4.4 step 3 that matters (`:719`). A failed judge keeps
-            // its `gate_note` the same way.
-            //
-            // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
-            // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
-            // `p_review` would stop the walk forever and the blueprint's own §7 rejection branch —
-            // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
-            // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
-            // conclusion it drew from that is the part this corrects.
-            // MOD-125 D1: a `stopped` step retires the same way; `superseded` is reserved for M3's
-            // fresh rerun.
-            StepStatus::Running | StepStatus::Stopped | StepStatus::Failed => {
-                move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
-            }
-            StepStatus::Superseded | StepStatus::Cancelled => {}
+        retire_row(ctx, step, now).await?;
+    }
+    Ok(())
+}
+
+/// MOD-139 M2 D11: the latest attempt of each part under `planner`
+/// ([`crate::divide::latest_parts`]), retired by [`retire_slot`]'s status split. Older attempts
+/// of a part are left as they are.
+///
+/// # Errors
+/// As [`retire_slot`].
+async fn retire_parts<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    steps: &[RunStep],
+    planner: &RunStep,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    for part in crate::divide::latest_parts(steps, planner.id) {
+        retire_row(ctx, part, now).await?;
+    }
+    Ok(())
+}
+
+/// One row retired by M2 D5's status split, [`retire_slot`]'s rule.
+///
+/// # Errors
+/// As [`retire_slot`].
+async fn retire_row<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    step: &RunStep,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    match step.status {
+        StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
+            ctx.store.supersede_step(step.id).await?;
         }
+        // `running -> superseded` and `failed -> superseded` are both illegal
+        // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
+        // retirement either of them has. `transition_step` moves `status` and nothing else, so
+        // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
+        // which is the half of ANA-2 §4.4 step 3 that matters (`:719`). A failed judge keeps
+        // its `gate_note` the same way.
+        //
+        // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
+        // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
+        // `p_review` would stop the walk forever and the blueprint's own §7 rejection branch —
+        // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
+        // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
+        // conclusion it drew from that is the part this corrects.
+        // MOD-125 D1: a `stopped` step retires the same way; `superseded` is reserved for M3's
+        // fresh rerun.
+        StepStatus::Running | StepStatus::Stopped | StepStatus::Failed => {
+            move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
+        }
+        StepStatus::Superseded | StepStatus::Cancelled => {}
     }
     Ok(())
 }
@@ -1416,7 +1525,7 @@ mod tests {
     use htui_agent::event::{DoneEvent, StopReason};
     use htui_agent::record::CapBreach;
     use htui_core::fixtures::{demo_data, ids};
-    use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
+    use htui_core::model::{Document, GraphSnapshot, StepRole, VerifyOutcome};
 
     use htui_core::model::{
         BatchId, DocumentId, GateOutcome, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep,
@@ -1458,6 +1567,7 @@ mod tests {
             output,
             verify_outcome: None,
             reads_verdict: false,
+            unmerged: None,
         }
     }
 
@@ -1593,6 +1703,135 @@ mod tests {
             ..ok_input(&ended, Some(&output))
         };
         assert_eq!(settle(&failed), Settle::Failed(StepFailure::VerifyFailed));
+    }
+
+    /// MOD-139 M3 D6: the post-check sits after `MissingOutput` and before `VerifyFailed`:
+    /// driver error > stop > cap > deadline > `MissingOutput` > `IntegrateIncomplete` >
+    /// `VerifyFailed`.
+    #[test]
+    fn integrate_incomplete_outranks_verify_not_missing_output() {
+        let output = document("body");
+        let ended = done(StopReason::EndTurn);
+        let parts = vec!["ui".to_owned()];
+        let unmerged = Some(super::Unmerged {
+            node: "implement",
+            parts: &parts,
+        });
+        let incomplete = Settle::Failed(StepFailure::IntegrateIncomplete {
+            node: "implement".to_owned(),
+            parts: parts.clone(),
+        });
+
+        let alone = SettleInput {
+            unmerged,
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(settle(&alone), incomplete);
+
+        let verify_failed = SettleInput {
+            unmerged,
+            verify_outcome: Some(VerifyOutcome::Fail),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(
+            settle(&verify_failed),
+            incomplete,
+            "the post-check outranks verify"
+        );
+
+        let no_output = SettleInput {
+            unmerged,
+            ..ok_input(&ended, None)
+        };
+        assert_eq!(
+            settle(&no_output),
+            Settle::Failed(StepFailure::MissingOutput),
+            "a missing document outranks the post-check"
+        );
+
+        let late = SettleInput {
+            unmerged,
+            deadline_seconds: Some(1),
+            now: epoch() + TimeDelta::seconds(2),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(
+            settle(&late),
+            Settle::Failed(StepFailure::DeadlineElapsed),
+            "the deadline outranks the post-check"
+        );
+
+        let closed: Result<DoneEvent, DriverError> = Err(DriverError::Closed);
+        let crashed = SettleInput {
+            unmerged,
+            ..ok_input(&closed, Some(&output))
+        };
+        assert!(
+            matches!(settle(&crashed), Settle::Failed(StepFailure::Driver(_))),
+            "the driver's own error outranks the post-check"
+        );
+    }
+
+    /// MOD-139 M3 D6: a post-check that found nothing settles as if it never ran.
+    #[test]
+    fn an_empty_unmerged_list_settles_ok() {
+        let output = document("body");
+        let ended = done(StopReason::EndTurn);
+        let input = SettleInput {
+            unmerged: Some(super::Unmerged {
+                node: "implement",
+                parts: &[],
+            }),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(settle(&input), Settle::Ok { note: None });
+    }
+
+    /// MOD-139 M3 Confirm 3 (blueprint P-1): only the step's own `integrate_incomplete` settle
+    /// note, of its own attempt, reads as that park.
+    #[tokio::test]
+    async fn parked_unmerged_reads_the_steps_own_note() {
+        let store = MemStore::demo();
+        let step = step_at(&store, 30, "implement", 1, 0, &[]).await;
+        let other = step_at(&store, 31, "review", 1, 0, &[]).await;
+        let note = |body: &str, via: Option<htui_core::model::StepId>| htui_core::model::Note {
+            id: htui_core::model::NoteId::new(),
+            item_id: ids::HTUI_ANA_1,
+            body: body.to_owned(),
+            created_by: ids::USER,
+            box_id: None,
+            via_step_id: via,
+            created_at: epoch(),
+        };
+        let own = "step `implement` attempt 1: integrate_incomplete: part `ui` of `implement` is \
+                   not merged";
+        assert!(super::parked_unmerged(&[note(own, Some(step.id))], &step));
+        assert!(
+            !super::parked_unmerged(&[note(own, Some(other.id))], &step),
+            "another step's note"
+        );
+        assert!(
+            !super::parked_unmerged(
+                &[note(
+                    "step `implement` attempt 2: integrate_incomplete: part `ui` of `implement` \
+                     is not merged",
+                    Some(step.id)
+                )],
+                &step
+            ),
+            "another attempt's note"
+        );
+        assert!(
+            !super::parked_unmerged(
+                &[note(
+                    "step `implement` attempt 1: verify_outcome: fail",
+                    Some(step.id)
+                )],
+                &step
+            ),
+            "a note that is not the post-check's"
+        );
+        assert!(!super::parked_unmerged(&[], &step));
     }
 
     /// Plan D8's step deadline, evaluated against the clock and never against a sleep.
@@ -1814,6 +2053,27 @@ mod tests {
         assert_eq!(
             StepFailure::CapBreached { batch: None }.run_failure_text(),
             "cap breached"
+        );
+
+        // MOD-139 M3 D6: the post-check's note and its `run.failure` are one sentence.
+        let incomplete = StepFailure::IntegrateIncomplete {
+            node: "implement".to_owned(),
+            parts: vec!["ui".to_owned()],
+        };
+        assert_eq!(
+            incomplete.to_string(),
+            "integrate_incomplete: part `ui` of `implement` is not merged"
+        );
+        assert_eq!(
+            incomplete.run_failure_text(),
+            "integrate_incomplete: part `ui` of `implement` is not merged"
+        );
+        assert_eq!(
+            incomplete.run_failure(),
+            Some(RunFailure::IntegrateIncomplete {
+                node: "implement".to_owned(),
+                parts: vec!["ui".to_owned()],
+            })
         );
     }
 
@@ -2760,6 +3020,9 @@ mod tests {
                 phase_name: phase_name.to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
             })
             .await
             .expect("the slot has room for this row");
@@ -2915,6 +3178,265 @@ mod tests {
             status_of(&store, ids::STEP_R3_RESEARCH_B).await,
             StepStatus::Superseded
         );
+    }
+
+    /// MOD-139 M2 D11 (ANA-33 §7.3: "That includes their parts and plans"): retiring a planner's
+    /// slot retires its parts' latest attempts by the same status split and abandons its plans;
+    /// an older attempt of a part stays as it is.
+    #[tokio::test]
+    async fn retire_takes_a_planners_parts_and_abandons_its_plans() {
+        use htui_core::model::{
+            NewRunPlan, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, RunPlanId, StepId,
+        };
+
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+            walk: None,
+        };
+        let row = |position: i32, attempt: i32, name: &str, role, parent| NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_3,
+            position,
+            attempt,
+            fanout_index: 0,
+            phase_name: name.to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+            role,
+            parent_step_id: parent,
+            node_key: Some(name.to_owned()),
+        };
+        let planner = store
+            .create_step(row(20, 1, "implement:plan", StepRole::Planner, None))
+            .await
+            .expect("the slot has room for the planner");
+        assert!(
+            store
+                .transition_step(
+                    planner.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    epoch()
+                )
+                .await
+                .expect("a legal move")
+        );
+        let (done, failed) = (
+            row(21, 1, "implement/api", StepRole::Part, Some(planner.id)),
+            row(22, 1, "implement/ui", StepRole::Part, Some(planner.id)),
+        );
+        let (done_id, older_id) = (done.id, failed.id);
+        let body = crate::divide::plan_body(&[]);
+        store
+            .admit_plan(
+                StepFence::Unleased,
+                PlanAdmission {
+                    run_id: ids::RUN_3,
+                    planner_step_id: planner.id,
+                    plan: PlanToAdmit::New(NewRunPlan {
+                        id: RunPlanId::new(),
+                        run_id: ids::RUN_3,
+                        revision: 0,
+                        planner_step_id: planner.id,
+                        scope: PlanScope::Parts,
+                        base_position: 21,
+                        digest: crate::divide::plan_digest(&body),
+                        body,
+                    }),
+                    base_refs: serde_json::json!({}),
+                    parts: vec![done, failed],
+                    at: epoch(),
+                },
+            )
+            .await
+            .expect("the planner is running and the parts are well formed");
+        let walk = |id, path: &'static [StepStatus]| {
+            let store = &store;
+            async move {
+                let mut from = StepStatus::Pending;
+                for &to in path {
+                    assert!(
+                        store
+                            .transition_step(id, from, to, epoch())
+                            .await
+                            .expect("a legal move")
+                    );
+                    from = to;
+                }
+            }
+        };
+        walk(done_id, &[StepStatus::Running, StepStatus::Done]).await;
+        walk(older_id, &[StepStatus::Running, StepStatus::Failed]).await;
+        let latest = store
+            .create_step(row(22, 2, "implement/ui", StepRole::Part, Some(planner.id)))
+            .await
+            .expect("attempt 2 has room");
+        walk(latest.id, &[StepStatus::Running, StepStatus::Failed]).await;
+
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        retire_slot(&ctx, &steps, 20, epoch())
+            .await
+            .expect("every move is legal");
+
+        assert_eq!(status_of(&store, planner.id).await, StepStatus::Superseded);
+        assert_eq!(status_of(&store, done_id).await, StepStatus::Superseded);
+        assert_eq!(status_of(&store, latest.id).await, StepStatus::Cancelled);
+        assert_eq!(
+            status_of(&store, older_id).await,
+            StepStatus::Failed,
+            "an older attempt stays as it is"
+        );
+        let plans = store.run_plans(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            plans.iter().map(|plan| plan.status).collect::<Vec<_>>(),
+            [PlanStatus::Abandoned]
+        );
+    }
+
+    /// MOD-139 M2 R1 (F-8, blueprint A6): a planner's slot retires its parts and abandons its plans
+    /// **before** the planner row, so a retirement a store error cut short leaves the planner
+    /// `done` (still the loop's source, read `failed` by its exhausted part) and the next call
+    /// replays it whole; a third call over retired rows is a no-op.
+    #[tokio::test]
+    async fn a_cut_short_planner_retirement_replays() {
+        use htui_core::model::{
+            NewRunPlan, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, RunPlanId, StepId,
+        };
+        use htui_core::store::mem::MemFault;
+
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+            fence: StepFence::Unleased,
+            walk: None,
+        };
+        let row = |position: i32, name: &str, role, parent| NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_3,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: name.to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+            role,
+            parent_step_id: parent,
+            node_key: Some(name.to_owned()),
+        };
+        let planner = store
+            .create_step(row(20, "implement:plan", StepRole::Planner, None))
+            .await
+            .expect("the slot has room for the planner");
+        assert!(
+            store
+                .transition_step(
+                    planner.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    epoch()
+                )
+                .await
+                .expect("a legal move")
+        );
+        let (done, failed) = (
+            row(21, "implement/api", StepRole::Part, Some(planner.id)),
+            row(22, "implement/ui", StepRole::Part, Some(planner.id)),
+        );
+        let (done_id, failed_id) = (done.id, failed.id);
+        let body = crate::divide::plan_body(&[]);
+        store
+            .admit_plan(
+                StepFence::Unleased,
+                PlanAdmission {
+                    run_id: ids::RUN_3,
+                    planner_step_id: planner.id,
+                    plan: PlanToAdmit::New(NewRunPlan {
+                        id: RunPlanId::new(),
+                        run_id: ids::RUN_3,
+                        revision: 0,
+                        planner_step_id: planner.id,
+                        scope: PlanScope::Parts,
+                        base_position: 21,
+                        digest: crate::divide::plan_digest(&body),
+                        body,
+                    }),
+                    base_refs: serde_json::json!({}),
+                    parts: vec![done, failed],
+                    at: epoch(),
+                },
+            )
+            .await
+            .expect("the planner is running and the parts are well formed");
+        for (id, path) in [
+            (done_id, [StepStatus::Running, StepStatus::Done]),
+            (failed_id, [StepStatus::Running, StepStatus::Failed]),
+        ] {
+            let mut from = StepStatus::Pending;
+            for to in path {
+                assert!(
+                    store
+                        .transition_step(id, from, to, epoch())
+                        .await
+                        .expect("a legal move")
+                );
+                from = to;
+            }
+        }
+        let plan_statuses = async || {
+            store
+                .run_plans(ids::RUN_3)
+                .await
+                .expect("RUN_3 exists")
+                .iter()
+                .map(|plan| plan.status)
+                .collect::<Vec<_>>()
+        };
+
+        store.set_fault(MemFault::TransitionStep(failed_id), true);
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        let cut = retire_slot(&ctx, &steps, 20, epoch()).await;
+        assert!(
+            matches!(
+                cut,
+                Err(crate::command::EngineError::Store(
+                    htui_core::store::StoreError::Unreachable(_)
+                ))
+            ),
+            "{cut:?}"
+        );
+        assert_eq!(
+            status_of(&store, planner.id).await,
+            StepStatus::Done,
+            "the planner, the loop's source, is retired last"
+        );
+        assert_eq!(status_of(&store, failed_id).await, StepStatus::Failed);
+        assert_eq!(plan_statuses().await, [PlanStatus::Admitted]);
+        store.set_fault(MemFault::TransitionStep(failed_id), false);
+
+        for replay in 0..2 {
+            let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+            retire_slot(&ctx, &steps, 20, epoch())
+                .await
+                .unwrap_or_else(|err| panic!("replay {replay} retires: {err}"));
+            assert_eq!(status_of(&store, planner.id).await, StepStatus::Superseded);
+            assert_eq!(status_of(&store, done_id).await, StepStatus::Superseded);
+            assert_eq!(status_of(&store, failed_id).await, StepStatus::Cancelled);
+            assert_eq!(plan_statuses().await, [PlanStatus::Abandoned]);
+        }
     }
 
     /// Plan D66: the hash half compares the winners of attempts 1 and 2. Attempt 2's winner sits

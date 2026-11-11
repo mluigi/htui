@@ -314,6 +314,11 @@ pub async fn build(
         persona: None,
         // MOD-163 D18: the live stand-in for the run's frozen memory (`MEMORY_NOTE`).
         memory,
+        // MOD-139 M2 D10: the preview renders no part section.
+        part: None,
+        // MOD-139 M3 D5: nor an integrate's `premerge` and `parts` sections.
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
