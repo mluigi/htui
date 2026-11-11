@@ -1,19 +1,157 @@
 //! The in-process lexical baselines (MOD-162 T4): G and G-dens (ANA-37 §5.4's keyword grep) and
 //! H (htui's no-Qdrant filter, mirrored).
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use htui_core::model::{Item, Requirement};
 
 use crate::types::{CorpusDoc, CorpusId, Ranked};
 
 /// Postgres' `english.stop` (snowball, 127 words), verbatim, so G drops what L drops.
-pub const STOPWORDS: &[&str] = &[];
+pub const STOPWORDS: &[&str] = &[
+    "i",
+    "me",
+    "my",
+    "myself",
+    "we",
+    "our",
+    "ours",
+    "ourselves",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+    "he",
+    "him",
+    "his",
+    "himself",
+    "she",
+    "her",
+    "hers",
+    "herself",
+    "it",
+    "its",
+    "itself",
+    "they",
+    "them",
+    "their",
+    "theirs",
+    "themselves",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "this",
+    "that",
+    "these",
+    "those",
+    "am",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "a",
+    "an",
+    "the",
+    "and",
+    "but",
+    "if",
+    "or",
+    "because",
+    "as",
+    "until",
+    "while",
+    "of",
+    "at",
+    "by",
+    "for",
+    "with",
+    "about",
+    "against",
+    "between",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "to",
+    "from",
+    "up",
+    "down",
+    "in",
+    "out",
+    "on",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "any",
+    "both",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "s",
+    "t",
+    "can",
+    "will",
+    "just",
+    "don",
+    "should",
+    "now",
+];
 
 /// G's keywords: lowercase; split on every char that is not alphanumeric, `-` or `_`; trim `-`/`_`
 /// at both ends; drop tokens shorter than 2 chars and stopwords; dedupe, first occurrence order.
 /// `"R-STO-8"` → `["r-sto-8"]`; `"Plackett-Luce"` → `["plackett-luce"]`.
 pub fn keywords(query: &str) -> Vec<String> {
-    let _ = query;
-    Vec::new()
+    let lower = query.to_lowercase();
+    let mut seen = HashSet::new();
+    lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .map(|token| token.trim_matches(|c| c == '-' || c == '_'))
+        .filter(|token| token.chars().count() >= 2 && !STOPWORDS.contains(token))
+        .filter(|token| seen.insert(*token))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// G's tie-break.
@@ -36,14 +174,24 @@ pub struct GrepIndex {
     pub words: Vec<usize>,
 }
 
+/// One doc's G tally, before sorting.
+struct GScore {
+    doc: usize,
+    matched: usize,
+    occurrences: usize,
+    density: f64,
+}
+
 impl GrepIndex {
     /// `lower[i] = docs[i].text.to_lowercase()`, `words[i] = max(1, whitespace word count)`.
     pub fn new(docs: &[CorpusDoc]) -> Self {
-        let _ = docs;
         Self {
-            ids: Vec::new(),
-            lower: Vec::new(),
-            words: Vec::new(),
+            ids: docs.iter().map(|doc| doc.id.clone()).collect(),
+            lower: docs.iter().map(|doc| doc.text.to_lowercase()).collect(),
+            words: docs
+                .iter()
+                .map(|doc| doc.text.split_whitespace().count().max(1))
+                .collect(),
         }
     }
 
@@ -53,8 +201,52 @@ impl GrepIndex {
     /// order asc); take `limit`. `Ranked.score` = matched / keywords.len() (the §5.4 "fraction
     /// matched"). No keywords → empty.
     pub fn search(&self, query: &str, tie: GTie, limit: usize) -> Vec<Ranked> {
-        let _ = (&self.ids, &self.lower, &self.words, query, tie, limit);
-        Vec::new()
+        let keys = keywords(query);
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut scores: Vec<GScore> = self
+            .lower
+            .iter()
+            .zip(&self.words)
+            .enumerate()
+            .filter_map(|(doc, (lower, &words))| {
+                let mut matched = 0;
+                let mut occurrences = 0;
+                for key in &keys {
+                    let count = lower.matches(key.as_str()).count();
+                    if count > 0 {
+                        matched += 1;
+                        occurrences += count;
+                    }
+                }
+                (matched > 0).then(|| GScore {
+                    doc,
+                    matched,
+                    occurrences,
+                    density: occurrences as f64 / words as f64,
+                })
+            })
+            .collect();
+        scores.sort_by(|a, b| {
+            let by_tie = match tie {
+                GTie::Occurrences => b.occurrences.cmp(&a.occurrences),
+                GTie::Density => b.density.total_cmp(&a.density),
+            };
+            b.matched
+                .cmp(&a.matched)
+                .then(by_tie)
+                .then(a.doc.cmp(&b.doc))
+        });
+        let total = keys.len() as f64;
+        scores
+            .into_iter()
+            .take(limit)
+            .map(|score| Ranked {
+                id: self.ids[score.doc].clone(),
+                score: score.matched as f64 / total,
+            })
+            .collect()
     }
 }
 
@@ -69,8 +261,40 @@ pub fn htui_filter(
     query: &str,
     limit: usize,
 ) -> Vec<Ranked> {
-    let _ = (items, requirements, query, limit);
-    Vec::new()
+    let needle = query.to_lowercase();
+    let has = |text: &str| text.to_lowercase().contains(&needle);
+
+    let mut found_items: Vec<&Item> = items
+        .iter()
+        .filter(|item| has(&item.key) || has(&item.title))
+        .collect();
+    found_items.sort_by(|a, b| {
+        by_bytes_then_number(&a.key_prefix, a.key_number, &b.key_prefix, b.key_number)
+    });
+
+    let mut found_requirements: Vec<&Requirement> = requirements
+        .iter()
+        .filter(|requirement| has(&requirement.key) || has(&requirement.body))
+        .collect();
+    found_requirements
+        .sort_by(|a, b| by_bytes_then_number(&a.area_code, a.number, &b.area_code, b.number));
+
+    found_items
+        .into_iter()
+        .map(CorpusId::of_item)
+        .chain(
+            found_requirements
+                .into_iter()
+                .map(|requirement| CorpusId::new(requirement.key.as_str())),
+        )
+        .take(limit)
+        .map(|id| Ranked { id, score: 1.0 })
+        .collect()
+}
+
+/// `ORDER BY <text> COLLATE "C", <number>`: byte order on the text, then the number.
+fn by_bytes_then_number(a: &str, a_number: i32, b: &str, b_number: i32) -> Ordering {
+    a.as_bytes().cmp(b.as_bytes()).then(a_number.cmp(&b_number))
 }
 
 #[cfg(test)]
@@ -156,9 +380,18 @@ mod tests {
         assert_eq!(STOPWORDS.len(), 127);
         assert_eq!(STOPWORDS.first(), Some(&"i"));
         assert_eq!(STOPWORDS.last(), Some(&"now"));
-        let unique: std::collections::HashSet<_> = STOPWORDS.iter().collect();
+        let unique: HashSet<_> = STOPWORDS.iter().collect();
         assert_eq!(unique.len(), 127, "no duplicates");
-        for w in ["the", "and", "s", "t", "don", "should", "against", "yourselves"] {
+        for w in [
+            "the",
+            "and",
+            "s",
+            "t",
+            "don",
+            "should",
+            "against",
+            "yourselves",
+        ] {
             assert!(STOPWORDS.contains(&w), "{w}");
         }
     }
@@ -221,7 +454,10 @@ mod tests {
             ids(&index.search("alpha", GTie::Occurrences, 10)),
             vec!["A", "B", "C"]
         );
-        assert_eq!(ids(&index.search("alpha", GTie::Density, 2)), vec!["A", "B"]);
+        assert_eq!(
+            ids(&index.search("alpha", GTie::Density, 2)),
+            vec!["A", "B"]
+        );
     }
 
     #[test]
@@ -250,7 +486,10 @@ mod tests {
             item("MOD-2", "other", "queue starvation in the body", None),
             item("TOOL-3", "unrelated", "", None),
         ];
-        assert_eq!(ids(&htui_filter(&items, &[], "queue STARVATION", 10)), vec!["MOD-1"]);
+        assert_eq!(
+            ids(&htui_filter(&items, &[], "queue STARVATION", 10)),
+            vec!["MOD-1"]
+        );
         assert_eq!(ids(&htui_filter(&items, &[], "tool-3", 10)), vec!["TOOL-3"]);
         assert!(htui_filter(&items, &[], "in the body", 10).is_empty());
     }
@@ -265,13 +504,24 @@ mod tests {
         let ranked = htui_filter(&items, &requirements, "SYNC", 10);
         assert_eq!(ids(&ranked), vec!["MOD-5", "R-STO-8"]);
         assert!(ranked.iter().all(|r| r.score == 1.0));
-        assert_eq!(ids(&htui_filter(&items, &requirements, "r-orch-2", 10)), vec!["R-ORCH-2"]);
+        assert_eq!(
+            ids(&htui_filter(&items, &requirements, "r-orch-2", 10)),
+            vec!["R-ORCH-2"]
+        );
     }
 
     #[test]
     fn h_maps_a_closed_item_to_its_decision() {
-        let items = [item("ANA-4", "Vector store choice", "", Some(Resolution::Concluded))];
-        assert_eq!(ids(&htui_filter(&items, &[], "vector", 10)), vec!["DEC:ANA-4"]);
+        let items = [item(
+            "ANA-4",
+            "Vector store choice",
+            "",
+            Some(Resolution::Concluded),
+        )];
+        assert_eq!(
+            ids(&htui_filter(&items, &[], "vector", 10)),
+            vec!["DEC:ANA-4"]
+        );
     }
 
     #[test]
@@ -289,7 +539,15 @@ mod tests {
         ];
         assert_eq!(
             ids(&htui_filter(&items, &requirements, "widget", 10)),
-            vec!["ANA-3", "MOD-9", "MOD-10", "TOOL-1", "R-ORCH-7", "R-ORCH-15", "R-TUI-1"]
+            vec![
+                "ANA-3",
+                "MOD-9",
+                "MOD-10",
+                "TOOL-1",
+                "R-ORCH-7",
+                "R-ORCH-15",
+                "R-TUI-1"
+            ]
         );
         assert_eq!(
             ids(&htui_filter(&items, &requirements, "widget", 3)),
@@ -302,7 +560,10 @@ mod tests {
         let items = [item("MOD-1", "beta alpha", "", None)];
         let requirements = [requirement("STO", 1, "beta alpha")];
         assert!(htui_filter(&items, &requirements, "alpha beta", 10).is_empty());
-        assert_eq!(htui_filter(&items, &requirements, "beta alpha", 10).len(), 2);
+        assert_eq!(
+            htui_filter(&items, &requirements, "beta alpha", 10).len(),
+            2
+        );
         // Not trimmed: a trailing space is part of the needle.
         assert!(htui_filter(&items, &requirements, "alpha ", 10).is_empty());
     }
