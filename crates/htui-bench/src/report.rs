@@ -493,7 +493,10 @@ impl<'a> View<'a> {
 
     fn cell(&self, backend: Backend, group: Group) -> Cell {
         let ranks: Vec<Option<usize>> = self.group(group).map(|q| self.rank(backend, q)).collect();
-        let errors = self.group(group).filter(|q| self.failed(backend, q)).count();
+        let errors = self
+            .group(group)
+            .filter(|q| self.failed(backend, q))
+            .count();
         let n = ranks.len();
         let hit1 = ranks.iter().filter(|r| metrics::hit_at(**r, 1)).count();
         let hit5 = ranks.iter().filter(|r| metrics::hit_at(**r, 5)).count();
@@ -588,7 +591,8 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
         ("htui_commit", meta.htui_commit.clone()),
         (
             "htui_dirty",
-            meta.htui_dirty.map_or_else(|| "unknown".to_owned(), |d| d.to_string()),
+            meta.htui_dirty
+                .map_or_else(|| "unknown".to_owned(), |d| d.to_string()),
         ),
         ("host.os", meta.host.os.clone()),
         ("host.cpus", meta.host.cpus.to_string()),
@@ -1136,7 +1140,10 @@ fn format_p(p: f64) -> String {
     let below = p < P_THRESHOLD;
     for digits in 3..=17 {
         let text = significant(p, digits);
-        if text.parse::<f64>().is_ok_and(|shown| (shown < P_THRESHOLD) == below) {
+        if text
+            .parse::<f64>()
+            .is_ok_and(|shown| (shown < P_THRESHOLD) == below)
+        {
             return text;
         }
     }
@@ -1817,7 +1824,8 @@ mod tests {
         let md = render_markdown(&results, &s);
         let section = thresholds_section(&md);
         assert!(
-            section.contains("- S recall@5 on duplicates: 0/2 ≥ 20/24 — not measured (1 failed call)"),
+            section
+                .contains("- S recall@5 on duplicates: 0/2 ≥ 20/24 — not measured (1 failed call)"),
             "{section}"
         );
         assert!(
@@ -1858,7 +1866,10 @@ mod tests {
         let s = summarize(&results);
         assert_eq!(s.best_lexical, None);
         assert_eq!(s.thresholds.best_lexical, None);
-        assert_eq!(s.thresholds.mcnemar, Verdict::NotMeasured { failed_calls: 3 });
+        assert_eq!(
+            s.thresholds.mcnemar,
+            Verdict::NotMeasured { failed_calls: 3 }
+        );
         assert_eq!(s.thresholds.recall, Verdict::NotMet);
         let md = render_markdown(&results, &s);
         let section = thresholds_section(&md);

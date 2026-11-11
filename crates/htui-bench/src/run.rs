@@ -737,7 +737,9 @@ fn htui_checkout() -> (String, Option<bool>) {
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
     let commit = git(&["rev-parse", "HEAD"]);
-    let porcelain = commit.as_ref().and_then(|_| git(&["status", "--porcelain"]));
+    let porcelain = commit
+        .as_ref()
+        .and_then(|_| git(&["status", "--porcelain"]));
     checkout_state(commit, porcelain)
 }
 

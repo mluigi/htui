@@ -433,7 +433,11 @@ mod tests {
                 .await
                 .expect_err("search refused"),
         );
-        refused(drop_schema(&pool, "").await.expect_err("drop_schema refused"));
+        refused(
+            drop_schema(&pool, "")
+                .await
+                .expect_err("drop_schema refused"),
+        );
     }
 
     #[test]
