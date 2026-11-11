@@ -207,7 +207,8 @@ pub fn bench_uuid(name: &str) -> Uuid {
 /// `git -C repo rev-parse --verify <rev>^{commit}`, then `git show <sha>:HANDOFF.md`,
 /// `git show <sha>:docs/REQUIREMENTS.md`, `git ls-tree -r --name-only <sha> -- docs/decisions`
 /// (only `*.md`) and `git show` of each. An unreachable rev is an error that names the rev and says
-/// "unreachable in this clone (shallow?); pass --corpus-ref".
+/// "unreachable in this clone (shallow?); pass --corpus-ref". A rev without a `docs/decisions`
+/// directory is an error, as it is for [`read_worktree`].
 pub fn read_git(repo: &Path, rev: &str) -> anyhow::Result<Sources> {
     let sha = resolve_commit(repo, rev)?;
     let show = |path: &str| {
@@ -216,6 +217,13 @@ pub fn read_git(repo: &Path, rev: &str) -> anyhow::Result<Sources> {
     };
     let handoff = show("HANDOFF.md")?;
     let requirements = show("docs/REQUIREMENTS.md")?;
+    // `ls-tree` lists a missing path as nothing and exits 0; refuse it, as `read_worktree` does.
+    let missing = || format!("corpus ref `{rev}` ({sha}) has no docs/decisions directory");
+    let kind =
+        git(repo, &["cat-file", "-t", &format!("{sha}:docs/decisions")]).with_context(missing)?;
+    if kind.trim() != "tree" {
+        bail!(missing());
+    }
     // `-z`: paths verbatim, never quoted.
     let listing = git(
         repo,
@@ -1280,6 +1288,62 @@ not a continuation
         );
         let err = read_git(&repo_root(), "--help").expect_err("an option is not a rev");
         assert!(err.to_string().contains("--help"), "{err}");
+    }
+
+    /// A one-commit repo under `root` holding `HANDOFF.md` and `docs/REQUIREMENTS.md` but no
+    /// `docs/decisions` (as before 449f5253).
+    fn repo_without_decisions(root: &Path) {
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(path, text).expect("write");
+        };
+        write("HANDOFF.md", "- [ ] **MOD-99 - Open one**\n");
+        write(
+            "docs/REQUIREMENTS.md",
+            "- **R-STO-8 (must).** Store things.\n",
+        );
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=htui-bench",
+                    "-c",
+                    "user.email=htui-bench@invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "--quiet"]);
+        run(&["add", "HANDOFF.md", "docs/REQUIREMENTS.md"]);
+        run(&["commit", "--quiet", "-m", "no decisions yet"]);
+    }
+
+    #[test]
+    fn a_missing_decisions_directory_is_an_error_in_both_modes() {
+        if !git_works() {
+            eprintln!("skipped: git not available");
+            return;
+        }
+        let root = scratch_dir("no-decisions");
+        repo_without_decisions(&root);
+        let from_git = read_git(&root, "HEAD");
+        let from_disk = read_worktree(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let err = format!("{:#}", from_git.expect_err("git: no docs/decisions"));
+        assert!(err.contains("docs/decisions"), "{err}");
+        assert!(err.contains("HEAD"), "{err}");
+        let err = format!("{:#}", from_disk.expect_err("disk: no docs/decisions"));
+        assert!(err.contains("docs/decisions"), "{err}");
     }
 
     #[test]
