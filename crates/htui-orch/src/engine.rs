@@ -6326,25 +6326,7 @@ where
                 run: run.id,
                 reason: format!("planner step {} is done with no admitted plan", planner.id),
             })?;
-        let base: BTreeMap<RepoId, String> = serde_json::from_value(
-            plan.base_refs
-                .clone()
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-        )
-        .map_err(|err| EngineError::Snapshot {
-            run: run.id,
-            reason: format!("plan {} has unreadable base refs: {err}", plan.id),
-        })?;
-        let planned: Vec<htui_core::model::SnapshotPart> = serde_json::from_value(
-            plan.body
-                .get("parts")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .map_err(|err| EngineError::Snapshot {
-            run: run.id,
-            reason: format!("plan {} has an unreadable parts body: {err}", plan.id),
-        })?;
+        let (base, planned) = plan_parts(run.id, &plan)?;
         let width_of_plan = i32::try_from(planned.len()).unwrap_or(i32::MAX);
 
         // MOD-10 D11, D13 at a parts round, as at `drive_group`: one resolution for the round.
@@ -9583,6 +9565,44 @@ fn part_retries(steps: &[RunStep], planner: StepId, retry_limit: i32) -> Vec<New
             node_key: part.node_key.clone(),
         })
         .collect()
+}
+
+/// An admitted plan's two decoded halves, `base_refs` and `body.parts`, with the two `Snapshot`
+/// sentences: one decode shared by the parts round and integrate (MOD-139 M3 D1), so the two
+/// cannot diverge.
+///
+/// # Errors
+/// [`EngineError::Snapshot`] when either half does not decode.
+fn plan_parts(
+    run: RunId,
+    plan: &htui_core::model::RunPlan,
+) -> Result<
+    (
+        BTreeMap<RepoId, String>,
+        Vec<htui_core::model::SnapshotPart>,
+    ),
+    EngineError,
+> {
+    let base: BTreeMap<RepoId, String> = serde_json::from_value(
+        plan.base_refs
+            .clone()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+    )
+    .map_err(|err| EngineError::Snapshot {
+        run,
+        reason: format!("plan {} has unreadable base refs: {err}", plan.id),
+    })?;
+    let planned: Vec<htui_core::model::SnapshotPart> = serde_json::from_value(
+        plan.body
+            .get("parts")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    )
+    .map_err(|err| EngineError::Snapshot {
+        run,
+        reason: format!("plan {} has an unreadable parts body: {err}", plan.id),
+    })?;
+    Ok((base, planned))
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).

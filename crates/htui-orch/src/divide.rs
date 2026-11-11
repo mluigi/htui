@@ -7,8 +7,8 @@
 //! the snapshot and the rows the caller already holds.
 
 use htui_core::model::{
-    GraphSnapshot, Isolation, NodeRole, PLAN_SUFFIX, RunPlan, RunStep, SkillGlob, SnapshotPart,
-    SnapshotPhase, StepId, StepRole, StepStatus,
+    GraphSnapshot, Isolation, NodeRole, PLAN_SUFFIX, PlanStatus, RunPlan, RunStep, SkillGlob,
+    SnapshotPart, SnapshotPhase, StepId, StepRole, StepStatus,
 };
 use serde_json::{Value, json};
 
@@ -286,6 +286,50 @@ pub fn latest_parts(steps: &[RunStep], planner: StepId) -> Vec<&RunStep> {
     latest
 }
 
+/// MOD-139 M3 D1: what an integrate attempt reads, selected from rows the caller holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegrateInputs {
+    /// The latest `done` planner row of the divided node.
+    pub planner: RunStep,
+    /// Its highest-revision `admitted` plan.
+    pub plan: RunPlan,
+    /// The plan's latest parts, every one `done`, position order.
+    pub parts: Vec<RunStep>,
+}
+
+/// MOD-139 M3 D1: the planner node is the `Planner` phase whose [`divided_name`] is `node.name`;
+/// its row is `latest_at(steps, planner_node.position)` with `role == Planner` and `status ==
+/// Done`; the plan is the highest-`revision` `Admitted` one of that `planner_step_id`; the parts
+/// are [`latest_parts`]. `None` when any is missing, no part exists, or a latest part is not `done`
+/// (integrate is reached only after `walk::parts_state` read the node `Done`).
+#[must_use]
+pub fn integrate_inputs(
+    snapshot: &GraphSnapshot,
+    node: &SnapshotPhase,
+    steps: &[RunStep],
+    plans: &[RunPlan],
+) -> Option<IntegrateInputs> {
+    let planner_node = snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.role == NodeRole::Planner && divided_name(phase) == node.name)?;
+    let planner = latest_at(steps, planner_node.position)
+        .filter(|row| row.role == StepRole::Planner && row.status == StepStatus::Done)?;
+    let plan = plans
+        .iter()
+        .filter(|plan| plan.planner_step_id == planner.id && plan.status == PlanStatus::Admitted)
+        .max_by_key(|plan| plan.revision)?;
+    let parts = latest_parts(steps, planner.id);
+    if parts.is_empty() || parts.iter().any(|part| part.status != StepStatus::Done) {
+        return None;
+    }
+    Some(IntegrateInputs {
+        planner: planner.clone(),
+        plan: plan.clone(),
+        parts: parts.into_iter().cloned().collect(),
+    })
+}
+
 /// Whether `status` is a part's settled failure: `failed`, `cancelled` or `superseded`.
 const fn failed_part(status: StepStatus) -> bool {
     matches!(
@@ -352,7 +396,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        admission_refusal, divided_name, exhausted, latest_parts, live_siblings,
+        admission_refusal, divided_name, exhausted, integrate_inputs, latest_parts, live_siblings,
         next_base_position, part_key, part_node_key, part_phase_name, parts_width, plan_body,
         plan_digest, planned_sessions, row_role,
     };
@@ -789,5 +833,139 @@ mod tests {
         second.status = StepStatus::Failed;
         assert!(exhausted(&second, 1));
         assert!(!exhausted(&other, 0), "a done part is not exhausted");
+    }
+
+    /// The divided FEAT-3's planner at 2, revision 0 admitted and superseded by a re-planned
+    /// revision 1 whose parts (7, 8) ran, `ui` twice.
+    fn re_planned() -> (GraphSnapshot, Vec<RunStep>, Vec<RunPlan>, RunStep, RunPlan) {
+        let snapshot = divided(vec![part("api", 0), part("ui", 1)]);
+        let mut old = step_at(2, StepRole::Planner, None, StepStatus::Superseded);
+        old.attempt = 1;
+        let mut planner = step_at(2, StepRole::Planner, None, StepStatus::Done);
+        planner.attempt = 2;
+        let mut first = plan_at(5, &[part("api", 0), part("ui", 1)]);
+        first.planner_step_id = old.id;
+        first.status = PlanStatus::Abandoned;
+        let mut zero = plan_at(5, &[part("api", 0), part("ui", 1)]);
+        zero.planner_step_id = planner.id;
+        zero.status = PlanStatus::Abandoned;
+        let mut one = plan_at(7, &[part("api", 0), part("ui", 1)]);
+        one.planner_step_id = planner.id;
+        one.revision = 1;
+        let api = step_at(7, StepRole::Part, Some(planner.id), StepStatus::Done);
+        let failed = step_at(8, StepRole::Part, Some(planner.id), StepStatus::Failed);
+        let mut ui = step_at(8, StepRole::Part, Some(planner.id), StepStatus::Done);
+        ui.attempt = 2;
+        let stale = step_at(5, StepRole::Part, Some(old.id), StepStatus::Superseded);
+        let steps = vec![old, planner.clone(), stale, ui, failed, api];
+        let plans = vec![first, one.clone(), zero];
+        (snapshot, steps, plans, planner, one)
+    }
+
+    /// MOD-139 M3 D1: the latest done planner, its highest admitted revision and the latest
+    /// attempt of each of its parts, position order.
+    #[test]
+    fn integrate_inputs_take_the_latest_planner_plan_and_parts() {
+        let (snapshot, steps, plans, planner, one) = re_planned();
+        let integrate = snapshot.phases[3].clone();
+        let inputs = integrate_inputs(&snapshot, &integrate, &steps, &plans)
+            .expect("a done planner, an admitted plan and done parts");
+        assert_eq!(inputs.planner.id, planner.id);
+        assert_eq!(inputs.plan.id, one.id, "revision 1 wins");
+        let parts: Vec<(i32, i32)> = inputs
+            .parts
+            .iter()
+            .map(|part| (part.position, part.attempt))
+            .collect();
+        assert_eq!(parts, [(7, 1), (8, 2)], "the latest attempt of each part");
+        assert!(
+            inputs
+                .parts
+                .iter()
+                .all(|part| part.parent_step_id == Some(planner.id)),
+            "only the latest planner's parts"
+        );
+    }
+
+    /// MOD-139 M3 D1: nothing to integrate while a part is not done, or with no planner, plan
+    /// or part at all.
+    #[test]
+    fn integrate_inputs_are_none_while_a_part_is_not_done() {
+        let (snapshot, mut steps, plans, _, _) = re_planned();
+        let integrate = snapshot.phases[3].clone();
+        let running = steps
+            .iter_mut()
+            .find(|step| step.position == 8 && step.attempt == 2)
+            .expect("ui attempt 2");
+        running.status = StepStatus::Running;
+        assert_eq!(
+            integrate_inputs(&snapshot, &integrate, &steps, &plans),
+            None
+        );
+
+        let (snapshot, steps, plans, planner, _) = re_planned();
+        let unplanned: Vec<RunPlan> = plans
+            .iter()
+            .filter(|plan| plan.status != PlanStatus::Admitted)
+            .cloned()
+            .collect();
+        assert_eq!(
+            integrate_inputs(&snapshot, &integrate, &steps, &unplanned),
+            None,
+            "no admitted plan"
+        );
+        let partless: Vec<RunStep> = steps
+            .iter()
+            .filter(|step| step.role != StepRole::Part)
+            .cloned()
+            .collect();
+        assert_eq!(
+            integrate_inputs(&snapshot, &integrate, &partless, &plans),
+            None,
+            "no part"
+        );
+        let mut undone = steps.clone();
+        for step in &mut undone {
+            if step.id == planner.id {
+                step.status = StepStatus::Running;
+            }
+        }
+        assert_eq!(
+            integrate_inputs(&snapshot, &integrate, &undone, &plans),
+            None,
+            "the planner is not done"
+        );
+        let mut stepless = snapshot.clone();
+        stepless
+            .phases
+            .retain(|phase| phase.role != NodeRole::Planner);
+        assert_eq!(
+            integrate_inputs(&stepless, &integrate, &steps, &plans),
+            None,
+            "no planner node"
+        );
+    }
+
+    /// MOD-139 M3 ruling R-3: the integrate node `graph::expand_divide` freezes inherits the
+    /// divided node's gate and `verify_command`, so integrate is gated and verified as the
+    /// divided node would have been.
+    #[test]
+    fn integrate_inherits_the_divided_nodes_gate_and_verify_command() {
+        let (snapshot, _) = fixture();
+        let template = snapshot.phases[0].clone();
+        let mut implement = node(&template, "implement", 1);
+        implement.divide = Some(SnapshotDivide::default());
+        implement.gate = htui_core::model::Gate::OnFailure;
+        implement.verify_command = Some("cargo test".to_owned());
+        let phases = vec![node(&template, "plan", 0), implement];
+        let (phases, _) =
+            crate::graph::expand_divide("feature", phases, Vec::new()).expect("no key is taken");
+        let integrate = phases
+            .iter()
+            .find(|phase| phase.role == NodeRole::Integrate)
+            .expect("an integrate node");
+        assert_eq!(integrate.name, "implement");
+        assert_eq!(integrate.gate, htui_core::model::Gate::OnFailure);
+        assert_eq!(integrate.verify_command.as_deref(), Some("cargo test"));
     }
 }
