@@ -644,10 +644,11 @@ pub enum EngineError {
         role: StepRole,
     },
     /// MOD-139 M3 D6 (Confirm 3, blueprint P-2, P-3): an answer that would land an integrate step
-    /// parked on a part its capture does not hold. Retry is the way on.
+    /// parked on a part its capture does not hold. Retry, while the budget allows, or reject (the
+    /// divided node's `fails` edge, else the run ends `rejected`) is the way on (ruling R-5).
     #[error(
         "step {step} is parked on integrate_incomplete: approving, skipping or promoting it would \
-         land it without a part; retry it instead"
+         land it without a part; retry or reject it instead"
     )]
     IntegrateIncomplete {
         /// The parked integrate step.
@@ -656,9 +657,10 @@ pub enum EngineError {
     /// MOD-139 M3 Confirm 3 (T3 repair 2): a landing answer on an integrate step whose park
     /// outranked its post-check (`missing_output`, a deadline, a cap, a crashed session), so its
     /// note does not say `integrate_incomplete`; the post-check, re-run over the step's recorded
-    /// capture, still finds parts it does not hold. Retry is the way on.
+    /// capture, still finds parts it does not hold. Retry or reject is the way on (ruling R-5).
     #[error(
-        "step {step}: {}; approving or skipping it would land it without a part; retry it instead",
+        "step {step}: {}; approving or skipping it would land it without a part; retry or reject \
+         it instead",
         crate::status::integrate_incomplete(.node, .parts)
     )]
     IntegrateUnmerged {
