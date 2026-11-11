@@ -92,7 +92,10 @@ pub fn plan_body(parts: &[SnapshotPart]) -> Value {
 /// `"sha256:" + sha256_hex` over `body` serialised with its object keys in byte order at every
 /// depth, so the digest does not depend on `serde_json`'s `preserve_order` (which a workspace
 /// build turns on and a crate build does not, `graph::topology`'s trap) or on the key order a
-/// store hands the body back in.
+/// store hands the body back in (Postgres `jsonb` has its own). This is the "sha256 over the
+/// canonical body" of `RunPlan::digest` (ANA-33 §7.2), which resume recomputes; blueprint §1.8's
+/// literal `sha256_hex(serde_json::to_string(body))` would not survive that round trip. Whatever
+/// else computes a plan digest (MOD-140's plan submission) calls this function.
 #[must_use]
 pub fn plan_digest(body: &Value) -> String {
     let mut text = String::new();
@@ -494,10 +497,40 @@ mod tests {
         let body = plan_body(&[part("api", 0)]);
         assert_eq!(body["scope"], "parts");
         assert_eq!(body["parts"][0]["key"], "api");
-        let reordered: serde_json::Value =
-            serde_json::from_str(&body.to_string()).expect("the body round-trips");
+        // Every object's keys reversed, the order a store may hand the body back in (Postgres
+        // `jsonb` sorts keys its own way); under `preserve_order` its `to_string` differs.
+        fn reversed(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => serde_json::Value::Object(
+                    map.iter()
+                        .rev()
+                        .map(|(key, value)| (key.clone(), reversed(value)))
+                        .collect(),
+                ),
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.iter().map(reversed).collect())
+                }
+                other => other.clone(),
+            }
+        }
+        let reordered = reversed(&body);
+        assert_eq!(reordered, body);
         assert_eq!(plan_digest(&body), plan_digest(&reordered));
         assert!(plan_digest(&body).starts_with("sha256:"));
+        // The formula: sha256 over the JSON text with every object's keys in byte order.
+        let nested = serde_json::json!({
+            "scope": "parts",
+            "parts": [{ "b": 1, "a": [2, { "d": null, "c": "x\"y" }] }],
+        });
+        assert_eq!(
+            plan_digest(&nested),
+            format!(
+                "sha256:{}",
+                htui_core::prompt::digest::sha256_hex(
+                    r#"{"parts":[{"a":[2,{"c":"x\"y","d":null}],"b":1}],"scope":"parts"}"#
+                )
+            )
+        );
         assert_ne!(
             plan_digest(&body),
             plan_digest(&plan_body(&[part("ui", 0)]))
