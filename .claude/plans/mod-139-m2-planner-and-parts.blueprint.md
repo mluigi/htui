@@ -69,6 +69,14 @@
 - **F-2 adopted.** M2 divided runs exist only in engine cases and end at the integrate node as D15 says.
 - **F-3 adopted.** The store refuses an admission with no part, with the sentence above; the engine's
   `empty_plan` comes first.
+- **F-4 (T3, adopted).** `plan_digest` hashes a canonical form of the body (object keys sorted by
+  byte order at every depth), not `serde_json::to_string(body)` as §1.8 wrote: serde_json's
+  `preserve_order` feature is on in every build, so §1.8's formula would hash insertion order, and a
+  body read back from `jsonb` would not match the digest stored at admission. Pinned by
+  `the_plan_body_and_digest_are_canonical` (`7a9e5e36`).
+- **F-5 (T3, adopted).** Two planners never admit at once (`schedule::plan_pass` rule (f),
+  `72a9114d`): each reads the run's revision and part positions before its own `admit_plan`, so two
+  in flight would collide.
 - **T3 case 15** (two parallel `fan_out_only` branches) depends on the first-poll order of concurrent
   futures. An implementer who sees it flake reports it as a remaining finding; it is never weakened or
   `#[ignore]`d without a coordinator ruling.

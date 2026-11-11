@@ -6345,9 +6345,10 @@ where
         let mut trees = None;
         let mut captured = false;
         let outcome = self.part_live(&stage, &mut trees, &mut captured).await;
-        if !matches!(outcome, Ok(PartOutcome::Settled))
-            && let (Some(trees), false) = (&trees, captured)
-        {
+        // Blueprint §1.10: uncaptured trees are released on every way out, a `Settled` refusal
+        // whose row another writer moved included (`run_candidate`'s rule); a part that ran to
+        // its end has `captured` set and releases nothing here.
+        if let (Some(trees), false) = (&trees, captured) {
             self.release_trees(stage.step, trees).await;
         }
         match outcome {
