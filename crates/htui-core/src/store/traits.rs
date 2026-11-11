@@ -1910,7 +1910,11 @@ pub trait WriteStore: ReadStore {
     /// `Constraint` ([`step_slot_is_taken`]) for the first part whose slot is taken; for a `New`
     /// plan, `Constraint` for a duplicate id (`already_exists("run_plan", id)`) or a taken
     /// `(run_id, revision)` ([`plan_revision_taken`]), not ordered between themselves. Every text
-    /// is the same on every backend.
+    /// listed so far is the same on every backend. Last, the part rows' own keys: a taken part id
+    /// or a part `agent_id` naming no agent is a `Constraint` too, but its text differs by
+    /// backend — `MemStore` answers `already_exists("run_step", id)` and
+    /// `references_no_row("run_step.agent_id", ..)`, Postgres the raw text of its unique (`23505`)
+    /// or foreign-key (`23503`) violation.
     ///
     /// [`PlanToAdmit::New`]: crate::model::PlanToAdmit::New
     /// [`PlanToAdmit::Proposed`]: crate::model::PlanToAdmit::Proposed
