@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-139](docs/decisions/mod/mod-139.md)** - Divided fan-out runtime: planner, parts, integrate (done, 2026-11-11)
 - **[MOD-163](docs/decisions/mod/mod-163.md)** - Memory: entry store and prompt section (done, 2026-11-09)
 - **[MOD-138](docs/decisions/mod/mod-138.md)** - Snapshot v2 and the graph walker (done, 2026-11-08)
 - **[MOD-160](docs/decisions/mod/mod-160.md)** - Knowledge search fails open cheaply and says so (done, 2026-11-06)
