@@ -70,9 +70,9 @@ use crate::fanout::{
     Route, judge_candidate, judge_inputs, judge_phase, judge_phase_name, parse_judge_verdict,
     prefilter, route,
 };
-use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
+use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput, Unmerged};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, env_files};
+use crate::isolate::{Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, PartTip, env_files};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, NOT_RESET, StepKind};
@@ -4203,10 +4203,6 @@ where
             },
             Cursor::Create { position, attempt } => {
                 let phase = Self::phase_at(run, snapshot, position)?;
-                // MOD-139 M2 D15: integrate runs from M3 on; no M2 run reaches it outside the seam.
-                if phase.role == NodeRole::Integrate {
-                    return Err(integrate_waits(&phase));
-                }
                 self.admit(row, snapshot, &phase, attempt).await
             }
             Cursor::Fan { position, attempt } => {
@@ -4226,8 +4222,11 @@ where
                         NodeRole::Planner => {
                             Box::pin(self.admit_planner(row, snapshot, &phase, step)).await
                         }
-                        NodeRole::Integrate => Err(integrate_waits(&phase)),
-                        NodeRole::Step => self.walk_step(row, snapshot, step, &phase).await,
+                        // MOD-139 M3 D1: integrate is a session step on the plain path, its
+                        // hooks inside `walk_live_step`.
+                        NodeRole::Integrate | NodeRole::Step => {
+                            self.walk_step(row, snapshot, step, &phase).await
+                        }
                     }
                 }
                 None => Ok(None),
@@ -5029,10 +5028,25 @@ where
         Box::pin(self.secrets_ready(run))
             .await?
             .map_err(EngineError::Secrets)?;
+        // MOD-139 M3 D1: integrate's inputs, read once and shared by its hooks; every hook below is
+        // a no-op for any other node. Prepared from the plan's `base_refs` (no slot under `local`).
+        let integrate = if phase.role == NodeRole::Integrate {
+            Some(Box::pin(self.integrate_stage(run, snapshot, phase)).await?)
+        } else {
+            None
+        };
         let prepared = self
             .parts
             .isolator
-            .prepare(run.id, step.id, &run.repo_scope, phase.isolation, None)
+            .prepare(
+                run.id,
+                step.id,
+                &run.repo_scope,
+                phase.isolation,
+                integrate
+                    .as_ref()
+                    .and_then(|stage| stage.slot(phase.isolation)),
+            )
             .await?;
         let trees: Vec<_> = prepared
             .trees
@@ -5043,6 +5057,12 @@ where
             .store
             .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &trees)
             .await?;
+        // MOD-139 M3 D3, D4: the deterministic pre-merge of the done parts, after the tree rows and
+        // before the commits are recorded (P-21); its report is the item note and stage 3's.
+        let premerge = match &integrate {
+            Some(stage) => Some(Box::pin(self.premerge(run, step, phase, stage, &trees)).await?),
+            None => None,
+        };
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -5059,11 +5079,27 @@ where
             .await?;
 
         // -- stage 3: prompt ------------------------------------------------------------------
+        // MOD-139 M3 D5: integrate's `premerge` and `parts` sections.
+        let integrate_prompt = match (&integrate, premerge) {
+            (Some(stage), Some(report)) => {
+                Some(Box::pin(self.integrate_prompt(run, phase, stage, report)).await?)
+            }
+            _ => None,
+        };
         // MOD-139 M2 D13: read once, so the prompt's section and the session's exposure agree.
         let live =
             crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
         let prompt = match self
-            .assemble_prompt(run, snapshot, step, phase, item, None, live)
+            .assemble_prompt(
+                run,
+                snapshot,
+                step,
+                phase,
+                item,
+                None,
+                live,
+                integrate_prompt.as_ref(),
+            )
             .await?
         {
             Ok(prompt) => prompt,
@@ -5179,6 +5215,14 @@ where
             .await?;
         // MOD-24 D1 (K4): the `after` commits are recorded; `finish_step` is not.
         crate::kill_point::reached(KillPoint::Captured, Site::step(step));
+        // MOD-139 M3 D6: integrate's post-check over its capture, only when the session returned
+        // `Ok` (as verify runs): its answer outranks verify's in `settle`.
+        let unmerged = match &integrate {
+            Some(stage) if result.is_ok() => {
+                Some(Box::pin(self.unmerged_keys(step, stage, &trees, &after)).await?)
+            }
+            _ => None,
+        };
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         let settled = gate::settle(&SettleInput {
@@ -5192,7 +5236,10 @@ where
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
             reads_verdict: snapshot.reads_verdict(&phase.name),
-            unmerged: None,
+            unmerged: unmerged.as_deref().map(|parts| Unmerged {
+                node: crate::divide::divided_name(phase),
+                parts,
+            }),
         });
         self.parts
             .store
@@ -5243,6 +5290,169 @@ where
                 Ok(Some(rest))
             }
         }
+    }
+
+    /// MOD-139 M3 D1: what one integrate attempt reads, read once and shared by its hooks: the
+    /// divided node's latest done planner, its admitted plan (decoded by [`plan_parts`], the parts
+    /// round's own decode) and a [`PartTip`] per latest done part, in plan order.
+    ///
+    /// # Errors
+    /// [`EngineError::Snapshot`] when [`crate::divide::integrate_inputs`] finds nothing: integrate
+    /// is reached only after the parts round read the node `Done`, so that is an engine error and
+    /// never a fallback; a store read's failure.
+    async fn integrate_stage(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+    ) -> Result<IntegrateStage, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let plans = self.parts.store.run_plans(run.id).await?;
+        let inputs =
+            crate::divide::integrate_inputs(snapshot, node, &steps, &plans).ok_or_else(|| {
+                EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!(
+                        "integrate node `{}` has no done planner, admitted plan or done parts",
+                        node.name
+                    ),
+                }
+            })?;
+        let (base, planned) = plan_parts(run.id, &inputs.plan)?;
+        let mut tips = Vec::with_capacity(inputs.parts.len());
+        for part in &inputs.parts {
+            tips.push(PartTip {
+                step: part.id,
+                key: part
+                    .node_key
+                    .as_deref()
+                    .and_then(crate::divide::part_key)
+                    .unwrap_or_default()
+                    .to_owned(),
+                trees: self.parts.store.step_trees(part.id).await?,
+                commits: self.parts.store.step_commits(part.id).await?,
+            });
+        }
+        Ok(IntegrateStage {
+            base,
+            planned,
+            tips,
+        })
+    }
+
+    /// MOD-139 M3 D3, D4: the isolator's pre-merge of `stage`'s parts into integrate's `trees`,
+    /// and its item note via the step, written once per attempt (recovery re-runs included) and
+    /// skipped for a report with no repo (blueprint P-10). A conflict is the agent's work; every
+    /// `Err` fails the step and the run through `walk_step`'s `fail_hard` (D3).
+    async fn premerge(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        node: &SnapshotPhase,
+        stage: &IntegrateStage,
+        trees: &[RunStepTree],
+    ) -> Result<htui_core::model::PremergeReport, EngineError> {
+        let report = self
+            .parts
+            .isolator
+            .premerge(step.id, trees, &stage.tips)
+            .await?;
+        if let Some(body) = htui_core::prompt::premerge_note(
+            crate::divide::divided_name(node),
+            step.attempt,
+            &report,
+        ) {
+            self.note(Self::item_of(run)?, body, Some(step.id), self.now())
+                .await?;
+        }
+        Ok(report)
+    }
+
+    /// MOD-139 M3 D5 (P-17): integrate's two prompt sections. Per part, in plan order: its key and
+    /// title, its tip per repo it committed to (by the project's repo name, the id when there is
+    /// none), its diffstat (`Isolator::diff`; an error is a withheld-if-unmaskable trim note and
+    /// no stat, `forwarded`'s shape) and its highest-version output document's body.
+    async fn integrate_prompt(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        stage: &IntegrateStage,
+        premerge: htui_core::model::PremergeReport,
+    ) -> Result<IntegratePrompt, EngineError> {
+        let item = Self::item_of(run)?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let name_of = |repo: RepoId| {
+            repos
+                .iter()
+                .find(|row| row.id == repo)
+                .map_or_else(|| repo.to_string(), |row| row.name.clone())
+        };
+        let mut notes = Vec::new();
+        let mut parts = Vec::with_capacity(stage.tips.len());
+        for tip in &stage.tips {
+            let tips = tip
+                .commits
+                .iter()
+                .filter_map(|commit| {
+                    commit
+                        .after_hash
+                        .as_ref()
+                        .filter(|after| **after != commit.before_hash)
+                        .map(|after| (name_of(commit.repo_id), after.clone()))
+                })
+                .collect();
+            let diff = match self.parts.isolator.diff(&tip.trees, &tip.commits).await {
+                Ok(diff) => diff,
+                Err(err) => {
+                    // MOD-9 D132's rule: git's stderr can name a checkout path.
+                    let mut note = [format!(
+                        "parts: diffstat of part `{}` unavailable: {err}",
+                        tip.key
+                    )];
+                    withhold_unmaskable_notes(&mut note, self.parts.scrubber);
+                    notes.extend(note);
+                    None
+                }
+            };
+            let body = self
+                .output_of(item, node, tip.step)
+                .await?
+                .map(|document| document.body);
+            let title = stage
+                .planned
+                .iter()
+                .find(|part| part.key == tip.key)
+                .map_or_else(|| tip.key.clone(), |part| part.title.clone());
+            parts.push(htui_core::prompt::IntegratePart {
+                key: tip.key.clone(),
+                title,
+                tips,
+                diff,
+                body,
+            });
+        }
+        Ok(IntegratePrompt {
+            premerge,
+            parts,
+            notes,
+        })
+    }
+
+    /// MOD-139 M3 D6 (Confirm 2(a)): the keys of the parts integrate's capture `heads` does not
+    /// hold, in plan order (`Isolator::unmerged`, a read).
+    async fn unmerged_keys(
+        &self,
+        step: &RunStep,
+        stage: &IntegrateStage,
+        trees: &[RunStepTree],
+        heads: &[RunStepCommit],
+    ) -> Result<Vec<String>, EngineError> {
+        let steps = self
+            .parts
+            .isolator
+            .unmerged(step.id, trees, heads, &stage.tips)
+            .await?;
+        Ok(stage.keys(&steps))
     }
 
     /// `verify_command`, between the session and the settle (`docs/ANA-2.md:491-493`, plan D30).
@@ -5509,7 +5719,7 @@ where
         // are live, and `fan_out > 1` exposes it anyway.
         let live = crate::divide::live_siblings(&steps, first.id);
         let prompt = match self
-            .assemble_prompt(run, snapshot, first, phase, item, None, live)
+            .assemble_prompt(run, snapshot, first, phase, item, None, live, None)
             .await?
         {
             Ok(prompt) => prompt,
@@ -6601,7 +6811,7 @@ where
         let live =
             crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
         let prompt = match self
-            .assemble_prompt(run, snapshot, step, node, item, Some(part), live)
+            .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
             .await?
         {
             Ok(prompt) => prompt,
@@ -8050,10 +8260,12 @@ where
     /// `part` (MOD-139 M2 D10) is a divided part's own brief: it sets the internal `part` section
     /// and names the phase by its divided node (blueprint P-9), so `{{phase}}` reads `implement`
     /// and not `implement:plan`. `live_siblings` is D13's, as [`Self::phase_spec`] reads it.
+    /// `integrate` (MOD-139 M3 D5) is an integrate session's pre-merge report and parts, set as
+    /// the internal `premerge` and `parts` sections; its diff-error notes join the spec's.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the step's coordinates, MOD-139 M2's part and D13's `live_siblings`; a struct \
-                  would be built at three call sites"
+        reason = "the step's coordinates, MOD-139 M2's part, D13's `live_siblings` and M3's \
+                  integrate sections; a struct would be built at three call sites"
     )]
     async fn assemble_prompt(
         &self,
@@ -8064,6 +8276,7 @@ where
         item: ItemId,
         part: Option<&htui_core::model::SnapshotPart>,
         live_siblings: bool,
+        integrate: Option<&IntegratePrompt>,
     ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
         let mut spec = match self
             .phase_spec(run, snapshot, step, phase, item, true, live_siblings)
@@ -8075,6 +8288,11 @@ where
         if let Some(part) = part {
             spec.part = Some(htui_core::prompt::PartBlock::from(part));
             crate::divide::divided_name(phase).clone_into(&mut spec.phase);
+        }
+        if let Some(integrate) = integrate {
+            spec.premerge = Some(integrate.premerge.clone());
+            spec.parts.clone_from(&integrate.parts);
+            spec.notes.extend(integrate.notes.iter().cloned());
         }
         // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
         // builder; a handoff reads no file.
@@ -9520,13 +9738,48 @@ enum PartOutcome {
     },
 }
 
-/// MOD-139 M2 D15 (blueprint F-2): a divided node's integrate step runs from M3 on, with the
-/// existing divide sentence. No production run reaches it: resolve refuses divided graphs.
-fn integrate_waits(phase: &SnapshotPhase) -> EngineError {
-    EngineError::Resolve(ResolveError::NotYetRunnable {
-        node: phase.name.clone(),
-        reason: graph::NotRunnable::Divide,
-    })
+/// MOD-139 M3 D1: one integrate attempt's inputs, read once ([`Engine::integrate_stage`]) and
+/// shared by its hooks.
+#[derive(Debug)]
+struct IntegrateStage {
+    /// The admitted plan's `base_refs`, decoded by [`plan_parts`].
+    base: BTreeMap<RepoId, String>,
+    /// The admitted plan's parts, decoded by [`plan_parts`] (for their titles).
+    planned: Vec<htui_core::model::SnapshotPart>,
+    /// One per latest done part of the plan, plan order.
+    tips: Vec<PartTip>,
+}
+
+impl IntegrateStage {
+    /// `FanoutSlot { index: 0, width: 1, base }`; `None` under `local`, where the real isolator
+    /// refuses any slot (integrate prepares in place on the part's tip, plan D2).
+    fn slot(&self, isolation: Isolation) -> Option<FanoutSlot<'_>> {
+        (isolation != Isolation::Local).then_some(FanoutSlot {
+            index: 0,
+            width: 1,
+            base: &self.base,
+        })
+    }
+
+    /// The keys of `steps`, in plan order (a step that is no part here is skipped).
+    fn keys(&self, steps: &[StepId]) -> Vec<String> {
+        self.tips
+            .iter()
+            .filter(|tip| steps.contains(&tip.step))
+            .map(|tip| tip.key.clone())
+            .collect()
+    }
+}
+
+/// MOD-139 M3 D5: what stage 3 adds to integrate's spec.
+#[derive(Debug, Clone)]
+struct IntegratePrompt {
+    /// The pre-merge's report: the protected `premerge` section.
+    premerge: htui_core::model::PremergeReport,
+    /// The done parts: the trimmable `parts` section.
+    parts: Vec<htui_core::prompt::IntegratePart>,
+    /// Diff-error trim notes, already withheld when unmaskable.
+    notes: Vec<String>,
 }
 
 /// MOD-139 M2 D6 (T4): the retry rows a parts round owes under `planner`. Unless some latest
@@ -13467,7 +13720,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
         let item = row.item_id.expect("the run has an item");
         let prompt = engine
-            .assemble_prompt(&row, &snapshot, &stale, phase, item, None, false)
+            .assemble_prompt(&row, &snapshot, &stale, phase, item, None, false, None)
             .await
             .expect("the prompt's reads succeed")
             .expect("`prd` needs no input");
@@ -15908,6 +16161,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault");
@@ -18482,6 +18736,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -18571,6 +18826,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -18642,6 +18898,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -18807,6 +19064,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -19149,6 +19407,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -19188,6 +19447,7 @@ mod tests {
                 ids::HTUI_FEAT_3,
                 None,
                 false,
+                None,
             )
             .await
             .expect("no store fault")
@@ -19311,6 +19571,73 @@ mod tests {
                 .chain(&requests[0].commits)
                 .all(|id| *id == first.id),
             "every row is attempt 1's: {requests:?}"
+        );
+    }
+
+    /// MOD-139 M3 D5: a part whose diffstat the isolator cannot answer renders its block without
+    /// a stat, and the error is a trim note (withheld when unmaskable, `forwarded`'s rule); the
+    /// prompt still assembles, so the step runs on.
+    #[tokio::test]
+    async fn a_part_diff_error_is_a_trim_note() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness.orch.isolator.fail_diff("index.lock held");
+        harness_engine!(harness.orch, engine);
+        let stage = super::IntegrateStage {
+            base: BTreeMap::new(),
+            planned: Vec::new(),
+            tips: vec![crate::isolate::PartTip {
+                step: prd.id,
+                key: "api".to_owned(),
+                trees: Vec::new(),
+                commits: Vec::new(),
+            }],
+        };
+
+        let integrate = engine
+            .integrate_prompt(
+                &row,
+                &snapshot.phases[0],
+                &stage,
+                htui_core::model::PremergeReport::default(),
+            )
+            .await
+            .expect("a diff error is no engine error");
+        assert_eq!(integrate.parts.len(), 1);
+        assert_eq!(
+            integrate.parts[0].diff, None,
+            "the block renders without a stat"
+        );
+        assert_eq!(
+            integrate.notes,
+            ["parts: diffstat of part `api` unavailable: git: index.lock held"],
+        );
+
+        let prompt = engine
+            .assemble_prompt(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                None,
+                false,
+                Some(&integrate),
+            )
+            .await
+            .expect("no store fault")
+            .expect("the prompt assembles: the step runs on");
+        assert!(prompt.text.contains("key=\"api\""), "{}", prompt.text);
+        assert!(
+            prompt
+                .trim
+                .notes
+                .iter()
+                .any(|note| note.starts_with("parts: diffstat of part `api` unavailable: ")),
+            "{:?}",
+            prompt.trim.notes
         );
     }
 

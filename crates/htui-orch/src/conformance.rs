@@ -14986,7 +14986,8 @@ async fn a_crash_before_admission_re_admits_on_the_same_planner_row<H: CaseHarne
 async fn a_crash_after_admission_re_plans_nothing_and_lands_no_part<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
-    primary_repo(&orch).await;
+    // Repo-less (M3 P-18): with a repo, integrate's capture is still unrecorded when its session
+    // stalls, so the sweep would reset and retry it; an empty scope reads it finished.
     let stalled = orch.stall_after_done("implement", 1, None, true);
     let run = crash_divided(&orch, &[stalled]).await;
     let steps = steps_of(&orch, run).await;
