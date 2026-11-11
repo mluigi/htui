@@ -14993,40 +14993,14 @@ async fn a_crash_after_admission_re_plans_nothing_and_lands_no_part<H: CaseHarne
     let steps = steps_of(&orch, run).await;
     let planner = planner_of(&steps);
     let integrate = integrate_of(&steps);
-    let parts: Vec<StepId> = parts_of(&steps, planner.id)
-        .iter()
-        .map(|part| part.id)
-        .collect();
 
     let other = orch.restarted();
     assert_eq!(adopted_next(&other, run).await, Next::Walk);
-    let reconciles = other.isolator().reconciles();
-    assert!(
-        reconciles
-            .iter()
-            .all(|(winner, siblings)| !parts.contains(winner)
-                && siblings.iter().all(|sibling| !parts.contains(sibling))),
-        "no part lands: {reconciles:?}"
-    );
     assert_eq!(
-        reconciles
-            .iter()
-            .filter(|(winner, _)| *winner == integrate.id)
-            .count(),
-        1,
-        "integrate lands once, through (Integrate, Finished): {reconciles:?}"
-    );
-    assert!(
-        reconciles
-            .iter()
-            .filter(|(winner, _)| *winner == planner.id)
-            .all(|(_, siblings)| siblings.is_empty())
-            && reconciles
-                .iter()
-                .filter(|(winner, _)| *winner == planner.id)
-                .count()
-                <= 1,
-        "the planner frontier at most once, with no tree: {reconciles:?}"
+        other.isolator().reconciles(),
+        [(integrate.id, Vec::new())],
+        "integrate lands once, through (Integrate, Finished); no part and no planner frontier \
+         lands"
     );
     other
         .resume(run)
@@ -15966,13 +15940,9 @@ async fn a_divided_run_lands_one_integrate_merge<H: CaseHarness>(harness: &H) {
     );
 
     let sections = prompt_sections(&orch, integrate.id).await;
-    let premerge = sections
-        .iter()
-        .position(|section| section == "premerge")
-        .unwrap_or_else(|| panic!("a premerge section: {sections:?}"));
     assert_eq!(
-        sections.get(premerge + 1).map(String::as_str),
-        Some("parts"),
+        sections.get(..3),
+        Some(&["template", "premerge", "parts"].map(String::from)[..]),
         "{sections:?}"
     );
     let text = prompt_text(&orch, integrate.id).await;
