@@ -3591,6 +3591,12 @@ where
             // it unchecked (M2 G-6's lesson): its post-check over the recorded commits feeds the
             // re-settle, so an unmerged part fails it rather than lands it. Each await boxed (the
             // stack rule). Reset and NeverReset stay on the plain arms.
+            //
+            // MOD-139 M3 R1 (ruling R-6): an isolator or snapshot error reading the stage or the
+            // post-check fails the step and the run as the walk's `fail_hard` does (D3: no
+            // retry). Propagated, it would note the item, release the lease and fail every later
+            // sweep's adoption again. A store, lease or stale error still propagates (A-4's
+            // transient class).
             (
                 StepKind::Integrate,
                 Adjudication::Finished {
@@ -3600,8 +3606,25 @@ where
             ) => {
                 self.finish_recovered(step, verify, verify_exit_code, now)
                     .await?;
-                let stage = Box::pin(self.integrate_stage(run, snapshot, phase)).await?;
-                let parts = Box::pin(self.unmerged_keys(step, &stage, &trees, &commits)).await?;
+                let read = match Box::pin(self.integrate_stage(run, snapshot, phase)).await {
+                    Ok(stage) => Box::pin(self.unmerged_keys(step, &stage, &trees, &commits)).await,
+                    Err(err) => Err(err),
+                };
+                let parts = match read {
+                    Ok(parts) => parts,
+                    Err(err @ (EngineError::Isolate(_) | EngineError::Snapshot { .. })) => {
+                        let reason = failure_text(&phase.name, &err);
+                        if !Box::pin(self.fail_hard(run, step, &reason)).await? {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Next::Finished(Rest {
+                            run: RunStatus::Failed,
+                            position: Some(phase.position),
+                            failure: None,
+                        })));
+                    }
+                    Err(err) => return Err(err),
+                };
                 let settled = recover::resettle(
                     output.as_ref(),
                     verify,
