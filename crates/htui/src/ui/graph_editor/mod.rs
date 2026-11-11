@@ -10,6 +10,8 @@
 //! - `history`: undo, redo and the one write in flight (D4, D6).
 //! - `canvas`: the rataflow projection, layout, selection and mouse (D7, D11).
 //! - `node_form`, `edge_form`, `links`: the forms and the links list (D8, D9, D10).
+//! - `notes`: what a run of one step would be refused with today, in resolve's own words (M2 D11).
+//! - `part_form`: one default part of a divide step (M2 D9).
 //! - [`GraphEditor`] (this module): the modes, every key through the key catalogue (D12), the
 //!   writes and the replies (D4), the mouse (D11) and the drawing (D2). Only this module names
 //!   `Act`, `Keys`, `Stack`, `Ctx` or `StoreRequest`.
@@ -20,6 +22,8 @@ pub(crate) mod history;
 pub(crate) mod links;
 pub(crate) mod model;
 pub(crate) mod node_form;
+pub(crate) mod notes;
+pub(crate) mod part_form;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
