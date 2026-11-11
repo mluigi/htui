@@ -3845,7 +3845,9 @@ where
         let note = step.gate_note.as_deref().unwrap_or_default();
         // MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge loops over it, in place of its
         // own `retry_limit`, on a failure of its own; an interrupted step (D92, D93) is a crash,
-        // not a failure, and keeps the retry below.
+        // not a failure, and keeps the retry below. A planner's own name sources no `fails` edge
+        // (`graph::expand_divide` keeps a divided node's out-edges on its integrate node), and
+        // `!planner` keeps it that way should the lookup move to `divide::divided_name`.
         if !planner && !note.starts_with(INTERRUPTED) {
             let fails = crate::walk::Graph::of(snapshot)
                 .loop_edge(&phase.name, EdgeKind::Fails)

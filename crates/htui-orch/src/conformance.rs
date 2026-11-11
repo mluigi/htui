@@ -15115,7 +15115,7 @@ async fn a_local_divided_node_lands_no_part_on_recovery<H: CaseHarness>(harness:
 
 /// The divided FEAT-3 graph (`api`, `ui`) over a primary repo with one session at a time, so the
 /// round runs `api` and holds `ui` in its queue.
-async fn divided_one_at_a_time<O: Orchestrate>(orch: &O) {
+async fn divided_width_one<O: Orchestrate>(orch: &O) {
     divided_feat_3(orch, &[("api", None), ("ui", None)], |_| {}).await;
     primary_repo(orch).await;
     orch.store()
@@ -15146,7 +15146,7 @@ async fn assert_ui_never_pulled<O: Orchestrate>(orch: &O, run: RunId) {
 /// and the walk answers `Cancelled`.
 async fn a_cancel_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
-    divided_one_at_a_time(&orch).await;
+    divided_width_one(&orch).await;
     let hold = orch.hold_sessions(&[("implement/api", 1)]);
     let run = orch
         .enqueue_divided(ids::HTUI_FEAT_3)
@@ -15169,7 +15169,7 @@ async fn a_cancel_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(h
 /// no longer this process's, and the caller gets `LeaseLost`.
 async fn a_lost_lease_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
-    divided_one_at_a_time(&orch).await;
+    divided_width_one(&orch).await;
     let hold = orch.hold_sessions(&[("implement/api", 1)]);
     let run = orch
         .enqueue_divided(ids::HTUI_FEAT_3)
@@ -15216,7 +15216,7 @@ async fn a_lost_lease_during_a_part_leaves_the_queued_part_pending<H: CaseHarnes
 /// session and is `cancelled` with the cut's note, never left `pending` under the `failed` run.
 async fn a_part_refusal_cancels_the_queued_parts<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
-    divided_one_at_a_time(&orch).await;
+    divided_width_one(&orch).await;
     // `plan` is the last prepare before the parts round, which admission makes none of.
     let hold = orch.hold_sessions(&[("plan", 1)]);
     let run = orch
@@ -15272,8 +15272,12 @@ async fn a_part_refusal_cancels_the_queued_parts<H: CaseHarness>(harness: &H) {
 
 /// MOD-139 M2 D6 (blueprint §T4.3, R1): a `failed` planner on recovery is an admission refusal
 /// whose `block_and_fail` a crash cut off. Every admission refusal is deterministic (P-8), so
-/// neither the node's retry nor its `fails` edge repeats it, whatever the budget: the run ends on
-/// `retry_budget_spent` and no planner attempt 2 is created.
+/// neither the node's retry nor its `fails` edge repeats it, whatever the budget: with both a
+/// retry left and a `fails` edge on the divided node, the run ends on `retry_budget_spent`, takes
+/// no loop and creates no planner attempt 2. The `fails` half holds twice over: `settle_failed`
+/// skips the edge for a planner, and the planner node `implement:plan` sources no `fails` edge
+/// (`expand_divide` keeps the divided node's out-edges on `implement`), so the edge here pins the
+/// behaviour should the lookup ever move to the divided name (R1 repair 1).
 async fn a_failed_planner_on_recovery_ends_on_the_retry_budget<H: CaseHarness>(harness: &H) {
     use htui_core::store::mem::MemFault;
 
@@ -15281,6 +15285,18 @@ async fn a_failed_planner_on_recovery_ends_on_the_retry_budget<H: CaseHarness>(h
     divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
         phase.retry_limit = 1;
     })
+    .await;
+    // A `fails` edge on the divided node, which a part's exhaustion would take (D6, D11): the
+    // refusal takes neither it nor the retry.
+    add_edge(
+        &orch,
+        ids::HTUI_FEAT_3,
+        "implement",
+        "plan",
+        EdgeKind::Fails,
+        None,
+        Some(1),
+    )
     .await;
     // The walk stops with the planner `running` and no plan; the planner is then failed by hand,
     // as a refusal's `running -> failed` would leave it with no `block_and_fail` after it.
@@ -15330,6 +15346,12 @@ async fn a_failed_planner_on_recovery_ends_on_the_retry_budget<H: CaseHarness>(h
             .collect::<Vec<_>>(),
         [(planner.id, 1, StepStatus::Failed)],
         "no planner attempt 2"
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|step| step.status != StepStatus::Superseded),
+        "the `fails` edge looped nothing: {steps:?}"
     );
     assert!(parts_of(&steps, planner.id).is_empty(), "{steps:?}");
     assert!(plans_of(&other, run).await.is_empty());
