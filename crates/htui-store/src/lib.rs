@@ -32,7 +32,7 @@ pub mod vector_sync;
 mod worker;
 pub mod writer;
 
-pub use backend::Backend;
+pub use backend::{Backend, ScopeKeys};
 pub use cache::{CacheMeta, CacheStore};
 pub use connect::{Applied, ConnEvent, ConnectContext, StartOptions, Started};
 pub use dsn::{Dsn, DsnError};

@@ -47,6 +47,17 @@ const MINUTE: i64 = 60;
 /// Seconds in an hour.
 const HOUR: i64 = 60 * MINUTE;
 
+/// MOD-170: one answer for the waiting key qualifier ([`Backend::waiting_keys`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeKeys {
+    /// The workspace's scope row, when the caller asked with a workspace and it has one.
+    pub scope_row: Option<ProjectId>,
+    /// `(id, slug, kind prefixes)` per held project, once each, in no particular order; the
+    /// prefixes in kind order, empty for a project with no kinds. The shape
+    /// `htui_core::model::KeyQualifier::new` takes.
+    pub projects: Vec<(ProjectId, String, Vec<String>)>,
+}
+
 /// The store the application runs against (ANA-9 §6.1).
 #[derive(Debug, Clone)]
 pub enum Backend {
@@ -432,6 +443,59 @@ impl Backend {
             Self::Online { pg, .. } => pg.item_kind_rows(project).await,
             Self::Offline { cache, .. } => cache.item_kinds(project).await,
         }
+    }
+
+    /// MOD-170: the waiting key qualifier's read — `workspace`'s scope row (when given) and each
+    /// held project's slug and kind prefixes, the scope row's own included. Online this is one
+    /// Postgres query ([`PgStore::waiting_keys`]); the mirror and memory are local, so they answer
+    /// it per project with [`ReadStore::scope_project`], [`ReadStore::project`] and
+    /// [`Backend::item_kinds`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports.
+    pub async fn waiting_keys(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> Result<ScopeKeys> {
+        match self {
+            Self::Online { pg, .. } => pg.waiting_keys(workspace, ids).await,
+            Self::Memory(_) | Self::Offline { .. } => self.waiting_keys_by_project(workspace, ids).await,
+        }
+    }
+
+    /// [`Backend::waiting_keys`] one project at a time: the scope row first, then `ids`, each
+    /// project once, a project the store does not hold left out — what the Postgres query answers.
+    async fn waiting_keys_by_project(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> Result<ScopeKeys> {
+        let scope_row = match workspace {
+            Some(workspace) => self.scope_project(workspace).await?,
+            None => None,
+        };
+        let mut projects: Vec<(ProjectId, String, Vec<String>)> = Vec::with_capacity(ids.len() + 1);
+        for &id in scope_row.iter().chain(ids) {
+            if projects.iter().any(|(held, ..)| *held == id) {
+                continue;
+            }
+            let Some(project) = self.project(id).await? else {
+                continue;
+            };
+            let prefixes = self
+                .item_kinds(id)
+                .await?
+                .into_iter()
+                .map(|kind| kind.prefix)
+                .collect();
+            projects.push((id, project.slug, prefixes));
+        }
+        Ok(ScopeKeys {
+            scope_row,
+            projects,
+        })
     }
 
     // -------------------------------------------------------------------------------------------

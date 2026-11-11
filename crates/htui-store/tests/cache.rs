@@ -25,7 +25,7 @@ use htui_core::model::{
 use htui_core::model::{NewRunPlan, PlanScope, PlanStatus, RunPlanId};
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
-use htui_store::{Backend, CacheStore, identity};
+use htui_store::{Backend, CacheStore, ScopeKeys, identity};
 use serde_json::json;
 use sqlx::{Row as _, SqlitePool};
 
@@ -1485,6 +1485,132 @@ async fn the_mirror_lists_item_kinds_like_postgres() {
         pg,
         "the offline backend reads the mirror"
     );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// [`ScopeKeys`] with its projects in id order: Postgres answers them in no particular order.
+fn keys_by_id(mut keys: ScopeKeys) -> ScopeKeys {
+    keys.projects.sort_by_key(|(id, ..)| id.as_uuid());
+    keys
+}
+
+/// The `(slug, prefixes)` [`ScopeKeys`] holds for `project`, if any.
+fn keys_of(keys: &ScopeKeys, project: ProjectId) -> Option<(&str, Vec<&str>)> {
+    keys.projects
+        .iter()
+        .find(|(id, ..)| *id == project)
+        .map(|(_, slug, prefixes)| (slug.as_str(), prefixes.iter().map(String::as_str).collect()))
+}
+
+/// MOD-170: the waiting key qualifier's one read. Online it is one Postgres query
+/// (`PgStore::waiting_keys`); offline the mirror answers it per project. Both answer alike: the
+/// workspace's scope row (flagged, and listed even when not asked by id), each held project's slug
+/// and kind prefixes (empty for a project with no kinds), and nothing for a project the store does
+/// not hold. Without a workspace no row is flagged and the scope row is listed only when asked.
+#[tokio::test]
+async fn the_mirror_answers_waiting_keys_like_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let bare = ProjectId::new();
+    sqlx::query("INSERT INTO project (id, slug, name, created_by) VALUES ($1, 'bare', 'Bare', $2)")
+        .bind(bare.as_uuid())
+        .bind(ids::USER.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("insert a project with no kinds");
+    let unknown = ProjectId::new();
+    let members = platform_scope().await.project_ids;
+    let mut asked = members.clone();
+    asked.extend([bare, unknown]);
+
+    let wide = db
+        .store
+        .waiting_keys(Some(ids::WORKSPACE_PLATFORM), &asked)
+        .await
+        .expect("pg waiting_keys with a workspace");
+    assert_eq!(wide.scope_row, Some(ids::PROJECT_SCOPE_PLATFORM));
+    assert_eq!(wide.projects.len(), members.len() + 2, "members, bare and the scope row");
+    assert_eq!(
+        keys_of(&wide, ids::PROJECT_SCOPE_PLATFORM).map(|(_, prefixes)| prefixes),
+        Some(vec!["WS"]),
+        "the scope row is listed with its one kind though not asked by id"
+    );
+    for member in &members {
+        let pg_prefixes: Vec<String> = db
+            .store
+            .item_kinds(*member)
+            .await
+            .expect("pg item_kinds")
+            .into_iter()
+            .map(|kind| kind.prefix)
+            .collect();
+        let (slug, prefixes) = keys_of(&wide, *member).expect("a member is listed");
+        assert_eq!(
+            slug,
+            db.store.project(*member).await.expect("pg project").expect("held").slug
+        );
+        assert_eq!(prefixes, pg_prefixes, "in kind order, like item_kinds");
+        assert!(prefixes.contains(&"FEAT"), "Platform's members share FEAT");
+    }
+    assert_eq!(keys_of(&wide, bare), Some(("bare", vec![])), "no kinds, empty prefixes");
+    assert_eq!(keys_of(&wide, unknown), None, "a project the store does not hold");
+
+    let narrow = db
+        .store
+        .waiting_keys(None, &asked)
+        .await
+        .expect("pg waiting_keys without a workspace");
+    assert_eq!(narrow.scope_row, None);
+    assert_eq!(narrow.projects.len(), members.len() + 1, "members and bare");
+    assert_eq!(keys_of(&narrow, ids::PROJECT_SCOPE_PLATFORM), None);
+
+    let by_id = db
+        .store
+        .waiting_keys(None, &[ids::PROJECT_SCOPE_PLATFORM])
+        .await
+        .expect("pg waiting_keys of the scope row by id");
+    assert_eq!(by_id.scope_row, None, "not flagged without a workspace");
+    assert_eq!(
+        keys_of(&by_id, ids::PROJECT_SCOPE_PLATFORM),
+        Some(("@platform", vec!["WS"]))
+    );
+
+    assert_eq!(
+        db.store
+            .waiting_keys(None, &[])
+            .await
+            .expect("an empty ask"),
+        ScopeKeys::default()
+    );
+
+    let cache = open_cache(&db).await;
+    let mut mirrored = all_projects();
+    mirrored.extend([ids::PROJECT_SCOPE_PLATFORM, bare]);
+    run_pass(&db.pool, &cache, &mirrored, &settings(&db, 20))
+        .await
+        .expect("one pass");
+    let offline = Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    };
+    for (workspace, ask, pg) in [
+        (Some(ids::WORKSPACE_PLATFORM), asked.clone(), wide),
+        (None, asked.clone(), narrow),
+        (None, vec![ids::PROJECT_SCOPE_PLATFORM], by_id),
+    ] {
+        assert_eq!(
+            keys_by_id(
+                offline
+                    .waiting_keys(workspace, &ask)
+                    .await
+                    .expect("offline waiting_keys")
+            ),
+            keys_by_id(pg),
+            "the mirror answers like Postgres for {workspace:?}"
+        );
+    }
 
     teardown(db, &[&cache]).await;
 }

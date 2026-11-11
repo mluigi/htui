@@ -45,6 +45,7 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
+use crate::backend::ScopeKeys;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
@@ -3125,6 +3126,52 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    /// MOD-170: [`crate::Backend::waiting_keys`] in one query, for the waiting list's once-a-second
+    /// read (it was a scope-row read plus a `project` and a kinds read per scope project). The scope
+    /// row is `workspace`'s `owner_workspace_id` row, listed whether or not `ids` names it; each
+    /// held project once, its prefixes in `item_kind_rows`' order (`position`, then `prefix`
+    /// bytes); an id the store does not hold is left out.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through `map_sqlx`.
+    pub async fn waiting_keys(
+        &self,
+        workspace: Option<WorkspaceId>,
+        ids: &[ProjectId],
+    ) -> Result<ScopeKeys> {
+        if workspace.is_none() && ids.is_empty() {
+            return Ok(ScopeKeys::default());
+        }
+        let ids: Vec<Uuid> = ids.iter().map(|id| id.as_uuid()).collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT p.id   AS "id!: ProjectId",
+                   p.slug AS "slug!",
+                   COALESCE(p.owner_workspace_id = $2, false) AS "scope_row!",
+                   ARRAY(SELECT k.prefix FROM item_kind k
+                          WHERE k.project_id = p.id
+                          ORDER BY k.position, k.prefix COLLATE "C") AS "prefixes!"
+              FROM project p
+             WHERE p.id = ANY($1) OR p.owner_workspace_id = $2
+            "#,
+            &ids[..],
+            workspace.map(WorkspaceId::as_uuid),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let scope_row = rows.iter().find(|row| row.scope_row).map(|row| row.id);
+        let projects = rows
+            .into_iter()
+            .map(|row| (row.id, row.slug, row.prefixes))
+            .collect();
+        Ok(ScopeKeys {
+            scope_row,
+            projects,
+        })
     }
 
     /// A project's graphs, ordered by `name` bytes.
