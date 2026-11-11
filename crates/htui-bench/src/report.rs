@@ -370,7 +370,7 @@ pub fn summarize(results: &Results) -> Summary {
             failed_calls: s_a.errors + lexical,
         }
     } else {
-        met_if(vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other))
+        met_if(vs_best.is_some_and(|r| r.p < P_THRESHOLD && r.only_s > r.only_other))
     };
     let thresholds = Thresholds {
         s_hit5_a: s_a.hit5,
@@ -396,6 +396,9 @@ pub fn summarize(results: &Results) -> Summary {
         thresholds,
     }
 }
+
+/// PRD: S ahead of the best lexical baseline at McNemar p < 0.05.
+const P_THRESHOLD: f64 = 0.05;
 
 /// PRD: S recall@5 on duplicates ≥ 20/24.
 const RECALL_NUM: usize = 20;
@@ -1124,13 +1127,28 @@ pub fn render_comparison(c: &Comparison) -> String {
     md
 }
 
-/// A McNemar p: `{:.4}`, or `< 0.0001` below that.
+/// A McNemar p: three significant digits, more where rounding would carry it across
+/// [`P_THRESHOLD`] (0.04996 prints as `0.04996`, never `0.0500`); `< 0.0001` below that.
 fn format_p(p: f64) -> String {
-    if p >= 0.0001 {
-        format!("{p:.4}")
-    } else {
-        "< 0.0001".to_owned()
+    if p.is_nan() || p < 0.0001 {
+        return "< 0.0001".to_owned();
     }
+    let below = p < P_THRESHOLD;
+    for digits in 3..=17 {
+        let text = significant(p, digits);
+        if text.parse::<f64>().is_ok_and(|shown| (shown < P_THRESHOLD) == below) {
+            return text;
+        }
+    }
+    significant(p, 17)
+}
+
+/// `p` (≥ 0.0001, finite) to `digits` significant digits.
+fn significant(p: f64, digits: i32) -> String {
+    // `p` is in [0.0001, 1], so its decimal exponent is in -4..=0.
+    let exponent = p.log10().floor().clamp(-4.0, 0.0) as i32;
+    let decimals = usize::try_from(digits - 1 - exponent).unwrap_or(0);
+    format!("{p:.decimals$}")
 }
 
 /// A table cell: at most 80 chars (`…` marks a cut), `|` escaped.
