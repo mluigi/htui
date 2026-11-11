@@ -113,7 +113,7 @@ object (`htui_orch::verify::run_shell`, B-15). The tail is scrubbed fail-closed.
 `app_setting.command_limits` overlaid by the box's own, with a missing class at 1. The worker's
 `{"verify":1}` fallback is gone. `verify` stays the orchestrator's.
 
-**Exposure and denials (D16 as amended, D17).** `command_queue_exposed(mode, fan_out, item_tags)`:
+**Exposure and denials (D16 as amended, D17).** `command_queue_exposed(mode, fan_out, item_tags)` (MOD-139 M2 adds `live_siblings` after `fan_out`):
 `off` false, `always` true, `fan_out_only` when `fan_out > 1` or the item's tags hold
 `heavy_build`. The engine's `command_run_exposed` also requires a tool host (R1-C), and the persona
 term is `persona_keeps_command_run` (R1-H1). The prompt's `command_queue` section and the tool read

@@ -1087,6 +1087,15 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   `:plan` suffix refused at save; conformance 258 cases. Plan `.claude/plans/mod-139-m1-records.plan.md`. Owed on
   the host: the Qdrant-live tests (sandbox timeouts) and the Postgres gate; MOD-97 also took `0028`, so whichever
   lands second renumbers and moves the count pins.
+  **Phase M2 landed (`hr/MOD-139` `400bf96e`, 2026-11-11):** in engine cases only; production `resolve` still
+  refuses every divided graph and a planner agent (MOD-140). The planner admits its default parts in one
+  `admit_plan` (revision 0, `base_refs` = primary HEADs); each part runs in its own tree with its own `PART`
+  prompt section, agent and session, never verified or landed; `fan_out_only` counts live siblings. Parts retry
+  per part, an exhausted part fails the divided step `part_exhausted` and takes the integrate node's `fails`
+  edge; loops retire parts and abandon plans; recovery by role. Integrate still refuses (M3). Core 267, orch 219
+  cases. Plan `.claude/plans/mod-139-m2-planner-and-parts.plan.md`, rulings F-1..F-8 in its blueprint. M3
+  preconditions: the `shared_serialized` end-of-round reset to `base_refs` is best-effort (integrate prepares
+  from `base_refs`); substitution notes are at-least-once on a re-admission. Owed on the host: Qdrant-live tests.
 - [ ] **MOD-140 - The planner's MCP tools and run-time changes** (from ANA-33, `docs/ANA-33.md` §7.6, §10). `R-MCP-2`,
   `R-MCP-1`, `R-ID-6`, `R-ORCH-1`. `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced
   `run_plan` proposal writer in the `write_step_document` style; the `ToolScope` role and plan scope set in
