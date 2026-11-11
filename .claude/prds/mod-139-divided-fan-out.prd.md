@@ -90,7 +90,7 @@ Decisions taken at the PRD gate (2026-11-10):
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Concurrent part futures overflow the 2 MiB debug stack | Medium | High | Box every per-node future; gate `--no-fail-fast` and grep SIGABRT (ANA-33 §9) |
-| Ancestry proves commits, not changes (an integrate `-s ours` merge passes) | Low | Medium | Per-part diffstat to integrate and review; review stays after integrate |
+| Ancestry proves commits, not changes (an integrate `-s ours` merge passes) | Low | Medium | Per-part diffstat to integrate; a deterministic post-check that each done part's changed paths overlap integrate's own changes (M3 plan Confirm 2, 2026-11-11, replacing a review diffstat); review stays after integrate |
 | One run with N parts draws N sessions and quotas | Medium | Medium | `max_parallel_sessions` and per-part quota wait; box cap deferred (Q3) |
 | Migration moves count pins and needs `sqlx prepare` on a migrated scratch DB | High | Low | Repin `tests/migrations.rs`, conformance counts; scratch DB per `docs/hr-sandbox.md` |
 | Recovery bug classes seen elsewhere (stop-then-retry on fanned-out DAGs) | Medium | High | Recovery tests per role; MOD-125's matrix gains a divided step |

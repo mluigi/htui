@@ -27,6 +27,8 @@ plan (workflow `wf_a831d4e2-7ee`), and every correction is folded in below (§ F
 
 ## Confirm (maintainer decisions)
 
+**Decided 2026-11-11 (plan confirmed): 1 item note; 2 (a) the path-overlap check; 3 refuse approval.**
+
 1. **Where the pre-merge report is kept (D4).** Recommended: an item note tied to the integrate step. It needs no
    migration. No planned consumer reads the report structurally: MOD-142 shows a part's key, agent and state, and
    MOD-140's `plan_status` lists state, branch, tip, diffstat and document id. If either one ever needs the report,
@@ -169,7 +171,7 @@ fail the check:
   (capture records `None` when HEAD == base). A part with no commits is exempt.
 - **Repository:** it opens the copy tree when it holds the descendant, else the checkout (`range_of`'s D74 rule,
   `real.rs:1344-1358`). It never opens a worktree that capture removed.
-- **Confirm 2(a):** if adopted, a part also fails when its changed paths do not intersect integrate's base..after
+- **Confirm 2(a) (adopted):** a part also fails when its changed paths do not intersect integrate's base..after
   changed paths (`changed_paths`, `isolate.rs:208`).
 
 Settle and failure:
