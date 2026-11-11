@@ -6269,10 +6269,13 @@ where
     /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part
     /// and the run. Then every pending part through [`Self::run_part`], at most
     /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
-    /// every part); each future is boxed (the stack rule, ANA-33 §9). A cancel or a fenced write
-    /// is raised once every part settled (`group_error`). A deterministic pre-session refusal
-    /// ([`PartOutcome::Refused`]) ends the run with the first one in part position order, after
-    /// every started part settled (blueprint P-11). Under `shared_serialized` the primary
+    /// every part); each future is boxed (the stack rule, ANA-33 §9). Once a part answers a
+    /// cancel, a fenced write, another error or a refusal, no further part is pulled and the
+    /// ones in flight drain (R1, F-7). A cancel or a fenced write is raised once every pulled part
+    /// settled (`group_error`), the unpulled ones left `pending` for the cancel's settlement or
+    /// the adopter. A deterministic pre-session refusal ([`PartOutcome::Refused`]) ends the run
+    /// with the first one in part position order, after every pulled part settled (blueprint
+    /// P-11), and the unpulled parts are `cancelled` ([`Self::cancel_parts`]). Under `shared_serialized` the primary
     /// checkout is reset to `base_refs` after the round's last part (D4): parts never land, so no
     /// later node starts from a part's commit.
     async fn drive_parts(
@@ -6396,6 +6399,13 @@ where
         }
         // `buffer_unordered`'s shape, written out: at most `width` part futures in flight, each
         // boxed at its push (the stack rule), the next one pushed as one settles.
+        //
+        // MOD-139 M2 R1 (F-7), `WalkEnd::admits`' rule for a round: once a part answers anything
+        // but `Settled` (a cancel, a lost fence, another error, or a refusal that ends the run),
+        // the round pulls no further part and only drains the ones in flight. A part pulled after
+        // a lost fence would move `pending -> running` on a run another process adopted and
+        // prepare a real tree there; after a cancel or a refusal it would spend a session the run
+        // never uses. The parts never pulled stay `pending`.
         let width = crate::divide::parts_width(snapshot, &steps, node);
         let width = usize::try_from(width).unwrap_or(1).max(1);
         let mut queue = stages.into_iter();
@@ -6404,12 +6414,15 @@ where
             running.push(Box::pin(self.run_part(stage)));
         }
         let mut settled = Vec::with_capacity(pending.len());
+        let mut stopped = false;
         while let Some(outcome) = futures::StreamExt::next(&mut running).await {
+            stopped |= !matches!(outcome, Ok(PartOutcome::Settled));
             settled.push(outcome);
-            if let Some(stage) = queue.next() {
+            if !stopped && let Some(stage) = queue.next() {
                 running.push(Box::pin(self.run_part(stage)));
             }
         }
+        let unpulled: Vec<&RunStep> = queue.map(|stage| stage.step).collect();
 
         let mut errors = Vec::new();
         let mut refusals = Vec::new();
@@ -6436,6 +6449,8 @@ where
         }
         refusals.sort_by_key(|(position, ..)| *position);
         if let Some((_, step, text, failure, block)) = refusals.into_iter().next() {
+            // R1 (F-7): the parts the stop left unpulled end with the run, before its last write.
+            self.cancel_parts(run, node, &unpulled).await?;
             let now = self.now();
             match (block, &failure) {
                 (true, Some(failure)) => {
@@ -6488,6 +6503,11 @@ where
     /// move fails **this part** — never its siblings and never the run — except a cancel or a lost
     /// fence, which settle nothing (MOD-42 I-6, D4).
     async fn run_part(&self, stage: PartStage<'_>) -> Result<PartOutcome, EngineError> {
+        // R1 (F-7): a cancel (or the walk's cut) read before the move leaves the part `pending`,
+        // as `drive_once`'s own read would only after a prepare and a prompt.
+        if self.cancel_read(stage.run.id, &self.session_control(stage.run.id)) {
+            return Err(EngineError::Cancelled { run: stage.run.id });
+        }
         self.move_step(
             stage.run.id,
             stage.step.id,
@@ -6754,6 +6774,44 @@ where
             }
         }
         Ok(PartOutcome::Settled)
+    }
+
+    /// MOD-139 M2 R1 (F-7): the `pending` parts a round stopped before pulling, once a refusal
+    /// ends the run: each `pending -> cancelled` with the cut's note naming the divided node
+    /// ([`Self::cancel_unsettled`]'s words), so none is left `pending` under the `failed` run. A
+    /// row another writer moved first is skipped.
+    async fn cancel_parts(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        parts: &[&RunStep],
+    ) -> Result<(), EngineError> {
+        let now = self.now();
+        for part in parts {
+            if !self
+                .parts
+                .store
+                .transition_step(part.id, StepStatus::Pending, StepStatus::Cancelled, now)
+                .await?
+            {
+                continue;
+            }
+            if let Some(item) = run.item_id {
+                self.note(
+                    item,
+                    format!(
+                        "step `{}` attempt {} cancelled: the run ended at `{}`",
+                        part.phase_name,
+                        part.attempt,
+                        crate::divide::divided_name(node)
+                    ),
+                    Some(part.id),
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// A deterministic pre-session refusal of one part (blueprint P-11): the part fails with

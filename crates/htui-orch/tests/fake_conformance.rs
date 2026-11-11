@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        213,
+        217,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -64,7 +64,9 @@ fn cases_len_is_pinned() {
          `shared_serialized` resets, a slotless `local` part, five admission refusals, \
          `command_run` beside live siblings and on a parallel branch, the operator verbs and stage \
          rows, and the resolve refusals) 204, and MOD-139 M2 T4's nine (a part retried alone, the \
-         exhausted divided step, its `fails` loop and re-plan, and recovery per role) 213"
+         exhausted divided step, its `fails` loop and re-plan, and recovery per role) 213, and \
+         MOD-139 M2 R1's four (a cancel, a lost lease and a refusal stopping a parts round's pulls, \
+         and a failed planner on recovery) 217"
     );
 }
 

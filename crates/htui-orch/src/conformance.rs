@@ -261,6 +261,11 @@ pub trait Orchestrate {
     /// # Errors
     /// Whatever the seam or the store refuses with.
     async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError>;
+
+    /// MOD-42 plan D10: every walk of this orchestrator is asked to stop, `grace` given to each
+    /// live session. Out of the blueprint's §4.5 list, and needed (MOD-139 M2 R1, F-7): a case
+    /// that pins what a cancel does to a parts round has to send one while a part is live.
+    fn cancel_walks(&self, grace: std::time::Duration);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -399,6 +404,10 @@ impl Orchestrate for FakeOrchestrator {
 
     async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError> {
         crate::engine::enqueue_divided_fake(self, item).await
+    }
+
+    fn cancel_walks(&self, grace: std::time::Duration) {
+        Self::cancel_walks(self, grace);
     }
 }
 
@@ -597,6 +606,12 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// after it re-plans nothing and lands no part, a crashed part with its output is `done`, one
 /// without is reset and retried alone, one in a dirty `local` tree parks, and a `local` divided
 /// node lands no part.
+///
+/// **Four for MOD-139 M2 R1** (F-7, blueprint §T4.3): one part at a time, a cancel or a lost
+/// lease while the first part is live leaves the second `pending`, never prepared and with no
+/// session, and a refusal of the first ends the run with the second `cancelled`; and a `failed`
+/// planner on recovery (an admission refusal a crash cut short) is neither retried nor looped,
+/// whatever its budget: the run ends on `retry_budget_spent`.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -971,6 +986,12 @@ pub const CASES: &[&str] = &[
     "a_crashed_part_without_output_retries_alone",
     "a_crashed_part_in_a_dirty_local_tree_parks",
     "a_local_divided_node_lands_no_part_on_recovery",
+    // MOD-139 M2 R1 (F-7, blueprint §T4.3): a parts round stops pulling queued parts after a
+    // cancel, a lost fence or a refusal, and a `failed` planner on recovery repeats nothing.
+    "a_cancel_during_a_part_leaves_the_queued_part_pending",
+    "a_lost_lease_during_a_part_leaves_the_queued_part_pending",
+    "a_part_refusal_cancels_the_queued_parts",
+    "a_failed_planner_on_recovery_ends_on_the_retry_budget",
 ];
 
 /// Run one case by name.
@@ -14480,6 +14501,18 @@ fn divided_recovery_case<'a, H: CaseHarness>(
         "a_local_divided_node_lands_no_part_on_recovery" => {
             Box::pin(a_local_divided_node_lands_no_part_on_recovery(harness))
         }
+        "a_cancel_during_a_part_leaves_the_queued_part_pending" => Box::pin(
+            a_cancel_during_a_part_leaves_the_queued_part_pending(harness),
+        ),
+        "a_lost_lease_during_a_part_leaves_the_queued_part_pending" => Box::pin(
+            a_lost_lease_during_a_part_leaves_the_queued_part_pending(harness),
+        ),
+        "a_part_refusal_cancels_the_queued_parts" => {
+            Box::pin(a_part_refusal_cancels_the_queued_parts(harness))
+        }
+        "a_failed_planner_on_recovery_ends_on_the_retry_budget" => Box::pin(
+            a_failed_planner_on_recovery_ends_on_the_retry_budget(harness),
+        ),
         _ => return None,
     })
 }
@@ -15078,6 +15111,230 @@ async fn a_local_divided_node_lands_no_part_on_recovery<H: CaseHarness>(harness:
     assert_eq!(plans_of(&other, run).await.len(), 1);
 }
 
+// -- MOD-139 M2 R1: a parts round stops pulling, a failed planner repeats nothing ----------------
+
+/// The divided FEAT-3 graph (`api`, `ui`) over a primary repo with one session at a time, so the
+/// round runs `api` and holds `ui` in its queue.
+async fn divided_one_at_a_time<O: Orchestrate>(orch: &O) {
+    divided_feat_3(orch, &[("api", None), ("ui", None)], |_| {}).await;
+    primary_repo(orch).await;
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+}
+
+/// That the queued `ui` part was never pulled: still `pending`, never prepared, no session.
+async fn assert_ui_never_pulled<O: Orchestrate>(orch: &O, run: RunId) {
+    let steps = steps_of(orch, run).await;
+    assert_eq!(
+        part_named(&steps, "implement/ui").status,
+        StepStatus::Pending,
+        "the queued part stays `pending`"
+    );
+    let log = call_log_of(orch, run).await;
+    assert!(
+        !log.iter().any(|call| call.starts_with("prepare 6/")),
+        "the queued part is never prepared: {log:?}"
+    );
+    assert!(
+        orch.spec_for(&session("implement/ui", 0)).is_none(),
+        "the queued part starts no session"
+    );
+}
+
+/// MOD-139 M2 R1 (F-7, MOD-42 I-6): a cancel while the round's first part is live stops the round
+/// pulling. The live part settles nothing, the queued one is never moved, prepared or started,
+/// and the walk answers `Cancelled`.
+async fn a_cancel_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_one_at_a_time(&orch).await;
+    let hold = orch.hold_sessions(&[("implement/api", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let cancel = async {
+        within(hold.live(1), "`api` held").await;
+        orch.cancel_walks(std::time::Duration::from_millis(10));
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), cancel);
+    assert!(
+        matches!(&result, Err(EngineError::Cancelled { run: stopped }) if *stopped == run),
+        "{result:?}"
+    );
+    assert_ui_never_pulled(&orch, run).await;
+}
+
+/// MOD-139 M2 R1 (F-7, D4): a lease another process took while the round's first part is live
+/// stops the round pulling: the queued part never moves `pending -> running` on a run that is
+/// no longer this process's, and the caller gets `LeaseLost`.
+async fn a_lost_lease_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_one_at_a_time(&orch).await;
+    let hold = orch.hold_sessions(&[("implement/api", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let other = orch.restarted();
+    let steal = async {
+        within(hold.live(1), "`api` held").await;
+        assert!(
+            orch.store()
+                .release_lease(run, orch.owner())
+                .await
+                .expect("MemStore releases"),
+            "the walk held the lease"
+        );
+        assert!(
+            other
+                .store()
+                .take_lease(run, ids::BOX, other.owner(), TimeDelta::days(1))
+                .await
+                .expect("MemStore takes the lease"),
+            "another process takes the free lease"
+        );
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), steal);
+    assert!(
+        matches!(&result, Err(EngineError::LeaseLost { run: lost }) if *lost == run),
+        "{result:?}"
+    );
+    assert_ui_never_pulled(&orch, run).await;
+    assert!(
+        other
+            .store()
+            .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the other process still holds the lease"
+    );
+}
+
+/// MOD-139 M2 R1 (F-7, P-11): a deterministic refusal of the round's first part (its prepare)
+/// ends the run on that refusal, and the round pulls no further part: the queued one starts no
+/// session and is `cancelled` with the cut's note, never left `pending` under the `failed` run.
+async fn a_part_refusal_cancels_the_queued_parts<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_one_at_a_time(&orch).await;
+    // `plan` is the last prepare before the parts round, which admission makes none of.
+    let hold = orch.hold_sessions(&[("plan", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let refuse = async {
+        within(hold.live(1), "`plan` held").await;
+        orch.isolator().refuse_prepare("the api tree is locked");
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), refuse);
+    let outcome = result.expect("a refused part is a rest, not an error");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!((rest.run, rest.position), (RunStatus::Failed, Some(2)));
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::Failed);
+    assert!(
+        row.failure
+            .as_deref()
+            .is_some_and(|text| text.contains("the api tree is locked")),
+        "the run fails on the first part's refusal: {row:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(
+        part_shape(&steps, planner.id),
+        [
+            shaped("implement/api", 1, StepStatus::Failed, 5),
+            shaped("implement/ui", 1, StepStatus::Cancelled, 6),
+        ]
+    );
+    let log = call_log_of(&orch, run).await;
+    assert!(
+        !log.iter().any(|call| call.starts_with("prepare 6/")),
+        "the queued part is never prepared: {log:?}"
+    );
+    assert!(
+        orch.spec_for(&session("implement/ui", 0)).is_none(),
+        "the queued part starts no session"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|note| note
+                == "step `implement/ui` attempt 1 cancelled: the run ended at `implement`"),
+        "{notes:?}"
+    );
+}
+
+/// MOD-139 M2 D6 (blueprint §T4.3, R1): a `failed` planner on recovery is an admission refusal
+/// whose `block_and_fail` a crash cut off. Every admission refusal is deterministic (P-8), so
+/// neither the node's retry nor its `fails` edge repeats it, whatever the budget: the run ends on
+/// `retry_budget_spent` and no planner attempt 2 is created.
+async fn a_failed_planner_on_recovery_ends_on_the_retry_budget<H: CaseHarness>(harness: &H) {
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.retry_limit = 1;
+    })
+    .await;
+    // The walk stops with the planner `running` and no plan; the planner is then failed by hand,
+    // as a refusal's `running -> failed` would leave it with no `block_and_fail` after it.
+    orch.store().set_fault(MemFault::AdmitPlan, true);
+    let (run, result) = start_divided(&orch).await;
+    assert!(
+        matches!(result, Err(EngineError::Store(StoreError::Unreachable(_)))),
+        "{result:?}"
+    );
+    orch.store().set_fault(MemFault::AdmitPlan, false);
+    let planner = planner_of(&steps_of(&orch, run).await);
+    assert!(
+        orch.store()
+            .transition_step(
+                planner.id,
+                StepStatus::Running,
+                StepStatus::Failed,
+                orch.clock().now()
+            )
+            .await
+            .expect("a legal move"),
+        "the planner was `running`"
+    );
+
+    let other = orch.restarted();
+    let next = adopted_next(&other, run).await;
+    let Next::Finished(rest) = next else {
+        panic!("the sweep ends the run, not {next:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (
+            RunStatus::Failed,
+            Some(2),
+            Some(RunFailure::RetryBudgetSpent {
+                phase: planner.phase_name.clone(),
+                attempt: 1,
+            })
+        )
+    );
+    assert_eq!(run_of(&other, run).await.status, RunStatus::Failed);
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        rows_of_role(&steps, StepRole::Planner)
+            .iter()
+            .map(|row| (row.id, row.attempt, row.status))
+            .collect::<Vec<_>>(),
+        [(planner.id, 1, StepStatus::Failed)],
+        "no planner attempt 2"
+    );
+    assert!(parts_of(&steps, planner.id).is_empty(), "{steps:?}");
+    assert!(plans_of(&other, run).await.is_empty());
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -15102,8 +15359,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            213,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            217,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18 + 9 + 4: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -15186,7 +15443,8 @@ mod tests {
              siblings alike, a pre-MOD-163 snapshot, no entries no row), and MOD-139 M2 T3's \
              eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17), and MOD-139 M2 \
              T4's nine (a part retried alone, the exhausted divided step, its `fails` loop and \
-             re-plan, and recovery per role)"
+             re-plan, and recovery per role), and MOD-139 M2 R1's four (a cancel, a lost lease \
+             and a refusal stopping a parts round's pulls, and a failed planner on recovery)"
         );
     }
 
