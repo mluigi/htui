@@ -295,8 +295,9 @@ pub enum ResolveError {
     /// M2 lifted (c), authored edges (D10).
     #[error("phase `{node}` cannot run yet: {reason}")]
     NotYetRunnable {
-        /// The node refused: the divide phase, the palette phase, or the fanned-out node with an
-        /// `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
+        /// The node refused: the divided node (its planner agent, no default parts, or a
+        /// `plan_scope` past its parts; MOD-139 M3 D10), the palette phase, or the fanned-out node
+        /// with an `asks_you` or `fails` edge (blueprint A7). M3 D8 moved R1's mixed `asks_you` node to
         /// the shared validator (W5), so it is an [`ResolveError::InvalidGraph`].
         node: String,
         /// Why.
@@ -5268,8 +5269,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .await;
     }
 
-    /// MOD-139 M2 D17 (PRD Q1): a configured planner agent is refused before the divide refusal,
-    /// named by the divided node.
+    /// MOD-139 M2 D17 (PRD Q1): a configured planner agent is refused first, before every other
+    /// divided-node refusal, named by the divided node.
     #[tokio::test]
     async fn a_planner_agent_is_refused_before_the_divide() {
         let store = MemStore::demo();

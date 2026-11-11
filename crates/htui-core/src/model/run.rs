@@ -1092,7 +1092,8 @@ str_enum!(
         /// One part of an admitted plan revision: `parent_step_id` is the planner step and
         /// `node_key` is `<divided>/<part_key>` (`chk_run_step_part`); MOD-139 M2 writes it.
         Part => "part",
-        /// A divided node's integrate step; MOD-139 M2 writes it, M3 runs it.
+        /// A divided node's integrate step; MOD-139 M2 writes it and M3 runs it: pre-merge,
+        /// session, post-check, landing.
         Integrate => "integrate",
         /// A subgraph node's step (MOD-143).
         Subgraph => "subgraph",
@@ -1199,9 +1200,10 @@ pub struct SnapshotEdge {
     pub loop_limit: Option<i32>,
 }
 
-/// MOD-138 D1, D11: a `divide` node's frozen block. **M1 never stores one** (resolve refuses a
-/// divide node after expanding it, D6(a)), so MOD-139 may reshape it without a compatibility
-/// concern.
+/// MOD-138 D1, D11: a `divide` node's frozen block. M1 never stored one (its resolve refused a
+/// divide node after expanding it, D6(a)), which let MOD-139 shape it freely. From MOD-139 M3
+/// resolve freezes and runs a default-parts node, so a run's snapshot holds this block and a
+/// change to it is a compatibility question.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotDivide {
     /// The `planner_*` columns.
