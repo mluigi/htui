@@ -3757,6 +3757,14 @@ where
             Vec::new()
         };
         let phase = Self::node_at(run.id, snapshot, &steps, step)?;
+        // MOD-139 M2 D6 (T4): a planner row is its divided step. `done`, it rests `failed` because
+        // a part ran out of attempts (`walk::parts_state`); `failed`, it is an admission refusal
+        // whose `block_and_fail` a crash cut off, which no `fails` edge and no retry may repeat
+        // (every refusal is deterministic, blueprint P-8), so it ends on the last rule below.
+        if step.role == StepRole::Planner && step.status == StepStatus::Done {
+            return Box::pin(self.settle_exhausted_part(run, snapshot, &phase, step)).await;
+        }
+        let planner = step.role == StepRole::Planner;
         let now = self.now();
         if step.gate_outcome == Some(GateOutcome::Rejected) {
             return self.rejection(run, snapshot, step, &phase, now).await;
@@ -3765,7 +3773,7 @@ where
         // MOD-138 M2 D7 (blueprint F8): a node with a `fails` edge loops over it, in place of its
         // own `retry_limit`, on a failure of its own; an interrupted step (D92, D93) is a crash,
         // not a failure, and keeps the retry below.
-        if !note.starts_with(INTERRUPTED) {
+        if !planner && !note.starts_with(INTERRUPTED) {
             let fails = crate::walk::Graph::of(snapshot)
                 .loop_edge(&phase.name, EdgeKind::Fails)
                 .cloned();
@@ -3774,10 +3782,10 @@ where
             }
         }
         let not_reset = note == NOT_RESET;
-        if !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
+        if !planner && !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
             return self.admit(run, snapshot, &phase, step.attempt + 1).await;
         }
-        if note.starts_with(INTERRUPTED) {
+        if !planner && note.starts_with(INTERRUPTED) {
             let trees = self.parts.store.step_trees(step.id).await?;
             let listed = trees_text(step.id, &trees, &[]);
             let body = if not_reset {
@@ -3807,6 +3815,62 @@ where
         Ok(Some(Rest {
             run: RunStatus::Failed,
             position: Some(step.position),
+            failure: Some(failure),
+        }))
+    }
+
+    /// MOD-139 M2 D6 (T4): `settle_failed` on a `done` planner row whose node rests `failed`: a
+    /// part of the planner's latest attempt is out of attempts, so the divided step failed. The
+    /// first such part in position order decides (none: the rows moved since the walk read them,
+    /// and the walk re-derives). A `fails` edge on the divided node, looked up on its integrate
+    /// node's name, loops with the planner row as its source (`gate::edge_loop` retires the
+    /// region, the planner's parts and plan with it, D11); otherwise the run fails
+    /// `part_exhausted` at the planner's position. The planner is never re-admitted here: a loop's
+    /// next planner attempt admits the next revision.
+    async fn settle_exhausted_part(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        node: &SnapshotPhase,
+        planner: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let Some(part) = crate::divide::latest_parts(&steps, planner.id)
+            .into_iter()
+            .find(|part| crate::divide::exhausted(part, node.retry_limit))
+        else {
+            return Ok(None);
+        };
+        let divided = crate::divide::divided_name(node);
+        let fails = crate::walk::Graph::of(snapshot)
+            .loop_edge(divided, EdgeKind::Fails)
+            .cloned();
+        if let Some(edge) = fails {
+            return Box::pin(self.loop_over(run.id, snapshot, planner, &edge)).await;
+        }
+        let failure = RunFailure::PartExhausted {
+            node: divided.to_owned(),
+            part: part
+                .node_key
+                .as_deref()
+                .and_then(crate::divide::part_key)
+                .unwrap_or_default()
+                .to_owned(),
+            attempts: part.attempt,
+        };
+        self.parts
+            .store
+            .finish_run(
+                run.id,
+                RunStatus::Failed,
+                Some(&failure.to_string()),
+                self.now(),
+            )
+            .await?;
+        self.cleanup_walk(run.id).await?;
+        Ok(Some(Rest {
+            run: RunStatus::Failed,
+            position: Some(planner.position),
             failure: Some(failure),
         }))
     }
@@ -6115,11 +6179,13 @@ where
         })
     }
 
-    /// MOD-139 M2 D4: `Cursor::Parts`, one round of a divided node's parts (T3: no retry rows;
-    /// T4 adds them at the top of the round).
+    /// MOD-139 M2 D4: `Cursor::Parts`, one round of a divided node's parts.
     ///
-    /// The latest planner row at the node (`done`, else nothing to do), its `pending` latest
-    /// parts in position order, and its admitted plan with the `base_refs` the parts branch from.
+    /// The latest planner row at the node (`done`, else nothing to do); D6's retry rows
+    /// ([`part_retries`]: every latest part that failed with an attempt left gets its next
+    /// attempt at its own position, unless some part is out of attempts, which is the divided
+    /// step's failure and [`Self::settle_exhausted_part`]'s); its `pending` latest parts in
+    /// position order, and its admitted plan with the `base_refs` the parts branch from.
     /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part
     /// and the run. Then every pending part through [`Self::run_part`], at most
     /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
@@ -6135,12 +6201,21 @@ where
         snapshot: &GraphSnapshot,
         node: &SnapshotPhase,
     ) -> Result<Option<Rest>, EngineError> {
-        let steps = self.parts.store.run_steps(run.id).await?;
+        let mut steps = self.parts.store.run_steps(run.id).await?;
         let Some(planner) = latest_at(&steps, node.position)
             .filter(|row| row.role == StepRole::Planner && row.status == StepStatus::Done)
+            .cloned()
         else {
             return Ok(None);
         };
+        // MOD-139 M2 D6 (T4): the retry rows this round owes, before its pending parts are read.
+        let retries = part_retries(&steps, planner.id, node.retry_limit);
+        if !retries.is_empty() {
+            for retry in retries {
+                self.parts.store.create_step(retry).await?;
+            }
+            steps = self.parts.store.run_steps(run.id).await?;
+        }
         let pending: Vec<RunStep> = crate::divide::latest_parts(&steps, planner.id)
             .into_iter()
             .filter(|part| part.status == StepStatus::Pending)
@@ -9320,6 +9395,44 @@ fn integrate_waits(phase: &SnapshotPhase) -> EngineError {
         node: phase.name.clone(),
         reason: graph::NotRunnable::Divide,
     })
+}
+
+/// MOD-139 M2 D6 (T4): the retry rows a parts round owes under `planner`. Unless some latest
+/// part is out of attempts ([`crate::divide::exhausted`]: the divided step failed, and its
+/// settle is not a retry), every latest part `failed`, `cancelled` or `superseded` with
+/// [`may_attempt`]`(attempt + 1, retry_limit)` gets its next attempt: the same position (so the
+/// same `base_refs` slot), `fanout_index` 0, phase name, agent, model, parent and `node_key`
+/// (blueprint §1.8). No note: the failed attempt carries `fail_part`'s.
+fn part_retries(steps: &[RunStep], planner: StepId, retry_limit: i32) -> Vec<NewRunStep> {
+    let latest = crate::divide::latest_parts(steps, planner);
+    if latest
+        .iter()
+        .any(|part| crate::divide::exhausted(part, retry_limit))
+    {
+        return Vec::new();
+    }
+    latest
+        .into_iter()
+        .filter(|part| {
+            matches!(
+                part.status,
+                StepStatus::Failed | StepStatus::Cancelled | StepStatus::Superseded
+            ) && may_attempt(part.attempt + 1, retry_limit)
+        })
+        .map(|part| NewRunStep {
+            id: StepId::new(),
+            run_id: part.run_id,
+            position: part.position,
+            attempt: part.attempt + 1,
+            fanout_index: 0,
+            phase_name: part.phase_name.clone(),
+            agent_id: part.agent_id,
+            model: part.model.clone(),
+            role: StepRole::Part,
+            parent_step_id: part.parent_step_id,
+            node_key: part.node_key.clone(),
+        })
+        .collect()
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).

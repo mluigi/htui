@@ -447,8 +447,10 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
         (Gate::Never, Settle::Failed(failure)) => {
             note_step(ctx, step, Some(&failure.to_string()), now).await?;
             // MOD-138 M2 D7: a node with a `fails` edge loops over it instead of retrying itself.
+            // MOD-139 M2 D6 (blueprint P-7): a divided node's edge sits on its integrate node,
+            // whose name `divided_name` gives; every other phase's is its own.
             let fails = crate::walk::Graph::of(ctx.snapshot)
-                .loop_edge(&phase.name, EdgeKind::Fails)
+                .loop_edge(crate::divide::divided_name(phase), EdgeKind::Fails)
                 .cloned();
             let Some(edge) = fails else {
                 return retry_or_fail(ctx, step, phase, &failure, now).await;
