@@ -253,6 +253,14 @@ pub trait Orchestrate {
     /// MOD-138 M3 T3 (F14): every session yields once before its first event, so admitted node
     /// futures interleave.
     fn interleave_sessions(&self);
+
+    /// MOD-139 M2 D16 (blueprint P-10): a queued run of `item`'s divided graph, resolved through
+    /// the test seam that lifts only the divide refusal; claim it with
+    /// [`claim`](Orchestrate::claim). Production resolve (`StartRun`) still refuses it.
+    ///
+    /// # Errors
+    /// Whatever the seam or the store refuses with.
+    async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError>;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -387,6 +395,10 @@ impl Orchestrate for FakeOrchestrator {
 
     fn interleave_sessions(&self) {
         Self::interleave_sessions(self);
+    }
+
+    async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError> {
+        crate::engine::enqueue_divided_fake(self, item).await
     }
 }
 
@@ -564,6 +576,19 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// and a retry render the run-start bytes); fan-out siblings carry byte-identical memory and the
 /// judge none; a pre-MOD-163 snapshot resumes with no memory section; and a project without
 /// memory writes no `memory` row.
+///
+/// **Eighteen for MOD-139 M2 T3** (plan D1-D5, D7, D8, D10, D13, D15-D17): divided nodes. Built
+/// through the D16 resolve seam, since production resolve still refuses them (the last case
+/// pins both refusals, and D17's planner agent first). A divided node admits its default parts
+/// as plan revision 0 from the primary's `base_refs`; each part runs in its own tree from those
+/// refs with its own prompt section, agent and session, and never lands; part documents stay out
+/// of input resolution; the integrate node is offered only once every part is done (where an M2
+/// run stops, D15); the parts share the session cap, run one at a time under a cap of one or
+/// under `shared_serialized` (which resets to the refs), and a lone `local` part prepares with no
+/// slot; `local` with two parts, an agent outside the candidates, a part persona, an over-cap and
+/// an empty plan each fail admission; `command_run` reaches a part beside a live sibling and a
+/// parallel branch beside a live one; the operator verbs refuse a part row; and stage rows are
+/// invisible to the walk.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -908,6 +933,25 @@ pub const CASES: &[&str] = &[
     "fan_out_siblings_carry_byte_identical_memory_sections",
     "a_snapshot_without_memory_resumes_with_no_memory_section",
     "a_project_without_memory_writes_no_memory_row",
+    // MOD-139 M2 T3 (plan D1-D5, D7, D8, D10, D13, D15-D17): divided nodes, admission and parts.
+    "a_divided_node_admits_its_default_parts_as_revision_zero",
+    "each_part_runs_in_its_own_tree_with_its_own_prompt_and_agent",
+    "part_documents_stay_out_of_input_resolution",
+    "integrate_is_offered_only_once_every_part_is_done",
+    "two_parts_are_live_at_once_under_the_cap",
+    "max_parallel_sessions_one_runs_the_parts_one_at_a_time",
+    "shared_serialized_parts_reset_to_the_base_refs",
+    "a_single_local_part_prepares_with_no_slot",
+    "local_with_two_parts_fails_admission",
+    "a_part_agent_outside_the_candidates_fails_admission",
+    "a_part_persona_fails_admission",
+    "an_over_cap_plan_fails_admission",
+    "an_empty_divided_node_fails_admission",
+    "a_part_with_a_live_sibling_gets_command_run",
+    "a_fan_out_only_branch_beside_a_live_sibling_gets_command_run",
+    "the_operator_verbs_refuse_a_part_row",
+    "stage_rows_are_ignored_by_the_walk",
+    "start_run_refuses_a_divided_graph_and_first_a_planner_agent",
 ];
 
 /// Run one case by name.
@@ -945,6 +989,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| concurrency_case(name, harness))
         .or_else(|| concurrent_recovery_case(name, harness))
         .or_else(|| review_fix_case(name, harness))
+        .or_else(|| divided_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -13493,6 +13538,893 @@ async fn a_rejection_handed_back_beside_an_interrupted_park_ends_the_run_as_in_p
     );
 }
 
+// -- MOD-139 M2 T3: divided nodes (plan D1-D5, D7, D8, D10, D13, D15-D17) ----------------------
+
+/// MOD-139 M2 T3's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn divided_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_divided_node_admits_its_default_parts_as_revision_zero" => Box::pin(
+            a_divided_node_admits_its_default_parts_as_revision_zero(harness),
+        ),
+        "each_part_runs_in_its_own_tree_with_its_own_prompt_and_agent" => {
+            Box::pin(each_part_runs_in_its_own_tree_with_its_own_prompt_and_agent(harness))
+        }
+        "part_documents_stay_out_of_input_resolution" => {
+            Box::pin(part_documents_stay_out_of_input_resolution(harness))
+        }
+        "integrate_is_offered_only_once_every_part_is_done" => {
+            Box::pin(integrate_is_offered_only_once_every_part_is_done(harness))
+        }
+        "two_parts_are_live_at_once_under_the_cap" => {
+            Box::pin(two_parts_are_live_at_once_under_the_cap(harness))
+        }
+        "max_parallel_sessions_one_runs_the_parts_one_at_a_time" => Box::pin(
+            max_parallel_sessions_one_runs_the_parts_one_at_a_time(harness),
+        ),
+        "shared_serialized_parts_reset_to_the_base_refs" => {
+            Box::pin(shared_serialized_parts_reset_to_the_base_refs(harness))
+        }
+        "a_single_local_part_prepares_with_no_slot" => {
+            Box::pin(a_single_local_part_prepares_with_no_slot(harness))
+        }
+        "local_with_two_parts_fails_admission" => {
+            Box::pin(local_with_two_parts_fails_admission(harness))
+        }
+        "a_part_agent_outside_the_candidates_fails_admission" => {
+            Box::pin(a_part_agent_outside_the_candidates_fails_admission(harness))
+        }
+        "a_part_persona_fails_admission" => Box::pin(a_part_persona_fails_admission(harness)),
+        "an_over_cap_plan_fails_admission" => Box::pin(an_over_cap_plan_fails_admission(harness)),
+        "an_empty_divided_node_fails_admission" => {
+            Box::pin(an_empty_divided_node_fails_admission(harness))
+        }
+        "a_part_with_a_live_sibling_gets_command_run" => {
+            Box::pin(a_part_with_a_live_sibling_gets_command_run(harness))
+        }
+        "a_fan_out_only_branch_beside_a_live_sibling_gets_command_run" => {
+            Box::pin(a_fan_out_only_branch_beside_a_live_sibling_gets_command_run(harness))
+        }
+        "the_operator_verbs_refuse_a_part_row" => {
+            Box::pin(the_operator_verbs_refuse_a_part_row(harness))
+        }
+        "stage_rows_are_ignored_by_the_walk" => {
+            Box::pin(stage_rows_are_ignored_by_the_walk(harness))
+        }
+        "start_run_refuses_a_divided_graph_and_first_a_planner_agent" => Box::pin(
+            start_run_refuses_a_divided_graph_and_first_a_planner_agent(harness),
+        ),
+        _ => return None,
+    })
+}
+
+/// FEAT-3 ungated with every phase's `input_kinds` cleared, and `implement` divided (`split =
+/// divide`, `fan_out` 1, `mutate` applied) into `parts`, each `(key, agent)` with the title `The
+/// <key>`, the brief `Build the <key> part.`, the owned path `src/<key>/**` and the acceptance
+/// `the <key> tests pass`.
+///
+/// # Panics
+/// When the store refuses the edited graph.
+async fn divided_feat_3<O: Orchestrate>(
+    orch: &O,
+    parts: &[(&str, Option<AgentId>)],
+    mutate: impl Fn(&mut StepGraphPhase),
+) {
+    feat_3_gated(orch, Gate::Never, |phase| phase.input_kinds.clear()).await;
+    edit_graph(orch, ids::HTUI_FEAT_3, |body| {
+        let node = body
+            .nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("FEAT-3's graph has `implement`");
+        node.phase.split = htui_core::model::Split::Divide;
+        node.phase.fan_out = 1;
+        mutate(&mut node.phase);
+        let phase = node.phase.id;
+        node.parts = parts
+            .iter()
+            .enumerate()
+            .map(|(position, (key, agent))| htui_core::model::PhasePart {
+                phase_id: phase,
+                position: i32::try_from(position).expect("a handful of parts"),
+                key: (*key).to_owned(),
+                title: format!("The {key}"),
+                brief: format!("Build the {key} part."),
+                owned_paths: vec![format!("src/{key}/**")],
+                acceptance: Some(format!("the {key} tests pass")),
+                agent_id: *agent,
+                model: None,
+                persona_id: None,
+            })
+            .collect();
+    })
+    .await;
+}
+
+/// The divided FEAT-3 run through the D16 seam, then claimed: its id and the claim's answer.
+///
+/// # Panics
+/// When the seam refuses the graph.
+async fn start_divided<O: Orchestrate>(orch: &O) -> (RunId, Result<CommandOutcome, EngineError>) {
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    (run, orch.claim(run).await)
+}
+
+/// MOD-139 M2 D15 (F-2): an M2 divided run ends at its integrate node with the existing divide
+/// refusal, named by the divided node.
+fn stops_at_integrate(result: &Result<CommandOutcome, EngineError>) {
+    assert!(
+        matches!(
+            result,
+            Err(EngineError::Resolve(crate::graph::ResolveError::NotYetRunnable {
+                node,
+                reason: crate::graph::NotRunnable::Divide,
+            })) if node == "implement"
+        ),
+        "the walk stops at the integrate node: {result:?}"
+    );
+}
+
+/// The rows under `planner`, in `(position, attempt)` order.
+fn parts_of(steps: &[RunStep], planner: StepId) -> Vec<RunStep> {
+    let mut parts: Vec<RunStep> = steps
+        .iter()
+        .filter(|step| step.parent_step_id == Some(planner))
+        .cloned()
+        .collect();
+    parts.sort_by_key(|step| (step.position, step.attempt));
+    parts
+}
+
+/// The latest planner row.
+///
+/// # Panics
+/// When the run holds none.
+fn planner_of(steps: &[RunStep]) -> RunStep {
+    steps
+        .iter()
+        .filter(|step| step.role == StepRole::Planner)
+        .max_by_key(|step| step.attempt)
+        .cloned()
+        .expect("the walk created the planner row")
+}
+
+/// The latest part row named `phase_name`.
+///
+/// # Panics
+/// When the run holds none.
+fn part_named<'s>(steps: &'s [RunStep], phase_name: &str) -> &'s RunStep {
+    steps
+        .iter()
+        .filter(|step| step.role == StepRole::Part && step.phase_name == phase_name)
+        .max_by_key(|step| step.attempt)
+        .unwrap_or_else(|| panic!("the run holds the part `{phase_name}`"))
+}
+
+/// The run's plan revisions.
+async fn plans_of<O: Orchestrate>(orch: &O, run: RunId) -> Vec<htui_core::model::RunPlan> {
+    orch.store()
+        .run_plans(run)
+        .await
+        .expect("MemStore never fails a read")
+}
+
+/// The admitted plan's `base_refs` entry for `repo`.
+///
+/// # Panics
+/// When the run has no admitted plan or the plan names no such repo.
+async fn base_ref_of<O: Orchestrate>(orch: &O, run: RunId, repo: RepoId) -> String {
+    plans_of(orch, run)
+        .await
+        .into_iter()
+        .find(|plan| plan.status == htui_core::model::PlanStatus::Admitted)
+        .and_then(|plan| plan.base_refs)
+        .and_then(|refs| refs.get(repo.to_string()).cloned())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .expect("the admitted plan names the repo's base")
+}
+
+/// The trees a step recorded.
+async fn trees_of<O: Orchestrate>(orch: &O, step: StepId) -> Vec<htui_core::model::RunStepTree> {
+    orch.store()
+        .step_trees(step)
+        .await
+        .expect("MemStore never fails a read")
+}
+
+/// MOD-139 M2 D2, D9: when the planner node is ready, the engine admits the node's default parts
+/// as plan revision 0 in one store write — the plan `admitted` with `base_refs`, the part rows
+/// `pending` past the frozen node list, the planner `done` — and both parts then run. The walk
+/// stops at the integrate node (D15), the next cursor once both parts are done.
+async fn a_divided_node_admits_its_default_parts_as_revision_zero<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let repo = primary_repo(&orch).await;
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(
+        (
+            planner.position,
+            planner.role,
+            planner.node_key.as_deref(),
+            planner.status
+        ),
+        (
+            2,
+            StepRole::Planner,
+            Some("implement:plan"),
+            StepStatus::Done
+        )
+    );
+    assert!(planner.finished_at.is_some(), "{planner:?}");
+
+    let plans = plans_of(&orch, run).await;
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    let plan = &plans[0];
+    assert_eq!(
+        (
+            plan.revision,
+            plan.status,
+            plan.base_position,
+            plan.planner_step_id
+        ),
+        (0, htui_core::model::PlanStatus::Admitted, 5, planner.id)
+    );
+    let mut base = serde_json::Map::new();
+    base.insert(
+        repo.to_string(),
+        serde_json::Value::String(format!("fake:group-base:{repo}")),
+    );
+    assert_eq!(plan.base_refs, Some(serde_json::Value::Object(base)));
+    let snapshot = snapshot_of(&orch, run).await;
+    let defaults = snapshot.phases[2]
+        .divide
+        .as_ref()
+        .expect("the planner node carries its divide block")
+        .default_parts
+        .clone();
+    let body = crate::divide::plan_body(&defaults);
+    assert_eq!(plan.body, body);
+    assert_eq!(plan.digest, crate::divide::plan_digest(&body));
+
+    let shape: Vec<_> = parts_of(&steps, planner.id)
+        .into_iter()
+        .map(|part| {
+            (
+                part.position,
+                part.phase_name.clone(),
+                part.node_key.clone(),
+                part.role,
+                part.attempt,
+                part.fanout_index,
+                part.status,
+            )
+        })
+        .collect();
+    let part = |position: i32, name: &str| {
+        (
+            position,
+            name.to_owned(),
+            Some(name.to_owned()),
+            StepRole::Part,
+            1,
+            0,
+            StepStatus::Done,
+        )
+    };
+    assert_eq!(shape, [part(5, "implement/api"), part(6, "implement/ui")]);
+    assert!(
+        steps.iter().all(|step| step.position != 3),
+        "integrate waits for M3"
+    );
+    assert_eq!(
+        crate::walk::ready(&snapshot, &steps),
+        [crate::status::Cursor::Create {
+            position: 3,
+            attempt: 1
+        }]
+    );
+}
+
+/// MOD-139 M2 D4, D5, D10: each part runs in its own tree branched from the plan's `base_refs`,
+/// under its own agent, with its own prompt (the internal `part` section) and its own session;
+/// a part is never reconciled into the primary tree.
+async fn each_part_runs_in_its_own_tree_with_its_own_prompt_and_agent<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    orch.with_candidates(
+        "implement",
+        vec![
+            (ids::AGENT_CLAUDE, "sonnet"),
+            (ids::AGENT_AGY, "gemini-3.7-flash-high"),
+        ],
+    );
+    divided_feat_3(
+        &orch,
+        &[("api", None), ("ui", Some(ids::AGENT_AGY))],
+        |_| {},
+    )
+    .await;
+    let repo = primary_repo(&orch).await;
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let api = part_named(&steps, "implement/api").clone();
+    let ui = part_named(&steps, "implement/ui").clone();
+    let base = base_ref_of(&orch, run, repo).await;
+    let (api_trees, ui_trees) = (trees_of(&orch, api.id).await, trees_of(&orch, ui.id).await);
+    for trees in [&api_trees, &ui_trees] {
+        assert_eq!(trees.len(), 1, "{trees:?}");
+        assert_eq!(trees[0].base_ref, base, "a part branches from base_refs");
+    }
+    assert_ne!(api_trees[0].path, ui_trees[0].path, "one tree per part");
+
+    let log = call_log_of(&orch, run).await;
+    for entry in [
+        "prepare 5/1/0",
+        "capture 5/1/0",
+        "prepare 6/1/0",
+        "capture 6/1/0",
+    ] {
+        assert!(log.iter().any(|call| call == entry), "{entry}: {log:?}");
+    }
+    assert!(
+        !log.iter()
+            .any(|call| call.starts_with("reconcile 5/") || call.starts_with("reconcile 6/")),
+        "a part never lands: {log:?}"
+    );
+
+    assert_eq!(api.agent_id, Some(ids::AGENT_CLAUDE));
+    assert_eq!(
+        (ui.agent_id, ui.model.as_deref()),
+        (Some(ids::AGENT_AGY), Some("gemini-3.7-flash-high"))
+    );
+    for part in [&api, &ui] {
+        let sections = prompt_sections(&orch, part.id).await;
+        assert_eq!(
+            sections.get(1).map(String::as_str),
+            Some("part"),
+            "{sections:?}"
+        );
+    }
+    let text = prompt_text(&orch, api.id).await;
+    assert!(text.contains("key=\"api\""), "{text}");
+    assert!(text.contains("Build the api part."), "{text}");
+    assert!(!text.contains("Build the ui part."), "{text}");
+    assert_ne!(api.prompt_digest, ui.prompt_digest);
+    spec_of(&orch, &session("implement/api", 0));
+    spec_of(&orch, &session("implement/ui", 0));
+}
+
+/// MOD-139 M2 D12: both parts write the divided node's `output_kind`, and neither document is a
+/// generic input: with no hand-written one, the kind resolves to nothing.
+async fn part_documents_stay_out_of_input_resolution<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let mut parts: Vec<StepId> = parts_of(&steps, planner_of(&steps).id)
+        .iter()
+        .map(|part| part.id)
+        .collect();
+    parts.sort();
+    let mut producers: Vec<StepId> = orch
+        .store()
+        .documents(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .filter(|head| head.kind == "implement")
+        .filter_map(|head| head.produced_by_step_id)
+        .collect();
+    producers.sort();
+    assert_eq!(producers, parts, "each part wrote an `implement` document");
+    let resolved = orch
+        .store()
+        .resolve_inputs(ids::HTUI_FEAT_3, run, &["implement".to_owned()])
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].kind, "implement");
+    assert_eq!(resolved[0].document, None, "a part document is no input");
+}
+
+/// MOD-139 M2 D3: while a part is live it rests its node and nothing downstream is created; once
+/// every part is done the integrate node is the next cursor.
+async fn integrate_is_offered_only_once_every_part_is_done<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let hold = orch.hold_sessions(&[("implement/ui", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+
+    let check = async {
+        until_steps(&orch, run, |steps| {
+            steps
+                .iter()
+                .any(|step| step.phase_name == "implement/api" && step.status == StepStatus::Done)
+        })
+        .await;
+        within(hold.live(1), "`ui` held").await;
+        let steps = steps_of(&orch, run).await;
+        let snapshot = snapshot_of(&orch, run).await;
+        let ui = part_named(&steps, "implement/ui");
+        assert_eq!(
+            crate::walk::ready(&snapshot, &steps),
+            [crate::status::Cursor::Rest {
+                step: ui.id,
+                status: StepStatus::Running
+            }],
+            "a live part rests its node"
+        );
+        assert!(steps.iter().all(|step| step.position != 3), "{steps:?}");
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), check);
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        crate::walk::ready(&snapshot_of(&orch, run).await, &steps),
+        [crate::status::Cursor::Create {
+            position: 3,
+            attempt: 1
+        }]
+    );
+}
+
+/// MOD-139 M2 D4: a round runs its parts at once up to the session cap.
+async fn two_parts_are_live_at_once_under_the_cap<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let release = async {
+        within(hold.live(2), "both parts live").await;
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), release);
+    stops_at_integrate(&result);
+    assert_eq!(orch.live_sessions_high_water(), 2);
+    let steps = steps_of(&orch, run).await;
+    for name in ["implement/api", "implement/ui"] {
+        assert_eq!(part_named(&steps, name).status, StepStatus::Done, "{name}");
+    }
+}
+
+/// MOD-139 M2 D4: `max_parallel_sessions` 1 runs the parts one at a time.
+async fn max_parallel_sessions_one_runs_the_parts_one_at_a_time<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    orch.store()
+        .set_app_setting("max_parallel_sessions", serde_json::json!(1));
+    let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let release = async {
+        within(hold.live(1), "one part live").await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(hold.reached(), 1, "the cap holds the second part back");
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), release);
+    stops_at_integrate(&result);
+    assert_eq!(orch.live_sessions_high_water(), 1);
+    let steps = steps_of(&orch, run).await;
+    for name in ["implement/api", "implement/ui"] {
+        assert_eq!(part_named(&steps, name).status, StepStatus::Done, "{name}");
+    }
+}
+
+/// MOD-139 M2 D4, D7: under `shared_serialized` the parts run one at a time, each prepared from
+/// the plan's `base_refs`, and the primary checkout is reset to them after the last part.
+async fn shared_serialized_parts_reset_to_the_base_refs<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.isolation = Some(Isolation::SharedSerialized);
+    })
+    .await;
+    let repo = primary_repo(&orch).await;
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let base = base_ref_of(&orch, run, repo).await;
+    for name in ["implement/api", "implement/ui"] {
+        let trees = trees_of(&orch, part_named(&steps, name).id).await;
+        assert_eq!(trees[0].base_ref, base, "{name}");
+    }
+    let parts: Vec<String> = call_log_of(&orch, run)
+        .await
+        .into_iter()
+        .filter(|call| call.contains(" 5/") || call.contains(" 6/"))
+        .collect();
+    assert_eq!(
+        parts,
+        [
+            "prepare 5/1/0",
+            "capture 5/1/0",
+            "prepare 6/1/0",
+            "capture 6/1/0",
+            "reset 6/1/0",
+        ]
+    );
+    assert_eq!(orch.isolator().in_place_overlaps(), 0);
+    assert_eq!(orch.live_sessions_high_water(), 1);
+}
+
+/// MOD-139 M2 D4, D7: one part under `local` runs in place with no fan-out slot (the real
+/// isolator refuses one there), so its tree is a fresh base, not the plan's.
+async fn a_single_local_part_prepares_with_no_slot<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None)], |phase| {
+        phase.isolation = Some(Isolation::Local);
+    })
+    .await;
+    let repo = primary_repo(&orch).await;
+
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    let api = part_named(&steps, "implement/api");
+    assert_eq!(api.status, StepStatus::Done);
+    let trees = trees_of(&orch, api.id).await;
+    let base = base_ref_of(&orch, run, repo).await;
+    assert!(
+        trees[0].base_ref.starts_with("fake:base:"),
+        "{}",
+        trees[0].base_ref
+    );
+    assert_ne!(trees[0].base_ref, base, "no slot, so no plan base");
+}
+
+/// MOD-139 M2 D2, P-8: an admission refusal fails the planner step, writes no plan and no part,
+/// blocks the item with the sentence as its last note and fails the run on it.
+async fn assert_admission_refused<O: Orchestrate>(orch: &O, failure: &RunFailure) {
+    let (run, result) = start_divided(orch).await;
+    let outcome = result.expect("an admission refusal is a rest, not an error");
+    let CommandOutcome::Started { rest, .. } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(2), Some(failure))
+    );
+    assert_eq!(run_of(orch, run).await.failure, Some(failure.to_string()));
+    let steps = steps_of(orch, run).await;
+    let planner = planner_of(&steps);
+    assert_eq!(planner.status, StepStatus::Failed);
+    assert!(parts_of(&steps, planner.id).is_empty(), "{steps:?}");
+    assert!(plans_of(orch, run).await.is_empty());
+    assert_eq!(
+        item_of(orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    assert_eq!(
+        notes_of(orch, ids::HTUI_FEAT_3).await.last(),
+        Some(&failure.to_string())
+    );
+}
+
+/// MOD-139 M2 D7: `local` runs one tree, so two parts fail admission.
+async fn local_with_two_parts_fails_admission<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.isolation = Some(Isolation::Local);
+    })
+    .await;
+    assert_admission_refused(
+        &orch,
+        &RunFailure::LocalCannotDivide {
+            node: "implement".to_owned(),
+            parts: 2,
+        },
+    )
+    .await;
+}
+
+/// MOD-139 M2 D5: a part's agent must be one of the node's candidates; no silent fallback.
+async fn a_part_agent_outside_the_candidates_fails_admission<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(
+        &orch,
+        &[("api", None), ("ui", Some(ids::AGENT_AGY))],
+        |_| {},
+    )
+    .await;
+    assert_admission_refused(
+        &orch,
+        &RunFailure::PartAgentNotCandidate {
+            node: "implement".to_owned(),
+            part: "ui".to_owned(),
+            agent: ids::AGENT_AGY,
+        },
+    )
+    .await;
+}
+
+/// MOD-139 M2 D5: per-part personas are MOD-140's; a part naming one fails admission.
+async fn a_part_persona_fails_admission<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    edit_graph(&orch, ids::HTUI_FEAT_3, |body| {
+        let node = body
+            .nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("FEAT-3's graph has `implement`");
+        node.parts[1].persona_id = Some(ids::PERSONA_ARCHITECT);
+    })
+    .await;
+    assert_admission_refused(
+        &orch,
+        &RunFailure::PartPersonaUnsupported {
+            node: "implement".to_owned(),
+            part: "ui".to_owned(),
+        },
+    )
+    .await;
+}
+
+/// MOD-139 M2 D8: a plan over the node's `max_parts` fails admission.
+async fn an_over_cap_plan_fails_admission<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.max_parts = Some(1);
+    })
+    .await;
+    assert_admission_refused(
+        &orch,
+        &RunFailure::PlanOverCaps {
+            node: "implement".to_owned(),
+            cap: crate::status::PlanCap::MaxParts,
+            planned: 2,
+            max: 1,
+        },
+    )
+    .await;
+}
+
+/// MOD-139 M2 D2 (ANA-33 §7.6): a divided node with no default part fails admission.
+async fn an_empty_divided_node_fails_admission<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[], |_| {}).await;
+    assert_admission_refused(
+        &orch,
+        &RunFailure::EmptyPlan {
+            node: "implement".to_owned(),
+        },
+    )
+    .await;
+}
+
+/// MOD-139 M2 D13: a `fan_out_only` part beside a live sibling part gets `command_run`, the
+/// denials and the section; a lone plain step of the same run does not. Both parts are held until
+/// both are live, so each one's prompt is assembled beside a live sibling whatever the poll order.
+async fn a_part_with_a_live_sibling_gets_command_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh().hosted();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.command_queue = CommandQueue::FanOutOnly;
+    })
+    .await;
+    let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
+    let run = orch
+        .enqueue_divided(ids::HTUI_FEAT_3)
+        .await
+        .expect("the seam resolves the divided graph");
+    let release = async {
+        within(hold.live(2), "both parts live").await;
+        hold.release();
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), release);
+    stops_at_integrate(&result);
+    let steps = steps_of(&orch, run).await;
+    for name in ["implement/api", "implement/ui"] {
+        let spec = spec_of(&orch, &session(name, 0));
+        assert!(spec.tools.command_run, "{name} gets `command_run`");
+        assert!(has_denials(&spec), "{name} gets the denials");
+        let sections = prompt_sections(&orch, part_named(&steps, name).id).await;
+        assert!(
+            sections.iter().any(|section| section == "command_queue"),
+            "{name}: {sections:?}"
+        );
+    }
+    let prd = spec_of(&orch, &session("prd", 0));
+    assert!(!prd.tools.command_run, "a lone plain step");
+    assert!(!has_denials(&prd));
+}
+
+/// MOD-139 M2 D13 (blueprint G-9): the deliberate change — a `fan_out_only` step of a parallel
+/// branch gets `command_run` while the other branch is live; the root `prd`, alone, does not.
+async fn a_fan_out_only_branch_beside_a_live_sibling_gets_command_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh().hosted();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        phase.command_queue = CommandQueue::FanOutOnly;
+    })
+    .await;
+    let hold = orch.hold_sessions(&[("plan", 1), ("implement", 1)]);
+    let release = async {
+        within(hold.live(2), "both branches live").await;
+        hold.release();
+    };
+    let ((_, rest), ()) = tokio::join!(start(&orch, ids::HTUI_FEAT_3), release);
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    for phase in ["plan", "implement"] {
+        let spec = spec_of(&orch, &session(phase, 0));
+        assert!(spec.tools.command_run, "{phase} beside a live branch");
+        assert!(has_denials(&spec), "{phase} gets the denials");
+    }
+    let prd = spec_of(&orch, &session("prd", 0));
+    assert!(!prd.tools.command_run, "the root runs alone");
+    assert!(!has_denials(&prd));
+}
+
+/// MOD-139 M2 D1: the four row-taking operator verbs refuse a part row in `operator_row`'s
+/// sentence, and nothing moves.
+async fn the_operator_verbs_refuse_a_part_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let (run, result) = start_divided(&orch).await;
+    stops_at_integrate(&result);
+    let before = steps_of(&orch, run).await;
+    let api = part_named(&before, "implement/api").id;
+    for command in [
+        Command::AnswerGate {
+            run,
+            step: api,
+            answer: GateAnswer::Approved,
+        },
+        Command::RetryStep { run, step: api },
+        Command::PromoteStep {
+            run,
+            step: api,
+            chat_open: false,
+        },
+        Command::AcceptArtifact {
+            run,
+            step: api,
+            chat_live: false,
+        },
+    ] {
+        let refused = orch
+            .dispatch(command.clone())
+            .await
+            .expect_err("a part is driven by its divided node");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RoleRow {
+                    step,
+                    role: StepRole::Part
+                } if step == api
+            ),
+            "{command:?}: {refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!("step {api} is a part; a part is driven by its divided node")
+        );
+    }
+    assert_eq!(steps_of(&orch, run).await, before, "no row moved");
+}
+
+/// MOD-139 M2 (C3): htui's stage rows (negative positions) are invisible to the walk: a run
+/// holding three finishes over them, and they stay `pending`.
+async fn stage_rows_are_ignored_by_the_walk<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let mut stages = Vec::new();
+    for (position, key) in [(-3, "pick"), (-2, "prepare"), (-1, "collect")] {
+        let stage = orch
+            .store()
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "stage".to_owned(),
+                agent_id: None,
+                model: None,
+                role: StepRole::Stage,
+                parent_step_id: None,
+                node_key: Some(key.to_owned()),
+            })
+            .await
+            .expect("a stage row is a row of the run");
+        stages.push(stage.id);
+    }
+    let rest = answer_at(&orch, run, 0, GateAnswer::Approved).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    let steps = steps_of(&orch, run).await;
+    for stage in &stages {
+        let row = steps
+            .iter()
+            .find(|step| step.id == *stage)
+            .expect("the stage row is there");
+        assert_eq!(row.status, StepStatus::Pending, "{row:?}");
+    }
+    assert_eq!(
+        crate::walk::ready(&snapshot_of(&orch, run).await, &steps),
+        [crate::status::Cursor::Finished]
+    );
+}
+
+/// MOD-139 M2 D16, D17: production resolve (`StartRun`) refuses a divided graph, and first a
+/// configured planner agent, which the seam refuses too. No run is created.
+async fn start_run_refuses_a_divided_graph_and_first_a_planner_agent<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let start = || {
+        orch.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: None,
+        })
+    };
+    fn refused<T>(result: &Result<T, EngineError>, reason: crate::graph::NotRunnable) -> bool {
+        matches!(
+            result,
+            Err(EngineError::Resolve(crate::graph::ResolveError::NotYetRunnable {
+                node,
+                reason: found,
+            })) if node == "implement" && *found == reason
+        )
+    }
+    let divide = start().await;
+    assert!(
+        refused(&divide, crate::graph::NotRunnable::Divide),
+        "{divide:?}"
+    );
+
+    edit_graph(&orch, ids::HTUI_FEAT_3, |body| {
+        let node = body
+            .nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("FEAT-3's graph has `implement`");
+        node.phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
+    })
+    .await;
+    let agent = start().await;
+    assert!(
+        refused(&agent, crate::graph::NotRunnable::PlannerAgent),
+        "{agent:?}"
+    );
+    let seam = orch.enqueue_divided(ids::HTUI_FEAT_3).await;
+    assert!(
+        refused(&seam, crate::graph::NotRunnable::PlannerAgent),
+        "the seam keeps D17: {seam:?}"
+    );
+    assert_eq!(feat_3_run(&orch).await, None, "no run was created");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -13517,8 +14449,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            186,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            204,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 18: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -13598,7 +14530,8 @@ mod tests {
              rejection handed back beside an interrupted park ending the run as in process), \
              and MOD-163 M2's six memory cases (plan D11, D12, D18: an entry reaching every \
              phase of its project, closed entries kept out, an edit after `StartRun`, fan-out \
-             siblings alike, a pre-MOD-163 snapshot, no entries no row)"
+             siblings alike, a pre-MOD-163 snapshot, no entries no row), and MOD-139 M2 T3's \
+             eighteen divided-node cases (plan D1-D5, D7, D8, D10, D13, D15-D17)"
         );
     }
 

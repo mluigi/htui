@@ -64,7 +64,7 @@ pub use engine::{
     live_step_at, never_cancelled,
 };
 #[cfg(feature = "test-support")]
-pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};
+pub use engine::{claim_fake, dispatch_fake, enqueue_divided_fake, resume_fake, sweep_fake};
 pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
