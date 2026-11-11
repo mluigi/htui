@@ -254,14 +254,6 @@ pub trait Orchestrate {
     /// futures interleave.
     fn interleave_sessions(&self);
 
-    /// MOD-139 M2 D16 (blueprint P-10): a queued run of `item`'s divided graph, resolved through
-    /// the test seam that lifts only the divide refusal; claim it with
-    /// [`claim`](Orchestrate::claim). Production resolve (`StartRun`) still refuses it.
-    ///
-    /// # Errors
-    /// Whatever the seam or the store refuses with.
-    async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError>;
-
     /// MOD-139 M3 D11: [`Engine::enqueue`](crate::engine::Engine::enqueue) of `item` — `Manual`,
     /// the item's default scope, no workspace — so `start_enabled`, `missing_tags` and the
     /// production resolve run as for `StartRun`; claim the run with
@@ -409,10 +401,6 @@ impl Orchestrate for FakeOrchestrator {
 
     fn interleave_sessions(&self) {
         Self::interleave_sessions(self);
-    }
-
-    async fn enqueue_divided(&self, item: ItemId) -> Result<RunId, EngineError> {
-        crate::engine::enqueue_divided_fake(self, item).await
     }
 
     async fn enqueue(&self, item: ItemId) -> Result<RunId, EngineError> {
@@ -13718,15 +13706,16 @@ async fn divided_feat_3<O: Orchestrate>(
     .await;
 }
 
-/// The divided FEAT-3 run through the D16 seam, then claimed: its id and the claim's answer.
+/// The divided FEAT-3 run enqueued through [`Orchestrate::enqueue`], then claimed: its id and the
+/// claim's answer.
 ///
 /// # Panics
-/// When the seam refuses the graph.
+/// When resolve refuses the graph.
 async fn start_divided<O: Orchestrate>(orch: &O) -> (RunId, Result<CommandOutcome, EngineError>) {
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     (run, orch.claim(run).await)
 }
 
@@ -14028,9 +14017,9 @@ async fn integrate_is_offered_only_once_every_part_is_done<H: CaseHarness>(harne
     divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
     let hold = orch.hold_sessions(&[("implement/ui", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
 
     let check = async {
         until_steps(&orch, run, |steps| {
@@ -14078,9 +14067,9 @@ async fn two_parts_are_live_at_once_under_the_cap<H: CaseHarness>(harness: &H) {
     divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
     let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let release = async {
         within(hold.live(2), "both parts live").await;
         hold.release();
@@ -14103,9 +14092,9 @@ async fn max_parallel_sessions_one_runs_the_parts_one_at_a_time<H: CaseHarness>(
         .set_app_setting("max_parallel_sessions", serde_json::json!(1));
     let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let release = async {
         within(hold.live(1), "one part live").await;
         for _ in 0..64 {
@@ -14221,9 +14210,9 @@ async fn a_part_with_a_live_sibling_gets_command_run<H: CaseHarness>(harness: &H
     .await;
     let hold = orch.hold_sessions(&[("implement/api", 1), ("implement/ui", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let release = async {
         within(hold.live(2), "both parts live").await;
         hold.release();
@@ -14285,9 +14274,9 @@ async fn the_operator_verbs_refuse_a_part_row<H: CaseHarness>(harness: &H) {
     // Integrate held, so every part row is settled and nothing past the parts moves.
     let hold = orch.hold_sessions(&[("implement", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let refuse = async {
         within(hold.live(1), "integrate held").await;
         refuse_on_a_part(&orch, run).await;
@@ -14616,17 +14605,17 @@ fn divided_recovery_case<'a, H: CaseHarness>(
 }
 
 /// A process killed while the divided FEAT-3 run's parts are live (`crash_on_all`'s shape): the
-/// run is enqueued through the D16 seam and claimed, the claim is polled until every signal in
+/// run is enqueued through [`Orchestrate::enqueue`] and claimed, the claim is polled until every signal in
 /// `stalled` fired, then dropped, and the run it left `running` is handed back.
 ///
 /// # Panics
-/// When the seam refuses the graph, the walk finishes instead of stalling, or the run is not
+/// When resolve refuses the graph, the walk finishes instead of stalling, or the run is not
 /// left `running`.
 async fn crash_divided<O: Orchestrate>(orch: &O, stalled: &[Arc<Notify>]) -> RunId {
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let every = async {
         for signal in stalled {
             signal.notified().await;
@@ -15320,9 +15309,9 @@ async fn a_cancel_during_a_part_leaves_the_queued_part_pending<H: CaseHarness>(h
     divided_width_one(&orch).await;
     let hold = orch.hold_sessions(&[("implement/api", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let cancel = async {
         within(hold.live(1), "`api` held").await;
         orch.cancel_walks(std::time::Duration::from_millis(10));
@@ -15343,9 +15332,9 @@ async fn a_lost_lease_during_a_part_leaves_the_queued_part_pending<H: CaseHarnes
     divided_width_one(&orch).await;
     let hold = orch.hold_sessions(&[("implement/api", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let other = orch.restarted();
     let steal = async {
         within(hold.live(1), "`api` held").await;
@@ -15391,9 +15380,9 @@ async fn a_part_refusal_cancels_the_queued_parts<H: CaseHarness>(harness: &H) {
     // `plan` is the last prepare before the parts round, which admission makes none of.
     let hold = orch.hold_sessions(&[("plan", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let refuse = async {
         within(hold.live(1), "`plan` held").await;
         orch.isolator().refuse_prepare("the api tree is locked");
@@ -15578,9 +15567,9 @@ async fn cut_retirement_replays<H: CaseHarness>(harness: &H, by_hand: bool) {
     // is faulted.
     let hold = orch.hold_sessions(&[("implement/ui", 1)]);
     let run = orch
-        .enqueue_divided(ids::HTUI_FEAT_3)
+        .enqueue(ids::HTUI_FEAT_3)
         .await
-        .expect("the seam resolves the divided graph");
+        .expect("resolve takes the divided graph");
     let fault = async {
         within(hold.live(1), "`ui` held").await;
         let api = part_named(&steps_of(&orch, run).await, "implement/api").id;

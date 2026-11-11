@@ -10466,61 +10466,6 @@ pub async fn claim_fake(
     engine.claim(run).await
 }
 
-/// MOD-139 M2 D16 (blueprint P-10): a divided graph's run, created on the fake's `MemStore` through
-/// [`graph::resolve_divided`] — the real resolve with **only** the divide refusal lifted — over
-/// the fake's own graph source. The caller claims it with [`claim_fake`]. Not an `Engine`
-/// method: no engine path reaches the seam, so a `test-support` build lifts nothing for any
-/// other caller.
-/// M3 deletes it with the refusal.
-///
-/// # Errors
-/// [`EngineError::Store`] (the item `NotFound`, or the store refusing the run) and
-/// [`EngineError::Resolve`] for every refusal the seam keeps.
-#[cfg(feature = "test-support")]
-pub async fn enqueue_divided_fake(
-    orch: &crate::fake::FakeOrchestrator,
-    item: ItemId,
-) -> Result<RunId, EngineError> {
-    use htui_core::store::WorkerStore as _;
-    let item = orch
-        .store
-        .item(item)
-        .await?
-        .ok_or(EngineError::Store(StoreError::NotFound {
-            entity: "item",
-            id: item.to_string(),
-        }))?;
-    let graphs = orch.graphs();
-    let app = orch.store.app_settings().await?;
-    let resolved = Box::pin(graph::resolve(
-        &orch.store,
-        &graphs,
-        &item,
-        htui_core::model::RunMode::Manual,
-        &app,
-        None,
-        orch.box_id(),
-    ))
-    .await?;
-    let id = RunId::new();
-    orch.store
-        .create_run(NewRun {
-            workspace_id: None,
-            id,
-            project_id: item.project_id,
-            item_id: item.id,
-            mode: htui_core::model::RunMode::Manual,
-            target_box_id: orch.box_id(),
-            started_by: orch.user(),
-            graph_snapshot: resolved.snapshot,
-            repo_scope: resolved.repo_scope,
-            queued_at: orch.clock.now(),
-            batch_id: None,
-        })
-        .await?;
-    Ok(id)
-}
-
 /// MOD-139 M3 D11: [`Engine::enqueue`] over a `FakeOrchestrator`'s parts — `Manual`, the item's
 /// default scope, no workspace — so `start_enabled`, `missing_tags` and the production resolve
 /// run as for `StartRun`.

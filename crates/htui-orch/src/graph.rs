@@ -752,7 +752,10 @@ fn not_yet_runnable(phases: &[SnapshotPhase]) -> std::result::Result<(), Resolve
             NotRunnable::PlannerAgent,
         );
     }
-    for phase in phases.iter().filter(|phase| phase.role == NodeRole::Planner) {
+    for phase in phases
+        .iter()
+        .filter(|phase| phase.role == NodeRole::Planner)
+    {
         let name = crate::divide::divided_name(phase);
         if phase
             .divide
