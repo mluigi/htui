@@ -9,7 +9,8 @@
 //! [`propose_link`], `remove` tombstones through [`withdraw_link`], both under the session's fence
 //! (I-3). A run withdraws only what one of its steps proposed (PRD OQ-4, B-6): anything else
 //! reads `not yours`, and so does a `remove` of another project's item with no live link (edge 9:
-//! the store's `not found` would print an id outside the reach).
+//! the store's `not found` would print an id outside the reach), as `is no live link this run
+//! proposed`, which stays true when the link was this run's and is already withdrawn.
 //!
 //! [`item_by_key`]: htui_core::store::WorkerStore::item_by_key
 //! [`propose_link`]: htui_core::store::WorkerStore::propose_link
@@ -152,12 +153,16 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
             not_yours()
         }
         // MOD-147 edge 9: `withdraw_link` has no reach check, so another project's item with no
-        // live link reads `not yours` (this run proposed nothing there). The store's sentence
-        // would print both ids and name an item outside the reach.
+        // live link reads `not yours` (this run has nothing live there to withdraw). The store's
+        // sentence would print both ids and name an item outside the reach. `WorkerStore` has no
+        // workspace read to tell an out-of-reach target from a co-member's, so this covers both,
+        // worded to hold when the link was this run's and is already withdrawn.
         StoreError::NotFound {
             entity: "item_link",
             ..
-        } if elsewhere => not_yours(),
+        } if elsewhere => ToolError(format!(
+            "not yours: {from_key} {kind} {canonical} is no live link this run proposed"
+        )),
         StoreError::Constraint(sentence) if sentence == link_outside_reach(target) => {
             out_of_scope(&to)
         }
