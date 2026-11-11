@@ -1950,6 +1950,107 @@ async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-139 D12: the mirror skips a divided part's document the way Postgres does, and keeps a
+/// hand-written one beside it (whose `s.role` is `NULL` through the `LEFT JOIN`).
+///
+/// On `RUN_1` a planner (position 60) and a part under it (61) are written, then a hand-written
+/// `notes` v1 and the part's `notes` v2 on the run's item. Both tables are seeded **before** the
+/// one pass: `run_pass` commits `document` before `run_step`, and a reader between the two would
+/// see the part's document with no step row (the accepted mid-pass lag `CacheStore::resolve_inputs`
+/// documents). From `RUN_1`'s seat the part's newer v2 is skipped, so v1 is read on both engines; a
+/// mirror without the role test would answer v2.
+#[tokio::test]
+async fn the_mirror_skips_part_documents_the_way_postgres_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let step = |position: i32, role: StepRole, parent: Option<StepId>, key: Option<&str>| {
+        htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: key.unwrap_or("implement:plan").to_owned(),
+            agent_id: None,
+            model: None,
+            role,
+            parent_step_id: parent,
+            node_key: key.map(str::to_owned),
+        }
+    };
+    let planner = db
+        .store
+        .create_step(step(60, StepRole::Planner, None, None))
+        .await
+        .expect("the planner row")
+        .id;
+    let part = db
+        .store
+        .create_step(step(
+            61,
+            StepRole::Part,
+            Some(planner),
+            Some("implement/api"),
+        ))
+        .await
+        .expect("the part row")
+        .id;
+
+    let insert = |version: i32, step: Option<StepId>| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO document (project_id, item_id, kind, version, title, body, \
+                                       produced_by_step_id, created_by) \
+                 VALUES ($1, $2, 'notes', $3, $4, 'body', $5, $6) RETURNING id",
+            )
+            .bind(ids::PROJECT_HTUI.as_uuid())
+            .bind(ids::HTUI_FEAT_1.as_uuid())
+            .bind(version)
+            .bind(format!("notes v{version}"))
+            .bind(step.map(StepId::as_uuid))
+            .bind(ids::USER.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .map(|row| row.get::<uuid::Uuid, _>("id"))
+            .expect("a notes row the resolver has to judge")
+        }
+    };
+    let hand_written = insert(1, None).await;
+    insert(2, Some(part)).await;
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that carries the two steps and the two documents");
+
+    let asked = ["notes".to_owned()];
+    let mirrored = cache
+        .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &asked)
+        .await
+        .expect("the mirror resolves");
+    assert_eq!(
+        mirrored,
+        db.store
+            .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &asked)
+            .await
+            .expect("Postgres resolves"),
+        "the two engines skip the part's document alike"
+    );
+    assert_eq!(
+        mirrored
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|document| document.id.as_uuid()),
+        Some(hand_written),
+        "the part's newer v2 is no input; the hand-written v1 is read"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// Plants one `document` row straight into the mirror, in its encodings: ids as hyphenated text,
 /// `created_at` as epoch microseconds. Postgres never sees it.
 async fn plant_mirrored_document(

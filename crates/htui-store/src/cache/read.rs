@@ -1107,7 +1107,10 @@ impl ReadStore for CacheStore {
     /// never competes as hand-written. A fan-out **loser's** document can still be answered here
     /// where Postgres excludes it, when nothing in its arm ranks above it and it is newer than the
     /// hand-written pick. ANA-9 §6.2 promises whole-table consistency, not cross-table, so this is
-    /// by design; a caller that cannot tolerate a loser's output must read Postgres.
+    /// by design; a caller that cannot tolerate a loser's output must read Postgres. A **part's**
+    /// document can be answered offline the same way while its `run_step` row has not arrived
+    /// (MOD-139 D12, accepted like the loser's): once it has, `s.role <> 'part'` excludes it, inside
+    /// the same disjunction Postgres uses, so a hand-written document is never dropped.
     async fn resolve_inputs(
         &self,
         item: ItemId,
@@ -1150,7 +1153,8 @@ impl ReadStore for CacheStore {
                                LEFT JOIN run_step s ON s.id = d.produced_by_step_id \
                               WHERE d.item_id = ? \
                                 AND d.kind IN (SELECT k.value FROM json_each(?) k) \
-                                AND (s.id IS NULL OR COALESCE(s.selected, 1) <> 0)) \
+                                AND (s.id IS NULL \
+                                     OR (COALESCE(s.selected, 1) <> 0 AND s.role <> 'part'))) \
                       WHERE rank_in_arm = 1) \
               WHERE rank_in_kind = 1",
         )

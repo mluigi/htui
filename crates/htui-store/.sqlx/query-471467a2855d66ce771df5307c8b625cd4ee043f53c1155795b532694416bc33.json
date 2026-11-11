@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MIN(revision) AS \"revision\" FROM run_plan\n                WHERE planner_step_id = $1 AND status = 'admitted'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revision",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "471467a2855d66ce771df5307c8b625cd4ee043f53c1155795b532694416bc33"
+}

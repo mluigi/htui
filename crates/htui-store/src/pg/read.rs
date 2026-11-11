@@ -837,6 +837,11 @@ impl ReadStore for PgStore {
     /// on the column, not on `s.id IS NULL` (MOD-73 plan D3). On Postgres the two coincide
     /// (`fk_document_step ... ON DELETE SET NULL`); the mirror is where they don't.
     ///
+    /// MOD-139 D12: a divided part's document is no generic input (its integrate node reads it,
+    /// through `{{parts}}`), so the step-produced arm also skips a `role = 'part'` step. The test
+    /// sits inside the disjunction, `s.id IS NULL OR (… AND s.role <> 'part')`: a bare
+    /// `AND s.role <> 'part'` would drop every hand-written document, whose `s.role` is `NULL`.
+    ///
     /// The caller's order is applied in Rust, exactly as
     /// [`documents_of_kinds`](ReadStore::documents_of_kinds) applies it and for the same two
     /// reasons: it is an arbitrary permutation no `ORDER BY` expresses, and the empty-`kinds` case
@@ -904,7 +909,8 @@ impl ReadStore for PgStore {
                               LEFT JOIN run_step s ON s.id = d.produced_by_step_id
                              WHERE d.item_id = $1
                                AND d.kind = ANY($3::text[])
-                               AND (s.id IS NULL OR s.selected IS NOT FALSE)) arm
+                               AND (s.id IS NULL
+                                    OR (s.selected IS NOT FALSE AND s.role <> 'part'))) arm
                      WHERE arm.rank_in_arm = 1) ranked
              WHERE rank_in_kind = 1
             "#,
