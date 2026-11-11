@@ -562,6 +562,36 @@ mod tests {
         assert!(!assembled.text.contains("name=\"part\""));
     }
 
+    /// MOD-139 M3 D5: the handoff spec never carries an abandoned integrate's pre-merge report or
+    /// its done parts, and its prompt renders neither section.
+    #[test]
+    fn the_handoff_spec_drops_premerge_and_parts() {
+        let phase = PromptSpec {
+            premerge: Some(htui_core::prompt::fixtures::premerge_one_conflict()),
+            parts: htui_core::prompt::fixtures::integrate_parts(),
+            ..phase_implement_attempt2()
+        };
+        let integrate = assemble(&phase, &MinimalScrubber::new([])).expect("the phase assembles");
+        assert!(
+            integrate.text.contains("name=\"premerge\"")
+                && integrate.text.contains("name=\"parts\""),
+            "the phase spec renders both, which is what makes this test able to fail"
+        );
+        let spec = handoff_spec(
+            phase,
+            &handoff_template(),
+            &handoff_events(),
+            &[root()],
+            Some(diff()),
+            "gave up".to_owned(),
+        );
+        assert_eq!(spec.premerge, None);
+        assert!(spec.parts.is_empty());
+        let assembled = assemble(&spec, &MinimalScrubber::new([])).expect("the handoff assembles");
+        assert!(!assembled.text.contains("name=\"premerge\""));
+        assert!(!assembled.text.contains("name=\"parts\""));
+    }
+
     /// MOD-9 D44 (blueprint F-D, D63): the handoff body cannot place `{{skills}}`, so a phase's
     /// candidates would only be scrubbed and recorded `not_placed`. The spec drops them, and the
     /// assembled record has no choice to show. Tested here because the engine's only handoff path
