@@ -7450,6 +7450,9 @@ where
             memory: None,
             // MOD-139 M2 D10: a judge works no part.
             part: None,
+            // MOD-139 M3 D5: nor integrates any.
+            premerge: None,
+            parts: Vec::new(),
             excerpts: no_excerpts(caps),
             // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
             // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
@@ -8350,6 +8353,9 @@ where
             memory: snapshot.memory.clone(),
             // MOD-139 M2 D10: no part here; a divided part's session sets its own (T3).
             part: None,
+            // MOD-139 M3 D5: nor an integrate's report and parts; its session sets them (T3).
+            premerge: None,
+            parts: Vec::new(),
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.

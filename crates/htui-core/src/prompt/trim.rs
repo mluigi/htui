@@ -38,10 +38,11 @@ use crate::model::memory::SnapshotMemoryEntry;
 use crate::model::skill::SkillChoice;
 use crate::prompt::estimate::TokenEstimator;
 use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
-use crate::prompt::render::{self, Rendered, UpstreamState};
+use crate::prompt::render::{self, PartState, Rendered, UpstreamState};
 use crate::prompt::template::{Placeholder, TemplateRole};
 use crate::prompt::{
-    AssembleError, JudgeCandidate, MEMORY_SEPARATOR, PromptSpec, SectionName, TemplateRef,
+    AssembleError, JudgeCandidate, MEMORY_SEPARATOR, PARTS_SEPARATOR, PromptSpec, SectionName,
+    TemplateRef,
 };
 use crate::scrub::{Scrubber, Unmasked};
 
@@ -365,13 +366,17 @@ impl TrimRecord {
 }
 
 /// MOD-163 D14: a section's span — its wrapper, plus the memory section's trailing
-/// [`MEMORY_SEPARATOR`] — estimated and multiplied by how often the body places it. The one
-/// arithmetic `Trimmer::new`, `re_estimate` and `section_yardstick` record with (M-3), so the
-/// separator is counted, and dropped, with the memory section and never with the frame.
+/// [`MEMORY_SEPARATOR`] or the `parts` section's trailing [`PARTS_SEPARATOR`] (MOD-139 M3 D5) —
+/// estimated and multiplied by how often the body places it. The one arithmetic `Trimmer::new`,
+/// `re_estimate` and `section_yardstick` record with (M-3), so each separator is counted, and
+/// dropped, with its section and never with the frame.
 fn span_tokens(est: TokenEstimator, rendered: &Rendered, weight: i64) -> i64 {
     let mut span = render::wrap(rendered);
     if rendered.name == SectionName::Memory {
         span.push_str(MEMORY_SEPARATOR);
+    }
+    if rendered.name == SectionName::Parts {
+        span.push_str(PARTS_SEPARATOR);
     }
     est.estimate(&span) * weight
 }
@@ -392,6 +397,9 @@ pub(crate) enum TrimStep {
     VerifyFailure,
     /// Rank 3: the document group.
     Documents,
+    /// Rank 3, after the documents (MOD-139 M3 D5): integrate's done parts, bodies head+tail
+    /// last part first, then bodies dropped, then the section.
+    Parts,
     /// Rank 4: head+tail, never dropped.
     Item,
     /// Judge rank 1: the per-candidate isolate cap.
@@ -410,7 +418,9 @@ pub(crate) enum TrimStep {
 /// document group and the group before `item` (blueprint P-3, following §5.1's worked example
 /// rather than §4.4's row text — the two disagree and the example is the one with arithmetic in
 /// it). MOD-163 D16 puts project memory after the excerpts and before upstream (ANA-5 §4.4 as
-/// amended 2026-10-20). The two role orders are §4.4's own two-entry orders.
+/// amended 2026-10-20). MOD-139 M3 D5 puts integrate's `parts` in `R-PRM-3`'s "prior documents"
+/// rank: after the document group, before `item`. The two role orders are §4.4's own two-entry
+/// orders.
 pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
     match role {
         TemplateRole::Phase => &[
@@ -420,6 +430,7 @@ pub(crate) const fn trim_order(role: TemplateRole) -> &'static [TrimStep] {
             TrimStep::PreviousDiff,
             TrimStep::VerifyFailure,
             TrimStep::Documents,
+            TrimStep::Parts,
             TrimStep::Item,
         ],
         TemplateRole::Judge => &[TrimStep::Candidates, TrimStep::JudgeTask],
@@ -450,6 +461,8 @@ enum Source {
     VerifyFailure,
     /// How many of `spec.memory.entries` are still rendered (a prefix; the tail goes first).
     Memory(usize),
+    /// MOD-139 M3 D5: one ladder state per `spec.parts` block, positionally.
+    Parts(Vec<PartState>),
     /// A diff; `true` once it has been degraded to its stat.
     Diff(bool),
     /// `candidates[i]`; `true` once its diff has been degraded to its stat.
@@ -579,6 +592,7 @@ impl<'a> Trimmer<'a> {
                     .as_ref()
                     .map_or(0, |memory| memory.entries.len()),
             ),
+            SectionName::Parts => Source::Parts(vec![PartState::Full; inputs.spec.parts.len()]),
             SectionName::PreviousDiff | SectionName::DiffSoFar => Source::Diff(false),
             SectionName::JudgeCandidate(index) => inputs
                 .candidates
@@ -588,6 +602,7 @@ impl<'a> Trimmer<'a> {
             SectionName::Template
             | SectionName::Persona
             | SectionName::Part
+            | SectionName::Premerge
             | SectionName::Box
             | SectionName::Skills
             | SectionName::CommandQueue
@@ -672,6 +687,7 @@ impl<'a> Trimmer<'a> {
                 TrimStep::DiffSoFar => self.trim_diff(&SectionName::DiffSoFar),
                 TrimStep::VerifyFailure => self.trim_verify_failure(),
                 TrimStep::Documents => self.trim_documents(),
+                TrimStep::Parts => self.trim_parts(),
                 TrimStep::Item => {
                     self.head_tail_in_place(
                         &SectionName::Item,
@@ -881,6 +897,87 @@ impl<'a> Trimmer<'a> {
         self.drop_section(index);
     }
 
+    /// MOD-139 M3 D5 (blueprint P-20): integrate's done parts, three rungs, each walking the parts
+    /// **last first** and stopping the moment the deficit clears. Rung 1 head+tails each body to
+    /// the document floor (`HeadTail`, elided lines and bytes summed over the cuts); rung 2 drops
+    /// the bodies, keeping each block's key, title, tips and stat (`Dropped`, `dropped` counting
+    /// bodies); rung 3 drops the section, its separator with it. The last rung's strategy wins.
+    ///
+    /// Renders from `self.inputs.spec.parts`, the **masked** spec, so no rung can bring an unmasked
+    /// byte back (review C-1), and each cut is priced by re-rendering the whole section with that
+    /// part cut and measuring its span, the arithmetic `re_estimate` records with (M-3).
+    fn trim_parts(&mut self) {
+        let Some(index) = self.live_index(&SectionName::Parts) else {
+            return;
+        };
+        let Source::Parts(states) = &self.entries[index].source else {
+            return;
+        };
+        let mut states = states.clone();
+        let parts = &self.inputs.spec.parts;
+        let (est, weight) = (self.est, self.entries[index].weight);
+
+        let mut lines = self.entries[index].record.elided_lines.unwrap_or(0);
+        let mut bytes = self.entries[index].record.elided_bytes.unwrap_or(0);
+        for part in (0..parts.len()).rev() {
+            if self.deficit() <= 0 {
+                return;
+            }
+            if states[part] != PartState::Full {
+                continue;
+            }
+            let Some(body) = render::part_body(&parts[part]) else {
+                continue;
+            };
+            let floor = floor_for(&body, DOCUMENT_FLOOR_LINES, DOCUMENT_FLOOR_PERCENT);
+            let measure = |candidate: &str| {
+                let mut trial = states.clone();
+                trial[part] = PartState::Cut(candidate.to_owned());
+                render::parts(parts, &trial).map_or(0, |section| span_tokens(est, &section, weight))
+            };
+            let Some((cut, cut_lines, cut_bytes)) =
+                head_tail(&body, floor, self.deficit(), &measure)
+            else {
+                continue;
+            };
+            states[part] = PartState::Cut(cut);
+            lines = lines.saturating_add(cut_lines);
+            bytes = bytes.saturating_add(cut_bytes);
+            self.entries[index].record.elided_lines = Some(lines);
+            self.entries[index].record.elided_bytes = Some(bytes);
+            self.mark(index, TrimStrategy::HeadTail);
+            self.render_parts(index, &states);
+        }
+
+        let mut dropped = self.entries[index].record.dropped.unwrap_or(0);
+        for part in (0..parts.len()).rev() {
+            if self.deficit() <= 0 {
+                return;
+            }
+            if states[part] == PartState::Bare || render::part_body(&parts[part]).is_none() {
+                continue;
+            }
+            states[part] = PartState::Bare;
+            dropped += 1;
+            self.entries[index].record.dropped = Some(dropped);
+            self.mark(index, TrimStrategy::Dropped);
+            self.render_parts(index, &states);
+        }
+
+        if self.deficit() > 0 {
+            self.drop_section(index);
+        }
+    }
+
+    /// Re-renders the `parts` section at `index` in `states` and re-measures it.
+    fn render_parts(&mut self, index: usize, states: &[PartState]) {
+        if let Some(rendered) = render::parts(&self.inputs.spec.parts, states) {
+            self.entries[index].rendered = rendered;
+        }
+        self.entries[index].source = Source::Parts(states.to_vec());
+        self.re_estimate(index);
+    }
+
     /// §4.3's depth ladder, one rung at a time with re-estimation after each (§4.4's `upstream`).
     fn trim_upstream(&mut self) {
         let Some(index) = self.live_index(&SectionName::Upstream) else {
@@ -955,6 +1052,8 @@ impl<'a> Trimmer<'a> {
             | SectionName::Persona
             | SectionName::Memory
             | SectionName::Part
+            | SectionName::Premerge
+            | SectionName::Parts
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream
@@ -1325,6 +1424,7 @@ mod tests {
                 TrimStep::PreviousDiff,
                 TrimStep::VerifyFailure,
                 TrimStep::Documents,
+                TrimStep::Parts,
                 TrimStep::Item,
             ]
         );

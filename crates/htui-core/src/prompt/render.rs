@@ -29,6 +29,7 @@
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::{SnapshotMemory, SnapshotMemoryEntry};
+use crate::model::run::{PartMerge, PartPremerge, PremergeReport};
 use crate::model::skill::BoundSkill;
 use crate::model::{EventKind, SessionEvent};
 use crate::prompt::defaults::COMMAND_QUEUE_TEXT;
@@ -36,8 +37,8 @@ use crate::prompt::excerpt::{Excerpt, RepoRoot};
 use crate::prompt::memory::{MEMORY_PREAMBLE, left_out_line};
 use crate::prompt::template::ParsedTemplate;
 use crate::prompt::{
-    DiffBlock, InputDocument, JudgeCandidate, PartBlock, PersonaBlock, PromptSpec, SectionName,
-    StepSummary, VerifyFailure,
+    DiffBlock, InputDocument, IntegratePart, JudgeCandidate, PartBlock, PersonaBlock, PromptSpec,
+    SectionName, StepSummary, VerifyFailure,
 };
 
 /// §4.2 rule 4's cap on a rendered `title` attribute, in bytes of the title itself.
@@ -741,6 +742,159 @@ pub fn part(block: &PartBlock) -> Rendered {
         ],
         content: normalise_newlines(&blocks.join("\n\n")),
     }
+}
+
+/// MOD-139 M3 D5: the `premerge` section's opening paragraph, byte-pinned.
+pub const PREMERGE_PREAMBLE: &str = "htui merged the done parts into this tree, in plan order, before this session. Finish every merge it could not make and commit it: the step passes only when each part's tip is in this branch's history and each part's changed paths are among the ones this step changes.";
+
+/// MOD-139 M3 D5: conflicted paths listed per part, the first this many in byte order; the rest
+/// counted on one `and <n> more` line, so a huge conflict cannot refuse the step meant to resolve
+/// it.
+pub const PREMERGE_PATH_CAP: usize = 20;
+
+/// MOD-139 M3 D5: the `parts` section's opening line.
+pub const PARTS_PREAMBLE: &str =
+    "The done parts, in plan order: each one's tips, diffstat and output document.";
+
+/// MOD-139 M3 D4, D5: the `premerge` content, which is the item note's body too
+/// ([`crate::prompt::premerge_note`]): [`PREMERGE_PREAMBLE`], then per repo
+/// `` repo `<name>` at <head>: `` and one line per part:
+///
+/// - ``- part `<key>` <tip>: merged as <commit>``
+/// - ``- part `<key>` <tip>: already contained``
+/// - ``- part `<key>`: no commits``
+/// - ``- part `<key>` <tip>: conflicted, merge aborted; conflicted paths:``, then
+///   ``  - <path>`` for the first [`PREMERGE_PATH_CAP`] in byte order and ``  - and <n> more``
+///   past the cap
+/// - ``- part `<key>` <tip>: not attempted, an earlier part conflicted``
+///
+/// Lines joined by one LF, LF-normalised. No step id anywhere (blueprint P-9): a part is named by
+/// its key and its tip hash only.
+#[must_use]
+pub fn premerge_content(report: &PremergeReport) -> String {
+    let mut lines = vec![PREMERGE_PREAMBLE.to_owned()];
+    for repo in &report.repos {
+        lines.push(format!("repo `{}` at {}:", repo.name, repo.head));
+        for part in &repo.parts {
+            premerge_lines(part, &mut lines);
+        }
+    }
+    normalise_newlines(&lines.join("\n"))
+}
+
+/// One part's lines of [`premerge_content`].
+fn premerge_lines(part: &PartPremerge, lines: &mut Vec<String>) {
+    let head = match &part.tip {
+        Some(tip) => format!("- part `{}` {tip}", part.key),
+        None => format!("- part `{}`", part.key),
+    };
+    match &part.merge {
+        PartMerge::Merged { commit } => lines.push(format!("{head}: merged as {commit}")),
+        PartMerge::Contained => lines.push(format!("{head}: already contained")),
+        PartMerge::NoCommits => lines.push(format!("- part `{}`: no commits", part.key)),
+        PartMerge::Conflicted { paths } => {
+            lines.push(format!(
+                "{head}: conflicted, merge aborted; conflicted paths:"
+            ));
+            let mut sorted: Vec<&String> = paths.iter().collect();
+            sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            for path in sorted.iter().take(PREMERGE_PATH_CAP) {
+                lines.push(format!("  - {path}"));
+            }
+            if paths.len() > PREMERGE_PATH_CAP {
+                lines.push(format!("  - and {} more", paths.len() - PREMERGE_PATH_CAP));
+            }
+        }
+        PartMerge::NotAttempted => {
+            lines.push(format!("{head}: not attempted, an earlier part conflicted"));
+        }
+    }
+}
+
+/// MOD-139 M3 D5: a part's body as [`parts`] renders it in full — LF-normalised, trailing LFs
+/// removed — or `None` when it has no document or an empty one. What the `parts` ladder cuts.
+pub(crate) fn part_body(part: &IntegratePart) -> Option<String> {
+    part.body
+        .as_deref()
+        .map(content_of)
+        .filter(|body| !body.is_empty())
+}
+
+/// MOD-139 M3 D5: `<section name="premerge">` (no attributes) over [`premerge_content`]; `None`
+/// when the report names no repo (blueprint P-10, I-7: no empty section).
+#[must_use]
+pub fn premerge(report: &PremergeReport) -> Option<Rendered> {
+    if report.repos.is_empty() {
+        return None;
+    }
+    Some(Rendered {
+        name: SectionName::Premerge,
+        attrs: Vec::new(),
+        content: premerge_content(report),
+    })
+}
+
+/// MOD-139 M3 D5: one part block's state on the `parts` trim ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartState {
+    /// The whole body.
+    Full,
+    /// The body head+tail-cut to this text.
+    Cut(String),
+    /// No body: key, title, tips and stat only.
+    Bare,
+}
+
+/// MOD-139 M3 D5: the `parts` section: [`PARTS_PREAMBLE`], then one block per part, blocks joined
+/// by one blank line. A block is `<part key="…" title="…">`, one ``tip `<repo>` <hash>`` line per
+/// tip (or `no commits`), the diff's stat when present, the body per its state after one blank
+/// line ([`PartState::Full`] the whole body, [`PartState::Cut`] the cut, [`PartState::Bare`]
+/// nothing), then `</part>`.
+///
+/// `states` is positional; a short slice falls back to [`PartState::Full`], so a caller that has
+/// not run the ladder gets the untrimmed render. `None` when `parts` is empty.
+#[must_use]
+pub fn parts(parts: &[IntegratePart], states: &[PartState]) -> Option<Rendered> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut blocks = vec![PARTS_PREAMBLE.to_owned()];
+    for (index, part) in parts.iter().enumerate() {
+        let mut block = format!(
+            "<part key=\"{}\" title=\"{}\">",
+            attr(&part.key),
+            title_attr(&part.title)
+        );
+        if part.tips.is_empty() {
+            block.push_str("\nno commits");
+        }
+        for (repo, tip) in &part.tips {
+            block.push_str(&format!("\ntip `{repo}` {tip}"));
+        }
+        if let Some(diff) = &part.diff {
+            let stat = diff_content(diff, true);
+            if !stat.is_empty() {
+                block.push('\n');
+                block.push_str(&stat);
+            }
+        }
+        let body = match states.get(index).unwrap_or(&PartState::Full) {
+            PartState::Full => part_body(part).unwrap_or_default(),
+            PartState::Cut(cut) => cut.clone(),
+            PartState::Bare => String::new(),
+        };
+        if !body.is_empty() {
+            block.push_str("\n\n");
+            block.push_str(&body);
+        }
+        block.push_str("\n</part>");
+        blocks.push(block);
+    }
+    Some(Rendered {
+        name: SectionName::Parts,
+        attrs: Vec::new(),
+        content: normalise_newlines(&blocks.join("\n\n")),
+    })
 }
 
 /// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim — less the

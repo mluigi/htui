@@ -14,13 +14,13 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::model::box_::BoxProfile;
-use crate::model::ids::{ItemId, MemoryEntryId, SkillId, StepId};
+use crate::model::ids::{ItemId, MemoryEntryId, RepoId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::{
     MemoryEntry, MemoryKind, MemorySource, MemoryState, SnapshotMemory, SnapshotMemoryEntry,
 };
-use crate::model::run::RunStatus;
+use crate::model::run::{PartMerge, PartPremerge, PremergeReport, RepoPremerge, RunStatus};
 use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
@@ -29,8 +29,8 @@ use crate::prompt::excerpt::{
 };
 use crate::prompt::settings::{Budget, BudgetSource};
 use crate::prompt::{
-    DiffBlock, HandoffInputs, InputDocument, JudgeCandidate, JudgeInputs, PartBlock, PromptSpec,
-    StepSummary, TemplateRef, TemplateRole, TokenEstimator, VerifyFailure,
+    DiffBlock, HandoffInputs, InputDocument, IntegratePart, JudgeCandidate, JudgeInputs, PartBlock,
+    PromptSpec, StepSummary, TemplateRef, TemplateRole, TokenEstimator, VerifyFailure,
 };
 
 /// The §5.3 default budget at the §5.3 default reserve, sourced from the project rung so the
@@ -238,6 +238,8 @@ pub fn phase_implement_attempt2() -> PromptSpec {
         persona: None,
         memory: None,
         part: None,
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet {
             files: excerpts,
             audit,
@@ -304,6 +306,8 @@ pub fn phase_all_empty() -> PromptSpec {
         persona: None,
         memory: None,
         part: None,
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -400,6 +404,8 @@ pub fn judge_three_candidates() -> PromptSpec {
         persona: None,
         memory: None,
         part: None,
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -548,6 +554,8 @@ pub fn handoff_basic() -> PromptSpec {
         persona: None,
         memory: None,
         part: None,
+        premerge: None,
+        parts: Vec::new(),
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
@@ -840,6 +848,77 @@ pub fn part_api() -> PartBlock {
         owned_paths: vec!["htui:crates/api/**".to_owned(), "docs/api.md".to_owned()],
         acceptance: Some("`cargo test -p api` passes.".to_owned()),
     }
+}
+
+/// MOD-139 M3 (blueprint §T2.1): a pre-merge over one repo `core` — `api` merged, `ui`
+/// conflicted on 22 paths (handed in a scrambled order, so the renderer's byte-order sort and its
+/// 20-path cap both show), `db` not attempted. Fixed ids and hashes, no clock.
+#[must_use]
+pub fn premerge_one_conflict() -> PremergeReport {
+    // 7 is coprime to 22, so `(n * 7) % 22` visits every file once, out of order.
+    let paths = (0..22)
+        .map(|n| format!("crates/htui/src/tabs/runs/f{:02}.rs", (n * 7) % 22))
+        .collect();
+    PremergeReport {
+        repos: vec![RepoPremerge {
+            repo_id: RepoId::from_uuid(Uuid::from_u128(0xc04e)),
+            name: "core".to_owned(),
+            head: "4e5f6a7b8c9d".to_owned(),
+            parts: vec![
+                PartPremerge {
+                    step: StepId::from_uuid(Uuid::from_u128(0x5a01)),
+                    key: "api".to_owned(),
+                    tip: Some("a1b2c3d4e5f6".to_owned()),
+                    merge: PartMerge::Merged {
+                        commit: "9a8b7c6d5e4f".to_owned(),
+                    },
+                },
+                PartPremerge {
+                    step: StepId::from_uuid(Uuid::from_u128(0x5a02)),
+                    key: "ui".to_owned(),
+                    tip: Some("d4e5f6a7b8c9".to_owned()),
+                    merge: PartMerge::Conflicted { paths },
+                },
+                PartPremerge {
+                    step: StepId::from_uuid(Uuid::from_u128(0x5a03)),
+                    key: "db".to_owned(),
+                    tip: Some("0f1e2d3c4b5a".to_owned()),
+                    merge: PartMerge::NotAttempted,
+                },
+            ],
+        }],
+    }
+}
+
+/// MOD-139 M3 (blueprint §T2.1): integrate's two done parts, `api` and `ui`, each with one tip in
+/// `core`, a diffstat and a 300-line output document — long enough that the `parts` ladder has a
+/// body to cut and a body to drop.
+#[must_use]
+pub fn integrate_parts() -> Vec<IntegratePart> {
+    vec![
+        IntegratePart {
+            key: "api".to_owned(),
+            title: "The HTTP API".to_owned(),
+            tips: vec![("core".to_owned(), "a1b2c3d4e5f6".to_owned())],
+            diff: Some(DiffBlock {
+                range: "0123abcd4567..a1b2c3d4e5f6".to_owned(),
+                stat: " 3 files changed, 120 insertions(+), 4 deletions(-)".to_owned(),
+                diff: diff_block(40),
+            }),
+            body: Some(prose_block("api impl", 300)),
+        },
+        IntegratePart {
+            key: "ui".to_owned(),
+            title: "The Runs pane".to_owned(),
+            tips: vec![("core".to_owned(), "d4e5f6a7b8c9".to_owned())],
+            diff: Some(DiffBlock {
+                range: "0123abcd4567..d4e5f6a7b8c9".to_owned(),
+                stat: " 5 files changed, 260 insertions(+), 31 deletions(-)".to_owned(),
+                diff: diff_block(60),
+            }),
+            body: Some(prose_block("ui impl", 300)),
+        },
+    ]
 }
 
 /// Criterion 6: the same spec with every body re-encoded as CRLF.
