@@ -7952,6 +7952,18 @@ impl WriteStore for PgStore {
         Ok(row)
     }
 
+    async fn admit_plan(
+        &self,
+        _fence: StepFence,
+        _admission: htui_core::model::PlanAdmission,
+    ) -> Result<RunPlan> {
+        Err(StoreError::Backend("MOD-139 M2: not yet".into()))
+    }
+
+    async fn abandon_plans(&self, _fence: StepFence, _planner_step: StepId) -> Result<u32> {
+        Err(StoreError::Backend("MOD-139 M2: not yet".into()))
+    }
+
     /// One `command_run` row, every column the caller's (plan D31).
     ///
     /// A transaction for one insert, and not the bare `execute` a single statement would allow,

@@ -326,6 +326,16 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<htui_core::model::RunPlan> {
         WriteStore::insert_run_plan(self, fence, plan).await
     }
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
+    }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await
     }
@@ -735,6 +745,16 @@ impl htui_core::store::WorkerStore for Writer {
         plan: htui_core::model::NewRunPlan,
     ) -> Result<htui_core::model::RunPlan> {
         WriteStore::insert_run_plan(self, fence, plan).await
+    }
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> Result<htui_core::model::RunPlan> {
+        WriteStore::admit_plan(self, fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> Result<u32> {
+        WriteStore::abandon_plans(self, fence, planner_step).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::record_command_run(self, new).await

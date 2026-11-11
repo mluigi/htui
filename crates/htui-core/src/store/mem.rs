@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
+use crate::model::PlanAdmission;
 use crate::model::link::{ProposeLink, WithdrawLink};
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
@@ -163,6 +164,9 @@ pub enum MemFault {
     /// [`ReadStore::step_trees`] (MOD-138 M3 R1): a read the run-terminal cleanup makes and the
     /// cut writes do not.
     StepTrees,
+    /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
+    /// commit.
+    AdmitPlan,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -10510,6 +10514,16 @@ impl WriteStore for MemStore {
     async fn insert_run_plan(&self, fence: StepFence, plan: NewRunPlan) -> Result<RunPlan> {
         let now = self.now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
         self.write(|state| state.insert_run_plan(fence, plan, now))
+    }
+
+    async fn admit_plan(&self, _fence: StepFence, _admission: PlanAdmission) -> Result<RunPlan> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::AdmitPlan)?;
+        Err(StoreError::Backend("MOD-139 M2: not yet".into()))
+    }
+
+    async fn abandon_plans(&self, _fence: StepFence, _planner_step: StepId) -> Result<u32> {
+        Err(StoreError::Backend("MOD-139 M2: not yet".into()))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {

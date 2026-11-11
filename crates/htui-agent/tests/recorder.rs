@@ -1077,6 +1077,16 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<htui_core::model::RunPlan> {
         self.inner.insert_run_plan(fence, plan).await
     }
+    async fn admit_plan(
+        &self,
+        fence: StepFence,
+        admission: htui_core::model::PlanAdmission,
+    ) -> StoreResult<htui_core::model::RunPlan> {
+        self.inner.admit_plan(fence, admission).await
+    }
+    async fn abandon_plans(&self, fence: StepFence, planner_step: StepId) -> StoreResult<u32> {
+        self.inner.abandon_plans(fence, planner_step).await
+    }
     async fn record_command_run(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
         self.inner.record_command_run(new).await
     }
