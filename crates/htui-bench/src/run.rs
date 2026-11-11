@@ -1,19 +1,40 @@
 //! The runner: corpus, points, backends, ranked lists and timings per query (MOD-162 T6).
+//!
+//! [`run`] checks the frozen query set, builds the corpus, validates the targets, connects to
+//! Postgres and Qdrant (failing fast, before the slow parts), loads the production embedder and
+//! hands over to [`run_with`]'s pipeline: a clean collection (blueprint F8), the points upserted
+//! in chunks of 64, the L schema, then every backend over every query.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use anyhow::{Context as _, bail};
 use chrono::{DateTime, Utc};
+use htui_store::bm25;
 use htui_store::embed::{DenseEmbedder, EmbedderIdentity, RtenEmbedder};
+use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::vector::{Hit, QdrantStore, SearchArms, SearchQuery, VectorStore};
+use qdrant_client::Qdrant;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
-use crate::corpus::{Corpus, PointCounts};
-use crate::queries::{Query, QuerySet};
-use crate::types::{Backend, CorpusId, QueryClass, Ranked};
+use crate::corpus::{self, Corpus, PointCounts};
+use crate::lexical::{self, GTie, GrepIndex};
+use crate::metrics;
+use crate::pg_fts;
+use crate::queries::{self, Query, QuerySet};
+use crate::types::{
+    Backend, CorpusId, DocKind, LVariant, QueryClass, RANK_DEPTH, Ranked, S_LIMIT, S10_LIMIT,
+    ranked_from_hits,
+};
 
 /// `results.json`'s `schema`.
 pub const RESULTS_SCHEMA: u32 = 1;
+
+/// Points per `VectorStore::upsert` call.
+const UPSERT_CHUNK: usize = 64;
 
 /// Where and what to run. `Debug` is hand-written and prints `database_url` as `<redacted>`.
 pub struct RunConfig {
@@ -37,16 +58,37 @@ pub struct RunConfig {
 
 impl std::fmt::Debug for RunConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        Ok(())
+        f.debug_struct("RunConfig")
+            .field("repo", &self.repo)
+            .field("corpus_ref", &self.corpus_ref)
+            .field("queries", &self.queries)
+            .field("out", &self.out)
+            .field("qdrant", &self.qdrant)
+            .field("database_url", &"<redacted>")
+            .field("collection", &self.collection)
+            .field("schema", &self.schema)
+            .finish()
     }
 }
 
 /// `htui_bench_` + corpus_ref lowercased, every char outside [a-z0-9] → `_`, at most 48 chars
 /// (`d15e9fea` → `htui_bench_d15e9fea`; `WORKTREE` → `htui_bench_worktree`).
 pub fn collection_name(corpus_ref: &str) -> String {
-    let _ = corpus_ref;
-    String::new()
+    let tail: String = corpus_ref
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Every char is ASCII now, so a byte cut is a char cut.
+    let mut name = format!("htui_bench_{tail}");
+    name.truncate(48);
+    name
 }
 
 /// One run's output: `results.json`.
@@ -169,8 +211,37 @@ pub struct BackendRun {
 /// # Errors
 /// Any step's, with context.
 pub async fn run(config: &RunConfig) -> anyhow::Result<Results> {
-    let _ = config;
-    anyhow::bail!("run::run: not implemented yet (MOD-162 T6)")
+    let started_at = Utc::now();
+    let frozen = queries::load_frozen(&config.queries)?;
+    note(&format!(
+        "query set {} ({} queries, sha256 {})",
+        frozen.set.set,
+        frozen.set.queries.len(),
+        frozen.sha256
+    ));
+    let corpus = corpus::build(&config.repo, &config.corpus_ref)?;
+    note_corpus(&corpus);
+    check_targets(&corpus, &frozen.set)?;
+    warn_on_another_ref(&frozen.set, &config.corpus_ref);
+
+    let services = Services::connect(config).await?;
+    let clock = Instant::now();
+    let embedder = load_embedder().await?;
+    let model_load = elapsed_ms(clock);
+    note(&format!(
+        "embedding model loaded ({:.1} s)",
+        model_load / 1000.0
+    ));
+
+    let ctx = RunContext {
+        config,
+        corpus: &corpus,
+        queries: &frozen.set,
+        query_sha256: &frozen.sha256,
+        started_at,
+        model_load_ms: Some(model_load),
+    };
+    pipeline(&ctx, embedder, &services).await
 }
 
 /// Everything after the model is loaded; generic so a test runs it with `HashEmbedder`.
@@ -184,8 +255,17 @@ pub async fn run_with<E: DenseEmbedder>(
     query_sha256: &str,
     embedder: E,
 ) -> anyhow::Result<Results> {
-    let _ = (config, corpus, queries, query_sha256, embedder);
-    anyhow::bail!("run::run_with: not implemented yet (MOD-162 T6)")
+    let started_at = Utc::now();
+    let services = Services::connect(config).await?;
+    let ctx = RunContext {
+        config,
+        corpus,
+        queries,
+        query_sha256,
+        started_at,
+        model_load_ms: None,
+    };
+    pipeline(&ctx, embedder, &services).await
 }
 
 /// `ensure_model_noting(|l| eprintln!("{l}"))`, then `RtenEmbedder::load` on `spawn_blocking`,
@@ -194,7 +274,13 @@ pub async fn run_with<E: DenseEmbedder>(
 /// # Errors
 /// The model cannot be fetched or loaded.
 pub async fn load_embedder() -> anyhow::Result<RtenEmbedder> {
-    anyhow::bail!("run::load_embedder: not implemented yet (MOD-162 T6)")
+    let files = model::ensure_model_noting(|line| eprintln!("{line}"))
+        .await
+        .context("cannot load the embedding model")?;
+    tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
+        .await
+        .context("the embedding model's loader stopped")?
+        .context("cannot load the embedding model")
 }
 
 /// Refuses a query set naming a target that is not in the corpus, one line per unknown target.
@@ -202,8 +288,18 @@ pub async fn load_embedder() -> anyhow::Result<RtenEmbedder> {
 /// # Errors
 /// At least one unknown target.
 pub fn check_targets(corpus: &Corpus, set: &QuerySet) -> anyhow::Result<()> {
-    let _ = (corpus, set);
-    Ok(())
+    let unknown = queries::validate(&set.queries, &corpus.ids());
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = unknown.iter().map(ToString::to_string).collect();
+    bail!(
+        "{} unknown target(s) in {} against {}:\n{}",
+        unknown.len(),
+        set.set,
+        corpus.corpus_ref,
+        lines.join("\n")
+    )
 }
 
 /// One query's [`QueryRecord`].
@@ -213,7 +309,7 @@ pub fn query_record(query: &Query) -> QueryRecord {
         class: query.class,
         text: query.text.clone(),
         targets: query.targets.clone(),
-        sparse_terms: 0,
+        sparse_terms: bm25::query_vector(&query.text).indices.len(),
     }
 }
 
@@ -225,27 +321,403 @@ pub fn backend_run(
     outcome: Result<Vec<Ranked>, String>,
     latency_ms: f64,
 ) -> BackendRun {
-    let _ = outcome;
+    let (ranked, error) = match outcome {
+        Ok(ranked) => (ranked, None),
+        Err(message) => (Vec::new(), Some(message)),
+    };
+    let ids: Vec<CorpusId> = ranked.iter().map(|row| row.id.clone()).collect();
     BackendRun {
         backend,
         query: query.id.clone(),
-        ranked: Vec::new(),
-        first_rank: None,
+        first_rank: metrics::first_target_rank(&ids, &query.targets),
+        ranked,
         latency_ms,
-        error: None,
+        error,
     }
 }
 
 /// The three load averages of `/proc/loadavg`'s text.
 pub fn parse_loadavg(text: &str) -> Option<[f64; 3]> {
-    let _ = text;
-    None
+    let mut fields = text.split_whitespace().map(str::parse::<f64>);
+    let mut next = || fields.next()?.ok();
+    Some([next()?, next()?, next()?])
 }
 
 /// Documents by kind, as [`RunMeta::docs`] records them.
 pub fn doc_counts(corpus: &Corpus) -> BTreeMap<String, usize> {
-    let _ = corpus;
-    BTreeMap::new()
+    let mut counts: BTreeMap<String, usize> = ["open_item", "requirement", "decision"]
+        .into_iter()
+        .map(|kind| (kind.to_owned(), 0))
+        .collect();
+    for doc in &corpus.docs {
+        let kind = match doc.kind {
+            DocKind::OpenItem => "open_item",
+            DocKind::Requirement => "requirement",
+            DocKind::Decision => "decision",
+        };
+        *counts.entry(kind.to_owned()).or_default() += 1;
+    }
+    counts.insert("total".to_owned(), corpus.docs.len());
+    counts
+}
+
+/// Progress, on stderr.
+fn note(line: &str) {
+    eprintln!("htui-bench: {line}");
+}
+
+fn note_corpus(corpus: &Corpus) {
+    let counts = doc_counts(corpus);
+    let count = |kind: &str| counts.get(kind).copied().unwrap_or_default();
+    note(&format!(
+        "corpus {} ({}): {} open items, {} requirements, {} decisions, {} documents",
+        corpus.corpus_ref,
+        corpus.commit.as_deref().unwrap_or("work tree"),
+        count("open_item"),
+        count("requirement"),
+        count("decision"),
+        count("total"),
+    ));
+}
+
+fn warn_on_another_ref(set: &QuerySet, corpus_ref: &str) {
+    if set.corpus_ref != corpus_ref {
+        note(&format!(
+            "warning: the query set was written against {}, the corpus is {corpus_ref}",
+            set.corpus_ref
+        ));
+    }
+}
+
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+/// What a run has before the pipeline starts.
+struct RunContext<'a> {
+    config: &'a RunConfig,
+    corpus: &'a Corpus,
+    queries: &'a QuerySet,
+    query_sha256: &'a str,
+    started_at: DateTime<Utc>,
+    model_load_ms: Option<f64>,
+}
+
+/// Postgres and Qdrant, checked before anything slow.
+struct Services {
+    pool: PgPool,
+    postgres_version: String,
+    raw: Qdrant,
+    qdrant_version: String,
+}
+
+impl Services {
+    async fn connect(config: &RunConfig) -> anyhow::Result<Self> {
+        if !pg_fts::is_valid_schema(&config.schema) {
+            bail!(
+                "schema {:?} is not a valid name (^[a-z_][a-z0-9_]{{0,62}}$)",
+                config.schema
+            );
+        }
+        let pool = pg_fts::connect(&config.database_url).await?;
+        let postgres_version = pg_fts::server_version(&pool).await?;
+        let raw = raw_client(&config.qdrant)?;
+        let qdrant_version = raw
+            .health_check()
+            .await
+            .context("Qdrant health check")?
+            .version;
+        note(&format!(
+            "Postgres: {postgres_version}; Qdrant {qdrant_version}"
+        ));
+        Ok(Self {
+            pool,
+            postgres_version,
+            raw,
+            qdrant_version,
+        })
+    }
+}
+
+/// A client of the bench's own, for what `QdrantStore` does not expose. No compatibility check:
+/// it prints to stdout (as `vector.rs` `client_config` notes).
+fn raw_client(settings: &QdrantSettings) -> anyhow::Result<Qdrant> {
+    let mut builder = Qdrant::from_url(settings.url.as_str()).skip_compatibility_check();
+    if let Some(key) = &settings.api_key {
+        builder = builder.api_key(key.as_str());
+    }
+    builder.build().context("building the Qdrant client")
+}
+
+/// Steps 7-13 of blueprint §4.1.
+async fn pipeline<E: DenseEmbedder>(
+    ctx: &RunContext<'_>,
+    embedder: E,
+    services: &Services,
+) -> anyhow::Result<Results> {
+    let config = ctx.config;
+    let load_start = read_loadavg();
+    let identity = embedder.identity();
+
+    // F8: `connect_to` refuses a collection another embedder made, so delete it first.
+    let name = config.collection.as_str();
+    if services
+        .raw
+        .collection_exists(name)
+        .await
+        .with_context(|| format!("checking for collection {name}"))?
+    {
+        note(&format!("deleting the previous collection {name}"));
+        services
+            .raw
+            .delete_collection(name)
+            .await
+            .with_context(|| format!("deleting collection {name}"))?;
+    }
+    let store = QdrantStore::connect_to(&config.qdrant, embedder, name)
+        .await
+        .with_context(|| format!("creating collection {name}"))?;
+
+    let points = ctx.corpus.points();
+    let total = points.len();
+    let clock = Instant::now();
+    let mut done = 0;
+    for chunk in points.chunks(UPSERT_CHUNK) {
+        store
+            .upsert(chunk.to_vec())
+            .await
+            .with_context(|| format!("upserting points {}..{}", done, done + chunk.len()))?;
+        done += chunk.len();
+        note(&format!(
+            "indexed {done}/{total} points ({:.1} s)",
+            clock.elapsed().as_secs_f64()
+        ));
+    }
+    let index_ms = elapsed_ms(clock);
+
+    let measured = measure(ctx, &store, &services.pool).await;
+    if let Err(err) = pg_fts::drop_schema(&services.pool, &config.schema).await {
+        note(&format!(
+            "warning: could not drop schema {}: {err:#}",
+            config.schema
+        ));
+    }
+    let measured = measured?;
+
+    let (htui_commit, htui_dirty) = htui_checkout();
+    let meta = RunMeta {
+        started_at: ctx.started_at,
+        finished_at: Utc::now(),
+        corpus_ref: ctx.corpus.corpus_ref.clone(),
+        corpus_commit: ctx.corpus.commit.clone(),
+        docs: doc_counts(ctx.corpus),
+        points: ctx.corpus.point_counts(),
+        query_set: ctx.queries.set.clone(),
+        query_file: config.queries.display().to_string(),
+        query_sha256: ctx.query_sha256.to_owned(),
+        embedder: identity.to_string(),
+        embedder_identity: identity,
+        qdrant_version: services.qdrant_version.clone(),
+        collection: config.collection.clone(),
+        postgres_version: services.postgres_version.clone(),
+        htui_commit,
+        htui_dirty,
+        host: HostInfo {
+            os: std::env::consts::OS.to_owned(),
+            cpus: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            load_start,
+            load_end: read_loadavg(),
+        },
+        timings_ms: Timings {
+            model_load: ctx.model_load_ms,
+            index: index_ms,
+            pg_load: measured.pg_load_ms,
+            queries: measured.queries_ms,
+        },
+        rank_depth: RANK_DEPTH,
+    };
+    Ok(Results {
+        schema: RESULTS_SCHEMA,
+        meta,
+        queries: ctx.queries.queries.iter().map(query_record).collect(),
+        runs: measured.runs,
+    })
+}
+
+/// The backends' rows and the timings around them.
+struct Measured {
+    runs: Vec<BackendRun>,
+    pg_load_ms: f64,
+    queries_ms: f64,
+}
+
+/// Steps 9-11: the L schema, the grep index, a warm-up, then every backend per query.
+async fn measure<E: DenseEmbedder>(
+    ctx: &RunContext<'_>,
+    store: &QdrantStore<E>,
+    pool: &PgPool,
+) -> anyhow::Result<Measured> {
+    let schema = ctx.config.schema.as_str();
+    let corpus = ctx.corpus;
+    let clock = Instant::now();
+    pg_fts::load(pool, schema, &corpus.docs)
+        .await
+        .context("loading the L schema")?;
+    let pg_load_ms = elapsed_ms(clock);
+    let grep = GrepIndex::new(&corpus.docs);
+
+    // Warm-up, untimed and unrecorded: the first calls pay for connections and caches.
+    if let Some(first) = ctx.queries.queries.first() {
+        let query = search_query(corpus, &first.text, S_LIMIT);
+        for arms in [SearchArms::Hybrid, SearchArms::Dense, SearchArms::Sparse] {
+            let _ = store.search_arms(&query, arms).await;
+        }
+        let _ = pg_fts::search(pool, schema, LVariant::Or, &first.text, RANK_DEPTH).await;
+    }
+
+    let total = ctx.queries.queries.len();
+    let clock = Instant::now();
+    let mut runs = Vec::with_capacity(total * Backend::ALL.len());
+    for (done, query) in ctx.queries.queries.iter().enumerate() {
+        // S-points reads S10's response (no second call), and S10 comes first in `Backend::ALL`.
+        let mut s10: Option<(Result<Vec<Hit>, String>, f64)> = None;
+        for backend in Backend::ALL {
+            let (outcome, latency) = match backend {
+                Backend::S => qdrant(store, corpus, query, SearchArms::Hybrid, S_LIMIT, true).await,
+                Backend::S10 => {
+                    let (hits, latency) =
+                        timed_hits(store, corpus, query, SearchArms::Hybrid, S10_LIMIT).await;
+                    let outcome = ranked(&hits, true);
+                    s10 = Some((hits, latency));
+                    (outcome, latency)
+                }
+                Backend::SPoints => match &s10 {
+                    Some((hits, latency)) => (ranked(hits, false), *latency),
+                    None => (Err("S10 did not run".to_owned()), 0.0),
+                },
+                Backend::SDense => {
+                    qdrant(store, corpus, query, SearchArms::Dense, S_LIMIT, true).await
+                }
+                Backend::SSparse => {
+                    qdrant(store, corpus, query, SearchArms::Sparse, S_LIMIT, true).await
+                }
+                Backend::LAnd | Backend::LOr | Backend::LAndLen | Backend::LOrLen => {
+                    let variant = backend.l_variant().unwrap_or(LVariant::And);
+                    let clock = Instant::now();
+                    let outcome =
+                        pg_fts::search(pool, schema, variant, &query.text, RANK_DEPTH).await;
+                    (outcome.map_err(|e| format!("{e:#}")), elapsed_ms(clock))
+                }
+                Backend::G | Backend::GDens => {
+                    let tie = if backend == Backend::G {
+                        GTie::Occurrences
+                    } else {
+                        GTie::Density
+                    };
+                    let clock = Instant::now();
+                    let rows = grep.search(&query.text, tie, RANK_DEPTH);
+                    (Ok(rows), elapsed_ms(clock))
+                }
+                Backend::H => {
+                    let clock = Instant::now();
+                    let rows = lexical::htui_filter(
+                        &corpus.items,
+                        &corpus.requirements,
+                        &query.text,
+                        RANK_DEPTH,
+                    );
+                    (Ok(rows), elapsed_ms(clock))
+                }
+            };
+            runs.push(backend_run(backend, query, outcome, latency));
+        }
+        let done = done + 1;
+        if done % 10 == 0 || done == total {
+            note(&format!(
+                "ran {done}/{total} queries ({:.1} s)",
+                clock.elapsed().as_secs_f64()
+            ));
+        }
+    }
+    Ok(Measured {
+        runs,
+        pg_load_ms,
+        queries_ms: elapsed_ms(clock),
+    })
+}
+
+/// The bench's search: the one synthetic project, no filters.
+fn search_query(corpus: &Corpus, text: &str, limit: u64) -> SearchQuery {
+    SearchQuery {
+        text: text.to_owned(),
+        projects: vec![corpus.project],
+        types: vec![],
+        statuses: vec![],
+        resolutions: vec![],
+        limit,
+    }
+}
+
+/// One timed `search_arms` call (embedding included, as ANA-37 §5.5 measured).
+async fn timed_hits<E: DenseEmbedder>(
+    store: &QdrantStore<E>,
+    corpus: &Corpus,
+    query: &Query,
+    arms: SearchArms,
+    limit: u64,
+) -> (Result<Vec<Hit>, String>, f64) {
+    let search = search_query(corpus, &query.text, limit);
+    let clock = Instant::now();
+    let hits = store.search_arms(&search, arms).await;
+    (hits.map_err(|e| e.to_string()), elapsed_ms(clock))
+}
+
+async fn qdrant<E: DenseEmbedder>(
+    store: &QdrantStore<E>,
+    corpus: &Corpus,
+    query: &Query,
+    arms: SearchArms,
+    limit: u64,
+    collapse: bool,
+) -> (Result<Vec<Ranked>, String>, f64) {
+    let (hits, latency) = timed_hits(store, corpus, query, arms, limit).await;
+    (ranked(&hits, collapse), latency)
+}
+
+fn ranked(hits: &Result<Vec<Hit>, String>, collapse: bool) -> Result<Vec<Ranked>, String> {
+    match hits {
+        Ok(hits) => Ok(ranked_from_hits(hits, collapse, RANK_DEPTH)),
+        Err(message) => Err(message.clone()),
+    }
+}
+
+fn read_loadavg() -> Option<[f64; 3]> {
+    parse_loadavg(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+/// `git rev-parse HEAD` and whether `git status --porcelain` is non-empty, for the checkout this
+/// binary was built from; `("unknown", false)` without git.
+fn htui_checkout() -> (String, bool) {
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    match git(&["rev-parse", "HEAD"]) {
+        Some(commit) => {
+            let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            (commit, dirty)
+        }
+        None => ("unknown".to_owned(), false),
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +807,7 @@ mod tests {
         let long = collection_name(&"a".repeat(100));
         assert_eq!(long.len(), 48);
         assert!(long.starts_with("htui_bench_aaa"));
-        assert_eq!(collection_name("Ünï"), "htui_bench____");
+        assert_eq!(collection_name("Ünï"), "htui_bench__n_");
     }
 
     #[test]
@@ -388,10 +860,13 @@ mod tests {
         assert_eq!(record.targets, vec![CorpusId::new("R-STO-8")]);
         assert_eq!(
             record.sparse_terms,
-            htui_store::bm25::query_vector("R-STO-8").indices.len()
+            bm25::query_vector("R-STO-8").indices.len()
         );
         assert!(record.sparse_terms > 0);
-        assert_eq!(query_record(&query("d01", QueryClass::D, "?!", &[])).sparse_terms, 0);
+        assert_eq!(
+            query_record(&query("d01", QueryClass::D, "?!", &[])).sparse_terms,
+            0
+        );
     }
 
     #[test]
@@ -467,7 +942,7 @@ mod tests {
         .await;
 
         // The collection is the test's to drop, whatever happened.
-        let raw = qdrant_client::Qdrant::from_url(&qdrant)
+        let raw = Qdrant::from_url(&qdrant)
             .skip_compatibility_check()
             .build()
             .expect("client");
@@ -502,7 +977,7 @@ mod tests {
             results.meta.points
         );
 
-        let pool = crate::pg_fts::connect(&database).await.expect("Postgres");
+        let pool = pg_fts::connect(&database).await.expect("Postgres");
         let left: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1",
         )

@@ -1,10 +1,14 @@
 //! The report: per-backend metrics, paired tests and the run's provenance (MOD-162 T6).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::run::Results;
-use crate::types::{Backend, CorpusId, QueryClass};
+use anyhow::{Context as _, bail};
+
+use crate::metrics;
+use crate::run::{BackendRun, QueryRecord, RESULTS_SCHEMA, Results};
+use crate::types::{Backend, CorpusId, QueryClass, RANK_DEPTH};
 
 /// A class group of the tables: a, b, c, and a+b+c.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -179,14 +183,563 @@ pub struct Summary {
 
 /// The metrics of one run (pure).
 pub fn summarize(results: &Results) -> Summary {
-    let _ = results;
-    Summary::default()
+    let view = View::new(results);
+    let backends = view.backends.clone();
+
+    let mut cells = BTreeMap::new();
+    for &backend in &backends {
+        for group in Group::ALL {
+            cells.insert((backend, group), view.cell(backend, group));
+        }
+    }
+
+    let mut mcnemar = Vec::new();
+    if view.has(Backend::S) {
+        for &other in backends.iter().filter(|&&b| b != Backend::S) {
+            for group in Group::ALL {
+                let (mut only_s, mut only_other) = (0, 0);
+                for q in view.group(group) {
+                    match (view.hit5(Backend::S, q), view.hit5(other, q)) {
+                        (true, false) => only_s += 1,
+                        (false, true) => only_other += 1,
+                        _ => {}
+                    }
+                }
+                mcnemar.push(McNemarRow {
+                    other,
+                    group,
+                    only_s,
+                    only_other,
+                    p: metrics::mcnemar_exact(only_s, only_other),
+                });
+            }
+        }
+    }
+
+    // Highest hits@5 on duplicates, then MRR@10, then `Backend::ALL` order (`backends` is in it).
+    let mut best_lexical: Option<(Backend, Cell)> = None;
+    for &backend in backends.iter().filter(|b| b.is_lexical()) {
+        let cell = cells[&(backend, Group::A)];
+        let better = best_lexical.is_none_or(|(_, best)| {
+            cell.hit5 > best.hit5 || (cell.hit5 == best.hit5 && cell.mrr10 > best.mrr10)
+        });
+        if better {
+            best_lexical = Some((backend, cell));
+        }
+    }
+    let best_lexical = best_lexical.map(|(backend, _)| backend);
+
+    let separability = SEPARABILITY
+        .iter()
+        .filter(|(_, backend)| view.has(*backend))
+        .map(|&(name, backend)| {
+            let scores = |class: QueryClass| -> Vec<f64> {
+                view.queries
+                    .iter()
+                    .filter(|q| q.class == class)
+                    .map(|q| view.top1(backend, q))
+                    .collect()
+            };
+            let (positives, negatives) = (scores(QueryClass::A), scores(QueryClass::D));
+            SeparabilityRow {
+                name: name.to_owned(),
+                backend,
+                auc: metrics::auc(&positives, &negatives),
+                recall_zero_false_alarms: metrics::recall_at_zero_false_alarms(
+                    &positives, &negatives,
+                ),
+            }
+        })
+        .collect();
+
+    let lexical: Vec<Backend> = backends
+        .iter()
+        .copied()
+        .filter(|b| b.is_lexical())
+        .collect();
+    let (mut s_only, mut lexical_only, mut all_miss) = (Vec::new(), Vec::new(), Vec::new());
+    for q in view.group(Group::Abc) {
+        let s = view.hit5(Backend::S, q);
+        let any_lexical = lexical.iter().any(|&b| view.hit5(b, q));
+        if s && !any_lexical {
+            s_only.push(view.rescue(q));
+        }
+        if any_lexical && !s {
+            lexical_only.push(view.rescue(q));
+        }
+        if backends.iter().all(|&b| !view.hit5(b, q)) {
+            all_miss.push(view.rescue(q));
+        }
+    }
+
+    let latency = backends
+        .iter()
+        .map(|&backend| {
+            let values: Vec<f64> = results
+                .runs
+                .iter()
+                .filter(|r| r.backend == backend && r.error.is_none())
+                .map(|r| r.latency_ms)
+                .collect();
+            LatencyRow {
+                backend,
+                p50: metrics::percentile(&values, 50.0),
+                p95: metrics::percentile(&values, 95.0),
+            }
+        })
+        .collect();
+
+    let errors = results
+        .runs
+        .iter()
+        .filter_map(|r| {
+            r.error.as_ref().map(|message| ErrorRow {
+                query: r.query.clone(),
+                backend: r.backend,
+                message: message.clone(),
+            })
+        })
+        .collect();
+
+    let s_a = cells
+        .get(&(Backend::S, Group::A))
+        .copied()
+        .unwrap_or_default();
+    let vs_best = best_lexical.and_then(|best| {
+        mcnemar
+            .iter()
+            .find(|r: &&McNemarRow| r.other == best && r.group == Group::A)
+            .copied()
+    });
+    let thresholds = Thresholds {
+        s_hit5_a: s_a.hit5,
+        n_a: s_a.n,
+        recall_met: s_a.n > 0 && s_a.hit5 * RECALL_DEN >= RECALL_NUM * s_a.n,
+        best_lexical,
+        p_vs_best: vs_best.map(|r| r.p),
+        mcnemar_met: vs_best.is_some_and(|r| r.p < 0.05 && r.only_s > r.only_other),
+    };
+
+    Summary {
+        backends,
+        cells,
+        mcnemar,
+        best_lexical,
+        separability,
+        s_only,
+        lexical_only,
+        all_miss,
+        latency,
+        errors,
+        thresholds,
+    }
+}
+
+/// PRD: S recall@5 on duplicates ≥ 20/24.
+const RECALL_NUM: usize = 20;
+const RECALL_DEN: usize = 24;
+
+/// §5.4's rows: the name shown and the backend whose top-1 score it reads.
+const SEPARABILITY: [(&str, Backend); 5] = [
+    ("S hybrid RRF", Backend::S),
+    ("S-dense cosine", Backend::SDense),
+    ("S-sparse per query term", Backend::SSparse),
+    ("L-or-len", Backend::LOrLen),
+    ("G / G-dens fraction matched", Backend::G),
+];
+
+/// The results indexed for lookups.
+struct View<'a> {
+    queries: &'a [QueryRecord],
+    runs: HashMap<(Backend, &'a str), &'a BackendRun>,
+    backends: Vec<Backend>,
+}
+
+impl<'a> View<'a> {
+    fn new(results: &'a Results) -> Self {
+        let runs: HashMap<(Backend, &str), &BackendRun> = results
+            .runs
+            .iter()
+            .map(|r| ((r.backend, r.query.as_str()), r))
+            .collect();
+        let present: BTreeSet<Backend> = results.runs.iter().map(|r| r.backend).collect();
+        Self {
+            queries: &results.queries,
+            runs,
+            backends: Backend::ALL
+                .into_iter()
+                .filter(|b| present.contains(b))
+                .collect(),
+        }
+    }
+
+    fn has(&self, backend: Backend) -> bool {
+        self.backends.contains(&backend)
+    }
+
+    fn group(&self, group: Group) -> impl Iterator<Item = &'a QueryRecord> + use<'a> {
+        self.queries.iter().filter(move |q| group.contains(q.class))
+    }
+
+    fn rank(&self, backend: Backend, q: &QueryRecord) -> Option<usize> {
+        self.runs
+            .get(&(backend, q.id.as_str()))
+            .and_then(|r| r.first_rank)
+    }
+
+    fn hit5(&self, backend: Backend, q: &QueryRecord) -> bool {
+        metrics::hit_at(self.rank(backend, q), 5)
+    }
+
+    /// The top-1 score §5.4 compares; 0.0 without a hit. S-sparse's is per query term.
+    fn top1(&self, backend: Backend, q: &QueryRecord) -> f64 {
+        let score = self
+            .runs
+            .get(&(backend, q.id.as_str()))
+            .and_then(|r| r.ranked.first())
+            .map_or(0.0, |row| row.score);
+        if backend == Backend::SSparse {
+            if q.sparse_terms == 0 {
+                0.0
+            } else {
+                score / q.sparse_terms as f64
+            }
+        } else {
+            score
+        }
+    }
+
+    fn cell(&self, backend: Backend, group: Group) -> Cell {
+        let ranks: Vec<Option<usize>> = self.group(group).map(|q| self.rank(backend, q)).collect();
+        let n = ranks.len();
+        let hit1 = ranks.iter().filter(|r| metrics::hit_at(**r, 1)).count();
+        let hit5 = ranks.iter().filter(|r| metrics::hit_at(**r, 5)).count();
+        let mrr10 = if n == 0 {
+            0.0
+        } else {
+            ranks
+                .iter()
+                .map(|r| metrics::reciprocal_rank(*r, 10))
+                .sum::<f64>()
+                / n as f64
+        };
+        Cell {
+            n,
+            hit1,
+            hit5,
+            mrr10,
+            wilson5: metrics::wilson_interval(hit5, n),
+        }
+    }
+
+    fn rescue(&self, q: &QueryRecord) -> Rescue {
+        Rescue {
+            query: q.id.clone(),
+            text: q.text.clone(),
+            targets: q.targets.clone(),
+            ranks: RESCUE_BACKENDS
+                .iter()
+                .map(|&b| (b, self.rank(b, q).filter(|&r| r <= RANK_DEPTH)))
+                .collect(),
+        }
+    }
 }
 
 /// `report.md` (pure).
 pub fn render_markdown(results: &Results, summary: &Summary) -> String {
-    let _ = (results, summary);
-    String::new()
+    let meta = &results.meta;
+    let mut md = String::new();
+    let _ = writeln!(
+        md,
+        "# htui-bench: {} on {}\n",
+        meta.query_set, meta.corpus_ref
+    );
+
+    md.push_str("## Run\n\n| field | value |\n|---|---|\n");
+    let points_total = meta.points.item + meta.points.requirement + meta.points.document;
+    let points_per_s = if meta.timings_ms.index > 0.0 {
+        format!(
+            "{:.1}",
+            points_total as f64 / (meta.timings_ms.index / 1000.0)
+        )
+    } else {
+        "—".to_owned()
+    };
+    let docs: Vec<String> = meta.docs.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    let load = |l: Option<[f64; 3]>| {
+        l.map_or("—".to_owned(), |[a, b, c]| {
+            format!("{a:.2} {b:.2} {c:.2}")
+        })
+    };
+    let rows: Vec<(&str, String)> = vec![
+        ("started_at", meta.started_at.to_rfc3339()),
+        ("finished_at", meta.finished_at.to_rfc3339()),
+        ("corpus_ref", meta.corpus_ref.clone()),
+        (
+            "corpus_commit",
+            meta.corpus_commit
+                .clone()
+                .unwrap_or_else(|| "work tree".into()),
+        ),
+        ("docs", docs.join(", ")),
+        (
+            "points",
+            format!(
+                "item {}, requirement {}, document {} (total {points_total})",
+                meta.points.item, meta.points.requirement, meta.points.document
+            ),
+        ),
+        ("points/s (index)", points_per_s),
+        ("query_set", meta.query_set.clone()),
+        ("query_file", meta.query_file.clone()),
+        ("query_sha256", meta.query_sha256.clone()),
+        ("embedder", meta.embedder.clone()),
+        (
+            "embedder_identity",
+            serde_json::to_string(&meta.embedder_identity).unwrap_or_default(),
+        ),
+        ("qdrant_version", meta.qdrant_version.clone()),
+        ("collection", meta.collection.clone()),
+        ("postgres_version", meta.postgres_version.clone()),
+        ("htui_commit", meta.htui_commit.clone()),
+        ("htui_dirty", meta.htui_dirty.to_string()),
+        ("host.os", meta.host.os.clone()),
+        ("host.cpus", meta.host.cpus.to_string()),
+        ("host.load_start", load(meta.host.load_start)),
+        ("host.load_end", load(meta.host.load_end)),
+        (
+            "timings_ms.model_load",
+            meta.timings_ms
+                .model_load
+                .map_or("— (embedder passed in)".to_owned(), |t| format!("{t:.0}")),
+        ),
+        ("timings_ms.index", format!("{:.0}", meta.timings_ms.index)),
+        (
+            "timings_ms.pg_load",
+            format!("{:.0}", meta.timings_ms.pg_load),
+        ),
+        (
+            "timings_ms.queries",
+            format!("{:.0}", meta.timings_ms.queries),
+        ),
+        ("rank_depth", meta.rank_depth.to_string()),
+    ];
+    for (key, value) in rows {
+        let _ = writeln!(md, "| {key} | {} |", cell_text(&value));
+    }
+
+    let t = &summary.thresholds;
+    md.push_str("\n## Thresholds\n\n");
+    let _ = writeln!(
+        md,
+        "- S recall@5 on duplicates: {}/{} ≥ {RECALL_NUM}/{RECALL_DEN} — {}",
+        t.s_hit5_a,
+        t.n_a,
+        met(t.recall_met)
+    );
+    match (t.best_lexical, t.p_vs_best) {
+        (Some(best), Some(p)) => {
+            let _ = writeln!(
+                md,
+                "- S vs best lexical baseline ({}) on duplicates: p = {} < 0.05 — {}",
+                best.name(),
+                format_p(p),
+                met(t.mcnemar_met)
+            );
+        }
+        _ => {
+            md.push_str(
+                "- S vs best lexical baseline on duplicates: not measured (S or every lexical \
+                 baseline missing) — not met\n",
+            );
+        }
+    }
+    md.push_str("- Reproducibility: compare with a second run (htui-bench compare)\n");
+
+    let header = |md: &mut String, first: &str| {
+        let groups: Vec<String> = Group::ALL
+            .iter()
+            .map(|&g| format!("{} ({})", g.label(), group_n(summary, g)))
+            .collect();
+        let _ = writeln!(md, "| {first} | {} |", groups.join(" | "));
+        let _ = writeln!(md, "|---|{}", "---|".repeat(Group::ALL.len()));
+    };
+
+    md.push_str("\n## Results (recall@1 / recall@5 / MRR@10)\n\n");
+    header(&mut md, "backend");
+    for &backend in &summary.backends {
+        let cells: Vec<String> = Group::ALL
+            .iter()
+            .map(|&g| {
+                let c = summary
+                    .cells
+                    .get(&(backend, g))
+                    .copied()
+                    .unwrap_or_default();
+                format!(
+                    "{:.2} / {:.2} / {:.2}",
+                    ratio(c.hit1, c.n),
+                    ratio(c.hit5, c.n),
+                    c.mrr10
+                )
+            })
+            .collect();
+        let _ = writeln!(md, "| {} | {} |", backend.name(), cells.join(" | "));
+    }
+    md.push_str("\nS-points ranks points, not corpus IDs (ANA-37 §11).\n");
+
+    md.push_str("\n## Recall@5 with Wilson 95% intervals\n\n");
+    header(&mut md, "backend");
+    for &backend in &summary.backends {
+        let cells: Vec<String> = Group::ALL
+            .iter()
+            .map(|&g| {
+                let c = summary
+                    .cells
+                    .get(&(backend, g))
+                    .copied()
+                    .unwrap_or_default();
+                format!("{}/{} ({:.2}-{:.2})", c.hit5, c.n, c.wilson5.0, c.wilson5.1)
+            })
+            .collect();
+        let _ = writeln!(md, "| {} | {} |", backend.name(), cells.join(" | "));
+    }
+
+    md.push_str("\n## Paired exact McNemar on recall@5, S against each backend\n\n");
+    if summary.mcnemar.is_empty() {
+        md.push_str("none (S did not run)\n");
+    } else {
+        let groups: Vec<String> = Group::ALL
+            .iter()
+            .map(|g| format!("{0} S only | {0} other only | {0} p", g.label()))
+            .collect();
+        let _ = writeln!(md, "| backend | {} |", groups.join(" | "));
+        let _ = writeln!(md, "|---|{}", "---|".repeat(3 * Group::ALL.len()));
+        for &other in summary.backends.iter().filter(|&&b| b != Backend::S) {
+            let cells: Vec<String> = Group::ALL
+                .iter()
+                .map(|&g| {
+                    summary
+                        .mcnemar
+                        .iter()
+                        .find(|r| r.other == other && r.group == g)
+                        .map_or("— | — | —".to_owned(), |r| {
+                            format!("{} | {} | {}", r.only_s, r.only_other, format_p(r.p))
+                        })
+                })
+                .collect();
+            let _ = writeln!(md, "| {} | {} |", other.name(), cells.join(" | "));
+        }
+    }
+
+    md.push_str("\n## Separability of the top-1 score (duplicates against no-target)\n\n");
+    md.push_str("| score | AUC | recall at zero false alarms |\n|---|---|---|\n");
+    let two = |v: Option<f64>| v.map_or("—".to_owned(), |v| format!("{v:.2}"));
+    for row in &summary.separability {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} |",
+            row.name,
+            two(row.auc),
+            two(row.recall_zero_false_alarms)
+        );
+    }
+
+    for (title, list) in [
+        (
+            "S finds it in the top 5 and every lexical baseline misses",
+            &summary.s_only,
+        ),
+        (
+            "A lexical baseline finds it in the top 5 and S misses",
+            &summary.lexical_only,
+        ),
+        ("Every backend misses the top 5", &summary.all_miss),
+    ] {
+        let _ = writeln!(md, "\n## {title}\n");
+        if list.is_empty() {
+            md.push_str("none\n");
+            continue;
+        }
+        let names: Vec<&str> = RESCUE_BACKENDS.iter().map(|b| b.name()).collect();
+        let _ = writeln!(md, "| query | text | targets | {} |", names.join(" / "));
+        md.push_str("|---|---|---|---|\n");
+        for rescue in list {
+            let targets: Vec<&str> = rescue.targets.iter().map(CorpusId::as_str).collect();
+            let ranks: Vec<String> = rescue
+                .ranks
+                .iter()
+                .map(|(_, r)| r.map_or("–".to_owned(), |r| r.to_string()))
+                .collect();
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} |",
+                rescue.query,
+                cut_text(&rescue.text),
+                targets.join(", "),
+                ranks.join(" / ")
+            );
+        }
+    }
+
+    md.push_str("\n## Latency (ms, p50 / p95)\n\n| backend | p50 | p95 |\n|---|---|---|\n");
+    let ms = |v: Option<f64>| v.map_or("—".to_owned(), |v| format!("{v:.1}"));
+    for row in &summary.latency {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} |",
+            row.backend.name(),
+            ms(row.p50),
+            ms(row.p95)
+        );
+    }
+
+    md.push_str("\n## Errors\n\n");
+    if summary.errors.is_empty() {
+        md.push_str("none\n");
+    } else {
+        md.push_str("| query | backend | message |\n|---|---|---|\n");
+        for e in &summary.errors {
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} |",
+                e.query,
+                e.backend.name(),
+                cell_text(&e.message)
+            );
+        }
+    }
+
+    md.push_str("\n## Threats to validity\n\n");
+    md.push_str(THREATS);
+    md
+}
+
+/// The fixed threats section (blueprint §4.2).
+const THREATS: &str = "\
+- The author knew the targets when writing the queries (ANA-37 §5.9).
+- The queries are re-authored from ANA-37 §5.3, not ANA-37's lost set: easier or harder in ways no \
+table here shows.
+- Hybrid (RRF) ties reorder between runs; compare two runs before reading a one-query difference.
+- The corpus is the markdown at a pinned commit, not htui's Postgres rows.
+- This corpus chunks to 777 document points at the pin against ANA-37's 759 (blueprint F3).
+";
+
+fn met(yes: bool) -> &'static str {
+    if yes { "met" } else { "not met" }
+}
+
+fn ratio(k: usize, n: usize) -> f64 {
+    if n == 0 { 0.0 } else { k as f64 / n as f64 }
+}
+
+/// Queries in a group (the same for every backend).
+fn group_n(summary: &Summary, group: Group) -> usize {
+    summary
+        .backends
+        .first()
+        .and_then(|&b| summary.cells.get(&(b, group)))
+        .map_or(0, |c| c.n)
 }
 
 /// Writes `<out>/results.json` and `<out>/report.md`, creating `out`.
@@ -194,8 +747,16 @@ pub fn render_markdown(results: &Results, summary: &Summary) -> String {
 /// # Errors
 /// A directory or file that cannot be written.
 pub fn write(results: &Results, out: &Path) -> anyhow::Result<()> {
-    let _ = (results, out);
-    anyhow::bail!("report::write: not implemented yet (MOD-162 T6)")
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut json = serde_json::to_string_pretty(results).context("serialising the results")?;
+    json.push('\n');
+    let results_path = out.join("results.json");
+    std::fs::write(&results_path, json)
+        .with_context(|| format!("writing {}", results_path.display()))?;
+    let report_path = out.join("report.md");
+    std::fs::write(&report_path, render_markdown(results, &summarize(results)))
+        .with_context(|| format!("writing {}", report_path.display()))?;
+    Ok(())
 }
 
 /// A results file, or a directory holding `results.json`.
@@ -203,8 +764,23 @@ pub fn write(results: &Results, out: &Path) -> anyhow::Result<()> {
 /// # Errors
 /// A missing or unreadable file, or another schema.
 pub fn load_results(path: &Path) -> anyhow::Result<Results> {
-    let _ = path;
-    anyhow::bail!("report::load_results: not implemented yet (MOD-162 T6)")
+    let file = if path.is_dir() {
+        path.join("results.json")
+    } else {
+        path.to_path_buf()
+    };
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let results: Results =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+    if results.schema != RESULTS_SCHEMA {
+        bail!(
+            "{} has schema {}, this build reads schema {RESULTS_SCHEMA}",
+            file.display(),
+            results.schema
+        );
+    }
+    Ok(results)
 }
 
 /// Hits@5 of one backend and group in two runs.
@@ -254,25 +830,163 @@ pub struct Comparison {
 
 /// Compares two runs (pure).
 pub fn compare(a: &Results, b: &Results) -> Comparison {
-    let _ = (a, b);
-    Comparison::default()
+    let same_queries = a.meta.query_sha256 == b.meta.query_sha256;
+    let in_b: BTreeSet<&str> = b.queries.iter().map(|q| q.id.as_str()).collect();
+    let common: Vec<&QueryRecord> = a
+        .queries
+        .iter()
+        .filter(|q| in_b.contains(q.id.as_str()))
+        .collect();
+    let (view_a, view_b) = (View::new(a), View::new(b));
+    let backends: Vec<Backend> = Backend::ALL
+        .into_iter()
+        .filter(|&backend| view_a.has(backend) || view_b.has(backend))
+        .collect();
+
+    let mut rows = Vec::new();
+    for &backend in &backends {
+        for group in Group::ALL {
+            let queries: Vec<&QueryRecord> = common
+                .iter()
+                .copied()
+                .filter(|q| group.contains(q.class))
+                .collect();
+            let hits = |view: &View<'_>| queries.iter().filter(|q| view.hit5(backend, q)).count();
+            let (hit5_a, hit5_b) = (hits(&view_a), hits(&view_b));
+            rows.push(CompareRow {
+                backend,
+                group,
+                n: queries.len(),
+                hit5_a,
+                hit5_b,
+                delta: hit5_b as i64 - hit5_a as i64,
+            });
+        }
+    }
+
+    let top = |view: &View<'_>, backend: Backend, id: &str| -> Vec<CorpusId> {
+        view.runs.get(&(backend, id)).map_or_else(Vec::new, |r| {
+            r.ranked
+                .iter()
+                .take(RANK_DEPTH)
+                .map(|row| row.id.clone())
+                .collect()
+        })
+    };
+    let changed = backends
+        .iter()
+        .map(|&backend| ChangedTop {
+            backend,
+            queries: common
+                .iter()
+                .filter(|q| top(&view_a, backend, &q.id) != top(&view_b, backend, &q.id))
+                .map(|q| q.id.clone())
+                .collect(),
+        })
+        .collect();
+
+    let s_within_one_per_class = view_a.has(Backend::S)
+        && view_b.has(Backend::S)
+        && rows
+            .iter()
+            .filter(|r| r.backend == Backend::S && r.group != Group::Abc)
+            .all(|r| r.delta.abs() <= 1);
+
+    Comparison {
+        same_queries,
+        sha256_a: a.meta.query_sha256.clone(),
+        sha256_b: b.meta.query_sha256.clone(),
+        common_queries: common.len(),
+        rows,
+        changed,
+        s_within_one_per_class,
+    }
 }
 
 /// The comparison as markdown (pure).
 pub fn render_comparison(c: &Comparison) -> String {
-    let _ = c;
-    String::new()
+    let mut md = String::new();
+    if !c.same_queries {
+        let _ = writeln!(
+            md,
+            "**Warning:** the runs used different query files (sha256 {} against {}); compared \
+             over the {} query ids both hold.\n",
+            c.sha256_a, c.sha256_b, c.common_queries
+        );
+    }
+    md.push_str("# htui-bench compare\n\n## Recall@5 hits, run A → run B (Δ)\n\n");
+    let groups: Vec<String> = Group::ALL
+        .iter()
+        .map(|&g| {
+            let n = c.rows.iter().find(|r| r.group == g).map_or(0, |r| r.n);
+            format!("{} ({n})", g.label())
+        })
+        .collect();
+    let _ = writeln!(md, "| backend | {} |", groups.join(" | "));
+    let _ = writeln!(md, "|---|{}", "---|".repeat(Group::ALL.len()));
+    let mut backends: Vec<Backend> = c.rows.iter().map(|r| r.backend).collect();
+    backends.dedup();
+    for backend in backends {
+        let cells: Vec<String> = Group::ALL
+            .iter()
+            .map(|&g| {
+                c.rows
+                    .iter()
+                    .find(|r| r.backend == backend && r.group == g)
+                    .map_or("—".to_owned(), |r| {
+                        format!("{} → {} ({:+})", r.hit5_a, r.hit5_b, r.delta)
+                    })
+            })
+            .collect();
+        let _ = writeln!(md, "| {} | {} |", backend.name(), cells.join(" | "));
+    }
+
+    md.push_str(
+        "\n## Queries whose top 10 changed\n\n| backend | count | queries |\n|---|---|---|\n",
+    );
+    for ch in &c.changed {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} |",
+            ch.backend.name(),
+            ch.queries.len(),
+            ch.queries.join(", ")
+        );
+    }
+    let _ = writeln!(
+        md,
+        "\nS recall@5 within one query per class: {}",
+        if c.s_within_one_per_class {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    md
 }
 
 /// A McNemar p: `{:.4}`, or `< 0.0001` below that.
 fn format_p(p: f64) -> String {
-    let _ = p;
-    String::new()
+    if p >= 0.0001 {
+        format!("{p:.4}")
+    } else {
+        "< 0.0001".to_owned()
+    }
 }
 
 /// A table cell: at most 80 chars (`…` marks a cut), `|` escaped.
 fn cut_text(text: &str) -> String {
-    text.to_owned()
+    let cut: String = if text.chars().count() > 80 {
+        text.chars().take(79).chain(std::iter::once('…')).collect()
+    } else {
+        text.to_owned()
+    };
+    cell_text(&cut)
+}
+
+/// A table cell's text: `|` escaped, line breaks as spaces.
+fn cell_text(text: &str) -> String {
+    text.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
 #[cfg(test)]
@@ -323,10 +1037,15 @@ mod tests {
             finished_at: DateTime::from_timestamp(1_760_000_100, 0).expect("time"),
             corpus_ref: "d15e9fea".into(),
             corpus_commit: Some("d15e9fea0000000000000000000000000000beef".into()),
-            docs: [("open_item", 3), ("requirement", 1), ("decision", 1), ("total", 5)]
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v))
-                .collect(),
+            docs: [
+                ("open_item", 3),
+                ("requirement", 1),
+                ("decision", 1),
+                ("total", 5),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
             points: PointCounts {
                 item: 4,
                 requirement: 1,
@@ -419,7 +1138,12 @@ mod tests {
         let mut runs = Vec::new();
         for (i, query) in queries.iter().enumerate() {
             for (backend, lists) in &table {
-                runs.push(backend_run(*backend, query, lists[i], 10.0 * (i + 1) as f64));
+                runs.push(backend_run(
+                    *backend,
+                    query,
+                    lists[i],
+                    10.0 * (i + 1) as f64,
+                ));
             }
         }
         let failed = runs
@@ -634,7 +1358,10 @@ mod tests {
     fn render_markdown_has_thresholds_tables_and_rank_markers() {
         let results = fixture();
         let md = render_markdown(&results, &summarize(&results));
-        assert!(md.starts_with("# htui-bench: fixture on d15e9fea\n"), "{md}");
+        assert!(
+            md.starts_with("# htui-bench: fixture on d15e9fea\n"),
+            "{md}"
+        );
         for heading in [
             "## Run",
             "## Thresholds",
@@ -663,9 +1390,7 @@ mod tests {
             "{md}"
         );
         assert!(
-            md.contains(
-                "| a duplicates (2) | b questions (1) | c identifiers (1) | a+b+c (4) |"
-            ),
+            md.contains("| a duplicates (2) | b questions (1) | c identifiers (1) | a+b+c (4) |"),
             "{md}"
         );
         assert!(
@@ -673,7 +1398,10 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("| S | 1/2 ("), "{md}");
-        assert!(md.contains("| a01 | the text of a01 | MOD-1 | 1 / 2 / – / – / – / – |"), "{md}");
+        assert!(
+            md.contains("| a01 | the text of a01 | MOD-1 | 1 / 2 / – / – / – / – |"),
+            "{md}"
+        );
         assert!(md.contains("| d02 | H | boom |"), "{md}");
         assert!(md.contains(&"ab".repeat(32)), "the full sha256\n{md}");
         assert!(md.contains("777"), "the F3 threat\n{md}");

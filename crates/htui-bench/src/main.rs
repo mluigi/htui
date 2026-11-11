@@ -2,7 +2,12 @@
 
 use std::path::PathBuf;
 
+use anyhow::{Context as _, bail};
 use clap::Parser as _;
+use htui_bench::run::{self, RunConfig};
+use htui_bench::{corpus, queries, report};
+use htui_core::qdrant::QdrantUrl;
+use htui_store::qdrant_settings::QdrantSettings;
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "htui-bench", about = "MOD-162 retrieval benchmark (dev tool)")]
@@ -81,15 +86,163 @@ struct CompareArgs {
 /// The flag (or its `HTUI_BENCH_*` variable, which clap reads), else the `HTUI_TEST_*` fallback;
 /// a blank value is unset.
 fn pick(flag: Option<String>, fallback: Option<String>) -> Option<String> {
-    let _ = (flag, fallback);
-    None
+    flag.filter(|v| !v.trim().is_empty())
+        .or_else(|| fallback.filter(|v| !v.trim().is_empty()))
+}
+
+/// [`pick`] with the fallback read from the environment, or an error naming both variables.
+fn resolve(
+    flag: Option<String>,
+    primary: &str,
+    fallback: &str,
+    what: &str,
+) -> anyhow::Result<String> {
+    pick(flag, std::env::var(fallback).ok())
+        .with_context(|| format!("no {what}: pass the flag, or set {primary} or {fallback}"))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let _ = cli.command;
-    anyhow::bail!("htui-bench: the CLI lands with MOD-162 T6")
+    match Cli::parse().command {
+        Command::Run(args) => run(args).await,
+        Command::Validate(args) => validate(&args),
+        Command::Freeze(args) => freeze(&args),
+        Command::Compare(args) => compare(&args),
+    }
+}
+
+async fn run(args: RunArgs) -> anyhow::Result<()> {
+    let results_path = args.out.join("results.json");
+    if results_path.exists() && !args.force {
+        bail!(
+            "{} exists; pass --force to overwrite it",
+            results_path.display()
+        );
+    }
+    let qdrant_url = resolve(
+        args.qdrant_url,
+        "HTUI_BENCH_QDRANT_URL",
+        "HTUI_TEST_QDRANT_URL",
+        "Qdrant URL",
+    )?;
+    let url = QdrantUrl::parse(&qdrant_url)
+        .map_err(|e| anyhow::anyhow!("the Qdrant URL is not valid: {e}"))?;
+    // The key only ever comes from the environment, never a flag, and is never printed.
+    let api_key = std::env::var("HTUI_BENCH_QDRANT_API_KEY").ok();
+    let database_url = resolve(
+        args.database_url,
+        "HTUI_BENCH_DATABASE_URL",
+        "HTUI_TEST_DATABASE_URL",
+        "Postgres DSN",
+    )?;
+    let collection = args
+        .collection
+        .unwrap_or_else(|| run::collection_name(&args.set.corpus_ref));
+    let config = RunConfig {
+        repo: args.set.repo,
+        corpus_ref: args.set.corpus_ref,
+        queries: args.set.queries,
+        out: args.out,
+        qdrant: QdrantSettings::new(url, api_key),
+        database_url,
+        collection,
+        schema: args.schema,
+    };
+    let results = run::run(&config).await?;
+    report::write(&results, &config.out)?;
+    let summary = report::summarize(&results);
+    println!("{}", config.out.join("results.json").display());
+    println!("{}", config.out.join("report.md").display());
+    println!(
+        "S recall@5 on duplicates: {}/{}",
+        summary.thresholds.s_hit5_a, summary.thresholds.n_a
+    );
+    Ok(())
+}
+
+fn validate(args: &SetArgs) -> anyhow::Result<()> {
+    let frozen = queries::load_frozen(&args.queries)?;
+    let corpus = corpus::build(&args.repo, &args.corpus_ref)?;
+    if frozen.set.corpus_ref != args.corpus_ref {
+        eprintln!(
+            "htui-bench: warning: the query set was written against {}, the corpus is {}",
+            frozen.set.corpus_ref, args.corpus_ref
+        );
+    }
+    let ids = corpus.ids();
+    let unknown = queries::validate(&frozen.set.queries, &ids);
+    if !unknown.is_empty() {
+        for target in &unknown {
+            eprintln!("{target}");
+        }
+        bail!(
+            "{} unknown target(s) against {}",
+            unknown.len(),
+            args.corpus_ref
+        );
+    }
+    println!(
+        "{} queries (sha256 {}) valid against {} ({} documents)",
+        frozen.set.queries.len(),
+        frozen.sha256,
+        args.corpus_ref,
+        ids.len()
+    );
+    Ok(())
+}
+
+fn freeze(args: &FreezeArgs) -> anyhow::Result<()> {
+    let bytes = std::fs::read(&args.queries)
+        .with_context(|| format!("reading {}", args.queries.display()))?;
+    let set = queries::parse(&bytes)?;
+    queries::check_shape(&set)?;
+    let sha = queries::sha256_hex(&bytes);
+    let file_name = args
+        .queries
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no file name", args.queries.display()))?;
+    let sidecar = queries::sidecar_path(&args.queries);
+    if sidecar.exists() {
+        let text = std::fs::read_to_string(&sidecar)
+            .with_context(|| format!("reading {}", sidecar.display()))?;
+        match queries::parse_sidecar(&text) {
+            Ok(old) if old == sha => {
+                println!("{} already holds {sha}; nothing written", sidecar.display());
+                return Ok(());
+            }
+            Ok(old) if !args.force => bail!(
+                "{} holds {old}, the file hashes to {sha}; pass --force to re-freeze",
+                sidecar.display()
+            ),
+            Err(err) if !args.force => {
+                return Err(err.context(format!(
+                    "{} is not a sidecar; pass --force to overwrite it",
+                    sidecar.display()
+                )));
+            }
+            _ => {}
+        }
+    }
+    std::fs::write(&sidecar, queries::sidecar_line(&sha, file_name))
+        .with_context(|| format!("writing {}", sidecar.display()))?;
+    println!("froze {} at {sha}", args.queries.display());
+    Ok(())
+}
+
+fn compare(args: &CompareArgs) -> anyhow::Result<()> {
+    let a = report::load_results(&args.a)?;
+    let b = report::load_results(&args.b)?;
+    let comparison = report::compare(&a, &b);
+    if !comparison.same_queries {
+        eprintln!(
+            "htui-bench: warning: the two runs used different query files; comparing the {} \
+             query ids both hold",
+            comparison.common_queries
+        );
+    }
+    print!("{}", report::render_comparison(&comparison));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -108,11 +261,8 @@ mod tests {
         };
         assert_eq!(args.out, PathBuf::from("target/bench/x"));
         assert!(!args.force);
-        assert_eq!(args.set.corpus_ref, htui_bench::corpus::DEFAULT_PIN);
-        assert_eq!(
-            args.set.queries,
-            PathBuf::from(htui_bench::queries::DEFAULT_FILE)
-        );
+        assert_eq!(args.set.corpus_ref, corpus::DEFAULT_PIN);
+        assert_eq!(args.set.queries, PathBuf::from(queries::DEFAULT_FILE));
         assert_eq!(args.schema, htui_bench::pg_fts::SCHEMA);
         assert_eq!(args.collection, None);
     }
@@ -169,7 +319,7 @@ mod tests {
             panic!("not freeze");
         };
         assert!(!args.force);
-        assert_eq!(args.queries, PathBuf::from(htui_bench::queries::DEFAULT_FILE));
+        assert_eq!(args.queries, PathBuf::from(queries::DEFAULT_FILE));
         assert!(matches!(
             parse(&["freeze", "--force"]).expect("freeze").command,
             Command::Freeze(FreezeArgs { force: true, .. })
@@ -192,7 +342,10 @@ mod tests {
             Some("flag")
         );
         assert_eq!(pick(None, Some("test".into())).as_deref(), Some("test"));
-        assert_eq!(pick(Some("  ".into()), Some("test".into())).as_deref(), Some("test"));
+        assert_eq!(
+            pick(Some("  ".into()), Some("test".into())).as_deref(),
+            Some("test")
+        );
         assert_eq!(pick(None, Some(String::new())), None);
         assert_eq!(pick(None, None), None);
     }
