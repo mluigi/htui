@@ -421,10 +421,19 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool");
-        assert!(load(&pool, "a;b", &[]).await.is_err());
-        assert!(search(&pool, "Upper", LVariant::And, "x", 1).await.is_err());
-        let err = drop_schema(&pool, "").await.expect_err("refused");
-        assert!(err.to_string().contains("schema"), "{err}");
+        // Nothing listens on port 1, so only `checked()` can produce this message: without it
+        // each call fails on the connection instead.
+        let refused = |err: anyhow::Error| {
+            let shown = format!("{err:#}");
+            assert!(shown.contains("invalid schema name"), "{shown}");
+        };
+        refused(load(&pool, "a;b", &[]).await.expect_err("load refused"));
+        refused(
+            search(&pool, "Upper", LVariant::And, "x", 1)
+                .await
+                .expect_err("search refused"),
+        );
+        refused(drop_schema(&pool, "").await.expect_err("drop_schema refused"));
     }
 
     #[test]
