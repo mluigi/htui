@@ -1404,7 +1404,30 @@ mod tests {
         );
         assert!(md.contains("| d02 | H | boom |"), "{md}");
         assert!(md.contains(&"ab".repeat(32)), "the full sha256\n{md}");
-        assert!(md.contains("777"), "the F3 threat\n{md}");
+        // The F3 threat reads the run's own point counts, never the pin's 777.
+        assert!(
+            md.contains(
+                "- This corpus chunks to 5 document points (10 points in all) at d15e9fea against \
+                 ANA-37's 759 (blueprint F3).\n"
+            ),
+            "the F3 threat\n{md}"
+        );
+        assert!(!md.contains("777"), "{md}");
+    }
+
+    #[test]
+    fn the_f3_threat_follows_the_run_metadata() {
+        let mut results = fixture();
+        results.meta.corpus_ref = "WORKTREE".into();
+        results.meta.points.document = 812;
+        let md = render_markdown(&results, &summarize(&results));
+        assert!(
+            md.contains(
+                "- This corpus chunks to 812 document points (817 points in all) at WORKTREE \
+                 against ANA-37's 759 (blueprint F3).\n"
+            ),
+            "{md}"
+        );
     }
 
     #[test]

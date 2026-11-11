@@ -1472,9 +1472,10 @@ not a continuation
             counts.document,
             counts.item + counts.requirement + counts.document
         );
-        assert_eq!(counts.item, 201);
-        assert_eq!(counts.requirement, 121);
-        assert!(counts.document >= 700, "{counts:?}");
+        assert_eq!(counts.item, 201, "{counts:?}");
+        assert_eq!(counts.requirement, 121, "{counts:?}");
+        // Blueprint F3: 777 document points at the pin (ANA-37 had 759).
+        assert_eq!(counts.document, 777, "{counts:?}");
         let points = corpus.points();
         let unique: BTreeSet<Uuid> = points.iter().map(|p| p.id()).collect();
         assert_eq!(unique.len(), points.len());
