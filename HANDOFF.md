@@ -859,6 +859,15 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 247 (`htui-core/tests/mem_s
   and question queries; report dense-only beside the hybrid; rerun the agent trial on a corpus that does
   not fit one read. The workspace-scale gain stays unmeasured until it runs. MOD-169 runs its memory
   measurements on this harness. Not blocked; the workspace rerun needs MOD-112 (4) and MOD-8.
+  **Phase 1 landed (hr/MOD-162, 2026-11-11):** M1 harness in the repo as the dev-tool crate
+  `crates/htui-bench` (`docs/htui-bench.md`): corpus from a pinned commit (`d15e9fea`, 1,099 points), every
+  ANA-37 backend plus htui's own no-Qdrant search (H), re-authored 72-query set frozen with its sha256
+  (`e533bb66`; the ANA-37 originals were lost), statistics, report; `htui-store` gains
+  `QdrantStore::search_arms` (dense-only, sparse-only; the hybrid request unchanged, unit-pinned). Owed on the
+  host: `qdrant_live`, the bench's live wiring test and the two reference runs
+  (`docs/benchmarks/mod-162-m1-2026-11-11.md`; the sandbox Qdrant times out). M2 (workspace corpus from
+  Postgres) and M3 (agent trial, blocked on MOD-112 (1)) open: PRD
+  `.claude/prds/mod-162-retrieval-benchmark.prd.md`.
 - [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
   `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
   shared across projects and workspaces, with per-project overrides, as a **group of the Toolbox

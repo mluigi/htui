@@ -46,6 +46,15 @@ and the reverse; latency percentiles; run metadata (pin, query hash, embedder id
 load). The PRD's thresholds are checked and printed: S recall@5 on duplicates ≥ 20/24, and S ahead of the best
 lexical baseline with p < 0.05.
 
+**Failed calls are never read as results.** A backend call that errors (a Qdrant timeout, a dropped Postgres)
+still counts as a miss in the cells, but the cell carries a `(k err)` marker, the Errors table lists it (an
+S-points failure that only repeats S10's is marked as such and counted once), and stderr prints the number of
+distinct failed calls. A lexical backend with any failed call on a duplicate query is never chosen as the best
+lexical baseline. If S, or every lexical baseline, failed on a duplicate query, both threshold lines read
+`not measured (N failed calls)` instead of met or not met. A p-value is printed to three significant digits,
+with more digits when rounding would carry it across 0.05. `htui_dirty` in the run metadata is `null`
+("unknown") when git could not tell.
+
 ## Running it
 
 Needs a scratch Qdrant (1.19.x, as `compose.yaml` pins), a Postgres, and the 133 MB embedding model, which
@@ -100,4 +109,11 @@ Carried over from ANA-37 §5.9, plus what this rebuild adds:
 - **Hybrid results are not deterministic.** Qdrant orders tied RRF scores arbitrarily, so the S rows can
   differ between runs; `compare` shows by how much.
 - **L and G are untuned and carry no IDF;** H is htui's real no-Qdrant behaviour and is deliberately weak.
+- **L-and is "AND as parsed".** `websearch_to_tsquery` reads a bare `or` as the OR operator, and `&` binds
+  tighter than `|`, so a query like a05 ("approve or refuse …") runs as `'approv' | ('refus' & …)` under L-and:
+  far looser than AND. The L variants report what Postgres full-text search does with the text as written.
+- **The live `search == search_arms(Hybrid)` test is no evidence on its own.** `search` delegates to
+  `search_arms(Hybrid)`, so the live test only shows Qdrant answers the same request the same way up to tie
+  order. What guards production behaviour is the unit test that compares the built request byte for byte with
+  the pre-MOD-162 builder (`hybrid_request_is_the_request_search_sent_before_mod_162`).
 - **Latency** depends on the host's load, which the report records.

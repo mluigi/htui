@@ -87,7 +87,7 @@ statistics above, and a report. Search goes through the production search code, 
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Harness and reproduction | One command rebuilds the `d15e9fea` corpus, checks the frozen query hash, runs every backend through htui's real search and prints a report that reproduces ANA-37's duplicate headline | in-progress | `.claude/plans/mod-162-m1-retrieval-benchmark.plan.md` |
+| 1 | Harness and reproduction | One command rebuilds the `d15e9fea` corpus, checks the frozen query hash, runs every backend through htui's real search and prints a report that reproduces ANA-37's duplicate headline | in-progress (code done 2026-11-11 on hr/MOD-162; the two reference runs and the live Qdrant tests owed on the host, `docs/benchmarks/mod-162-m1-2026-11-11.md`) | `.claude/plans/mod-162-m1-retrieval-benchmark.plan.md` |
 | 2 | Workspace corpus from Postgres | The harness builds its corpus from a workspace's Postgres rows (several projects, notes, transcripts) and carries cross-project duplicate and question queries; tested on seeded fixtures; the real run owed on the host once ≥2 projects hold content | pending | — |
 | 3 | Agent trial at workspace scale | The A/B trial reruns on a corpus that does not fit one read, lexical arm = MCP read tools with a text filter; design deferred | pending (blocked on MOD-112 (1), M2) | — |
 
