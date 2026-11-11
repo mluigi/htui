@@ -1242,6 +1242,23 @@ fn phase_fk_refused(err: sqlx::Error, phase: &StepGraphPhase) -> StoreError {
     map_sqlx(err)
 }
 
+/// MOD-139 M1 F1: `fk_run_step_parent_step`'s `23503` in `MemStore`'s sentence. The key is
+/// `(run_id, parent_step_id)`, so an unknown parent and a step of another run are one violation
+/// and one sentence; anything else through [`map_sqlx`].
+fn parent_fk_refused(err: sqlx::Error, parent: Option<StepId>, run: RunId) -> StoreError {
+    if let sqlx::Error::Database(db) = &err
+        && db.constraint() == Some("fk_run_step_parent_step")
+        && let Some(parent) = parent
+    {
+        return StoreError::Constraint(references_no_row(
+            "run_step.parent_step_id",
+            parent,
+            &format!("run_step of run {run}"),
+        ));
+    }
+    map_sqlx(err)
+}
+
 /// MOD-137 D3: the three `uq_step_graph_*_name` partial uniques' `23505` and the two owner FKs'
 /// `23503` in `MemStore`'s sentences; anything else through [`map_sqlx`].
 fn graph_name_refused(err: sqlx::Error, name: &str, scope: GraphScope) -> StoreError {
@@ -7134,13 +7151,16 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`] on an unknown run or agent (foreign key), a repeated `id`
     /// (primary key) or a repeated `(run_id, position, attempt, fanout_index)` — the table's own
-    /// `UNIQUE`, which is why this writer has no guard of its own. [`run_step_refusal`] first,
+    /// `UNIQUE`, which is why this writer has no guard of its own. A parent that is no step of the
+    /// run (`(run_id, parent_step_id)`'s key, MOD-139 M1 F1) is refused in `MemStore`'s sentence
+    /// through [`parent_fk_refused`]. [`run_step_refusal`] first,
     /// before any statement (MOD-139 blueprint P-7), so both stores refuse a part without its
     /// parent or key, or a stage off its reserved positions, in one sentence.
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         if let Some(refusal) = run_step_refusal(&new) {
             return Err(StoreError::Constraint(refusal));
         }
+        let (parent, run) = (new.parent_step_id, new.run_id);
         sqlx::query_as!(
             RunStep,
             r#"
@@ -7189,7 +7209,7 @@ impl WriteStore for PgStore {
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(|err| parent_fk_refused(err, parent, run))
     }
 
     /// §4.3's compare-and-set on `run.status`, in [`WriteStore::transition`]'s shape with §4.3's

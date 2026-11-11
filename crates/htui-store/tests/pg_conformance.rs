@@ -50,15 +50,16 @@ use htui_store::testkit as common;
 /// and MOD-138 M2's three `record_branch` cases (plan D5, Q-A) make it 233,
 /// and MOD-138 M3's W5 mixed-`asks_you` case (plan D8, Q-3) makes it 234,
 /// and MOD-147 M1's fourteen scope-row and owner-document cases (plan D1-D9, A1, A2) make it 248,
-/// and MOD-139 M1's nine divided fan-out record cases (plan D1, D4-D6) make it 257.
-const EXPECTED_CASES: usize = 257;
+/// and MOD-139 M1's nine divided fan-out record cases (plan D1, D4-D6) make it 257,
+/// and MOD-139 M1 F1's cross-run parent case makes it 258.
+const EXPECTED_CASES: usize = 258;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (257 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (258 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -68,7 +69,7 @@ fn case_list_matches_mem_store() {
          MOD-144's nine item-status cases and its R1 `block_if_idle` case, and MOD-138 M2's \
          closed-`if`-set case and three `record_branch` cases, MOD-138 M3's W5 \
          mixed-`asks_you` case, and MOD-147 M1's fourteen scope-row and owner-document cases, and MOD-139 M1's \
-         nine divided fan-out record cases)"
+         nine divided fan-out record cases and its F1 cross-run parent case)"
     );
 }
 

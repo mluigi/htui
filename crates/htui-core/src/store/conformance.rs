@@ -355,6 +355,7 @@ pub const CASES: &[&str] = &[
     "create_step_refuses_a_part_without_parent_or_key",
     "create_step_reserves_negative_positions_for_stages",
     "create_step_refuses_an_unknown_parent_step",
+    "create_step_refuses_a_parent_in_another_run",
     "insert_run_plan_writes_a_proposed_revision",
     "insert_run_plan_refuses_a_taken_revision_or_id",
     "insert_run_plan_refusal_order",
@@ -1120,6 +1121,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "create_step_refuses_an_unknown_parent_step" => {
             Box::pin(create_step_refuses_an_unknown_parent_step(store)).await;
+        }
+        "create_step_refuses_a_parent_in_another_run" => {
+            Box::pin(create_step_refuses_a_parent_in_another_run(store)).await;
         }
         "insert_run_plan_writes_a_proposed_revision" => {
             Box::pin(insert_run_plan_writes_a_proposed_revision(store)).await;
@@ -28422,29 +28426,87 @@ async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store
     }
 }
 
-/// MOD-139 D1: a part's parent is a `run_step` row. An unknown one is `Constraint` on every store;
-/// the sentence is the foreign key's, which differs per backend (blueprint §1).
+/// The sentence both stores give a `run_step.parent_step_id` that names no step of `run`, an
+/// unknown step or a step of another run alike (MOD-139 M1 F1: the parent foreign key is
+/// `(run_id, parent_step_id)`, so Postgres cannot tell the two apart either).
+fn parent_not_in_run(parent: StepId, run: RunId) -> String {
+    references_no_row(
+        "run_step.parent_step_id",
+        parent,
+        &format!("run_step of run {run}"),
+    )
+}
+
+/// MOD-139 D1: a part's parent is a `run_step` row of its run. An unknown one is refused with
+/// [`parent_not_in_run`]'s sentence on every store, and nothing is written.
 async fn create_step_refuses_an_unknown_parent_step<S: WriteStore>(store: &S) {
     const CASE: &str = "create_step_refuses_an_unknown_parent_step";
     let (run, _) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
     let before = store.run_steps(run).await.expect(CASE);
-    let orphan = store
-        .create_step(role_step(
-            run,
-            5,
-            StepRole::Part,
-            Some(StepId::new()),
-            Some("implement/api"),
-        ))
-        .await;
-    assert!(
-        matches!(orphan, Err(StoreError::Constraint(_))),
-        "{CASE}: a part under an unknown step is Constraint, got {orphan:?}"
+    let unknown = StepId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_step(role_step(
+                run,
+                5,
+                StepRole::Part,
+                Some(unknown),
+                Some("implement/api"),
+            ))
+            .await,
+        &parent_not_in_run(unknown, run),
+        "a part under an unknown step",
     );
     assert_eq!(
         store.run_steps(run).await.expect(CASE),
         before,
         "{CASE}: the refused part wrote nothing"
+    );
+}
+
+/// MOD-139 M1 F1 (ANA-33 §7.4, §7.5): a part's parent is its planner step in the same run. A part
+/// of run B under a step of run A is refused with [`parent_not_in_run`]'s sentence on every
+/// store and writes nothing in either run; so no project delete can cascade across runs.
+async fn create_step_refuses_a_parent_in_another_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_step_refuses_a_parent_in_another_run";
+    let (run_a, _) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
+    let planner_a = store
+        .create_step(role_step(run_a, 1, StepRole::Planner, None, None))
+        .await
+        .expect(CASE)
+        .id;
+    let run_b = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let before_a = store.run_steps(run_a).await.expect(CASE);
+    let before_b = store.run_steps(run_b).await.expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store
+            .create_step(role_step(
+                run_b,
+                2,
+                StepRole::Part,
+                Some(planner_a),
+                Some("implement/api"),
+            ))
+            .await,
+        &parent_not_in_run(planner_a, run_b),
+        "a part of run B under run A's planner",
+    );
+    assert_eq!(
+        store.run_steps(run_b).await.expect(CASE),
+        before_b,
+        "{CASE}: the refused part wrote nothing in run B"
+    );
+    assert_eq!(
+        store.run_steps(run_a).await.expect(CASE),
+        before_a,
+        "{CASE}: nor in run A"
     );
 }
 

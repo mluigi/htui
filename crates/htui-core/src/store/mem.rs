@@ -6692,15 +6692,20 @@ impl State {
             )));
         }
         // Postgres checks the parent's foreign key once the row is in, so a step that names
-        // itself as its parent passes there and here.
+        // itself as its parent passes there and here. The key is (run_id, parent_step_id)
+        // (MOD-139 M1 F1): a step of another run is no parent, in the same words as an unknown
+        // one, which is how PgStore words the key's violation.
         if let Some(parent) = new.parent_step_id
             && parent != new.id
-            && !self.steps.contains_key(&parent)
+            && self
+                .steps
+                .get(&parent)
+                .is_none_or(|row| row.run_id != new.run_id)
         {
             return Err(StoreError::Constraint(references_no_row(
                 "run_step.parent_step_id",
                 parent,
-                "run_step",
+                &format!("run_step of run {}", new.run_id),
             )));
         }
         if self.steps.values().any(|row| {
