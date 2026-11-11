@@ -6439,6 +6439,8 @@ where
             persona: None,
             // MOD-163 D18: a judge carries no memory.
             memory: None,
+            // MOD-139 M2 D10: a judge works no part.
+            part: None,
             excerpts: no_excerpts(caps),
             // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
             // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
@@ -7302,6 +7304,8 @@ where
             // renders it. Not role-guarded here: `assemble` renders it for a Phase spec only
             // (blueprint P-5), and the handoff builder clears it.
             memory: snapshot.memory.clone(),
+            // MOD-139 M2 D10: no part here; a divided part's session sets its own (T3).
+            part: None,
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.

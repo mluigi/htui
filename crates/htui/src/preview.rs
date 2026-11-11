@@ -314,6 +314,8 @@ pub async fn build(
         persona: None,
         // MOD-163 D18: the live stand-in for the run's frozen memory (`MEMORY_NOTE`).
         memory,
+        // MOD-139 M2 D10: the preview renders no part section.
+        part: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
