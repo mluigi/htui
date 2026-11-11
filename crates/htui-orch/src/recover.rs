@@ -12,7 +12,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_core::model::{
     CommandRun, CommandRunStatus, Document, GraphSnapshot, Isolation, RepoId, RunStep,
-    RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
+    RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::store::StoreError;
 use serde_json::Value;
@@ -190,13 +190,20 @@ pub enum StepKind {
     Candidate,
     /// The slot's judge (`fanout_index = -1`).
     Judge,
+    /// MOD-139 M2 D14: one part of a divided node (`role = part`). Classified by the plain
+    /// artefact test; a finished part is `done` and never landed, an unfinished one is reset and
+    /// failed `interrupted` for its node's next parts round to retry.
+    Part,
 }
 
 impl StepKind {
-    /// `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
+    /// A `part` row → Part (MOD-139 M2 D14, first); `fanout_index == -1` → Judge;
+    /// `phase.fan_out > 1` → Candidate; else Plain.
     #[must_use]
     pub const fn of(step: &RunStep, phase: &SnapshotPhase) -> Self {
-        if step.fanout_index == JUDGE_FANOUT_INDEX {
+        if matches!(step.role, StepRole::Part) {
+            Self::Part
+        } else if step.fanout_index == JUDGE_FANOUT_INDEX {
             Self::Judge
         } else if phase.fan_out > 1 {
             Self::Candidate
@@ -228,7 +235,8 @@ pub enum Adjudication {
 /// D90/D92/D93 over one `running` step. Seven arguments, which is clippy's limit.
 ///
 /// Finished when the output document exists **and** either `finished_at` is set or the capture
-/// landed. For a plain step or a judge the capture landed when every repo of `run_scope` has a
+/// landed. For a plain step, a judge or a part (MOD-139 M2 D14) the capture landed when every
+/// repo of `run_scope` has a
 /// `run_step_commit` row and at least one of them has an `after_hash`: stage 2 gives every scope
 /// repo a row, and stage 5's capture batch lands in one transaction, so one `after_hash` proves
 /// the batch. Every row without one stays unfinished, since a capture that never landed and one
@@ -252,7 +260,7 @@ pub fn classify(
     let changed = |repo: &RepoId| row(repo).is_some_and(|row| row.after_hash.is_some());
     let captured = match kind {
         StepKind::Candidate => run_scope.iter().all(changed),
-        StepKind::Plain | StepKind::Judge => {
+        StepKind::Plain | StepKind::Judge | StepKind::Part => {
             run_scope.iter().all(|repo| row(repo).is_some())
                 && (run_scope.is_empty() || run_scope.iter().any(changed))
         }
@@ -1287,6 +1295,46 @@ mod tests {
             ),
             "a judge is classified as well; the engine ignores the answer (D95)"
         );
+    }
+
+    /// MOD-139 M2 D14: a part is its own kind, whatever its node's `fan_out`, and its capture is
+    /// proved as a plain step's: one scope repo with an `after_hash` is enough.
+    #[test]
+    fn a_part_is_classified_by_the_plain_artefact_test() {
+        let mut fanned = implement();
+        fanned.fan_out = 3;
+        let mut part = step(2, 1, 0, StepStatus::Running);
+        part.role = StepRole::Part;
+        assert_eq!(StepKind::of(&part, &implement()), StepKind::Part);
+        assert_eq!(
+            StepKind::of(&part, &fanned),
+            StepKind::Part,
+            "never a candidate"
+        );
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&part, first, Isolation::Worktree, false),
+            tree(&part, second, Isolation::Worktree, false),
+        ];
+        let one = [
+            commit(&part, first, Some("after-1")),
+            commit(&part, second, None),
+        ];
+        let answer = classify(&part, &fanned, &[first, second], &trees, &one, true, &[]);
+        assert_eq!(
+            answer,
+            (
+                StepKind::Part,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            ),
+            "one `after_hash` proves the capture batch, as for a plain step"
+        );
+        let none = [commit(&part, first, None), commit(&part, second, None)];
+        let answer = classify(&part, &fanned, &[first, second], &trees, &none, true, &[]);
+        assert_eq!(answer, (StepKind::Part, Adjudication::Reset));
     }
 
     #[test]

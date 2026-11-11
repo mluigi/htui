@@ -3340,6 +3340,9 @@ where
     ///    another writer parked is still `StaleWrite`, plan D145). An outcome that ends the run
     ///    stops it: every row still unsettled is cancelled with the cut's note
     ///    ([`Self::cancel_unsettled`]) and that end is the answer. Otherwise the first park is.
+    ///    MOD-139 M2 D14, per role: a stage row is skipped; a planner row is admitted on the same
+    ///    row ([`Self::admit_parts`]: admission never ran, so no attempt is spent); a part is
+    ///    [`recover::StepKind::Part`] in [`Self::recover_step`], never landed.
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
     ///    completes the park. A rejection handed back beside it, or beside an A7 recovery's
     ///    interrupted park (R1), (`Tails::HandBack`) is finished
@@ -3378,10 +3381,18 @@ where
                 continue;
             }
             let phase = Self::node_at(run.id, &snapshot, &steps, step)?;
-            match self
-                .recover_step(run, &snapshot, &phase, item, step)
-                .await?
-            {
+            // MOD-139 M2 D14: a `running` planner is a crash before admission, which never ran:
+            // it is admitted now on the same row (no new row, no `interrupt_step`, no attempt
+            // spent). Boxed, the stack rule.
+            let recovered = if step.role == StepRole::Planner {
+                Box::pin(self.admit_parts(run, &snapshot, &phase, step))
+                    .await?
+                    .map(Self::landed)
+            } else {
+                self.recover_step(run, &snapshot, &phase, item, step)
+                    .await?
+            };
+            match recovered {
                 None => {}
                 Some(Next::Finished(rest)) => {
                     let row = self.run(run.id).await?;
@@ -3530,6 +3541,24 @@ where
                     .interrupt_step(step.id, INTERRUPTED, now)
                     .await?;
                 Ok(None)
+            }
+            // MOD-139 M2 D14: a part, before the `(_, …)` arms that would land it (blueprint
+            // G-6). Finished, it is `done` with its settle columns and never landed (D4: no gate,
+            // no landing); unfinished, its trees are reset and it fails `interrupted`, which the
+            // next parts round retries (or, out of attempts, the divided step fails, ruling F-1);
+            // a tree that must not be reset parks the run (D93).
+            (StepKind::Part, Adjudication::Finished { .. }) => {
+                self.finish_recovered(step, None, None, now).await?;
+                self.move_step(run.id, step.id, StepStatus::Running, StepStatus::Done, now)
+                    .await?;
+                Ok(None)
+            }
+            (StepKind::Part, Adjudication::Reset) => {
+                self.reset_part(run, phase, step, &trees).await
+            }
+            (StepKind::Part, Adjudication::NeverReset { .. }) => {
+                self.never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
+                    .await
             }
             (
                 _,
@@ -3698,6 +3727,43 @@ where
         let body = spent_note(step, phase, &listed);
         let rest = self.park_interrupted(run, step, phase, true, body).await?;
         Ok(Some(Next::Parked(rest)))
+    }
+
+    /// MOD-139 M2 D14: [`Self::reset_interrupted`] for a part. The isolator resets its trees (a
+    /// refusal or an error is [`Self::never_reset`]'s park, as there), and the part fails
+    /// `interrupted`. Nothing is admitted here: the node's next parts round creates the retry row
+    /// (`part_retries`, D6), and a part out of attempts fails the divided step (ruling F-1).
+    async fn reset_part(
+        &self,
+        run: &Run,
+        node: &SnapshotPhase,
+        step: &RunStep,
+        trees: &[RunStepTree],
+    ) -> Result<Option<Next>, EngineError> {
+        match self.parts.isolator.reset(step.id, trees).await {
+            Ok(report) if report.refused.is_empty() => {}
+            Ok(report) => {
+                let reason = report
+                    .refused
+                    .iter()
+                    .map(|(_, refusal)| refusal.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return self
+                    .never_reset(run, node, step, trees, &report.labelled, &reason)
+                    .await;
+            }
+            Err(err) => {
+                return self
+                    .never_reset(run, node, step, trees, &[], &err.to_string())
+                    .await;
+            }
+        }
+        self.parts
+            .store
+            .interrupt_step(step.id, INTERRUPTED, self.now())
+            .await?;
+        Ok(None)
     }
 
     /// D93: a tree that must not be reset is never touched. The step fails `interrupted, tree not

@@ -14,7 +14,7 @@ use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
     BatchId, BoxId, Document, EdgeKind, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, Note,
-    NoteId, Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId,
+    NoteId, Run, RunId, RunStatus, RunStep, SnapshotEdge, SnapshotPhase, Status, StepId, StepRole,
     StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
@@ -1313,8 +1313,14 @@ async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// and `failed` are cancelled; `superseded` and `cancelled` are already retired and left alone.
 /// A position with no rows is skipped.
 ///
+/// MOD-139 M2 D11 (ANA-33 §7.3, "That includes their parts and plans"): a slot whose row is a
+/// planner (the planner node's latest attempt) retires its parts too ([`retire_parts`]: the
+/// latest attempt of each, by the same split; older attempts stay as they are) and then abandons
+/// every `proposed` or `admitted` plan of that planner, under the walk's fence. The parts sit
+/// past the node list, so no region names their positions.
+///
 /// # Errors
-/// Every [`EngineError`] `supersede_step` and `transition_step` can raise, and
+/// Every [`EngineError`] `supersede_step`, `transition_step` and `abandon_plans` can raise, and
 /// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
 pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
@@ -1333,31 +1339,66 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
     let slot = steps
         .iter()
         .filter(|step| step.position == position && step.attempt == attempt);
-    for step in slot {
-        match step.status {
-            StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
-                ctx.store.supersede_step(step.id).await?;
-            }
-            // `running -> superseded` and `failed -> superseded` are both illegal
-            // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
-            // retirement either of them has. `transition_step` moves `status` and nothing else, so
-            // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
-            // which is the half of ANA-2 §4.4 step 3 that matters (`:719`). A failed judge keeps
-            // its `gate_note` the same way.
-            //
-            // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
-            // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
-            // `p_review` would stop the walk forever and the blueprint's own §7 rejection branch —
-            // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
-            // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
-            // conclusion it drew from that is the part this corrects.
-            // MOD-125 D1: a `stopped` step retires the same way; `superseded` is reserved for M3's
-            // fresh rerun.
-            StepStatus::Running | StepStatus::Stopped | StepStatus::Failed => {
-                move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
-            }
-            StepStatus::Superseded | StepStatus::Cancelled => {}
+    for step in slot.clone() {
+        retire_row(ctx, step, now).await?;
+    }
+    for planner in slot.filter(|step| step.role == StepRole::Planner) {
+        retire_parts(ctx, steps, planner, now).await?;
+        ctx.store.abandon_plans(ctx.fence, planner.id).await?;
+    }
+    Ok(())
+}
+
+/// MOD-139 M2 D11: the latest attempt of each part under `planner`
+/// ([`crate::divide::latest_parts`]), retired by [`retire_slot`]'s status split. Older attempts
+/// of a part are left as they are.
+///
+/// # Errors
+/// As [`retire_slot`].
+async fn retire_parts<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    steps: &[RunStep],
+    planner: &RunStep,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    for part in crate::divide::latest_parts(steps, planner.id) {
+        retire_row(ctx, part, now).await?;
+    }
+    Ok(())
+}
+
+/// One row retired by M2 D5's status split, [`retire_slot`]'s rule.
+///
+/// # Errors
+/// As [`retire_slot`].
+async fn retire_row<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    step: &RunStep,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    match step.status {
+        StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
+            ctx.store.supersede_step(step.id).await?;
         }
+        // `running -> superseded` and `failed -> superseded` are both illegal
+        // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
+        // retirement either of them has. `transition_step` moves `status` and nothing else, so
+        // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
+        // which is the half of ANA-2 §4.4 step 3 that matters (`:719`). A failed judge keeps
+        // its `gate_note` the same way.
+        //
+        // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
+        // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
+        // `p_review` would stop the walk forever and the blueprint's own §7 rejection branch —
+        // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
+        // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
+        // conclusion it drew from that is the part this corrects.
+        // MOD-125 D1: a `stopped` step retires the same way; `superseded` is reserved for M3's
+        // fresh rerun.
+        StepStatus::Running | StepStatus::Stopped | StepStatus::Failed => {
+            move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
+        }
+        StepStatus::Superseded | StepStatus::Cancelled => {}
     }
     Ok(())
 }
