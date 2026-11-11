@@ -643,6 +643,26 @@ pub enum EngineError {
         /// Its role: `part` or `stage`.
         role: StepRole,
     },
+    /// MOD-139 M3 D6 (Confirm 3, blueprint P-2, P-3): an answer that would land an integrate step
+    /// parked on a part its capture does not hold. Retry is the way on.
+    #[error(
+        "step {step} is parked on integrate_incomplete: approving, skipping or promoting it would \
+         land it without a part; retry it instead"
+    )]
+    IntegrateIncomplete {
+        /// The parked integrate step.
+        step: StepId,
+    },
+    /// MOD-139 M3 ruling R-1: a promoted integrate step could be accepted before its post-check,
+    /// so no integrate row is promoted; a divided node lands only through its own settle.
+    #[error(
+        "step {step} is an integrate step: promoting it would land it without its post-check; \
+         answer or retry it instead"
+    )]
+    PromoteIntegrate {
+        /// The integrate step named.
+        step: StepId,
+    },
     /// Blueprint D185: a chat of this process is live. `None` for a promotion, which the one Chat
     /// tab cannot host beside another session; `Some` for an accept of the step being chatted with.
     #[error("{}", chat_is_live(.step))]
