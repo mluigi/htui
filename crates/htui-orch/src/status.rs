@@ -142,6 +142,89 @@ pub enum RunFailure {
         /// The target's attempt just judged.
         attempts: i32,
     },
+    /// MOD-139 M2 D2 (ANA-33 §7.6): a divided node's admitted plan has no part.
+    EmptyPlan {
+        /// The divided node's name (`implement`, never `implement:plan`).
+        node: String,
+    },
+    /// MOD-139 M2 D7: more than one part under `local` isolation, which runs one.
+    LocalCannotDivide {
+        /// The divided node's name.
+        node: String,
+        /// The parts planned.
+        parts: u32,
+    },
+    /// MOD-139 M2 D8 (ANA-33 §7.8): an admission over one of its caps.
+    PlanOverCaps {
+        /// The divided node's name.
+        node: String,
+        /// The cap broken.
+        cap: PlanCap,
+        /// Parts planned (`MaxParts`, `MaxFanOut`), or the run's planned sessions
+        /// (`MaxAgentsPerRun`).
+        planned: u32,
+        /// The cap's value.
+        max: u32,
+    },
+    /// MOD-139 M2 D5: a default part names a persona; per-part personas run from MOD-140 on.
+    PartPersonaUnsupported {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+    },
+    /// MOD-139 M2 D5: a default part names an agent that is not one of the node's candidates.
+    PartAgentNotCandidate {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The agent the part names.
+        agent: htui_core::model::AgentId,
+    },
+    /// MOD-139 M2 D10: a default part's owned path is not a repo-relative `repo:glob`.
+    PartPathRefused {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The owned path, trimmed.
+        path: String,
+        /// Why: not a glob, absolute, or leaving its repository.
+        reason: String,
+    },
+    /// MOD-139 M2 D6: a part failed with no attempt left, so the divided step failed.
+    PartExhausted {
+        /// The divided node's name.
+        node: String,
+        /// The part's key.
+        part: String,
+        /// The part's last attempt.
+        attempts: i32,
+    },
+}
+
+/// MOD-139 M2 D8: which cap an admission broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanCap {
+    /// The divided node's own `max_parts`.
+    MaxParts,
+    /// `app_setting.max_fan_out`, frozen in the snapshot.
+    MaxFanOut,
+    /// `app_setting.max_agents_per_run`, frozen in the snapshot.
+    MaxAgentsPerRun,
+}
+
+impl PlanCap {
+    /// The cap's setting name, as the failure sentence names it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxParts => "max_parts",
+            Self::MaxFanOut => "max_fan_out",
+            Self::MaxAgentsPerRun => "max_agents_per_run",
+        }
+    }
 }
 
 impl RunFailure {
@@ -204,6 +287,62 @@ impl fmt::Display for RunFailure {
             } => write!(
                 f,
                 "{kind} loop exhausted after {attempts} attempts: `{from}` to `{to}`"
+            ),
+            Self::EmptyPlan { node } => {
+                write!(f, "empty_plan: divided node `{node}` has no parts")
+            }
+            Self::LocalCannotDivide { node, parts } => write!(
+                f,
+                "local_cannot_divide: divided node `{node}` plans {parts} parts under `local` \
+                 isolation, which runs one"
+            ),
+            Self::PlanOverCaps {
+                node,
+                cap: cap @ PlanCap::MaxAgentsPerRun,
+                planned,
+                max,
+            } => write!(
+                f,
+                "plan_over_caps: divided node `{node}` brings the run to {planned} planned \
+                 sessions; {} is {max}",
+                cap.as_str()
+            ),
+            Self::PlanOverCaps {
+                node,
+                cap,
+                planned,
+                max,
+            } => write!(
+                f,
+                "plan_over_caps: divided node `{node}` plans {planned} parts; {} is {max}",
+                cap.as_str()
+            ),
+            Self::PartPersonaUnsupported { node, part } => write!(
+                f,
+                "part_persona_unsupported: part `{part}` of `{node}` names a persona; per-part \
+                 personas run from MOD-140 on"
+            ),
+            Self::PartAgentNotCandidate { node, part, agent } => write!(
+                f,
+                "part_agent_not_candidate: part `{part}` of `{node}` names agent {agent}, which is \
+                 not one of the node's candidates"
+            ),
+            Self::PartPathRefused {
+                node,
+                part,
+                path,
+                reason,
+            } => write!(
+                f,
+                "part_path_refused: part `{part}` of `{node}`: owned path `{path}` {reason}"
+            ),
+            Self::PartExhausted {
+                node,
+                part,
+                attempts,
+            } => write!(
+                f,
+                "part_exhausted: part `{part}` of `{node}` failed after {attempts} attempts"
             ),
         }
     }
@@ -574,8 +713,9 @@ mod tests {
     use htui_core::model::{GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus};
 
     use crate::status::{
-        Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
-        next_attempt, position_of, resumable, resumable_park, run_resumable, winner_at,
+        Cursor, PlanCap, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at,
+        may_attempt, next_attempt, position_of, resumable, resumable_park, run_resumable,
+        winner_at,
     };
     use crate::walk::tests::{diamond, done, row};
 
@@ -876,6 +1016,102 @@ mod tests {
             "env_files_refused: `.env` in the session's trees; the project resolves its secrets \
              from infisical. Remove them, or set allow_env_files.",
             "MOD-89 D7: names the files and the provider, never a value"
+        );
+        let node = || "implement".to_owned();
+        let part = || "api".to_owned();
+        assert_eq!(
+            RunFailure::EmptyPlan { node: node() }.to_string(),
+            "empty_plan: divided node `implement` has no parts",
+            "MOD-139 M2 D2"
+        );
+        assert_eq!(
+            RunFailure::LocalCannotDivide {
+                node: node(),
+                parts: 2,
+            }
+            .to_string(),
+            "local_cannot_divide: divided node `implement` plans 2 parts under `local` isolation, \
+             which runs one",
+            "MOD-139 M2 D7"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxParts,
+                planned: 3,
+                max: 2,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` plans 3 parts; max_parts is 2",
+            "MOD-139 M2 D8, a part count"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxFanOut,
+                planned: 3,
+                max: 2,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` plans 3 parts; max_fan_out is 2",
+            "MOD-139 M2 D8, a part count"
+        );
+        assert_eq!(
+            RunFailure::PlanOverCaps {
+                node: node(),
+                cap: PlanCap::MaxAgentsPerRun,
+                planned: 9,
+                max: 8,
+            }
+            .to_string(),
+            "plan_over_caps: divided node `implement` brings the run to 9 planned sessions; \
+             max_agents_per_run is 8",
+            "MOD-139 M2 D8, the run's sessions"
+        );
+        assert_eq!(
+            RunFailure::PartPersonaUnsupported {
+                node: node(),
+                part: part(),
+            }
+            .to_string(),
+            "part_persona_unsupported: part `api` of `implement` names a persona; per-part \
+             personas run from MOD-140 on",
+            "MOD-139 M2 D5"
+        );
+        assert_eq!(
+            RunFailure::PartAgentNotCandidate {
+                node: node(),
+                part: part(),
+                agent: ids::AGENT_AGY,
+            }
+            .to_string(),
+            format!(
+                "part_agent_not_candidate: part `api` of `implement` names agent {}, which is not \
+                 one of the node's candidates",
+                ids::AGENT_AGY
+            ),
+            "MOD-139 M2 D5"
+        );
+        assert_eq!(
+            RunFailure::PartPathRefused {
+                node: node(),
+                part: part(),
+                path: "/etc/x".to_owned(),
+                reason: "is an absolute path".to_owned(),
+            }
+            .to_string(),
+            "part_path_refused: part `api` of `implement`: owned path `/etc/x` is an absolute path",
+            "MOD-139 M2 D10"
+        );
+        assert_eq!(
+            RunFailure::PartExhausted {
+                node: node(),
+                part: part(),
+                attempts: 2,
+            }
+            .to_string(),
+            "part_exhausted: part `api` of `implement` failed after 2 attempts",
+            "MOD-139 M2 D6"
         );
     }
 

@@ -32,6 +32,7 @@ pub mod closeout;
 pub mod command;
 #[cfg(feature = "test-support")]
 pub mod conformance;
+pub mod divide;
 pub mod engine;
 #[cfg(feature = "test-support")]
 pub mod fake;
@@ -80,7 +81,7 @@ pub use recover::{Heartbeat, LeaseTimes};
 pub use secrets::RunSecrets;
 pub use select::{SkipCause, Walk, walk};
 pub use status::{
-    Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,
+    Cursor, PlanCap, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,
 };
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 pub use walk::required_inputs;
