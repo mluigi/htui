@@ -6268,18 +6268,18 @@ where
     /// attempt at its own position, unless some part is out of attempts, which is the divided
     /// step's failure and [`Self::settle_exhausted_part`]'s); its `pending` latest parts in
     /// position order, and its admitted plan with the `base_refs` the parts branch from.
-    /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part
-    /// and the run. Then every pending part through [`Self::run_part`], at most
+    /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part and
+    /// the run. Then every pending part through [`Self::run_part`], at most
     /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
-    /// every part); each future is boxed (the stack rule, ANA-33 §9). Once a part answers a
-    /// cancel, a fenced write, another error or a refusal, no further part is pulled and the
-    /// ones in flight drain (R1, F-7). A cancel or a fenced write is raised once every pulled part
-    /// settled (`group_error`), the unpulled ones left `pending` for the cancel's settlement or
-    /// the adopter. A deterministic pre-session refusal ([`PartOutcome::Refused`]) ends the run
-    /// with the first one in part position order, after every pulled part settled (blueprint
-    /// P-11), and the unpulled parts are `cancelled` ([`Self::cancel_parts`]). Under `shared_serialized` the primary
-    /// checkout is reset to `base_refs` after the round's last part (D4): parts never land, so no
-    /// later node starts from a part's commit.
+    /// every part); each future is boxed (the stack rule, ANA-33 §9). Once a part answers a cancel,
+    /// a fenced write, another error or a refusal, no further part is pulled and the ones in flight
+    /// drain (R1, F-7). A cancel or a fenced write is raised once every pulled part settled
+    /// (`group_error`), the unpulled ones left `pending` for the cancel's settlement or the
+    /// adopter. A deterministic pre-session refusal ([`PartOutcome::Refused`]) ends the run with
+    /// the first one in part position order, after every pulled part settled (blueprint P-11), and
+    /// the unpulled parts are `cancelled` ([`Self::cancel_parts`]). Under `shared_serialized` the
+    /// primary checkout is reset to `base_refs` after the round's last part (D4): parts never land,
+    /// so no later node starts from a part's commit.
     async fn drive_parts(
         &self,
         run: &Run,
