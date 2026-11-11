@@ -205,12 +205,33 @@ pub struct BackendRun {
     pub error: Option<String>,
 }
 
+/// What every collection and schema a run may delete starts with.
+pub const SCRATCH_PREFIX: &str = "htui_bench";
+
+/// Refuses a `--collection` or `--schema` that is not a scratch name: a run deletes and recreates
+/// both (`DROP SCHEMA … CASCADE`, F8's collection delete), so `public` or `htui_concepts_v2` would
+/// destroy real data (T6 verify finding).
+///
+/// # Errors
+/// Either name does not start with [`SCRATCH_PREFIX`].
+pub fn check_scratch_names(collection: &str, schema: &str) -> anyhow::Result<()> {
+    for (what, name) in [("collection", collection), ("schema", schema)] {
+        anyhow::ensure!(
+            name.starts_with(SCRATCH_PREFIX),
+            "refusing {what} {name:?}: a run deletes and recreates it, so it must start with \
+             {SCRATCH_PREFIX:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The whole run: `queries::load_frozen` (refuses a changed file), `corpus::build`,
 /// `queries::validate` (refuses, listing each unknown target), the production model, `run_with`.
 ///
 /// # Errors
 /// Any step's, with context.
 pub async fn run(config: &RunConfig) -> anyhow::Result<Results> {
+    check_scratch_names(&config.collection, &config.schema)?;
     let started_at = Utc::now();
     let frozen = queries::load_frozen(&config.queries)?;
     note(&format!(
@@ -255,6 +276,7 @@ pub async fn run_with<E: DenseEmbedder>(
     query_sha256: &str,
     embedder: E,
 ) -> anyhow::Result<Results> {
+    check_scratch_names(&config.collection, &config.schema)?;
     let started_at = Utc::now();
     let services = Services::connect(config).await?;
     let ctx = RunContext {
@@ -725,6 +747,41 @@ mod tests {
     use super::*;
     use crate::corpus::{Sources, build_from_sources};
     use htui_core::qdrant::QdrantUrl;
+
+    #[test]
+    fn only_scratch_names_may_be_deleted() {
+        assert!(check_scratch_names("htui_bench_d15e9fea", "htui_bench").is_ok());
+        assert!(check_scratch_names("htui_bench_t_0190", "htui_bench_t_0190").is_ok());
+        for (collection, schema) in [
+            ("htui_concepts_v2", "htui_bench"),
+            ("htui_bench_x", "public"),
+            ("", "htui_bench"),
+            ("htui_bench_x", "htui"),
+        ] {
+            let err = check_scratch_names(collection, schema).expect_err("refused");
+            assert!(format!("{err}").contains("htui_bench"), "{err}");
+        }
+    }
+
+    /// No service is reachable at the fixture's addresses: the refusal must come first.
+    #[tokio::test]
+    async fn run_with_refuses_a_real_schema_before_connecting() {
+        let config = RunConfig {
+            schema: "public".into(),
+            ..config("postgres://nobody@127.0.0.1:1/none")
+        };
+        let corpus = build_from_sources("fixture", fixture_sources()).expect("builds");
+        let err = run_with(
+            &config,
+            &corpus,
+            &fixture_set(),
+            &"0".repeat(64),
+            htui_store::embed::HashEmbedder::new(htui_store::embed::DENSE_DIM),
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{err}").contains("refusing schema"), "{err}");
+    }
 
     fn settings() -> QdrantSettings {
         QdrantSettings::new(
