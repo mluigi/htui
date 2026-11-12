@@ -340,8 +340,18 @@ mod tests {
         assert_eq!(form.focus, PERSONA);
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(form.on_text_key(key), FieldOutcome::Pass, "a choice row");
+        assert!(form.text_mut().is_none(), "a choice row has no text field");
         form.on_paste("ignored");
-        assert_eq!(form.persona, None);
+        let texts = [
+            &form.key,
+            &form.title,
+            &form.brief,
+            &form.owned_paths,
+            &form.acceptance,
+        ]
+        .map(TextField::text);
+        assert_eq!(texts, [Some(""); 5], "no text row took the paste");
+        assert_eq!((&form.agent, form.persona), (&None, None));
     }
 
     #[test]
