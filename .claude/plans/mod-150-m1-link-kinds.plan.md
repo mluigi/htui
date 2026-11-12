@@ -31,7 +31,12 @@ advertises the new kinds (through `LinkKind::ALL`) and documents them, and the G
   `pg_advisory_xact_lock(hashtextextended('item_link:parent', 0))`. That is one database-wide key: parent
   writes are rare and cycles cross projects. It mirrors `claim_command`'s lock (`pg/write.rs:9936`). The
   cycle and depth walks run after the lock. MemStore is serialised by its state lock already.
-  `duplicates` needs no lock: the partial unique index is enough there.
+  A `duplicates` proposal takes a per-item lock at the same point,
+  `hashtextextended('item_link:duplicates:<from>', 0)`. The partial unique index alone is not
+  enough. The upsert's `ON CONFLICT (from, to, kind)` absorbs only a primary-key conflict. So two
+  identical first-time proposals racing past the second-canonical check make the loser trip
+  `uq_item_link_one_canonical` (23505). That turns D4's idempotent upsert into a refusal. Found by
+  the M1 review and fixed in round R1.
 - **D4 — Refusal order.** Today's order stays: `self_link`, step/fence, own item, `to` not found, outside
   reach. Then, for `parent`: second parent, cycle, depth; for `duplicates`: second canonical.
   - **A live row with the same `to` is an idempotent upsert, never a "second".**

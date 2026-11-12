@@ -9640,7 +9640,8 @@ impl WriteStore for PgStore {
 
     /// D13, B-6: the upsert, one transaction after `step_scope`, the own-item check and `to`'s
     /// reach (MOD-147 D3: the step's project, its workspaces' scope rows and members), then the
-    /// MOD-150 link rules (D4, under D3's advisory lock for `parent`). A live row keeps its
+    /// MOD-150 link rules (D4, under D3's advisory locks: one database-wide key for `parent`, one
+    /// key per proposing item for `duplicates`, review R1). A live row keeps its
     /// proposer; a tombstone revives with the step as proposer.
     /// `updated_at` is the `BEFORE UPDATE` trigger's.
     ///
@@ -9694,21 +9695,30 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
         // MOD-150 D3: parent writes are serialised database-wide (one key: parent writes are rare
-        // and cycles cross projects), so the walks below see every committed parent link. Under
-        // READ COMMITTED each statement after the lock reads a fresh snapshot. This is
-        // `claim_command`'s statement text verbatim, so it reuses that query's `.sqlx` entry.
-        if link.kind == LinkKind::Parent {
+        // and cycles cross projects), so the walks below see every committed parent link.
+        // `duplicates` writes are serialised per proposing item (review R1): the upsert's
+        // `ON CONFLICT` absorbs only a primary-key conflict, so without the lock a concurrent
+        // identical first-time proposal trips uq_item_link_one_canonical (23505) instead of
+        // upserting. Under READ COMMITTED each statement after the lock reads a fresh snapshot.
+        // This is `claim_command`'s statement text verbatim, so it reuses that query's `.sqlx`
+        // entry; the key is built here.
+        let lock_key = match link.kind {
+            LinkKind::Parent => Some("item_link:parent".to_owned()),
+            LinkKind::Duplicates => Some(format!("item_link:duplicates:{}", link.from)),
+            _ => None,
+        };
+        if let Some(lock_key) = lock_key {
             sqlx::query!(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                "item_link:parent",
+                lock_key,
             )
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
         }
         // MOD-150 D4: one live parent, one live canonical. A live row with the same `to` is the
-        // upsert below; a tombstone's revival is checked like an insert. `duplicates` takes no
-        // lock: uq_item_link_one_canonical backs it (D3, D5).
+        // upsert below; a tombstone's revival is checked like an insert. uq_item_link_one_parent
+        // and uq_item_link_one_canonical back both checks (D5).
         if matches!(link.kind, LinkKind::Parent | LinkKind::Duplicates) {
             let current = sqlx::query_scalar!(
                 r#"

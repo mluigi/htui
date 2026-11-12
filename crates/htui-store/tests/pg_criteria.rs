@@ -11355,6 +11355,109 @@ async fn two_concurrent_opposite_parents_close_no_cycle() {
     db.drop_db().await;
 }
 
+/// MOD-150 D3 (review R1, LOW-1): identical first-time `x duplicates y` proposals race from four
+/// pools at once. `ON CONFLICT (from, to, kind)` absorbs only a primary-key conflict: a loser that
+/// passed the pre-check beside the winner trips `uq_item_link_one_canonical` instead and answers
+/// 23505, a constraint refusal for what D4 calls an idempotent upsert. The per-item advisory lock
+/// serialises the proposals, so every one succeeds and exactly one live row lands. Twenty-five
+/// rounds of eight proposals, each round on two fresh items with an unleased run and one step.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_identical_duplicates_all_land_one_row() {
+    use htui_core::model::LinkKind;
+    use htui_core::model::link::ProposeLink;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..4 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+
+    for round in 0..25 {
+        let x = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} x")))
+            .await
+            .expect("mint the duplicate")
+            .id;
+        let y = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} y")))
+            .await
+            .expect("mint the canonical")
+            .id;
+        let run = db
+            .store
+            .create_run(race_run(x))
+            .await
+            .expect("queue a graph run")
+            .id;
+        let step = db
+            .store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
+            })
+            .await
+            .expect("create the round's step")
+            .id;
+        let link = ProposeLink {
+            from: x,
+            to: y,
+            kind: LinkKind::Duplicates,
+            step,
+        };
+
+        let answers = join_all(
+            pools
+                .iter()
+                .cycle()
+                .take(8)
+                .map(|pool| pool.propose_link(StepFence::Unleased, link)),
+        )
+        .await;
+        for answer in answers {
+            let row = answer.unwrap_or_else(|error| {
+                panic!("round {round}: every identical proposal is an upsert, got {error:?}")
+            });
+            assert_eq!(
+                (row.from_item_id, row.to_item_id, row.kind, row.deleted_at),
+                (x, y, LinkKind::Duplicates, None),
+                "round {round}: each answer is the one live row"
+            );
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_link WHERE kind = 'duplicates' AND deleted_at IS NULL \
+             AND from_item_id = $1",
+        )
+        .bind(x.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the item's live canonical links");
+        assert_eq!(live, 1, "round {round}: one live canonical link");
+    }
+
+    for pool in pools {
+        pool.close().await;
+    }
+    db.drop_db().await;
+}
+
 /// MOD-150 D6 (blueprint deviation 3): the inherent `ready_items` and `queue_rows` read only
 /// `blocked_by`, so a `parent`, a `duplicates` and an `implements` link to a running or blocked
 /// item change neither, on Postgres (before and after a raw insert) or on `MemStore` (a store
