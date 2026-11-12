@@ -4441,6 +4441,60 @@ pub(crate) mod tests {
         rests_within(&fixture, run, RunStatus::Stopped, ESCALATED).await;
     }
 
+    /// D2: `stop_walk` waits a session out for [`htui_worker::STOP_SLACK`] past the grace, not the
+    /// cancel path's 1 s, so a session flushing its last rows is not cut off mid-flush. A forced
+    /// stop's session that ends its turn [`STOP_LAG`] after the zero-grace cancel — past the cancel
+    /// slack, inside the stop's — ends the walk on its own: its `done` row is recorded, where a
+    /// token drop at the cancel slack would have lost it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_waits_out_its_own_slack() {
+        let fixture = Fixture::new().await;
+        let park = Park::lagging(STOP_LAG);
+        fixture.sessions.push(Play::Park(park.clone()));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+
+        let stopped = tokio::time::Instant::now();
+        stop_platform(&fixture, StopMode::Forced).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        let dones: Vec<serde_json::Value> = fixture
+            .store
+            .step_events(parked.run_step_id)
+            .await
+            .expect("the read answers")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.kind == EventKind::Done)
+            .map(|row| row.payload)
+            .collect();
+        assert_eq!(
+            dones,
+            [json!({ "stop_reason": "cancelled" })],
+            "the session's own `done` is recorded: the walk ended on its own"
+        );
+        assert!(
+            stopped.elapsed() >= STOP_LAG,
+            "the stop waited the session out: {:?}",
+            stopped.elapsed()
+        );
+        assert_eq!(park.grace(), Some(Duration::ZERO), "a forced stop");
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the walk's own requester hears it preempted"
+        );
+    }
+
+    /// How long [`a_stop_waits_out_its_own_slack`]'s session takes to end its turn once
+    /// cancelled: past the cancel path's 1 s slack, inside [`htui_worker::STOP_SLACK`].
+    const STOP_LAG: Duration = Duration::from_secs(3);
+    const _: () =
+        assert!(STOP_LAG.as_secs() > 1 && STOP_LAG.as_secs() < htui_worker::STOP_SLACK.as_secs());
+
     /// D4: a cancel of the run requested while its stop is still inside the session's grace wins
     /// too, whichever task takes the run's lock first. Its B-5 guard is held until the stop task
     /// has ended, so the stop task meets the pending row under the lock and leaves the run to it.
