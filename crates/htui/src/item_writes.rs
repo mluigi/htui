@@ -248,7 +248,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 context.item_graph = item_graph(&writer, &context.graphs, &row).await?;
                 context.item = Some(row);
             }
-            named(&writer, &mut context).await?;
+            named(&writer, &mut context).await;
             Ok(StoreReply::ItemForm(Box::new(context)))
         }
         StoreRequest::MintItem { project, spec } => {
@@ -301,7 +301,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     // Milestone 3 D7: the catalogue just read, with the head as its item.
                     context.item_graph = item_graph(&writer, &context.graphs, &head).await?;
                     context.item = Some(head.clone());
-                    named(&writer, &mut context).await?;
+                    named(&writer, &mut context).await;
                     Ok(StoreReply::ItemDiverged(Box::new(ItemDivergence {
                         head,
                         ancestor,
@@ -364,11 +364,12 @@ async fn catalogue(writer: &Writer, project: ProjectId) -> Result<ItemFormContex
 
 /// MOD-141 M3 D2: fills [`ItemFormContext::workspaces`] over its `graphs` and `item_graph`, one
 /// `workspace` read per distinct workspace ([`WorkspaceNames::read`]). Called once `item_graph`
-/// is set, and only for a context that reaches the UI.
-async fn named(writer: &Writer, context: &mut ItemFormContext) -> Result<()> {
+/// is set, and only for a context that reaches the UI. Infallible (R1 L3): a failed name read is
+/// logged and leaves that workspace unnamed, so it never fails the form's read nor turns a
+/// divergence into a `Failed`.
+async fn named(writer: &Writer, context: &mut ItemFormContext) {
     context.workspaces =
-        WorkspaceNames::read(writer, context.graphs.iter().chain(&context.item_graph)).await?;
-    Ok(())
+        WorkspaceNames::read(writer, context.graphs.iter().chain(&context.item_graph)).await;
 }
 
 /// [`ItemFormContext::item_graph`]: `item`'s own graph row when `graphs` lacks it. A graph the

@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use chrono::Utc;
 use htui_core::model::{
     GraphBody, GraphScope, ItemKind, ItemKindId, NewItemKind, NewStepGraph, PersonaId, PhaseId,
-    Project, Scope, StepGraph, StepGraphId, WorkspaceId,
+    Project, Scope, StepGraph, StepGraphId, Workspace, WorkspaceId,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::seed;
@@ -85,7 +85,9 @@ pub struct ProjectCatalogue {
     /// [`graph_name`](Self::graph_name) finds these and a typed name does not. In kind order.
     pub kept: Vec<StepGraph>,
     /// MOD-141 M3 D1/D2: the workspace of every [`shared`](Self::shared) and
-    /// [`kept`](Self::kept) workspace graph, so [`label`](Self::label) names it.
+    /// [`kept`](Self::kept) workspace graph, so [`label`](Self::label) names it. The same for
+    /// every project of one snapshot (R1 L2): the scope's workspaces, read once, so the slug rule
+    /// is decided over the whole scope and every project labels a graph alike.
     pub workspaces: WorkspaceNames,
 }
 
@@ -146,8 +148,8 @@ impl ProjectCatalogue {
 }
 
 /// MOD-141 M3 D1: one workspace as a graph label names it: the id, the name, and the slug that
-/// stands in for the name when two listed workspaces share it (`workspace.slug` is unique,
-/// `workspace.name` is not).
+/// stands in for the name when another listed workspace shares it or spells it as its slug
+/// (`workspace.slug` is unique, `workspace.name` is not).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceName {
     /// `workspace.id`.
@@ -183,53 +185,104 @@ impl WorkspaceNames {
     /// event, never per keystroke). A workspace the read no longer finds is left out, a torn read
     /// like a missing project, and its graphs keep the bare `name · workspace`.
     ///
-    /// # Errors
-    /// Whatever the store reports.
+    /// Never fails (MOD-141 M3 R1 L3): a read that errs leaves that workspace out too, logged at
+    /// `warn`, so a failed name read costs a label its workspace word and never the reply the
+    /// names ride in (the item form, a divergence, the catalogue).
     pub async fn read<'a, S: WriteStore + ?Sized>(
         store: &S,
         graphs: impl IntoIterator<Item = &'a StepGraph>,
-    ) -> Result<Self> {
+    ) -> Self {
         // Collected before the first await, so no borrow of `graphs` is held across one.
-        let ids: BTreeSet<WorkspaceId> = graphs
+        let ids = Self::ids(graphs);
+        let mut reads = Vec::with_capacity(ids.len());
+        for id in ids {
+            reads.push((id, store.workspace(id).await));
+        }
+        Self::from_reads(reads)
+    }
+
+    /// The distinct workspaces among `graphs`' scopes, in id order: what [`read`](Self::read)
+    /// reads, one read each.
+    fn ids<'a>(graphs: impl IntoIterator<Item = &'a StepGraph>) -> BTreeSet<WorkspaceId> {
+        graphs
             .into_iter()
             .filter_map(|graph| graph.scope.workspace_id())
-            .collect();
-        let mut rows = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(workspace) = store.workspace(id).await? {
-                rows.push(WorkspaceName {
+            .collect()
+    }
+
+    /// The names [`read`](Self::read)'s answers give, one `(workspace, answer)` each in id order:
+    /// a found row is named, a missing one left out, and a failed one left out and logged (R1
+    /// L3). The seam its tests fail a read through.
+    fn from_reads(
+        reads: impl IntoIterator<Item = (WorkspaceId, Result<Option<Workspace>>)>,
+    ) -> Self {
+        let mut rows = Vec::new();
+        for (id, read) in reads {
+            match read {
+                Ok(Some(workspace)) => rows.push(WorkspaceName {
                     id,
                     name: workspace.name,
                     slug: workspace.slug,
-                });
+                }),
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    %err,
+                    workspace = %id,
+                    "a workspace name read failed; its graphs read `name \u{b7} workspace`"
+                ),
             }
         }
-        Ok(Self { rows })
+        Self { rows }
     }
 
     /// How a list names a graph a kind or item may use (MOD-138 D12, MOD-141 M3 M-1): a project
     /// graph by its bare name; a library graph as `name · library`; a workspace graph as
-    /// `name · workspace <workspace name>`, the slug in place of the name when another listed
-    /// workspace shares that name; and `name · workspace` for a workspace no read found. A shared
-    /// graph so never reads as one of the project's own, and two workspaces' same-named graphs
-    /// never read alike.
+    /// `name · workspace <word>` ([`word`](Self::word): its name, or its slug when the name is
+    /// another listed row's name or slug); and `name · workspace` for a workspace no read found.
+    /// A shared graph so never reads as one of the project's own, and two read workspaces'
+    /// same-named graphs never read alike.
     #[must_use]
     pub fn label(&self, name: &str, scope: GraphScope) -> String {
         match scope {
             GraphScope::Project(_) => name.to_owned(),
             GraphScope::Library => format!("{name} \u{b7} library"),
-            GraphScope::Workspace(id) => match self.rows.iter().find(|row| row.id == id) {
+            GraphScope::Workspace(id) => match self.row(id) {
                 None => format!("{name} \u{b7} workspace"),
-                Some(row) => {
-                    let shared = self
-                        .rows
-                        .iter()
-                        .any(|other| other.id != id && other.name == row.name);
-                    let word = if shared { &row.slug } else { &row.name };
-                    format!("{name} \u{b7} workspace {word}")
-                }
+                Some(row) => format!("{name} \u{b7} workspace {}", self.word(row)),
             },
         }
+    }
+
+    /// MOD-141 M3 R1 M1: every spelling a typed label may name a workspace graph by, whatever
+    /// [`label`](Self::label) shows today: `name · workspace <workspace name>` and
+    /// `name · workspace <slug>`. Which one a list shows depends on what else is listed, so a
+    /// label typed or prefilled under one list stays valid under the next. None for another scope
+    /// or for a workspace no read found.
+    #[must_use]
+    pub fn spellings(&self, name: &str, scope: GraphScope) -> Vec<String> {
+        let Some(row) = scope.workspace_id().and_then(|id| self.row(id)) else {
+            return Vec::new();
+        };
+        [&row.name, &row.slug]
+            .into_iter()
+            .map(|word| format!("{name} \u{b7} workspace {word}"))
+            .collect()
+    }
+
+    /// The row of workspace `id`, when a read found it.
+    fn row(&self, id: WorkspaceId) -> Option<&WorkspaceName> {
+        self.rows.iter().find(|row| row.id == id)
+    }
+
+    /// The word a label names `row` by (D1, R1 L5): its name, unless another listed row has that
+    /// name or spells it as its slug; then its slug, which is unique. So no two read rows ever
+    /// read alike: a name word matches no other row's name or slug, and two slugs never match.
+    fn word<'a>(&self, row: &'a WorkspaceName) -> &'a str {
+        let taken = self
+            .rows
+            .iter()
+            .any(|other| other.id != row.id && (other.name == row.name || other.slug == row.name));
+        if taken { &row.slug } else { &row.name }
     }
 
     /// How many workspaces are named.
@@ -258,8 +311,9 @@ impl WorkspaceNames {
 /// longer finds is skipped, a torn read like a missing project. A kind's graph neither list holds
 /// gets one more `graph_body` read for [`ProjectCatalogue::kept`]; one no read finds is left out,
 /// and the kind draws as `graph missing`. Then one `workspace` read per distinct workspace among
-/// `shared` and `kept` (MOD-141 M3 D2, [`WorkspaceNames::read`]) names each workspace graph's
-/// workspace.
+/// every project's `shared` and `kept` (MOD-141 M3 D2, R1 L2, [`WorkspaceNames::read`]) names
+/// each workspace graph's workspace, the same names for every project; a failed name read leaves
+/// that workspace unnamed rather than failing the snapshot (R1 L3).
 ///
 /// The bound is `ReadStore + WriteStore` rather than `ReadStore` alone because `item_kinds`,
 /// `usable_graphs` and `graph_body` live on [`WriteStore`] (which extends [`ReadStore`]); only
@@ -295,15 +349,26 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
                 kept.push(body.graph);
             }
         }
-        let workspaces = WorkspaceNames::read(store, shared.iter().chain(&kept)).await?;
         projects.push(ProjectCatalogue {
             project,
             kinds,
             graphs,
             shared,
             kept,
-            workspaces,
+            workspaces: WorkspaceNames::default(),
         });
+    }
+    // MOD-141 M3 R1 L2: one read per distinct workspace across the whole scope, and the slug rule
+    // decided over all of them, so a graph two projects share reads alike on both lines.
+    // Collected into a `Vec` first: a `flat_map` closure held in this future trips the worker
+    // task's `Send` check (a higher-ranked lifetime the compiler cannot prove general).
+    let graphs: Vec<&StepGraph> = projects
+        .iter()
+        .flat_map(|project| project.shared.iter().chain(&project.kept))
+        .collect();
+    let workspaces = WorkspaceNames::read(store, graphs).await;
+    for project in &mut projects {
+        project.workspaces = workspaces.clone();
     }
     let personas = store
         .personas()
@@ -760,5 +825,184 @@ mod tests {
         let own = &project.graphs[0].graph;
         assert_eq!(project.label_of(own.id).as_deref(), Some(own.name.as_str()));
         assert_eq!(project.label_of(StepGraphId::new()), None);
+    }
+
+    /// MOD-141 M3 R1 L5: a name another row spells as its slug reads by slug too, so no two read
+    /// workspaces ever label alike: `x`'s name is the first `Shared`'s slug, and `z`'s name is
+    /// then `x`'s slug.
+    #[test]
+    fn a_name_another_row_uses_as_its_slug_reads_by_slug() {
+        let ids: Vec<WorkspaceId> = (0..4).map(|_| WorkspaceId::new()).collect();
+        let names = WorkspaceNames::new([
+            row(ids[0], "Shared", "x"),
+            row(ids[1], "Shared", "y"),
+            row(ids[2], "x", "z"),
+            row(ids[3], "z", "w"),
+        ]);
+        let labels: Vec<String> = ids
+            .iter()
+            .map(|&id| names.label("flow", GraphScope::Workspace(id)))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "flow \u{b7} workspace x",
+                "flow \u{b7} workspace y",
+                "flow \u{b7} workspace z",
+                "flow \u{b7} workspace w",
+            ]
+        );
+    }
+
+    /// R1 M1: every spelling a typed label may name a workspace graph by, whatever `label` shows:
+    /// by workspace name and by slug; none for another scope or an unread workspace.
+    #[test]
+    fn spellings_name_a_workspace_graph_both_ways() {
+        let names = WorkspaceNames::new([
+            row(ids::WORKSPACE_PLATFORM, "Shared", "platform"),
+            row(ids::WORKSPACE_GRAPHICS, "Shared", "graphics"),
+        ]);
+        assert_eq!(
+            names.spellings("flow", GraphScope::Workspace(ids::WORKSPACE_PLATFORM)),
+            [
+                "flow \u{b7} workspace Shared",
+                "flow \u{b7} workspace platform"
+            ]
+        );
+        assert!(names.spellings("flow", GraphScope::Library).is_empty());
+        assert!(
+            names
+                .spellings("flow", GraphScope::Workspace(WorkspaceId::new()))
+                .is_empty()
+        );
+    }
+
+    /// R1 L2 and L6: the scope's workspaces are read once, and the slug rule decided over the
+    /// whole scope, so a graph two projects share reads alike on both. Graphics is renamed
+    /// `Platform` and holds a graph only Vulkan sees, so the two `Platform`s read by slug on
+    /// `htui`'s line as well as on Vulkan's: the slug path through `snapshot`.
+    #[tokio::test]
+    async fn every_project_of_the_scope_labels_a_graph_alike() {
+        use htui_core::model::WorkspacePatch;
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_id: ids::PROJECT_VULKAN,
+                position: 9,
+            })
+            .await
+            .expect("vulkan joins platform");
+        let graphics = store
+            .workspace(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect("a memory read")
+            .expect("graphics");
+        store
+            .update_workspace(
+                graphics.id,
+                graphics.updated_at,
+                WorkspacePatch {
+                    name: Some("Platform".to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            )
+            .await
+            .expect("graphics is renamed");
+        let flow = graph(
+            &store,
+            GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+            "flow",
+        )
+        .await;
+        let other = graph(
+            &store,
+            GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            "other",
+        )
+        .await;
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_VULKAN],
+        };
+
+        let read = snapshot(&store, &scope).await.expect("the catalogue");
+
+        assert_eq!(read.projects.len(), 2);
+        for project in &read.projects {
+            assert_eq!(
+                project.label_of(flow.id).as_deref(),
+                Some("flow \u{b7} workspace platform"),
+                "{}",
+                project.project.slug
+            );
+            assert_eq!(project.workspaces, read.projects[0].workspaces);
+        }
+        assert_eq!(
+            read.projects[1].label(&other),
+            "other \u{b7} workspace graphics"
+        );
+    }
+
+    /// R1 L3: a workspace whose read fails is left unread, logged, and its graphs keep the bare
+    /// `name · workspace`; the rest are named. One read per distinct workspace, however many of
+    /// its graphs are listed.
+    #[tokio::test]
+    async fn a_failed_workspace_read_leaves_that_workspace_unread() {
+        use htui_core::store::StoreError;
+        let store = MemStore::demo();
+        let platform = store
+            .workspace(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("a memory read")
+            .expect("platform");
+        let graphs = [
+            graph(
+                &store,
+                GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                "one",
+            )
+            .await,
+            graph(
+                &store,
+                GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                "two",
+            )
+            .await,
+            graph(
+                &store,
+                GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+                "three",
+            )
+            .await,
+            graph(&store, GraphScope::Library, "four").await,
+        ];
+        let asked = WorkspaceNames::ids(&graphs);
+        let mut expected = vec![ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS];
+        expected.sort();
+        assert_eq!(
+            asked.iter().copied().collect::<Vec<_>>(),
+            expected,
+            "one read per workspace"
+        );
+
+        let names = WorkspaceNames::from_reads(asked.into_iter().map(|id| {
+            let read = if id == ids::WORKSPACE_GRAPHICS {
+                Err(StoreError::Backend("down".to_owned()))
+            } else {
+                Ok(Some(platform.clone()))
+            };
+            (id, read)
+        }));
+
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names.label("one", graphs[0].scope),
+            "one \u{b7} workspace Platform"
+        );
+        assert_eq!(
+            names.label("three", graphs[2].scope),
+            "three \u{b7} workspace"
+        );
     }
 }

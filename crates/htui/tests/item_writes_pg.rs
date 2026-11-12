@@ -17,8 +17,11 @@
 use htui::item_writes::{ItemFormContext, ItemWrite};
 use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui_core::fixtures::ids;
-use htui_core::model::{EditReason, Item, ItemFilter, ItemId, ItemSpec, Scope, SpecChanges};
-use htui_core::store::{MemStore, ReadStore as _};
+use htui_core::model::{
+    EditReason, GraphScope, Item, ItemFilter, ItemId, ItemSpec, NewStepGraph, Scope, SpecChanges,
+    StepGraphId,
+};
+use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 
 /// The database, the mirror (and the directory it lives in) and the backend over both.
@@ -301,6 +304,49 @@ async fn the_form_read_on_postgres_matches_memory() {
         pg.repos.is_empty(),
         "the demo seeds no repo: {:?}",
         pg.repos
+    );
+
+    stack.finish().await;
+}
+
+/// MOD-141 M3 D2 (R1 L6): on Postgres too the form's read names the workspace of each workspace
+/// graph it lists, so the picker reads `wsflow · workspace <Platform's name>`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_form_read_on_postgres_names_its_workspaces() {
+    let Some(stack) = Stack::new("item-writes-pg-workspaces").await else {
+        return;
+    };
+    let platform = stack
+        .db
+        .store
+        .workspace(ids::WORKSPACE_PLATFORM)
+        .await
+        .expect("the server answers")
+        .expect("the demo holds platform");
+    let wsflow = stack
+        .db
+        .store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+            name: "wsflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a workspace graph");
+    let read = StoreRequest::ItemForm {
+        project: ids::PROJECT_HTUI,
+        item: None,
+    };
+
+    let pg = form(store_worker::serve(&stack.backend, &read).await);
+
+    assert!(pg.graphs.iter().any(|graph| graph.id == wsflow.id));
+    assert_eq!(pg.workspaces.len(), 1, "{pg:?}");
+    assert_eq!(
+        pg.label(&wsflow),
+        format!("wsflow \u{b7} workspace {}", platform.name)
     );
 
     stack.finish().await;
