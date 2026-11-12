@@ -3,6 +3,7 @@ source: crates/htui/tests/prompt_settings.rs
 expression: frame
 ---
  app
+   compete_fan_out                unset | off (default) on/off
    excerpt_file_line_cap          unset | 400 (default) lines
    excerpt_head_lines             unset | 200 (default) lines
    excerpt_max_file_bytes         unset | 524288 (default) bytes

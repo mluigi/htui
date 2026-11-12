@@ -3,6 +3,7 @@ source: crates/htui/tests/prompt_settings.rs
 expression: frame
 ---
  app
+   compete_fan_out                unset | off (default) on/off
    excerpt_file_line_cap          10 | 10 (app setting) lines
 ▌  excerpt_head_lines             50 | 10 (app setting) lines
                                   Lines quoted from the top of a file; the reader clamps it to

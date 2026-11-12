@@ -41,8 +41,8 @@ use ratatui::widgets::Paragraph;
 
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
-    resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_excerpt_caps,
-    resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
+    resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_compete_fan_out,
+    resolve_excerpt_caps, resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
 };
 use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
@@ -1019,7 +1019,7 @@ impl SettingsSection for PromptSection {
                 NextStep(&reads_again(reload.as_deref())),
                 theme,
             ),
-            // There is no empty case below this one: the `App` group is always the registry's eleven.
+            // There is no empty case below this one: the `App` group is always the registry's twelve.
             (None, Some(snapshot)) => {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
@@ -1097,9 +1097,10 @@ fn effective(
     let present = label::setting_source(present_source(project_value, app.contains_key(key.key())));
     let mut notes = Vec::new();
     let (text, number, source) = match key {
-        // The three switches (MOD-89 D4, MOD-33 D267, MOD-163 D19): one row shape, each its own
-        // resolver. The two project-only keys never hold an `app_setting` row, so their App
-        // value is always `None` and they never name that rung.
+        // The four switches (MOD-89 D4, MOD-33 D267, MOD-163 D19, MOD-141 M2 D5): one row
+        // shape, each its own resolver. The two project-only keys never hold an `app_setting`
+        // row, so their App value is always `None` and they never name that rung; the App-only
+        // `compete_fan_out` is never a project row, so it never names the project rung.
         SettingKey::AllowEnvFiles => switch(
             resolve_allow_env_files(project),
             project_value,
@@ -1112,6 +1113,11 @@ fn effective(
         ),
         SettingKey::MemoryCapture => switch(
             resolve_memory_capture(project, app),
+            project_value,
+            app.get(key.key()),
+        ),
+        SettingKey::CompeteFanOut => switch(
+            resolve_compete_fan_out(app),
             project_value,
             app.get(key.key()),
         ),
@@ -1621,6 +1627,37 @@ mod tests {
             switch(true, None, None),
             (SWITCH_ON.to_owned(), None, DEFAULT)
         );
+    }
+
+    /// MOD-141 M2 D5: `compete_fan_out` is an App-only switch, off by default; its row reads `on`
+    /// only for a stored JSON `true`, names the App rung only for a stored boolean, and is never
+    /// clamp arithmetic.
+    #[test]
+    fn the_compete_switch_is_off_unless_the_app_row_holds_true() {
+        let key = SettingKey::CompeteFanOut;
+        let app_setting = label::setting_source(BudgetSource::AppSetting);
+        for (stored, text, source) in [
+            (Some(json!(true)), SWITCH_ON, app_setting),
+            (Some(json!(false)), SWITCH_OFF, app_setting),
+            (Some(json!("on")), SWITCH_OFF, DEFAULT),
+            (Some(json!(1)), SWITCH_OFF, DEFAULT),
+            (None, SWITCH_OFF, DEFAULT),
+        ] {
+            let app: BTreeMap<String, Value> = stored
+                .iter()
+                .map(|value| (key.key().to_owned(), value.clone()))
+                .collect();
+            let row = effective(key, None, None, &app);
+            assert_eq!(
+                (row.text.as_str(), row.source),
+                (text, source),
+                "{stored:?}"
+            );
+            assert_eq!(
+                row.number, None,
+                "D13's clamp arithmetic never reads a switch"
+            );
+        }
     }
 
     /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
