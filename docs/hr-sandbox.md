@@ -734,5 +734,6 @@ skips without the `docker` CLI.
 
 Knobs that help when driving `scripts/hr` from a script or a test: `HR_INTERACTIVE=0|1` forces
 non-interactive or interactive behaviour (default: interactive when stdin and stdout are
-terminals), `HR_NO_GUM=1` behaves as if `gum` were not installed, and `scripts/hr ls --tsv` prints
+terminals), `HR_NO_GUM=1` behaves as if `gum` were not installed, `HR_MODELS=implementer=sonnet` (stage=model pairs,
+comma-separated) is forwarded by `attach` to staff `/handoff-run` stages for that session, and `scripts/hr ls --tsv` prints
 the table as tab-separated text.

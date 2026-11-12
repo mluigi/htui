@@ -1,6 +1,6 @@
 ---
 name: handoff-run
-description: "Run a HANDOFF.md item through its full lifecycle from one command: select (explicit ID, or `next` to resolve the logically next item and ask the maintainer on a tie), route (PRD/plan/ANA), confirm with maintainer, execute the chain (plan-prd, plan, code-architect, implementer fan-out, configured reviewer), then apply HANDOFF/DECISIONS bookkeeping per workflow-docs.md and validate it. Trigger: /handoff-run <ITEM-ID>|next [--dry-run]."
+description: "Run a HANDOFF.md item through its full lifecycle from one command: select (explicit ID, or `next` to resolve the logically next item and ask the maintainer on a tie), route (PRD/plan/ANA), confirm with maintainer, execute the chain (plan-prd, plan, task briefs, implementers, configured reviewer), then apply HANDOFF/DECISIONS bookkeeping per workflow-docs.md and validate it. Trigger: /handoff-run <ITEM-ID>|next [--dry-run]."
 ---
 
 # /handoff-run
@@ -14,7 +14,29 @@ One command per HANDOFF item lifecycle. Auto-chain with the maintainer present �
 /handoff-run next             # pick the logically next item, then the same lifecycle
 /handoff-run ANA-5 --dry-run  # routing verdict only, nothing executes
 /handoff-run next --dry-run   # selection block + routing verdict only, nothing executes
+/handoff-run MOD-4 --model implementer=sonnet                      # one stage on another model, this run only
+/handoff-run MOD-4 --model implementer=sonnet --model verifier=haiku
 ```
+
+## Stage models
+
+Each stage runs on the session model unless a model is set for it. Stages: `plan` (plan drafting and its
+fact-check), `architect`, `implementer` (implementers and repairs), `verifier`, `reviewer`. Values: `sonnet`,
+`opus`, `haiku`, or `inherit`. Resolution, first hit wins:
+
+1. `--model <stage>=<model>` on the command (repeatable) — this run only.
+2. The `HR_MODELS` environment variable, same pairs comma-separated (`implementer=sonnet,verifier=haiku`).
+   `scripts/hr attach` forwards it into a sandbox, so `HR_MODELS=implementer=sonnet scripts/hr up MOD-4` sets a
+   run's models from the host.
+3. `.claude/workflow-config.json`, key `models` (`{"implementer": "sonnet"}`; `null` or absent = inherit) — the
+   repo default.
+
+An unknown stage or model name is a usage error: stop and say so, never guess. Print the resolved table in the
+routing verdict (step 2) on a line `Models: implementer=sonnet (--model), others inherit`, so the maintainer
+confirms it with the route. Apply it by passing `model` on that stage's `Agent` call, and `args.models` to
+`scripts/task-lane.js`; a stage that inherits gets no `model` at all. The selection subagent of step 1.5 is not a
+stage and keeps its own rule. A stage that fails on its model (quota, 402) is reported and re-run on the session
+model only after the maintainer agrees: a silent fallback would spoil the comparison the override was for.
 
 ## References (load per phase, not all up front)
 
@@ -27,6 +49,8 @@ One command per HANDOFF item lifecycle. Auto-chain with the maintainer present �
 - `scripts/next-item-id.sh` / `.ps1` — the owned-ID mint, run whenever a path spawns a new item (lifecycle P0)
 - `scripts/hr-mint` (repo root, Linux) — the leased mint; P0 mints through it whenever `scripts/hr-mint --leasing`
   exits 0 (always in a sandbox; on the host once `scripts/hr up` has been used). User guide: `docs/hr-sandbox.md`
+- `scripts/task-lane.js` — the Workflow-tool script for the implementation phase (step 4); its header documents `args`
+- `scripts/token-usage.py` — token usage per item, stage, task and model from the session transcripts (step 5)
 - `scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run at close-out
 - Law: `.claude/rules/workflow-docs.md` (auto-loads when workflow docs are touched)
 
@@ -122,24 +146,53 @@ routing trigger needed).
 
 ### 4. Implementation phase (PRD/plan paths, after CONFIRM)
 
-1. **`code-architect`** agent produces the blueprint from the approved plan.
-2. **Implementer fan-out**: tasks the plan marks independent run as parallel agents; TDD per repo convention (tests
-   first). Every subagent prompt doing code exploration includes the graphify-first rule. Independence is decided by
-   the fact-checked file sets from step 3.5, never by plan prose — a non-empty intersection strips the parallel
-   marking; the affected tasks run serial (or in isolated worktrees when the split is worth it).
-   **Ultracode mode** (verdict recommended the **implement** phase and the maintainer accepted, per
-   `references/routing.md`): run this step as one Workflow-tool script instead of individual agent calls — pipeline the
-   plan's independent tasks through implement → adversarial-verify stages, deterministic fan-out, findings fed to
-   the review gate (step 3 below). The confirmed verdict is the orchestration opt-in; scale the agent count to the
-   plan's task list, not beyond it. Orchestration is never permission to skip TDD or any gate.
-3. **Review gate** — the repo's configured reviewer agent always runs over the full change set; it is the final
-   review authority and nothing replaces it. Resolve it from the
-   repo's `.claude/workflow-config.json`, key `reviewer` (agent name, e.g. `"cpp-reviewer"`). File or key missing →
-   propose a reviewer from the repo's dominant language, confirm with the maintainer, write the file, then run it.
-   Findings applied (or explicitly deferred with the maintainer) before close-out. Ultracode does not replace
-   this gate. Verdict recommended the **review** phase (maintainer accepted) → after the configured reviewer
-   runs, fan its findings through a Workflow-tool adversarial-verify pass (one verifier per finding) before
-   applying/deferring them — the verify pass only checks findings, never substitutes for the reviewer.
+Cost rule behind every step here: an agent pays for its whole context on every turn, so each agent gets the smallest
+text that specifies its job, runs the smallest check that proves it, and is spawned only where it is the one that
+catches the defect. Review authority sits in one place, the review gate.
+
+1. **Plan carries the design.** The confirmed plan's task sections must each stand alone: files owned, the types and
+   signatures to add or change, the tests to write, and the task's own check command (crate-scoped, never the
+   workspace gate). Shared decisions sit in one short section. A plan that lacks this is amended before sub-step 2, not
+   patched by an architect.
+   **`code-architect` runs only when C2 fired** (new public API, module seam or engine-structure decision) or the
+   maintainer asks for it. Its blueprint then holds the design decisions and the deltas to the plan, not a second
+   copy of the tasks: at most ~300 lines, and every delta is folded into the task sections it changes.
+2. **Task briefs.** For each task write `.claude/plans/<name>.briefs/<KEY>.md`: the shared-decisions section plus
+   that task's section, cut out of the plan (and blueprint) mechanically, not re-written. The brief is the only
+   planning text an implementer or verifier reads. A task whose brief exceeds ~300 lines is split.
+3. **Implement.** TDD per repo convention (tests first). Independence is decided by the fact-checked file sets from
+   step 3.5, never by plan prose: a non-empty intersection strips the parallel marking, and the affected tasks run
+   serial (or in isolated worktrees when the split is worth it).
+   - **Light shape** (the plan has at most two tasks, or touches about five files or fewer): one implementer per
+     task as a plain `Agent` call from its brief. No workflow.
+   - **Lane shape** (everything else, and whenever the confirmed verdict recommends ultracode for **implement**):
+     run `scripts/task-lane.js` through the Workflow tool with `scriptPath` and `args` (the header of the script
+     documents them). One run takes one lane of serial tasks on one checkout; parallel lanes are concurrent runs in
+     separate worktrees. The confirmed verdict is the orchestration opt-in; one implementer per task, never more
+     agents than the plan has tasks plus the verifiers below.
+   - **Verifier, by exception.** A task gets one read-only verifier (conformance and breakage in one agent, over
+     the task's own commit range) only when it is a **foundation** task that later tasks build on, or a
+     **fix round** (sub-step 5 below). Medium and high findings get one repair; a repaired high gets one re-check of the
+     repair's diff alone. Low findings are not repaired there: they go to the review gate's list. All other tasks
+     go to the gate and the review unverified by design.
+   - **Small same-shape tasks are batched** into one brief and one implementer.
+   - **Agents never run the workspace gate.** An implementer runs its task's check, clippy and rustfmt on the crates
+     it touched. A workflow agent's prompt cache lasts five minutes, so a long build inside an agent reloads its
+     whole context at full price.
+4. **Gate, once per lane.** After a lane finishes, the main thread runs the gate itself (`bash scripts/gate.sh`, or
+   the item's narrower gate when the plan names one) and reads the result. A red gate goes back to one implementer
+   with the failing output and that task's brief.
+5. **Review gate.** The repo's configured reviewer agent always runs over the full change set; it is the final
+   review authority and nothing replaces it. Resolve it from the repo's `.claude/workflow-config.json`, key
+   `reviewer` (agent name, e.g. `"cpp-reviewer"`). File or key missing → propose a reviewer from the repo's dominant
+   language, confirm with the maintainer, write the file, then run it.
+   Its prompt carries: the exact range (`git diff <base>..HEAD`), the plan path with the instruction to check the
+   change against the plan's tasks as well as for quality, and the low findings carried from sub-step 3. One reviewer
+   run per item; split it into parallel area instances only when the diff exceeds ~5,000 lines.
+   Findings are applied (or explicitly deferred with the maintainer) before close-out, in **one fix round**: the
+   findings go to one implementer per affected area as a `verify: 'fix-round'` task, whose prompt tells it to
+   confirm each finding against the code before acting. The fix round's verifier reads the fix diff only. There is
+   no verifier per finding, and no second reviewer pass, unless the maintainer asks for one.
 
 ### 5. Close-out
 
@@ -153,7 +206,10 @@ routing trigger needed).
    as `[WARNING] ... (pre-existing ...)` and does not block an unrelated commit. Human escape hatch:
    `WORKFLOW_SKIP_HOOK=1`.
 3. Update PRD milestone row / plan artifact status where they exist.
-4. Report: what shipped, commits, validator result. Push only when agreed (the repo's
+4. Usage table: run `python3 .claude/skills/handoff-run/scripts/token-usage.py --item <ITEM-ID>` and put its
+   output in the report as-is (stage, task, model, cost share, cache reloads, verifier findings). It reads this
+   session's transcripts, so it is a measurement, not an estimate; `--help` explains the columns.
+5. Report: what shipped, commits, validator result, the usage table, and the stage models that were in force. Push only when agreed (the repo's
    `AGENTS.md` push policy).
 
 ## Sandbox mode (`HR_SANDBOX=1`)
@@ -192,6 +248,8 @@ reviewer gate included — is unchanged.
   push.
 - CONFIRM is only offered over a fact-checked plan (step 3.5); implementer fan-out never trusts prose independence —
   file-set intersection decides.
+- Implementers and verifiers read their task brief, not the plan; no agent runs the workspace gate; the configured
+  reviewer is the one review authority and runs once per item (step 4).
 - `next` selects, it never invents: only open checklist lines in the current repo are candidates, a blocked item is
   never auto-selected, and a tie that only file order would break is asked. Selection is a separate confirm from
   routing — printing the selection block does not consume the step-2 gate. The Sonnet 5 selection subagent drafts

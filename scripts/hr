@@ -28,6 +28,7 @@
 #   HR_DOCKER     docker binary              (default docker; the tests stub it)
 #   HR_INTERACTIVE  auto (default: stdin and stdout are terminals) | 1 | 0
 #   HR_NO_GUM=1   behave as if gum were not installed
+#   HR_MODELS     /handoff-run stage models for the session attach starts, e.g. implementer=sonnet (forwarded by name)
 # Everything scripts/hr exports to compose is the env contract in the header of
 # docker/hr/compose.hr.yaml (blueprint §T1).
 #
@@ -975,6 +976,8 @@ cmd_attach() {
         [[ -n "${ANTHROPIC_API_KEY:-}" ]] || die 2 "--api-key needs ANTHROPIC_API_KEY set in the host environment"
         envs+=(-e ANTHROPIC_API_KEY)
     fi
+    # /handoff-run reads HR_MODELS (stage=model pairs) to staff its stages; unset means the repo's defaults.
+    [[ -z "${HR_MODELS:-}" ]] || envs+=(-e HR_MODELS)
     if [[ "$shell" -ne 1 ]]; then
         local -a genv=()
         [[ -z "${HR_GORTEX_WAIT:-}" ]] || genv=(-e HR_GORTEX_WAIT)

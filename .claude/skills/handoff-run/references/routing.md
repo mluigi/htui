@@ -45,6 +45,7 @@ Item:      <PREFIX-N> — <title>
 Path:      ANA | PRD | plan
 Criteria:  C1 ✗  C2 ✓ (new public mount API)  C3 ✓ (backend choice open)  C4 ✗   → 2 fired
 Ultracode: recommended (<phase> — <which trigger>[; <phase> — <trigger>…]) | not needed
+Models:    all inherit | <stage>=<model> (<--model | HR_MODELS | config>)[, …], others inherit
 Reasoning: <one or two sentences>
 ```
 
@@ -56,8 +57,8 @@ trigger. Phase triggers:
 | Phase | Recommend when |
 |---|---|
 | **research** (ANA path) | The question spans multiple repos, backends, or source families — multi-modal sweep (per-repo/per-backend readers + web survey in parallel). The ANA doc itself is still written by one agent from the sweep's returns. |
-| **implement** (PRD/plan paths) | **C4 fired** (breadth > ~10 files), **≥3 criteria fired**, or the item text asks for an exhaustive sweep/audit/migration. |
-| **review** | The change set is wide enough that reviewer findings warrant parallel adversarial verification (one verifier per finding). Never replaces the reviewer gate — the configured reviewer still runs; the workflow only verifies its findings. |
+| **implement** (PRD/plan paths) | **C4 fired** (breadth > ~10 files), **≥3 criteria fired**, or the item text asks for an exhaustive sweep/audit/migration. The workflow is the lane script of `SKILL.md` step 4: one implementer per task, a verifier only for foundation tasks and fix rounds. |
+| **review** | Never recommended by default: the configured reviewer runs once and its findings go to one fix round (`SKILL.md` step 4). Only the maintainer adds a verify fan-out over reviewer findings ("verify the review"). |
 
 No phase qualifies → `not needed`. A phase qualifies only when a scripted workflow is
 actually cheaper and safer than driving the same agents by hand — a handful of sequential

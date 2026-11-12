@@ -1,3 +1,10 @@
 {
-  "reviewer": "rust-reviewer"
+  "reviewer": "rust-reviewer",
+  "models": {
+    "plan": null,
+    "architect": null,
+    "implementer": null,
+    "verifier": null,
+    "reviewer": null
+  }
 }
