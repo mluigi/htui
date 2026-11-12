@@ -41,8 +41,8 @@ use ratatui::widgets::Paragraph;
 
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
-    resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_excerpt_caps,
-    resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
+    resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_compete_fan_out,
+    resolve_excerpt_caps, resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
 };
 use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
@@ -1097,9 +1097,10 @@ fn effective(
     let present = label::setting_source(present_source(project_value, app.contains_key(key.key())));
     let mut notes = Vec::new();
     let (text, number, source) = match key {
-        // The three switches (MOD-89 D4, MOD-33 D267, MOD-163 D19): one row shape, each its own
-        // resolver. The two project-only keys never hold an `app_setting` row, so their App
-        // value is always `None` and they never name that rung.
+        // The four switches (MOD-89 D4, MOD-33 D267, MOD-163 D19, MOD-141 M2 D5): one row
+        // shape, each its own resolver. The two project-only keys never hold an `app_setting`
+        // row, so their App value is always `None` and they never name that rung; the App-only
+        // `compete_fan_out` is never a project row, so it never names the project rung.
         SettingKey::AllowEnvFiles => switch(
             resolve_allow_env_files(project),
             project_value,
@@ -1112,6 +1113,11 @@ fn effective(
         ),
         SettingKey::MemoryCapture => switch(
             resolve_memory_capture(project, app),
+            project_value,
+            app.get(key.key()),
+        ),
+        SettingKey::CompeteFanOut => switch(
+            resolve_compete_fan_out(app),
             project_value,
             app.get(key.key()),
         ),

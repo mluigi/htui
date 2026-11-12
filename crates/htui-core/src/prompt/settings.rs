@@ -55,6 +55,10 @@ pub const BOX_HOSTNAME_DEFAULT: bool = true;
 /// row, so its resolver falls through to this constant.
 pub const MEMORY_CAPTURE_DEFAULT: bool = true;
 
+/// MOD-141 M2 D5: `compete_fan_out`'s compiled default, off. An App key with no seeded row, like
+/// `memory_capture`; only the graph editor reads it (`R-LATER-13`).
+pub const COMPETE_FAN_OUT_DEFAULT: bool = false;
+
 /// `project.settings.allow_env_files`'s compiled default: a provider project whose session trees
 /// hold env files is refused (MOD-89 D3, D4). Not a field of [`Defaults`]: no App rung.
 pub const ALLOW_ENV_FILES_DEFAULT: bool = false;
@@ -91,9 +95,9 @@ pub struct Defaults {
 }
 
 impl Defaults {
-    /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture`, as `(key, value)` in **key byte
-    /// order**, which is the order migration `0002`'s `INSERT` is compared against and the order a
-    /// seeder must write them in.
+    /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture` and MOD-141's unseeded
+    /// `compete_fan_out`, as `(key, value)` in **key byte order**, which is the order migration
+    /// `0002`'s `INSERT` is compared against and the order a seeder must write them in.
     ///
     /// Iterated out of [`SettingKey::app_keys`] rather than spelled a second time (MOD-15 plan D7):
     /// the key list has one home, so a key added to the registry cannot be forgotten here and drift
@@ -115,6 +119,7 @@ impl Defaults {
         match key {
             SettingKey::AllowEnvFiles => Value::Bool(ALLOW_ENV_FILES_DEFAULT),
             SettingKey::BoxHostname => Value::Bool(BOX_HOSTNAME_DEFAULT),
+            SettingKey::CompeteFanOut => Value::Bool(COMPETE_FAN_OUT_DEFAULT),
             SettingKey::ExcerptFileLineCap => Value::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => Value::from(self.excerpt_head_lines),
             SettingKey::ExcerptMaxFileBytes => Value::from(self.excerpt_max_file_bytes),
@@ -141,6 +146,7 @@ impl Defaults {
         match key {
             SettingKey::AllowEnvFiles => i64::from(ALLOW_ENV_FILES_DEFAULT),
             SettingKey::BoxHostname => i64::from(BOX_HOSTNAME_DEFAULT),
+            SettingKey::CompeteFanOut => i64::from(COMPETE_FAN_OUT_DEFAULT),
             SettingKey::ExcerptFileLineCap => i64::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => i64::from(self.excerpt_head_lines),
             SettingKey::ExcerptMaxFileBytes => {
@@ -160,10 +166,11 @@ impl Defaults {
     }
 }
 
-/// The thirteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
-/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, and MOD-163's
-/// `memory_capture`, a switch both the App and the Project rung hold — declared in **key byte
-/// order**: the discriminant indexes [`SPECS`].
+/// The fourteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
+/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, MOD-163's
+/// `memory_capture`, a switch both the App and the Project rung hold, and MOD-141's
+/// `compete_fan_out`, a switch only the App rung holds — declared in **key byte order**: the
+/// discriminant indexes [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
 /// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
@@ -175,35 +182,39 @@ pub enum SettingKey {
     AllowEnvFiles = 0,
     /// `box_hostname`, a [`SettingKind::Boolean`] only a project holds (MOD-33 D267).
     BoxHostname = 1,
+    /// `compete_fan_out`, MOD-141 M2 D5: whether the step-graph editor offers the compete split;
+    /// App only, off by default.
+    CompeteFanOut = 2,
     /// `excerpt_file_line_cap`.
-    ExcerptFileLineCap = 2,
+    ExcerptFileLineCap = 3,
     /// `excerpt_head_lines`.
-    ExcerptHeadLines = 3,
+    ExcerptHeadLines = 4,
     /// `excerpt_max_file_bytes`.
-    ExcerptMaxFileBytes = 4,
+    ExcerptMaxFileBytes = 5,
     /// `excerpt_max_files`.
-    ExcerptMaxFiles = 5,
+    ExcerptMaxFiles = 6,
     /// `excerpt_max_scan_files`.
-    ExcerptMaxScanFiles = 6,
+    ExcerptMaxScanFiles = 7,
     /// `excerpt_provider_deadline_ms`.
-    ExcerptProviderDeadlineMs = 7,
+    ExcerptProviderDeadlineMs = 8,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 8,
+    MaxSkillTokens = 9,
     /// `memory_capture`, MOD-163 D19: automatic memory capture at run end; read by MOD-164.
-    MemoryCapture = 9,
+    MemoryCapture = 10,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 10,
+    PromptReserveFraction = 11,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 11,
+    UpstreamHops = 12,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 12,
+    TokenBudget = 13,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::AllowEnvFiles,
         Self::BoxHostname,
+        Self::CompeteFanOut,
         Self::ExcerptFileLineCap,
         Self::ExcerptHeadLines,
         Self::ExcerptMaxFileBytes,
@@ -218,8 +229,8 @@ impl SettingKey {
     ];
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
-    /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture`, and no project-only
-    /// key (MOD-33 D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate
+    /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture` and MOD-141's
+    /// unseeded `compete_fan_out`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate
     /// this, never `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
@@ -239,7 +250,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the thirteen.
+    /// The reverse of [`Self::key`], `None` for a string outside the fourteen.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -313,8 +324,8 @@ impl core::fmt::Display for Rungs {
 }
 
 /// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
-/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the three switches,
-/// `allow_env_files`, `box_hostname` and `memory_capture`, are booleans.
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the four switches,
+/// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
@@ -363,7 +374,7 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 13] = [
+pub const SPECS: [SettingSpec; 14] = [
     SettingSpec {
         key: "allow_env_files",
         project_key: Some("allow_env_files"),
@@ -385,6 +396,17 @@ pub const SPECS: [SettingSpec; 13] = [
         not_above: None,
         unit: "on/off",
         doc: "Whether a phase prompt's box section names this box; the digest never includes it.",
+    },
+    SettingSpec {
+        key: "compete_fan_out",
+        project_key: None,
+        kind: SettingKind::Boolean,
+        min: 0,
+        max: 1,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "on/off",
+        doc: "Offer the compete split (several agents, one winner) in the step-graph editor.",
     },
     SettingSpec {
         key: "excerpt_file_line_cap",
@@ -827,6 +849,17 @@ pub fn resolve_memory_capture(project: Option<&Value>, app: &BTreeMap<String, Va
         .unwrap_or(MEMORY_CAPTURE_DEFAULT)
 }
 
+/// `compete_fan_out` (MOD-141 M2 D5): the `app_setting` row's boolean, else
+/// [`COMPETE_FAN_OUT_DEFAULT`] (off). The house fall-through rule: absent, `null` or a
+/// non-boolean is not a value. Only the graph editor reads it; the engine runs a compete node
+/// whatever it says.
+#[must_use]
+pub fn resolve_compete_fan_out(app: &BTreeMap<String, Value>) -> bool {
+    app.get("compete_fan_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(COMPETE_FAN_OUT_DEFAULT)
+}
+
 /// `project.settings.allow_env_files` (MOD-89 D4): whether a provider project whose session trees
 /// hold env files warns instead of refusing.
 ///
@@ -936,18 +969,20 @@ mod tests {
         assert_eq!(rows.len(), 10, "ANA-5 §5.3 reserves ten keys, got {rows:?}");
         let mut expected = rows.clone();
         expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        // MOD-163 D19: `memory_capture` is an App key 0002 does not seed; its resolver falls
-        // through to the compiled default, so the seeded ten are the rows without it.
+        // MOD-163 D19 and MOD-141 M2 D5: `memory_capture` and `compete_fan_out` are App keys
+        // 0002 does not seed; their resolvers fall through to the compiled defaults, so the
+        // seeded ten are the rows without them.
         let rows = DEFAULTS.as_rows();
         assert_eq!(
             rows.len(),
-            11,
-            "0002's ten rows plus MOD-163's unseeded `memory_capture`"
+            12,
+            "0002's ten rows plus the unseeded `memory_capture` and `compete_fan_out`"
         );
         assert!(rows.contains(&("memory_capture", Value::Bool(true))));
+        assert!(rows.contains(&("compete_fan_out", Value::Bool(false))));
         assert_eq!(
             rows.into_iter()
-                .filter(|(key, _)| *key != "memory_capture")
+                .filter(|(key, _)| !matches!(*key, "memory_capture" | "compete_fan_out"))
                 .collect::<Vec<_>>(),
             expected
                 .iter()
@@ -1147,7 +1182,7 @@ mod tests {
         );
         assert!(rung_refusal(SettingKey::MemoryCapture, Rungs::PHASE).is_some());
         assert_eq!(
-            SettingKey::ALL[9],
+            SettingKey::ALL[10],
             SettingKey::MemoryCapture,
             "`memory_capture` sorts between `max_skill_tokens` and `prompt_reserve_fraction`"
         );
@@ -1183,18 +1218,82 @@ mod tests {
         );
     }
 
+    /// MOD-141 M2 D5: the fourth switch, and the first one only the App rung holds. Only the
+    /// graph editor reads it.
+    #[test]
+    fn compete_fan_out_is_an_app_only_boolean() {
+        let spec = SettingKey::CompeteFanOut.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "compete_fan_out",
+                project_key: None,
+                kind: SettingKind::Boolean,
+                min: 0,
+                max: 1,
+                rungs: Rungs::APP,
+                not_above: None,
+                unit: "on/off",
+                doc: spec.doc,
+            }
+        );
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert_eq!(SettingKey::CompeteFanOut.key(), "compete_fan_out");
+        assert_eq!(rung_refusal(SettingKey::CompeteFanOut, Rungs::APP), None);
+        assert!(rung_refusal(SettingKey::CompeteFanOut, Rungs::PROJECT).is_some());
+        assert!(rung_refusal(SettingKey::CompeteFanOut, Rungs::PHASE).is_some());
+        assert_eq!(
+            SettingKey::ALL[2],
+            SettingKey::CompeteFanOut,
+            "`compete_fan_out` sorts between `box_hostname` and `excerpt_file_line_cap`"
+        );
+        for on in [json!(true), json!(false)] {
+            assert_eq!(
+                validate(SettingKey::CompeteFanOut, Rungs::APP, &on, None),
+                Ok(()),
+                "{on} is a value of the switch"
+            );
+        }
+        assert!(
+            validate(SettingKey::CompeteFanOut, Rungs::APP, &json!(1), None).is_err(),
+            "a number is refused, not coerced"
+        );
+    }
+
+    /// MOD-141 M2 D5: default off; only a stored JSON boolean is a value.
+    #[test]
+    fn resolve_compete_fan_out_defaults_off() {
+        assert!(!resolve_compete_fan_out(&BTreeMap::new()), "default off");
+        assert!(resolve_compete_fan_out(&app(&[(
+            "compete_fan_out",
+            json!(true)
+        )])));
+        assert!(!resolve_compete_fan_out(&app(&[(
+            "compete_fan_out",
+            json!(false)
+        )])));
+        for dud in [json!("on"), json!(1), Value::Null] {
+            assert!(
+                !resolve_compete_fan_out(&app(&[("compete_fan_out", dud.clone())])),
+                "{dud} is not a boolean, so the default answers"
+            );
+        }
+    }
+
     /// D276: the App group and `as_rows` are the `app_setting` keys, never a project-only one:
-    /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19).
+    /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19) and MOD-141's unseeded
+    /// `compete_fan_out` (M2 D5).
     #[test]
     fn app_keys_are_0002s_ten_plus_memory_capture_in_byte_order() {
         let app: Vec<SettingKey> = SettingKey::app_keys().collect();
         assert_eq!(
             app.len(),
-            11,
-            "migration 0002 seeds ten rows, and `memory_capture` is the eleventh"
+            12,
+            "migration 0002 seeds ten rows, and `memory_capture` and `compete_fan_out`, unseeded"
         );
-        assert_eq!(SettingKey::app_keys().count(), 11);
+        assert_eq!(SettingKey::app_keys().count(), 12);
         assert!(app.contains(&SettingKey::MemoryCapture));
+        assert!(app.contains(&SettingKey::CompeteFanOut));
         assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
         assert_eq!(
@@ -1313,7 +1412,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "thirteen distinct keys, strictly ascending as bytes"
+            "fourteen distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),
