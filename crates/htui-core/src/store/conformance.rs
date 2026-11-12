@@ -25733,8 +25733,10 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
         row.integrate_model = Some("sonnet".to_owned());
         row.max_parts = Some(2);
         row.deadline_seconds = Some(900);
-        row.judge_agent_id = Some(ids::AGENT_CLAUDE);
-        row.judge_model = Some("opus".to_owned());
+        // Review R1 A-L1: an agent and a model no other column of the row holds, so a judge
+        // bound in the planner's or the integrator's place reads back wrong.
+        row.judge_agent_id = Some(ids::AGENT_CLAUDE_CLI);
+        row.judge_model = Some("haiku".to_owned());
         row
     };
     let mut body = body_now(CASE, store, graph).await;
@@ -25840,7 +25842,12 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
         [
             ("plan", None, None, None),
             ("split", None, None, None),
-            ("merge", Some(900), Some(ids::AGENT_CLAUDE), Some("opus")),
+            (
+                "merge",
+                Some(900),
+                Some(ids::AGENT_CLAUDE_CLI),
+                Some("haiku")
+            ),
         ],
         "{CASE}: a kept node's deadline and judge clear to none; the other kept node keeps its own"
     );

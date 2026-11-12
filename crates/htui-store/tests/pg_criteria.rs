@@ -13217,8 +13217,10 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
     phase.integrate_model = Some("sonnet".to_owned());
     phase.max_parts = Some(3);
     phase.deadline_seconds = Some(900);
-    phase.judge_agent_id = Some(ids::AGENT_AGY);
-    phase.judge_model = Some("opus".to_owned());
+    // Review R1 A-L1: an agent and a model no other column holds, so a swapped bind reads back
+    // wrong.
+    phase.judge_agent_id = Some(ids::AGENT_CLAUDE_CLI);
+    phase.judge_model = Some("haiku".to_owned());
     let phase = phase.clone();
     let graph = data
         .graphs
