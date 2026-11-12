@@ -684,6 +684,11 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   recall it), then rewrite history with `git filter-repo --replace-text` on every branch and force-push
   `origin` and `github`, **after** the live `hr` sandbox branches (TOOL-8, ANA-30, TOOL-10 at the
   audit) are merged or dropped. Maintainer decision 2026-10-14: file now, rewrite later. Not blocked.
+  **Branches (maintainer decision 2026-11-12):** those `hr` branches are merged; every remote branch but `main`
+  still carries the three commits and is **deleted before the rewrite, not rewritten**: `origin/mod-9` (an
+  abandoned MOD-9 milestone 3 attempt, 98 commits never on main, superseded by `hr/MOD-9`'s merge `b9ed0387`),
+  and the fully merged `origin/chore/ignore-headroom-wrap-state`, `origin/hr/attach-gortex-wait`,
+  `origin/spike/ui-skeleton` and `github/mod-32`. Re-list `git branch -r --contains be47ad47` on the day.
   **Requirements review note (2026-10-15):** `R-ID-7` now names logs, telemetry and error reports
   explicitly. Check that `tracing` output written to a file passes the scrubber too, not only what
   reaches the endpoint.
