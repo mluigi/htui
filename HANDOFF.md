@@ -14,9 +14,13 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-12):** phases landed on main with the item still open: MOD-141 M1 and M2 (M3 open),
+**Current status (2026-11-12):** phases landed on main with the item still open:
 MOD-147 M1 and M2 (M3, M4 open), MOD-162 M1, MOD-122 M1, MOD-125 M1; each item's note says what is next.
-**MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
+**MOD-141 is done** (`docs/decisions/mod/mod-141.md`; M3 on `hr/MOD-141`, to collect): one rataflow step-graph
+editor saves a graph of any scope through `ReplaceGraph`; `Settings > Kinds` opens it on project graphs, and
+`GraphEditorHost::open_by_id` is the entry point MOD-124 wires into the Toolbox. A workspace graph's label names its
+workspace (`flow · workspace Platform`), and a typed graph name that matches several graphs is refused, listing
+the qualified labels. **MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
 qualifier comes from one Postgres query a tick (`PgStore::waiting_keys`: the scope row and every scope project's
 slug and kind prefixes), where it was 2N+1 serial round trips; the mirror and memory still read per project, and
 the output is unchanged. **MOD-139 is done** (`docs/decisions/mod/mod-139.md`): divided fan-out runs.
@@ -27,13 +31,8 @@ diffstats to its agent, and lands alone after a post-check (every part's tip an 
 integrate's) and verify; recovery per role. Resolve refuses only a planner agent (MOD-140) and what admission
 would refuse. Owed on the host: the Qdrant suites and the Postgres gate; MOD-97 took `0028`, so
 MOD-139's migration is `0029_divided_fanout` (renumbered at the merge).
-**MOD-97 is done** (`docs/decisions/mod/mod-97.md`): a
-`billing = subscription` agent row no longer bills an exported or project-secret API key. The row's
-`settings.api_billing_env` names the variables (seeded on `claude` and `claude-cli`, backfilled by
-`0028_seed_api_billing_env`); both drivers drop them from every session spawn, inherited copies included,
-with a names-only warning, and `per_token` rows keep them; `--bare` is pinned by a seeded-argv test and an
-ignored live case. MOD-143 waits on MOD-150 and MOD-133.
-Earlier completions, MOD-163 back to the 2026-10-14
+MOD-143 waits on MOD-150 and MOD-133.
+Earlier completions, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -1027,7 +1026,7 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   ask or automatic, default workflow) and **Catalogue** (source, last update, update now). **Amended by
   ANA-33 (2026-10-18, `docs/ANA-33.md` §7.6):** the Workflows section's run-time changes field is the
   `runtime_changes` default (`off`, `ask` default, `automatic`) that MOD-140 freezes into a run's bounds; a graph
-  may override it (MOD-141). Overlaps
+  may override it (MOD-171). Overlaps
   MOD-109's surfaces: land beside it. MOD-115 is done (`docs/decisions/mod/mod-115.md`).
 - [ ] **MOD-124 - Toolbox tab and workflow editor** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.6).
   `R-TUI-7`, `R-ORCH-1`, `R-PRM-4`. The Toolbox tab with the kinds ANA-40 settled (`docs/decisions/ana/ana-40.md`; templates stay a
@@ -1037,8 +1036,12 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   or click a link (change, delete), right-click edits, `T` pins a target, undo/redo of every edit
   (`u`/`U`, `Ctrl-Z`/`Ctrl-Y`); runs keep the version they started with. **Amended by ANA-33 (2026-10-18,
   `docs/ANA-33.md` §7.10):** the workflow editor *is* MOD-141's shared step-graph component (one editor for every
-  `step_graph`, whatever its scope); this item keeps the Toolbox shell and opens MOD-141 on the library and the
-  workspace's graphs. MOD-115 is done (`docs/decisions/mod/mod-115.md`); the generic binding is MOD-127, bundles are MOD-128, the editor MOD-141.
+  `step_graph`, whatever its scope); this item keeps the Toolbox shell and opens the editor on the library and the
+  workspace's graphs. MOD-141 is done (`docs/decisions/mod/mod-141.md`): call `GraphEditorHost::open_by_id`
+  (`crates/htui/src/ui/graph_editor/host.rs`), tested on all three scopes. Owed here from its M3 review (L1): a
+  `StoreReply::GraphBody` carries no id, so a late `GraphBody(None)` or `Failed{"graph_body"}` from a replaced open
+  can refuse a newer one; carry the requested id before opening by id twice. MOD-115 is done
+  (`docs/decisions/mod/mod-115.md`); the generic binding is MOD-127, bundles are MOD-128.
 - [ ] **MOD-125 - Stopping and resuming runs** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.1).
   `R-ORCH-16`, `R-TUI-14`, `R-TUI-18`, `R-AGT-1`. Stop every run in a workspace, the open one
   included: graceful stops each agent step before its next turn (a check or `htui`'s own step at
@@ -1102,41 +1105,6 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   revision ≥ 1), parts and integrate run; resolve refuses a planner agent (`NotRunnable::PlannerAgent`), a
   part-less divide (`NoParts`) and a non-`parts` plan scope (`PlanScope`) until this item lifts them. Owed here from
   MOD-139: `refuse_admission`'s end-to-end case (its M3 ruling R-2) and per-part personas (refused at admission).
-- [ ] **MOD-141 - One step-graph editor for Settings and the Toolbox** (from ANA-33, `docs/ANA-33.md` §7.10, §10).
-  `R-TUI-8`, `R-TUI-7`, `R-TUI-10`, `R-ORCH-1`. A rataflow editor over `replace_graph`: the node form (every snapshot
-  field; split none, divide or compete, compete only behind the later-tier setting; candidates through a
-  `phase_agent` editor; palette; plan scope) and the edge form (relation, `if` predicate, `loop_limit`); the
-  save-time validator; in-memory undo and redo over the revision CAS; catalogue key actions only, collisions resolved
-  per context. `Settings > Kinds` opens it on the project's graphs, the Toolbox on the library and the workspace's.
-  Amends MOD-124 (its workflow editor is this component) and MOD-123 (the `runtime_changes` default). Saves
-  through `StoreRequest::ReplaceGraph` with a body from `GraphEntry` (MOD-137). The shared validator is in (MOD-138
-  M1, `graph_body_walk_refusal`); MOD-115 is done (`docs/decisions/mod/mod-115.md`). Owed from MOD-138 M1's review:
-  two workspaces holding one project may each own a graph of one name, and the item and kind pickers then show two
-  identical `name · workspace` entries and take the first typed match; qualify the label or refuse the ambiguity.
-  PRD `.claude/prds/mod-141-step-graph-editor.prd.md` (M1 editor core, M2 splits/palette/header and the
-  deadline, M3 every scope and the picker fix; framing 2026-11-10: Toolbox reach is a tested scope-generic
-  entry MOD-124 wires, duplicate labels are qualified by workspace name, a compete toggle off by default, divide
-  offered with a MOD-139 note).
-  **Phase M1 landed (`hr/MOD-141` `a040804e`, 2026-11-10):** `crates/htui/src/ui/graph_editor/` (rataflow canvas,
-  node form with candidates, edge form with live `if` parse, links list, client-side validator in the store's
-  order, undo/redo where each applied edit is one `ReplaceGraph` CAS, Stale clears the stacks), hosted by
-  `Settings > Kinds` on `Enter` (the position-based phase forms retired); `ReplaceGraph` answers
-  `GraphReplaced` with the body and `GraphBody` reads one graph of any scope (the Toolbox hook); keys
-  `[graph_editor]`/`[graph_editor.links]` (redo `U`/`ctrl-r`, candidate add/remove `alt-n`/`alt-d`). Review R1
-  fixed undo past a refused entry, a landed write read as failed, and a gesture outliving the canvas. Gate green
-  but for 25 sandbox Qdrant timeouts (owed on the host). M2, M3 open.
-  **Phase M2 landed (`hr/MOD-141` `427f7690`, 2026-11-12):** the step form edits split (none, divide, and
-  compete only while the new App-rung switch `compete_fan_out` is on; a compete step is read-only and
-  kept byte for byte while it is off), fan-out, judge, the deadline, palette, plan scope, the divide columns
-  and the default parts through a part form (`alt-e`; owned paths split by `skill_glob::split_list`; a key
-  refuses `/` and `@`). `StepGraphPhase` carries `deadline_seconds`, `judge_agent_id` and `judge_model`;
-  both stores write them, and resolve reads the step first. `notes` gives resolve's own sentences
-  as warnings that never block a save; a noted step is `! name` on the canvas. The header shows the run
-  limits (`run_bounds`) read-only. Tightening them is MOD-171; review follow-ups are MOD-172..174. Plan
-  `.claude/plans/mod-141-m2-splits-palette-header.plan.md` (+ blueprint, outcomes W1-W8). Gate red only on
-  25 sandbox Qdrant timeouts and two htui-agent timing tests that pass alone; Qdrant and the merged-tree
-  Postgres gate are owed on the host. Upgrade note: a keys file binding `alt-e` in a stack the step form
-  shares (e.g. `[global] find`) is now refused at start (MOD-173). M3 open.
 - [ ] **MOD-142 - Runs pane for divided and planned runs** (from ANA-33, `docs/ANA-33.md` §7.10, §10). `R-TUI-4`,
   `R-ORCH-11`. `RunSummary` carries the decoded v2 graph and `run_plan` rows; the step list groups planner, parts and
   integrate as a tree with each part's key, agent and state, offline from the mirrored `role`, `parent_step_id` and
@@ -1254,6 +1222,6 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 81 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 80 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |
