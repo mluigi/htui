@@ -1,0 +1,12 @@
+---
+source: crates/htui/src/ui/graph_editor/part_form.rs
+expression: text(&lines)
+---
+ key           ui
+ title         UI
+ brief         the step form's rows
+ owned paths   htui:crates/htui/src/ui/**
+ acceptance    cargo test -p htui
+ agent         ‹ claude · opus ›
+▌persona       ‹ reviewer ›
+               per-part personas run from MOD-140 on

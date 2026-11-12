@@ -13,6 +13,7 @@ use htui_core::model::{
 use ratatui::style::Style;
 use ratatui::text::Line;
 
+use super::part_form::{PartForm, PartTarget};
 use super::{Lookups, step_name};
 use crate::ui::kit::form::{Field, Form, Value};
 use crate::ui::kit::label;
@@ -33,6 +34,10 @@ pub(crate) const FAN_OUT_IS_A_NUMBER: &str = "`fan-out` is a whole number, 2 or 
 /// A divide step's part cap that is neither empty nor a whole number of at least 1 (M2 D9).
 pub(crate) const MAX_PARTS_IS_A_NUMBER: &str =
     "`max parts` is a whole number of at least 1, or empty";
+/// A part edit with no part row focused (M2 D14).
+pub(crate) const NO_PART: &str = "no part is selected";
+/// A new part asked for on a step that does not divide (M2 D9).
+pub(crate) const PARTS_ON_DIVIDE_ONLY: &str = "only a divide step has parts; choose divide first";
 /// No template chosen while the scope has names to choose from.
 pub(crate) const TEMPLATE_REQUIRED: &str = "`template` is required; choose one";
 /// No template name to choose, and none chosen.
@@ -129,6 +134,25 @@ pub(crate) struct FormKeys<'a> {
     pub(crate) open: Option<&'a str>,
 }
 
+/// Which list the focus is on, for the four list acts (M2 D14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListFocus {
+    /// The candidate agents: any row but a part row.
+    Candidates,
+    /// The divide step's default parts: a part row or their placeholder.
+    Parts,
+}
+
+/// What [`NodeForm::open_part`] opens (M2 D14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+pub(crate) enum PartOpen {
+    /// A blank part, appended on keep.
+    New,
+    /// The focused part.
+    Focused,
+}
+
 /// Every row the form can show, in the order it shows them (B3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
@@ -169,6 +193,8 @@ pub(super) type Seat = (AgentId, Option<String>);
 pub(crate) struct NodeForm {
     /// The node it writes back to.
     target: NodeTarget,
+    /// The node's id: what its parts belong to.
+    phase_id: PhaseId,
     /// The compete switch (M2 D5) as the form opened: whether the split offers compete.
     compete: bool,
     /// A compete step opened with the switch off: its split, fan-out and judge are shown and
@@ -257,6 +283,7 @@ impl NodeForm {
         parts.sort_by_key(|part| part.position);
         Self {
             target,
+            phase_id: phase.id,
             compete,
             locked: !compete && phase.split == Split::Compete,
             name: TextField::with_text(&phase.name),
@@ -665,6 +692,155 @@ impl NodeForm {
             self.candidates.swap(at, to);
             self.focus = Self::candidate_row(to);
         }
+        Ok(())
+    }
+
+    /// Which list the four list acts work on (M2 D14): the parts on a part row or their
+    /// placeholder, else the candidates.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn list_focus(&self) -> ListFocus {
+        match self.current() {
+            Row::Part(_) | Row::NoParts => ListFocus::Parts,
+            _ => ListFocus::Candidates,
+        }
+    }
+
+    /// Removes the focused list's focused entry: a part, else a candidate.
+    ///
+    /// # Errors
+    /// [`NO_PART`] on the parts placeholder; [`NO_CANDIDATE`] off both lists.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn list_remove(&mut self) -> Result<(), String> {
+        match self.list_focus() {
+            ListFocus::Parts => self.part_remove(),
+            ListFocus::Candidates => self.candidate_remove(),
+        }
+    }
+
+    /// Moves the focused list's focused entry one place up or down: a part, else a candidate.
+    ///
+    /// # Errors
+    /// [`NO_PART`] on the parts placeholder; [`NO_CANDIDATE`] off both lists.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn list_move(&mut self, up: bool) -> Result<(), String> {
+        match self.list_focus() {
+            ListFocus::Parts => self.part_move(up),
+            ListFocus::Candidates => self.candidate_move(up),
+        }
+    }
+
+    /// The focused part's index.
+    fn part_at(&self) -> Result<usize, String> {
+        match self.current() {
+            Row::Part(at) => Ok(at),
+            _ => Err(NO_PART.to_owned()),
+        }
+    }
+
+    /// Focus on part `at`, or on the placeholder when there is no part; unchanged when the step
+    /// shows no part rows.
+    fn focus_part(&mut self, at: usize) {
+        let row = if self.parts.is_empty() {
+            Row::NoParts
+        } else {
+            Row::Part(at.min(self.parts.len() - 1))
+        };
+        if let Some(focus) = self.rows().iter().position(|each| *each == row) {
+            self.focus = focus;
+        }
+    }
+
+    /// Removes the focused part; focus stays on the row now there, or the last.
+    ///
+    /// # Errors
+    /// [`NO_PART`] off a part row.
+    pub(crate) fn part_remove(&mut self) -> Result<(), String> {
+        let at = self.part_at()?;
+        self.parts.remove(at);
+        self.focus_part(at);
+        Ok(())
+    }
+
+    /// Moves the focused part one place up or down; focus follows it. At either end it stays.
+    ///
+    /// # Errors
+    /// [`NO_PART`] off a part row.
+    pub(crate) fn part_move(&mut self, up: bool) -> Result<(), String> {
+        let at = self.part_at()?;
+        let to = if up {
+            at.checked_sub(1)
+        } else {
+            Some(at + 1).filter(|to| *to < self.parts.len())
+        };
+        if let Some(to) = to {
+            self.parts.swap(at, to);
+            self.focus_part(to);
+        }
+        Ok(())
+    }
+
+    /// The part form (M2 D9): [`PartOpen::New`] a blank part, [`PartOpen::Focused`] the focused
+    /// one ([`PartTarget::Edit`]). It offers the step form's own candidates as they are now,
+    /// since admission refuses a part agent the step does not list.
+    ///
+    /// # Errors
+    /// [`PARTS_ON_DIVIDE_ONLY`] for a new part off divide; [`NO_PART`] for the focused part off a
+    /// part row.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn open_part(&self, open: PartOpen) -> Result<PartForm, String> {
+        let candidates = self.candidates.clone();
+        match open {
+            PartOpen::New if self.split == Split::Divide => {
+                Ok(PartForm::new(None, PartTarget::New, candidates))
+            }
+            PartOpen::New => Err(PARTS_ON_DIVIDE_ONLY.to_owned()),
+            PartOpen::Focused => {
+                let at = self.part_at()?;
+                Ok(PartForm::new(
+                    self.parts.get(at),
+                    PartTarget::Edit(at),
+                    candidates,
+                ))
+            }
+        }
+    }
+
+    /// Keeps the part `form` built: [`PartTarget::New`] appends it, [`PartTarget::Edit`]
+    /// replaces that part. Positions are renumbered `0..n` and the focus moves onto its row.
+    ///
+    /// # Errors
+    /// What [`PartForm::build`] refuses (the key, against every other part's); [`NO_PART`] for an
+    /// edit of a part the step no longer has.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn put_part(&mut self, form: &PartForm) -> Result<(), String> {
+        let edited = match form.target() {
+            PartTarget::New => None,
+            PartTarget::Edit(at) if at < self.parts.len() => Some(at),
+            PartTarget::Edit(_) => return Err(NO_PART.to_owned()),
+        };
+        let others: Vec<PhasePart> = self
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| Some(*at) != edited)
+            .map(|(_, part)| part.clone())
+            .collect();
+        let part = form.build(self.phase_id, &others)?;
+        let at = match edited {
+            Some(at) => {
+                self.parts[at] = part;
+                at
+            }
+            None => {
+                self.parts.push(part);
+                self.parts.len() - 1
+            }
+        };
+        for (at, part) in self.parts.iter_mut().enumerate() {
+            part.phase_id = self.phase_id;
+            part.position = position(at);
+        }
+        self.focus_part(at);
         Ok(())
     }
 
@@ -1220,7 +1396,7 @@ pub(super) fn persona_options(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use chrono::{DateTime, Utc};
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
@@ -1247,7 +1423,7 @@ mod tests {
     const INPUTS: usize = 11;
     const OUTPUT: usize = 12;
 
-    fn accent() -> Style {
+    pub(crate) fn accent() -> Style {
         Style::new().fg(Color::Magenta)
     }
 
@@ -1257,12 +1433,12 @@ mod tests {
         open: Some("Alt+e"),
     };
 
-    fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_788_393_600, 0).expect("a valid instant")
     }
 
     /// The lines as text, trailing blanks dropped.
-    fn text(lines: &[Line<'_>]) -> String {
+    pub(crate) fn text(lines: &[Line<'_>]) -> String {
         lines
             .iter()
             .map(|line| {
@@ -1319,7 +1495,7 @@ mod tests {
 
     /// Two personas, two agents (claude with two models, agy with a default only) and the
     /// templates plan v1, research v1 and v2, verdict v1.
-    fn lookups() -> Lookups {
+    pub(crate) fn lookups() -> Lookups {
         Lookups {
             personas: vec![
                 PersonaSummary {
@@ -2543,6 +2719,179 @@ mod tests {
                 Row::FanOut,
                 Row::Judge
             ]
+        );
+    }
+
+    /// The keys of `form`'s parts, in order.
+    fn keys_of(form: &NodeForm) -> Vec<&str> {
+        form.parts.iter().map(|part| part.key.as_str()).collect()
+    }
+
+    /// Types `text` into the focused row of `form` after clearing it.
+    fn type_part(form: &mut PartForm, text: &str) {
+        for _ in 0..64 {
+            let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(form.on_text_key(key), FieldOutcome::Consumed);
+        }
+        for c in text.chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(form.on_text_key(key), FieldOutcome::Consumed);
+        }
+    }
+
+    #[test]
+    fn the_list_acts_follow_the_focus() {
+        let node = research_divide();
+        let mut form = edit(&node);
+
+        // A part row: the parts.
+        focus_on(&mut form, Row::Part(0));
+        assert_eq!(form.list_focus(), ListFocus::Parts);
+        form.list_move(true).expect("the top stays put");
+        assert_eq!(form.current(), Row::Part(0));
+        form.list_move(false).expect("a part row");
+        assert_eq!(keys_of(&form), ["store", "ui"]);
+        assert_eq!(form.current(), Row::Part(1), "focus follows the move");
+        form.list_move(false).expect("the bottom stays put");
+        assert_eq!(form.current(), Row::Part(1));
+        form.list_remove().expect("a part row");
+        assert_eq!(keys_of(&form), ["store"]);
+        assert_eq!(form.current(), Row::Part(0), "the last row now");
+        assert_eq!(form.candidates.len(), 2, "the candidates untouched");
+        form.list_remove().expect("a part row");
+        assert_eq!(form.current(), Row::NoParts);
+        assert_eq!(form.list_focus(), ListFocus::Parts);
+        assert_eq!(form.list_remove(), Err(NO_PART.to_owned()));
+        assert_eq!(form.list_move(true), Err(NO_PART.to_owned()));
+        assert_eq!(
+            form.open_part(PartOpen::Focused).map(|part| part.target()),
+            Err(NO_PART.to_owned())
+        );
+        assert_eq!(
+            form.open_part(PartOpen::New).map(|part| part.target()),
+            Ok(PartTarget::New),
+            "the placeholder adds"
+        );
+
+        // A candidate row: the candidates.
+        focus(&mut form, FIXED_ROWS + 1);
+        assert_eq!(form.list_focus(), ListFocus::Candidates);
+        form.list_move(true).expect("a candidate row");
+        assert_eq!(
+            form.candidates,
+            [
+                (ids::AGENT_AGY, "gemini".to_owned()),
+                (ids::AGENT_CLAUDE, "sonnet".to_owned()),
+            ]
+        );
+        form.list_remove().expect("a candidate row");
+        assert_eq!(form.candidates.len(), 1);
+        assert!(form.parts.is_empty(), "the parts untouched");
+
+        // Any other row: M1's refusal.
+        focus(&mut form, NAME);
+        assert_eq!(form.list_focus(), ListFocus::Candidates);
+        assert_eq!(form.list_remove(), Err(NO_CANDIDATE.to_owned()));
+        assert_eq!(form.list_move(false), Err(NO_CANDIDATE.to_owned()));
+        assert_eq!(
+            form.open_part(PartOpen::Focused).map(|part| part.target()),
+            Err(NO_PART.to_owned())
+        );
+
+        // Off divide there are no parts to add.
+        let plain = edit(&research());
+        assert_eq!(
+            plain.open_part(PartOpen::New).map(|part| part.target()),
+            Err(PARTS_ON_DIVIDE_ONLY.to_owned())
+        );
+        let mut form = edit(&node);
+        focus_on(&mut form, Row::Part(1));
+        assert_eq!(
+            form.open_part(PartOpen::Focused).map(|part| part.target()),
+            Ok(PartTarget::Edit(1))
+        );
+    }
+
+    #[test]
+    fn put_part_appends_replaces_and_renumbers() {
+        let lookups = lookups();
+        let node = research_divide();
+        let mut form = edit(&node);
+
+        // New: appended, the focus on it.
+        let mut part = form.open_part(PartOpen::New).expect("a divide step");
+        type_part(&mut part, "api");
+        form.put_part(&part).expect("a free key");
+        assert_eq!(keys_of(&form), ["ui", "store", "api"]);
+        assert_eq!(form.current(), Row::Part(2));
+
+        // Edit: replaced in place, its own key free to keep.
+        focus_on(&mut form, Row::Part(0));
+        let mut part = form.open_part(PartOpen::Focused).expect("a part row");
+        type_part(&mut part, "web");
+        form.put_part(&part).expect("a free key");
+        assert_eq!(keys_of(&form), ["web", "store", "api"]);
+        assert_eq!(form.current(), Row::Part(0));
+        focus_on(&mut form, Row::Part(1));
+        let part = form.open_part(PartOpen::Focused).expect("a part row");
+        form.put_part(&part).expect("its own key");
+        assert_eq!(keys_of(&form), ["web", "store", "api"]);
+
+        // A taken key is refused and nothing moves.
+        let mut part = form.open_part(PartOpen::New).expect("a divide step");
+        type_part(&mut part, "store");
+        assert_eq!(
+            form.put_part(&part),
+            Err(crate::ui::graph_editor::part_form::part_key_taken("store"))
+        );
+        assert_eq!(keys_of(&form), ["web", "store", "api"]);
+        assert_eq!(form.current(), Row::Part(1));
+
+        // Moved and built: positions 0..n on the node's id.
+        form.part_move(true).expect("a part row");
+        let built = form.build(&node, &lookups).expect("a valid form");
+        let rows: Vec<(PhaseId, i32, &str)> = built
+            .parts
+            .iter()
+            .map(|part| (part.phase_id, part.position, part.key.as_str()))
+            .collect();
+        let id = node.phase.id;
+        assert_eq!(rows, [(id, 0, "store"), (id, 1, "web"), (id, 2, "api")]);
+
+        // An edit of a part the step no longer has.
+        focus_on(&mut form, Row::Part(2));
+        let part = form.open_part(PartOpen::Focused).expect("a part row");
+        form.part_remove().expect("a part row");
+        assert_eq!(form.put_part(&part), Err(NO_PART.to_owned()));
+
+        // A blank part's key is required.
+        let part = form.open_part(PartOpen::New).expect("a divide step");
+        assert_eq!(
+            form.put_part(&part),
+            Err(crate::ui::graph_editor::part_form::PART_KEY_REQUIRED.to_owned())
+        );
+    }
+
+    #[test]
+    fn the_part_form_offers_the_step_forms_candidates_as_they_are_now() {
+        let lookups = lookups();
+        let node = research_divide();
+        let mut form = edit(&node);
+        focus(&mut form, FIXED_ROWS + 1);
+        form.candidate_remove().expect("a candidate row");
+        let mut part = form.open_part(PartOpen::New).expect("a divide step");
+        type_part(&mut part, "api");
+        for _ in 0..5 {
+            part.next_field();
+        }
+        part.cycle(true, &lookups);
+        form.put_part(&part).expect("a free key");
+        let built = form.build(&node, &lookups).expect("a valid form");
+        let api = built.parts.last().expect("the new part");
+        assert_eq!(
+            (api.agent_id, api.model.as_deref()),
+            (Some(ids::AGENT_CLAUDE), Some("sonnet")),
+            "the one candidate left"
         );
     }
 
