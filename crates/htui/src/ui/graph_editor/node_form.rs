@@ -11,11 +11,10 @@ use htui_core::model::{
     PhaseAgent, PhaseId, PhasePart, PlanScope, Split,
 };
 use ratatui::style::Style;
-use ratatui::text::Line;
 
 use super::part_form::{PartForm, PartTarget};
 use super::{Lookups, step_name};
-use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::form::{Field, Form, FormLines, Value};
 use crate::ui::kit::label;
 use crate::ui::{FieldOutcome, TextField, Theme};
 
@@ -321,6 +320,18 @@ impl NodeForm {
     /// The node the form writes back to.
     pub(crate) const fn target(&self) -> NodeTarget {
         self.target
+    }
+
+    /// The compete switch's first reading, for a form opened before the editor's settings read
+    /// answered, so with the switch off (M2 D5, Open risk 4). On, the split offers compete and a
+    /// compete step's split, fan-out and judge are no longer locked: they hold the step's own
+    /// values, so nothing typed is lost, and the rows they add come after every focusable row a
+    /// locked form has, so the focus keeps its row. Off changes nothing.
+    pub(crate) const fn switch_read(&mut self, compete: bool) {
+        if compete {
+            self.compete = true;
+            self.locked = false;
+        }
     }
 
     /// Every row drawn, in order, each with whether it takes the focus (B3): M1's fixed rows,
@@ -958,9 +969,8 @@ impl NodeForm {
         }
     }
 
-    /// The form's rows `width` cells wide, the focused one being edited; read-only rows dim.
-    /// `base` is the node the form opened on: a locked compete step's split rows show its values,
-    /// the ones [`build`](Self::build) keeps. `keys` names the keys the placeholder rows cite.
+    /// [`layout`](Self::layout)'s lines alone.
+    #[cfg(test)]
     pub(crate) fn lines(
         &self,
         base: &NodeBody,
@@ -969,7 +979,24 @@ impl NodeForm {
         width: u16,
         accent: Style,
         theme: &Theme,
-    ) -> Vec<Line<'static>> {
+    ) -> Vec<ratatui::text::Line<'static>> {
+        self.layout(base, lookups, keys, width, accent, theme).lines
+    }
+
+    /// The form's rows `width` cells wide, the focused one being edited, and the focused row's
+    /// lines among them, so a panel shorter than the form scrolls the focus into view. Read-only
+    /// rows are dim. `base` is the node the form opened on: a locked compete step's split rows
+    /// show its values, the ones [`build`](Self::build) keeps. `keys` names the keys the
+    /// placeholder rows cite.
+    pub(crate) fn layout(
+        &self,
+        base: &NodeBody,
+        lookups: &Lookups,
+        keys: FormKeys<'_>,
+        width: u16,
+        accent: Style,
+        theme: &Theme,
+    ) -> FormLines {
         let shown = self.shown();
         let views: Vec<View<'_>> = shown
             .iter()
@@ -984,7 +1011,7 @@ impl NodeForm {
             .iter()
             .position(|(row, _)| *row == current)
             .unwrap_or(0);
-        form.focus(focus).lines(width, accent, theme)
+        form.focus(focus).layout(width, accent, theme)
     }
 
     /// How `row` is drawn; `focusable` is `false` for a read-only row.
@@ -1398,6 +1425,7 @@ pub(super) mod tests {
     };
     use htui_core::seed::{KINDS, phase_row};
     use ratatui::style::Color;
+    use ratatui::text::Line;
 
     use super::*;
     use crate::catalogue::PersonaSummary;

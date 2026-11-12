@@ -5,8 +5,7 @@ expression: frame
 Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Kinds ──────────────────────────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
 │reference · project graph · revision 6 · u undoes: linking review → implement                     │
-│limits · fan-out 4 · agents 8 · plan revisions 3 · parallel 4 · child runs 8 · run-time changes   │
-│ask                                                                                               │
+│limits · fan-out 4 · agents 8 · plan revisions 3 · parallel 4 · child runs 8 · …                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -29,6 +28,7 @@ Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI
 │ │gate never            │      │gate never            │ │                                         │
 │ │agy · gemini-3.8-flas…│      │agy · gemini-3.8-flas…│─╯                                         │
 │ ╰───────────●──────────╯      ╰───────────●──────────╯                                           │
+│                                                                                                  │
 │                                                                                                  │
 │saved: linking review → implement                                                                 │
 ╰─Down/Up select · a add · e edit · x delete · c connect · i links · u undo · U redo · = fit …─────╯

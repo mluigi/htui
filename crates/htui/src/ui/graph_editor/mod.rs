@@ -52,6 +52,8 @@ use crate::catalogue::{EditorSettings, PersonaSummary};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplatesSnapshot;
+use crate::ui::cells::cell_width;
+use crate::ui::kit::form::FormLines;
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::{FieldOutcome, Theme};
@@ -202,9 +204,8 @@ fn unavailable(what: &str, message: &str) -> String {
 /// The header's second line before the settings read answered (M2 D6).
 const LIMITS_NOT_READ: &str = "limits not read yet";
 
-/// The most rows the limits line takes under the header's first: it wraps rather than cut a
-/// number off.
-const LIMITS_ROWS: usize = 2;
+/// What ends a [`limits_row`] that had to drop part of the line.
+const LIMITS_MORE: &str = " \u{b7} \u{2026}";
 
 /// M2 D13: the run limits resolve freezes, read-only (M-1): exactly what a run would freeze.
 fn limits_line(settings: Option<&EditorSettings>) -> String {
@@ -226,11 +227,61 @@ fn limits_line(settings: Option<&EditorSettings>) -> String {
     )
 }
 
-/// [`limits_line`] wrapped to `width`, at most [`LIMITS_ROWS`] rows.
-fn limits_rows(settings: Option<&EditorSettings>, width: u16) -> Vec<String> {
-    let mut rows = wrapped(&limits_line(settings), usize::from(width).max(1));
-    rows.truncate(LIMITS_ROWS);
-    rows
+/// [`limits_line`] in its one row, `width` cells wide: the editor clips it, it never wraps
+/// (Open risk 5). What does not fit goes a whole `label value` at a time and ` · …` says so,
+/// so no number is cut in half; a row too narrow for the first is `…`.
+fn limits_row(settings: Option<&EditorSettings>, width: u16) -> String {
+    let line = limits_line(settings);
+    let width = usize::from(width);
+    if cell_width(&line) <= width {
+        return line;
+    }
+    let mut kept = String::new();
+    for segment in line.split(" \u{b7} ") {
+        let longer = if kept.is_empty() {
+            segment.to_owned()
+        } else {
+            format!("{kept} \u{b7} {segment}")
+        };
+        if cell_width(&longer) + cell_width(LIMITS_MORE) > width {
+            break;
+        }
+        kept = longer;
+    }
+    if kept.is_empty() {
+        "\u{2026}".to_owned()
+    } else {
+        kept + LIMITS_MORE
+    }
+}
+
+/// The step form's rows and its notes in `height` rows (M2 D11, D14), all of them when they fit.
+/// Else the notes stay on screen under the rows, taking at most half of them (`…` ending the
+/// notes when some were cut), and the rows above scroll the focused row into view.
+fn fitted(
+    form: FormLines,
+    mut notes: Vec<Line<'static>>,
+    height: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if form.lines.len() + notes.len() <= height {
+        let mut lines = form.lines;
+        lines.extend(notes);
+        return lines;
+    }
+    let room = height / 2;
+    if notes.len() > room {
+        notes.truncate(room.saturating_sub(1));
+        if room > 0 {
+            notes.push(notice("  \u{2026}", Tone::Error, theme));
+        }
+    }
+    let rows = height - notes.len();
+    let offset = form.offset(u16::try_from(rows).unwrap_or(u16::MAX));
+    let mut lines: Vec<Line<'static>> = form.lines.into_iter().skip(offset).take(rows).collect();
+    lines.extend(notes);
+    lines
 }
 
 /// The canvas's keys.
@@ -522,7 +573,7 @@ impl GraphEditor {
     }
 
     /// The compete switch as last read (M2 D5): off until the settings read answers. A step form
-    /// keeps the switch it opened with.
+    /// keeps the switch it opened with, but one opened before the first read takes that read.
     fn compete(&self) -> bool {
         self.settings.is_some_and(|settings| settings.compete)
     }
@@ -724,6 +775,17 @@ impl GraphEditor {
             // M2 D6: the limits on the header, the switch for the next step form, and the
             // canvas's markers, which need `max_fan_out`.
             StoreReply::GraphEditorSettings(settings) => {
+                // Open risk 4: a step form opened before the first read (Kinds' `e` opens it
+                // before the reads leave) opened with the switch off; that read reaches it.
+                if self.settings.is_none() {
+                    match &mut self.mode {
+                        Mode::NodeForm(editing) => editing.form.switch_read(settings.compete),
+                        Mode::PartForm(editing) => {
+                            editing.node.form.switch_read(settings.compete);
+                        }
+                        _ => {}
+                    }
+                }
                 self.settings = Some(**settings);
                 self.resync.set(true);
             }
@@ -740,14 +802,12 @@ impl GraphEditor {
         let theme = ctx.theme;
         let mut bottom = self.bottom_lines(area.width, ctx);
         bottom.truncate(NOTICE_ROWS);
-        let mut heading = vec![Line::styled(self.header(ctx.keys()), theme.title)];
-        heading.extend(
-            limits_rows(self.settings.as_ref(), area.width)
-                .into_iter()
-                .map(|row| Line::styled(row, theme.dim)),
-        );
+        let heading = vec![
+            Line::styled(self.header(ctx.keys()), theme.title),
+            Line::styled(limits_row(self.settings.as_ref(), area.width), theme.dim),
+        ];
         let [header, middle, foot] = Layout::vertical([
-            Constraint::Length(u16::try_from(heading.len()).unwrap_or(1)),
+            Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(u16::try_from(bottom.len()).unwrap_or(0)),
         ])
@@ -764,7 +824,10 @@ impl GraphEditor {
             ])
             .areas(middle);
             self.draw_canvas(frame, canvas, ctx);
-            frame.render_widget(Paragraph::new(self.panel_lines(side.width, ctx)), side);
+            frame.render_widget(
+                Paragraph::new(self.panel_lines(side.width, side.height, ctx)),
+                side,
+            );
         } else {
             self.draw_canvas(frame, middle, ctx);
         }
@@ -792,9 +855,10 @@ impl GraphEditor {
         header
     }
 
-    /// The panel beside the canvas: the open form's or the links list's title, then its rows; the
-    /// step form's notes under its rows (M2 D11).
-    fn panel_lines(&self, width: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+    /// The panel beside the canvas, `width` x `height`: the open form's or the links list's title,
+    /// then its rows; the step form's notes under its rows (M2 D11), the rows scrolled to the
+    /// focused one when the step form is taller than the panel.
+    fn panel_lines(&self, width: u16, height: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let (title, rows) = match &self.mode {
             Mode::NodeForm(editing) => {
@@ -803,7 +867,7 @@ impl GraphEditor {
                     label(Act::GraphEditorCandidateAdd),
                     label(Act::GraphEditorOpenPart),
                 );
-                let mut rows = editing.form.lines(
+                let form = editing.form.layout(
                     &editing.base,
                     &self.lookups,
                     FormKeys {
@@ -814,7 +878,9 @@ impl GraphEditor {
                     ctx.accent(),
                     theme,
                 );
-                rows.extend(self.note_lines(editing, width, theme));
+                let notes = self.note_lines(editing, width, theme);
+                // The title takes the panel's first row.
+                let rows = fitted(form, notes, height.saturating_sub(1), theme);
                 (editing.form.title(&self.body), rows)
             }
             Mode::PartForm(editing) => {
@@ -1638,9 +1704,15 @@ mod tests {
 
         /// The editor drawn into 100x30, as text.
         fn render(&self, editor: &GraphEditor) -> String {
-            let area = Rect::new(0, 0, 100, 30);
+            self.render_in(editor, 100, 30)
+        }
+
+        /// The editor drawn into `width` x `height`, as text. The shell's 100x30 gives it 98x27
+        /// (the Kinds pane's border, the top bar and the hint row).
+        fn render_in(&self, editor: &GraphEditor, width: u16, height: u16) -> String {
+            let area = Rect::new(0, 0, width, height);
             let mut terminal = Terminal::with_options(
-                TestBackend::new(100, 30),
+                TestBackend::new(width, height),
                 TerminalOptions {
                     viewport: Viewport::Fixed(area),
                 },
@@ -1858,19 +1930,42 @@ mod tests {
             drawn_line(&bench, &editor, 0).starts_with("flow \u{b7} library graph"),
             "the first line is the graph's"
         );
-        // Narrower, it wraps rather than cut a number off.
+        // Narrower, it is clipped to its one row (Open risk 5), a whole `label value` at a time
+        // and ` · …` saying so: no number is cut in half.
         let read = settings(false);
         let StoreReply::GraphEditorSettings(read) = &read else {
             unreachable!("a settings answer");
         };
+        let whole = limits_line(Some(read));
+        assert_eq!(limits_row(Some(read), 99), whole);
         assert_eq!(
-            limits_rows(Some(read), 62),
-            [
-                "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4",
-                "\u{b7} child runs 8 \u{b7} run-time changes ask",
-            ]
+            limits_row(Some(read), 98),
+            "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4 \
+             \u{b7} child runs 8 \u{b7} \u{2026}"
         );
-        assert_eq!(limits_rows(None, 60), [LIMITS_NOT_READ]);
+        assert_eq!(
+            limits_row(Some(read), 30),
+            "limits \u{b7} fan-out 4 \u{b7} \u{2026}"
+        );
+        assert_eq!(limits_row(None, 60), LIMITS_NOT_READ);
+        assert_eq!(limits_row(None, 10), "\u{2026}");
+        for width in 0..=110 {
+            let row = limits_row(Some(read), width);
+            assert!(
+                cell_width(&row) <= usize::from(width.max(1)),
+                "{width}: {row}"
+            );
+            let kept = row.trim_end_matches(" \u{b7} \u{2026}");
+            assert!(
+                row == whole || row == "\u{2026}" || whole.starts_with(&format!("{kept} \u{b7} ")),
+                "{width}: {row}"
+            );
+        }
+        // In the shell's 98 columns the header stays two rows: the third is the canvas's.
+        let screen = bench.render_in(&editor, 98, 27);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert_eq!(rows[1], limits_row(Some(read), 98));
+        assert!(!screen.contains("run-time changes"), "{screen}");
     }
 
     /// M2 D6: a refused settings read is said like the other lookups', and the limits stay unread.
@@ -2648,7 +2743,7 @@ mod tests {
     fn shown_notes(bench: &Bench, editor: &GraphEditor) -> Vec<String> {
         let ctx = bench.ctx();
         let mut shown: Vec<String> = Vec::new();
-        for line in editor.panel_lines(PANEL_WIDTH, &ctx) {
+        for line in editor.panel_lines(PANEL_WIDTH, u16::MAX, &ctx) {
             let line = line.to_string();
             if let Some(first) = line.strip_prefix("! ") {
                 shown.push(first.to_owned());
@@ -2808,6 +2903,139 @@ mod tests {
         let (_, _, sent, _) = bench.write();
         assert_eq!(sent.nodes[0].phase.split, Split::Divide);
         assert!(sent.nodes[0].parts.is_empty());
+    }
+
+    /// M2 D11, D14: a divide step's form is taller than the panel in the shell's 98x27 (and in
+    /// less), so the panel scrolls the focused row into view and keeps the notes under it.
+    #[tokio::test]
+    async fn a_tall_step_form_scrolls_to_its_focus_and_keeps_its_notes() {
+        let bench = Bench::new().await;
+        let note = "! phase `research` cannot run yet";
+        for (width, height) in [(98, 27), (98, 18)] {
+            let (mut editor, _) = GraphEditor::open(divided(&[]), Vec::new(), &bench.scope);
+            bench.reply(&mut editor, &settings(false));
+            bench.key(&mut editor, "e");
+            let screen = bench.render_in(&editor, width, height);
+            for shown in ["step research", "\u{258c}name", note, "MOD-140"] {
+                assert!(
+                    screen.contains(shown),
+                    "{width}x{height} {shown}:\n{screen}"
+                );
+            }
+
+            bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+            let screen = bench.render_in(&editor, width, height);
+            for shown in ["step research", "\u{258c}parts", note, "MOD-140"] {
+                assert!(
+                    screen.contains(shown),
+                    "{width}x{height} {shown}:\n{screen}"
+                );
+            }
+            assert!(!screen.contains("\u{258c}name"), "{screen}");
+        }
+    }
+
+    /// M2 D11: notes taller than half the panel keep the rows' half, and `…` says some were cut.
+    #[test]
+    fn notes_past_half_the_panel_end_in_an_ellipsis() {
+        let theme = Theme::default();
+        let row = |n: usize| Line::raw(format!("row {n}"));
+        let form = FormLines {
+            lines: (0..10).map(row).collect(),
+            focus: Some(9..10),
+        };
+        let notes: Vec<Line<'static>> = (0..6)
+            .map(|n| notice(&format!("! note {n}"), Tone::Error, &theme))
+            .collect();
+        let shown: Vec<String> = fitted(form, notes, 8, &theme)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "row 6",
+                "row 7",
+                "row 8",
+                "row 9",
+                "! note 0",
+                "! note 1",
+                "! note 2",
+                "  \u{2026}"
+            ]
+        );
+    }
+
+    /// M2 D5 (Open risk 4): Kinds' `e` on a phase row opens the step form before the editor's
+    /// reads leave, so before the switch is read. The first read reaches that form: on, the
+    /// split offers compete and a compete step is no longer locked. A later read does not.
+    #[tokio::test]
+    async fn a_form_opened_before_the_first_settings_read_takes_its_switch() {
+        let bench = Bench::new().await;
+        // As `KindsSection::open_editor` opens it.
+        let opened = |body: GraphBody| {
+            let (mut editor, _) = GraphEditor::open(body, Vec::new(), &bench.scope);
+            editor.select(phase(1));
+            editor.open_node_form();
+            editor
+        };
+        let built = |editor: &GraphEditor| {
+            let Mode::NodeForm(editing) = &editor.mode else {
+                panic!("the step form is open");
+            };
+            editing
+                .form
+                .build(&editing.base, &editor.lookups)
+                .expect("the form builds")
+        };
+
+        let mut editor = opened(flow(0, GraphScope::Library, 0));
+        bench.reply(&mut editor, &settings(true));
+        bench.keys(&mut editor, &["tab"; 16]);
+        bench.keys(&mut editor, &["l", "l"]);
+        assert_eq!(built(&editor).phase.split, Split::Compete);
+
+        let mut body = flow(0, GraphScope::Library, 0);
+        body.nodes[0].phase.split = Split::Compete;
+        body.nodes[0].phase.fan_out = 2;
+        let locked = "read-only while";
+        let mut editor = opened(body.clone());
+        assert!(bench.render(&editor).contains(locked));
+        bench.reply(&mut editor, &settings(true));
+        let screen = bench.render(&editor);
+        assert!(!screen.contains(locked), "{screen}");
+        // The fan-out row (after the split) takes a key now.
+        bench.keys(&mut editor, &["tab"; 17]);
+        bench.keys(&mut editor, &["backspace"]);
+        bench.typed(&mut editor, "3");
+        assert_eq!(built(&editor).phase.fan_out, 3);
+
+        // Read off first, then on: the form keeps the switch it had read.
+        let mut editor = opened(body);
+        bench.reply(&mut editor, &settings(false));
+        bench.reply(&mut editor, &settings(true));
+        assert!(bench.render(&editor).contains(locked));
+    }
+
+    /// M2 D14: a focused part row names the open act's key under it, from the editor's keys.
+    #[tokio::test]
+    async fn a_focused_part_names_the_key_that_edits_it() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&["ui"]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        let screen = bench.render(&editor);
+        assert!(screen.contains("\u{258c}part 1"), "{screen}");
+        assert!(screen.contains("Alt+e edits it"), "{screen}");
+
+        let keys = load_str("[graph_editor]\nopen_part = [\"alt-o\"]\n").expect("the file loads");
+        let rebound = Bench::new().await.with_keys(keys);
+        let screen = rebound.render(&editor);
+        assert!(screen.contains("Alt+o edits it"), "{screen}");
+        assert!(!screen.contains("Alt+e"), "{screen}");
+        assert!(rebound.hint(&editor).contains("Alt+o edit part"));
+        rebound.key(&mut editor, "alt-o");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_PART_FORM);
     }
 
     #[tokio::test]
