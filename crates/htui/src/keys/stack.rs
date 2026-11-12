@@ -366,6 +366,11 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
         "in the graph editor's delete question",
         views::GRAPH_EDITOR_CONFIRM,
     ),
+    // MOD-141 M2 D14: the graph editor's part form, appended after its six.
+    (
+        "in the graph editor's part form",
+        views::GRAPH_EDITOR_PART_FORM,
+    ),
 ];
 
 impl Keys {
@@ -458,8 +463,8 @@ mod tests {
         );
         // MOD-115 M2 T6: the quit question's entry went with it; MOD-122 D5 adds Settings >
         // Logging's before it.
-        // MOD-141 D12: the graph editor's six.
-        assert_eq!(DECLARED.len(), 97);
+        // MOD-141 D12: the graph editor's six; M2 D14: its part form's.
+        assert_eq!(DECLARED.len(), 98);
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
         assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));

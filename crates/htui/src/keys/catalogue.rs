@@ -910,14 +910,20 @@ pub enum Act {
     GraphEditorRight,
     /// `graph_editor.close`: close the editor, cancel connecting (MOD-141 D12).
     GraphEditorClose,
-    /// `graph_editor.candidate_add`: the step form: add a candidate agent (MOD-141 D12).
+    /// `graph_editor.candidate_add`: the step form: add an entry to the focused list's: a
+    /// candidate agent, or a part of a divide step (MOD-141 D12, M2 D14).
     GraphEditorCandidateAdd,
-    /// `graph_editor.candidate_remove`: the step form: remove the focused candidate agent (MOD-141 D12).
+    /// `graph_editor.candidate_remove`: the step form: remove the focused list's focused entry: a
+    /// candidate agent, or a part of a divide step (MOD-141 D12, M2 D14).
     GraphEditorCandidateRemove,
-    /// `graph_editor.candidate_up`: the step form: move the focused candidate agent up (MOD-141 D12).
+    /// `graph_editor.candidate_up`: the step form: move the focused list's focused entry up: a
+    /// candidate agent, or a part of a divide step (MOD-141 D12, M2 D14).
     GraphEditorCandidateUp,
-    /// `graph_editor.candidate_down`: the step form: move the focused candidate agent down (MOD-141 D12).
+    /// `graph_editor.candidate_down`: the step form: move the focused list's focused entry down: a
+    /// candidate agent, or a part of a divide step (MOD-141 D12, M2 D14).
     GraphEditorCandidateDown,
+    /// `graph_editor.open_part`: the step form: open the focused part's form (MOD-141 M2 D14).
+    GraphEditorOpenPart,
     /// `graph_editor.links.edit`: edit the link under the cursor (MOD-141 D12).
     LinksEdit,
     /// `graph_editor.links.delete`: remove the link under the cursor (MOD-141 D12).
@@ -1646,28 +1652,36 @@ pub static CATALOGUE: &[ActionSpec] = &[
         GraphEditor,
         "candidate_add",
         &["alt-n"],
-        "add agent",
+        "add agent or part",
     ),
     row(
         Act::GraphEditorCandidateRemove,
         GraphEditor,
         "candidate_remove",
         &["alt-d"],
-        "remove agent",
+        "remove agent or part",
     ),
     row(
         Act::GraphEditorCandidateUp,
         GraphEditor,
         "candidate_up",
         &["alt-up"],
-        "agent up",
+        "agent or part up",
     ),
     row(
         Act::GraphEditorCandidateDown,
         GraphEditor,
         "candidate_down",
         &["alt-down"],
-        "agent down",
+        "agent or part down",
+    ),
+    // MOD-141 M2 D14: the step form opens the focused part of a divide step.
+    row(
+        Act::GraphEditorOpenPart,
+        GraphEditor,
+        "open_part",
+        &["alt-e"],
+        "edit part",
     ),
     // [graph_editor.links]: the graph editor's links list (MOD-141 D12).
     row(
@@ -2980,6 +2994,7 @@ mod tests {
         Act::LinksDelete,
         Act::LinksClose,
         Act::KindsEditor,
+        Act::GraphEditorOpenPart,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3231,6 +3246,7 @@ mod tests {
             Act::LinksDelete => 242,
             Act::LinksClose => 243,
             Act::KindsEditor => 244,
+            Act::GraphEditorOpenPart => 245,
         }
     }
 
@@ -3264,7 +3280,8 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 245);
+        // MOD-141 M2 D14: `graph_editor.open_part`, 246.
+        assert_eq!(CATALOGUE.len(), 246);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
