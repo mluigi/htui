@@ -16,6 +16,8 @@ project or a box.
 - [Scope: what a session can touch](#scope-what-a-session-can-touch)
 - [The output instruction in the prompt](#the-output-instruction-in-the-prompt)
 - [`command_run` and the command queue](#command_run-and-the-command-queue)
+- [Command logs: `command_output_read`](#command-logs-command_output_read)
+- [Started commands: `command_start`, `command_wait`, `command_cancel`](#started-commands-command_start-command_wait-command_cancel)
 - [Heavy commands outside the queue (R-MCP-4)](#heavy-commands-outside-the-queue-r-mcp-4)
 - [Permission prompts for `claude-cli`](#permission-prompts-for-claude-cli)
 - [Isolation from your Claude Code setup](#isolation-from-your-claude-code-setup)
@@ -79,7 +81,11 @@ Code CLI may add keys to its call: an extra key there is ignored.
 | `item_status` | `status`, `reason`, `resolution` (optional, only with `closed`) | `{"note_id"}` |
 | `item_link` | `op` (`add` or `remove`), `to` (an item key: `FEAT-12` in this project, `api:FEAT-12` in another project of its workspaces, `@shop:WS-1` for a workspace's own item), `kind` | `{"from", "to", "kind", "live"}`; `to` is canonical: bare in this project, `slug:KEY` elsewhere |
 | `search_concepts` | `query`, `types` (optional), `statuses` (optional), `limit` (optional, 1 to 20, default 10) | `{"hits": […]}` |
-| `command_run` | `class` (`build`, `test` or `run`), `command`, `cwd` (optional), `timeout_secs` (optional, 1 to 1800, default 1800) | `{"exit_code", "status", "output", "truncated", "command_run_id"}` |
+| `command_run` | `class` (`build`, `test` or `run`), `command`, `cwd` (optional), `timeout_secs` (optional, 1 to 1800, default 1800), `repo` (optional) | `{"exit_code", "status", "output", "truncated", "command_run_id"}` |
+| `command_start` | as `command_run` | `{"command_run_id", "status": "queued"}`, at once |
+| `command_wait` | `command_run_id`, `deadline` (RFC 3339, at most 300 s away), `pattern` (optional), `after_line` (optional, default 0) | `{"status", "exit_code", "matched", "line_no", "line", "tail", "next_line", "total_lines", "deadline_reached"}` |
+| `command_cancel` | `command_run_id` | `{"command_run_id", "status", "exit_code"}` |
+| `command_output_read` | `command_run_id` (optional, default the run's latest), one of `tail_lines` (default 200), `from_line` with `to_line`, or `pattern` with `context` (0 to 20, default 2); `max_bytes` (1 to 65536, default 16384) | `{"command_run_id", "status", "exit_code", "total_lines", "log_truncated", "text", "first_line", "last_line", "capped"}` |
 | `permission_prompt` | `tool_name`, `input`, `tool_use_id` (the Claude Code CLI's contract) | `{"behavior": "allow", "updatedInput": …}` or `{"behavior": "deny", "message": …}` |
 
 **`box_profile`** describes the box the session runs on. When the project's `box_hostname` switch
@@ -136,7 +142,9 @@ answer (Qdrant down or refusing the key, an index written by another embedding m
 failing to load) answers `knowledge search unavailable: <cause>`. A project that was never indexed
 answers no hits, and the search creates nothing in Qdrant.
 
-**`command_run`**: see [below](#command_run-and-the-command-queue).
+**`command_run`**: see [below](#command_run-and-the-command-queue); **`command_output_read`**:
+[Command logs](#command-logs-command_output_read); **`command_start`**, **`command_wait`** and
+**`command_cancel`**: [Started commands](#started-commands-command_start-command_wait-command_cancel).
 
 **`permission_prompt`**: see [below](#permission-prompts-for-claude-cli). Claude Code hides this
 tool from the model; only the CLI calls it.
@@ -152,7 +160,7 @@ JSON-RPC error (`-32602`, `unknown tool: <name>`).
 | `document_write` | the session has an item **and** an output kind |
 | `note_add`, `item_status`, `item_link` | the session has an item |
 | `search_concepts` | a Qdrant URL is configured (below) |
-| `command_run` | the step's command queue is exposed ([below](#when-command_run-is-offered)) |
+| `command_run`, `command_output_read`, `command_start`, `command_wait`, `command_cancel` | the step's command queue is exposed ([below](#when-command_run-is-offered)) |
 | `permission_prompt` | the agent uses the CLI transport (`claude-cli`) |
 
 What that gives each kind of session:
@@ -208,7 +216,8 @@ every call answers `knowledge search unavailable: <cause>`. See
   is unregistered, and a call on a connection still open answers `session ended`, whether it
   arrives later or was still running. A call that arrives later writes nothing; one still running
   may already have written. A queued or running `command_run` is killed and its row `cancelled`,
-  unless it had already finished.
+  unless it had already finished, and so is every command the session started with
+  `command_start`.
 - **The token is never on a command line.** For `claude-cli`, htui writes the session's MCP server
   list, token included, to a file `mcp.json` in a new directory `htui-cli-<pid>-<8 hex>`, and starts
   the CLI with `--mcp-config=<path>`, so the process list shows only the path. On Linux and macOS the
@@ -245,7 +254,8 @@ process that hosts the session, as your user, with that process's environment.
 
 ### When `command_run` is offered
 
-A phase's `command_queue` setting decides (shown in Settings › Kinds):
+A phase's `command_queue` setting decides (shown in Settings › Kinds). The same setting offers
+`command_output_read`, `command_start`, `command_wait` and `command_cancel` with it:
 
 | `command_queue` | `command_run` offered |
 |---|---|
@@ -288,8 +298,13 @@ The class `verify` belongs to the orchestrator's own verification: `command_run`
 
 ### What a call does
 
-1. **Checks.** `cwd`, when given, must be a relative path with no `..` that names an existing
-   directory under the session's working directory; the default is that directory itself. The
+1. **Checks.** `repo`, when given, names one of the session's other directories (a promoted
+   step's extra worktrees, for example) by its last path component, and the command runs there
+   instead of in the session's working directory. A name that is none of them is refused as
+   ``refused: repo `x` is not one of: a, b``, and one that two directories share as
+   ``refused: repo `x` names more than one directory``. `cwd`, when given, must be a relative path
+   with no `..` that names an existing directory under that directory (or under the session's
+   working directory); the default is that directory itself. The
    command may not be empty. `timeout_secs` must be 1 to 1800. A session runs one `command_run`
    at a time: a call while its previous one is still queued or running is refused at once with
    `refused: a command_run is already queued or running in this session`, and queues nothing.
@@ -304,6 +319,7 @@ The class `verify` belongs to the orchestrator's own verification: `command_run`
    background is killed the same way, so `server & echo started` neither holds the call nor
    outlives it (a process that left the group, for example with `setsid`, is not reached).
 5. **Answers.** The last 64 KiB of output is kept, scrubbed and stored on the row, then returned.
+   The merged output is also kept, up to 2 MiB, as the row's [log](#command-logs-command_output_read).
    When more was printed, `truncated` is `true` and the tail opens with the line
    `[… earlier output truncated]`. A timed-out command's output opens with the line
    `[killed: the <n> s timeout elapsed]`, before that one. Output that cannot be masked is
@@ -337,9 +353,70 @@ command ran.
 
 **Long calls and the agent's own timeout.** A command may run for 30 minutes. Some MCP clients
 give up on a tool call earlier; the progress notifications help those that wait as long as
-progress arrives. If your agent abandons long `command_run` calls, raise its MCP tool timeout (for
-Claude Code, the `MCP_TOOL_TIMEOUT` environment variable, in milliseconds, set in the environment
-htui is started from) or pass a shorter `timeout_secs`.
+progress arrives. For a command that runs long, use
+[`command_start`](#started-commands-command_start-command_wait-command_cancel) instead: it answers
+at once, and each `command_wait` lasts at most 5 minutes.
+
+## Command logs: `command_output_read`
+
+Every command row, blocking or started, keeps a log of its merged output (stdout and stderr in the
+order they arrived), apart from the 64 KiB tail on the row itself:
+
+- **Size.** The log keeps the last 2 MiB. A cut log opens with the line
+  `[… earlier output truncated]` and starts on a whole line; `log_truncated` says so.
+- **Scrubbed, fail closed.** The log is scrubbed as one text before it is stored. A log that cannot
+  be masked is stored as `[log withheld: it matched credential rule <rule>]`, and every slice a
+  read answers is scrubbed again the same way. A NUL byte is stored as U+FFFD.
+- **Written before the row ends**, so a log can be read as soon as a row is `done`, `failed` or
+  `cancelled`. A row reaped after its host crashed has no log (its row output says why); reading
+  it answers `not found: command log`.
+- **Scope.** A session reads the rows of its own run, of any of its steps: a later step can read an
+  earlier step's build log. Without `command_run_id`, the read is the run's latest row.
+
+A read answers one slice, at most `max_bytes`: the last `tail_lines` lines (the default, 200), the
+lines `from_line` to `to_line` (counted from 1, both included), or the lines matching `pattern`
+(a Rust regular expression, matched per line) numbered `N:`, with `context` lines around each
+numbered `N-` and groups separated by `--`. `capped` is `true` when `max_bytes` cut the slice.
+
+A command this session started with `command_start` and that still runs is read from its live
+log: complete lines only (a line still being written is held back), scrubbed as one text before
+`pattern` sees it.
+
+## Started commands: `command_start`, `command_wait`, `command_cancel`
+
+`command_start` runs a command through the same queue as `command_run`, with the same arguments,
+checks, class limits, lease checks, scrubbing and log, but answers `{"command_run_id", "status":
+"queued"}` at once. The command runs in the background of the htui process that hosts the session.
+
+- **At most 4 at once.** A session may have 4 started commands queued or running; a fifth is
+  refused as `refused: 4 commands are already queued or running in this session`. This limit is
+  separate from `command_run`'s one call at a time, and both share the box's class
+  [limits](#limits) with every other command.
+- **`command_wait`** answers when the command has ended, when a line after `after_line` matches
+  `pattern` (a Rust regular expression, per line), or when `deadline` passes, whichever is first.
+  The deadline is an RFC 3339 time (`2026-11-13T10:00:00Z`); one more than 300 seconds away is
+  read as 300 seconds, and one already passed answers at once. The answer:
+  - `status` (`queued`, `running`, `done`, `failed` or `cancelled`) and `exit_code`;
+  - `matched`, with the matched line's number `line_no` and its text `line` (at most 4 KiB);
+  - `tail`: the last 20 lines (at most 4 KiB);
+  - `next_line`: pass it as `after_line` to look for the next match; it is the matched line, or
+    the last line read;
+  - `total_lines` and `deadline_reached`.
+
+  Lines are those of the log, counted from 1. While a command runs, only complete lines count. The
+  lines are scrubbed before `pattern` sees them: a masked secret never matches, and lines that
+  cannot be masked match nothing and their tail is withheld. Any command row of the session's run
+  can be waited on; a row another session runs is read from the store about once a second.
+  An agent that asked for progress gets a notification every 5 seconds while it waits.
+- **`command_cancel`** stops a command this session started: a queued row is `cancelled` and
+  never runs, a running one has its process group killed. It answers the row's settled status; a
+  command that had already ended answers how it ended. Any other row, of another session or
+  another run, answers `not found: command_run <id>`.
+- **Ends.** A cancelled row's output opens with `[stopped: cancelled by command_cancel]`; one the
+  end of the session stopped (the step settles or is cancelled, the chat ends, htui quits) with
+  `[stopped: the session ended]`; one whose run another process took over with
+  `[stopped: fenced: lease lost]`, within about 10 seconds. What the command printed follows.
+  A row cancelled before it ran keeps no output, and its log is that one line.
 
 ## Heavy commands outside the queue (R-MCP-4)
 
@@ -379,14 +456,16 @@ ordinary permission request:
   ask.
 
 **htui's own tools are pre-approved.** On both transports, in a step and in a chat, the session's
-policy answers `allow_once` for every htui tool the session is offered except `command_run` (and
-`permission_prompt`, the channel itself), so `document_write` or `note_add` never waits for you.
+policy answers `allow_once` for every htui tool the session is offered except `command_run`,
+`command_start` and `command_cancel` (and `permission_prompt`, the channel itself), so
+`document_write`, `note_add`, `command_wait` or `command_output_read` never waits for you.
 These rules come after the R-MCP-4 refusals, the persona's rules and the agent's own, just ahead of
 the remembered choices and the default, so they only replace the default `ask`: a persona that
 rejects the kind htui's tools carry (`other`), or a rule of yours that names one of them, still
 wins. A policy whose default is not `ask` gets none of them: under a persona's or an agent's
 `deny` default htui's tools stay rejected, and under `allow` the default already allows them.
-`command_run` runs any command, so under the default `ask` it still asks.
+`command_run` and `command_start` run any command, and `command_cancel` stops one, so under the
+default `ask` they still ask; `command_wait` and `command_output_read` run nothing.
 
 The options are **Allow** and **Reject**. An allow lets the call run with its input unchanged; a
 reject answers the CLI `denied in htui`. A cancel answers every pending prompt
@@ -627,12 +706,13 @@ the private directory or the file that hands `claude-cli` its MCP servers. Check
 the step settled or was cancelled, the chat ended, or htui quit. A call that arrived after the
 end wrote nothing. One still running may or may not have written (a note or document whose write
 had already committed stays). A `command_run` that was queued or running was killed and its row
-`cancelled`, unless it had already finished.
+`cancelled`, unless it had already finished, and so was every command started with
+`command_start`.
 
 **`fenced: lease lost`.** Another process took the run over while this session was still running
 (it had lost its lease, for example after a long database outage). Nothing was written; the run
-goes on in the process that holds it. For `command_run`, a command still running was killed and
-its row `cancelled`, keeping what it printed ([Scope](#scope-what-a-session-can-touch)).
+goes on in the process that holds it. For `command_run` and `command_start`, a command still
+running was killed and its row `cancelled`, keeping what it printed ([Scope](#scope-what-a-session-can-touch)).
 
 **`version mismatch: the host is htui <x>, this relay is <y>; restart the agent`** (exit 3). The
 binary the agent started is not the build the host runs: htui was upgraded on disk while it was
@@ -657,7 +737,8 @@ Qdrant URL is configured; store one in Settings › Qdrant.
 
 **A long `command_run` call is abandoned by the agent.** Its MCP client timed out before the
 command finished: see [Long calls](#liveness-crashes-and-cancellation). The queue cancels the row
-and kills the command when the call is cancelled or the session ends.
+and kills the command when the call is cancelled or the session ends. Run it with `command_start`
+and `command_wait` instead.
 
 **`command_run` waits for ever.** Another command of the same class on the box holds the slot.
 Its row is reaped 30 seconds after its host stops renewing it; a live one ends when it finishes or
