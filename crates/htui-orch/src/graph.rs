@@ -2587,7 +2587,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("the seeded feature graph resolves")
             .snapshot;
-        assert_eq!(snapshot.v, GraphSnapshot::V, "{TOPOLOGY_MOVED}");
+        assert_eq!(snapshot.v, 2, "{TOPOLOGY_MOVED}");
         assert_eq!(snapshot.topology, FEATURE_TOPOLOGY_V2, "{TOPOLOGY_MOVED}");
         for phase in &snapshot.phases {
             assert_eq!(
