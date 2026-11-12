@@ -14,7 +14,9 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-11):** **MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
+**Current status (2026-11-12):** phases landed on main with the item still open: MOD-141 M1 and M2 (M3 open),
+MOD-147 M1 and M2 (M3, M4 open), MOD-162 M1, MOD-122 M1, MOD-125 M1; each item's note says what is next.
+**MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
 qualifier comes from one Postgres query a tick (`PgStore::waiting_keys`: the scope row and every scope project's
 slug and kind prefixes), where it was 2N+1 serial round trips; the mirror and memory still read per project, and
 the output is unchanged. **MOD-139 is done** (`docs/decisions/mod/mod-139.md`): divided fan-out runs.
@@ -42,13 +44,15 @@ Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-14
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-97's live `cli_live` case 11 (an inherited key, `apiKeySource` stays `none`) and Windows build of its
-`remove_case_variants`; MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
+`remove_case_variants`; MOD-141's, MOD-147's and MOD-162's merged-tree Postgres gate and live-Qdrant suites, with
+MOD-162's bench live wiring test and its two reference runs (`docs/benchmarks/mod-162-m1-2026-11-11.md`);
+MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
 `state_cli_pg`'s index case, MOD-160's
 `concepts_worker` mismatch case; the sandbox Qdrant times out creating collections), MOD-158's bats `3h2` and a real
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-139 (checked against the tree 2026-11-11): migrations run through
+Live coordinates after MOD-141 M2 (checked against the tree 2026-11-12): migrations run through
 `0029_divided_fanout` (MOD-139: `run_step` role, parent and node key, `run_plan`; mirrored by cache `0010`), before it
 `0028_seed_api_billing_env` (MOD-97: data-only, adds `settings.api_billing_env` to seeded `claude`/`claude-cli` rows; not mirrored), before it
 `0027_trim_record_v5` (MOD-163 M2: comment-only, `run_step.trim_record` v 5; not mirrored), before it
@@ -65,11 +69,11 @@ nullable `item_id`, `workspace_box_path.folder_path`; no new table; mirrored by 
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges, and MOD-144's `0023` became `0024` behind MOD-138's (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
-`htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. That rename left
-`migrations::the_ana_column_comments_are_present_and_verbatim` red: `0027`'s column comment says "written before
-0026" while `MOD163_M2_COLUMN_COMMENTS` pins "0027" (fix the pin, or the SQL only where no database has applied it). Items that still owe one include MOD-139 (and its cache mirror), MOD-143,
-MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 186 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
+`htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. `0027`'s column
+comment keeps its own bytes ("written before 0026") and `MOD163_M2_COLUMN_COMMENTS` pins them (`8d69db61`); an applied
+migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143,
+MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 230 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 52
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
@@ -188,7 +192,7 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_s
   dropped and ANA-13 §3.3 superseded: the typed exits and hop cap above become a `successors` plan and
   `max_plan_revisions` (MOD-140), and a tree-writing `spawn_subagent` is a part (MOD-139). MOD-139 is done
   (`docs/decisions/mod/mod-139.md`): parts, `role`/`parent_step_id` and integrate exist; `role = 'consult'` is
-  reserved in `0028`'s CHECK.
+  reserved in `0029`'s CHECK.
   ANA-36 §7.2 adds design input: consult as a blocking tool result, capped on depth, concurrency and
   budget. Per its §8 Q8 the consult reuses the one tool-to-engine channel MOD-75 builds.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
@@ -387,7 +391,7 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_s
   compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. **Amended by ANA-33
   (2026-10-18, `docs/ANA-33.md` §7.11):** `prepare · <target>` and `collect branch` are `role = 'stage'` rows at
   positions -2 and -1 (`node_key` `prepare`, `collect`). MOD-139 is done (`docs/decisions/mod/mod-139.md`): the
-  `stage` role and positions -3..-1 with these keys are reserved in `0028`; writing the rows is this item's.
+  `stage` role and positions -3..-1 with these keys are reserved in `0029`; writing the rows is this item's.
   Blocked on MOD-130.
 - [ ] **MOD-133 - Integration records and modes (local, push, pull_request)** (from ANA-34,
   `docs/ANA-34.md` §7.2-§7.4). `R-ORCH-14`, `R-ORCH-11`, `R-TUI-9`, `R-ENT-4`. Per-repo `integrate`
@@ -711,12 +715,12 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_s
   `0019_stop_runs` added `run.workspace_id` (cache `0006_run_workspace`), `Run.workspace_id` carries it
   (`htui-core/src/model/run.rs`), and the Backlog's run start (`Some(ctx.scope.workspace_id)`) and the queue
   runner (`queue_entry.workspace_id` → `enqueue_in_batch`) both record it. What remains: in `phase_spec`
-  (`engine.rs` ~5990) build `PromptScope { workspace: run.workspace_id, project }` instead of
+  (the `PromptScope::project_only` call, `engine.rs:8610` on 2026-11-12) build `PromptScope { workspace: run.workspace_id, project }` instead of
   `PromptScope::project_only`, since `run` is already a parameter there; add the preview/engine equality test;
   check whether the TUI's nil startup scope (`WorkspaceId::default()`, `app/update.rs` `has_scope`) can reach
   `StartRun`/`QueueItem` as `Some(nil)`; and record that this changes `prompt_digest` for a run whose
-  upstream items sit in other projects of its workspace. Small; touches `engine.rs`, so merge it before
-  MOD-138's rebase.
+  upstream items sit in other projects of its workspace. Small; touches `engine.rs` (MOD-138 and MOD-139 are
+  done, so no rebase is waiting on it).
 - [ ] **MOD-103 - Chat tab per session, and a project choice for a free-standing chat** (from the
   2026-10-14 requirements audit). `R-TUI-1`, `R-TUI-6`. `register_all` registers one `ChatTab`
   (`crates/htui/src/app/mod.rs:84`) holding one `session: Option<ChatSessionState>`
@@ -1060,7 +1064,7 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_s
   row at position -3 (`node_key = 'pick'`), inserted in the `create_run` transaction with agent, model and usage,
   its record a `workflow_pick` document; the pick runs before `create_run` and is re-run after a crash. MOD-139 is
   done (`docs/decisions/mod/mod-139.md`): the `stage` role and position -3 (`node_key = 'pick'`) are reserved in
-  `0028`; writing the row is this item's.
+  `0029`; writing the row is this item's.
 - [ ] **MOD-127 - Generic Toolbox binding; MCP server, command and env-preset kinds** (from ANA-40, §8 P2, P3).
   `R-SKL-2`, `R-TUI-7`, `R-ID-3`, `R-ID-5`, `R-AGT-11`. Generalise `skill_binding` to a typed binding (kind, ref,
   level, pin, activation) with one resolver shared by the Postgres and in-memory stores and a step-level reason
