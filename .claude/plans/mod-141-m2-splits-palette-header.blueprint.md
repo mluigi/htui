@@ -1120,6 +1120,24 @@ cargo test -p htui --lib -- --test-threads=1 ui::graph_editor::model ui::graph_e
 
 ---
 
+## Wave-1 outcomes (main thread, 2026-11-12, binding on T7-T9 and review)
+
+Merged on `hr/MOD-141` at `b8b05d0a` (T4 `0d4d927b`, T2 `5d92d9b1`, T6 `03a46994`, T3 `381fbcd7`,
+T5 `b8b05d0a`). Where a lane went past this blueprint after its verifiers, the code wins:
+
+- **W1 `notes` order (T6 repair).** `notes` first lists the two per-step refusals `snapshot_phase` raises
+  before anything else: `ResolveError::LocalFanOut` (the step's own `isolation == Some(Local)` with
+  `fan_out > 1`), then `ReviewFanOut` (a step named `review` with `fan_out > 1`). Only after those does it
+  follow §6.2's list. On a **divide** step the palette note names `N:plan`, as `not_yet_runnable` does.
+  The known limits also name `NoTemplate` (the project's templates are not visible here). The test
+  `the_first_note_is_the_refusal_resolve_raises` cross-checks the first note against the real `resolve`.
+- **W2 Step form (T5).** `NodeForm::new` takes `compete: bool`, and `lines` takes `FormKeys { add, open }`.
+  The part form's agent choice lists a candidate the step holds twice only once. A judge stored on a step
+  whose split is not compete is cleared when the step is saved through the form (§5.4).
+- **W3 Wave allows** to remove in T8: `git grep -n 'MOD-141 M2 T8 wires it'`.
+
+---
+
 ## T7 - Editor settings read (D6) (wave 2, serial)
 
 **File set**:
