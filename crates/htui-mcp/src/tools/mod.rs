@@ -1,4 +1,4 @@
-//! The tool table (MOD-11 blueprint §2.10): nine tools, one file each, fixed here once.
+//! The tool table (MOD-11 blueprint §2.10): twelve tools, fixed here once.
 //!
 //! [`ALL`]'s order is `tools/list`'s order and a pin. Each file exports a [`ToolDef`] named `DEF`
 //! and an `async fn call`; a tool's owning task replaces both in its own file and never edits this
@@ -12,9 +12,11 @@ use serde_json::Value;
 
 use crate::host::Session;
 use crate::protocol::Progress;
+pub(crate) use command_async::LiveCommands;
 
 mod box_profile;
 mod command;
+mod command_async;
 mod command_log;
 mod document;
 mod link;
@@ -43,7 +45,7 @@ pub(crate) struct HostCaps {
 }
 
 /// Table order is `tools/list` order and a pin.
-pub(crate) const ALL: [&ToolDef; 9] = [
+pub(crate) const ALL: [&ToolDef; 12] = [
     &box_profile::DEF,
     &document::DEF,
     &note::DEF,
@@ -52,6 +54,9 @@ pub(crate) const ALL: [&ToolDef; 9] = [
     &search::DEF,
     &command::DEF,
     &command_log::DEF,
+    &command_async::START,
+    &command_async::WAIT,
+    &command_async::CANCEL,
     &permission::DEF,
 ];
 
@@ -88,6 +93,9 @@ pub(crate) async fn dispatch<H: htui_core::store::WorkerHost>(
         "search_concepts" => search::call(ctx, args).await,
         "command_run" => command::call(ctx, args).await,
         "command_output_read" => command_log::call(ctx, args).await,
+        "command_start" => command_async::start_call(ctx, args).await,
+        "command_wait" => command_async::wait_call(ctx, args).await,
+        "command_cancel" => command_async::cancel_call(ctx, args).await,
         "permission_prompt" => permission::call(ctx, args).await,
         other => Err(ToolError(format!("unknown tool: {other}"))),
     }
@@ -162,6 +170,9 @@ mod tests {
                 "search_concepts",
                 "command_run",
                 "command_output_read",
+                "command_start",
+                "command_wait",
+                "command_cancel",
                 "permission_prompt",
             ]
         );

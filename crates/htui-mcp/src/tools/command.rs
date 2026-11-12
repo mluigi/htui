@@ -2,11 +2,13 @@
 //! command through the box's queue.
 //!
 //! The call is validated by [`check`] (class, `repo` and `cwd`, timeout), its command line scrubbed
-//! (I-5), and [`Runner::execute`] enqueues it as a `queued` `command_run` row of the session's step on the session's box. It then asks for
-//! admission every [`COMMAND_ADMIT_POLL`] under the class limit D15 resolves per call, ticking
+//! (I-5), and [`Runner::enqueue`] enqueues it as a `queued` `command_run` row of the session's
+//! step on the session's box. [`Runner::run`] then asks for admission every
+//! [`COMMAND_ADMIT_POLL`] under the class limit D15 resolves per call, ticking
 //! progress (B-11; a tick never waits long on a client that does not read); runs through
 //! [`run_shell_with`] in the session's directory, its merged output streamed into a
-//! [`LogBuffer`] that is scrubbed and stored as the row's log before the row ends (MOD-152 D4), beating the claim every [`COMMAND_HEARTBEAT`] (a
+//! [`LogBuffer`] that is scrubbed and stored as the row's log before the row ends (MOD-152 D4),
+//! beating the claim every [`COMMAND_HEARTBEAT`] (a
 //! beat that answers `false` kills the child: the row was reaped or cancelled); scrubs the tail,
 //! fail closed; finishes the row; and answers it. Everything a cancelled call must undo lives in
 //! [`Enqueued`]'s drop (H-18): the row is cancelled and the child's process group dies with the
@@ -27,7 +29,7 @@ use std::time::Duration;
 use htui_core::clock::Clock;
 use htui_core::model::kind::{command_limit, resolve_command_limits};
 use htui_core::model::{
-    BoxId, CommandRun, CommandRunId, CommandRunStatus, NewCommandRun, RunId, StepId,
+    BoxId, CommandLog, CommandRun, CommandRunId, CommandRunStatus, NewCommandRun, RunId, StepId,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::traits::COMMAND_HEARTBEAT;
@@ -59,9 +61,6 @@ pub(crate) const BUSY: &str = "refused: a command_run is already queued or runni
 
 /// The line a row stopped on a lost lease opens with (MOD-78 D4).
 const LEASE_LOST: &str = "[stopped: fenced: lease lost]\n";
-
-/// The line a row its caller stopped opens with (MOD-152 D7).
-const CANCELLED: &str = "[stopped: cancelled]\n";
 
 /// MOD-78 D1, D3: the lease the session's writes are fenced on, and the step a loss is
 /// reported on.
@@ -113,8 +112,27 @@ enum Stopped {
     Taken,
     /// The session's lease is lost.
     LeaseLost,
-    /// The caller stopped the command (`command_cancel`, the end of the session).
-    Cancelled,
+    /// The caller stopped the command (`command_cancel`, the end of the session); the line the
+    /// row's output opens with, which says which (MOD-152 D7).
+    Cancelled(&'static str),
+}
+
+/// What watches a command run (MOD-152 D7): the log its output is written into, told when a line
+/// was written and when the command was admitted. A blocking `command_run` watches with a bare
+/// [`SharedLog`]; a started command with its registry entry.
+pub(crate) trait Watch: Sync {
+    /// The log the output streams into.
+    fn log(&self) -> &SharedLog;
+    /// Output holding a newline was written.
+    fn wrote(&self) {}
+    /// The command was admitted and is about to run.
+    fn running(&self) {}
+}
+
+impl Watch for SharedLog {
+    fn log(&self) -> &SharedLog {
+        self
+    }
 }
 
 // The step, the box and the directory are the scope's (I-1): a `run_id` or a `step_id` is
@@ -258,9 +276,11 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
         .try_acquire_owned()
         .map_err(|_| ToolError(BUSY.to_owned()))?;
     let limit = class_limit(&ctx.host, &session.scope, checked.class()).await?;
-    let finished = Runner::of(session, limit)
-        .execute(
-            checked,
+    let runner = Runner::of(session, limit);
+    let queued = runner.enqueue(CommandRunId::new(), checked).await?;
+    let finished = runner
+        .run(
+            queued,
             ctx.progress.as_ref(),
             std::future::pending(),
             &SharedLog::default(),
@@ -288,7 +308,7 @@ pub(crate) async fn class_limit<H: htui_core::store::WorkerHost>(
     ))
 }
 
-/// How a checked command ended, as [`Runner::execute`] answers it.
+/// How a checked command ended, as [`Runner::run`] answers it.
 #[derive(Debug)]
 pub(crate) struct Finished {
     /// The `command_run` row.
@@ -349,21 +369,15 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
         }
     }
 
-    /// Queues `checked`, waits for admission, runs it and ends its row.
-    ///
-    /// The lease is read before anything is queued, at admission and on every heartbeat; a lost
-    /// one answers `fenced: lease lost` and ends a running row `cancelled` (MOD-78). `external_stop`
-    /// resolving stops the child and ends the row `cancelled` (MOD-152 D7). The command's merged
-    /// output is written into `log` as it arrives; once the command is over the log is scrubbed
-    /// and stored before the row ends (D4), so whoever sees the row terminal can read it. Dropped
-    /// before the row ends, the call cancels the row (H-18).
-    pub(crate) async fn execute(
+    /// Queues `checked` as the row `id`, once the lease is read (MOD-78 D3(a), R1: a lost lease
+    /// queues nothing; a failed read refuses too, D5: nothing has been written yet, so there is
+    /// nothing a refusal could strand). Dropped before [`run`](Self::run) ends it, the answer
+    /// cancels the row (H-18).
+    pub(crate) async fn enqueue(
         &self,
+        id: CommandRunId,
         checked: Checked,
-        progress: Option<&Progress>,
-        external_stop: impl Future<Output = ()> + Send,
-        log: &SharedLog,
-    ) -> Result<Finished, ToolError> {
+    ) -> Result<Queued<S>, ToolError> {
         let Checked {
             class,
             command,
@@ -372,9 +386,6 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
             timeout,
         } = checked;
         let store = &self.store;
-        let scrubber = self.scrubber.as_ref();
-        // MOD-78 D3(a), R1: a lost lease queues nothing. A failed read refuses too (D5): nothing
-        // has been written yet, so there is nothing a refusal could strand.
         let lease = self.lease;
         if !lease.holds(store).await.map_err(store_error)? {
             return Err(lease.lost());
@@ -382,7 +393,7 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
         let queued = htui_core::store::WorkerStore::enqueue_command(
             store,
             NewCommandRun {
-                id: CommandRunId::new(),
+                id,
                 run_step_id: self.step,
                 box_id: self.box_id,
                 class,
@@ -398,21 +409,59 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
         )
         .await
         .map_err(store_error)?;
-        let mut guard = Enqueued {
-            store: Some(store.clone()),
+        Ok(Queued {
+            guard: Enqueued {
+                store: Some(store.clone()),
+                id: queued.id,
+            },
             id: queued.id,
-        };
-        let id = queued.id;
+            command,
+            dir,
+            timeout,
+        })
+    }
+
+    /// Waits for `queued`'s admission, runs it and ends its row.
+    ///
+    /// The lease is read at admission and on every heartbeat; a lost one answers `fenced: lease
+    /// lost` and ends a running row `cancelled` (MOD-78). `halt` resolving — to the line the row's
+    /// output then opens with — cancels a queued row, or stops the child and ends a running row
+    /// `cancelled` (MOD-152 D7). The command's merged output is written into `watch`'s log as it
+    /// arrives; once the command is over the log is scrubbed and stored before the row ends (D4),
+    /// so whoever sees the row terminal can read it. Dropped before the row ends, the call
+    /// cancels the row (H-18).
+    pub(crate) async fn run(
+        &self,
+        queued: Queued<S>,
+        progress: Option<&Progress>,
+        halt: impl Future<Output = &'static str> + Send,
+        watch: &impl Watch,
+    ) -> Result<Finished, ToolError> {
+        let Queued {
+            mut guard,
+            id,
+            command,
+            dir,
+            timeout,
+        } = queued;
+        let store = &self.store;
+        let scrubber = self.scrubber.as_ref();
+        let lease = self.lease;
         let claimant = Uuid::now_v7();
         let mut ticks = 0_u64;
+        tokio::pin!(halt);
 
-        admit(store, id, claimant, self.limit, lease, progress, &mut ticks).await?;
+        tokio::select! {
+            admitted = admit(store, id, claimant, self.limit, lease, progress, &mut ticks) => admitted?,
+            why = &mut halt => return self.cancel_queued(id, why, &mut guard).await,
+        }
         // MOD-78 D3(b): a call that waited may have lost the lease since its last read; it must
         // not spawn a child for a heartbeat on it. The armed guard cancels the running row. A
         // failed read is not a stop (D5): the heartbeat reads again.
         if lease.lost_now(store).await {
             return Err(lease.lost());
         }
+        watch.running();
 
         // OQ-3: the claim beats until the queue takes the row, the lease is lost (MOD-78 D3(c)) or
         // the caller stops it; that is `run_shell_with`'s `stop`.
@@ -420,12 +469,17 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
         let beats = async {
             let why = tokio::select! {
                 why = beat(store, id, claimant, lease, progress, &mut ticks) => why,
-                () = external_stop => Stopped::Cancelled,
+                why = &mut halt => Stopped::Cancelled(why),
             };
             // Set once: `beats` runs once.
             let _ = stopped.set(why);
         };
-        let sink = |chunk: &[u8]| lock(log).push(chunk);
+        let sink = |chunk: &[u8]| {
+            lock(watch.log()).push(chunk);
+            if chunk.contains(&b'\n') {
+                watch.wrote();
+            }
+        };
         let ran = run_shell_with(&command, &dir, Duration::from_secs(timeout), beats, &sink).await;
 
         let (status, exit_code) = match ran.ended {
@@ -436,12 +490,16 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
         };
         let output = answer_output(scrubber, &ran, timeout);
         // D4: the log is written before the row ends. A failed write is not a stop: the row's own
-        // tail still answers.
-        let mut buffer = std::mem::take(&mut *lock(log));
-        if ran.ended == ShellEnd::SpawnFailed {
-            // The sink saw nothing of a shell that never started; its reason is the log.
-            buffer.push(ran.output.as_bytes());
-        }
+        // tail still answers. The live log keeps its text until the row has ended, so a reader
+        // of a running command never sees it empty.
+        let buffer = {
+            let mut live = lock(watch.log());
+            if ran.ended == ShellEnd::SpawnFailed {
+                // The sink saw nothing of a shell that never started; its reason is the log.
+                live.push(ran.output.as_bytes());
+            }
+            live.clone()
+        };
         let stored = buffer.into_stored(scrubber, id, self.clock.now());
         if let Err(err) = htui_core::store::WorkerStore::put_command_log(store, stored).await {
             tracing::warn!(%id, %err, "a command's log could not be written");
@@ -452,8 +510,8 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
                 finish_lease_lost(store, id, claimant, &output, &mut guard).await;
                 return Err(lease.lost());
             }
-            Some(Stopped::Cancelled) => {
-                let note = format!("{CANCELLED}{output}");
+            Some(Stopped::Cancelled(why)) => {
+                let note = format!("{why}{output}");
                 let ended = htui_core::store::WorkerStore::finish_command(
                     store,
                     id,
@@ -516,6 +574,77 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
             truncated,
         })
     }
+
+    /// MOD-152 D7: ends a row halted before it was admitted `cancelled`. It never ran, so its log
+    /// is the reason (written first, D4); the row keeps no output.
+    async fn cancel_queued(
+        &self,
+        id: CommandRunId,
+        why: &'static str,
+        guard: &mut Enqueued<S>,
+    ) -> Result<Finished, ToolError> {
+        let store = &self.store;
+        let reason = CommandLog {
+            command_run_id: id,
+            text: why.to_owned(),
+            truncated: false,
+            total_bytes: 0,
+            written_at: self.clock.now(),
+        };
+        if let Err(err) = htui_core::store::WorkerStore::put_command_log(store, reason).await {
+            tracing::warn!(%id, %err, "a cancelled command's reason could not be written");
+        }
+        // `Err`: the armed guard cancels the row.
+        htui_core::store::WorkerStore::cancel_command(store, id)
+            .await
+            .map_err(store_error)?;
+        guard.disarm();
+        let row = stored_row(store, self.step, id).await?;
+        Ok(Finished {
+            id,
+            status: row.status,
+            exit_code: row.exit_code,
+            output: why.to_owned(),
+            truncated: false,
+        })
+    }
+}
+
+impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S> {
+    /// How the row `id` stands once [`run`](Self::run) answered an error (a lost lease, a store
+    /// failure): as the store holds it, cancelled first when it is still queued or running. A
+    /// store that cannot answer leaves it `cancelled` as far as the caller knows; the queue reaps
+    /// the row.
+    pub(crate) async fn settled(&self, id: CommandRunId) -> (CommandRunStatus, Option<i32>) {
+        let open = |status| matches!(status, CommandRunStatus::Queued | CommandRunStatus::Running);
+        if let Ok(row) = stored_row(&self.store, self.step, id).await
+            && !open(row.status)
+        {
+            return (row.status, row.exit_code);
+        }
+        if let Err(err) = htui_core::store::WorkerStore::cancel_command(&self.store, id).await {
+            tracing::warn!(%id, %err, "a started command's row could not be cancelled");
+        }
+        match stored_row(&self.store, self.step, id).await {
+            Ok(row) if !open(row.status) => (row.status, row.exit_code),
+            _ => (CommandRunStatus::Cancelled, None),
+        }
+    }
+}
+
+/// A row [`Runner::enqueue`] queued and [`Runner::run`] has not yet ended: dropped, it cancels
+/// the row (H-18).
+pub(crate) struct Queued<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> {
+    /// Cancels the row when dropped armed.
+    guard: Enqueued<S>,
+    /// The row.
+    id: CommandRunId,
+    /// The command line the shell runs.
+    command: String,
+    /// The directory it runs in.
+    dir: PathBuf,
+    /// Seconds before it is killed.
+    timeout: u64,
 }
 
 /// `log` locked; a lock a panicking sink poisoned still holds the output.
@@ -590,7 +719,7 @@ fn answer_output(scrubber: &dyn Scrubber, ran: &ShellRun, timeout: u64) -> Strin
 }
 
 /// The row `id` of `step`, read back after the queue moved it.
-async fn stored_row<S: htui_core::store::WorkerStore>(
+pub(crate) async fn stored_row<S: htui_core::store::WorkerStore>(
     store: &S,
     step: StepId,
     id: CommandRunId,
@@ -688,7 +817,7 @@ async fn beat<S: htui_core::store::WorkerStore>(
 /// [`TICK_PATIENCE`] for room on the connection, then is dropped: a client that holds the
 /// connection open without reading must not stop the beats and asks the row's liveness rests
 /// on (a frozen heartbeat is reaped, and its class slot handed on while the child still runs).
-async fn tick(progress: Option<&Progress>, ticks: &mut u64) {
+pub(crate) async fn tick(progress: Option<&Progress>, ticks: &mut u64) {
     if let Some(progress) = progress {
         *ticks += 1;
         let _ = tokio::time::timeout(TICK_PATIENCE, progress.tick(*ticks)).await;

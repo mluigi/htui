@@ -29,7 +29,7 @@ use crate::protocol::{
     CallRefused, CallResult, Handler, Progress, SUPPORTED_VERSIONS, ToolInfo, serve,
 };
 use crate::search::ConceptSearch;
-use crate::tools::{self, Ctx, HostCaps, ToolError};
+use crate::tools::{self, Ctx, HostCaps, LiveCommands, ToolError};
 use crate::{ENV_ADDR, ENV_TOKEN, SERVER_NAME};
 
 /// The in-process client's pipe size (D5).
@@ -109,6 +109,10 @@ pub(crate) struct Session<S> {
     /// call (a cancelled call's dropped future gives it back), so one agent cannot fill the
     /// store's connection pool with waiting calls.
     pub(crate) command_slot: Arc<tokio::sync::Semaphore>,
+    /// MOD-152 D7: the commands `command_start` started, by row. Each entry's stop is a child of
+    /// [`cancel`](Self::cancel), so the end of the session stops every one of them: its child is
+    /// killed and its row ends `cancelled`.
+    pub(crate) commands: LiveCommands,
 }
 
 impl<S> Session<S> {
@@ -427,6 +431,7 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
                 scrubber: Arc::clone(&config.scrubber),
                 clock: Arc::clone(&config.clock),
                 command_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+                commands: LiveCommands::default(),
             };
             (config.binary.clone(), Arc::new(session))
         };
@@ -715,6 +720,9 @@ pub(crate) mod tests {
                 "item_link",
                 "command_run",
                 "command_output_read",
+                "command_start",
+                "command_wait",
+                "command_cancel",
                 "permission_prompt",
             ]
         );

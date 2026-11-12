@@ -868,7 +868,14 @@ async fn command_run_is_not_advertised_when_exposure_is_off() {
     let (_on, mut on) = open(&host, scope(dir.path(), true)).await;
     assert_eq!(
         on.tool_names().await.expect("tools/list"),
-        ["box_profile", "command_run", "command_output_read"]
+        [
+            "box_profile",
+            "command_run",
+            "command_output_read",
+            "command_start",
+            "command_wait",
+            "command_cancel",
+        ]
     );
 }
 

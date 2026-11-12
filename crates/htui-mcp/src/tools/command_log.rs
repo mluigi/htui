@@ -6,7 +6,8 @@
 //! was dropped and starting on a line boundary, scrubbed as one text and fail closed (D3). The
 //! tool answers a slice of it: the last lines, a line range, or the lines matching a pattern, at
 //! most `max_bytes`. Line numbers count the lines of the stored text, the truncation line being
-//! the first of a cut log. The read is scoped to the caller's run (D5).
+//! the first of a cut log. The read is scoped to the caller's run (D5); a command the session
+//! started and that still runs is read from its live log (MOD-152 T5).
 
 use std::sync::Mutex;
 
@@ -91,10 +92,32 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
             .await
             .map_err(store_error)?
             .ok_or_else(|| ToolError(NO_LOG.to_owned()))?;
-    let log = stored.log.ok_or_else(|| ToolError(NO_LOG.to_owned()))?;
+    // MOD-152 T5: a command this session started and that still runs is read from its live log,
+    // complete lines only, scrubbed as one text before a pattern sees it (D3).
+    let live = session
+        .commands
+        .get(stored.row.id)
+        .map(|live| live.snapshot())
+        .filter(|(phase, _, _)| !phase.ended());
+    let (text, log_truncated, status, exit_code) = match live {
+        Some((phase, text, cut)) => {
+            let text =
+                scrub(session.scrubber.as_ref(), text).unwrap_or_else(|rule| withheld(&rule));
+            (text, cut, phase.status(), None)
+        }
+        None => {
+            let log = stored.log.ok_or_else(|| ToolError(NO_LOG.to_owned()))?;
+            (
+                log.text,
+                log.truncated,
+                stored.row.status.as_str(),
+                stored.row.exit_code,
+            )
+        }
+    };
 
-    let total_lines = log.text.lines().count();
-    let mut slice = slice(&log.text, &mode, max_bytes);
+    let total_lines = text.lines().count();
+    let mut slice = slice(&text, &mode, max_bytes);
     // D3: the stored text was scrubbed; the slice is scrubbed again on its way out, fail closed.
     match scrub(session.scrubber.as_ref(), slice.text) {
         Ok(text) => slice.text = text,
@@ -104,10 +127,10 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     }
     Ok(json!({
         "command_run_id": stored.row.id,
-        "status": stored.row.status.as_str(),
-        "exit_code": stored.row.exit_code,
+        "status": status,
+        "exit_code": exit_code,
         "total_lines": total_lines,
-        "log_truncated": log.truncated,
+        "log_truncated": log_truncated,
         "text": slice.text,
         "first_line": slice.first_line,
         "last_line": slice.last_line,
@@ -165,10 +188,7 @@ impl Mode {
                     .filter(|context| *context <= MAX_CONTEXT)
                     .ok_or_else(|| refuse(&format!("context {asked} is not 0..={MAX_CONTEXT}")))?,
             };
-            let pattern = RegexBuilder::new(pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-                .map_err(|err| refuse(&format!("pattern: {}", one_line(&err.to_string()))))?;
+            let pattern = compile(pattern)?;
             return Ok(Self::Pattern { pattern, context });
         }
         if ranged {
@@ -189,6 +209,14 @@ impl Mode {
             Some(lines) => Ok(Self::Tail(widen(lines))),
         }
     }
+}
+
+/// `pattern` compiled within [`REGEX_SIZE_LIMIT`], or the one-line refusal.
+pub(crate) fn compile(pattern: &str) -> Result<Regex, ToolError> {
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|err| refuse(&format!("pattern: {}", one_line(&err.to_string()))))
 }
 
 /// `refused: <reason>`.
@@ -280,7 +308,7 @@ impl Emit {
 }
 
 /// The first at most `max` bytes of `text`, ending on a character boundary.
-fn cut_head(text: &str, max: usize) -> &str {
+pub(crate) fn cut_head(text: &str, max: usize) -> &str {
     let mut end = max.min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -385,7 +413,7 @@ pub(crate) fn withheld(rule: &str) -> String {
 /// bytes, plus the size of everything written to it. A running command's reader asks
 /// [`complete_lines`](Self::complete_lines); the runner ends it with
 /// [`into_stored`](Self::into_stored).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct LogBuffer {
     /// The last bytes pushed: at most twice the cap, so a trim is paid once per cap of output.
     bytes: Vec<u8>,
@@ -434,7 +462,6 @@ impl LogBuffer {
 
     /// The output so far, whole lines only, as a log opens: with the truncation line when it is
     /// a tail. Not scrubbed: the reader scrubs the slice it serves (D3). A NUL is U+FFFD.
-    #[allow(dead_code, reason = "MOD-152 T5: the live read of a running command")]
     pub(crate) fn complete_lines(&self) -> (String, bool) {
         let (bytes, cut) = self.tail();
         let whole = bytes
