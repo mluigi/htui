@@ -1416,7 +1416,8 @@ fn joined(mut chords: Vec<String>, then: Vec<String>) -> Vec<String> {
 /// both splits' rows (compete with the switch on; divide's planner, integrate, part cap and plan
 /// scope), and the default parts through the part form (add, edit every column, reorder,
 /// remove), each edited with keys, saved through the store worker and read back from
-/// `graph_body`; every other column of the graph unchanged.
+/// `graph_body`; every other column of the graph unchanged, a divide step's own columns and
+/// parts included when only another column is typed.
 #[tokio::test]
 async fn every_m2_node_field_round_trips() {
     let seed = body_of(&MemStore::demo(), ANALYSIS).await;
@@ -1425,8 +1426,10 @@ async fn every_m2_node_field_round_trips() {
     let pairs = agent_pairs(&Backend::memory(MemStore::demo())).await;
     assert!(!pairs.is_empty(), "a pair to choose");
     let first = pairs[0].clone();
+    let last = pairs[pairs.len() - 1].clone();
     let personas = persona_ids().await;
     let persona = *personas.first().expect("a seed persona");
+    let other_persona = *personas.last().expect("a seed persona");
 
     let cases = vec![
         M2Case {
@@ -1663,6 +1666,38 @@ async fn every_m2_node_field_round_trips() {
                 phase.plan_scope = None;
                 node.parts = Vec::new();
             }),
+        },
+        M2Case {
+            column: "divide: kept through an edit of another column",
+            compete: false,
+            prepare: Some(Box::new({
+                let (planner, integrate) = (first.clone(), last.clone());
+                move |node| {
+                    let phase = &mut node.phase;
+                    phase.split = Split::Divide;
+                    phase.planner_persona_id = Some(persona);
+                    (phase.planner_agent_id, phase.planner_model) = seat(&planner);
+                    phase.integrate_persona_id = Some(other_persona);
+                    (phase.integrate_agent_id, phase.integrate_model) = seat(&integrate);
+                    phase.max_parts = Some(4);
+                    phase.plan_scope = Some(PlanScope::Graph);
+                    node.parts = vec![
+                        PhasePart {
+                            title: "The UI".to_owned(),
+                            brief: "draw it".to_owned(),
+                            owned_paths: vec!["src/ui/**".to_owned()],
+                            acceptance: Some("cargo test".to_owned()),
+                            persona_id: Some(other_persona),
+                            ..bare_part(research, 0, "ui")
+                        },
+                        bare_part(research, 1, "store"),
+                    ];
+                }
+            })),
+            // The deadline is the only column typed: the divide columns and the parts the form
+            // opened with are saved as they were.
+            chords: retyped(row(DEADLINE), "900"),
+            expect: Box::new(|node| node.phase.deadline_seconds = Some(900)),
         },
         M2Case {
             column: "compete (switch on): fan-out and judge",
