@@ -1,10 +1,14 @@
-//! MOD-141 D8: the node form - every M1 node field, the ordered candidate agents, and the M2
-//! fields shown read-only. Key-agnostic: the editor maps its acts onto these methods.
+//! MOD-141 D8, M2 D7-D10: the node form - every M1 node field, the ordered candidate agents,
+//! then the deadline, the palette flag, the split and the split's own rows (compete: fan-out and
+//! judge; divide: planner, integrate, part cap, plan scope and the default parts). Key-agnostic:
+//! the editor maps its acts onto these methods.
+
+use std::borrow::Cow;
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{
     AgentId, AgentSummary, CommandQueue, Gate, GraphBody, Isolation, NodeBody, PersonaId,
-    PhaseAgent, PhaseId, PlanScope, Split,
+    PhaseAgent, PhaseId, PhasePart, PlanScope, Split,
 };
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -21,6 +25,14 @@ pub(crate) const RETRY_IS_A_NUMBER: &str = "`retry limit` is a whole number, 0 o
 /// A token budget that is neither empty nor a whole number of at least 1.
 pub(crate) const BUDGET_IS_A_NUMBER: &str =
     "`token budget` is a whole number of at least 1, or empty";
+/// A deadline that is neither empty nor a whole number of at least 1 (M2 D10).
+pub(crate) const DEADLINE_IS_A_NUMBER: &str =
+    "`deadline` is a whole number of seconds, at least 1, or empty";
+/// A compete step's fan-out that is not a whole number of at least 2 (M2 D8).
+pub(crate) const FAN_OUT_IS_A_NUMBER: &str = "`fan-out` is a whole number, 2 or more";
+/// A divide step's part cap that is neither empty nor a whole number of at least 1 (M2 D9).
+pub(crate) const MAX_PARTS_IS_A_NUMBER: &str =
+    "`max parts` is a whole number of at least 1, or empty";
 /// No template chosen while the scope has names to choose from.
 pub(crate) const TEMPLATE_REQUIRED: &str = "`template` is required; choose one";
 /// No template name to choose, and none chosen.
@@ -32,8 +44,7 @@ pub(crate) const AGENTS_NOT_READ: &str =
 pub(crate) const NO_AGENTS: &str = "no agents to choose from; add one in Settings \u{203a} Agents";
 /// A candidate edit with no candidate row focused.
 pub(crate) const NO_CANDIDATE: &str = "no candidate agent is selected";
-/// What a `divide` node's split row adds.
-pub(crate) const DIVIDE_NOTE: &str = "runs once MOD-139 lands";
+
 /// The placeholder row's text while the node has no candidate, naming `add`, the key the editor
 /// binds to adding one (D12, R-TUI-10: the key comes from the key file, never this module), or
 /// `none` alone while nothing is bound to it.
@@ -41,22 +52,35 @@ pub(crate) fn no_candidates(add: Option<&str>) -> String {
     add.map_or_else(|| "none".to_owned(), |key| format!("none ({key} adds one)"))
 }
 
-/// The fixed rows before the candidates, in focus order.
+/// The split row of a compete step while the compete switch is off (M2 D7): shown, never edited.
+const COMPETE_LOCKED: &str =
+    "compete \u{b7} read-only while compete is off (Settings \u{203a} Prompt)";
+/// The split row's help with the compete switch on.
+const SPLIT_HELP_ON: &str = "none, divide into parts, or compete: several agents, one winner";
+/// The split row's help with the compete switch off.
+const SPLIT_HELP_OFF: &str =
+    "none or divide into parts; compete is off in Settings \u{203a} Prompt";
+
+/// The fixed rows before the candidates, in focus order: M1's 13, which M2 never moves (B3).
 const FIXED_ROWS: usize = 13;
-/// Row indices of the fixed rows.
+/// The name row's index, where a form opens.
 const NAME: usize = 0;
-const TEMPLATE: usize = 1;
-const VERSION: usize = 2;
-const PERSONA: usize = 3;
-const GATE: usize = 4;
-const HARD_GATE: usize = 5;
-const RETRY: usize = 6;
-const ISOLATION: usize = 7;
-const COMMANDS: usize = 8;
-const VERIFY: usize = 9;
-const BUDGET: usize = 10;
-const INPUTS: usize = 11;
-const OUTPUT: usize = 12;
+/// M1's fixed rows in focus order; a row's index here is its index in [`NodeForm::rows`].
+const FIXED: [Row; FIXED_ROWS] = [
+    Row::Name,
+    Row::Template,
+    Row::Version,
+    Row::Persona,
+    Row::Gate,
+    Row::HardGate,
+    Row::Retry,
+    Row::Isolation,
+    Row::Commands,
+    Row::Verify,
+    Row::Budget,
+    Row::Inputs,
+    Row::Output,
+];
 
 /// Which node the form writes back to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +101,7 @@ pub(crate) enum NodeRow {
     Text,
     /// A choice row: it cycles.
     Choice,
-    /// The hard-gate toggle: it cycles by flipping.
+    /// A toggle (hard gate, palette): it cycles by flipping.
     Toggle,
     /// Candidate `n` (0-based): it cycles over the agent and model pairs.
     Candidate(usize),
@@ -85,10 +109,51 @@ pub(crate) enum NodeRow {
     NoCandidates,
 }
 
-/// The open node form (D8).
+/// The key labels the form's own words name (R-TUI-10); the editor resolves them from its stack.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FormKeys<'a> {
+    /// `graph_editor.candidate_add`'s label: the placeholder rows.
+    pub(crate) add: Option<&'a str>,
+    /// `graph_editor.open_part`'s label: a part row's help. `None` until T8 binds it.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) open: Option<&'a str>,
+}
+
+/// Every row the form can show, in the order it shows them (B3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Name,
+    Template,
+    Version,
+    Persona,
+    Gate,
+    HardGate,
+    Retry,
+    Isolation,
+    Commands,
+    Verify,
+    Budget,
+    Inputs,
+    Output,
+    Candidate(usize),
+    NoCandidates,
+    Deadline,
+    Palette,
+    Split,
+}
+
+/// A seat: an agent and its model, `None` when the pair's model is empty.
+pub(super) type Seat = (AgentId, Option<String>);
+
+/// The open node form (D8, M2 D7-D10).
 pub(crate) struct NodeForm {
     /// The node it writes back to.
     target: NodeTarget,
+    /// The compete switch (M2 D5) as the form opened: whether the split offers compete.
+    compete: bool,
+    /// A compete step opened with the switch off: its split, fan-out and judge are shown and
+    /// kept byte for byte, never edited (M2 D7).
+    locked: bool,
     /// `name`.
     name: TextField,
     /// `retry_limit`, as typed.
@@ -117,35 +182,67 @@ pub(crate) struct NodeForm {
     command_queue: CommandQueue,
     /// The candidate agents in priority order: agent and model.
     candidates: Vec<(AgentId, String)>,
-    /// The focused row: [`FIXED_ROWS`] fixed rows, then the candidates or the placeholder.
+    /// `deadline_seconds`, as typed; empty follows the project's.
+    deadline: TextField,
+    /// `palette`.
+    palette: bool,
+    /// `split`.
+    split: Split,
+    /// `fan_out`, as typed; read on a compete step only.
+    fan_out: TextField,
+    /// `judge_agent_id` and `judge_model`; `None` is the project default.
+    judge: Option<Seat>,
+    /// `planner_persona_id`.
+    planner_persona: Option<PersonaId>,
+    /// `planner_agent_id` and `planner_model`.
+    planner: Option<Seat>,
+    /// `integrate_persona_id`.
+    integrate_persona: Option<PersonaId>,
+    /// `integrate_agent_id` and `integrate_model`.
+    integrate: Option<Seat>,
+    /// `max_parts`, as typed; empty for no cap.
+    max_parts: TextField,
+    /// `plan_scope`.
+    plan_scope: Option<PlanScope>,
+    /// The default parts in position order.
+    parts: Vec<PhasePart>,
+    /// The focused row: an index into [`rows`](Self::rows).
     focus: usize,
 }
 
-/// The target, the focus and the candidate count, never what was typed (H-7).
+/// The target, the focus, the counts, the split and the lock, never what was typed (H-7).
 impl core::fmt::Debug for NodeForm {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NodeForm")
             .field("target", &self.target)
             .field("focus", &self.focus)
             .field("candidates", &self.candidates.len())
+            .field("parts", &self.parts.len())
+            .field("split", &self.split)
+            .field("locked", &self.locked)
             .finish_non_exhaustive()
     }
 }
 
 impl NodeForm {
-    /// The form prefilled from `node` (D8), writing back to `target`.
-    pub(crate) fn new(node: &NodeBody, target: NodeTarget) -> Self {
+    /// The form prefilled from `node` (D8), writing back to `target`. `compete` is the compete
+    /// switch (M2 D5): off, the split offers none and divide only, and a compete `node` keeps its
+    /// split, fan-out and judge read-only.
+    pub(crate) fn new(node: &NodeBody, target: NodeTarget, compete: bool) -> Self {
         let phase = &node.phase;
+        let seat = |agent: Option<AgentId>, model: &Option<String>| {
+            agent.map(|agent| (agent, model.clone()))
+        };
+        let mut parts = node.parts.clone();
+        parts.sort_by_key(|part| part.position);
         Self {
             target,
+            compete,
+            locked: !compete && phase.split == Split::Compete,
             name: TextField::with_text(&phase.name),
             retry_limit: TextField::with_text(&phase.retry_limit.to_string()),
             verify_command: TextField::with_text(phase.verify_command.as_deref().unwrap_or("")),
-            token_budget: TextField::with_text(
-                &phase
-                    .token_budget
-                    .map_or_else(String::new, |budget| budget.to_string()),
-            ),
+            token_budget: TextField::with_text(&number_text(phase.token_budget)),
             input_kinds: TextField::with_text(&phase.input_kinds.join(", ")),
             output_kind: TextField::with_text(&phase.output_kind),
             template_name: phase.template_name.clone(),
@@ -160,6 +257,18 @@ impl NodeForm {
                 .iter()
                 .map(|agent| (agent.agent_id, agent.model.clone()))
                 .collect(),
+            deadline: TextField::with_text(&number_text(phase.deadline_seconds)),
+            palette: phase.palette,
+            split: phase.split,
+            fan_out: TextField::with_text(&phase.fan_out.to_string()),
+            judge: seat(phase.judge_agent_id, &phase.judge_model),
+            planner_persona: phase.planner_persona_id,
+            planner: seat(phase.planner_agent_id, &phase.planner_model),
+            integrate_persona: phase.integrate_persona_id,
+            integrate: seat(phase.integrate_agent_id, &phase.integrate_model),
+            max_parts: TextField::with_text(&number_text(phase.max_parts)),
+            plan_scope: phase.plan_scope,
+            parts,
             focus: NAME,
         }
     }
@@ -169,42 +278,84 @@ impl NodeForm {
         self.target
     }
 
-    /// The focused row's kind.
-    pub(crate) fn focused(&self) -> NodeRow {
-        match self.focus {
-            NAME | RETRY | VERIFY | BUDGET | INPUTS | OUTPUT => NodeRow::Text,
-            TEMPLATE | VERSION | PERSONA | GATE | ISOLATION | COMMANDS => NodeRow::Choice,
-            HARD_GATE => NodeRow::Toggle,
-            _ if self.candidates.is_empty() => NodeRow::NoCandidates,
-            at => NodeRow::Candidate(at - FIXED_ROWS),
+    /// Every row drawn, in order, each with whether it takes the focus (B3): M1's fixed rows,
+    /// the candidates or their placeholder, the deadline, the palette and the split. A locked
+    /// compete step's split is drawn read-only.
+    fn shown(&self) -> Vec<(Row, bool)> {
+        let mut rows: Vec<(Row, bool)> = FIXED.iter().map(|row| (*row, true)).collect();
+        if self.candidates.is_empty() {
+            rows.push((Row::NoCandidates, true));
         }
+        rows.extend((0..self.candidates.len()).map(|at| (Row::Candidate(at), true)));
+        rows.extend([
+            (Row::Deadline, true),
+            (Row::Palette, true),
+            (Row::Split, !self.locked),
+        ]);
+        rows
     }
 
-    /// How many rows take the focus: the fixed rows, then the candidates or the placeholder.
-    fn focusable(&self) -> usize {
-        FIXED_ROWS + self.candidates.len().max(1)
+    /// The rows that take the focus, in order; [`focus`](Self::focus) indexes this list.
+    fn rows(&self) -> Vec<Row> {
+        self.shown()
+            .into_iter()
+            .filter_map(|(row, focusable)| focusable.then_some(row))
+            .collect()
+    }
+
+    /// The focused row; the last one should the focus ever sit past the end.
+    fn current(&self) -> Row {
+        let rows = self.rows();
+        rows.get(self.focus)
+            .or_else(|| rows.last())
+            .copied()
+            .unwrap_or(Row::Name)
+    }
+
+    /// The focused row's kind.
+    pub(crate) fn focused(&self) -> NodeRow {
+        match self.current() {
+            Row::Name
+            | Row::Retry
+            | Row::Verify
+            | Row::Budget
+            | Row::Inputs
+            | Row::Output
+            | Row::Deadline => NodeRow::Text,
+            Row::HardGate | Row::Palette => NodeRow::Toggle,
+            Row::Candidate(at) => NodeRow::Candidate(at),
+            Row::NoCandidates => NodeRow::NoCandidates,
+            Row::Template
+            | Row::Version
+            | Row::Persona
+            | Row::Gate
+            | Row::Isolation
+            | Row::Commands
+            | Row::Split => NodeRow::Choice,
+        }
     }
 
     /// Focus on the next row, wrapping. Read-only rows are never focused.
     pub(crate) fn next_field(&mut self) {
-        self.focus = (self.focus + 1) % self.focusable();
+        self.focus = (self.focus + 1) % self.rows().len();
     }
 
     /// Focus on the previous row, wrapping.
     pub(crate) fn prev_field(&mut self) {
-        let rows = self.focusable();
+        let rows = self.rows().len();
         self.focus = (self.focus + rows - 1) % rows;
     }
 
     /// The focused text field, if a text row has the focus.
     fn text_mut(&mut self) -> Option<&mut TextField> {
-        match self.focus {
-            NAME => Some(&mut self.name),
-            RETRY => Some(&mut self.retry_limit),
-            VERIFY => Some(&mut self.verify_command),
-            BUDGET => Some(&mut self.token_budget),
-            INPUTS => Some(&mut self.input_kinds),
-            OUTPUT => Some(&mut self.output_kind),
+        match self.current() {
+            Row::Name => Some(&mut self.name),
+            Row::Retry => Some(&mut self.retry_limit),
+            Row::Verify => Some(&mut self.verify_command),
+            Row::Budget => Some(&mut self.token_budget),
+            Row::Inputs => Some(&mut self.input_kinds),
+            Row::Output => Some(&mut self.output_kind),
+            Row::Deadline => Some(&mut self.deadline),
             _ => None,
         }
     }
@@ -224,49 +375,104 @@ impl NodeForm {
     }
 
     /// The focused choice, toggle or candidate row moves one option, wrapping. A template change
-    /// resets the version to latest. A text row and the placeholder row do nothing.
+    /// resets the version to latest; a split change runs the M2 D7 transitions
+    /// ([`set_split`](Self::set_split)). A text row and the placeholder row do nothing.
     ///
     /// # Errors
     /// [`NO_TEMPLATE`] on the template row with no name to choose; [`AGENTS_NOT_READ`] or
     /// [`NO_AGENTS`] on a candidate row.
     pub(crate) fn cycle(&mut self, forward: bool, lookups: &Lookups) -> Result<(), String> {
-        match self.focused() {
-            NodeRow::Text | NodeRow::NoCandidates => {}
-            NodeRow::Toggle => self.gate_hard = !self.gate_hard,
-            NodeRow::Candidate(at) => {
+        match self.current() {
+            Row::Name
+            | Row::Retry
+            | Row::Verify
+            | Row::Budget
+            | Row::Inputs
+            | Row::Output
+            | Row::Deadline
+            | Row::NoCandidates => {}
+            Row::HardGate => self.gate_hard = !self.gate_hard,
+            Row::Palette => self.palette = !self.palette,
+            Row::Candidate(at) => {
                 let pairs = pairs_of(lookups)?;
                 if let Some(candidate) = self.candidates.get_mut(at) {
                     *candidate = step(&pairs, candidate, forward);
                 }
             }
-            NodeRow::Choice => match self.focus {
-                TEMPLATE => {
-                    let names = self.template_names(lookups);
-                    if names.is_empty() {
-                        return Err(NO_TEMPLATE.to_owned());
-                    }
-                    let name = step(&names, &self.template_name, forward);
-                    if name != self.template_name {
-                        self.template_name = name;
-                        self.template_version = None;
-                    }
+            Row::Template => {
+                let names = self.template_names(lookups);
+                if names.is_empty() {
+                    return Err(NO_TEMPLATE.to_owned());
                 }
-                VERSION => {
-                    self.template_version =
-                        step(&self.versions(lookups), &self.template_version, forward);
+                let name = step(&names, &self.template_name, forward);
+                if name != self.template_name {
+                    self.template_name = name;
+                    self.template_version = None;
                 }
-                PERSONA => self.persona = step(&self.personas(lookups), &self.persona, forward),
-                GATE => self.gate = step(Gate::ALL, &self.gate, forward),
-                ISOLATION => {
-                    let options: Vec<Option<Isolation>> = core::iter::once(None)
-                        .chain(Isolation::ALL.iter().copied().map(Some))
-                        .collect();
-                    self.isolation = step(&options, &self.isolation, forward);
-                }
-                _ => self.command_queue = step(CommandQueue::ALL, &self.command_queue, forward),
-            },
+            }
+            Row::Version => {
+                self.template_version =
+                    step(&self.versions(lookups), &self.template_version, forward);
+            }
+            Row::Persona => {
+                self.persona = step(
+                    &persona_options(lookups, self.persona),
+                    &self.persona,
+                    forward,
+                );
+            }
+            Row::Gate => self.gate = step(Gate::ALL, &self.gate, forward),
+            Row::Isolation => {
+                let options: Vec<Option<Isolation>> = core::iter::once(None)
+                    .chain(Isolation::ALL.iter().copied().map(Some))
+                    .collect();
+                self.isolation = step(&options, &self.isolation, forward);
+            }
+            Row::Commands => {
+                self.command_queue = step(CommandQueue::ALL, &self.command_queue, forward);
+            }
+            Row::Split => {
+                let options: &[Split] = if self.compete {
+                    &[Split::None, Split::Divide, Split::Compete]
+                } else {
+                    &[Split::None, Split::Divide]
+                };
+                let split = step(options, &self.split, forward);
+                self.set_split(split);
+            }
         }
         Ok(())
+    }
+
+    /// M2 D7, moving the split from what it is to `split`: leaving divide clears the divide
+    /// columns, the parts and the plan scope; entering compete sets the fan-out to 2; leaving
+    /// compete sets it to 1 and clears the judge; entering divide clears the judge. Only rows
+    /// after the split change, so the focus stays on it.
+    fn set_split(&mut self, split: Split) {
+        let from = self.split;
+        if from == split {
+            return;
+        }
+        if from == Split::Divide {
+            self.planner_persona = None;
+            self.planner = None;
+            self.integrate_persona = None;
+            self.integrate = None;
+            self.max_parts = TextField::new();
+            self.parts.clear();
+            self.plan_scope = None;
+        }
+        if split == Split::Compete {
+            self.fan_out = TextField::with_text("2");
+        }
+        if from == Split::Compete {
+            self.fan_out = TextField::with_text("1");
+            self.judge = None;
+        }
+        if split == Split::Divide {
+            self.judge = None;
+        }
+        self.split = split;
     }
 
     /// The template names to choose from: the scope's, sorted and unique, with the current name
@@ -304,16 +510,9 @@ impl NodeForm {
             .collect()
     }
 
-    /// The personas to choose from: none, the registry in its order, then the current id when
-    /// the registry lacks it.
-    fn personas(&self, lookups: &Lookups) -> Vec<Option<PersonaId>> {
-        let mut personas: Vec<Option<PersonaId>> = core::iter::once(None)
-            .chain(lookups.personas.iter().map(|persona| Some(persona.id)))
-            .collect();
-        if !personas.contains(&self.persona) {
-            personas.push(self.persona);
-        }
-        personas
+    /// The row index of candidate `at` (or of the placeholder when there is none).
+    const fn candidate_row(at: usize) -> usize {
+        FIXED_ROWS + at
     }
 
     /// Appends the first (agent, model) pair; focus moves to it.
@@ -323,7 +522,7 @@ impl NodeForm {
     pub(crate) fn candidate_add(&mut self, lookups: &Lookups) -> Result<(), String> {
         let first = pairs_of(lookups)?.swap_remove(0);
         self.candidates.push(first);
-        self.focus = FIXED_ROWS + self.candidates.len() - 1;
+        self.focus = Self::candidate_row(self.candidates.len() - 1);
         Ok(())
     }
 
@@ -342,7 +541,7 @@ impl NodeForm {
     pub(crate) fn candidate_remove(&mut self) -> Result<(), String> {
         let at = self.candidate_at()?;
         self.candidates.remove(at);
-        self.focus = FIXED_ROWS + at.min(self.candidates.len().saturating_sub(1));
+        self.focus = Self::candidate_row(at.min(self.candidates.len().saturating_sub(1)));
         Ok(())
     }
 
@@ -360,15 +559,18 @@ impl NodeForm {
         };
         if let Some(to) = to {
             self.candidates.swap(at, to);
-            self.focus = FIXED_ROWS + to;
+            self.focus = Self::candidate_row(to);
         }
         Ok(())
     }
 
     /// Parses and assembles the node. `base` supplies every column the form does not edit (id,
-    /// graph id, position, fan-out, split, palette, plan scope, the divide columns, the parts and
-    /// `updated_at`). `lookups` tells an unchosen template with names to choose
+    /// graph id, position, `updated_at`), and a locked compete step's split, fan-out and judge,
+    /// byte for byte (M2 D7). `lookups` tells an unchosen template with names to choose
     /// ([`TEMPLATE_REQUIRED`]) from one with none ([`NO_TEMPLATE`]).
+    ///
+    /// Off compete the fan-out is 1 and there is no judge; off divide there are no divide
+    /// columns and no parts. The plan scope is written as the form holds it.
     ///
     /// # Errors
     /// The first refusal in row order.
@@ -390,14 +592,22 @@ impl NodeForm {
             _ => return Err(RETRY_IS_A_NUMBER.to_owned()),
         };
         let verify = text_of(&self.verify_command);
-        let budget = text_of(&self.token_budget);
-        let token_budget = if budget.is_empty() {
-            None
-        } else {
-            match budget.parse::<i32>() {
-                Ok(budget) if budget >= 1 => Some(budget),
-                _ => return Err(BUDGET_IS_A_NUMBER.to_owned()),
+        let token_budget = at_least(text_of(&self.token_budget), 1, BUDGET_IS_A_NUMBER)?;
+        let deadline_seconds = at_least(text_of(&self.deadline), 1, DEADLINE_IS_A_NUMBER)?;
+        let compete = self.split == Split::Compete && !self.locked;
+        let fan_out = if compete {
+            match text_of(&self.fan_out).parse::<i32>() {
+                Ok(fan_out) if fan_out >= 2 => fan_out,
+                _ => return Err(FAN_OUT_IS_A_NUMBER.to_owned()),
             }
+        } else {
+            1
+        };
+        let divide = self.split == Split::Divide;
+        let max_parts = if divide {
+            at_least(text_of(&self.max_parts), 1, MAX_PARTS_IS_A_NUMBER)?
+        } else {
+            None
         };
         let output = text_of(&self.output_kind);
         let mut node = base.clone();
@@ -413,19 +623,51 @@ impl NodeForm {
         phase.command_queue = self.command_queue;
         phase.verify_command = (!verify.is_empty()).then(|| verify.to_owned());
         phase.token_budget = token_budget;
-        phase.input_kinds = input_kinds(text_of(&self.input_kinds));
+        phase.input_kinds = comma_list(text_of(&self.input_kinds));
         phase.output_kind = if output.is_empty() { name } else { output }.to_owned();
+        phase.deadline_seconds = deadline_seconds;
+        phase.palette = self.palette;
+        if !self.locked {
+            let judge = self.judge.clone().filter(|_| compete);
+            phase.split = self.split;
+            phase.fan_out = fan_out;
+            phase.judge_agent_id = judge.as_ref().map(|(agent, _)| *agent);
+            phase.judge_model = judge.and_then(|(_, model)| model);
+        }
+        let planner = self.planner.clone().filter(|_| divide);
+        let integrate = self.integrate.clone().filter(|_| divide);
+        phase.planner_persona_id = self.planner_persona.filter(|_| divide);
+        phase.planner_agent_id = planner.as_ref().map(|(agent, _)| *agent);
+        phase.planner_model = planner.and_then(|(_, model)| model);
+        phase.integrate_persona_id = self.integrate_persona.filter(|_| divide);
+        phase.integrate_agent_id = integrate.as_ref().map(|(agent, _)| *agent);
+        phase.integrate_model = integrate.and_then(|(_, model)| model);
+        phase.max_parts = max_parts;
+        phase.plan_scope = self.plan_scope;
         node.agents = self
             .candidates
             .iter()
             .enumerate()
             .map(|(at, (agent_id, model))| PhaseAgent {
                 phase_id: base.phase.id,
-                position: i32::try_from(at).unwrap_or(i32::MAX),
+                position: position(at),
                 agent_id: *agent_id,
                 model: model.clone(),
             })
             .collect();
+        node.parts = if divide {
+            self.parts
+                .iter()
+                .enumerate()
+                .map(|(at, part)| PhasePart {
+                    phase_id: base.phase.id,
+                    position: position(at),
+                    ..part.clone()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(node)
     }
 
@@ -443,122 +685,235 @@ impl NodeForm {
         }
     }
 
-    /// The form's rows `width` cells wide, the focused one being edited, then the read-only rows
-    /// from `base`. `add` is the label of the key that adds a candidate, for the placeholder row.
+    /// The form's rows `width` cells wide, the focused one being edited; read-only rows dim.
+    /// `base` is the node the form opened on: a locked compete step's split rows show its values,
+    /// the ones [`build`](Self::build) keeps. `keys` names the keys the placeholder rows cite.
     pub(crate) fn lines(
         &self,
         base: &NodeBody,
         lookups: &Lookups,
-        add: Option<&str>,
+        keys: FormKeys<'_>,
         width: u16,
         accent: Style,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
-        let template = if self.template_name.is_empty() {
-            "none".to_owned()
-        } else {
-            self.template_name.clone()
-        };
-        let version = self
-            .template_version
-            .map_or_else(|| "latest".to_owned(), |version| format!("v{version}"));
-        let persona = persona_word(self.persona, lookups);
-        let isolation = self.isolation.map_or("project default", label::isolation);
-        let candidates: Vec<(String, String)> = self
-            .candidates
+        let shown = self.shown();
+        let views: Vec<View<'_>> = shown
             .iter()
-            .enumerate()
-            .map(|(at, (agent, model))| {
-                (
-                    format!("agent {}", at + 1),
-                    pair_word(*agent, model, lookups),
-                )
-            })
+            .map(|(row, focusable)| self.view(*row, *focusable, base, lookups, keys))
             .collect();
-        let template_help = if lookups.templates.is_none() {
-            "templates not read yet; the current name is kept"
-        } else {
-            "the prompt template this step runs"
-        };
-        let mut form = Form::new()
-            .editing(true)
-            .field(Field::new("name", Value::Text(&self.name)))
-            .field(Field::new("template", Value::Choice(&template)).help(template_help))
-            .field(
-                Field::new("version", Value::Choice(&version))
-                    .help("latest follows every new version"),
-            )
-            .field(Field::new("persona", Value::Choice(&persona)))
-            .field(Field::new("gate", Value::Choice(label::gate(self.gate))))
-            .field(Field::new("hard gate", Value::Toggle(self.gate_hard)))
-            .field(Field::new("retry limit", Value::Text(&self.retry_limit)))
-            .field(Field::new("isolation", Value::Choice(isolation)))
-            .field(Field::new(
-                "commands",
-                Value::Choice(label::command_queue(self.command_queue)),
-            ))
-            .field(Field::new("verify", Value::Text(&self.verify_command)).help("empty for none"))
-            .field(
-                Field::new("token budget", Value::Text(&self.token_budget))
-                    .help("empty for the project's budget"),
-            )
-            .field(
-                Field::new("inputs", Value::Text(&self.input_kinds))
-                    .help("document kinds, comma separated"),
-            )
-            .field(Field::new("output", Value::Text(&self.output_kind)).help("empty for the name"));
-        if candidates.is_empty() {
-            form = form.field(Field::new(
-                "agents",
-                Value::ReadOnly(no_candidates(add).into()),
-            ));
+        let mut form = Form::new().editing(true);
+        for view in &views {
+            form = form.field(view.field(theme));
         }
-        for (label, value) in &candidates {
-            form = form.field(
-                Field::new(label, Value::Choice(value))
-                    .help("agent and model, tried in this order"),
-            );
+        let current = self.current();
+        let focus = shown
+            .iter()
+            .position(|(row, _)| *row == current)
+            .unwrap_or(0);
+        form.focus(focus).lines(width, accent, theme)
+    }
+
+    /// How `row` is drawn; `focusable` is `false` for a read-only row.
+    fn view(
+        &self,
+        row: Row,
+        focusable: bool,
+        _base: &NodeBody,
+        lookups: &Lookups,
+        keys: FormKeys<'_>,
+    ) -> View<'_> {
+        match row {
+            Row::Name => View::text("name", &self.name),
+            Row::Template => {
+                let template = if self.template_name.is_empty() {
+                    "none".to_owned()
+                } else {
+                    self.template_name.clone()
+                };
+                View::choice("template", template).help(if lookups.templates.is_none() {
+                    "templates not read yet; the current name is kept"
+                } else {
+                    "the prompt template this step runs"
+                })
+            }
+            Row::Version => View::choice(
+                "version",
+                self.template_version
+                    .map_or_else(|| "latest".to_owned(), |version| format!("v{version}")),
+            )
+            .help("latest follows every new version"),
+            Row::Persona => View::choice("persona", persona_word(self.persona, lookups)),
+            Row::Gate => View::choice("gate", label::gate(self.gate)),
+            Row::HardGate => View::toggle("hard gate", self.gate_hard),
+            Row::Retry => View::text("retry limit", &self.retry_limit),
+            Row::Isolation => View::choice(
+                "isolation",
+                self.isolation.map_or("project default", label::isolation),
+            ),
+            Row::Commands => View::choice("commands", label::command_queue(self.command_queue)),
+            Row::Verify => View::text("verify", &self.verify_command).help("empty for none"),
+            Row::Budget => View::text("token budget", &self.token_budget)
+                .help("empty for the project's budget"),
+            Row::Inputs => {
+                View::text("inputs", &self.input_kinds).help("document kinds, comma separated")
+            }
+            Row::Output => View::text("output", &self.output_kind).help("empty for the name"),
+            Row::Candidate(at) => {
+                let (agent, model) = self.candidates.get(at).cloned().unwrap_or_default();
+                View::choice(
+                    format!("agent {}", at + 1),
+                    pair_word(agent, &model, lookups),
+                )
+                .help("agent and model, tried in this order")
+            }
+            Row::NoCandidates => View::read_only("agents", no_candidates(keys.add)),
+            Row::Deadline => View::text("deadline", &self.deadline)
+                .help("seconds; empty for the project's deadline"),
+            Row::Palette => {
+                View::toggle("palette", self.palette).help("a planner places it; it has no links")
+            }
+            Row::Split if focusable => {
+                View::choice("split", split_word(self.split)).help(if self.compete {
+                    SPLIT_HELP_ON
+                } else {
+                    SPLIT_HELP_OFF
+                })
+            }
+            Row::Split => View::read_only("split", COMPETE_LOCKED).dim(),
         }
-        let phase = &base.phase;
-        let split = match phase.split {
-            Split::None => "none".to_owned(),
-            Split::Compete => "compete".to_owned(),
-            Split::Divide => format!("divide \u{b7} {DIVIDE_NOTE}"),
-        };
-        let read_only =
-            |label, text: String| Field::new(label, Value::ReadOnly(text.into())).style(theme.dim);
-        form = form
-            .field(read_only("split", split))
-            .field(read_only("fan-out", phase.fan_out.to_string()))
-            .field(read_only(
-                "palette",
-                if phase.palette { "yes" } else { "no" }.to_owned(),
-            ))
-            .field(read_only(
-                "plan scope",
-                phase.plan_scope.map_or("none", plan_scope).to_owned(),
-            ));
-        if phase.split == Split::Divide {
-            form = form.field(read_only("divide", divide_words(base, lookups)));
-        }
-        form.field(read_only(
-            "parts",
-            label::plural(base.parts.len(), "part", "parts"),
-        ))
-        .field(read_only("deadline", "edited in M2".to_owned()))
-        .focus(self.focus)
-        .lines(width, accent, theme)
     }
 }
 
+/// One drawn row of the node form: label, value, help and whether it is read-only (dim).
+#[derive(Debug)]
+struct View<'f> {
+    /// The label column's words.
+    label: Cow<'static, str>,
+    /// The value column.
+    value: Shown<'f>,
+    /// Shown under the row while it has the focus.
+    help: Option<Cow<'static, str>>,
+    /// A read-only row: `theme.dim`.
+    dim: bool,
+}
+
+/// A [`View`]'s value, owned where the form computes it.
+#[derive(Debug)]
+enum Shown<'f> {
+    /// A text field of the form.
+    Text(&'f TextField),
+    /// `● on` / `○ off`.
+    Toggle(bool),
+    /// `‹ word ›`.
+    Choice(String),
+    /// Plain words.
+    ReadOnly(String),
+}
+
+impl<'f> View<'f> {
+    /// A row with no help, not dim.
+    fn new(label: impl Into<Cow<'static, str>>, value: Shown<'f>) -> Self {
+        Self {
+            label: label.into(),
+            value,
+            help: None,
+            dim: false,
+        }
+    }
+
+    /// A text row.
+    fn text(label: &'static str, field: &'f TextField) -> Self {
+        Self::new(label, Shown::Text(field))
+    }
+
+    /// A toggle row.
+    fn toggle(label: &'static str, on: bool) -> Self {
+        Self::new(label, Shown::Toggle(on))
+    }
+
+    /// A choice row showing `word`.
+    fn choice(label: impl Into<Cow<'static, str>>, word: impl Into<String>) -> Self {
+        Self::new(label, Shown::Choice(word.into()))
+    }
+
+    /// A row of plain words.
+    fn read_only(label: impl Into<Cow<'static, str>>, words: impl Into<String>) -> Self {
+        Self::new(label, Shown::ReadOnly(words.into()))
+    }
+
+    /// The help shown under the row while it has the focus.
+    fn help(mut self, help: impl Into<Cow<'static, str>>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    /// Drawn `theme.dim`: a read-only row.
+    const fn dim(mut self) -> Self {
+        self.dim = true;
+        self
+    }
+
+    /// The row as a kit form field.
+    fn field(&self, theme: &Theme) -> Field<'_> {
+        let value = match &self.value {
+            Shown::Text(field) => Value::Text(field),
+            Shown::Toggle(on) => Value::Toggle(*on),
+            Shown::Choice(word) => Value::Choice(word),
+            Shown::ReadOnly(words) => Value::ReadOnly(Cow::Borrowed(words)),
+        };
+        let field = Field::new(&self.label, value);
+        let field = match &self.help {
+            Some(help) => field.help(help.as_ref()),
+            None => field,
+        };
+        if self.dim {
+            field.style(theme.dim)
+        } else {
+            field
+        }
+    }
+}
+
+/// A split in words.
+const fn split_word(split: Split) -> &'static str {
+    match split {
+        Split::None => "none",
+        Split::Divide => "divide",
+        Split::Compete => "compete",
+    }
+}
+
+/// An optional whole number as a text row holds it: empty for `None`.
+fn number_text(number: Option<i32>) -> String {
+    number.map_or_else(String::new, |number| number.to_string())
+}
+
+/// `text` as an optional whole number of at least `min`: empty is `None`; anything else that is
+/// not such a number is `refusal`.
+fn at_least(text: &str, min: i32, refusal: &str) -> Result<Option<i32>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<i32>() {
+        Ok(number) if number >= min => Ok(Some(number)),
+        _ => Err(refusal.to_owned()),
+    }
+}
+
+/// A list index as a stored `position`.
+fn position(at: usize) -> i32 {
+    i32::try_from(at).unwrap_or(i32::MAX)
+}
+
 /// What a text field holds, trimmed.
-fn text_of(field: &TextField) -> &str {
+pub(super) fn text_of(field: &TextField) -> &str {
     field.text().unwrap_or_default().trim()
 }
 
-/// `input_kinds` as `kinds.rs` reads it: split on `,`, each part trimmed, empty parts dropped,
-/// order kept, no de-duplication.
-fn input_kinds(text: &str) -> Vec<String> {
+/// A comma-separated row as `kinds.rs` reads `input_kinds`: split on `,`, each part trimmed,
+/// empty parts dropped, order kept, no de-duplication.
+pub(super) fn comma_list(text: &str) -> Vec<String> {
     text.split(',')
         .map(str::trim)
         .filter(|part| !part.is_empty())
@@ -568,7 +923,7 @@ fn input_kinds(text: &str) -> Vec<String> {
 
 /// One step from `current` through `options`, wrapping; from a value the options lack, forward
 /// goes to the first and back to the last.
-fn step<T: Clone + PartialEq>(options: &[T], current: &T, forward: bool) -> T {
+pub(super) fn step<T: Clone + PartialEq>(options: &[T], current: &T, forward: bool) -> T {
     let len = options.len();
     let next = match options.iter().position(|option| option == current) {
         Some(at) if forward => (at + 1) % len,
@@ -626,7 +981,7 @@ fn agent_word(agent: AgentId, lookups: &Lookups) -> String {
 }
 
 /// A candidate: `claude · opus`, or the agent alone when the model is empty.
-fn pair_word(agent: AgentId, model: &str, lookups: &Lookups) -> String {
+pub(super) fn pair_word(agent: AgentId, model: &str, lookups: &Lookups) -> String {
     let agent = agent_word(agent, lookups);
     if model.is_empty() {
         agent
@@ -636,7 +991,7 @@ fn pair_word(agent: AgentId, model: &str, lookups: &Lookups) -> String {
 }
 
 /// A persona by name, its id when the registry lacks it, `none` for none.
-fn persona_word(persona: Option<PersonaId>, lookups: &Lookups) -> String {
+pub(super) fn persona_word(persona: Option<PersonaId>, lookups: &Lookups) -> String {
     persona.map_or_else(
         || "none".to_owned(),
         |id| {
@@ -649,43 +1004,19 @@ fn persona_word(persona: Option<PersonaId>, lookups: &Lookups) -> String {
     )
 }
 
-/// What a planner node may plan, in words.
-const fn plan_scope(scope: PlanScope) -> &'static str {
-    match scope {
-        PlanScope::Parts => "its parts",
-        PlanScope::Successors => "its successors",
-        PlanScope::Graph => "the whole graph",
+/// The personas to choose from: none, the registry in its order, then `current` when the
+/// registry lacks it.
+pub(super) fn persona_options(
+    lookups: &Lookups,
+    current: Option<PersonaId>,
+) -> Vec<Option<PersonaId>> {
+    let mut personas: Vec<Option<PersonaId>> = core::iter::once(None)
+        .chain(lookups.personas.iter().map(|persona| Some(persona.id)))
+        .collect();
+    if !personas.contains(&current) {
+        personas.push(current);
     }
-}
-
-/// A `divide` node's planner, integrate and part cap: `planner architect, claude · opus ·
-/// integrate reviewer, agy · at most 4 parts`.
-fn divide_words(node: &NodeBody, lookups: &Lookups) -> String {
-    let phase = &node.phase;
-    let who = |persona: Option<PersonaId>, agent: Option<AgentId>, model: &Option<String>| {
-        let agent = agent.map_or_else(
-            || "no agent".to_owned(),
-            |agent| pair_word(agent, model.as_deref().unwrap_or(""), lookups),
-        );
-        format!("{}, {agent}", persona_word(persona, lookups))
-    };
-    let parts = phase.max_parts.map_or_else(
-        || "no part cap".to_owned(),
-        |max| format!("at most {max} parts"),
-    );
-    format!(
-        "planner {} \u{b7} integrate {} \u{b7} {parts}",
-        who(
-            phase.planner_persona_id,
-            phase.planner_agent_id,
-            &phase.planner_model
-        ),
-        who(
-            phase.integrate_persona_id,
-            phase.integrate_agent_id,
-            &phase.integrate_model
-        ),
-    )
+    personas
 }
 
 #[cfg(test)]
@@ -694,8 +1025,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        GraphScope, PhasePart, ProjectId, PromptTemplate, PromptTemplateId, StepGraph, StepGraphId,
-        UserId,
+        GraphScope, ProjectId, PromptTemplate, PromptTemplateId, StepGraph, StepGraphId, UserId,
     };
     use htui_core::seed::{KINDS, phase_row};
     use ratatui::style::Color;
@@ -703,12 +1033,29 @@ mod tests {
     use super::*;
     use crate::catalogue::PersonaSummary;
 
+    // M1's fixed rows by index (B3): unchanged, so M1's drivers reach the same rows.
+    const TEMPLATE: usize = 1;
+    const VERSION: usize = 2;
+    const PERSONA: usize = 3;
+    const GATE: usize = 4;
+    const HARD_GATE: usize = 5;
+    const RETRY: usize = 6;
+    const ISOLATION: usize = 7;
+    const COMMANDS: usize = 8;
+    const VERIFY: usize = 9;
+    const BUDGET: usize = 10;
+    const INPUTS: usize = 11;
+    const OUTPUT: usize = 12;
+
     fn accent() -> Style {
         Style::new().fg(Color::Magenta)
     }
 
-    /// The candidate-add key's label as the compiled keys write it.
-    const ADD: Option<&str> = Some("Alt+n");
+    /// The candidate-add and part-open keys' labels as the compiled keys write them.
+    const KEYS: FormKeys<'static> = FormKeys {
+        add: Some("Alt+n"),
+        open: Some("Alt+e"),
+    };
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_788_393_600, 0).expect("a valid instant")
@@ -822,17 +1169,76 @@ mod tests {
         node
     }
 
+    fn part(node: &NodeBody, position: i32, key: &str, title: &str) -> PhasePart {
+        PhasePart {
+            phase_id: node.phase.id,
+            position,
+            key: key.to_owned(),
+            title: title.to_owned(),
+            brief: String::new(),
+            owned_paths: Vec::new(),
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        }
+    }
+
+    /// `research_bound` as a store-valid divide step: planner `architect` on `claude · opus`,
+    /// integrate `reviewer` on `agy` (no model), at most 4 parts, plan scope parts, the parts
+    /// `ui · UI` and `store · Store`, a 600 s deadline.
+    fn research_divide() -> NodeBody {
+        let mut node = research_bound();
+        let phase = &mut node.phase;
+        phase.split = Split::Divide;
+        phase.deadline_seconds = Some(600);
+        phase.plan_scope = Some(PlanScope::Parts);
+        phase.planner_persona_id = Some(ids::PERSONA_ARCHITECT);
+        phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
+        phase.planner_model = Some("opus".to_owned());
+        phase.integrate_persona_id = Some(ids::PERSONA_REVIEWER);
+        phase.integrate_agent_id = Some(ids::AGENT_AGY);
+        phase.integrate_model = None;
+        phase.max_parts = Some(4);
+        node.parts = vec![part(&node, 0, "ui", "UI"), part(&node, 1, "store", "Store")];
+        node
+    }
+
+    /// `research_bound` as a compete step: fan-out 3, judged by `judge`.
+    fn research_compete(judge: (AgentId, &str)) -> NodeBody {
+        let mut node = research_bound();
+        node.phase.split = Split::Compete;
+        node.phase.fan_out = 3;
+        node.phase.judge_agent_id = Some(judge.0);
+        node.phase.judge_model = Some(judge.1.to_owned());
+        node
+    }
+
+    /// The form on `node` with the compete switch `compete`.
+    fn open(node: &NodeBody, compete: bool) -> NodeForm {
+        NodeForm::new(node, NodeTarget::Edit(node.phase.id), compete)
+    }
+
+    /// The form on `node` with the compete switch off.
     fn edit(node: &NodeBody) -> NodeForm {
-        NodeForm::new(node, NodeTarget::Edit(node.phase.id))
+        open(node, false)
     }
 
     fn focus(form: &mut NodeForm, row: usize) {
         form.focus = row;
     }
 
-    /// Replaces what text row `row` holds by typing `text` into it.
-    fn set_text(form: &mut NodeForm, row: usize, text: &str) {
-        focus(form, row);
+    /// Focuses `row`, which must take the focus.
+    fn focus_on(form: &mut NodeForm, row: Row) {
+        form.focus = form
+            .rows()
+            .iter()
+            .position(|each| *each == row)
+            .unwrap_or_else(|| panic!("{row:?} takes the focus"));
+    }
+
+    /// Replaces what the focused text row holds by typing `text` into it.
+    fn retype(form: &mut NodeForm, text: &str) {
         for _ in 0..64 {
             let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
             assert_eq!(form.on_text_key(key), FieldOutcome::Consumed);
@@ -841,6 +1247,18 @@ mod tests {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
             assert_eq!(form.on_text_key(key), FieldOutcome::Consumed);
         }
+    }
+
+    /// Replaces what text row `row` holds by typing `text` into it.
+    fn set_text(form: &mut NodeForm, row: usize, text: &str) {
+        focus(form, row);
+        retype(form, text);
+    }
+
+    /// Replaces what text row `row` holds by typing `text` into it.
+    fn set_row_text(form: &mut NodeForm, row: Row, text: &str) {
+        focus_on(form, row);
+        retype(form, text);
     }
 
     /// The node `form` builds over `research()`'s columns.
@@ -891,12 +1309,76 @@ mod tests {
         );
         // Untouched, the form writes back exactly what it opened on.
         assert_eq!(form.build(&node, &lookups()), Ok(node));
+
+        // M2: the deadline, the palette, the split and the split's columns prefill too.
+        let mut node = research_divide();
+        node.phase.palette = true;
+        let form = edit(&node);
+        assert_eq!(form.deadline.text(), Some("600"));
+        assert!(form.palette);
+        assert_eq!(form.split, Split::Divide);
+        assert_eq!(form.fan_out.text(), Some("1"));
+        assert_eq!(form.judge, None);
+        assert_eq!(form.planner_persona, Some(ids::PERSONA_ARCHITECT));
+        assert_eq!(
+            form.planner,
+            Some((ids::AGENT_CLAUDE, Some("opus".to_owned())))
+        );
+        assert_eq!(form.integrate_persona, Some(ids::PERSONA_REVIEWER));
+        assert_eq!(form.integrate, Some((ids::AGENT_AGY, None)));
+        assert_eq!(form.max_parts.text(), Some("4"));
+        assert_eq!(form.plan_scope, Some(PlanScope::Parts));
+        assert_eq!(form.parts, node.parts);
+        let compete = research_compete((ids::AGENT_AGY, "gemini"));
+        let form = open(&compete, true);
+        assert_eq!(form.fan_out.text(), Some("3"));
+        assert_eq!(
+            form.judge,
+            Some((ids::AGENT_AGY, Some("gemini".to_owned())))
+        );
+        assert_eq!(form.deadline.text(), Some(""), "no deadline: empty");
+
+        // Untouched, a divide step with parts and a compete step with a judge build back as
+        // they are, the switch on or off.
+        for node in [research_divide(), compete] {
+            for switch in [false, true] {
+                assert_eq!(
+                    open(&node, switch).build(&node, &lookups()),
+                    Ok(node.clone()),
+                    "{:?}, switch {switch}",
+                    node.phase.split
+                );
+            }
+        }
     }
 
     #[test]
-    fn build_writes_every_field_back_and_keeps_the_m2_columns_of_the_base() {
+    fn the_parts_prefill_in_position_order() {
+        let mut node = research_divide();
+        node.parts.reverse();
+        let form = edit(&node);
+        let keys: Vec<&str> = form.parts.iter().map(|part| part.key.as_str()).collect();
+        assert_eq!(keys, ["ui", "store"]);
+    }
+
+    #[test]
+    fn build_writes_every_m1_field_and_keeps_the_m2_fields_it_opened_with() {
         let lookups = lookups();
-        let mut form = edit(&research());
+        let mut base = research();
+        base.phase.position = 4;
+        base.phase.split = Split::Divide;
+        base.phase.plan_scope = Some(PlanScope::Parts);
+        base.phase.planner_persona_id = Some(ids::PERSONA_ARCHITECT);
+        base.phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
+        base.phase.planner_model = Some("opus".to_owned());
+        base.phase.integrate_persona_id = Some(ids::PERSONA_REVIEWER);
+        base.phase.integrate_agent_id = Some(ids::AGENT_AGY);
+        base.phase.integrate_model = Some("gemini".to_owned());
+        base.phase.max_parts = Some(3);
+        base.phase.deadline_seconds = Some(600);
+        base.parts = vec![part(&base, 0, "ui", "UI")];
+
+        let mut form = edit(&base);
         set_text(&mut form, NAME, "  dig  ");
         cycle_at(&mut form, TEMPLATE, &lookups); // research → verdict
         cycle_at(&mut form, VERSION, &lookups); // latest → v1
@@ -911,21 +1393,6 @@ mod tests {
         set_text(&mut form, INPUTS, "plan");
         set_text(&mut form, OUTPUT, "dig");
         form.candidate_add(&lookups).expect("agents read");
-
-        let mut base = research();
-        base.phase.position = 4;
-        base.phase.fan_out = 2;
-        base.phase.split = Split::Divide;
-        base.phase.palette = true;
-        base.phase.plan_scope = Some(PlanScope::Parts);
-        base.phase.planner_persona_id = Some(ids::PERSONA_ARCHITECT);
-        base.phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
-        base.phase.planner_model = Some("opus".to_owned());
-        base.phase.integrate_persona_id = Some(ids::PERSONA_REVIEWER);
-        base.phase.integrate_agent_id = Some(ids::AGENT_AGY);
-        base.phase.integrate_model = Some("gemini".to_owned());
-        base.phase.max_parts = Some(3);
-        base.parts = vec![part(&base, 0, "ui")];
         let node = form.build(&base, &lookups).expect("a valid form");
 
         let mut want = base.clone();
@@ -944,21 +1411,6 @@ mod tests {
         want.phase.output_kind = "dig".to_owned();
         want.agents = vec![candidate(&base, 0, ids::AGENT_CLAUDE, "opus")];
         assert_eq!(node, want);
-    }
-
-    fn part(node: &NodeBody, position: i32, key: &str) -> PhasePart {
-        PhasePart {
-            phase_id: node.phase.id,
-            position,
-            key: key.to_owned(),
-            title: key.to_owned(),
-            brief: String::new(),
-            owned_paths: Vec::new(),
-            acceptance: None,
-            agent_id: None,
-            model: None,
-            persona_id: None,
-        }
     }
 
     #[test]
@@ -1075,7 +1527,7 @@ mod tests {
         let mut form = edit(&node);
         focus(&mut form, TEMPLATE);
         assert!(
-            text(&form.lines(&node, &lookups, ADD, 56, accent(), &Theme::default()))
+            text(&form.lines(&node, &lookups, KEYS, 56, accent(), &Theme::default()))
                 .contains("legacy")
         );
         form.cycle(false, &lookups).expect("names to choose");
@@ -1157,7 +1609,7 @@ mod tests {
         let mut node = research();
         node.phase.persona_id = Some(unknown);
         let mut form = edit(&node);
-        let shown = text(&form.lines(&node, &lookups, ADD, 80, accent(), &Theme::default()));
+        let shown = text(&form.lines(&node, &lookups, KEYS, 80, accent(), &Theme::default()));
         assert!(shown.contains(&unknown.to_string()), "{shown}");
         focus(&mut form, PERSONA);
         form.cycle(true, &lookups).expect("a choice");
@@ -1336,7 +1788,7 @@ mod tests {
         use NodeRow::{Candidate, Choice, Text, Toggle};
         let mut form = edit(&research_bound());
         let mut seen = vec![form.focused()];
-        for _ in 0..FIXED_ROWS + 2 {
+        for _ in 0..FIXED_ROWS + 5 {
             form.next_field();
             seen.push(form.focused());
         }
@@ -1359,17 +1811,202 @@ mod tests {
                 Candidate(0),
                 Candidate(1),
                 Text,
+                Toggle,
+                Choice,
+                Text,
             ],
-            "after the last candidate comes the name again"
+            "after the candidates come deadline, palette and split, then the name again"
         );
         form.prev_field();
-        assert_eq!(form.focused(), Candidate(1));
+        assert_eq!(form.focused(), Choice);
+        assert_eq!(form.current(), Row::Split);
 
         let mut form = edit(&research());
         form.prev_field();
-        assert_eq!(form.focused(), NodeRow::NoCandidates);
+        assert_eq!(form.current(), Row::Split);
         form.next_field();
         assert_eq!(form.focused(), Text);
+        assert_eq!(form.current(), Row::Name);
+    }
+
+    #[test]
+    fn deadline_empty_is_none_and_below_1_is_refused() {
+        for (typed, want) in [
+            ("", Ok(None)),
+            ("  ", Ok(None)),
+            ("1", Ok(Some(1))),
+            ("7200", Ok(Some(7200))),
+            ("0", Err(DEADLINE_IS_A_NUMBER.to_owned())),
+            ("-3", Err(DEADLINE_IS_A_NUMBER.to_owned())),
+            ("soon", Err(DEADLINE_IS_A_NUMBER.to_owned())),
+        ] {
+            let mut form = edit(&research());
+            set_row_text(&mut form, Row::Deadline, typed);
+            assert_eq!(form.focused(), NodeRow::Text);
+            assert_eq!(
+                built(&form).map(|node| node.phase.deadline_seconds),
+                want,
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_toggles() {
+        let lookups = lookups();
+        let mut form = edit(&research());
+        focus_on(&mut form, Row::Palette);
+        assert_eq!(form.focused(), NodeRow::Toggle);
+        form.cycle(true, &lookups).expect("a toggle");
+        assert_eq!(built(&form).map(|node| node.phase.palette), Ok(true));
+        form.cycle(false, &lookups).expect("a toggle");
+        assert_eq!(built(&form).map(|node| node.phase.palette), Ok(false));
+    }
+
+    #[test]
+    fn split_offers_compete_only_with_the_switch_on() {
+        let lookups = lookups();
+        for (switch, want, help) in [
+            (
+                false,
+                [Split::Divide, Split::None, Split::Divide],
+                SPLIT_HELP_OFF,
+            ),
+            (
+                true,
+                [Split::Divide, Split::Compete, Split::None],
+                SPLIT_HELP_ON,
+            ),
+        ] {
+            let node = research();
+            let mut form = open(&node, switch);
+            focus_on(&mut form, Row::Split);
+            assert_eq!(form.focused(), NodeRow::Choice);
+            let shown = text(&form.lines(&node, &lookups, KEYS, 120, accent(), &Theme::default()));
+            assert!(shown.contains(help), "switch {switch}: {shown}");
+            let mut seen = Vec::new();
+            for _ in 0..want.len() {
+                form.cycle(true, &lookups).expect("a choice");
+                seen.push(form.split);
+            }
+            assert_eq!(seen, want, "switch {switch}");
+        }
+    }
+
+    #[test]
+    fn leaving_divide_clears_the_divide_columns_parts_and_plan_scope() {
+        let lookups = lookups();
+        let node = research_divide();
+        let mut form = edit(&node);
+        focus_on(&mut form, Row::Split);
+        form.cycle(false, &lookups).expect("a choice"); // divide → none
+        assert_eq!(form.split, Split::None);
+        assert_eq!(form.current(), Row::Split, "the focus stays on the split");
+        assert_eq!(
+            (
+                form.planner_persona,
+                &form.planner,
+                form.integrate_persona,
+                &form.integrate
+            ),
+            (None, &None, None, &None)
+        );
+        assert_eq!(form.max_parts.text(), Some(""));
+        assert_eq!(form.plan_scope, None);
+        assert!(form.parts.is_empty());
+
+        let mut want = node.clone();
+        let phase = &mut want.phase;
+        phase.split = Split::None;
+        phase.plan_scope = None;
+        phase.planner_persona_id = None;
+        phase.planner_agent_id = None;
+        phase.planner_model = None;
+        phase.integrate_persona_id = None;
+        phase.integrate_agent_id = None;
+        phase.integrate_model = None;
+        phase.max_parts = None;
+        want.parts = Vec::new();
+        assert_eq!(form.build(&node, &lookups), Ok(want.clone()));
+
+        // Back to divide: nothing comes back.
+        form.cycle(true, &lookups).expect("a choice");
+        assert_eq!(form.split, Split::Divide);
+        want.phase.split = Split::Divide;
+        assert_eq!(form.build(&node, &lookups), Ok(want));
+    }
+
+    #[test]
+    fn entering_compete_sets_fan_out_2_and_leaving_it_sets_1_and_clears_the_judge() {
+        let lookups = lookups();
+        let node = research();
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Split);
+        form.cycle(false, &lookups).expect("a choice"); // none → compete
+        assert_eq!(form.split, Split::Compete);
+        assert_eq!(form.fan_out.text(), Some("2"));
+        let phase = |form: &NodeForm| {
+            form.build(&node, &lookups).map(|node| {
+                (
+                    node.phase.split,
+                    node.phase.fan_out,
+                    node.phase.judge_agent_id,
+                    node.phase.judge_model,
+                )
+            })
+        };
+        assert_eq!(phase(&form), Ok((Split::Compete, 2, None, None)));
+        form.judge = Some((ids::AGENT_AGY, Some("gemini".to_owned())));
+        assert_eq!(
+            phase(&form),
+            Ok((
+                Split::Compete,
+                2,
+                Some(ids::AGENT_AGY),
+                Some("gemini".to_owned())
+            ))
+        );
+
+        form.cycle(true, &lookups).expect("a choice"); // compete → none
+        assert_eq!(form.split, Split::None);
+        assert_eq!(form.fan_out.text(), Some("1"));
+        assert_eq!(form.judge, None);
+        assert_eq!(phase(&form), Ok((Split::None, 1, None, None)));
+    }
+
+    #[test]
+    fn entering_divide_clears_the_judge() {
+        let lookups = lookups();
+        // A split-none step with a judge: the store ties the judge to no split.
+        let mut node = research();
+        node.phase.judge_agent_id = Some(ids::AGENT_AGY);
+        node.phase.judge_model = Some("gemini".to_owned());
+        let mut form = edit(&node);
+        assert_eq!(
+            form.judge,
+            Some((ids::AGENT_AGY, Some("gemini".to_owned())))
+        );
+        focus_on(&mut form, Row::Split);
+        form.cycle(true, &lookups).expect("a choice"); // none → divide
+        assert_eq!(form.split, Split::Divide);
+        assert_eq!(form.judge, None);
+
+        // From compete, the switch on: the judge goes and the fan-out is 1.
+        let node = research_compete((ids::AGENT_AGY, "gemini"));
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Split);
+        form.cycle(false, &lookups).expect("a choice"); // compete → divide
+        assert_eq!(form.split, Split::Divide);
+        assert_eq!(form.judge, None);
+        assert_eq!(
+            form.build(&node, &lookups).map(|node| (
+                node.phase.split,
+                node.phase.fan_out,
+                node.phase.judge_agent_id,
+                node.phase.judge_model
+            )),
+            Ok((Split::Divide, 1, None, None))
+        );
     }
 
     #[test]
@@ -1377,9 +2014,11 @@ mod tests {
         let mut form = edit(&research());
         set_text(&mut form, NAME, "hunter2");
         set_text(&mut form, VERIFY, "swordfish");
+        set_row_text(&mut form, Row::Deadline, "31337");
         let printed = format!("{form:?}");
         assert!(!printed.contains("hunter2"), "{printed}");
         assert!(!printed.contains("swordfish"), "{printed}");
+        assert!(!printed.contains("31337"), "{printed}");
         assert!(printed.contains("NodeForm"), "{printed}");
     }
 
@@ -1410,11 +2049,11 @@ mod tests {
             after: Some(node.phase.id),
         };
         assert_eq!(
-            NodeForm::new(&node, after).title(&graph),
+            NodeForm::new(&node, after, false).title(&graph),
             "new step after research"
         );
         assert_eq!(
-            NodeForm::new(&node, NodeTarget::New { after: None }).title(&graph),
+            NodeForm::new(&node, NodeTarget::New { after: None }, false).title(&graph),
             "new step"
         );
     }
@@ -1423,7 +2062,7 @@ mod tests {
     fn node_form_edit() {
         let node = research_bound();
         let form = edit(&node);
-        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
+        let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_edit", text(&lines));
     }
 
@@ -1439,27 +2078,17 @@ mod tests {
         let target = NodeTarget::New {
             after: Some(PhaseId::new()),
         };
-        let form = NodeForm::new(&node, target);
-        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
+        let form = NodeForm::new(&node, target, false);
+        let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_new", text(&lines));
     }
 
     #[test]
     fn node_form_divide() {
-        let mut node = research_bound();
-        node.phase.split = Split::Divide;
-        node.phase.plan_scope = Some(PlanScope::Parts);
-        node.phase.planner_persona_id = Some(ids::PERSONA_ARCHITECT);
-        node.phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
-        node.phase.planner_model = Some("opus".to_owned());
-        node.phase.integrate_persona_id = Some(ids::PERSONA_REVIEWER);
-        node.phase.integrate_agent_id = Some(ids::AGENT_AGY);
-        node.phase.integrate_model = None;
-        node.phase.max_parts = Some(4);
-        node.parts = vec![part(&node, 0, "ui"), part(&node, 1, "store")];
+        let node = research_divide();
         let mut form = edit(&node);
         focus(&mut form, OUTPUT);
-        let lines = form.lines(&node, &lookups(), ADD, 56, accent(), &Theme::default());
+        let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_divide", text(&lines));
     }
 }

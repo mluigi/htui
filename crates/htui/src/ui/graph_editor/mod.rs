@@ -427,7 +427,8 @@ impl GraphEditor {
             self.refuse(NO_STEP_SELECTED);
             return;
         };
-        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id));
+        // MOD-141 M2 T8 passes the switch
+        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id), false);
         self.mode = Mode::NodeForm(Box::new(NodeEditing {
             form,
             base: node.clone(),
@@ -698,7 +699,10 @@ impl GraphEditor {
                     editing.form.lines(
                         &editing.base,
                         &self.lookups,
-                        add.as_deref(),
+                        node_form::FormKeys {
+                            add: add.as_deref(),
+                            open: None,
+                        },
                         width,
                         ctx.accent(),
                         theme,
@@ -813,6 +817,7 @@ impl GraphEditor {
                         NodeTarget::New {
                             after: self.selected,
                         },
+                        false,
                     );
                     self.mode = Mode::NodeForm(Box::new(NodeEditing { form, base }));
                     self.notice = None;
@@ -2172,7 +2177,7 @@ mod tests {
             ),
             (
                 Mode::NodeForm(Box::new(NodeEditing {
-                    form: NodeForm::new(&node, NodeTarget::Edit(phase(1))),
+                    form: NodeForm::new(&node, NodeTarget::Edit(phase(1)), false),
                     base: node.clone(),
                 })),
                 views::GRAPH_EDITOR_NODE_FORM,

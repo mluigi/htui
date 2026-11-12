@@ -18,9 +18,6 @@ analysis · project graph · revision 0
              │any agent             │              inputs         research
              ╰───────────●──────────╯              output         verdict
                                                    agents         none (Alt+n adds one)
-                                                   split          none
-                                                   fan-out        1
-                                                   palette        no
-                                                   plan scope     none
-                                                   parts          0 parts
-                                                   deadline       edited in M2
+                                                   deadline
+                                                   palette        ○ off
+                                                   split          ‹ none ›

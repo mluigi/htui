@@ -18,12 +18,6 @@ expression: text(&lines)
                 empty for the name
  agent 1        ‹ claude · sonnet ›
  agent 2        ‹ agy · gemini ›
- split          divide · runs once MOD-139 lands
- fan-out        1
- palette        no
- plan scope     its parts
- divide         planner architect, claude · opus ·
-                integrate reviewer, agy · at most 4
-                parts
- parts          2 parts
- deadline       edited in M2
+ deadline       600
+ palette        ○ off
+ split          ‹ divide ›
