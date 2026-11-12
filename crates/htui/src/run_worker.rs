@@ -4294,19 +4294,12 @@ pub(crate) mod tests {
     /// graceful one in flight is the token drop, now: the run settles `stopped` long before the
     /// 60 s grace and its 5 s slack. No `Done(Cancelled)` row is asserted: the drop path's cleanup
     /// is `abandoned`.
-    /// The stop's info line names the mode applied: `forced` once escalated (plan D3: the line is
-    /// the only record of a stop's mode).
+    /// The escalation itself is pinned by state: the run rests `stopped` inside [`ESCALATED`], with
+    /// the session's one 60 s cancel. The stop's info line names the mode applied: `forced` once
+    /// escalated (plan D3: the line is the only record of a stop's mode).
     #[tokio::test]
     async fn a_forced_poll_escalates_a_graceful_stop() {
-        let logs = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer({
-                let logs = logs.clone();
-                move || logs.clone()
-            })
-            .with_ansi(false)
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        let (logs, _logging) = LogBuffer::capture();
         let fixture = Fixture::new().await;
         let (mut worker, start, run, deaf, _probe) = deaf_walk_stopped_gracefully(&fixture).await;
 
@@ -4333,6 +4326,13 @@ pub(crate) mod tests {
     #[derive(Clone, Default)]
     struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
 
+    /// [`LogBuffer::capture`]'s guard: the thread's default, then the peer dispatcher, drop in
+    /// this order.
+    struct LogCapture {
+        _guard: tracing::subscriber::DefaultGuard,
+        _peer: tracing::Dispatch,
+    }
+
     impl std::io::Write for LogBuffer {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -4348,6 +4348,31 @@ pub(crate) mod tests {
     }
 
     impl LogBuffer {
+        /// A buffer capturing this thread's `INFO` lines until the guard drops, robust to tests on
+        /// other threads. With one dispatcher registered, `tracing-core` computes a new callsite's
+        /// interest against the default of whichever thread hits it first: a parallel test with no
+        /// subscriber caches `never` for a line this case asserts, and the line is lost. A second
+        /// live dispatcher, registered first, makes every interest computation read all of them.
+        fn capture() -> (Self, LogCapture) {
+            let logs = Self::default();
+            let peer = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            (
+                logs,
+                LogCapture {
+                    _guard: guard,
+                    _peer: peer,
+                },
+            )
+        }
+
         fn text(&self) -> String {
             String::from_utf8_lossy(
                 &self
