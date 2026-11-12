@@ -1161,6 +1161,14 @@ additions to `node_form.rs`, a T5 file that §8.2 otherwise opens only for its a
 - **W7 The part form waits for a write.** `open_part` refuses with `history::IN_FLIGHT` while a write is
   in flight, as `open_node_form` does (the reply would close the part form). Main thread, `16d50afe`,
   from the last unrepaired verifier finding. Pin: `no_part_form_opens_while_a_write_is_in_flight`.
+- **W8 Part form, review R1 (amends §5.6).** Owned paths split with
+  `htui_core::model::skill_glob::split_list`, not `comma_list`: a comma inside `{…}` or `[…]`, or
+  escaped, stays in its glob, and the prefill's `, ` join is what it reverses (`47d68e72`). `build`
+  refuses a trimmed key holding `/` or `@` with `PART_KEY_CHARS`, after `PART_KEY_REQUIRED` and before
+  `part_key_taken`: a run reads the key back after the last `/`, and `{step}/api@1` is both `api@1`
+  at revision 0 and `api` at revision 1 (`4f1bbae9`). The store, admission and engine rule is MOD-172.
+  Pins: `owned_paths_keep_brace_globs_classes_and_escaped_commas_whole`,
+  `a_part_key_holds_no_slash_and_no_at`.
 
 ---
 
