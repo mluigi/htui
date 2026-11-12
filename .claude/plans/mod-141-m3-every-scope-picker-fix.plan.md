@@ -222,6 +222,14 @@ gate stays owed on the host.
 | `upsert_workspace_project` can put one project in two workspaces | ✓ | `traits.rs:822` |
 | T1 and T2 touch disjoint files; T3 shares `kinds.rs` with T1, so it runs serially | ✓ | Files-to-Change table |
 | No migration or `.sqlx` change | ✓ | the only new store read is the existing `workspace(id)` |
+| `item_form.rs:1253` is an `ItemFormContext` literal | ✗ (architect) | it is a `context()` helper's return type; nothing changes there |
+| D2: `catalogue`/`item_graph` fill the names | ✗ (architect) | fill in the `ItemForm` and `Diverged` arms via `named()`; `catalogue()` also serves mint/edit |
+| Kinds tests link `PROJECT_HTUI` into Graphics | ✗ (architect) | the Kinds bench scope is Graphics + `PROJECT_VULKAN`; link Vulkan into Platform |
+| Test-created workspace/library graphs are editable as-is | ✗ (architect) | they have no steps; seed them through `replace_graph` |
+
+Amended by the blueprint (`mod-141-m3-every-scope-picker-fix.blueprint.md` §4, which wins on any
+difference): the D4 pass-through list, the `tests/kinds.rs:2119/:2133` pins move to `Graphics`, T1
+validation adds `cargo insta test`, and the `graph_editor/mod.rs` module doc changes.
 
 ## Acceptance
 
