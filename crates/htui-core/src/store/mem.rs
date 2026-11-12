@@ -1051,7 +1051,9 @@ impl MemStore {
     }
 
     /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
-    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order.
+    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order. MOD-125 M2 D8: less the
+    /// queued runs of a stopped workspace (they hold no slot and cannot be claimed until the
+    /// resume).
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
@@ -1060,7 +1062,15 @@ impl MemStore {
             let mut rows: Vec<(RunId, DateTime<Utc>)> = state
                 .runs
                 .values()
-                .filter(|row| row.target_box_id == box_id && row.status == RunStatus::Queued)
+                .filter(|row| {
+                    row.target_box_id == box_id
+                        && row.status == RunStatus::Queued
+                        // MOD-125 M2 D8: a stopped workspace's queued run takes no free slot and
+                        // is not re-claimed every sweep; it reappears at the resume.
+                        && row
+                            .workspace_id
+                            .is_none_or(|ws| !state.workspace_stops.contains_key(&ws))
+                })
                 .map(|row| (row.id, row.queued_at))
                 .collect();
             rows.sort_by_key(|(id, at)| (*at, *id));
@@ -15126,6 +15136,109 @@ mod tests {
                 .expect("the read is answered"),
             expected,
             "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+        );
+    }
+
+    /// MOD-125 M2 D8: `queued_runs_on_box` leaves out the queued runs of a stopped workspace (they
+    /// hold no slot and cannot be claimed until the resume), keeps a run without a workspace, and
+    /// lists the held run again once the workspace resumes. The Postgres half is
+    /// `pg_criteria.rs::queued_runs_on_box_skips_a_stopped_workspaces_runs`.
+    #[tokio::test]
+    async fn queued_runs_on_box_skips_a_stopped_workspaces_runs() {
+        let store = MemStore::demo();
+        let workspace = store
+            .create_workspace(crate::model::NewWorkspace {
+                id: crate::model::WorkspaceId::new(),
+                slug: "held".to_owned(),
+                name: "Held".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the workspace is created")
+            .id;
+        // The fixture already queues a run on this box (of another workspace): it leads.
+        let fixture = store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered");
+        let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let late = early + TimeDelta::seconds(1);
+        let mut queued = Vec::new();
+        for (title, scoped, queued_at) in [
+            ("queued in the workspace", Some(workspace), early),
+            ("queued without a workspace", None, late),
+        ] {
+            let item = store
+                .mint_item(NewItem {
+                    id: ItemId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    kind_id: ids::KIND_HTUI_FEAT,
+                    title: title.to_owned(),
+                    body: String::new(),
+                    required_tags: Vec::new(),
+                    touched_paths: Vec::new(),
+                    priority: 0,
+                    step_graph_id: None,
+                    created_by: ids::USER,
+                    box_id: Some(ids::BOX),
+                })
+                .await
+                .expect("the mint lands")
+                .id;
+            let run = store
+                .create_run(NewRun {
+                    workspace_id: scoped,
+                    queued_at,
+                    ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                })
+                .await
+                .expect("the run is queued")
+                .id;
+            queued.push((run, queued_at));
+        }
+        let [scoped, unscoped] = queued[..] else {
+            panic!("two runs were queued")
+        };
+        let both = [fixture.clone(), vec![scoped, unscoped]].concat();
+        let read = || async {
+            store
+                .queued_runs_on_box(ids::BOX)
+                .await
+                .expect("the read is answered")
+        };
+        assert_eq!(
+            read().await,
+            both,
+            "control: both runs are queued on the box"
+        );
+
+        store
+            .stop_workspace(
+                workspace,
+                crate::model::StopMode::Graceful,
+                ids::USER,
+                Utc::now(),
+            )
+            .await
+            .expect("the stop is recorded");
+        assert_eq!(
+            read().await,
+            [fixture.clone(), vec![unscoped]].concat(),
+            "the stopped workspace's queued run is left out; the unscoped one stays"
+        );
+
+        assert!(
+            store
+                .resume_workspace(workspace)
+                .await
+                .expect("the resume is answered"),
+            "the workspace resumes"
+        );
+        assert_eq!(
+            read().await,
+            both,
+            "the held run is listed again after the resume"
         );
     }
 

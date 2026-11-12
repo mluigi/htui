@@ -28,8 +28,8 @@ use htui_core::model::{
     Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
     RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
     RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
-    StepOutcome, StepRole, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch,
+    StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6311,6 +6311,99 @@ async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
             .expect("the read is answered"),
         expected,
         "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 M2 D8: `queued_runs_on_box` leaves out the queued runs of a stopped workspace, keeps
+/// a run without a workspace, and lists the held run again once the workspace resumes. The
+/// `MemStore` half is `queued_runs_on_box_skips_a_stopped_workspaces_runs` in `store::mem`.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_runs_on_box_skips_a_stopped_workspaces_runs() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let workspace = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "held".to_owned(),
+            name: "Held".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    // The fixture already queues a run on this box (of another workspace): it leads.
+    let fixture = db
+        .store
+        .queued_runs_on_box(ids::BOX)
+        .await
+        .expect("the read is answered");
+    let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let late = early + TimeDelta::seconds(1);
+    let mut queued = Vec::new();
+    for (title, scoped, queued_at) in [
+        ("queued in the workspace", Some(workspace), early),
+        ("queued without a workspace", None, late),
+    ] {
+        let item = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, title))
+            .await
+            .expect("the mint lands")
+            .id;
+        let run = db
+            .store
+            .create_run(NewRun {
+                workspace_id: scoped,
+                queued_at,
+                ..race_run(item)
+            })
+            .await
+            .expect("the run is queued")
+            .id;
+        queued.push((run, queued_at));
+    }
+    let [scoped, unscoped] = queued[..] else {
+        panic!("two runs were queued")
+    };
+    let both = [fixture.clone(), vec![scoped, unscoped]].concat();
+    let read = || async {
+        db.store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered")
+    };
+    assert_eq!(
+        read().await,
+        both,
+        "control: both runs are queued on the box"
+    );
+
+    db.store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, Utc::now())
+        .await
+        .expect("the stop is recorded");
+    assert_eq!(
+        read().await,
+        [fixture.clone(), vec![unscoped]].concat(),
+        "the stopped workspace's queued run is left out; the unscoped one stays"
+    );
+
+    assert!(
+        db.store
+            .resume_workspace(workspace)
+            .await
+            .expect("the resume is answered"),
+        "the workspace resumes"
+    );
+    assert_eq!(
+        read().await,
+        both,
+        "the held run is listed again after the resume"
     );
 
     db.drop_db().await;
