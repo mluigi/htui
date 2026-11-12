@@ -18,9 +18,10 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, EdgeId, Gate,
     GraphBody, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, NodeBody,
     PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps, ProjectId, ProjectSettings,
-    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding, SkillBindingKey,
-    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona, SnapshotPhase,
-    SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
+    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, RuntimeChanges, SkillBinding,
+    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId,
+    StepGraphPhase,
 };
 use htui_core::model::{
     EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
@@ -155,6 +156,25 @@ pub struct Resolved {
     pub snapshot: GraphSnapshot,
     /// `run.repo_scope` (ANA-2 §4.7), from [`crate::overlap::resolve`].
     pub repo_scope: Vec<RepoId>,
+}
+
+/// MOD-141 M2 D4: the run limits [`resolve`] freezes into [`SnapshotSettings`], over the same
+/// `app_setting` keys and code defaults; the graph editor's header shows exactly these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunBounds {
+    /// `app_setting.max_fan_out`, else 4.
+    pub max_fan_out: u32,
+    /// `app_setting.max_agents_per_run`, else 8.
+    pub max_agents_per_run: u32,
+    /// `app_setting.max_parallel_sessions`, else
+    /// [`SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS`].
+    pub max_parallel_sessions: u32,
+    /// `app_setting.max_plan_revisions`, else [`SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS`].
+    pub max_plan_revisions: u32,
+    /// `app_setting.max_child_runs`, else [`SnapshotSettings::DEFAULT_MAX_CHILD_RUNS`].
+    pub max_child_runs: u32,
+    /// `app_setting.runtime_changes`, else `ask`.
+    pub runtime_changes: RuntimeChanges,
 }
 
 /// Why a graph could not be resolved into a snapshot.
@@ -618,25 +638,18 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         });
     }
 
+    let bounds = run_bounds(app);
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
         per_token_cap_run: caps.run_micros,
         per_token_cap_batch: caps.batch_micros,
-        max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
-        max_agents_per_run: app_u32(app, "max_agents_per_run")
-            .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        max_fan_out: bounds.max_fan_out,
+        max_agents_per_run: bounds.max_agents_per_run,
         // MOD-138 D13: the bounds, frozen over their code defaults like the caps above.
-        max_parallel_sessions: app_u32(app, "max_parallel_sessions")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS),
-        max_plan_revisions: app_u32(app, "max_plan_revisions")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS),
-        max_child_runs: app_u32(app, "max_child_runs")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_CHILD_RUNS),
-        runtime_changes: app
-            .get("runtime_changes")
-            .and_then(Value::as_str)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default(),
+        max_parallel_sessions: bounds.max_parallel_sessions,
+        max_plan_revisions: bounds.max_plan_revisions,
+        max_child_runs: bounds.max_child_runs,
+        runtime_changes: bounds.runtime_changes,
     };
     check_fan_out_caps(&phases, &settings)?;
 
@@ -1595,6 +1608,28 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
     app_positive(app, key).and_then(|n| i32::try_from(n).ok())
 }
 
+/// MOD-141 M2 D4: [`RunBounds`] over `app`, each key under [`app_u32`]'s "positive or silent"
+/// rule; `runtime_changes` a known word or `ask`.
+#[must_use]
+pub fn run_bounds(app: &BTreeMap<String, Value>) -> RunBounds {
+    RunBounds {
+        max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
+        max_agents_per_run: app_u32(app, "max_agents_per_run")
+            .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        max_parallel_sessions: app_u32(app, "max_parallel_sessions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS),
+        max_plan_revisions: app_u32(app, "max_plan_revisions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS),
+        max_child_runs: app_u32(app, "max_child_runs")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_CHILD_RUNS),
+        runtime_changes: app
+            .get("runtime_changes")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    }
+}
+
 /// ANA-2 §4.10's one line (`R-ORCH-6`, `R-ORCH-2`): in auto mode a phase whose gate is not hard is
 /// snapshotted `never`, so its steps land `done` with `gate_outcome = skipped`; a hard gate, and
 /// every gate of a manual run, is kept. Applied **only** here, at snapshot time (MOD-12 D10):
@@ -1906,10 +1941,10 @@ mod tests {
     use super::{
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSnapshot,
         GraphSource, Isolation, Item, ItemId, NotRunnable, PhaseAgent, PhaseId, PhasePart,
-        ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunMode,
-        SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
+        ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunBounds,
+        RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
         effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
-        resolve, snapshot_walk_refusal, topology_v2,
+        resolve, run_bounds, snapshot_walk_refusal, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -5372,6 +5407,109 @@ question and not a test fix. Decide the version bump first, then paste the new d
             })
         );
         assert_eq!(pin.topology, snapshot.topology, "the source is not hashed");
+    }
+
+    /// Every key [`run_bounds`] reads, each set to a value no code default holds.
+    /// `max_agents_per_run` stays at or above the four agents `feature` plans, so it resolves.
+    fn every_bound_set() -> BTreeMap<String, Value> {
+        [
+            ("max_fan_out".to_owned(), json!(2)),
+            ("max_agents_per_run".to_owned(), json!(5)),
+            ("max_parallel_sessions".to_owned(), json!(7)),
+            ("max_plan_revisions".to_owned(), json!(1)),
+            ("max_child_runs".to_owned(), json!(3)),
+            ("runtime_changes".to_owned(), json!("off")),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// MOD-141 M2 D4: over no `app_setting` row, every bound is its code default.
+    #[test]
+    fn run_bounds_are_the_code_defaults_over_no_row() {
+        assert_eq!(
+            run_bounds(&BTreeMap::new()),
+            RunBounds {
+                max_fan_out: 4,
+                max_agents_per_run: 8,
+                max_parallel_sessions: 4,
+                max_plan_revisions: 3,
+                max_child_runs: 8,
+                runtime_changes: RuntimeChanges::Ask,
+            }
+        );
+    }
+
+    /// MOD-141 M2 D4: each key answers for itself, and a silent one (zero, negative, a string, a
+    /// bool, `null`, too large for `u32`, an unknown word) falls through to its code default.
+    #[test]
+    fn run_bounds_read_each_key_and_fall_through_on_silence() {
+        assert_eq!(
+            run_bounds(&every_bound_set()),
+            RunBounds {
+                max_fan_out: 2,
+                max_agents_per_run: 5,
+                max_parallel_sessions: 7,
+                max_plan_revisions: 1,
+                max_child_runs: 3,
+                runtime_changes: RuntimeChanges::Off,
+            }
+        );
+
+        let silent: BTreeMap<String, Value> = [
+            ("max_fan_out".to_owned(), json!(0)),
+            ("max_agents_per_run".to_owned(), json!("6")),
+            ("max_parallel_sessions".to_owned(), json!(-1)),
+            ("max_plan_revisions".to_owned(), json!(true)),
+            ("max_child_runs".to_owned(), json!(u64::from(u32::MAX) + 1)),
+            ("runtime_changes".to_owned(), json!("maybe")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            run_bounds(&silent),
+            run_bounds(&BTreeMap::new()),
+            "every silent key reads as its code default"
+        );
+        let null: BTreeMap<String, Value> = [("runtime_changes".to_owned(), Value::Null)]
+            .into_iter()
+            .collect();
+        assert_eq!(run_bounds(&null).runtime_changes, RuntimeChanges::Ask);
+    }
+
+    /// MOD-141 M2 D4: what `resolve` freezes into the snapshot's settings is exactly
+    /// [`run_bounds`] over the same `app_setting` map, so the editor's header cannot disagree.
+    #[tokio::test]
+    async fn resolve_freezes_exactly_run_bounds() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        for app in [BTreeMap::new(), every_bound_set()] {
+            let settings = resolve(
+                &store,
+                &TestSource::claude(&store),
+                &item,
+                RunMode::Manual,
+                &app,
+                None,
+                ids::BOX,
+            )
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot
+            .settings;
+            assert_eq!(
+                RunBounds {
+                    max_fan_out: settings.max_fan_out,
+                    max_agents_per_run: settings.max_agents_per_run,
+                    max_parallel_sessions: settings.max_parallel_sessions,
+                    max_plan_revisions: settings.max_plan_revisions,
+                    max_child_runs: settings.max_child_runs,
+                    runtime_changes: settings.runtime_changes,
+                },
+                run_bounds(&app),
+                "{app:?}"
+            );
+        }
     }
 
     /// MOD-138 D11, MOD-139 M3 D10: a `divide` node is expanded (so the validator checks the
