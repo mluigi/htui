@@ -1193,11 +1193,16 @@ impl GraphEditor {
 
     /// The step form's part form (M2 D9): [`PartOpen::New`] a blank part, [`PartOpen::Focused`]
     /// the focused one; the step form waits under it. What the step form refuses is said and it
-    /// stays open.
+    /// stays open. Refused while a write is in flight, as [`Self::open_node_form`] is: its reply
+    /// would close the part form and drop what was typed.
     fn open_part(&mut self, open: PartOpen) -> bool {
         let Mode::NodeForm(editing) = &self.mode else {
             return false;
         };
+        if self.busy() {
+            self.refuse(history::IN_FLIGHT);
+            return true;
+        }
         match editing.form.open_part(open) {
             Ok(form) => {
                 self.mode = match core::mem::replace(&mut self.mode, Mode::Canvas) {
@@ -2803,6 +2808,28 @@ mod tests {
             ),
             ("ui", "Front", 0)
         );
+    }
+
+    /// M1's rule for forms holds for the part form: while the step form's save is in flight its
+    /// reply would close a part form and drop what was typed, so neither list act opens one.
+    #[tokio::test]
+    async fn no_part_form_opens_while_a_write_is_in_flight() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&["ui"]), Vec::new(), &bench.scope);
+        bench.keys(&mut editor, &["e", "enter"]);
+        let (_, _, sent, _) = bench.write();
+        assert!(editor.busy());
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        for chord in ["alt-e", "alt-n"] {
+            editor.notice = None;
+            bench.key(&mut editor, chord);
+            assert_eq!(notice_text(&editor), Some(history::IN_FLIGHT), "{chord}");
+            assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM, "{chord}");
+        }
+        assert!(bench.requests().is_empty());
+        bench.reply(&mut editor, &applied(stored(sent)));
+        assert!(!editor.busy());
     }
 
     /// M2 D14: the open act edits the focused part (off a part row it says there is none); `Esc`
