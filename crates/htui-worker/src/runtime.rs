@@ -2238,6 +2238,9 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// every ready entry stopped by the spend gate), the batch closes `drained` like an empty one,
 /// unless a run of its own is live; a later `Q` then waits for `P`. A tick with no free slot, a
 /// failed read and an enqueue refusal never close.
+///
+/// MOD-125 M2 D8: an entry of a stopped workspace is skipped, and a batch whose only
+/// admissible-looking entries are such is not drained.
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2355,10 +2358,46 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .iter()
         .map(|entry| (entry.item_id, entry.workspace_id))
         .collect();
+    // MOD-125 M2 D8: one stop read per distinct workspace of the ordered entries. A stopped
+    // workspace's entries stay queued and untouched, and do not count toward the `Stalled` drain:
+    // a stop never closes a batch. (No writer: `Kit::read` below fails as it always has.)
+    let mut stopped: HashSet<WorkspaceId> = HashSet::new();
+    if let Some(writer) = host.writer() {
+        let mut read: HashSet<WorkspaceId> = HashSet::new();
+        for workspace in order
+            .iter()
+            .filter_map(|item| workspace_of.get(item).copied().flatten())
+        {
+            if !read.insert(workspace) {
+                continue;
+            }
+            match htui_core::store::WorkerStore::workspace_stop(&writer, workspace).await {
+                Ok(Some(_)) => {
+                    stopped.insert(workspace);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    shared.queue_read_failed("reading a workspace's stop", &err);
+                    return;
+                }
+            }
+        }
+    }
+    let mut held = 0_usize;
     // `None`: the project read as absent.
     let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
     let mut admissible = Vec::with_capacity(order.len());
     for item in order {
+        if workspace_of
+            .get(&item)
+            .copied()
+            .flatten()
+            .is_some_and(|ws| stopped.contains(&ws))
+        {
+            held += 1;
+            tracing::debug!(batch = %batch.id, %item, "the entry's workspace is stopped; it stays queued");
+            continue;
+        }
         let Some(&project) = project_of.get(&item) else {
             continue;
         };
@@ -2389,6 +2428,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     shared.queue_reads_ok();
     if admissible.is_empty() {
+        // MOD-125 M2 D8: an entry a workspace stop holds keeps the batch open.
+        if held > 0 {
+            return;
+        }
         // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
         // an absent project.
         drain(ctx, &batch, Drain::Stalled, &seen).await;
