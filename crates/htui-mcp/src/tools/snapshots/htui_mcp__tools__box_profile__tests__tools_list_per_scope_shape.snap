@@ -137,9 +137,12 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "blocked_by",
               "origin",
               "relates",
-              "supersedes"
+              "supersedes",
+              "parent",
+              "duplicates",
+              "implements"
             ],
-            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
           }
         },
         "required": [
@@ -274,9 +277,12 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "blocked_by",
               "origin",
               "relates",
-              "supersedes"
+              "supersedes",
+              "parent",
+              "duplicates",
+              "implements"
             ],
-            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
           }
         },
         "required": [
@@ -411,9 +417,12 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "blocked_by",
               "origin",
               "relates",
-              "supersedes"
+              "supersedes",
+              "parent",
+              "duplicates",
+              "implements"
             ],
-            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
           }
         },
         "required": [
