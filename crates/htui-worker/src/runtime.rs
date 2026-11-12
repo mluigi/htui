@@ -3361,9 +3361,12 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// cancel seam — `Cancel { grace }`, graceful = the runtime's cancel grace, forced = zero — and its
 /// token drops at grace + [`STOP_SLACK`]; the walk publishes its own `PREEMPTED` and runs
 /// `abandoned`. Then, under the run's lock (taken directly, not through a walk token, so an
-/// escalation's `preempt` reaches only the walk, blueprint F10), `Engine::settle_stop`. A run
-/// leased here with no live walk goes straight to the settle. Every failure is logged: the stop
-/// row stays, so the next poll retries.
+/// escalation's `preempt` reaches only the walk, blueprint F10), `Engine::settle_stop` — unless a
+/// cancel of the run is pending by then: D4's pending cancel wins, and a cancel requested while
+/// the stop waited out its grace is not in the poll's listing F9 skips on, so the task reads the
+/// same rows (`pending_commands(owner, box)`) and leaves the run to it here. A run leased here
+/// with no live walk goes straight to the settle. Every failure is logged: the stop row stays,
+/// so the next poll retries.
 async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     run: RunId,
@@ -3392,6 +3395,19 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
+    match htui_core::store::WorkerStore::pending_commands(&kit.writer, ctx.shared.owner, kit.box_id)
+        .await
+    {
+        Ok(rows) if rows.iter().any(|row| row.run_id == run) => {
+            tracing::debug!(%run, "a cancel of the run is pending: the stop leaves the run to it");
+            return;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(%run, %err, "a stop could not read the pending cancels; the next poll retries");
+            return;
+        }
+    }
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     match Box::pin(engine.settle_stop(run)).await {
@@ -3665,6 +3681,19 @@ pub mod testing {
                 .iter()
                 .copied()
                 .collect()
+        }
+
+        /// How many tracked tasks working on `run` have not finished (MOD-125 M2: a walk and its
+        /// stop task).
+        #[must_use]
+        pub fn tasks_on(&self, run: RunId) -> usize {
+            self.0
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|task| task.tag.run.get() == Some(&run) && !task.handle.is_finished())
+                .count()
         }
 
         /// Whether every tracked task has finished.

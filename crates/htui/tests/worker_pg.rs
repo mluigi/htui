@@ -1062,6 +1062,12 @@ async fn a_cancel_from_another_box_ends_a_live_worker_walk() {
 const STOP_BOUND: Duration =
     Duration::from_secs(CANCEL_GRACE.as_secs() + STOP_SLACK.as_secs() + COMMAND_POLL.as_secs() + 2);
 
+/// MOD-125 M2: a session that ends its turn on the stop's cancel ([`ParksOnce`]) is settled once
+/// its walk ends, not when the token drops at grace + [`STOP_SLACK`]: within the grace, one poll
+/// and a margin, which a stop waiting out its slack misses in either mode.
+const PROMPT_STOP_BOUND: Duration =
+    Duration::from_secs(CANCEL_GRACE.as_secs() + COMMAND_POLL.as_secs() + 2);
+
 /// MOD-125 M2 D2, D4: a client on another box stops the workspace of a run the worker walks while
 /// its session is parked. The worker's command poll lists the stop and applies it in `mode`: the
 /// parked request answered `cancelled` and recorded once (I-7), the step and the run `stopped`
@@ -1098,6 +1104,11 @@ async fn a_stop_from_another_box_settles(mode: StopMode) {
     assert!(
         took < STOP_BOUND,
         "the {mode} stop settled {took:?} after the request, not within {STOP_BOUND:?}"
+    );
+    assert!(
+        took < PROMPT_STOP_BOUND,
+        "the session ended its turn on the cancel, yet the {mode} stop settled {took:?} after \
+         the request, not within {PROMPT_STOP_BOUND:?}"
     );
 
     let row = client

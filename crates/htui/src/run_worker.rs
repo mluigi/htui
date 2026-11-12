@@ -381,6 +381,9 @@ pub(crate) mod tests {
     struct Park {
         request: PermissionRequestEvent,
         grace: Arc<StdMutex<Option<Duration>>>,
+        /// How long the session's `cancel` waits before it ends the turn (MOD-125 M2: a session
+        /// still inside a stop's grace).
+        lag: Duration,
     }
 
     impl Park {
@@ -404,7 +407,13 @@ pub(crate) mod tests {
                     ],
                 },
                 grace: Arc::default(),
+                lag: Duration::ZERO,
             }
+        }
+
+        /// [`Park::new`] whose `cancel` ends the turn only `lag` after it is called.
+        fn lagging(lag: Duration) -> Self {
+            Self { lag, ..Self::new() }
         }
 
         /// The grace the session's `cancel` received; `None` while it was never cancelled.
@@ -543,6 +552,7 @@ pub(crate) mod tests {
                     Play::Park(park) => Ok(Box::new(Graced {
                         inner: session,
                         grace: park.grace,
+                        lag: park.lag,
                     }) as Box<dyn AgentSession>),
                     Play::Deaf(deaf) => Ok(Box::new(Deafened {
                         inner: session,
@@ -585,6 +595,7 @@ pub(crate) mod tests {
     struct Graced {
         inner: Box<dyn AgentSession>,
         grace: Arc<StdMutex<Option<Duration>>>,
+        lag: Duration,
     }
 
     impl AgentSession for Graced {
@@ -610,7 +621,12 @@ pub(crate) mod tests {
 
         fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
             *self.grace.lock().expect("the cell") = Some(grace);
-            self.inner.cancel(grace)
+            let lag = self.lag;
+            let cancel = self.inner.cancel(grace);
+            Box::pin(async move {
+                tokio::time::sleep(lag).await;
+                cancel.await
+            })
         }
     }
 
@@ -4136,7 +4152,6 @@ pub(crate) mod tests {
             fixture.run(run).await.workspace_id,
             Some(ids::WORKSPACE_PLATFORM)
         );
-        let item = fixture.item(ids::HTUI_ANA_2).await.status;
         stop_platform(&fixture, StopMode::Graceful).await;
 
         rests_at(&fixture, run, RunStatus::Stopped).await;
@@ -4168,9 +4183,31 @@ pub(crate) mod tests {
         );
         assert_eq!(
             fixture.item(ids::HTUI_ANA_2).await.status,
-            item,
-            "the item is untouched"
+            Status::Open,
+            "the item row stays open"
         );
+        assert_eq!(
+            item_state(&fixture, ids::HTUI_ANA_2).await,
+            htui_core::model::ItemState::Stopped,
+            "its item shows it stopped"
+        );
+    }
+
+    /// `item`'s derived state, as the Backlog lists it in `PLATFORM`'s `htui` project.
+    async fn item_state(fixture: &Fixture, item: ItemId) -> htui_core::model::ItemState {
+        let scope = htui_core::model::Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        fixture
+            .store
+            .items(&scope, &htui_core::model::ItemFilter::default())
+            .await
+            .expect("the read answers")
+            .into_iter()
+            .find(|row| row.id == item)
+            .expect("the item is listed")
+            .state()
     }
 
     /// D2: a forced stop interrupts the session with zero grace; the run and step settle
@@ -4204,12 +4241,22 @@ pub(crate) mod tests {
         );
     }
 
+    /// How long an escalated stop may take to settle: one poll and a margin, well under
+    /// [`htui_worker::STOP_SLACK`], so a forced stop that waits out its own slack instead of
+    /// dropping the walk at once misses it.
+    const ESCALATED: Duration = Duration::from_secs(3);
+    const _: () = assert!(ESCALATED.as_secs() < htui_worker::STOP_SLACK.as_secs());
+
     /// The `Deaf` walk of `ANA-2` in `PLATFORM`, started under a 60 s grace and live in its
-    /// session, then stopped gracefully: the worker, the start's seq, the run and the session.
-    async fn deaf_walk_stopped_gracefully(fixture: &Fixture) -> (Worker, u64, RunId, Deaf) {
+    /// session, then stopped gracefully: the worker, the start's seq, the run, the session and a
+    /// probe on the runtime.
+    async fn deaf_walk_stopped_gracefully(
+        fixture: &Fixture,
+    ) -> (Worker, u64, RunId, Deaf, testing::Probe<TuiReplies>) {
         let deaf = Deaf::default();
         fixture.sessions.push(Play::Deaf(deaf.clone()));
         let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(60));
+        let probe = testing::probe(&runtime);
         let mut worker = Worker::spawn(&fixture.store, runtime);
         let start = worker.send(
             Origin::App,
@@ -4240,7 +4287,7 @@ pub(crate) mod tests {
         })
         .await;
         assert_eq!(deaf.graces(), [Duration::from_secs(60)], "a graceful stop");
-        (worker, start, run, deaf)
+        (worker, start, run, deaf, probe)
     }
 
     /// D2: the relay does not re-read its control inside `cancel`, so a forced stop over a
@@ -4250,10 +4297,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_forced_poll_escalates_a_graceful_stop() {
         let fixture = Fixture::new().await;
-        let (mut worker, start, run, deaf) = deaf_walk_stopped_gracefully(&fixture).await;
+        let (mut worker, start, run, deaf, _probe) = deaf_walk_stopped_gracefully(&fixture).await;
 
         stop_platform(&fixture, StopMode::Forced).await;
-        rests_at(&fixture, run, RunStatus::Stopped).await;
+        rests_within(&fixture, run, RunStatus::Stopped, ESCALATED).await;
         assert!(
             matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
         );
@@ -4265,15 +4312,19 @@ pub(crate) mod tests {
         assert_eq!(step_at(&fixture, run, 0).await.status, StepStatus::Stopped);
     }
 
-    /// D4.1: a stop in flight is not applied again: later polls list the same stop, and the
-    /// session still received exactly one cancel. An escalation then ends the walk.
+    /// D4.1: a stop in flight is not applied again: later polls list the same stop, spawn no
+    /// second stop task of the run, and the session still received exactly one cancel. An
+    /// escalation then ends the walk at once.
     #[tokio::test]
     async fn a_second_poll_does_not_restop() {
         let fixture = Fixture::new().await;
-        let (_worker, _start, run, deaf) = deaf_walk_stopped_gracefully(&fixture).await;
+        let (_worker, _start, run, deaf, probe) = deaf_walk_stopped_gracefully(&fixture).await;
+        let tasks = probe.tasks_on(run);
+        assert_eq!(tasks, 2, "the walk and its stop");
 
         tokio::time::sleep(2 * htui_worker::worker::COMMAND_POLL + Duration::from_millis(200))
             .await;
+        assert_eq!(probe.tasks_on(run), tasks, "no second stop task");
         assert_eq!(deaf.graces().len(), 1, "one cancel: {:?}", deaf.graces());
         assert_eq!(
             fixture.run(run).await.status,
@@ -4282,8 +4333,65 @@ pub(crate) mod tests {
         );
 
         stop_platform(&fixture, StopMode::Forced).await;
-        rests_at(&fixture, run, RunStatus::Stopped).await;
+        rests_within(&fixture, run, RunStatus::Stopped, ESCALATED).await;
         assert_eq!(deaf.graces().len(), 1, "{:?}", deaf.graces());
+    }
+
+    /// D4: a cancel of the run requested while its stop is still inside the session's grace wins
+    /// too, whichever task takes the run's lock first. Its B-5 guard is held until the stop task
+    /// has ended, so the stop task meets the pending row under the lock and leaves the run to it.
+    #[tokio::test]
+    async fn a_cancel_requested_during_a_stop_wins() {
+        let fixture = Fixture::new().await;
+        let park = Park::lagging(Duration::from_secs(2));
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(60));
+        let probe = testing::probe(&runtime);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        stop_platform(&fixture, StopMode::Graceful).await;
+        within("the stop's cancel reaching the session", async {
+            while park.grace().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let id = requested(&fixture, run).await;
+        {
+            let _held = probe
+                .hold_applying(id)
+                .expect("nothing applies the row yet");
+            assert!(
+                matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+                "the walk ended"
+            );
+            within("the stop task ending", async {
+                while probe.tasks_on(run) > 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert_eq!(
+                fixture.run(run).await.status,
+                RunStatus::Running,
+                "the stop left the run to the pending cancel"
+            );
+        }
+
+        rests_at(&fixture, run, RunStatus::Cancelled).await;
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Applied)]
+        );
     }
 
     /// D4 (blueprint F9): a pending cancel of a run in a stopped workspace wins: the poll leaves
