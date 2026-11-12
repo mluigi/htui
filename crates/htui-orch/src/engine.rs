@@ -9255,13 +9255,14 @@ where
                     &candidate,
                     &project,
                     &cwd,
+                    &extra_dirs,
                     tools.command_run,
                 ))
                 .await?,
             ),
             None => None,
         };
-        // MOD-11 R1 M2: htui's own advertised tools (but `command_run` and `permission_prompt`)
+        // MOD-11 R1 M2: htui's own advertised tools (but the `ASKING_TOOLS`)
         // are pre-approved after every rule above, so they only replace the default `ask`.
         if let Some(lease) = &lease {
             crate::tools::pre_approve(&mut policy, lease);
@@ -9391,6 +9392,7 @@ where
         candidate: &SnapshotCandidate,
         project: &Project,
         cwd: &Path,
+        extra_dirs: &[PathBuf],
         command_queue: bool,
     ) -> Result<crate::tools::ToolLease, EngineError> {
         // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
@@ -9421,6 +9423,8 @@ where
             // MOD-11 D16: the exposure `drive_once` resolved, after the persona's narrowing.
             command_queue,
             cwd: cwd.to_path_buf(),
+            // MOD-152 D11: the trees `command_run`'s `repo` argument names.
+            extra_dirs: extra_dirs.to_vec(),
             transport,
         };
         let lease = host
@@ -23770,8 +23774,36 @@ mod tests {
                     hostname,
                     command_queue: false,
                     cwd: spec.cwd.clone(),
+                    extra_dirs: Vec::new(),
                     transport: Transport::Acp,
                 }]
+            );
+        }
+
+        /// MOD-152 D11: the scope carries the isolator's `extra_dirs`, the same list the session
+        /// itself is started with, so `command_run`'s `repo` argument names what the agent can read.
+        #[tokio::test(start_paused = true)]
+        async fn a_phase_session_s_scope_carries_the_isolator_s_extra_dirs() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .isolator
+                .script_extra_dirs(vec![std::path::PathBuf::from("/fake/elsewhere/docs")]);
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let elsewhere = std::path::PathBuf::from("/fake/elsewhere/docs");
+            assert_eq!(spec.extra_dirs, vec![elsewhere.clone()]);
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.extra_dirs.clone())
+                    .collect::<Vec<_>>(),
+                [vec![elsewhere]],
             );
         }
 

@@ -1111,6 +1111,7 @@ impl AgentRuntime {
                         hostname: hostname_line(project_settings.as_ref()),
                         command_queue: false,
                         cwd: opening.cwd.clone(),
+                        extra_dirs: Vec::new(),
                         transport: summary.agent.transport,
                     },
                 )?)
@@ -2442,6 +2443,7 @@ impl AgentRuntime {
                     hostname: hostname_line(project_settings.as_ref()),
                     command_queue: false,
                     cwd: cwd.clone(),
+                    extra_dirs: Vec::new(),
                     transport: summary.agent.transport,
                 },
             )?),

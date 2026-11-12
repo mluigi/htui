@@ -51,6 +51,7 @@ fn scope(cwd: &Path, exposed: bool) -> ToolScope {
         hostname: HostnameLine::Omitted,
         command_queue: exposed,
         cwd: cwd.to_path_buf(),
+        extra_dirs: Vec::new(),
         transport: Transport::Acp,
     }
 }

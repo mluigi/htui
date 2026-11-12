@@ -158,6 +158,7 @@ impl Leased {
             hostname: HostnameLine::Omitted,
             command_queue: false,
             cwd: std::env::temp_dir(),
+            extra_dirs: Vec::new(),
             transport: Transport::Acp,
         }
     }
