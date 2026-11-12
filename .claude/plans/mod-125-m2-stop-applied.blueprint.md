@@ -802,7 +802,7 @@ Files: `version = "0.1.0"` → `"0.2.0"` on line 3 of each of the nine members:
 Commit: `MOD-125 M2 T4: every crate 0.2.0, raising the minimum version (D11 a)`.
 
 Validate: `cargo test -p htui-store --all-features --test migrations --test read_only_pg -- --test-threads=1`;
-`cargo test -p htui --all-features --bin htui cli`; `cargo test -p htui --all-features --lib claude_emit`;
+`cargo test -p htui --all-features --lib cli::` (the `--bin` filter ran 0 tests; corrected after T4's verify); `cargo test -p htui --all-features --lib claude_emit`;
 `cargo test -p htui-mcp --all-features`.
 
 ---
