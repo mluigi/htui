@@ -3,12 +3,13 @@
 //! Key-agnostic: the editor maps its acts onto these methods.
 
 use crossterm::event::KeyEvent;
+use htui_core::model::skill_glob::split_list;
 use htui_core::model::{AgentId, PersonaId, PhaseId, PhasePart};
 use ratatui::style::Style;
 use ratatui::text::Line;
 
 use super::Lookups;
-use super::node_form::{Seat, comma_list, pair_word, persona_options, persona_word, step, text_of};
+use super::node_form::{Seat, pair_word, persona_options, persona_word, step, text_of};
 use crate::ui::kit::form::{Field, Form, Value};
 use crate::ui::{FieldOutcome, TextField, Theme};
 
@@ -25,6 +26,9 @@ pub(crate) const PART_PERSONA_NOTE: &str = "per-part personas run from MOD-140 o
 
 /// The agent row's help: admission refuses a part agent the step does not list.
 const AGENT_HELP: &str = "one of the step's own agents (a run refuses any other)";
+
+/// The owned paths row's help: the list splits as the Skills form's globs do.
+const PATHS_HELP: &str = "repo:glob, comma separated; {a,b} and [a,b] stay whole";
 
 /// The rows, in focus order.
 const ROWS: usize = 7;
@@ -64,7 +68,8 @@ pub(crate) struct PartForm {
     title: TextField,
     /// `phase_part.brief`.
     brief: TextField,
-    /// `phase_part.owned_paths`, comma separated.
+    /// `phase_part.owned_paths`, comma separated as [`split_list`] reads them: a comma inside
+    /// `{…}` or `[…]`, or escaped `\,`, is the glob's own.
     owned_paths: TextField,
     /// `phase_part.acceptance`; empty for none.
     acceptance: TextField,
@@ -216,7 +221,7 @@ impl PartForm {
             key: key.to_owned(),
             title: text_of(&self.title).to_owned(),
             brief: text_of(&self.brief).to_owned(),
-            owned_paths: comma_list(text_of(&self.owned_paths)),
+            owned_paths: split_list(text_of(&self.owned_paths)),
             acceptance: (!acceptance.is_empty()).then(|| acceptance.to_owned()),
             agent_id: self.agent.as_ref().map(|(agent, _)| *agent),
             model: self.agent.as_ref().and_then(|(_, model)| model.clone()),
@@ -250,10 +255,7 @@ impl PartForm {
             .field(Field::new("key", Value::Text(&self.key)).help("unique in this step"))
             .field(Field::new("title", Value::Text(&self.title)))
             .field(Field::new("brief", Value::Text(&self.brief)).help("what this part does"))
-            .field(
-                Field::new("owned paths", Value::Text(&self.owned_paths))
-                    .help("repo:glob, comma separated"),
-            )
+            .field(Field::new("owned paths", Value::Text(&self.owned_paths)).help(PATHS_HELP))
             .field(Field::new("acceptance", Value::Text(&self.acceptance)).help("empty for none"))
             .field(Field::new("agent", Value::Choice(&agent)).help(AGENT_HELP))
             .field(Field::new("persona", Value::Choice(&persona)).help(PART_PERSONA_NOTE))
@@ -383,6 +385,36 @@ mod tests {
         let form = PartForm::new(Some(&full), PartTarget::Edit(1), candidates());
         assert_eq!(form.target(), PartTarget::Edit(1));
         assert_eq!(form.build(phase(), &[part("ui")]), Ok(full));
+    }
+
+    /// Review R1 F1: owned paths split as the Skills form splits globs, never inside `{…}` or
+    /// `[…]` and never on an escaped `\,`, so a brace glob or a class stays one entry.
+    #[test]
+    fn owned_paths_keep_brace_globs_classes_and_escaped_commas_whole() {
+        let mut form = blank();
+        set_text(&mut form, KEY, "ui");
+        set_text(&mut form, PATHS, "htui:crates/{api,ui}/**, docs/**");
+        assert_eq!(
+            form.build(phase(), &[]).map(|part| part.owned_paths),
+            Ok(vec![
+                "htui:crates/{api,ui}/**".to_owned(),
+                "docs/**".to_owned()
+            ])
+        );
+        form.focus = PATHS;
+        let shown = text(&form.lines(&lookups(), 120, accent(), &Theme::default()));
+        assert!(shown.contains(PATHS_HELP), "{shown}");
+
+        // Untouched, an Edit form builds back the paths it opened on (the prefill's `, ` join
+        // is what the split reverses).
+        let mut stored = part("api");
+        stored.owned_paths = vec![
+            "htui:crates/{api, ui}/**".to_owned(),
+            "src/[a,b].md".to_owned(),
+            "src/a\\,b.rs".to_owned(),
+        ];
+        let form = PartForm::new(Some(&stored), PartTarget::Edit(0), candidates());
+        assert_eq!(form.build(phase(), &[]), Ok(stored));
     }
 
     #[test]
