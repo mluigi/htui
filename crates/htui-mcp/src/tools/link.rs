@@ -12,6 +12,12 @@
 //! the store's `not found` would print an id outside the reach), as `is no live link this run
 //! proposed`, which stays true when the link was this run's and is already withdrawn.
 //!
+//! MOD-150 (plan D9): `kind` is any [`LinkKind`], `parent`, `duplicates` and `implements`
+//! included, and each goes live at once (pending links are MOD-155's). The store refuses a second
+//! live `parent` or `duplicates`, a `parent` that closes a cycle and one that makes a chain deeper
+//! than eight. Those refusals reach the agent unchanged as `refused: <sentence>` through
+//! `store_error`, which names the item's current parent or canonical.
+//!
 //! [`item_by_key`]: htui_core::store::WorkerStore::item_by_key
 //! [`propose_link`]: htui_core::store::WorkerStore::propose_link
 //! [`withdraw_link`]: htui_core::store::WorkerStore::withdraw_link
@@ -50,7 +56,15 @@ struct LinkArgs {
                        `api`, or `@shop:WS-1` for workspace `shop`'s own item."
     )]
     to: String,
-    /// Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`.
+    // An attribute, not a doc: a doc wrapped at 100 columns reaches the agent with a line break.
+    #[schemars(
+        description = "How this item relates to `to`, read `<this item> <kind> <to>`: \
+                       `blocked_by`: this item cannot start until `to` is finished; `origin`: \
+                       this item was spawned by `to`; `relates`: see also; `supersedes`: this \
+                       item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: \
+                       this item is the same as `to`; `implements`: this item carries out `to`'s \
+                       decision. An item has at most one `parent` and one `duplicates`."
+    )]
     #[schemars(schema_with = "kind_schema")]
     kind: LinkKind,
 }
