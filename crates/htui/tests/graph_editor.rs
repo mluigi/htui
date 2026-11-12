@@ -6,6 +6,9 @@
 //! fan-out. The table-driven cases use a [`SectionBench`] and [`bench_round`], the `tests/kinds.rs`
 //! worker-plus-section pattern without a shell. `MemStore` clones share their state, so every
 //! assertion reads the store the requests were served from.
+//!
+//! MOD-141 milestone 2, T9: the same drivers over the M2 node fields (the deadline, the palette
+//! flag, the split and its rows, the default parts through the part form) and the compete switch.
 #![cfg(feature = "testkit")]
 
 use std::collections::BTreeMap;
@@ -22,13 +25,16 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::predicate::IfPredicate;
 use htui_core::model::{
-    AgentId, CommandQueue, EdgeKind, Gate, GraphBody, Isolation, ItemId, NodeBody, PhaseAgent,
-    PhaseId, RunMode, StepGraphEdge, StepGraphId,
+    AgentId, CommandQueue, EdgeKind, Gate, GraphBody, Isolation, ItemId, NodeBody, PersonaId,
+    PhaseAgent, PhaseId, PhasePart, PlanScope, RunMode, Split, StepGraphEdge, StepGraphId,
 };
+use htui_core::prompt::SettingKey;
 use htui_core::store::{
-    CasOutcome, MemStore, WorkerStore, WriteStore, loop_edge_runs_forward, reserved_phase_name,
+    CasOutcome, MemStore, SettingRung, WorkerStore, WriteStore, loop_edge_runs_forward,
+    reserved_phase_name,
 };
 use htui_store::Backend;
+use serde_json::json;
 
 // -------------------------------------------------------------------------------------------
 // The shell driver
@@ -1194,4 +1200,615 @@ async fn the_editor_keys_are_catalogue_keys() {
         body.edges
     );
     assert_eq!(body.edges.len(), 1, "{:?}", body.edges);
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-141 milestone 2, T9: splits, palette, deadline and the graph header (PRD metrics)
+// -------------------------------------------------------------------------------------------
+
+/// M2's step-form rows come after M1's 13 and the candidates or their placeholder (B3, C15):
+/// the row `offset` names, counted from the name row of a form opened on `seed`.
+fn m2_row(seed: &NodeBody, offset: usize) -> usize {
+    13 + seed.agents.len().max(1) + offset
+}
+
+// [`m2_row`]'s offsets. The three rows every step shows:
+const DEADLINE: usize = 0;
+const PALETTE: usize = 1;
+const SPLIT: usize = 2;
+// A compete step's rows:
+const FAN_OUT: usize = 3;
+const JUDGE: usize = 4;
+// A divide step's rows, its first part (or the parts' placeholder) last:
+const PLANNER: usize = 3;
+const PLANNER_AGENT: usize = 4;
+const INTEGRATE: usize = 5;
+const INTEGRATE_AGENT: usize = 6;
+const MAX_PARTS: usize = 7;
+const PLAN_SCOPE: usize = 8;
+const FIRST_PART: usize = 9;
+
+/// Every chord of `chords`, in order.
+fn play(bench: &SectionBench, section: &mut KindsSection, chords: &[String]) {
+    for chord in chords {
+        bench.key(section, chord);
+    }
+}
+
+/// The seat a form stores for an (agent, model) pair: an empty model is none.
+fn seat(pair: &(AgentId, String)) -> (Option<AgentId>, Option<String>) {
+    (Some(pair.0), (!pair.1.is_empty()).then(|| pair.1.clone()))
+}
+
+/// A default part `key` of `phase` at `position`, nothing else set: what a part form holding
+/// only a key keeps.
+fn bare_part(phase: PhaseId, position: i32, key: &str) -> PhasePart {
+    PhasePart {
+        phase_id: phase,
+        position,
+        key: key.to_owned(),
+        title: String::new(),
+        brief: String::new(),
+        owned_paths: Vec::new(),
+        acceptance: None,
+        agent_id: None,
+        model: None,
+        persona_id: None,
+    }
+}
+
+/// The personas the catalogue hands the editor, in its order.
+async fn persona_ids() -> Vec<PersonaId> {
+    let StoreReply::Catalogue(snapshot) = serve(
+        &Backend::memory(MemStore::demo()),
+        &StoreRequest::Catalogue(SectionBench::new().await.ctx().scope.clone()),
+    )
+    .await
+    else {
+        panic!("the catalogue reads");
+    };
+    snapshot.personas.iter().map(|persona| persona.id).collect()
+}
+
+/// M2 D5: turns the compete switch on through the prompt section's own `SetSetting` (the `App`
+/// rung of `compete_fan_out`), as `Settings > Prompt` would.
+async fn compete_on(backend: &Backend) {
+    let reply = serve(
+        backend,
+        &StoreRequest::SetSetting {
+            scope: SectionBench::new().await.ctx().scope.clone(),
+            rung: SettingRung::App,
+            key: SettingKey::CompeteFanOut,
+            value: json!(true),
+            expected: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, StoreReply::PromptSettings(..)),
+        "the switch is set on: {reply:?}"
+    );
+}
+
+/// Changes `name`'s node of [`ANALYSIS`] straight in the store, one `replace_graph`.
+async fn store_edit(store: &MemStore, name: &str, edit: impl FnOnce(&mut NodeBody)) {
+    let mut body = body_of(store, ANALYSIS).await;
+    let node = body
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.name == name)
+        .unwrap_or_else(|| panic!("no step {name}"));
+    edit(node);
+    let revision = body.graph.revision;
+    let outcome = store
+        .replace_graph(ANALYSIS, revision, body)
+        .await
+        .expect("the store takes the edited body");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+}
+
+/// The node of `body` with phase id `id`.
+#[track_caller]
+fn node_of(body: &GraphBody, id: PhaseId) -> &NodeBody {
+    body.nodes
+        .iter()
+        .find(|node| node.phase.id == id)
+        .unwrap_or_else(|| panic!("no step {id}: {body:?}"))
+}
+
+/// The word the frame's `label` choice row shows between `‹` and `›`.
+fn shown_choice(frame: &str, label: &str) -> Option<String> {
+    frame.lines().find_map(|line| {
+        let rest = &line[line.find(label)? + label.len()..];
+        let open = rest.find('\u{2039}')? + '\u{2039}'.len_utf8();
+        let close = rest[open..].find('\u{203a}')? + open;
+        Some(rest[open..close].trim().to_owned())
+    })
+}
+
+/// An edit of one node: how a case prepares it, or how it expects it stored.
+type NodeEdit = Box<dyn Fn(&mut NodeBody)>;
+
+/// One M2 step-form case: the store's research as `prepare` leaves it, the keys from the form's
+/// first row, and how the stored node differs from the prepared one.
+struct M2Case {
+    /// The column, for messages.
+    column: &'static str,
+    /// The compete switch is on before the editor opens.
+    compete: bool,
+    /// Research as the store holds it before the editor opens; `None` keeps the seed's.
+    prepare: Option<NodeEdit>,
+    /// The chords after `e`; `"SAVE"` saves and lets the store answer, mid-case.
+    chords: Vec<String>,
+    /// The prepared node, changed as the case expects it stored.
+    expect: NodeEdit,
+}
+
+/// `chords` with `then` after them.
+fn joined(mut chords: Vec<String>, then: Vec<String>) -> Vec<String> {
+    chords.extend(then);
+    chords
+}
+
+/// PRD metric "every M2 node field round-trips": the deadline, the palette flag, the split and
+/// both splits' rows (compete with the switch on; divide's planner, integrate, part cap and plan
+/// scope), and the default parts through the part form (add, edit every column, reorder,
+/// remove), each edited with keys, saved through the store worker and read back from
+/// `graph_body`; every other column of the graph unchanged.
+#[tokio::test]
+async fn every_m2_node_field_round_trips() {
+    let seed = body_of(&MemStore::demo(), ANALYSIS).await;
+    let research = step(&seed, "research");
+    let row = |offset| m2_row(node_of(&seed, research), offset);
+    let pairs = agent_pairs(&Backend::memory(MemStore::demo())).await;
+    assert!(!pairs.is_empty(), "a pair to choose");
+    let first = pairs[0].clone();
+    let personas = persona_ids().await;
+    let persona = *personas.first().expect("a seed persona");
+
+    let cases = vec![
+        M2Case {
+            column: "deadline: set",
+            compete: false,
+            prepare: None,
+            chords: retyped(row(DEADLINE), "900"),
+            expect: Box::new(|node| node.phase.deadline_seconds = Some(900)),
+        },
+        M2Case {
+            column: "deadline: cleared",
+            compete: false,
+            prepare: Some(Box::new(|node| node.phase.deadline_seconds = Some(60))),
+            chords: retyped(row(DEADLINE), ""),
+            expect: Box::new(|node| node.phase.deadline_seconds = None),
+        },
+        M2Case {
+            column: "split: divide",
+            compete: false,
+            prepare: None,
+            chords: at_row(row(SPLIT), &["l"]),
+            expect: Box::new(|node| node.phase.split = Split::Divide),
+        },
+        M2Case {
+            column: "divide: planner persona",
+            compete: false,
+            prepare: None,
+            chords: joined(at_row(row(SPLIT), &["l"]), at_row(PLANNER - SPLIT, &["l"])),
+            expect: Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.phase.planner_persona_id = Some(persona);
+            }),
+        },
+        M2Case {
+            column: "divide: planner agent",
+            compete: false,
+            prepare: None,
+            chords: joined(
+                at_row(row(SPLIT), &["l"]),
+                at_row(PLANNER_AGENT - SPLIT, &["l"]),
+            ),
+            expect: Box::new({
+                let first = first.clone();
+                move |node| {
+                    node.phase.split = Split::Divide;
+                    (node.phase.planner_agent_id, node.phase.planner_model) = seat(&first);
+                }
+            }),
+        },
+        M2Case {
+            column: "divide: integrate persona",
+            compete: false,
+            prepare: None,
+            chords: joined(
+                at_row(row(SPLIT), &["l"]),
+                at_row(INTEGRATE - SPLIT, &["l"]),
+            ),
+            expect: Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.phase.integrate_persona_id = Some(persona);
+            }),
+        },
+        M2Case {
+            column: "divide: integrate agent",
+            compete: false,
+            prepare: None,
+            chords: joined(
+                at_row(row(SPLIT), &["l"]),
+                at_row(INTEGRATE_AGENT - SPLIT, &["l"]),
+            ),
+            expect: Box::new({
+                let first = first.clone();
+                move |node| {
+                    node.phase.split = Split::Divide;
+                    (node.phase.integrate_agent_id, node.phase.integrate_model) = seat(&first);
+                }
+            }),
+        },
+        M2Case {
+            column: "divide: max parts",
+            compete: false,
+            prepare: None,
+            chords: joined(at_row(row(SPLIT), &["l"]), retyped(MAX_PARTS - SPLIT, "3")),
+            expect: Box::new(|node| {
+                node.phase.split = Split::Divide;
+                node.phase.max_parts = Some(3);
+            }),
+        },
+        M2Case {
+            column: "divide: plan scope",
+            compete: false,
+            prepare: None,
+            chords: joined(
+                at_row(row(SPLIT), &["l"]),
+                at_row(PLAN_SCOPE - SPLIT, &["l"]),
+            ),
+            expect: Box::new(|node| {
+                node.phase.split = Split::Divide;
+                node.phase.plan_scope = Some(PlanScope::Parts);
+            }),
+        },
+        M2Case {
+            column: "parts: one, every column through the part form",
+            compete: false,
+            prepare: None,
+            // A candidate first (focus moves to it), so the part's agent is one of the step's.
+            chords: {
+                let mut chords = at_row(0, &["alt-n"]);
+                chords.extend(at_row(row(SPLIT) - 13, &["l"]));
+                chords.extend(at_row(FIRST_PART - SPLIT, &["alt-n"]));
+                for (at, text) in [
+                    "ui",
+                    "The UI",
+                    "draw it",
+                    "src/ui/**, docs/ui.md",
+                    "cargo test",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if at > 0 {
+                        chords.push("tab".to_owned());
+                    }
+                    chords.extend(text.chars().map(|character| match character {
+                        ' ' => "space".to_owned(),
+                        other => other.to_string(),
+                    }));
+                }
+                // The agent row: the step's one candidate; the persona row: the first persona.
+                chords.extend(at_row(1, &["l", "tab", "l", "enter"]));
+                chords
+            },
+            expect: Box::new({
+                let first = first.clone();
+                move |node| {
+                    node.agents = candidates(research, &[&first]);
+                    node.phase.split = Split::Divide;
+                    let (agent_id, model) = seat(&first);
+                    node.parts = vec![PhasePart {
+                        title: "The UI".to_owned(),
+                        brief: "draw it".to_owned(),
+                        owned_paths: vec!["src/ui/**".to_owned(), "docs/ui.md".to_owned()],
+                        acceptance: Some("cargo test".to_owned()),
+                        agent_id,
+                        model,
+                        persona_id: Some(persona),
+                        ..bare_part(research, 0, "ui")
+                    }];
+                }
+            }),
+        },
+        M2Case {
+            column: "parts: a second, then reordered",
+            compete: false,
+            prepare: None,
+            chords: {
+                let mut chords = at_row(row(SPLIT), &["l"]);
+                chords.extend(at_row(FIRST_PART - SPLIT, &["alt-n", "u", "i", "enter"]));
+                chords.extend(
+                    ["alt-n", "s", "t", "o", "r", "e", "enter", "alt-up"].map(str::to_owned),
+                );
+                chords
+            },
+            expect: Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.parts = vec![
+                    bare_part(research, 0, "store"),
+                    bare_part(research, 1, "ui"),
+                ];
+            }),
+        },
+        M2Case {
+            column: "parts: edited through the part form",
+            compete: false,
+            prepare: Some(Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.parts = vec![
+                    bare_part(research, 0, "ui"),
+                    bare_part(research, 1, "store"),
+                ];
+            })),
+            // The second part's title, typed in the form `alt-e` opens.
+            chords: at_row(row(FIRST_PART) + 1, &["alt-e", "tab", "D", "B", "enter"]),
+            expect: Box::new(move |node| {
+                node.parts[1].title = "DB".to_owned();
+            }),
+        },
+        M2Case {
+            column: "parts: remove",
+            compete: false,
+            prepare: None,
+            // Two saved, then the second removed in a second write.
+            chords: {
+                let mut chords = at_row(row(SPLIT), &["l"]);
+                chords.extend(at_row(FIRST_PART - SPLIT, &["alt-n", "u", "i", "enter"]));
+                chords.extend(["alt-n", "d", "b", "enter", "SAVE", "e"].map(str::to_owned));
+                chords.extend(at_row(row(FIRST_PART) + 1, &["alt-d"]));
+                chords
+            },
+            expect: Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.parts = vec![bare_part(research, 0, "ui")];
+            }),
+        },
+        M2Case {
+            column: "split: divide back to none",
+            compete: false,
+            prepare: Some(Box::new({
+                let first = first.clone();
+                move |node| {
+                    let phase = &mut node.phase;
+                    phase.split = Split::Divide;
+                    phase.planner_persona_id = Some(persona);
+                    (phase.planner_agent_id, phase.planner_model) = seat(&first);
+                    phase.integrate_persona_id = Some(persona);
+                    (phase.integrate_agent_id, phase.integrate_model) = seat(&first);
+                    phase.max_parts = Some(2);
+                    phase.plan_scope = Some(PlanScope::Parts);
+                    node.parts = vec![bare_part(research, 0, "ui")];
+                }
+            })),
+            chords: at_row(row(SPLIT), &["h"]),
+            // The seven divide columns, the parts and the plan scope go (D7).
+            expect: Box::new(|node| {
+                let phase = &mut node.phase;
+                phase.split = Split::None;
+                phase.planner_persona_id = None;
+                phase.planner_agent_id = None;
+                phase.planner_model = None;
+                phase.integrate_persona_id = None;
+                phase.integrate_agent_id = None;
+                phase.integrate_model = None;
+                phase.max_parts = None;
+                phase.plan_scope = None;
+                node.parts = Vec::new();
+            }),
+        },
+        M2Case {
+            column: "compete (switch on): fan-out and judge",
+            compete: true,
+            prepare: None,
+            // Back one from none is compete (none, divide, compete), its fan-out set to 2.
+            chords: {
+                let mut chords = at_row(row(SPLIT), &["h"]);
+                chords.extend(retyped(FAN_OUT - SPLIT, "3"));
+                chords.extend(at_row(JUDGE - FAN_OUT, &["l"]));
+                chords
+            },
+            expect: Box::new({
+                let first = first.clone();
+                move |node| {
+                    node.phase.split = Split::Compete;
+                    node.phase.fan_out = 3;
+                    (node.phase.judge_agent_id, node.phase.judge_model) = seat(&first);
+                }
+            }),
+        },
+    ];
+
+    for case in cases {
+        let store = MemStore::demo();
+        if let Some(prepare) = &case.prepare {
+            store_edit(&store, "research", |node| prepare(node)).await;
+        }
+        if case.compete {
+            compete_on(&Backend::memory(store.clone())).await;
+        }
+        let (bench, mut section, backend) = analysis_bench(&store, None).await;
+        let before = body_of(&store, ANALYSIS).await;
+        bench.key(&mut section, "e");
+        assert_eq!(
+            stack_of(&section),
+            Some(views::GRAPH_EDITOR_NODE_FORM),
+            "{}",
+            case.column
+        );
+        for chord in &case.chords {
+            if chord == "SAVE" {
+                bench.key(&mut section, "enter");
+                let _ = bench_round(&bench, &mut section, &backend).await;
+            } else {
+                bench.key(&mut section, chord);
+            }
+        }
+        bench.key(&mut section, "enter");
+        let served = bench_round(&bench, &mut section, &backend).await;
+        assert!(
+            served
+                .iter()
+                .any(|request| matches!(request, StoreRequest::ReplaceGraph { .. })),
+            "{}: the save went out: {}",
+            case.column,
+            bench.render_section(&section, 100)
+        );
+        let stored = body_of(&store, ANALYSIS).await;
+        let mut expected = before.clone();
+        let at = expected
+            .nodes
+            .iter()
+            .position(|node| node.phase.id == research)
+            .expect("research");
+        (case.expect)(&mut expected.nodes[at]);
+        assert_eq!(shape(&stored), shape(&expected), "{}", case.column);
+        assert_ne!(
+            shape(&stored),
+            shape(&before),
+            "{}: the column moved",
+            case.column
+        );
+    }
+
+    // Palette, on an unlinked new step: added with it on, then edited off.
+    let store = MemStore::demo();
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    let before = body_of(&store, ANALYSIS).await;
+    bench.key(&mut section, "a");
+    type_in(&bench, &mut section, "triage");
+    let draft = NodeBody {
+        agents: Vec::new(),
+        ..node_of(&seed, research).clone()
+    };
+    play(
+        &bench,
+        &mut section,
+        &at_row(m2_row(&draft, PALETTE), &["l"]),
+    );
+    saved(&bench, &mut section, &backend).await;
+    let added = body_of(&store, ANALYSIS).await;
+    let triage = step(&added, "triage");
+    assert!(node_of(&added, triage).phase.palette, "palette on");
+    assert_eq!(added.edges, before.edges, "a palette step takes no link");
+
+    // The new step is selected: `e` opens it.
+    bench.key(&mut section, "e");
+    play(
+        &bench,
+        &mut section,
+        &at_row(m2_row(&draft, PALETTE), &["l"]),
+    );
+    saved(&bench, &mut section, &backend).await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let mut expected = added.clone();
+    expected
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.id == triage)
+        .expect("triage")
+        .phase
+        .palette = false;
+    assert_eq!(shape(&stored), shape(&expected), "palette off");
+}
+
+/// PRD metric "compete stays hidden while the switch is off" (M2 D7): a compete step the
+/// editor did not make keeps its split, fan-out, judge and deadline byte for byte through an
+/// edit, and no step is offered compete. With the switch on, its fan-out and judge edit.
+#[tokio::test]
+async fn with_the_switch_off_a_compete_node_saves_byte_identical() {
+    let store = MemStore::demo();
+    let judge = (ids::AGENT_AGY, Some("gemini".to_owned()));
+    store_edit(&store, "verdict", |node| {
+        node.phase.split = Split::Compete;
+        node.phase.fan_out = 2;
+        (node.phase.judge_agent_id, node.phase.judge_model) = (Some(judge.0), judge.1.clone());
+        node.phase.deadline_seconds = Some(60);
+    })
+    .await;
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    let before = body_of(&store, ANALYSIS).await;
+    let verdict = step(&before, "verdict");
+
+    // The compete rows are shown read-only.
+    bench_select(&bench, &mut section, "verdict");
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("compete \u{b7} read-only"), "{frame}");
+    bench.key(&mut section, "esc");
+
+    // A rename saves every compete column as it was.
+    rename(&bench, &mut section, &backend, "2").await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let mut expected = before.clone();
+    expected
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.id == verdict)
+        .expect("verdict")
+        .phase
+        .name = "verdict2".to_owned();
+    assert_eq!(shape(&stored), shape(&expected), "byte for byte");
+
+    // Research's split cycles none and divide only.
+    bench_select(&bench, &mut section, "research");
+    bench.key(&mut section, "e");
+    play(
+        &bench,
+        &mut section,
+        &at_row(
+            m2_row(node_of(&before, step(&before, "research")), SPLIT),
+            &[],
+        ),
+    );
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        bench.key(&mut section, "l");
+        let frame = bench.render_section(&section, 100);
+        assert!(!frame.contains("\u{2039} compete \u{203a}"), "{frame}");
+        seen.push(shown_choice(&frame, "split").unwrap_or_default());
+    }
+    assert_eq!(seen, ["divide", "none", "divide"]);
+    bench.key(&mut section, "esc");
+    assert!(bench_round(&bench, &mut section, &backend).await.is_empty());
+
+    // The switch on, a fresh editor: the fan-out and the judge edit.
+    compete_on(&backend).await;
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    let renamed = body_of(&store, ANALYSIS).await;
+    let pairs = agent_pairs(&backend).await;
+    // The judge's choices: the project default, every pair, then the stored judge if no pair is
+    // it; `l` steps forward to the first pair.
+    let mut options: Vec<(Option<AgentId>, Option<String>)> = vec![(None, None)];
+    options.extend(pairs.iter().map(seat));
+    let current = (Some(judge.0), judge.1);
+    if !options.contains(&current) {
+        options.push(current.clone());
+    }
+    let from = options
+        .iter()
+        .position(|option| *option == current)
+        .expect("listed");
+    let presses = (1 + options.len() - from) % options.len();
+    bench_select(&bench, &mut section, "verdict2");
+    bench.key(&mut section, "e");
+    let mut chords = retyped(m2_row(node_of(&renamed, verdict), FAN_OUT), "3");
+    chords.extend(at_row(JUDGE - FAN_OUT, &vec!["l"; presses]));
+    play(&bench, &mut section, &chords);
+    saved(&bench, &mut section, &backend).await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let mut expected = renamed.clone();
+    let node = expected
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.id == verdict)
+        .expect("verdict");
+    node.phase.fan_out = 3;
+    (node.phase.judge_agent_id, node.phase.judge_model) = seat(&pairs[0]);
+    assert_eq!(shape(&stored), shape(&expected), "fan-out and judge edited");
 }
