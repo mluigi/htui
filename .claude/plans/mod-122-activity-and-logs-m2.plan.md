@@ -3,9 +3,9 @@
 **Source PRD**: `.claude/prds/mod-122-activity-and-logs.prd.md`
 **Selected Milestone**: 2 — Worker logs in the main instance
 **Complexity**: Large (four tasks, new table and store trait, worker shipper, Logs tab and Boxes settings)
-**Status**: drafted, awaiting CONFIRM
+**Status**: confirmed by the maintainer 2026-11-12; implementing
 **Routing**: PRD path by `/handoff-run MOD-122` (3 criteria fired; resumed at `plan`); ultracode accepted for the implement phase.
-**Grounded at**: `a05deeac` (branch `hr/MOD-122`). Requirements: `R-TUI-15`; PRD milestone 2. Touches `R-ID-7` / `R-SEC-3` (nothing off the box unscrubbed).
+**Grounded at**: `a05deeac` (branch `hr/MOD-122`). **Blueprint**: `.claude/plans/mod-122-activity-and-logs-m2.blueprint.md` (its F1–F14 amend this plan; the blueprint wins where they differ). Requirements: `R-TUI-15`; PRD milestone 2. Touches `R-ID-7` / `R-SEC-3` (nothing off the box unscrubbed).
 
 ## Summary
 
@@ -103,9 +103,10 @@ PRD open questions that M2 touches are answered here (D2–D6). Maintainer check
   - A failed read is absorbed (`Tab::absorbs_failure("worker_logs")`) so a down database does not fill the status
     line once a second; the last rows stay.
   - History `location`/`restore`: `source:worker:<box id>`; a box with no lines restores to `all`.
-- **D11 — Settings › Boxes.** The box detail gets one row, **Worker log level**, edited like the
-  executor (`Mode::Executor` in `settings/boxes.rs`): `←`/`→` or the new `boxes.log_level` key cycles
-  `off · error · warn · info · debug`, saved at once through `StoreRequest::SetBoxLogLevel`. Every key is
+- **D11 — Settings › Boxes.** The box detail gets one row, **Worker log level**. *Amended by blueprint
+  F8:* the browse key `settings.boxes.log_level` (default `v`) cycles `off · error · warn · info ·
+  debug` over the listed box and saves at once through `StoreRequest::SetBoxLogLevel`; `←`/`→` stay
+  section navigation (they are `settings.next_section`/`prev_section` in that stack). Every key is
   configurable (`keys.toml`), none reserved. A box that is not a headless worker shows the row with
   "applies to `htui worker` on this box". Local TUI logging stays Settings › Logging (M1).
 - **D12 — what is not in M2.** The TUI's own in-process run runtime keeps logging to its memory buffer
@@ -154,9 +155,14 @@ PRD open questions that M2 touches are answered here (D2–D6). Maintainer check
 | `crates/htui/src/store_worker.rs` | UPDATE | T3, T4 | T3: `WorkerLogs` request/reply/`name`; T4: `SetBoxLogLevel` |
 | `crates/htui/src/ui/tabs/logs/workers.rs` | CREATE | T3 | per-box rings, de-dup by id, counts |
 | `crates/htui/src/ui/tabs/logs/mod.rs`, `logs/snapshots/*` | UPDATE | T3 | worker rows, selection type, fetch, `absorbs_failure`, history |
-| `crates/htui/src/ui/tabs/settings/boxes.rs` + snapshots | UPDATE | T4 | the **Worker log level** row |
+| `crates/htui/src/ui/tabs/settings/boxes.rs` | UPDATE | T4 | the **Worker log level** row |
 | `crates/htui/src/keys/catalogue.rs`, `keys/views.rs` | UPDATE | T4 | `Act::BoxesLogLevel`, in the boxes stack |
 | `docs/htui-keys.md` | UPDATE | T4 | regenerated (`keys_file.rs` pins it) |
+| `crates/htui-core/tests/mem_store.rs`, `crates/htui-store/tests/pg_conformance.rs` | UPDATE | T1 | bind `WORKER_LOG_CASES` (F1) |
+| `crates/htui-store/src/worker.rs` | UPDATE | T1 | `impl WorkerLogStore for Writer` (F9) |
+| `crates/htui/src/logging/buffer.rs` | UPDATE (maybe) | T2 | `pub(crate)` the line visitor (F7b) |
+| `crates/htui/src/box_settings.rs`, `crates/htui/tests/box_settings.rs`, `crates/htui/tests/snapshots/box_settings__*.snap` | UPDATE | T4 | the write path and its pins (F9, F10) |
+| `README.md` | UPDATE | T4 (lane A only) | Settings › Boxes row; Logs tab worker sources (F12) |
 
 ## Tasks
 
@@ -234,9 +240,9 @@ lanes merge without hand edits except the generated `.sqlx` entries, which T1 ow
 
 ### Task 4: Worker log level in Settings › Boxes (lane A, after T3; same worktree)
 - **Action**: tests first, with the existing boxes `SectionBench`.
-  - The row renders the current level (default `warn` when the key is absent) with help beneath; `←`/`→` and `boxes.log_level` cycle `off → error → warn → info → debug`; each change emits `SetBoxLogLevel`; a refused or failed write shows the notice and keeps the old level; the row shows a changed-elsewhere note on a stale read.
+  - The row renders the current level (default `warn` when the key is absent) with help beneath; `settings.boxes.log_level` (`v`) cycles `off → error → warn → info → debug` (F8); each change emits `SetBoxLogLevel`; a refused or failed write shows the notice and keeps the old level; a box gone answers `BoxesStale` and the section says `DELETED_ELSEWHERE` (F9).
   - Catalogue invariants (`every_act_has_exactly_one_row`, `names_are_unique_per_context`, `context_tables_and_headings`) and `docs/htui-keys.md` regenerated.
-  - Store worker: `SetBoxLogLevel` reaches `set_box_log_level` through `Backend::writable()`; offline it is refused with the usual unreachable sentence.
+  - Store worker: `SetBoxLogLevel` reaches `set_box_log_level` through `box_settings::serve` over `backend.writer()` (F9); offline it is refused with the usual unreachable sentence.
 
   Then implement the mode, the request and the key.
 - **Mirror**: `Mode::Executor` and `on_executor_key`; `changed_elsewhere_executor`.
