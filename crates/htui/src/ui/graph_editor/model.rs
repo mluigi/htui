@@ -11,6 +11,7 @@ use htui_core::store::{
 };
 
 use super::{EdgeSpec, Lookups, forward_edges};
+use crate::ui::kit::label;
 
 /// D5: the store's checks in the store's order (`traits.rs:1091-1112`, `mem.rs:4208-4262`):
 /// `graph_body_shape_refusal(body.graph.id, body)`; then each `body_persona_refs` id against
@@ -49,6 +50,14 @@ pub(crate) const SELF_LINK: &str = "a step cannot link to itself";
 /// The refusal of an add whose step id the body already holds.
 pub(crate) const STEP_EXISTS: &str = "a step with this id already exists";
 
+/// D10: turning palette on for a step that has links, in words.
+pub(crate) fn palette_has_links(links: usize) -> String {
+    format!(
+        "a palette step has no links; delete its {} first",
+        label::plural(links, "link", "links")
+    )
+}
+
 /// D10: a fresh node for "add after `after`": `htui_core::seed::phase_row(PhaseId::new(),
 /// body.graph.id, max position + 1 (0 for an empty graph), &PhaseSeed { name: "",
 /// input_kinds: &[], gate_hard: false }, now)`, then `gate = Gate::Never`, `retry_limit = 0`,
@@ -82,12 +91,13 @@ pub(crate) fn draft_node(body: &GraphBody, after: Option<PhaseId>, now: DateTime
     }
 }
 
-/// D10 add: `node` appended to `body.nodes` (its `graph_id` set to the body's, agents re-tagged
-/// and renumbered 0..n). With `after` a flow node (not palette): every forward edge out of
-/// `after` (`forward_edges`) is re-pointed to leave from `node` (same id, kind, predicate,
-/// limit), then a `next` `after -> node` is added with `EdgeId::new()`. Back edges of `after`
-/// stay. With `after` `None`, unknown (the selection can lag a reload) or a palette node: `node`
-/// is a root with no edges. Err `STEP_EXISTS` only when `node.phase.id` is already in the body.
+/// D10 add: `node` appended to `body.nodes` (its `graph_id` set to the body's, agents and parts
+/// re-tagged and renumbered 0..n). With `after` a flow node (not palette): every forward edge
+/// out of `after` (`forward_edges`) is re-pointed to leave from `node` (same id, kind,
+/// predicate, limit), then a `next` `after -> node` is added with `EdgeId::new()`. Back edges of
+/// `after` stay. With `after` `None`, unknown (the selection can lag a reload) or a palette
+/// node, or a palette **new node** (M2 D10): `node` is a root with no edges and takes nothing
+/// over. Err `STEP_EXISTS` only when `node.phase.id` is already in the body.
 pub(crate) fn add_after(
     body: &GraphBody,
     after: Option<PhaseId>,
@@ -96,11 +106,14 @@ pub(crate) fn add_after(
     if node_of(body, node.phase.id).is_some() {
         return Err(STEP_EXISTS.to_owned());
     }
+    let palette = node.phase.palette;
     let node = adopted(body, node);
     let added = node.phase.id;
     let mut next = body.clone();
     next.nodes.push(node);
-    let flow = after.filter(|&after| node_of(body, after).is_some_and(|node| !node.phase.palette));
+    let flow = after
+        .filter(|_| !palette)
+        .filter(|&after| node_of(body, after).is_some_and(|node| !node.phase.palette));
     if let Some(after) = flow {
         for (edge, forward) in next.edges.iter_mut().zip(forward_edges(body)) {
             if forward && edge.from == after {
@@ -121,13 +134,26 @@ pub(crate) fn add_after(
 }
 
 /// D8: `node` replaces the node of the same phase id; position, edges and the graph row are
-/// kept; agents re-tagged (`phase_id`) and renumbered 0..n in order. Err `NO_SUCH_STEP`.
+/// kept; agents and parts re-tagged (`phase_id`) and renumbered 0..n in order. Err
+/// `NO_SUCH_STEP`; Err [`palette_has_links`] when `node` is a palette step and the body has
+/// links touching it (M2 D10: the store refuses a palette node with edges).
 pub(crate) fn replace_node(body: &GraphBody, node: NodeBody) -> Result<GraphBody, String> {
     let at = body
         .nodes
         .iter()
         .position(|kept| kept.phase.id == node.phase.id)
         .ok_or_else(|| NO_SUCH_STEP.to_owned())?;
+    if node.phase.palette {
+        let step = node.phase.id;
+        let links = body
+            .edges
+            .iter()
+            .filter(|edge| edge.from == step || edge.to == step)
+            .count();
+        if links > 0 {
+            return Err(palette_has_links(links));
+        }
+    }
     let mut next = body.clone();
     let mut node = adopted(body, node);
     node.phase.position = next.nodes[at].phase.position;
@@ -240,14 +266,18 @@ fn node_of(body: &GraphBody, id: PhaseId) -> Option<&NodeBody> {
     body.nodes.iter().find(|node| node.phase.id == id)
 }
 
-/// `node` made a node of `body`: its `graph_id` the body's, its candidates re-tagged to its own
-/// phase and renumbered 0..n in order.
+/// `node` made a node of `body`: its `graph_id` the body's, its candidates and its default parts
+/// each re-tagged to its own phase and renumbered 0..n in order.
 fn adopted(body: &GraphBody, mut node: NodeBody) -> NodeBody {
     node.phase.graph_id = body.graph.id;
     let phase = node.phase.id;
     for (row, position) in node.agents.iter_mut().zip(0..) {
         row.phase_id = phase;
         row.position = position;
+    }
+    for (part, position) in node.parts.iter_mut().zip(0..) {
+        part.phase_id = phase;
+        part.position = position;
     }
     node
 }
@@ -258,7 +288,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{
         AgentId, EdgeId, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope, IfPredicate,
-        NodeBody, PersonaId, PhaseAgent, PhaseId, ProjectId, StepGraph, StepGraphEdge, StepGraphId,
+        NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, ProjectId, Split, StepGraph,
+        StepGraphEdge, StepGraphId,
     };
     use htui_core::seed::{PhaseSeed, phase_row};
     use htui_core::store::{
@@ -653,6 +684,129 @@ mod tests {
         assert_eq!(
             add_after(&graph, None, graph.nodes[0].clone()),
             Err(STEP_EXISTS.to_owned())
+        );
+    }
+
+    /// D10: a palette step saved new is a root, whatever the selection.
+    #[tokio::test]
+    async fn a_palette_step_is_added_with_no_edges_and_takes_nothing_over() {
+        let (feature, lookups) = feature().await;
+        let plan = id(&feature, "plan");
+
+        let mut new = named(&feature, Some(plan), "security");
+        new.phase.palette = true;
+        let fresh = new.phase.id;
+        let added = add_after(&feature, Some(plan), new).expect("a palette step");
+
+        assert_eq!(added.nodes.len(), feature.nodes.len() + 1);
+        assert_eq!(added.nodes[..feature.nodes.len()], feature.nodes[..]);
+        assert_eq!(
+            added
+                .nodes
+                .last()
+                .map(|node| (node.phase.id, node.phase.palette)),
+            Some((fresh, true))
+        );
+        assert_eq!(added.edges, feature.edges, "no edge moves or appears");
+        assert_eq!(validate(&added, &lookups), None);
+    }
+
+    /// D10: the store refuses a palette node with edges, so the editor says so first.
+    #[test]
+    fn palette_on_for_a_linked_step_is_refused_in_words() {
+        let graph = reference();
+        let links = |step: PhaseId| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == step || edge.to == step)
+                .count()
+        };
+
+        let mut review = graph.nodes[1].clone();
+        review.phase.palette = true;
+        let n = links(review.phase.id);
+        assert_eq!(n, 2, "implement -> review and the loop back");
+        assert_eq!(replace_node(&graph, review), Err(palette_has_links(n)));
+
+        let mut fix = graph.nodes[2].clone();
+        fix.phase.palette = true;
+        assert_eq!(links(fix.phase.id), 1);
+        assert_eq!(
+            replace_node(&graph, fix),
+            Err("a palette step has no links; delete its 1 link first".to_owned())
+        );
+        assert_eq!(
+            palette_has_links(2),
+            "a palette step has no links; delete its 2 links first"
+        );
+    }
+
+    #[test]
+    fn palette_on_for_an_unlinked_step_is_kept() {
+        let mut graph = reference();
+        graph.edges.retain(|edge| edge.kind != EdgeKind::If);
+        let fix = id(&graph, "fix");
+        let mut edited = graph.nodes[2].clone();
+        edited.phase.palette = true;
+
+        let replaced = replace_node(&graph, edited).expect("an unlinked step");
+        let kept = &replaced.nodes[2];
+        assert_eq!((kept.phase.id, kept.phase.palette), (fix, true));
+        assert_eq!(replaced.edges, graph.edges);
+        assert_eq!(replaced.nodes[..2], graph.nodes[..2]);
+        assert_eq!(validate(&replaced, &Lookups::default()), None);
+    }
+
+    #[test]
+    fn adopted_retags_and_renumbers_parts() {
+        let graph = reference();
+        let implement = id(&graph, "implement");
+        let part = |phase_id: PhaseId, position: i32, key: &str| PhasePart {
+            phase_id,
+            position,
+            key: key.to_owned(),
+            title: key.to_owned(),
+            brief: String::new(),
+            owned_paths: Vec::new(),
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        };
+        let mut edited = graph.nodes[0].clone();
+        edited.phase.split = Split::Divide;
+        edited.parts = vec![
+            part(PhaseId::new(), 7, "api"),
+            part(implement, 3, "ui"),
+            part(PhaseId::new(), 0, "docs"),
+        ];
+
+        let replaced = replace_node(&graph, edited.clone()).expect("a known step");
+        let parts = |node: &NodeBody| {
+            node.parts
+                .iter()
+                .map(|part| (part.phase_id, part.position, part.key.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (implement, 0, "api".to_owned()),
+            (implement, 1, "ui".to_owned()),
+            (implement, 2, "docs".to_owned()),
+        ];
+        assert_eq!(parts(&replaced.nodes[0]), expected);
+
+        let mut fresh = named(&graph, None, "split");
+        let added_id = fresh.phase.id;
+        fresh.parts = edited.parts;
+        let added = add_after(&graph, None, fresh).expect("a new step");
+        let last = added.nodes.last().expect("the new step");
+        assert_eq!(
+            parts(last),
+            expected
+                .into_iter()
+                .map(|(_, position, key)| (added_id, position, key))
+                .collect::<Vec<_>>()
         );
     }
 
