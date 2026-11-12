@@ -3036,7 +3036,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "htui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "htui-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
  "bytes",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "htui-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "htui-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "globset",
@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "htui-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "htui-agent",
@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "htui-orch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures",
@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "htui-secrets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "htui-core",
  "reqwest",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "htui-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "htui-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "htui-agent",

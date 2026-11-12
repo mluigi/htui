@@ -1,6 +1,6 @@
 [package]
 name        = "htui-worker"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "Run supervision without a UI: the runtime `htui` and `htui worker` share (MOD-41)"
 
 edition.workspace      = true
