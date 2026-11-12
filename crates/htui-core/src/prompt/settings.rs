@@ -230,8 +230,8 @@ impl SettingKey {
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
     /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture` and MOD-141's
-    /// unseeded `compete_fan_out`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate
-    /// this, never `ALL`.
+    /// unseeded `compete_fan_out`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
+    /// and the `app` group of `Settings > Prompt` iterate this, never `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
             .into_iter()

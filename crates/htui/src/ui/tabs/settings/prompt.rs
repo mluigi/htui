@@ -1019,7 +1019,7 @@ impl SettingsSection for PromptSection {
                 NextStep(&reads_again(reload.as_deref())),
                 theme,
             ),
-            // There is no empty case below this one: the `App` group is always the registry's eleven.
+            // There is no empty case below this one: the `App` group is always the registry's twelve.
             (None, Some(snapshot)) => {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
@@ -1627,6 +1627,37 @@ mod tests {
             switch(true, None, None),
             (SWITCH_ON.to_owned(), None, DEFAULT)
         );
+    }
+
+    /// MOD-141 M2 D5: `compete_fan_out` is an App-only switch, off by default; its row reads `on`
+    /// only for a stored JSON `true`, names the App rung only for a stored boolean, and is never
+    /// clamp arithmetic.
+    #[test]
+    fn the_compete_switch_is_off_unless_the_app_row_holds_true() {
+        let key = SettingKey::CompeteFanOut;
+        let app_setting = label::setting_source(BudgetSource::AppSetting);
+        for (stored, text, source) in [
+            (Some(json!(true)), SWITCH_ON, app_setting),
+            (Some(json!(false)), SWITCH_OFF, app_setting),
+            (Some(json!("on")), SWITCH_OFF, DEFAULT),
+            (Some(json!(1)), SWITCH_OFF, DEFAULT),
+            (None, SWITCH_OFF, DEFAULT),
+        ] {
+            let app: BTreeMap<String, Value> = stored
+                .iter()
+                .map(|value| (key.key().to_owned(), value.clone()))
+                .collect();
+            let row = effective(key, None, None, &app);
+            assert_eq!(
+                (row.text.as_str(), row.source),
+                (text, source),
+                "{stored:?}"
+            );
+            assert_eq!(
+                row.number, None,
+                "D13's clamp arithmetic never reads a switch"
+            );
+        }
     }
 
     /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
