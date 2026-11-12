@@ -30662,7 +30662,8 @@ async fn duplicates_is_single_valued<S: WriteStore>(store: &S) {
 }
 
 /// MOD-150 D4: a `parent` that would make an item its own ancestor is refused, two-long and
-/// three-long; only `parent` walks, so a `relates` back up is fine.
+/// three-long; the walk follows live links only, so a withdrawn parent closes no cycle (review
+/// R1); only `parent` walks, so a `relates` back up is fine.
 async fn parent_refuses_a_cycle<S: WriteStore>(store: &S) {
     const CASE: &str = "parent_refuses_a_cycle";
     let mut items = Vec::new();
@@ -30689,6 +30690,17 @@ async fn parent_refuses_a_cycle<S: WriteStore>(store: &S) {
         "{CASE}: the two-long cycle wrote nothing"
     );
 
+    withdraw_unleased(CASE, store, a, LinkKind::Parent, b, step_a).await;
+    propose_unleased(store, b, LinkKind::Parent, a, step_b)
+        .await
+        .unwrap_or_else(|err| {
+            panic!("{CASE}: a parent b withdrawn, b parent a closes no cycle: {err:?}")
+        });
+    withdraw_unleased(CASE, store, b, LinkKind::Parent, a, step_b).await;
+    propose_unleased(store, a, LinkKind::Parent, b, step_a)
+        .await
+        .expect(CASE);
+
     propose_unleased(store, b, LinkKind::Parent, c, step_b)
         .await
         .expect(CASE);
@@ -30709,7 +30721,9 @@ async fn parent_refuses_a_cycle<S: WriteStore>(store: &S) {
 }
 
 /// MOD-150 D2: a parent chain holds at most eight items. Attaching a subtree counts its height:
-/// a two-high subtree fits under a six-deep chain and not under a seven-deep one.
+/// a two-high subtree fits under a six-deep chain and not under a seven-deep one, and a
+/// three-high subtree of four items fits under a five-deep chain, its size being no part of the
+/// sum (review R1).
 async fn parent_depth_is_at_most_eight<S: WriteStore>(store: &S) {
     const CASE: &str = "parent_depth_is_at_most_eight";
     assert_eq!(MAX_PARENT_DEPTH, 8, "{CASE}: the case is written for eight");
@@ -30762,6 +30776,36 @@ async fn parent_depth_is_at_most_eight<S: WriteStore>(store: &S) {
             && !live_link(CASE, store, j1, chain[6].0, LinkKind::Parent).await,
         "{CASE}: six plus two is eight, the boundary, and only that link is live"
     );
+
+    let mut wide = Vec::new();
+    for title in ["wide top", "wide left", "wide right", "wide grandchild"] {
+        let item = feat(CASE, store, title).await;
+        let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, item, None).await;
+        wide.push((item, step));
+    }
+    let [
+        (top, step_top),
+        (left, step_left),
+        (right, step_right),
+        (low, step_low),
+    ] = wide[..]
+    else {
+        unreachable!("{CASE}: four subtree items")
+    };
+    for (child, step, parent) in [
+        (left, step_left, top),
+        (right, step_right, top),
+        (low, step_low, left),
+    ] {
+        propose_unleased(store, child, LinkKind::Parent, parent, step)
+            .await
+            .expect(CASE);
+    }
+    propose_unleased(store, top, LinkKind::Parent, chain[4].0, step_top)
+        .await
+        .unwrap_or_else(|err| {
+            panic!("{CASE}: five plus a three-high subtree of four items is eight: {err:?}")
+        });
 }
 
 /// MOD-150 D4: `implements` follows `relates`' rules: many live per item, an upsert keeps the
