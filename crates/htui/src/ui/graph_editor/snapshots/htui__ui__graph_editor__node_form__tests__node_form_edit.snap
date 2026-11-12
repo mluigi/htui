@@ -17,9 +17,6 @@ expression: text(&lines)
  output         research
  agent 1        ‹ claude · sonnet ›
  agent 2        ‹ agy · gemini ›
- split          none
- fan-out        1
- palette        no
- plan scope     none
- parts          0 parts
- deadline       edited in M2
+ deadline
+ palette        ○ off
+ split          ‹ none ›

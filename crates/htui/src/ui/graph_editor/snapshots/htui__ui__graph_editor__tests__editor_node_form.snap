@@ -18,10 +18,10 @@ flow · library graph · revision 2
              │any agent             │              inputs
              ╰───────────●──────────╯              output         plan
                          │                         agents         none (Alt+n adds one)
-                         │                         split          none
-                         ▼                         fan-out        1
-             ╭─ review ─────────────╮              palette        no
-             │template review       │              plan scope     none
-             │gate always · retries…│              parts          0 parts
-             │any agent             │              deadline       edited in M2
+                         │                         deadline
+                         ▼                         palette        ○ off
+             ╭─ review ─────────────╮              split          ‹ none ›
+             │template review       │
+             │gate always · retries…│
+             │any agent             │
              ╰───────────●──────────╯
