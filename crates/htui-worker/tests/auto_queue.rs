@@ -745,6 +745,94 @@ async fn admit_records_the_entrys_workspace_on_the_run() {
     }
 }
 
+/// MOD-125 M2 D8: a stopped workspace's entries stay queued and untouched, and do not count
+/// toward the `Stalled` drain: a stop never closes a batch. Another workspace's entry is admitted
+/// beside them; once the batch's only other entry is spent, the held one still keeps the batch
+/// open; the workspace's resume admits it under the same batch.
+#[tokio::test]
+async fn admit_skips_a_stopped_workspaces_entries_without_draining_the_batch() {
+    let h = Harness::open().await;
+    let other = h
+        .store
+        .create_workspace(htui_core::model::NewWorkspace {
+            id: htui_core::model::WorkspaceId::new(),
+            slug: "other".to_owned(),
+            name: "Other".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    let x = mint_ana(&h.store, "x", 1).await;
+    let y = mint_ana(&h.store, "y", 0).await;
+    for (item, workspace) in [(x, ids::WORKSPACE_PLATFORM), (y, other)] {
+        h.store
+            .queue_item(item, ids::BOX, Some(workspace), ids::USER, Utc::now())
+            .await
+            .expect("the item queues");
+    }
+    let batch = h.resume().await;
+    h.store
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            htui_core::model::StopMode::Graceful,
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("the stop is recorded");
+    let mut runtime = h.runtime();
+
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.admitted_under(y, batch).await,
+        "the other workspace's entry runs"
+    );
+    let y_run = h.only_run(y).await;
+    let row = h
+        .store
+        .run(y_run.id)
+        .await
+        .expect("the read answers")
+        .expect("the run exists");
+    assert_eq!(row.workspace_id, Some(other));
+    assert!(
+        h.runs(x).await.is_empty(),
+        "the stopped workspace's entry waits"
+    );
+    assert_eq!(open_batch(&h).await, Some(batch));
+
+    // Y's run ends (a cancel sticks for the batch): only the held X is left.
+    h.store
+        .finish_run(y_run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("the run cancels");
+    h.sweep(&mut runtime).await;
+    assert!(h.runs(x).await.is_empty(), "still held");
+    assert_eq!(
+        open_batch(&h).await,
+        Some(batch),
+        "a stop never drains the batch"
+    );
+    assert!(
+        queued(&h).await.contains(&x),
+        "the held entry keeps its place"
+    );
+
+    assert!(
+        h.store
+            .resume_workspace(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("the resume answers")
+    );
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.admitted_under(x, batch).await,
+        "the resume admits it under the same batch"
+    );
+}
+
 /// (c) D5: an entry `ready_items` does not hold waits, and is admitted once it is ready. M3 D4
 /// (L4): the wait stalls the batch, which closes, so the unblocked entry runs after a resume.
 #[tokio::test]

@@ -50,7 +50,7 @@ use htui_core::model::{
     Executor, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpText, ItemId, NewDocument, NewFollowUp, NewRepo, PermissionStatus, RepoId,
     RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status,
-    StepId, StepPermission, StepStatus, Transport,
+    StepId, StepPermission, StepStatus, StopMode, Transport, WorkspaceId,
 };
 use htui_core::store::{CasOutcome, ReadStore as _, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -58,7 +58,7 @@ use htui_orch::{Command, CommandOutcome, GateAnswer, Isolator, Verifier};
 use htui_store::pg::PoolSize;
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 use htui_worker::worker::{self, COMMAND_POLL, WorkerConfig};
-use htui_worker::{CANCEL_GRACE, Role, RunRuntime, Unaddressed};
+use htui_worker::{CANCEL_GRACE, Role, RunRuntime, STOP_SLACK, Unaddressed};
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -396,12 +396,26 @@ impl Stack {
 
     /// `R` on `item`: the run and where its first walk rested.
     async fn start(&mut self, item: ItemId) -> (RunId, htui_orch::Rest) {
+        self.start_with(item, None).await
+    }
+
+    /// [`Stack::start`] recording `workspace` on the run (MOD-125 M2: its stop reaches it).
+    async fn start_in(&mut self, item: ItemId, workspace: WorkspaceId) -> (RunId, htui_orch::Rest) {
+        self.start_with(item, Some(workspace)).await
+    }
+
+    /// [`Stack::start`] with the run's workspace.
+    async fn start_with(
+        &mut self,
+        item: ItemId,
+        workspace: Option<WorkspaceId>,
+    ) -> (RunId, htui_orch::Rest) {
         match self
             .command(Command::StartRun {
                 item,
                 mode: RunMode::Manual,
                 repo_scope: None,
-                workspace: None,
+                workspace,
             })
             .await
         {
@@ -1038,6 +1052,100 @@ async fn a_cancel_from_another_box_ends_a_live_worker_walk() {
     );
     worker.stop().await;
     stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-125 M2 T3: a workspace stop across boxes (plan D2, D4)
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-125 M2: a stop ends a live worker walk within the grace, the slack, one poll and a margin.
+const STOP_BOUND: Duration =
+    Duration::from_secs(CANCEL_GRACE.as_secs() + STOP_SLACK.as_secs() + COMMAND_POLL.as_secs() + 2);
+
+/// MOD-125 M2: a session that ends its turn on the stop's cancel ([`ParksOnce`]) is settled once
+/// its walk ends, not when the token drops at grace + [`STOP_SLACK`]: within the grace, one poll
+/// and a margin, which a stop waiting out its slack misses in either mode.
+const PROMPT_STOP_BOUND: Duration =
+    Duration::from_secs(CANCEL_GRACE.as_secs() + COMMAND_POLL.as_secs() + 2);
+
+/// MOD-125 M2 D2, D4: a client on another box stops the workspace of a run the worker walks while
+/// its session is parked. The worker's command poll lists the stop and applies it in `mode`: the
+/// parked request answered `cancelled` and recorded once (I-7), the step and the run `stopped`
+/// within [`STOP_BOUND`], no `run_command` row, the lease given back.
+async fn a_stop_from_another_box_settles(mode: StopMode) {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, _) = stack
+        .start_in(ids::HTUI_FEAT_3, ids::WORKSPACE_PLATFORM)
+        .await;
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::default()));
+    let (client, _client_root) = another_box(&stack.db).await;
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+
+    let asked = Instant::now();
+    client
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            mode,
+            client.this_user(),
+            Utc::now(),
+        )
+        .await
+        .expect("the stop is written");
+    let deadline = asked + PATIENCE;
+    while stack.run_row(run).await.status != RunStatus::Stopped {
+        assert!(Instant::now() < deadline, "the run was never stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let took = asked.elapsed();
+    assert!(
+        took < STOP_BOUND,
+        "the {mode} stop settled {took:?} after the request, not within {STOP_BOUND:?}"
+    );
+    assert!(
+        took < PROMPT_STOP_BOUND,
+        "the session ended its turn on the cancel, yet the {mode} stop settled {took:?} after \
+         the request, not within {PROMPT_STOP_BOUND:?}"
+    );
+
+    let row = client
+        .permission(parked.id)
+        .await
+        .expect("the read answers")
+        .expect("the row exists");
+    assert_eq!(
+        row.status,
+        PermissionStatus::Cancelled,
+        "I-7: answered `cancelled`"
+    );
+    let answers = permission_answers(&stack.db.store, parked.run_step_id).await;
+    assert_eq!(answers.len(), 1, "I-7's row exactly once: {answers:?}");
+    assert_eq!(answers[0]["cancelled"], true, "{answers:?}");
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Stopped).await;
+    let row = stack.run_row(run).await;
+    assert_eq!(row.finished_at, None, "stopped, not ended");
+    assert!(
+        command_statuses(&stack, run).await.is_empty(),
+        "a stop writes no run_command row"
+    );
+    stack.released(run).await;
+    worker.stop().await;
+    stack.finish().await;
+}
+
+/// [`a_stop_from_another_box_settles`], graceful.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_from_another_box_settles_a_live_worker_walk_stopped() {
+    a_stop_from_another_box_settles(StopMode::Graceful).await;
+}
+
+/// [`a_stop_from_another_box_settles`], forced.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_stop_from_another_box_settles_a_live_worker_walk_stopped() {
+    a_stop_from_another_box_settles(StopMode::Forced).await;
 }
 
 // ---------------------------------------------------------------------------------------------

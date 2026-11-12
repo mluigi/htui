@@ -19,8 +19,8 @@ use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     AgentId, AgentSummary, BatchId, BatchStop, BoxId, BoxProfile, CancelRequest, CapError,
     Executor, ItemId, ProjectCaps, ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId,
-    RunKind, RunStatus, SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order,
-    batch_budget, free_slots, min_budget_micros,
+    RunKind, RunStatus, SnapshotCandidate, StopMode, UserId, WorkspaceId, admission_limit,
+    admission_order, batch_budget, free_slots, min_budget_micros,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
@@ -106,6 +106,12 @@ pub const CANCEL_REQUESTED: &str = "cancel requested: the run's executor applies
 pub const CANCEL_ALREADY_REQUESTED: &str =
     "a cancel is already requested: the run's executor applies it";
 
+/// MOD-125 M2 D7: a walking command on a run whose workspace is stopped.
+#[must_use]
+pub fn workspace_is_stopped(slug: &str) -> String {
+    format!("workspace `{slug}` is stopped: resume it first")
+}
+
 /// MOD-42 OQ-3: `p` on a step the box's worker walks. Promotion hands a live session to this
 /// TUI's chat, which cannot cross processes.
 #[must_use]
@@ -117,6 +123,16 @@ pub fn promote_needs_the_walker(run: RunId) -> String {
 
 /// MOD-42 plan D11, B-19: the window a graceful preempt gives a session's cancel.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+/// MOD-42 plan D11: how long past its grace a cancel's preempt waits for the walk to end.
+const CANCEL_SLACK: Duration = Duration::from_secs(1);
+
+/// MOD-125 M2 D2: how long past its grace a stop's preempt waits before the token drops the
+/// walk. After the driver's grace the relay still kills and reaps the agent, settles its
+/// permission rows, flushes its recorder, syncs the step and finishes; a drop mid-flush loses rows
+/// whose `seq` was taken (`relay.rs:758-760`). The wait ends as soon as the walk does, so a quick
+/// stop costs nothing.
+pub const STOP_SLACK: Duration = Duration::from_secs(5);
 
 /// OQ-6: the first delay before a run whose resume failed is resumed again.
 const BACKOFF_FIRST: Duration = Duration::from_secs(5);
@@ -245,6 +261,10 @@ struct Shared<P: ReplySink> {
     /// MOD-42 B-5: the run commands a task of this process is applying now, so the poll never
     /// applies a row the inline path (or an earlier tick) is still applying.
     applying: StdMutex<HashSet<RunCommandId>>,
+    /// MOD-125 M2 D4: the runs a stop task of this process is settling, with the strongest mode
+    /// asked so far. Not on `Walks::Parent`, which a preempt removes. Same or weaker mode: the
+    /// poll does nothing; `forced` over `graceful`: the walk is dropped at once (escalation).
+    stopping: StdMutex<HashMap<RunId, StopMode>>,
     /// MOD-24 D3 (B5): the live chats the last command poll was handed; the sweep's own cancels
     /// honour them as the poll does (D212). Always empty for the worker.
     last_live: StdMutex<LiveChats>,
@@ -631,6 +651,61 @@ impl<P: ReplySink> Shared<P> {
     }
 }
 
+/// What a polled stop of a run does (MOD-125 M2 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopTurn {
+    /// No stop task of this process settles the run: spawn one.
+    First,
+    /// `forced` over a `graceful` stop in flight: drop the walk now.
+    Escalate,
+    /// A stop task settles it already, in this mode or a stronger one: nothing.
+    InFlight,
+}
+
+impl<P: ReplySink> Shared<P> {
+    /// MOD-125 M2 D4: records `mode` for `run` and says what the poll does with it.
+    fn stop_turn(&self, run: RunId, mode: StopMode) -> StopTurn {
+        let mut map = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
+        match map.get(&run).copied() {
+            None => {
+                map.insert(run, mode);
+                StopTurn::First
+            }
+            Some(StopMode::Graceful) if mode == StopMode::Forced => {
+                map.insert(run, StopMode::Forced);
+                StopTurn::Escalate
+            }
+            Some(_) => StopTurn::InFlight,
+        }
+    }
+
+    /// MOD-125 M2 D3: the strongest mode asked of `run`'s stop in flight, an escalation's
+    /// included; `None` with no stop task of the run.
+    fn stop_mode(&self, run: RunId) -> Option<StopMode> {
+        self.stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&run)
+            .copied()
+    }
+}
+
+/// MOD-125 M2 D4: removes `run` from [`Shared::stopping`] however its stop task ends.
+struct StopInFlight<P: ReplySink> {
+    shared: Arc<Shared<P>>,
+    run: RunId,
+}
+
+impl<P: ReplySink> Drop for StopInFlight<P> {
+    fn drop(&mut self) {
+        self.shared
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.run);
+    }
+}
+
 /// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll
 /// and wakes whoever awaits it (MOD-24 D3).
 struct Applying<'a> {
@@ -776,11 +851,12 @@ impl Walks {
     }
 
     /// MOD-42 plan D11 (R-38): `Cancel { grace }` to every walk of `run`; wait until none is live
-    /// or `grace + 1 s`; then [`Self::preempt`] as before (a walk still live is dropped hard). The
-    /// parent stays in the map while this waits, so a walk that looks its control up meanwhile
-    /// reads the cancel, and a task queued for the run's lock is refused. Whether there was a
-    /// parent.
-    async fn preempt_gracefully(&self, run: RunId, grace: Duration) -> bool {
+    /// or `grace + slack` ([`CANCEL_SLACK`] for a cancel or a promotion, [`STOP_SLACK`] for a
+    /// workspace stop, MOD-125 M2 D2); then [`Self::preempt`] as before (a walk still live is
+    /// dropped hard). The parent stays in the map while this waits, so a walk that looks its
+    /// control up meanwhile reads the cancel, and a task queued for the run's lock is refused.
+    /// Whether there was a parent.
+    async fn preempt_gracefully(&self, run: RunId, grace: Duration, slack: Duration) -> bool {
         let live = {
             let walks = self.lock();
             let Some(parent) = walks.get(&run) else {
@@ -789,7 +865,7 @@ impl Walks {
             parent.signal.send_replace(Signal::Cancel { grace });
             Arc::clone(&parent.live)
         };
-        let deadline = tokio::time::Instant::now() + grace + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + grace + slack;
         while live.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1261,6 +1337,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
                 applying: StdMutex::default(),
+                stopping: StdMutex::default(),
                 last_live: StdMutex::default(),
                 applied: Notify::new(),
                 cancel_grace: CANCEL_GRACE,
@@ -2171,6 +2248,9 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// every ready entry stopped by the spend gate), the batch closes `drained` like an empty one,
 /// unless a run of its own is live; a later `Q` then waits for `P`. A tick with no free slot, a
 /// failed read and an enqueue refusal never close.
+///
+/// MOD-125 M2 D8: an entry of a stopped workspace is skipped, and a batch whose only
+/// admissible-looking entries are such is not drained.
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2288,10 +2368,46 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .iter()
         .map(|entry| (entry.item_id, entry.workspace_id))
         .collect();
+    // MOD-125 M2 D8: one stop read per distinct workspace of the ordered entries. A stopped
+    // workspace's entries stay queued and untouched, and do not count toward the `Stalled` drain:
+    // a stop never closes a batch. (No writer: `Kit::read` below fails as it always has.)
+    let mut stopped: HashSet<WorkspaceId> = HashSet::new();
+    if let Some(writer) = host.writer() {
+        let mut read: HashSet<WorkspaceId> = HashSet::new();
+        for workspace in order
+            .iter()
+            .filter_map(|item| workspace_of.get(item).copied().flatten())
+        {
+            if !read.insert(workspace) {
+                continue;
+            }
+            match htui_core::store::WorkerStore::workspace_stop(&writer, workspace).await {
+                Ok(Some(_)) => {
+                    stopped.insert(workspace);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    shared.queue_read_failed("reading a workspace's stop", &err);
+                    return;
+                }
+            }
+        }
+    }
+    let mut held = 0_usize;
     // `None`: the project read as absent.
     let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
     let mut admissible = Vec::with_capacity(order.len());
     for item in order {
+        if workspace_of
+            .get(&item)
+            .copied()
+            .flatten()
+            .is_some_and(|ws| stopped.contains(&ws))
+        {
+            held += 1;
+            tracing::debug!(batch = %batch.id, %item, "the entry's workspace is stopped; it stays queued");
+            continue;
+        }
         let Some(&project) = project_of.get(&item) else {
             continue;
         };
@@ -2322,6 +2438,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     shared.queue_reads_ok();
     if admissible.is_empty() {
+        // MOD-125 M2 D8: an entry a workspace stop holds keeps the batch open.
+        if held > 0 {
+            return;
+        }
         // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
         // an absent project.
         drain(ctx, &batch, Drain::Stalled, &seen).await;
@@ -2864,9 +2984,21 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
     }
     if preempt == Preempt::IfLive && ctx.shared.walks.is_live(run) {
+        // MOD-125 M2 D7 (+ Q1): `p` in a stopped workspace is refused before it preempts, on the
+        // row read before the lock, so a stop in flight keeps its own grace and `STOP_SLACK`. A
+        // cancel preempts all the same; the check under the lock below still covers a stop that
+        // lands meanwhile.
+        if matches!(command, Command::PromoteStep { .. })
+            && let Some(writer) = ctx.host.writer()
+            && let Some(refusal) =
+                stopped_workspace_refusal(&ctx.host, &writer, early.as_ref()).await
+        {
+            ctx.refuse(refusal);
+            return None;
+        }
         ctx.shared
             .walks
-            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .preempt_gracefully(run, ctx.shared.cancel_grace, CANCEL_SLACK)
             .await;
     }
     let walk = ctx.shared.walks.child(run);
@@ -2891,6 +3023,21 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     // `project_id` never changes, so the row read before the lock stands in for a failed one.
     let row = ctx.tag_run(&kit.writer, run).await.or(early);
+    // MOD-125 M2 D7 (+ Q1): the walking commands, `p` included, wait for the workspace's resume.
+    // `R` is the claim's refusal (M1), and `c`, `C` and `T` walk nothing.
+    if matches!(
+        command,
+        Command::AnswerGate { .. }
+            | Command::RetryStep { .. }
+            | Command::SelectFanout { .. }
+            | Command::AcceptArtifact { .. }
+            | Command::PromoteStep { .. }
+    ) && let Some(refusal) =
+        stopped_workspace_refusal(&ctx.host, &kit.writer, row.as_ref()).await
+    {
+        ctx.refuse(refusal);
+        return None;
+    }
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     let promoting = matches!(command, Command::PromoteStep { .. });
@@ -3092,7 +3239,7 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         // D12 step 3: this process walks it.
         ctx.shared
             .walks
-            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .preempt_gracefully(run, ctx.shared.cancel_grace, CANCEL_SLACK)
             .await;
     } else if row.executing_box_id != Some(box_id) {
         // D12 step 4, decided before `cancel_leased` (whose refusal there is `RunStatus`).
@@ -3157,7 +3304,8 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// MOD-42 plan D13: one command poll. Every pending row this process may apply
 /// (`pending_commands(owner, box)`, B-4), unless a task of this process is applying it already
-/// (B-5), runs as an internal cancel on a supervised task of its own.
+/// (B-5), runs as an internal cancel on a supervised task of its own; and every pending workspace
+/// stop (`pending_stops(owner)`, MOD-125 M2 D4) runs as [`stop_walk`] on a task of its own.
 async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     live: LiveChats,
@@ -3182,6 +3330,7 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
                 return;
             }
         };
+    let cancelling: HashSet<RunId> = rows.iter().map(|row| row.run_id).collect();
     for row in rows {
         if ctx.shared.is_applying(row.id) {
             continue;
@@ -3193,6 +3342,132 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
         spawn_supervised(task.clone(), async move {
             cancel_run(task, row.run_id, &live, Some(row.id)).await;
         });
+    }
+    // MOD-125 M2 D4: the stops this process applies, after the cancels. A run with a pending
+    // cancel in this listing is left to it (blueprint F9): the cancel's task applies first, and the
+    // next poll no longer lists a cancelled run.
+    let stops = match htui_core::store::WorkerStore::pending_stops(&writer, ctx.shared.owner).await
+    {
+        Ok(stops) => stops,
+        Err(err) => {
+            tracing::warn!(%err, "reading the pending workspace stops failed");
+            return;
+        }
+    };
+    for stop in stops {
+        if cancelling.contains(&stop.run) {
+            continue;
+        }
+        match ctx.shared.stop_turn(stop.run, stop.mode) {
+            StopTurn::InFlight => {}
+            // D2: the relay does not re-read its control inside `cancel`, so a forced stop over a
+            // graceful one in flight is the token drop, now; the first task then settles.
+            StopTurn::Escalate => {
+                ctx.shared.walks.preempt(stop.run);
+            }
+            StopTurn::First => {
+                let task = ctx.unaddressed("stop_run");
+                let in_flight = StopInFlight {
+                    shared: Arc::clone(&ctx.shared),
+                    run: stop.run,
+                };
+                spawn_supervised(task.clone(), async move {
+                    stop_walk(task, stop.run, stop.mode, in_flight).await;
+                });
+            }
+        }
+    }
+}
+
+/// MOD-125 M2 D4: one run's workspace stop. A live walk of the run is preempted through the
+/// cancel seam — `Cancel { grace }`, graceful = the runtime's cancel grace, forced = zero — and its
+/// token drops at grace + [`STOP_SLACK`]; the walk publishes its own `PREEMPTED` and runs
+/// `abandoned`. Then, under the run's lock (taken directly, not through a walk token, so an
+/// escalation's `preempt` reaches only the walk, blueprint F10), `Engine::settle_stop` — unless a
+/// cancel of the run is pending by then: D4's pending cancel wins, and a cancel requested while
+/// the stop waited out its grace is not in the poll's listing F9 skips on, so the task reads the
+/// same rows (`pending_commands(owner, box)`) and leaves the run to it here. A run leased here
+/// with no live walk goes straight to the settle. Every failure is logged: the stop row stays,
+/// so the next poll retries.
+async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    mode: StopMode,
+    _in_flight: StopInFlight<P>,
+) {
+    let _ = ctx.tag.run.set(run);
+    if ctx.shared.walks.is_live(run) {
+        let grace = match mode {
+            StopMode::Graceful => ctx.shared.cancel_grace,
+            StopMode::Forced => Duration::ZERO,
+        };
+        ctx.shared
+            .walks
+            .preempt_gracefully(run, grace, STOP_SLACK)
+            .await;
+    }
+    let guard = ctx.shared.locks.lock(run).await;
+    if ctx.shared.walks.closed() {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%run, %message, "a stop could not build its engine; the next poll retries");
+            return;
+        }
+    };
+    match htui_core::store::WorkerStore::pending_commands(&kit.writer, ctx.shared.owner, kit.box_id)
+        .await
+    {
+        Ok(rows) if rows.iter().any(|row| row.run_id == run) => {
+            tracing::debug!(%run, "a cancel of the run is pending: the stop leaves the run to it");
+            return;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(%run, %err, "a stop could not read the pending cancels; the next poll retries");
+            return;
+        }
+    }
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match Box::pin(engine.settle_stop(run)).await {
+        Ok(true) => {
+            // D3: the line is the stop's only record of its mode, so it names the mode applied:
+            // `forced` once an escalation reached the walk, though this task was spawned graceful.
+            let mode = ctx.shared.stop_mode(run).unwrap_or(mode);
+            tracing::info!(%run, %mode, "run {run} stopped ({mode})");
+        }
+        Ok(false) => {
+            tracing::debug!(%run, "the stop found the run no longer running under this process");
+        }
+        Err(err) => tracing::warn!(%run, %err, "settling a stop failed; the next poll retries"),
+    }
+    drop(guard);
+}
+
+/// MOD-125 M2 D7: the refusal of a walking command on `row`, when its workspace is stopped. A
+/// store failure refuses too (fail closed), in its own words.
+async fn stopped_workspace_refusal<H: htui_core::store::WorkerHost>(
+    host: &H,
+    writer: &H::Store,
+    row: Option<&Run>,
+) -> Option<String> {
+    let workspace = row?.workspace_id?;
+    match htui_core::store::WorkerStore::workspace_stop(writer, workspace).await {
+        Ok(None) => None,
+        Ok(Some(_)) => {
+            let slug = host.workspaces().await.ok().and_then(|all| {
+                all.into_iter()
+                    .find(|ws| ws.workspace_id == workspace)
+                    .map(|ws| ws.slug)
+            });
+            Some(workspace_is_stopped(
+                slug.as_deref().unwrap_or(&workspace.to_string()),
+            ))
+        }
+        Err(err) => Some(err.to_string()),
     }
 }
 
@@ -3236,6 +3511,14 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
     };
     if engine.unblock_case(item).await.ok() != Some(case) {
         return ctx.refuse(UNBLOCK_MOVED.to_owned());
+    }
+    // MOD-125 M2 D7 (blueprint F11): the resume case walks, so it waits for the workspace's resume.
+    if matches!(case, UnblockCase::Resume(_)) {
+        let row = ctx.tag_run(&kit.writer, run).await;
+        if let Some(refusal) = stopped_workspace_refusal(&ctx.host, &kit.writer, row.as_ref()).await
+        {
+            return ctx.refuse(refusal);
+        }
     }
     match walked(&walk, engine.dispatch(Command::Unblock { item })).await {
         // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
@@ -3425,6 +3708,19 @@ pub mod testing {
                 .iter()
                 .copied()
                 .collect()
+        }
+
+        /// How many tracked tasks working on `run` have not finished (MOD-125 M2: a walk and its
+        /// stop task).
+        #[must_use]
+        pub fn tasks_on(&self, run: RunId) -> usize {
+            self.0
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|task| task.tag.run.get() == Some(&run) && !task.handle.is_finished())
+                .count()
         }
 
         /// Whether every tracked task has finished.
