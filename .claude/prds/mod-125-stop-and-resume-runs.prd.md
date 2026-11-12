@@ -129,10 +129,10 @@ Decisions taken at the PRD gate (maintainer, 2026-10-18):
 ## Open Questions
 
 - [ ] Do runs created before the migration get a workspace? A project in one workspace is clear. A project in several is not; leaving them unscoped (never stopped by a workspace stop) is the likely answer. TBD — settle in `/plan`.
-- [ ] Mapping onto ACP and the CLI adapter (the HANDOFF line asks for this to be settled in the plan): which cancel path the graceful stop reuses, and how a CLI respawn with `--resume` redoes the turn. TBD — `/plan` fact-check against `acp/mod.rs` and `cli/mod.rs`.
+- [ ] Mapping onto ACP and the CLI adapter (the HANDOFF line asks for this to be settled in the plan): which cancel path the graceful stop reuses, and how a CLI respawn with `--resume` redoes the turn. TBD — `/plan` fact-check against `acp/mod.rs` and `cli/mod.rs`. **Cancel half settled by M2 D2** (graceful = `Cancel{CANCEL_GRACE}`, forced = `Cancel{0}` + token drop at `STOP_SLACK`); the `--resume` redo stays M3's.
 - [ ] Where the resumable session id is read from: the banner row, or a new column. TBD — `/plan`.
 - [ ] How ANA-2's state table and MOD-24's "no mid-step resume" are amended in the docs (amendment wording). TBD — `/plan`.
-- [ ] M1 review findings deferred (R1, 2026-10-19; detail in the M1 plan's "Deferred review findings"): M-3 `delete_workspace` refuses while the workspace has stopped runs (M2); L-3 a readable refusal for a deleted workspace's foreign keys, no fallback to `None` (M2); L-7 `select_fanout`'s loser and judge lists gain `stopped` (M3) and whether a stopped workspace's queued runs count against `admit`'s `free_slots` (M2); L-5 raise the minimum binary/schema version before any `stop_workspace` caller ships (M2); L-6 `queue_entry.workspace_id` stays unindexed (note).
+- [ ] M1 review findings deferred (R1, 2026-10-19; detail in the M1 plan's "Deferred review findings"): M-3 `delete_workspace` refuses while the workspace has stopped runs (M2); L-3 a readable refusal for a deleted workspace's foreign keys, no fallback to `None` (M2); L-7 `select_fanout`'s loser and judge lists gain `stopped` (M3) and whether a stopped workspace's queued runs count against `admit`'s `free_slots` (M2); L-5 raise the minimum binary/schema version before any `stop_workspace` caller ships (M2); L-6 `queue_entry.workspace_id` stays unindexed (note). M2 landed M-3 (D9), L-3 (D10), L-7's `admit` half (D8) and L-5 (D11 a); L-7's `select_fanout` half (M3) and L-6 remain.
 
 ## Risks
 

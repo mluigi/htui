@@ -704,11 +704,20 @@ recovery sweep's settlement; the "who" column names the milestone that first wri
 
 | from | event | guard | to | who |
 |---|---|---|---|---|
-| `running` | workspace stop applied | - | `stopped` | orchestrator (M2) |
+| `running` | workspace stop applied | - | `stopped` | orchestrator (executor's command poll, M2) |
 | `running` | lease expired, workspace stopped | recovery sweep (§4.9), MOD-125 D6 | `stopped` | recovery sweep |
 | `stopped` | resume | session reopened or rerun fresh | `running` | orchestrator (M3) |
 | `stopped` | cancel | - | `cancelled` | user (M3) |
 | `stopped` | resume impossible and no rerun | - | `failed` | orchestrator (M3) |
+
+*Amended by MOD-125 M2, 2026-11-12 (plan D1-D4, `.claude/plans/mod-125-m2-stop-applied.plan.md`):*
+the "workspace stop applied" row is written by the process that leases the run. Its command poll
+(every `COMMAND_POLL`, TUI and worker alike) lists `pending_stops(owner)`, its `running` runs whose
+workspace has a `workspace_stop` row, and interrupts each walk through the cancel seam (graceful:
+`Cancel { CANCEL_GRACE }`; forced: `Cancel { 0 }`; the token drops at grace + `STOP_SLACK` = 5 s, at
+once on an escalation). It then retakes the lease and calls `stop_run` (`Engine::settle_stop`).
+Trees, branch and the session banner stay; there is no `finished_at`. A pending cancel of the run
+wins; a run whose lease lapsed is the sweep's row below.
 
 `run.status` is **derived from its steps** at every step transition, except `queued` (set at insert)
 and `cancelled` (only a human sets it). That derivation is the single reason the two machines cannot
@@ -756,12 +765,21 @@ its list of who writes `superseded`.
 
 | from | event | guard | to | who |
 |---|---|---|---|---|
-| `running` | workspace stop applied | - | `stopped` | orchestrator (M2) |
+| `running` | workspace stop applied | - | `stopped` | orchestrator (executor's command poll, M2) |
 | `running` | lease expired, workspace stopped | recovery sweep | `stopped` | recovery sweep |
 | `stopped` | resume | session reopened | `running` | orchestrator (M3) |
 | `stopped` | resume cannot reopen the session | fresh rerun inserted | `superseded` | orchestrator (M3) |
 | `stopped` | run cancelled | - | `cancelled` | orchestrator |
 | `stopped` | run failed | - | `failed` | orchestrator |
+
+*Amended by MOD-125 M2, 2026-11-12 (plan D1-D4, `.claude/plans/mod-125-m2-stop-applied.plan.md`):*
+the "workspace stop applied" row is written by the process that leases the run. Its command poll
+(every `COMMAND_POLL`, TUI and worker alike) lists `pending_stops(owner)`, its `running` runs whose
+workspace has a `workspace_stop` row, and interrupts each walk through the cancel seam (graceful:
+`Cancel { CANCEL_GRACE }`; forced: `Cancel { 0 }`; the token drops at grace + `STOP_SLACK` = 5 s, at
+once on an escalation). It then retakes the lease and calls `stop_run` (`Engine::settle_stop`).
+Trees, branch and the session banner stay; there is no `finished_at`. A pending cancel of the run
+wins; a run whose lease lapsed is the sweep's row below. `pending` parts of a divided step stay `pending` (D6).
 
 This narrows MOD-24's "no mid-step resume" and §4.9's rejected re-attach. Crash recovery is
 unchanged: a lapsed lease in a workspace that is not stopped is still adjudicated from durable
