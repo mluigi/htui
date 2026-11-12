@@ -2302,9 +2302,11 @@ pub trait WriteStore: ReadStore {
     /// `lease_owner = owner` (live or lapsed, as [`pending_commands`](Self::pending_commands)'
     /// owner arm) and whose `workspace_id` has a `workspace_stop` row, with that row's mode, in
     /// `(queued_at, id)` order. A run without a workspace, a parked, queued or stopped run, and
-    /// another owner's run are never listed: a lapsed lease is the sweep's (`adopt_runs` settles
-    /// it, M1 D6), and a run leased elsewhere is that process's poll. No row is written: the
-    /// request is the `workspace_stop` row itself.
+    /// another owner's run are never listed: another owner's lapsed lease is the sweep's
+    /// (`adopt_runs` settles it, M1 D6), and its live one is that process's poll. The owner's own
+    /// lapsed lease is listed, as in `pending_commands`: `settle_stop`'s `take_lease` and the
+    /// sweep converge on that run. No row is written: the request is the `workspace_stop` row
+    /// itself.
     ///
     /// # Errors
     /// The backend's own failures only.
