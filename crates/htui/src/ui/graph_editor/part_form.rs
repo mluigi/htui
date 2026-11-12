@@ -166,18 +166,24 @@ impl PartForm {
     }
 
     /// The focused choice row moves one option, wrapping: the agent over none and the step's
-    /// candidates, the persona over none and the registry. A current value the options lack is
-    /// kept as the last option. A text row does nothing.
+    /// candidates (one a step lists twice is offered once), the persona over none and the
+    /// registry. A current value the options lack is kept as the last option. A text row does
+    /// nothing.
     pub(crate) fn cycle(&mut self, forward: bool, lookups: &Lookups) {
         match self.focus {
             AGENT => {
-                let mut options: Vec<Option<Seat>> = core::iter::once(None)
-                    .chain(self.candidates.iter().map(|(agent, model)| {
+                let seats = self
+                    .candidates
+                    .iter()
+                    .map(|(agent, model)| {
                         Some((*agent, (!model.is_empty()).then(|| model.clone())))
-                    }))
-                    .collect();
-                if !options.contains(&self.agent) {
-                    options.push(self.agent.clone());
+                    })
+                    .chain(core::iter::once(self.agent.clone()));
+                let mut options: Vec<Option<Seat>> = vec![None];
+                for seat in seats {
+                    if !options.contains(&seat) {
+                        options.push(seat);
+                    }
                 }
                 self.agent = step(&options, &self.agent, forward);
             }
@@ -431,6 +437,29 @@ mod tests {
         form.focus = AGENT;
         form.cycle(true, &lookups);
         assert_eq!(form.agent, None);
+    }
+
+    #[test]
+    fn a_candidate_the_step_lists_twice_is_offered_once() {
+        let lookups = lookups();
+        let mut twice = candidates();
+        twice.insert(1, (ids::AGENT_CLAUDE, "opus".to_owned()));
+        let mut form = PartForm::new(None, PartTarget::New, twice);
+        form.focus = AGENT;
+        let opus = Some((ids::AGENT_CLAUDE, Some("opus".to_owned())));
+        let agy = Some((ids::AGENT_AGY, None));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            form.cycle(true, &lookups);
+            seen.push(form.agent.clone());
+        }
+        assert_eq!(seen, [opus.clone(), agy.clone(), None], "forward");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            form.cycle(false, &lookups);
+            seen.push(form.agent.clone());
+        }
+        assert_eq!(seen, [agy, opus, None], "back");
     }
 
     #[test]
