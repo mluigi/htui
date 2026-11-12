@@ -11245,6 +11245,227 @@ async fn plant_queue_facts<S: htui_core::store::WriteStore>(store: &S, facts: &Q
     }
 }
 
+/// MOD-150 D3: two pools propose `a parent b` and `b parent a` at once. The advisory lock
+/// serialises the two walks, so exactly one lands and the other is refused with its own
+/// `parent_cycle`; exactly one live parent link joins the pair. Without the lock both walks would
+/// read a graph with neither link under READ COMMITTED and both rows would land, a cycle. Ten
+/// rounds, each on two fresh items with an unleased run and one step each.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_opposite_parents_close_no_cycle() {
+    use htui_core::model::LinkKind;
+    use htui_core::model::link::ProposeLink;
+    use htui_core::store::{StoreError, parent_cycle};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let left = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let right = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    for round in 0..10 {
+        let mut pair = Vec::new();
+        for side in ["a", "b"] {
+            let item = db
+                .store
+                .mint_item(race_item(
+                    ids::KIND_HTUI_FEAT,
+                    &format!("round {round} {side}"),
+                ))
+                .await
+                .expect("mint the round's item")
+                .id;
+            let run = db
+                .store
+                .create_run(race_run(item))
+                .await
+                .expect("queue a graph run")
+                .id;
+            let step = db
+                .store
+                .create_step(htui_core::model::NewRunStep {
+                    id: StepId::new(),
+                    run_id: run,
+                    position: 0,
+                    attempt: 1,
+                    fanout_index: 0,
+                    phase_name: "implement".to_owned(),
+                    agent_id: Some(ids::AGENT_CLAUDE),
+                    model: None,
+                    role: StepRole::Step,
+                    parent_step_id: None,
+                    node_key: None,
+                })
+                .await
+                .expect("create the round's step")
+                .id;
+            pair.push((item, step));
+        }
+        let [(a, step_a), (b, step_b)] = pair[..] else {
+            unreachable!("round {round}: two items")
+        };
+        let up = ProposeLink {
+            from: a,
+            to: b,
+            kind: LinkKind::Parent,
+            step: step_a,
+        };
+        let down = ProposeLink {
+            from: b,
+            to: a,
+            kind: LinkKind::Parent,
+            step: step_b,
+        };
+
+        let (first, second) = tokio::join!(
+            left.propose_link(StepFence::Unleased, up),
+            right.propose_link(StepFence::Unleased, down),
+        );
+        match (&first, &second) {
+            (Ok(_), Err(StoreError::Constraint(refusal))) => assert_eq!(
+                *refusal,
+                parent_cycle(b, a),
+                "round {round}: b parent a lost and names its own cycle"
+            ),
+            (Err(StoreError::Constraint(refusal)), Ok(_)) => assert_eq!(
+                *refusal,
+                parent_cycle(a, b),
+                "round {round}: a parent b lost and names its own cycle"
+            ),
+            other => panic!("round {round}: exactly one parent lands, got {other:?}"),
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_link WHERE kind = 'parent' AND deleted_at IS NULL \
+             AND from_item_id = ANY($1)",
+        )
+        .bind(vec![a.as_uuid(), b.as_uuid()])
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the pair's live parent links");
+        assert_eq!(live, 1, "round {round}: one live parent link, no cycle");
+    }
+
+    left.close().await;
+    right.close().await;
+    db.drop_db().await;
+}
+
+/// MOD-150 D6 (blueprint deviation 3): the inherent `ready_items` and `queue_rows` read only
+/// `blocked_by`, so a `parent`, a `duplicates` and an `implements` link to a running or blocked
+/// item change neither, on Postgres (before and after a raw insert) or on `MemStore` (a store
+/// loaded with the three links against one without).
+#[tokio::test(flavor = "multi_thread")]
+async fn new_link_kinds_never_gate_ready_items_or_queue_rows() {
+    use htui_core::model::{ItemLink, LinkKind};
+    use htui_core::store::MemStore;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let links = [
+        (ids::AGY_FEAT_1, LinkKind::Parent, ids::HTUI_FEAT_1),
+        (ids::AGY_FIX_1, LinkKind::Duplicates, ids::HTUI_FEAT_2),
+        (ids::HTUI_ANA_2, LinkKind::Implements, ids::HTUI_FEAT_1),
+    ];
+    let bare = MemStore::demo();
+    let mut data = htui_core::fixtures::demo_data();
+    for (from, kind, to) in links {
+        data.links.push(ItemLink {
+            from_item_id: from,
+            to_item_id: to,
+            kind,
+            proposed_by_step_id: None,
+            created_at: at,
+            updated_at: at,
+            deleted_at: None,
+        });
+    }
+    let linked = MemStore::from_demo(data);
+    let queued = [ids::AGY_FEAT_1, ids::AGY_FIX_1, ids::HTUI_ANA_2];
+    for item in queued {
+        pg.queue_item(item, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue on Postgres");
+        for mem in [&bare, &linked] {
+            mem.queue_item(item, ids::BOX, None, ids::USER, at)
+                .await
+                .expect("queue on MemStore");
+        }
+    }
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    };
+
+    let ready_before = pg.ready_items(&scope, ids::BOX).await.expect("ready_items");
+    let rows_before = pg.queue_rows(ids::BOX).await.expect("queue_rows");
+    assert_eq!(
+        rows_before.len(),
+        queued.len(),
+        "the three queued items are the box's queue"
+    );
+    for (from, kind, to) in links {
+        sqlx::query(
+            "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(from.as_uuid())
+        .bind(to.as_uuid())
+        .bind(kind.as_str())
+        .bind(at)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert {from} {kind} {to}: {err}"));
+    }
+    assert_eq!(
+        pg.ready_items(&scope, ids::BOX).await.expect("ready_items"),
+        ready_before,
+        "Postgres: the new kinds leave ready_items alone"
+    );
+    assert_eq!(
+        pg.queue_rows(ids::BOX).await.expect("queue_rows"),
+        rows_before,
+        "Postgres: the new kinds leave queue_rows, open_blockers included, alone"
+    );
+
+    assert_eq!(
+        linked
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("ready_items"),
+        bare.ready_items(&scope, ids::BOX)
+            .await
+            .expect("ready_items"),
+        "MemStore: the new kinds leave ready_items alone"
+    );
+    let bare_rows = bare.queue_rows(ids::BOX).await.expect("queue_rows");
+    let linked_rows = linked.queue_rows(ids::BOX).await.expect("queue_rows");
+    assert_eq!(
+        linked_rows
+            .iter()
+            .map(|row| &row.open_blockers)
+            .collect::<Vec<_>>(),
+        bare_rows
+            .iter()
+            .map(|row| &row.open_blockers)
+            .collect::<Vec<_>>(),
+        "MemStore: no new kind is an open blocker"
+    );
+    assert_eq!(
+        linked_rows, bare_rows,
+        "MemStore: the new kinds leave queue_rows alone"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-12 M3 D6: the same planted runs, steps, notes and edges answer the same `queue_rows` on
 /// both stores, fixture rows included: the latest graph run with its target hostname and first
 /// parked step, the latest note, the open blockers in byte order, all in D2 order.
