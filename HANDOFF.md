@@ -1122,6 +1122,18 @@ MOD-159 and MOD-164. Pins: store conformance `CASES` 255 (`htui-core/tests/mem_s
   `[graph_editor]`/`[graph_editor.links]` (redo `U`/`ctrl-r`, candidate add/remove `alt-n`/`alt-d`). Review R1
   fixed undo past a refused entry, a landed write read as failed, and a gesture outliving the canvas. Gate green
   but for 25 sandbox Qdrant timeouts (owed on the host). M2, M3 open.
+  **Phase M2 landed (`hr/MOD-141` `427f7690`, 2026-11-12):** the step form edits split (none, divide, and
+  compete only while the new App-rung switch `compete_fan_out` is on; a compete step is read-only and
+  kept byte for byte while it is off), fan-out, judge, the deadline, palette, plan scope, the divide columns
+  and the default parts through a part form (`alt-e`; owned paths split by `skill_glob::split_list`; a key
+  refuses `/` and `@`). `StepGraphPhase` carries `deadline_seconds`, `judge_agent_id` and `judge_model`;
+  both stores write them, and resolve reads the step first. `notes` gives resolve's own sentences
+  as warnings that never block a save; a noted step is `! name` on the canvas. The header shows the run
+  limits (`run_bounds`) read-only. Tightening them is MOD-171; review follow-ups are MOD-172..174. Plan
+  `.claude/plans/mod-141-m2-splits-palette-header.plan.md` (+ blueprint, outcomes W1-W8). Gate red only on
+  25 sandbox Qdrant timeouts and two htui-agent timing tests that pass alone; Qdrant and the merged-tree
+  Postgres gate are owed on the host. Upgrade note: a keys file binding `alt-e` in a stack the step form
+  shares (e.g. `[global] find`) is now refused at start (MOD-173). M3 open.
 - [ ] **MOD-142 - Runs pane for divided and planned runs** (from ANA-33, `docs/ANA-33.md` §7.10, §10). `R-TUI-4`,
   `R-ORCH-11`. `RunSummary` carries the decoded v2 graph and `run_plan` rows; the step list groups planner, parts and
   integrate as a tree with each part's key, agent and state, offline from the mirrored `role`, `parent_step_id` and

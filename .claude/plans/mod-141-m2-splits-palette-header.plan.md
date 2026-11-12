@@ -302,7 +302,12 @@ bash scripts/gate.sh                                     # full gate; sandbox Qd
 
 ## Acceptance
 
-- [ ] All tasks complete, TDD (tests first)
-- [ ] Validation passes (the sandbox's Qdrant/Postgres-live failures are recorded and owed on the host)
-- [ ] Patterns mirrored, not reinvented
-- [ ] The PRD's M2 metrics hold: every M2 node field round-trips, every saved divide that resolve accepts resolves, compete stays hidden while the switch is off, zero hardcoded keys
+**Status: complete (2026-11-12, `hr/MOD-141` `427f7690`).** T1-T9 and review round R1. Deviations from
+this plan are in the blueprint's corrections C1-C15 and outcomes W1-W8. Review follow-ups: MOD-172
+(part keys at admission and in the store), MOD-173 (new key defaults give way), MOD-174 (editor polish).
+
+- [x] All tasks complete, TDD (tests first)
+- [x] Validation passes (the sandbox's Qdrant/Postgres-live failures are recorded and owed on the host).
+  The gate's test step fails only on 25 Qdrant timeouts and two htui-agent timing tests that pass alone.
+- [x] Patterns mirrored, not reinvented
+- [x] The PRD's M2 metrics hold: every M2 node field round-trips, every saved divide that resolve accepts resolves, compete stays hidden while the switch is off, zero hardcoded keys
