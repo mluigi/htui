@@ -16,6 +16,12 @@ use crate::ui::{FieldOutcome, TextField, Theme};
 /// The key left empty.
 pub(crate) const PART_KEY_REQUIRED: &str = "`key` is required";
 
+/// A key holding `/` or `@`: a run names a part `{step}/{key}`, with `@{revision}` past revision
+/// 0, and reads its key back after the last `/` (htui-orch `divide::part_phase_name`,
+/// `divide::part_key`). `a/b` would read back as `b`, and `api@1` at revision 0 would share its
+/// name with `api` at revision 1.
+pub(crate) const PART_KEY_CHARS: &str = "`key` may not hold `/` or `@`";
+
 /// A key another part of the same step already has (`phase_part`'s key is unique in its phase).
 pub(crate) fn part_key_taken(key: &str) -> String {
     format!("`key` {key} is taken by another part of this step")
@@ -205,11 +211,14 @@ impl PartForm {
     /// step's other parts, whose keys this one may not take.
     ///
     /// # Errors
-    /// [`PART_KEY_REQUIRED`], or [`part_key_taken`].
+    /// [`PART_KEY_REQUIRED`], [`PART_KEY_CHARS`], or [`part_key_taken`].
     pub(crate) fn build(&self, phase: PhaseId, others: &[PhasePart]) -> Result<PhasePart, String> {
         let key = text_of(&self.key);
         if key.is_empty() {
             return Err(PART_KEY_REQUIRED.to_owned());
+        }
+        if key.contains(['/', '@']) {
+            return Err(PART_KEY_CHARS.to_owned());
         }
         if others.iter().any(|part| part.key == key) {
             return Err(part_key_taken(key));
@@ -355,6 +364,37 @@ mod tests {
             form.build(phase(), &[part("UI")]).map(|part| part.key),
             Ok("ui".to_owned())
         );
+    }
+
+    /// Review R1 F2: a run names a part `{step}/{key}`, `{step}/{key}@{revision}` past revision
+    /// 0, and reads the key back after the last `/`. A key holding `/` would be read back as
+    /// another key, and `api@1` at revision 0 would be `api` at revision 1, so both are refused,
+    /// after the empty check and before the taken one.
+    #[test]
+    fn a_part_key_holds_no_slash_and_no_at() {
+        let mut form = blank();
+        for typed in ["a/b", " api@1 ", "/", "@", "ui/", "@ui"] {
+            set_text(&mut form, KEY, typed);
+            assert_eq!(
+                form.build(phase(), &[]),
+                Err(PART_KEY_CHARS.to_owned()),
+                "{typed:?}"
+            );
+        }
+        set_text(&mut form, KEY, "a/b");
+        assert_eq!(
+            form.build(phase(), &[part("a/b")]),
+            Err(PART_KEY_CHARS.to_owned()),
+            "refused before the taken check"
+        );
+        for typed in ["api-1", "api_1", "api.v1", "api 1", "Api"] {
+            set_text(&mut form, KEY, typed);
+            assert_eq!(
+                form.build(phase(), &[]).map(|part| part.key),
+                Ok(typed.to_owned()),
+                "{typed:?}"
+            );
+        }
     }
 
     #[test]
