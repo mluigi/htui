@@ -267,6 +267,13 @@ pub trait Orchestrate {
     /// live session. Out of the blueprint's §4.5 list, and needed (MOD-139 M2 R1, F-7): a case
     /// that pins what a cancel does to a parts round has to send one while a part is live.
     fn cancel_walks(&self, grace: std::time::Duration);
+
+    /// MOD-125 M2 D3: `Engine::settle_stop`, the executor's settlement after its walk of `run`
+    /// was preempted (a case drops or cancels the walk first).
+    ///
+    /// # Errors
+    /// As `Engine::settle_stop`.
+    async fn settle_stop(&self, run: RunId) -> Result<bool, EngineError>;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -409,6 +416,10 @@ impl Orchestrate for FakeOrchestrator {
 
     fn cancel_walks(&self, grace: std::time::Duration) {
         Self::cancel_walks(self, grace);
+    }
+
+    async fn settle_stop(&self, run: RunId) -> Result<bool, EngineError> {
+        Box::pin(crate::engine::settle_stop_fake(self, run)).await
     }
 }
 
@@ -1032,6 +1043,12 @@ pub const CASES: &[&str] = &[
     // in integrate's recovery fails the run as the walk does.
     "an_exhausted_integrate_park_is_rejected_not_retried",
     "an_integrate_read_error_on_recovery_fails_the_run",
+    // MOD-125 M2: a stop of a divided step (plan D6): the live row stops, a queued part stays
+    // `pending`, and nothing is cleaned up.
+    "a_stop_during_the_planner_stops_the_planner",
+    "a_stop_during_a_part_stops_it_and_leaves_the_queued_part_pending",
+    "a_stop_during_the_pre_merge_stops_the_integrate_step",
+    "a_stop_during_integrate_stops_the_integrate_step",
 ];
 
 /// Run one case by name.
@@ -1072,6 +1089,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| divided_case(name, harness))
         .or_else(|| divided_recovery_case(name, harness))
         .or_else(|| integrate_case(name, harness))
+        .or_else(|| stop_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -16902,6 +16920,198 @@ async fn an_integrate_read_error_on_recovery_fails_the_run<H: CaseHarness>(harne
     );
 }
 
+// -- MOD-125 M2: a stop of a divided step (plan D6) ----------------------------------------------
+
+/// MOD-125 M2's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn stop_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_stop_during_the_planner_stops_the_planner" => {
+            Box::pin(a_stop_during_the_planner_stops_the_planner(harness))
+        }
+        "a_stop_during_a_part_stops_it_and_leaves_the_queued_part_pending" => {
+            Box::pin(a_stop_during_a_part_stops_it_and_leaves_the_queued_part_pending(harness))
+        }
+        "a_stop_during_the_pre_merge_stops_the_integrate_step" => Box::pin(
+            a_stop_during_the_pre_merge_stops_the_integrate_step(harness),
+        ),
+        "a_stop_during_integrate_stops_the_integrate_step" => {
+            Box::pin(a_stop_during_integrate_stops_the_integrate_step(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// That the executor's settlement of a preempted `run` stops it: `settle_stop` answers `true`,
+/// the run is `stopped` and not finished, no `cleanup_walk` ran (trees and branch kept, M1 D2),
+/// and a second `settle_stop` writes nothing.
+async fn settled_stopped<O: Orchestrate>(orch: &O, run: RunId) {
+    let settled = orch.settle_stop(run).await;
+    assert!(matches!(settled, Ok(true)), "the stop settles: {settled:?}");
+    let row = run_of(orch, run).await;
+    assert_eq!(
+        (row.status, row.finished_at),
+        (RunStatus::Stopped, None),
+        "stopped, not finished"
+    );
+    assert_eq!(orch.isolator().cleanups(), 0, "no `cleanup_walk`");
+    let again = orch.settle_stop(run).await;
+    assert!(
+        matches!(again, Ok(false)),
+        "a second stop writes nothing: {again:?}"
+    );
+    assert_eq!(
+        run_of(orch, run).await,
+        row,
+        "the second stop wrote nothing"
+    );
+}
+
+/// MOD-125 M2 D6: a stop while the planner row is `running`. The planner runs admission, not a
+/// session (MOD-139 M2 D2), so no hold reaches it: the walk that leaves it `running` is one whose
+/// admission write failed (`MemFault::AdmitPlan`, as `a_crash_before_admission_re_admits_on_the_
+/// same_planner_row`), which gave the lease back. The settle stops the planner row; no part row
+/// was created and no plan admitted.
+async fn a_stop_during_the_planner_stops_the_planner<H: CaseHarness>(harness: &H) {
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    divided_width_one(&orch).await;
+    orch.store().set_fault(MemFault::AdmitPlan, true);
+    let (run, result) = start_divided(&orch).await;
+    assert!(
+        matches!(result, Err(EngineError::Store(StoreError::Unreachable(_)))),
+        "{result:?}"
+    );
+    orch.store().set_fault(MemFault::AdmitPlan, false);
+    let planner = planner_of(&steps_of(&orch, run).await);
+    assert_eq!(
+        (planner.attempt, planner.status),
+        (1, StepStatus::Running),
+        "the planner is live"
+    );
+
+    settled_stopped(&orch, run).await;
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        planner_of(&steps).status,
+        StepStatus::Stopped,
+        "the planner row stops"
+    );
+    assert!(
+        parts_of(&steps, planner.id).is_empty(),
+        "no part row: {steps:?}"
+    );
+    assert!(plans_of(&orch, run).await.is_empty(), "no plan admitted");
+}
+
+/// MOD-125 M2 D6: a stop while the round's first part is live: the live part stops, the queued
+/// one stays `pending`, never prepared or started (as on a cancel), and the planner stays `done`.
+async fn a_stop_during_a_part_stops_it_and_leaves_the_queued_part_pending<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    divided_width_one(&orch).await;
+    let hold = orch.hold_sessions(&[("implement/api", 1)]);
+    let run = orch
+        .enqueue(ids::HTUI_FEAT_3)
+        .await
+        .expect("resolve takes the divided graph");
+    let cancel = async {
+        within(hold.live(1), "`api` held").await;
+        orch.cancel_walks(std::time::Duration::from_millis(10));
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), cancel);
+    assert!(
+        matches!(&result, Err(EngineError::Cancelled { run: stopped }) if *stopped == run),
+        "{result:?}"
+    );
+
+    settled_stopped(&orch, run).await;
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        part_named(&steps, "implement/api").status,
+        StepStatus::Stopped,
+        "the live part stops"
+    );
+    assert_eq!(
+        planner_of(&steps).status,
+        StepStatus::Done,
+        "the planner stays done"
+    );
+    assert_ui_never_pulled(&orch, run).await;
+}
+
+/// MOD-125 M2 D6: a stop while the walk sits in integrate's pre-merge (an isolator call, so only
+/// the token drop reaches it: the forced or escalated shape; the lease stays this owner's): the
+/// integrate row stops, both parts stay `done`, and the pre-merge was asked once.
+async fn a_stop_during_the_pre_merge_stops_the_integrate_step<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    primary_repo(&orch).await;
+    let stall = orch.isolator().stall_nth_premerge(1);
+    let run = crash_divided(&orch, &[stall]).await;
+    let integrate = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(
+        (integrate.attempt, integrate.status),
+        (1, StepStatus::Running)
+    );
+    assert!(
+        orch.spec_for(&session("implement", 0)).is_none(),
+        "the drop beat the integrate session"
+    );
+
+    settled_stopped(&orch, run).await;
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        integrate_of(&steps).status,
+        StepStatus::Stopped,
+        "the integrate row stops"
+    );
+    for part in ["implement/api", "implement/ui"] {
+        assert_eq!(
+            part_named(&steps, part).status,
+            StepStatus::Done,
+            "{part} stays done"
+        );
+    }
+    assert_eq!(orch.isolator().premerge_requests().len(), 1);
+}
+
+/// MOD-125 M2 D6: a stop while integrate's session is live (the walk dropped after its `done`,
+/// before the settle): the integrate row stops, the parts stay `done`, nothing is cleaned up.
+async fn a_stop_during_integrate_stops_the_integrate_step<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let stalled = orch.stall_after_done("implement", 1, None, false);
+    let run = crash_divided(&orch, &[stalled]).await;
+    assert_eq!(
+        integrate_of(&steps_of(&orch, run).await).status,
+        StepStatus::Running
+    );
+
+    settled_stopped(&orch, run).await;
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        integrate_of(&steps).status,
+        StepStatus::Stopped,
+        "the integrate row stops"
+    );
+    for part in ["implement/api", "implement/ui"] {
+        assert_eq!(
+            part_named(&steps, part).status,
+            StepStatus::Done,
+            "{part} stays done"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -16926,8 +17136,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            230,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            234,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -17017,7 +17227,8 @@ mod tests {
              fourteen integrate cases (plan D1-D9, Confirm 2(a), 3, ruling R-1, and T3 repair 2's \
              skip refused over a park that outranks the post-check), and MOD-139 M3 R1's two \
              (rulings R-5, R-6: an exhausted `integrate_incomplete` park rejected, not retried, \
-             and a read error in integrate's recovery failing the run as the walk does)"
+             and a read error in integrate's recovery failing the run as the walk does), and \
+             MOD-125 M2's four divided-step stops (plan D6) 234"
         );
     }
 
