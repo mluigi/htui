@@ -1740,8 +1740,25 @@ async fn every_m2_node_field_round_trips() {
         );
         for chord in &case.chords {
             if chord == "SAVE" {
+                // Review R1 C-L5: the mid-case save went out and was stored, so what the next
+                // write changes is a stored part, not a draft.
                 bench.key(&mut section, "enter");
-                let _ = bench_round(&bench, &mut section, &backend).await;
+                let served = bench_round(&bench, &mut section, &backend).await;
+                let frame = bench.render_section(&section, 100);
+                assert!(
+                    served
+                        .iter()
+                        .any(|request| matches!(request, StoreRequest::ReplaceGraph { .. })),
+                    "{}: the first save went out: {frame}",
+                    case.column
+                );
+                assert!(frame.contains("saved: "), "{}: {frame}", case.column);
+                assert_ne!(
+                    shape(&body_of(&store, ANALYSIS).await),
+                    shape(&before),
+                    "{}: the first save was stored",
+                    case.column
+                );
             } else {
                 bench.key(&mut section, chord);
             }
