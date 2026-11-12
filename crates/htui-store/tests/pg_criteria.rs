@@ -11359,8 +11359,10 @@ async fn two_concurrent_opposite_parents_close_no_cycle() {
 /// pools at once. `ON CONFLICT (from, to, kind)` absorbs only a primary-key conflict: a loser that
 /// passed the pre-check beside the winner trips `uq_item_link_one_canonical` instead and answers
 /// 23505, a constraint refusal for what D4 calls an idempotent upsert. The per-item advisory lock
-/// serialises the proposals, so every one succeeds and exactly one live row lands. Twenty-five
-/// rounds of eight proposals, each round on two fresh items with an unleased run and one step.
+/// serialises the proposals, so every one succeeds and exactly one live row lands. A hundred
+/// rounds of eight proposals, each round on two fresh items with an unleased run and one step; the
+/// eight run as spawned tasks released together by a barrier, so a missing lock fails nearly every
+/// run (review R1 repair: twenty-five `join_all` rounds still passed one run in three).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_identical_duplicates_all_land_one_row() {
     use htui_core::model::LinkKind;
@@ -11379,7 +11381,7 @@ async fn concurrent_identical_duplicates_all_land_one_row() {
         );
     }
 
-    for round in 0..25 {
+    for round in 0..100 {
         let x = db
             .store
             .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} x")))
@@ -11423,15 +11425,21 @@ async fn concurrent_identical_duplicates_all_land_one_row() {
             step,
         };
 
-        let answers = join_all(
-            pools
-                .iter()
-                .cycle()
-                .take(8)
-                .map(|pool| pool.propose_link(StepFence::Unleased, link)),
-        )
-        .await;
-        for answer in answers {
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let racers: Vec<_> = pools
+            .iter()
+            .cycle()
+            .take(8)
+            .map(|pool| {
+                let (pool, start) = (pool.clone(), std::sync::Arc::clone(&start));
+                tokio::spawn(async move {
+                    start.wait().await;
+                    pool.propose_link(StepFence::Unleased, link).await
+                })
+            })
+            .collect();
+        for racer in join_all(racers).await {
+            let answer = racer.expect("a racing proposal task completes");
             let row = answer.unwrap_or_else(|error| {
                 panic!("round {round}: every identical proposal is an upsert, got {error:?}")
             });
