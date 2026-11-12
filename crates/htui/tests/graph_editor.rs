@@ -462,7 +462,7 @@ async fn bench_round(
 }
 
 /// A Kinds section over `store` (the bench's scope's catalogue delivered), with the graph editor
-/// open on [`ANALYSIS`] from its kind row and its agents and templates read.
+/// open on [`ANALYSIS`] from its kind row and its agents, templates and settings read.
 async fn analysis_bench(
     store: &MemStore,
     keys: Option<htui::keys::Keys>,
@@ -484,9 +484,13 @@ async fn analysis_bench(
     assert!(
         matches!(
             read.as_slice(),
-            [StoreRequest::Agents, StoreRequest::Templates(_)]
+            [
+                StoreRequest::Agents,
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings
+            ]
         ),
-        "the editor opened and read its lookups: {read:?}"
+        "the editor opened and read its lookups and settings: {read:?}"
     );
     assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
     (bench, section, backend)

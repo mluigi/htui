@@ -3471,11 +3471,15 @@ fn cursor_row(bench: &SectionBench, section: &KindsSection) -> String {
     text.clone()
 }
 
-/// Answers the editor's two reads (`Agents`, `Templates`) from the demo world, as the worker would.
+/// Answers the editor's three reads (`Agents`, `Templates`, `GraphEditorSettings`) from the demo
+/// world, as the worker would.
 async fn answer_lookups(bench: &SectionBench, section: &mut KindsSection) {
     let backend = demo();
     for request in store_requests(bench) {
-        if matches!(request, StoreRequest::Agents | StoreRequest::Templates(_)) {
+        if matches!(
+            request,
+            StoreRequest::Agents | StoreRequest::Templates(_) | StoreRequest::GraphEditorSettings
+        ) {
             let reply = serve(&backend, &request).await;
             bench.reply(section, &reply);
         }
@@ -3499,7 +3503,8 @@ async fn bench_with_unreferenced_analysis() -> (SectionBench, KindsSection) {
 const ANALYSIS_HEADER: &str = "analysis \u{b7} project graph \u{b7} revision";
 
 /// MOD-141 D3: `Enter` on a graph row opens the editor over the section; it asks for the agents
-/// and the templates its step form picks from, and the section's keys are the editor's.
+/// and the templates its step form picks from, and (M2 D6) the run limits and the compete switch;
+/// the section's keys are the editor's.
 #[tokio::test]
 async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates() {
     let (bench, mut section) = bench_with_unreferenced_analysis().await;
@@ -3512,7 +3517,11 @@ async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates
     assert!(
         matches!(
             asked.as_slice(),
-            [StoreRequest::Agents, StoreRequest::Templates(asked_scope)] if *asked_scope == scope
+            [
+                StoreRequest::Agents,
+                StoreRequest::Templates(asked_scope),
+                StoreRequest::GraphEditorSettings
+            ] if *asked_scope == scope
         ),
         "{asked:?}"
     );
@@ -3530,7 +3539,8 @@ async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates
             [
                 StoreRequest::Catalogue(_),
                 StoreRequest::Agents,
-                StoreRequest::Templates(_)
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings
             ]
         ),
         "an open editor reads again on activation: {wanted:?}"
@@ -3575,7 +3585,11 @@ async fn e_on_a_phase_row_opens_its_step_form_in_the_editor() {
     assert!(
         matches!(
             asked.as_slice(),
-            [StoreRequest::Agents, StoreRequest::Templates(_)]
+            [
+                StoreRequest::Agents,
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings
+            ]
         ),
         "only the editor's reads: {asked:?}"
     );

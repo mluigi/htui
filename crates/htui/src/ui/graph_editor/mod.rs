@@ -47,7 +47,7 @@ use self::history::{History, Write};
 use self::links::Links;
 use self::node_form::{NodeForm, NodeRow, NodeTarget};
 use crate::app::{Ctx, Handled};
-use crate::catalogue::PersonaSummary;
+use crate::catalogue::{EditorSettings, PersonaSummary};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplatesSnapshot;
@@ -191,10 +191,44 @@ fn connecting(from: &str) -> String {
     format!("linking from {from}: pick the step it leads to")
 }
 
-/// The notice of a lookup read the store refused (`agents`, `templates`): the editor still works
-/// without it.
+/// The notice of a lookup read the store refused (`agents`, `templates`, the run limits): the
+/// editor still works without it.
 fn unavailable(what: &str, message: &str) -> String {
     format!("{what} unavailable: {message}")
+}
+
+/// The header's second line before the settings read answered (M2 D6).
+const LIMITS_NOT_READ: &str = "limits not read yet";
+
+/// The most rows the limits line takes under the header's first: it wraps rather than cut a
+/// number off.
+const LIMITS_ROWS: usize = 2;
+
+/// M2 D13: the run limits resolve freezes, read-only (M-1): exactly what a run would freeze.
+fn limits_line(settings: Option<&EditorSettings>) -> String {
+    settings.map_or_else(
+        || LIMITS_NOT_READ.to_owned(),
+        |settings| {
+            let bounds = &settings.bounds;
+            format!(
+                "limits \u{b7} fan-out {} \u{b7} agents {} \u{b7} plan revisions {} \u{b7} parallel {} \
+                 \u{b7} child runs {} \u{b7} run-time changes {}",
+                bounds.max_fan_out,
+                bounds.max_agents_per_run,
+                bounds.max_plan_revisions,
+                bounds.max_parallel_sessions,
+                bounds.max_child_runs,
+                bounds.runtime_changes.as_str(),
+            )
+        },
+    )
+}
+
+/// [`limits_line`] wrapped to `width`, at most [`LIMITS_ROWS`] rows.
+fn limits_rows(settings: Option<&EditorSettings>, width: u16) -> Vec<String> {
+    let mut rows = wrapped(&limits_line(settings), usize::from(width).max(1));
+    rows.truncate(LIMITS_ROWS);
+    rows
 }
 
 /// The canvas's keys.
@@ -342,6 +376,9 @@ pub struct GraphEditor {
     history: History,
     /// The personas, agents and templates (D1).
     lookups: Lookups,
+    /// The run limits and the compete switch (M2 D6, C8); `None` until the settings read
+    /// answered, which reads as the switch off and the limits not read.
+    settings: Option<EditorSettings>,
     /// The canvas; rataflow draws through `&mut`, so `render(&self)` borrows it.
     canvas: RefCell<Canvas>,
     /// The body, the selection or the lookups changed since the canvas last synced.
@@ -370,8 +407,8 @@ impl core::fmt::Debug for GraphEditor {
 
 impl GraphEditor {
     /// Opens on `body` with the host's persona registry, and answers the reads to send now:
-    /// `[StoreRequest::Agents, StoreRequest::Templates(scope)]`. Selects the first flow step
-    /// (position order), else none.
+    /// `[StoreRequest::Agents, StoreRequest::Templates(scope), StoreRequest::GraphEditorSettings]`.
+    /// Selects the first flow step (position order), else none.
     #[must_use]
     pub fn open(
         body: GraphBody,
@@ -389,6 +426,7 @@ impl GraphEditor {
                 agents: None,
                 templates: None,
             },
+            settings: None,
             canvas: RefCell::new(Canvas::new()),
             resync: Cell::new(true),
             canvas_area: Cell::new(None),
@@ -427,8 +465,7 @@ impl GraphEditor {
             self.refuse(NO_STEP_SELECTED);
             return;
         };
-        // MOD-141 M2 T8 passes the switch
-        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id), false);
+        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id), self.compete());
         self.mode = Mode::NodeForm(Box::new(NodeEditing {
             form,
             base: node.clone(),
@@ -436,10 +473,21 @@ impl GraphEditor {
         self.notice = None;
     }
 
-    /// The reads the host re-sends on activation: `Agents`, `Templates(scope)`.
+    /// The reads the host re-sends on activation: `Agents`, `Templates(scope)` and (M2 D6) the
+    /// run limits and the compete switch, `GraphEditorSettings`.
     #[must_use]
     pub fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Agents, StoreRequest::Templates(scope.clone())]
+        vec![
+            StoreRequest::Agents,
+            StoreRequest::Templates(scope.clone()),
+            StoreRequest::GraphEditorSettings,
+        ]
+    }
+
+    /// The compete switch as last read (M2 D5): off until the settings read answers. A step form
+    /// keeps the switch it opened with.
+    fn compete(&self) -> bool {
+        self.settings.is_some_and(|settings| settings.compete)
     }
 
     /// The persona registry changed (every catalogue the host adopts).
@@ -586,7 +634,7 @@ impl GraphEditor {
     }
 
     /// Every reply the host receives; the editor takes its own: its write's answer, and the
-    /// agents and templates it reads.
+    /// agents, templates and settings it reads.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::GraphReplaced { outcome, .. } => match outcome {
@@ -627,26 +675,38 @@ impl GraphEditor {
             StoreReply::Failed { request, message } if *request == "templates" => {
                 self.notice = Some(Notice::Info(unavailable("templates", message)));
             }
+            // M2 D6: the limits on the header, the switch for the next step form, and the
+            // canvas's markers, which need `max_fan_out`.
+            StoreReply::GraphEditorSettings(settings) => {
+                self.settings = Some(**settings);
+                self.resync.set(true);
+            }
+            StoreReply::Failed { request, message } if *request == "graph_editor_settings" => {
+                self.notice = Some(Notice::Info(unavailable("run limits", message)));
+            }
             _ => {}
         }
     }
 
-    /// Draws over the whole `area` (D2): the header, the canvas (and the open panel beside it),
-    /// then the notice or the delete question.
+    /// Draws over the whole `area` (D2): the header and its limits line (M2 D13), the canvas
+    /// (and the open panel beside it), then the notice or the delete question.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let mut bottom = self.bottom_lines(area.width, ctx);
         bottom.truncate(NOTICE_ROWS);
+        let mut heading = vec![Line::styled(self.header(ctx.keys()), theme.title)];
+        heading.extend(
+            limits_rows(self.settings.as_ref(), area.width)
+                .into_iter()
+                .map(|row| Line::styled(row, theme.dim)),
+        );
         let [header, middle, foot] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(u16::try_from(heading.len()).unwrap_or(1)),
             Constraint::Min(0),
             Constraint::Length(u16::try_from(bottom.len()).unwrap_or(0)),
         ])
         .areas(area);
-        frame.render_widget(
-            Paragraph::new(Line::styled(self.header(ctx.keys()), theme.title)),
-            header,
-        );
+        frame.render_widget(Paragraph::new(heading), header);
         let panel = match &self.mode {
             Mode::NodeForm(_) | Mode::EdgeForm(_) | Mode::Links(_) => true,
             Mode::Canvas | Mode::Connecting { .. } | Mode::ConfirmDelete { .. } => false,
@@ -817,7 +877,7 @@ impl GraphEditor {
                         NodeTarget::New {
                             after: self.selected,
                         },
-                        false,
+                        self.compete(),
                     );
                     self.mode = Mode::NodeForm(Box::new(NodeEditing { form, base }));
                     self.notice = None;
@@ -1263,7 +1323,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        EdgeId, NodeBody, PersonaId, ProjectRef, StepGraph, StepGraphEdge, StepGraphPhase,
+        EdgeId, NodeBody, PersonaId, ProjectRef, Split, StepGraph, StepGraphEdge, StepGraphPhase,
     };
     use htui_core::seed::{PhaseSeed, phase_row};
     use htui_core::store::{
@@ -1564,14 +1624,33 @@ mod tests {
         (*body, snapshot.personas.clone())
     }
 
+    /// The settings read's answer (M2 D6): the code defaults, the compete switch as given.
+    fn settings(compete: bool) -> StoreReply {
+        StoreReply::GraphEditorSettings(Box::new(EditorSettings {
+            bounds: htui_orch::graph::run_bounds(&std::collections::BTreeMap::new()),
+            compete,
+        }))
+    }
+
+    /// Line `n` of the editor drawn into 100x30.
+    fn drawn_line(bench: &Bench, editor: &GraphEditor, n: usize) -> String {
+        bench
+            .render(editor)
+            .lines()
+            .nth(n)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     #[tokio::test]
-    async fn opening_asks_for_agents_and_templates() {
+    async fn opening_asks_for_agents_templates_and_settings() {
         let bench = Bench::new().await;
         let (editor, requests) =
             GraphEditor::open(flow(0, GraphScope::Library, 0), Vec::new(), &bench.scope);
         let reads = vec![
             StoreRequest::Agents,
             StoreRequest::Templates(bench.scope.clone()),
+            StoreRequest::GraphEditorSettings,
         ];
         let reads = format!("{reads:?}");
         assert_eq!(format!("{requests:?}"), reads);
@@ -1580,6 +1659,109 @@ mod tests {
         assert_eq!(editor.selected, Some(phase(1)), "the first flow step");
         assert_eq!(editor.stack(), views::GRAPH_EDITOR);
         assert!(!editor.busy());
+    }
+
+    /// M2 D13: the header's second line is the run limits resolve freezes, read-only; before the
+    /// settings read answers it says so (D6).
+    #[tokio::test]
+    async fn the_header_shows_the_limits_once_read() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        assert_eq!(drawn_line(&bench, &editor, 1), LIMITS_NOT_READ);
+        bench.reply(&mut editor, &settings(false));
+        assert_eq!(
+            drawn_line(&bench, &editor, 1),
+            "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4 \
+             \u{b7} child runs 8 \u{b7} run-time changes ask"
+        );
+        assert!(
+            drawn_line(&bench, &editor, 0).starts_with("flow \u{b7} library graph"),
+            "the first line is the graph's"
+        );
+        // Narrower, it wraps rather than cut a number off.
+        let read = settings(false);
+        let StoreReply::GraphEditorSettings(read) = &read else {
+            unreachable!("a settings answer");
+        };
+        assert_eq!(
+            limits_rows(Some(read), 62),
+            [
+                "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4",
+                "\u{b7} child runs 8 \u{b7} run-time changes ask",
+            ]
+        );
+        assert_eq!(limits_rows(None, 60), [LIMITS_NOT_READ]);
+    }
+
+    /// M2 D6: a refused settings read is said like the other lookups', and the limits stay unread.
+    #[tokio::test]
+    async fn a_refused_settings_read_says_so() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        bench.reply(
+            &mut editor,
+            &StoreReply::Failed {
+                request: "graph_editor_settings",
+                message: "refused".to_owned(),
+            },
+        );
+        assert_eq!(
+            notice_text(&editor),
+            Some("run limits unavailable: refused")
+        );
+        assert_eq!(drawn_line(&bench, &editor, 1), LIMITS_NOT_READ);
+        assert!(bench.requests().is_empty(), "nothing asked again");
+    }
+
+    /// The split the step form holds after `e`, the focus on the split row and `presses` times
+    /// `l`; the form is cancelled after.
+    fn split_after(bench: &Bench, editor: &mut GraphEditor, presses: usize) -> Split {
+        bench.key(editor, "e");
+        // M1's 13 rows, the candidates' placeholder, the deadline and the palette.
+        bench.keys(editor, &["tab"; 16]);
+        bench.keys(editor, &vec!["l"; presses]);
+        let Mode::NodeForm(editing) = &editor.mode else {
+            panic!("the step form is open");
+        };
+        let split = editing
+            .form
+            .build(&editing.base, &editor.lookups)
+            .expect("the form builds")
+            .phase
+            .split;
+        bench.key(editor, "esc");
+        split
+    }
+
+    /// M2 D5, D7: compete is offered only once the settings read says the switch is on; until
+    /// then it is off. A form already open keeps the switch it opened with.
+    #[tokio::test]
+    async fn compete_is_offered_once_the_switch_reads_on() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        assert_eq!(split_after(&bench, &mut editor, 1), Split::Divide);
+        assert_eq!(
+            split_after(&bench, &mut editor, 2),
+            Split::None,
+            "not read yet: off"
+        );
+        bench.reply(&mut editor, &settings(false));
+        assert_eq!(split_after(&bench, &mut editor, 2), Split::None, "off");
+
+        // A form open while the switch reads on keeps it off.
+        bench.key(&mut editor, "e");
+        bench.reply(&mut editor, &settings(true));
+        bench.keys(&mut editor, &["tab"; 16]);
+        bench.keys(&mut editor, &["l", "l"]);
+        let Mode::NodeForm(editing) = &editor.mode else {
+            panic!("the step form is open");
+        };
+        let built = editing.form.build(&editing.base, &editor.lookups);
+        assert_eq!(built.map(|node| node.phase.split), Ok(Split::None));
+        bench.key(&mut editor, "esc");
+
+        assert_eq!(split_after(&bench, &mut editor, 2), Split::Compete, "on");
+        assert_eq!(split_after(&bench, &mut editor, 3), Split::None);
     }
 
     #[tokio::test]
