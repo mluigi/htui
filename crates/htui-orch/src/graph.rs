@@ -1667,12 +1667,14 @@ async fn snapshot_phase<G: GraphSource>(
         isolation,
         command_queue: phase.command_queue,
         verify_command: phase.verify_command.clone(),
-        // `StepGraphPhase` carries no `deadline_seconds` field at HEAD though `0003` added the
-        // column, so the chain starts one rung down, at the project (blueprint H-14). Adding the
-        // field is a model change and would touch `.sqlx`; it is recorded rather than fixed.
+        // MOD-141 M2 D3: the phase rung first (a positive column), then the project, the app and
+        // two hours. A NULL column resolves exactly as before, so no digest moves.
         deadline_seconds: Some(
-            settings
-                .step_deadline_seconds
+            phase
+                .deadline_seconds
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| u32::try_from(seconds).ok())
+                .or(settings.step_deadline_seconds)
                 .or_else(|| app_u32(app, "step_deadline_seconds"))
                 .unwrap_or(DEFAULT_DEADLINE_SECONDS),
         ),
@@ -1686,14 +1688,18 @@ async fn snapshot_phase<G: GraphSource>(
             .or_else(|| settings.token_budget.filter(|n| *n > 0))
             .or_else(|| app_i32(app, "token_budget")),
         candidates: candidates(source, phase, rung_one, settings, box_id).await?,
-        // `StepGraphPhase` carries no `judge_agent_id` / `judge_model` either (blueprint H-14), so
-        // this chain also starts at the project rung; `None` means human selection (§4.5).
-        judge: match settings.judge_agent_id {
+        // MOD-141 M2 D3: the phase's judge with its own model, else the project's with none;
+        // `None` means human selection (§4.5).
+        judge: match phase
+            .judge_agent_id
+            .map(|id| (id, phase.judge_model.clone()))
+            .or_else(|| settings.judge_agent_id.map(|id| (id, None)))
+        {
             None => None,
-            Some(id) => Some(SnapshotJudge {
+            Some((id, model)) => Some(SnapshotJudge {
                 agent_id: id,
                 agent_name: agent_name(source, &phase.name, id).await?,
-                model: None,
+                model,
                 template: judge_template(source, project).await?,
             }),
         },
@@ -2375,8 +2381,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
         // 120_000, so the project rung answers.
         assert_eq!(prd.token_budget, Some(120_000));
 
-        // `deadline_seconds`: no phase column exists at HEAD (blueprint H-14) and neither the
-        // project nor `app_setting` answers, so the built-in two hours does.
+        // `deadline_seconds`: the phase carries none, and neither does the project nor
+        // `app_setting`, so the built-in two hours answers.
         assert_eq!(prd.deadline_seconds, Some(7200));
 
         // `candidates`: rung 1, with `agent_name` denormalised off the registry.
@@ -2385,7 +2391,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(prd.candidates[0].agent_name, "claude");
         assert_eq!(prd.candidates[0].model, "sonnet");
 
-        // `judge_agent_id`: no phase column and no project setting, so none — human selection.
+        // `judge_agent_id`: no phase judge and no project judge, so none — human selection.
         assert_eq!(prd.judge, None);
 
         // The `app_setting` rungs of the envelope.
@@ -2421,7 +2427,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let judge = prd.judge.as_ref().expect("the project names a judge");
         assert_eq!(judge.agent_id, ids::AGENT_AGY);
         assert_eq!(judge.agent_name, "agy");
-        assert_eq!(judge.model, None, "no phase column carries a judge model");
+        assert_eq!(judge.model, None, "the project rung carries no model");
         assert_eq!(
             judge.template,
             Some(SnapshotTemplate {
@@ -2437,6 +2443,126 @@ question and not a test fix. Decide the version bump first, then paste the new d
             snapshot.topology, FEATURE_TOPOLOGY_V2,
             "a resolved value moving is a different topology, which is the point of the digest"
         );
+    }
+
+    /// MOD-141 M2 D3: a phase's own `deadline_seconds` answers before the project's; a phase
+    /// that carries none still reads the project rung.
+    #[tokio::test]
+    async fn the_phase_deadline_answers_before_the_project() {
+        let store = store_with_settings(json!({ "step_deadline_seconds": 600 }));
+        replace_feature(&store, |body| {
+            let prd = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "prd")
+                .expect("the feature graph has a prd phase");
+            prd.phase.deadline_seconds = Some(90);
+        })
+        .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the edited feature graph resolves")
+            .snapshot;
+
+        assert_eq!(snapshot.phases[0].name, "prd");
+        assert_eq!(
+            snapshot.phases[0].deadline_seconds,
+            Some(90),
+            "the phase rung answers first"
+        );
+        for phase in &snapshot.phases[1..] {
+            assert_eq!(
+                phase.deadline_seconds,
+                Some(600),
+                "`{}` carries no deadline, so the project rung answers",
+                phase.name
+            );
+        }
+    }
+
+    /// MOD-141 M2 D3: a phase's own judge answers with its own `judge_model`, before the
+    /// project's judge; a phase that names none falls through to the project's, with no model.
+    #[tokio::test]
+    async fn a_phase_judge_carries_its_model_and_beats_the_project_judge() {
+        let store = store_with_settings(json!({ "judge_agent_id": ids::AGENT_AGY }));
+        replace_feature(&store, |body| {
+            let implement = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has an implement phase");
+            implement.phase.judge_agent_id = Some(ids::AGENT_CLAUDE);
+            implement.phase.judge_model = Some("opus".to_owned());
+        })
+        .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the edited feature graph resolves")
+            .snapshot;
+        let judge_of = |name: &str| {
+            snapshot
+                .phases
+                .iter()
+                .find(|phase| phase.name == name)
+                .unwrap_or_else(|| panic!("the snapshot has a `{name}` phase"))
+                .judge
+                .clone()
+        };
+
+        let implement = judge_of("implement").expect("implement names its own judge");
+        assert_eq!(implement.agent_id, ids::AGENT_CLAUDE);
+        assert_eq!(implement.agent_name, "claude");
+        assert_eq!(
+            implement.model.as_deref(),
+            Some("opus"),
+            "the phase's judge carries the phase's model"
+        );
+        assert_eq!(
+            implement.template,
+            Some(SnapshotTemplate {
+                name: "judge".to_owned(),
+                version: 1
+            }),
+            "the seeded `judge` template is pinned whichever rung names the judge"
+        );
+
+        let prd = judge_of("prd").expect("prd falls through to the project's judge");
+        assert_eq!(prd.agent_id, ids::AGENT_AGY);
+        assert_eq!(prd.agent_name, "agy");
+        assert_eq!(prd.model, None, "the project rung carries no model");
+    }
+
+    /// MOD-141 M2 D3: the seeded phases carry no deadline and no judge, so the phase rung is
+    /// silent and resolve answers exactly as before: the same digest, two hours, no judge.
+    #[tokio::test]
+    async fn null_phase_columns_resolve_as_before() {
+        let store = MemStore::demo();
+        let stored = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            stored.iter().all(|phase| phase.deadline_seconds.is_none()
+                && phase.judge_agent_id.is_none()
+                && phase.judge_model.is_none()),
+            "every seeded phase leaves the three columns NULL"
+        );
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        assert_eq!(snapshot.v, GraphSnapshot::V, "{TOPOLOGY_MOVED}");
+        assert_eq!(snapshot.topology, FEATURE_TOPOLOGY_V2, "{TOPOLOGY_MOVED}");
+        for phase in &snapshot.phases {
+            assert_eq!(
+                phase.deadline_seconds,
+                Some(7200),
+                "`{}`: the built-in two hours",
+                phase.name
+            );
+            assert_eq!(phase.judge, None, "`{}`: human selection", phase.name);
+        }
     }
 
     /// An unrelated malformed key must not erase the caps: the lenient `ProjectSettings` decode
