@@ -4552,6 +4552,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// MOD-125 M2 R1 (review M-2): a cancel that lands during a graceful stop and whose own
+    /// graceful preempt ends first mints a fresh parent for its lock wait; the stop's preempt,
+    /// ending later, must not cancel that parent, or the user's cancel is answered `PREEMPTED`.
+    /// Deterministic: the test's child token stands in for the walk and keeps the stop's wait
+    /// (grace + `STOP_SLACK`) open past the cancel's (grace + 1 s); the test holds the run's lock,
+    /// so the cancel's `Waiting` frame says its fresh parent exists; only then does the "walk"
+    /// end, which ends the stop's wait.
+    #[tokio::test]
+    async fn a_cancel_during_a_graceful_stop_is_not_preempted_by_it() {
+        let fixture = Fixture::new().await;
+        let runtime = fixture
+            .runtime()
+            .with_cancel_grace(Duration::from_millis(100));
+        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
+        let probe = testing::probe(&runtime);
+        let walk = probe.walk_child(run);
+        let lock = probe.try_lock(run).expect("nobody holds the run's lock");
+        stop_platform(&fixture, StopMode::Graceful).await;
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        worker.send_at(
+            Origin::Tab(TabId("backlog")),
+            1,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        within("the stop task waiting on the walk", async {
+            while probe.tasks_on(run) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        frames(&mut worker);
+        let asked = worker.send(Origin::App, cancel(run));
+        within("the cancel's own preempt ending and its lock wait", async {
+            loop {
+                if frames(&mut worker).iter().any(|(_, _, frame)| {
+                    frame.run == Some(run) && matches!(frame.kind, FrameKind::Waiting)
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(walk);
+        // The stop's wait polls every 10 ms: it ends, and its preempt runs, well within this.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(lock);
+        assert!(
+            matches!(
+                outcome(worker.reply(asked).await),
+                CommandOutcome::Cancelled { .. }
+            ),
+            "the user's cancel is applied, not answered as preempted"
+        );
+        rests_at(&fixture, run, RunStatus::Cancelled).await;
+        within("the stop task ending", async {
+            while probe.tasks_on(run) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+    }
+
     /// D4 (blueprint F9): a pending cancel of a run in a stopped workspace wins: the poll leaves
     /// the stop to it, the run is `cancelled` and the row `applied`, whichever task runs first.
     /// Over a first poll the cancel's B-5 guard and the run's lock are held: a stop task would

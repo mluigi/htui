@@ -853,10 +853,11 @@ impl Walks {
 
     /// MOD-42 plan D11 (R-38): `Cancel { grace }` to every walk of `run`; wait until none is live
     /// or `grace + slack` ([`CANCEL_SLACK`] for a cancel or a promotion, [`STOP_SLACK`] for a
-    /// workspace stop, MOD-125 M2 D2); then [`Self::preempt`] as before (a walk still live is
-    /// dropped hard). The parent stays in the map while this waits, so a walk that looks its
-    /// control up meanwhile reads the cancel, and a task queued for the run's lock is refused.
-    /// Whether there was a parent.
+    /// workspace stop, MOD-125 M2 D2); then [`Self::preempt`]'s removal and cancel as before (a
+    /// walk still live is dropped hard), but only of the parent it signalled (MOD-125 M2 R1): a
+    /// parent minted after another preempt removed that one belongs to a later task. The parent
+    /// stays in the map while this waits, so a walk that looks its control up meanwhile reads the
+    /// cancel, and a task queued for the run's lock is refused. Whether it removed its parent.
     async fn preempt_gracefully(&self, run: RunId, grace: Duration, slack: Duration) -> bool {
         let live = {
             let walks = self.lock();
@@ -870,7 +871,21 @@ impl Walks {
         while live.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.preempt(run)
+        // MOD-125 M2 R1 (review M-2): only the parent this call signalled. Another preempt of the
+        // run (a cancel's, during a stop's longer wait) may have removed it already and its task
+        // minted a fresh one for its own lock wait; cancelling that would answer the later
+        // command `PREEMPTED`. One map lock decides and removes.
+        let parent = {
+            let mut walks = self.lock();
+            match walks.get(&run) {
+                Some(parent) if Arc::ptr_eq(&parent.live, &live) => walks.remove(&run),
+                _ => None,
+            }
+        };
+        parent.is_some_and(|parent| {
+            parent.token.cancel();
+            true
+        })
     }
 
     /// Whether a task of this process works on `run`.
