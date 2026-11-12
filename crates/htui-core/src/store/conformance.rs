@@ -70,6 +70,9 @@ use crate::store::traits::{
     withdrawn_requirement_cited,
 };
 use crate::store::traits::{
+    MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
+};
+use crate::store::traits::{
     back_asks_you_beside_another_asks_you, branch_is_not_an_object_of_booleans,
     forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
     loop_edge_runs_forward, workspace_graph_is_held,
@@ -390,6 +393,14 @@ pub const CASES: &[&str] = &[
     "a_judge_model_needs_a_judge_agent",
     "a_step_deadline_is_at_least_one_second",
     "a_phase_naming_no_judge_agent_is_refused",
+    // MOD-150 M1: link kinds (plan D2-D7)
+    "parent_is_single_valued",
+    "duplicates_is_single_valued",
+    "parent_refuses_a_cycle",
+    "parent_depth_is_at_most_eight",
+    "implements_links_like_relates",
+    "upstream_follows_parent",
+    "new_kinds_never_gate_readiness",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1224,6 +1235,13 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "a_phase_naming_no_judge_agent_is_refused" => {
             Box::pin(a_phase_naming_no_judge_agent_is_refused(store)).await;
         }
+        "parent_is_single_valued" => Box::pin(parent_is_single_valued(store)).await,
+        "duplicates_is_single_valued" => Box::pin(duplicates_is_single_valued(store)).await,
+        "parent_refuses_a_cycle" => Box::pin(parent_refuses_a_cycle(store)).await,
+        "parent_depth_is_at_most_eight" => Box::pin(parent_depth_is_at_most_eight(store)).await,
+        "implements_links_like_relates" => Box::pin(implements_links_like_relates(store)).await,
+        "upstream_follows_parent" => Box::pin(upstream_follows_parent(store)).await,
+        "new_kinds_never_gate_readiness" => Box::pin(new_kinds_never_gate_readiness(store)).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -30471,6 +30489,474 @@ async fn resolve_inputs_skips_part_documents<S: WriteStore>(store: &S) {
         vec![("implement", Some(written[1])), ("notes", Some(written[3]))],
         "{CASE}: the part's newer documents are skipped; the plain step's and the hand-written \
          one are read"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-150 M1: link kinds (plan D2-D7). `parent` and `duplicates` are single-valued, a `parent`
+// closes no cycle and makes no chain deeper than `MAX_PARENT_DEPTH`, `implements` links like
+// `relates`, `parent` walks upstream, and none of the three gates readiness.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-150: a fresh `htui` FEAT item, its id.
+async fn feat<S: WriteStore>(case: &str, store: &S, title: &str) -> ItemId {
+    store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, title))
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-150 D4: proposes `from --kind--> to` under the unleased fence a run of
+/// `agent_step(.., None)` writes under.
+async fn propose_unleased<S: WriteStore>(
+    store: &S,
+    from: ItemId,
+    kind: LinkKind,
+    to: ItemId,
+    step: StepId,
+) -> Result<crate::model::link::ItemLink, StoreError> {
+    store
+        .propose_link(
+            StepFence::Unleased,
+            ProposeLink {
+                from,
+                to,
+                kind,
+                step,
+            },
+        )
+        .await
+}
+
+/// MOD-150 D4: tombstones `from --kind--> to`, which `step` proposed.
+async fn withdraw_unleased<S: WriteStore>(
+    case: &str,
+    store: &S,
+    from: ItemId,
+    kind: LinkKind,
+    to: ItemId,
+    step: StepId,
+) {
+    let row = store
+        .withdraw_link(
+            StepFence::Unleased,
+            WithdrawLink {
+                from,
+                to,
+                kind,
+                step,
+            },
+        )
+        .await
+        .expect(case);
+    assert!(
+        row.deleted_at.is_some(),
+        "{case}: the withdraw tombstoned {from} {kind} {to}"
+    );
+}
+
+/// MOD-150 D4: the single-value rule of `kind` (`parent` or `duplicates`) on `HTUI_ANA_2`. A
+/// second live `to` is refused with `sentence(from, current)`; the same `to` again is an upsert;
+/// after the live one is withdrawn another goes live, and reviving the first one's tombstone
+/// while that one is live is refused like an insert.
+async fn single_valued<S: WriteStore>(
+    case: &str,
+    store: &S,
+    kind: LinkKind,
+    sentence: fn(ItemId, ItemId) -> String,
+) -> StepId {
+    let x = ids::HTUI_ANA_2;
+    let (_run, step) = agent_step(case, store, ids::PROJECT_HTUI, x, None).await;
+
+    let first = propose_unleased(store, x, kind, ids::HTUI_FEAT_1, step)
+        .await
+        .expect(case);
+    assert!(
+        live_link(case, store, x, ids::HTUI_FEAT_1, kind).await,
+        "{case}: the first {kind} link is live"
+    );
+    let again = propose_unleased(store, x, kind, ids::HTUI_FEAT_1, step)
+        .await
+        .expect(case);
+    assert_eq!(
+        (again.created_at, again.deleted_at),
+        (first.created_at, None),
+        "{case}: the same {kind} again is an upsert of the live row, never a second one"
+    );
+
+    constraint_exactly(
+        case,
+        propose_unleased(store, x, kind, ids::HTUI_FEAT_3, step).await,
+        &sentence(x, ids::HTUI_FEAT_1),
+        "a second live link of a single-valued kind",
+    );
+    assert!(
+        !live_link(case, store, x, ids::HTUI_FEAT_3, kind).await,
+        "{case}: the refused {kind} link wrote nothing"
+    );
+
+    withdraw_unleased(case, store, x, kind, ids::HTUI_FEAT_1, step).await;
+    propose_unleased(store, x, kind, ids::HTUI_FEAT_3, step)
+        .await
+        .expect(case);
+    assert!(
+        live_link(case, store, x, ids::HTUI_FEAT_3, kind).await,
+        "{case}: with the first withdrawn, another {kind} link goes live"
+    );
+
+    constraint_exactly(
+        case,
+        propose_unleased(store, x, kind, ids::HTUI_FEAT_1, step).await,
+        &sentence(x, ids::HTUI_FEAT_3),
+        "reviving a withdrawn link while another of its kind is live",
+    );
+    assert!(
+        !live_link(case, store, x, ids::HTUI_FEAT_1, kind).await,
+        "{case}: the refused revival left the tombstone a tombstone"
+    );
+    step
+}
+
+/// MOD-150 D4: an item has at most one live `parent`. The rule binds the kind only: a `relates`
+/// to the withdrawn parent is still fine.
+async fn parent_is_single_valued<S: WriteStore>(store: &S) {
+    const CASE: &str = "parent_is_single_valued";
+    let step = single_valued(CASE, store, LinkKind::Parent, second_parent).await;
+    propose_unleased(
+        store,
+        ids::HTUI_ANA_2,
+        LinkKind::Relates,
+        ids::HTUI_FEAT_1,
+        step,
+    )
+    .await
+    .expect(CASE);
+}
+
+/// MOD-150 D4: an item duplicates at most one live canonical item. A `parent` beside the live
+/// `duplicates` link is fine: kinds do not interfere.
+async fn duplicates_is_single_valued<S: WriteStore>(store: &S) {
+    const CASE: &str = "duplicates_is_single_valued";
+    let step = single_valued(CASE, store, LinkKind::Duplicates, second_canonical).await;
+    propose_unleased(
+        store,
+        ids::HTUI_ANA_2,
+        LinkKind::Parent,
+        ids::HTUI_FEAT_1,
+        step,
+    )
+    .await
+    .expect(CASE);
+    assert!(
+        live_link(
+            CASE,
+            store,
+            ids::HTUI_ANA_2,
+            ids::HTUI_FEAT_3,
+            LinkKind::Duplicates
+        )
+        .await,
+        "{CASE}: the duplicates link stays live beside the parent"
+    );
+}
+
+/// MOD-150 D4: a `parent` that would make an item its own ancestor is refused, two-long and
+/// three-long; only `parent` walks, so a `relates` back up is fine.
+async fn parent_refuses_a_cycle<S: WriteStore>(store: &S) {
+    const CASE: &str = "parent_refuses_a_cycle";
+    let mut items = Vec::new();
+    for title in ["a", "b", "c"] {
+        let item = feat(CASE, store, title).await;
+        let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, item, None).await;
+        items.push((item, step));
+    }
+    let [(a, step_a), (b, step_b), (c, step_c)] = items[..] else {
+        unreachable!("{CASE}: three items")
+    };
+
+    propose_unleased(store, a, LinkKind::Parent, b, step_a)
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        propose_unleased(store, b, LinkKind::Parent, a, step_b).await,
+        &parent_cycle(b, a),
+        "b parent a while a parent b",
+    );
+    assert!(
+        !live_link(CASE, store, b, a, LinkKind::Parent).await,
+        "{CASE}: the two-long cycle wrote nothing"
+    );
+
+    propose_unleased(store, b, LinkKind::Parent, c, step_b)
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        propose_unleased(store, c, LinkKind::Parent, a, step_c).await,
+        &parent_cycle(c, a),
+        "c parent a under a parent b parent c",
+    );
+    assert!(
+        !live_link(CASE, store, c, a, LinkKind::Parent).await,
+        "{CASE}: the three-long cycle wrote nothing"
+    );
+
+    propose_unleased(store, c, LinkKind::Relates, a, step_c)
+        .await
+        .expect(CASE);
+}
+
+/// MOD-150 D2: a parent chain holds at most eight items. Attaching a subtree counts its height:
+/// a two-high subtree fits under a six-deep chain and not under a seven-deep one.
+async fn parent_depth_is_at_most_eight<S: WriteStore>(store: &S) {
+    const CASE: &str = "parent_depth_is_at_most_eight";
+    assert_eq!(MAX_PARENT_DEPTH, 8, "{CASE}: the case is written for eight");
+    let mut chain = Vec::new();
+    for index in 0..9 {
+        let item = feat(CASE, store, &format!("chain {index}")).await;
+        let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, item, None).await;
+        chain.push((item, step));
+    }
+    for k in 1..8 {
+        propose_unleased(
+            store,
+            chain[k].0,
+            LinkKind::Parent,
+            chain[k - 1].0,
+            chain[k].1,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: link {k} of the chain: {err:?}"));
+    }
+    constraint_exactly(
+        CASE,
+        propose_unleased(store, chain[8].0, LinkKind::Parent, chain[7].0, chain[8].1).await,
+        &parent_too_deep(9),
+        "a ninth item under a chain of eight",
+    );
+    assert!(
+        !live_link(CASE, store, chain[8].0, chain[7].0, LinkKind::Parent).await,
+        "{CASE}: the too-deep link wrote nothing"
+    );
+
+    let j1 = feat(CASE, store, "subtree top").await;
+    let (_run, step_j1) = agent_step(CASE, store, ids::PROJECT_HTUI, j1, None).await;
+    let j2 = feat(CASE, store, "subtree child").await;
+    let (_run, step_j2) = agent_step(CASE, store, ids::PROJECT_HTUI, j2, None).await;
+    propose_unleased(store, j2, LinkKind::Parent, j1, step_j2)
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        propose_unleased(store, j1, LinkKind::Parent, chain[6].0, step_j1).await,
+        &parent_too_deep(9),
+        "a two-high subtree under the seventh item",
+    );
+    propose_unleased(store, j1, LinkKind::Parent, chain[5].0, step_j1)
+        .await
+        .expect(CASE);
+    assert!(
+        live_link(CASE, store, j1, chain[5].0, LinkKind::Parent).await
+            && !live_link(CASE, store, j1, chain[6].0, LinkKind::Parent).await,
+        "{CASE}: six plus two is eight, the boundary, and only that link is live"
+    );
+}
+
+/// MOD-150 D4: `implements` follows `relates`' rules: many live per item, an upsert keeps the
+/// row and its proposer, reach is checked, and a withdraw tombstones.
+async fn implements_links_like_relates<S: WriteStore>(store: &S) {
+    const CASE: &str = "implements_links_like_relates";
+    let x = ids::HTUI_ANA_2;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+    let feat_1 = propose_unleased(store, x, LinkKind::Implements, ids::HTUI_FEAT_1, step)
+        .await
+        .expect(CASE);
+    propose_unleased(store, x, LinkKind::Implements, ids::HTUI_FEAT_3, step)
+        .await
+        .expect(CASE);
+    assert!(
+        live_link(CASE, store, x, ids::HTUI_FEAT_1, LinkKind::Implements).await
+            && live_link(CASE, store, x, ids::HTUI_FEAT_3, LinkKind::Implements).await,
+        "{CASE}: implements is not single-valued"
+    );
+
+    let later = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let again = propose_unleased(store, x, LinkKind::Implements, ids::HTUI_FEAT_1, later)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            again.created_at,
+            again.proposed_by_step_id,
+            again.deleted_at
+        ),
+        (feat_1.created_at, Some(step), None),
+        "{CASE}: re-proposing upserts the live row and keeps its proposer"
+    );
+
+    constraint_exactly(
+        CASE,
+        propose_unleased(store, x, LinkKind::Implements, ids::VULKAN_FEAT_1, step).await,
+        &link_outside_reach(ids::VULKAN_FEAT_1),
+        "an implements link outside the run's reach",
+    );
+
+    withdraw_unleased(CASE, store, x, LinkKind::Implements, ids::HTUI_FEAT_3, step).await;
+    assert!(
+        !live_link(CASE, store, x, ids::HTUI_FEAT_3, LinkKind::Implements).await
+            && live_link(CASE, store, x, ids::HTUI_FEAT_1, LinkKind::Implements).await,
+        "{CASE}: the withdraw tombstoned one link and left the other"
+    );
+}
+
+/// MOD-150 D6: the upstream walk follows `parent` like `blocked_by` and `origin`, two hops out;
+/// an item reached both as an ancestor and as a blocker appears once, at its minimum depth.
+async fn upstream_follows_parent<S: WriteStore>(store: &S) {
+    const CASE: &str = "upstream_follows_parent";
+    let mut items = Vec::new();
+    for title in ["child", "parent", "grandparent", "great-grandparent"] {
+        items.push(feat(CASE, store, title).await);
+    }
+    let [c, p, g, gg] = items[..] else {
+        unreachable!("{CASE}: four items")
+    };
+    let mut steps = Vec::new();
+    for (from, to) in [(c, p), (p, g), (g, gg)] {
+        let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, from, None).await;
+        propose_unleased(store, from, LinkKind::Parent, to, step)
+            .await
+            .expect(CASE);
+        steps.push(step);
+    }
+    let scope = PromptScope::project_only(ids::PROJECT_HTUI);
+    let up = async |hops: u8| -> Vec<(ItemId, u8)> {
+        store
+            .upstream_summaries(c, hops, &scope)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|entry| (entry.item_id, entry.depth))
+            .collect()
+    };
+
+    assert_eq!(
+        up(2).await,
+        [(p, 1), (g, 2)],
+        "{CASE}: the parent and the grandparent; the great-grandparent is three hops out"
+    );
+    assert_eq!(up(1).await, [(p, 1)], "{CASE}: one hop is the parent");
+
+    for to in [g, p] {
+        propose_unleased(store, c, LinkKind::BlockedBy, to, steps[0])
+            .await
+            .expect(CASE);
+    }
+    assert_eq!(
+        up(2).await,
+        [(p, 1), (g, 1), (gg, 2)],
+        "{CASE}: an item reached as an ancestor and as a blocker appears once, at its minimum \
+         depth, in canonical order; the great-grandparent is now two hops out, through g"
+    );
+}
+
+/// MOD-150 D6: `parent`, `duplicates` and `implements` never gate readiness. The control, a
+/// `blocked_by` to the same running item, does, so the case can see gating.
+async fn new_kinds_never_gate_readiness<S: WriteStore>(store: &S) {
+    const CASE: &str = "new_kinds_never_gate_readiness";
+    let scope = platform_scope();
+    let ready = async || {
+        row_ids(
+            &store
+                .items(
+                    &scope,
+                    &ItemFilter {
+                        ready: Some(true),
+                        ..ItemFilter::default()
+                    },
+                )
+                .await
+                .expect(CASE),
+        )
+    };
+    let states = async || {
+        store
+            .items(&scope, &ItemFilter::default())
+            .await
+            .expect(CASE)
+    };
+    let ready_before = ready().await;
+    let states_before = states().await;
+    assert_eq!(
+        ready_before,
+        [ids::HTUI_ANA_2, ids::AGY_FEAT_1, ids::AGY_FIX_1],
+        "{CASE}: the fixture's ready items"
+    );
+
+    // HTUI_FEAT_1 is running and FEAT_2 blocked: a `blocked_by` to either would gate.
+    for (from, project, kind, to) in [
+        (
+            ids::AGY_FEAT_1,
+            ids::PROJECT_AGY,
+            LinkKind::Parent,
+            ids::HTUI_FEAT_1,
+        ),
+        (
+            ids::AGY_FIX_1,
+            ids::PROJECT_AGY,
+            LinkKind::Duplicates,
+            ids::HTUI_FEAT_2,
+        ),
+        (
+            ids::HTUI_ANA_2,
+            ids::PROJECT_HTUI,
+            LinkKind::Implements,
+            ids::HTUI_FEAT_1,
+        ),
+    ] {
+        let (run, step) = agent_step(CASE, store, project, from, None).await;
+        propose_unleased(store, from, kind, to, step)
+            .await
+            .expect(CASE);
+        store
+            .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+            .await
+            .expect(CASE);
+    }
+    assert_eq!(
+        ready().await,
+        ready_before,
+        "{CASE}: the new kinds leave the ready items alone"
+    );
+    assert_eq!(
+        states().await,
+        states_before,
+        "{CASE}: the new kinds leave every row and its derived state alone"
+    );
+
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_AGY, ids::AGY_FEAT_1, None).await;
+    propose_unleased(
+        store,
+        ids::AGY_FEAT_1,
+        LinkKind::BlockedBy,
+        ids::HTUI_FEAT_1,
+        step,
+    )
+    .await
+    .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        ready().await,
+        [ids::HTUI_ANA_2, ids::AGY_FIX_1],
+        "{CASE}: control: a blocked_by to the running FEAT-1 gates AGY FEAT-1"
     );
 }
 

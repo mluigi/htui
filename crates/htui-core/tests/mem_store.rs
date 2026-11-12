@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        277,
+        284,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -83,7 +83,7 @@ async fn demo_store_loads_the_fixture() {
          M1's nine for divided fan-out's records (plan D1, D4-D6) and its follow-up's one for a \
          parent step in another run (F1), and MOD-139 M2's nine admission, abandonment and \
          part-input cases (plan D9, D12), and MOD-141 M2's three for the phase's judge and \
-         deadline columns (plan D1, D2)"
+         deadline columns (plan D1, D2), and MOD-150 M1's seven link-kind cases (plan D2-D7)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),
