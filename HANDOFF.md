@@ -52,7 +52,8 @@ MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_wo
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-141 M2 (checked against the tree 2026-11-12): migrations run through
+Live coordinates after MOD-150 M1 (2026-11-12): migrations run through `0030_link_kinds` (MOD-150 M1: `item_link`
+kinds `parent`/`duplicates`/`implements`, `uq_item_link_one_parent`/`_one_canonical`; no new table; not mirrored), before it
 `0029_divided_fanout` (MOD-139: `run_step` role, parent and node key, `run_plan`; mirrored by cache `0010`), before it
 `0028_seed_api_billing_env` (MOD-97: data-only, adds `settings.api_billing_env` to seeded `claude`/`claude-cli` rows; not mirrored), before it
 `0027_trim_record_v5` (MOD-163 M2: comment-only, `run_step.trim_record` v 5; not mirrored), before it
@@ -497,6 +498,16 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   upstream prompt walk; close-out recording `duplicates`/`supersedes`; `item_artifact_link` with
   document version pinning (`to_attachment_id` without its FK, which MOD-114 (3) adds); MCP
   `to_document` and qualified keys; Graph legend and nodes. Not blocked (MOD-144 is done).
+  PRD `.claude/prds/mod-150-link-kinds.prd.md` (three milestones: kinds in the store, close-out recording,
+  links to documents; agents propose the new kinds live until MOD-155; `to_document` by owner + kind).
+  **Phase 1 landed (hr/MOD-150, 2026-11-12, `cc254143..951f6c48`):** `LinkKind` `parent`/`duplicates`/`implements`
+  (migration `0030_link_kinds`, partial uniques for one live parent and one canonical); both stores refuse a second
+  parent or canonical, a parent cycle and a chain deeper than 8 (subtree height counted), a revival checked like an
+  insert; Pg takes an advisory lock for `parent` (one key) and per item for `duplicates` (R1: a second unique index
+  defeats `ON CONFLICT`); `parent` joins the upstream prompt walk (Pg, Mem, cache), readiness untouched; MCP
+  `item_link` documents the seven kinds; Graph words `part of`/`duplicates`/`implements` (D1). `CASES` 284. Plan
+  `.claude/plans/mod-150-m1-link-kinds.plan.md`. Owed on the host: merged-tree Postgres gate, live-Qdrant suites,
+  `cache.rs::the_spawned_refresher_passes_and_follows_the_scope` (flaked once under sandbox load).
 - [ ] **MOD-151 - Tell agents about htui's MCP tools (server instructions, prompt section, typed
   results)** (from ANA-36, `docs/ANA-36.md` §7.3, §7.4, §8 Q7). `R-MCP-2`, `R-MCP-4`, `R-PRM-1`,
   `R-PRM-3`. `initialize.instructions` naming each advertised tool and when to use it; a prompt section
