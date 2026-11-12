@@ -52,6 +52,7 @@ pub use traits::{
     scope_row_slug_is_fixed, skill_body_refusal, skill_patch_refusal, skill_version_key,
     split_fan_out_mismatch, startable, step_is_not_promotable, step_not_a_part, step_slot_is_taken,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
-    workspace_graph_is_held, workspace_has_live_run, workspace_prefix_taken,
+    workspace_graph_is_held, workspace_has_live_run, workspace_has_stopped_run,
+    workspace_prefix_taken,
 };
 pub use worker::{RecorderStore, RelayStore, WorkerHost, WorkerStore};

@@ -93,7 +93,7 @@ use htui_core::store::{
 use htui_core::store::{
     plan_revision_taken, planner_not_in_run, project_slug_refusal, run_plan_refusal,
     scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace, scope_row_slug_is_fixed,
-    workspace_has_live_run,
+    workspace_has_live_run, workspace_has_stopped_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -6141,8 +6141,10 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
     /// lost the race, in which case nothing was deleted, or (MOD-138 A3) while a kind or an item
     /// names one of the workspace's graphs, or with [`workspace_has_live_run`] (MOD-147 A1) while
-    /// a run of its scope row is live (queued, running, awaiting_approval or stopped); both are
-    /// checked in the same transaction before the delete.
+    /// a run of its scope row is live (queued, running, awaiting_approval or stopped), or with
+    /// [`workspace_has_stopped_run`] (MOD-125 M2 D9) while a run of a member project that
+    /// recorded the workspace is `stopped` (or `running` under its stop, DV-2); all are checked
+    /// in the same transaction before the delete.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
         for _ in 0..DELETE_ATTEMPTS {
             if let Some(reach) = self.delete_workspace_once(id).await? {
@@ -10722,6 +10724,39 @@ impl PgStore {
             return Err(StoreError::Constraint(workspace_has_live_run(
                 &slug,
                 rows(live),
+            )));
+        }
+        // MOD-125 M2 D9 (M-3): a member project's run that recorded this workspace and is
+        // stopped (DV-2: or running under the workspace's stop) refuses. Scope-row runs are A1's
+        // (no double count). No row is locked here (DV-1): `workspace_stop` before `run` would
+        // invert `claim_run`'s and `adopt_runs`' order against the `SET NULL` cascade below. A run
+        // stopped after this snapshot conflicts with that cascade, the `40001` retries the
+        // attempt, and the recount sees it
+        // (`pg_criteria.rs::delete_workspace_recounts_a_run_stopped_under_it`).
+        let held = sqlx::query_scalar!(
+            r#"
+            SELECT count(*) AS "held!"
+              FROM run r JOIN project p ON p.id = r.project_id
+             WHERE r.workspace_id = $1
+               AND p.owner_workspace_id IS DISTINCT FROM $1
+               AND (r.status = 'stopped'
+                    OR (r.status = 'running'
+                        AND EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = $1)))
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if held > 0 {
+            let slug =
+                sqlx::query_scalar!("SELECT slug FROM workspace WHERE id = $1", id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+            return Err(StoreError::Constraint(workspace_has_stopped_run(
+                &slug,
+                rows(held),
             )));
         }
         if let Some(scope) = scope_row_id(&mut *tx, id).await? {

@@ -93,6 +93,7 @@ use crate::store::traits::{
 use crate::store::traits::{
     project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
     scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
+    workspace_has_stopped_run,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -276,6 +277,7 @@ pub const CASES: &[&str] = &[
     "pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace",
     "pending_stops_shows_an_escalation",
     "pending_stops_is_empty_after_resume",
+    "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -931,6 +933,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "pending_stops_is_empty_after_resume" => {
             Box::pin(pending_stops_is_empty_after_resume(store)).await;
+        }
+        "delete_workspace_refuses_while_a_member_run_of_it_is_stopped" => {
+            Box::pin(delete_workspace_refuses_while_a_member_run_of_it_is_stopped(store)).await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
@@ -8723,6 +8728,84 @@ async fn pending_stops_is_empty_after_resume<S: WriteStore>(store: &S) {
     assert!(
         store.refresh_lease(run, owner, LEASE).await.expect(CASE),
         "{CASE}: and still under the owner's lease"
+    );
+}
+
+/// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` refuses while a run of a member project that
+/// recorded the workspace is `stopped`, since the delete would unscope it (`ON DELETE SET NULL`)
+/// and no workspace resume would reach it again. DV-2: a run still `running` under the
+/// workspace's stop is about to be stopped, so it counts too. Nothing is deleted then; once the
+/// runs are settled otherwise the delete goes through and unscopes them.
+async fn delete_workspace_refuses_while_a_member_run_of_it_is_stopped<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_refuses_while_a_member_run_of_it_is_stopped";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = store
+        .create_workspace(new_workspace("held"))
+        .await
+        .expect(CASE)
+        .id;
+    let a = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    assert!(
+        store.stop_run(a, owner).await.expect(CASE),
+        "{CASE}: A is stopped (no workspace stop needed)"
+    );
+    let b = claimed_in(CASE, store, ids::HTUI_CLEAN_1, Some(workspace), owner).await;
+
+    let refused = |runs: u64| {
+        Err(StoreError::Constraint(workspace_has_stopped_run(
+            "held", runs,
+        )))
+    };
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        refused(1),
+        "{CASE}: the stopped member run refuses the delete; the running one does not count \
+         while the workspace is not stopped"
+    );
+    assert!(
+        store.workspace(workspace).await.expect(CASE).is_some(),
+        "{CASE}: the workspace is still there"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await.workspace_id,
+        Some(workspace),
+        "{CASE}: and the stopped run still names it"
+    );
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        refused(2),
+        "{CASE}: DV-2: a run still running under the workspace's stop counts too"
+    );
+    assert!(
+        store.workspace(workspace).await.expect(CASE).is_some(),
+        "{CASE}: the workspace is still there"
+    );
+
+    for (run, from) in [(a, RunStatus::Stopped), (b, RunStatus::Running)] {
+        assert!(
+            store
+                .transition_run(run, from, RunStatus::Cancelled, at)
+                .await
+                .expect(CASE),
+            "{CASE}: {from} -> cancelled is a sanctioned move"
+        );
+    }
+    store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(
+        store.workspace(workspace).await.expect(CASE),
+        None,
+        "{CASE}: with no stopped or stopping run left the workspace goes"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await.workspace_id,
+        None,
+        "{CASE}: and its runs are unscoped"
     );
 }
 

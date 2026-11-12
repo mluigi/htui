@@ -1469,8 +1469,11 @@ pub trait WriteStore: ReadStore {
     /// holder bytes, project slug bytes) order;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// ([`workspace_has_live_run`], MOD-147 A1) while a run of its scope row is live
-    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped). Nothing is
-    /// deleted then.
+    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped);
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`workspace_has_stopped_run`], MOD-125 M2 D9) while a run of a member project that
+    /// recorded this workspace is `stopped` (or `running` under the workspace's stop, DV-2),
+    /// checked after A1's. Nothing is deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
     /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts
@@ -3700,6 +3703,23 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     )
 }
 
+/// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` while `runs` (≥ 1) of its member projects'
+/// runs that recorded this workspace are stopped (DV-2: or still running under its stop). A
+/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names resume: a
+/// stopped run is cancelled or finished only once resumed (M3).
+#[must_use]
+pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
+    let (noun, pronoun) = if runs == 1 {
+        ("run", "it")
+    } else {
+        ("runs", "them")
+    };
+    format!(
+        "workspace `{workspace}` has {runs} stopped {noun}; resume the workspace and finish or \
+         cancel {pronoun} before deleting the workspace"
+    )
+}
+
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
 /// the scope row goes only with its workspace.
 #[must_use]
@@ -4427,7 +4447,7 @@ mod tests {
     use super::{
         LIVE_RUN_STATUSES, not_startable, project_slug_is_reserved, project_slug_refusal,
         run_workspace_for, scope_row_is_deleted_with_its_workspace, startable,
-        workspace_has_live_run,
+        workspace_has_live_run, workspace_has_stopped_run,
     };
     use crate::model::{ItemState, RunStatus, Status, WorkspaceId};
     use crate::store::StoreError;
@@ -4500,6 +4520,21 @@ mod tests {
             workspace_has_live_run("shop", 3),
             "workspace `shop` has 3 live runs; finish or cancel them before deleting the \
              workspace"
+        );
+    }
+
+    /// MOD-125 M2 D9: the stopped-run refusal counts its runs and names the resume.
+    #[test]
+    fn workspace_has_stopped_run_counts_runs() {
+        assert_eq!(
+            workspace_has_stopped_run("shop", 1),
+            "workspace `shop` has 1 stopped run; resume the workspace and finish or cancel it \
+             before deleting the workspace"
+        );
+        assert_eq!(
+            workspace_has_stopped_run("shop", 2),
+            "workspace `shop` has 2 stopped runs; resume the workspace and finish or cancel \
+             them before deleting the workspace"
         );
     }
 

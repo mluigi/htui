@@ -38,6 +38,7 @@ use htui_core::store::conformance::assert_leased_for;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken,
+    workspace_has_stopped_run,
 };
 use htui_store::PgStore;
 use sqlx::Row as _;
@@ -7887,6 +7888,115 @@ async fn stop_run_takes_the_steps_first() {
     db.drop_db().await;
 }
 
+/// MOD-125 M2 D9, DV-1: `delete_workspace` locks no `workspace_stop` row; a member run stopped
+/// after the delete's snapshot conflicts with the `ON DELETE SET NULL` cascade, the `40001`
+/// retries the attempt, and the recount refuses. A raw transaction stops the run uncommitted; the
+/// delete counts it `running` (no stop record), reaches the cascade and waits on the run; the
+/// holder commits; the delete answers the stopped-run refusal (never a `40P01`) and the
+/// workspace stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_workspace_recounts_a_run_stopped_under_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let workspace = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "recount".to_owned(),
+            name: "Recount".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    let run = db
+        .store
+        .create_run(NewRun {
+            workspace_id: Some(workspace),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("queue a member run of the workspace")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(
+                run,
+                ids::BOX,
+                uuid::Uuid::now_v7(),
+                Utc::now(),
+                TimeDelta::minutes(5)
+            )
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "the member run is running"
+    );
+
+    let mut holder = db.pool.begin().await.expect("begin holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read holder's pid");
+    sqlx::query("UPDATE run SET status = 'stopped', lease_owner = NULL WHERE id = $1")
+        .bind(run.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("the holder stops the run, uncommitted");
+
+    let store = db.store.clone();
+    let delete = tokio::spawn(async move { store.delete_workspace(workspace).await });
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the delete never reached the cascade on the held run"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !delete.is_finished(),
+        "the delete answered while the run was held"
+    );
+    holder.commit().await.expect("the holder commits the stop");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+        .await
+        .expect("the delete answers within 5 s")
+        .expect("the delete task joins");
+    assert_eq!(
+        answer,
+        Err(htui_core::store::StoreError::Constraint(
+            workspace_has_stopped_run("recount", 1)
+        )),
+        "the retried attempt recounts and refuses the stopped run"
+    );
+    assert!(
+        db.store
+            .workspace(workspace)
+            .await
+            .expect("read the workspace")
+            .is_some(),
+        "the workspace stays"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-125 D6 (blueprint F5 and T3.3, as amended by review round R1): under its run locks the
 /// sweep reads a stopped workspace's running steps plainly, then locks them `SKIP LOCKED`, so a run
 /// whose step another transaction holds is **deferred**: the sweep answers promptly, neither
@@ -7950,7 +8060,7 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
     db.store
         .stop_workspace(
             ids::WORKSPACE_PLATFORM,
-            htui_core::model::StopMode::Graceful,
+            StopMode::Graceful,
             ids::USER,
             Utc::now(),
         )

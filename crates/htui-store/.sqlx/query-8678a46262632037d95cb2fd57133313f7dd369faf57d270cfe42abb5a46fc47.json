@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT count(*) AS \"held!\"\n              FROM run r JOIN project p ON p.id = r.project_id\n             WHERE r.workspace_id = $1\n               AND p.owner_workspace_id IS DISTINCT FROM $1\n               AND (r.status = 'stopped'\n                    OR (r.status = 'running'\n                        AND EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = $1)))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "held!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8678a46262632037d95cb2fd57133313f7dd369faf57d270cfe42abb5a46fc47"
+}

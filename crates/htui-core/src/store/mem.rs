@@ -100,7 +100,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
-    scope_row_slug_is_fixed, workspace_has_live_run,
+    scope_row_slug_is_fixed, workspace_has_live_run, workspace_has_stopped_run,
 };
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use uuid::Uuid;
@@ -5790,6 +5790,11 @@ impl State {
     /// goes with the workspace (`ON DELETE CASCADE`), and its runs and queue entries outlive it
     /// unscoped (`ON DELETE SET NULL`). A run's `updated_at` moves, as Postgres's trigger moves it
     /// on the `SET NULL`; `queue_entry` has no `updated_at`.
+    ///
+    /// MOD-125 M2 D9 (M1 review M-3): a run of a member project that recorded this workspace and
+    /// is `stopped`, or `running` while the workspace has a stop record (DV-2), refuses the
+    /// delete ([`workspace_has_stopped_run`]), after A1's scope-row check and before anything
+    /// goes.
     fn delete_workspace(&mut self, id: WorkspaceId, now: DateTime<Utc>) -> Result<DeleteReach> {
         if !self.workspaces.contains_key(&id) {
             return Err(StoreError::NotFound {
@@ -5823,6 +5828,27 @@ impl State {
                     rows(live),
                 )));
             }
+        }
+        // MOD-125 M2 D9 (M-3): a stopped run of a member project that recorded this workspace
+        // would lose the only resume that reaches it (`ON DELETE SET NULL`). Scope-row runs are
+        // A1's above. DV-2: a run still `running` under this workspace's stop is about to be.
+        let stopping = self.workspace_stops.contains_key(&id);
+        let held = self
+            .runs
+            .values()
+            .filter(|run| {
+                run.workspace_id == Some(id)
+                    && Some(run.project_id) != scope
+                    && (run.status == RunStatus::Stopped
+                        || (stopping && run.status == RunStatus::Running))
+            })
+            .count();
+        if held > 0 {
+            let slug = &self.workspaces[&id].slug;
+            return Err(StoreError::Constraint(workspace_has_stopped_run(
+                slug,
+                rows(held),
+            )));
         }
         let mut reach = self.workspace_reach_of(id, &graphs, &phases);
         if let Some(scope) = scope {
