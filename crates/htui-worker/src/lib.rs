@@ -50,8 +50,8 @@ pub use graphs::HostGraphs;
 pub use runtime::testing;
 pub use runtime::{
     CANCEL_ALREADY_REQUESTED, CANCEL_GRACE, CANCEL_REQUESTED, PREEMPTED, REPOS_MOVED, Role,
-    RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED, promote_needs_the_walker, switched_off,
-    unknown_executor,
+    RunLocks, RunRuntime, STOP_SLACK, UNBLOCK_MOVED, WALK_PANICKED, promote_needs_the_walker,
+    switched_off, unknown_executor,
 };
 pub use views::{
     Enabled, FrameKind, ItemActions, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, ProgressSink,

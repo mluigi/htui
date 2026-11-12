@@ -118,6 +118,16 @@ pub fn promote_needs_the_walker(run: RunId) -> String {
 /// MOD-42 plan D11, B-19: the window a graceful preempt gives a session's cancel.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
+/// MOD-42 plan D11: how long past its grace a cancel's preempt waits for the walk to end.
+const CANCEL_SLACK: Duration = Duration::from_secs(1);
+
+/// MOD-125 M2 D2: how long past its grace a stop's preempt waits before the token drops the
+/// walk. After the driver's grace the relay still kills and reaps the agent, settles its
+/// permission rows, flushes its recorder, syncs the step and finishes; a drop mid-flush loses rows
+/// whose `seq` was taken (`relay.rs:758-760`). The wait ends as soon as the walk does, so a quick
+/// stop costs nothing.
+pub const STOP_SLACK: Duration = Duration::from_secs(5);
+
 /// OQ-6: the first delay before a run whose resume failed is resumed again.
 const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 /// OQ-6: the delay stops doubling here.
@@ -776,11 +786,12 @@ impl Walks {
     }
 
     /// MOD-42 plan D11 (R-38): `Cancel { grace }` to every walk of `run`; wait until none is live
-    /// or `grace + 1 s`; then [`Self::preempt`] as before (a walk still live is dropped hard). The
-    /// parent stays in the map while this waits, so a walk that looks its control up meanwhile
-    /// reads the cancel, and a task queued for the run's lock is refused. Whether there was a
-    /// parent.
-    async fn preempt_gracefully(&self, run: RunId, grace: Duration) -> bool {
+    /// or `grace + slack` ([`CANCEL_SLACK`] for a cancel or a promotion, [`STOP_SLACK`] for a
+    /// workspace stop, MOD-125 M2 D2); then [`Self::preempt`] as before (a walk still live is
+    /// dropped hard). The parent stays in the map while this waits, so a walk that looks its
+    /// control up meanwhile reads the cancel, and a task queued for the run's lock is refused.
+    /// Whether there was a parent.
+    async fn preempt_gracefully(&self, run: RunId, grace: Duration, slack: Duration) -> bool {
         let live = {
             let walks = self.lock();
             let Some(parent) = walks.get(&run) else {
@@ -789,7 +800,7 @@ impl Walks {
             parent.signal.send_replace(Signal::Cancel { grace });
             Arc::clone(&parent.live)
         };
-        let deadline = tokio::time::Instant::now() + grace + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + grace + slack;
         while live.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2866,7 +2877,7 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
     if preempt == Preempt::IfLive && ctx.shared.walks.is_live(run) {
         ctx.shared
             .walks
-            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .preempt_gracefully(run, ctx.shared.cancel_grace, CANCEL_SLACK)
             .await;
     }
     let walk = ctx.shared.walks.child(run);
@@ -3092,7 +3103,7 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         // D12 step 3: this process walks it.
         ctx.shared
             .walks
-            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .preempt_gracefully(run, ctx.shared.cancel_grace, CANCEL_SLACK)
             .await;
     } else if row.executing_box_id != Some(box_id) {
         // D12 step 4, decided before `cancel_leased` (whose refusal there is `RunStatus`).
