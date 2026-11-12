@@ -184,8 +184,8 @@ pub(crate) mod tests {
         EventKind, Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep,
         PermissionId, PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId,
         RunCommandKind, RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
-        SnapshotPhase, Status, StepId, StepPermission, StepRole, StepStatus, TIMESTAMPTZ_DIGITS,
-        Transport,
+        SnapshotPhase, Status, StepId, StepPermission, StepRole, StepStatus, StopMode,
+        TIMESTAMPTZ_DIGITS, Transport, WorkspaceId,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -317,6 +317,63 @@ pub(crate) mod tests {
         /// server on its own token, through the fixture's real `McpHost` (D5's in-process
         /// client), and asserts each answered without `isError`; then one turn and `done`.
         Tools(Vec<(&'static str, serde_json::Value)>),
+        /// MOD-125 M2: a session that never answers ([`Deaf`]): only the walk's token drop ends it.
+        Deaf(Deaf),
+    }
+
+    /// MOD-125 M2: a session whose `next_event` never resolves and whose `cancel` records each
+    /// grace it is given and returns without ending the turn, so a graceful stop waits out its
+    /// grace and slack, and only an escalation (the token drop) ends the walk sooner.
+    #[derive(Debug, Clone, Default)]
+    struct Deaf {
+        /// Raised at the session's first pull: the walk is live in its session.
+        started: Arc<Notify>,
+        graces: Arc<StdMutex<Vec<Duration>>>,
+    }
+
+    impl Deaf {
+        /// Every grace the session's `cancel` received, in order.
+        fn graces(&self) -> Vec<Duration> {
+            self.graces.lock().expect("the cell").clone()
+        }
+    }
+
+    /// [`Deaf`]'s session over the fake's.
+    #[derive(Debug)]
+    struct Deafened {
+        inner: Box<dyn AgentSession>,
+        deaf: Deaf,
+    }
+
+    impl AgentSession for Deafened {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+            let started = Arc::clone(&self.deaf.started);
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending().await
+            })
+        }
+
+        fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+            self.deaf.graces.lock().expect("the cell").push(grace);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     /// A parking session's request and the grace its `cancel` was given, if it was cancelled.
@@ -412,7 +469,7 @@ pub(crate) mod tests {
                 .unwrap_or(Play::Done);
             let script = match &play {
                 Play::Park(park) => park.script(),
-                Play::Done | Play::Stall(_) | Play::Panic | Play::Tools(_) => {
+                Play::Done | Play::Stall(_) | Play::Panic | Play::Tools(_) | Play::Deaf(_) => {
                     Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
                         stop_reason: StopReason::EndTurn,
                     }))])
@@ -486,6 +543,10 @@ pub(crate) mod tests {
                     Play::Park(park) => Ok(Box::new(Graced {
                         inner: session,
                         grace: park.grace,
+                    }) as Box<dyn AgentSession>),
+                    Play::Deaf(deaf) => Ok(Box::new(Deafened {
+                        inner: session,
+                        deaf,
                     }) as Box<dyn AgentSession>),
                 }
             })
@@ -820,6 +881,16 @@ pub(crate) mod tests {
             mode: RunMode::Manual,
             repo_scope: None,
             workspace: None,
+        }))
+    }
+
+    /// [`start_run`] recording `workspace` on the run (MOD-125 D3), so its stop reaches it.
+    fn start_run_in(item: ItemId, workspace: WorkspaceId) -> StoreRequest {
+        StoreRequest::Orch(OrchRequest::Command(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: Some(workspace),
         }))
     }
 
@@ -1614,6 +1685,21 @@ pub(crate) mod tests {
 
     /// [`stranded`] on `box_id`: targeted at it and claimed there (MOD-42 D12 step 4).
     async fn stranded_on(fixture: &Fixture, item: ItemId, box_id: BoxId) -> RunId {
+        stranded_with(fixture, item, box_id, None).await
+    }
+
+    /// [`stranded`] recording `workspace` on the run (MOD-125 M2: a stop reaches it).
+    async fn stranded_in(fixture: &Fixture, item: ItemId, workspace: WorkspaceId) -> RunId {
+        stranded_with(fixture, item, ids::BOX, Some(workspace)).await
+    }
+
+    /// [`stranded_on`] with the run's `workspace_id`.
+    async fn stranded_with(
+        fixture: &Fixture,
+        item: ItemId,
+        box_id: BoxId,
+        workspace: Option<WorkspaceId>,
+    ) -> RunId {
         let backend = Backend::memory(fixture.store.clone());
         let row = fixture.item(item).await;
         let app = fixture.store.app_settings().await.expect("the settings");
@@ -1633,7 +1719,7 @@ pub(crate) mod tests {
         fixture
             .store
             .create_run(NewRun {
-                workspace_id: None,
+                workspace_id: workspace,
                 id: run,
                 project_id: row.project_id,
                 item_id: row.id,
@@ -3997,6 +4083,281 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [(id, RunCommandStatus::Applied)]
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-125 M2 T3: the command poll applies a workspace stop (plan D2, D4)
+    // -----------------------------------------------------------------------------------------
+
+    /// `PLATFORM` stopped in `mode` by the demo user, as a TUI anywhere would (M1's verb).
+    async fn stop_platform(fixture: &Fixture, mode: StopMode) {
+        fixture
+            .store
+            .stop_workspace(ids::WORKSPACE_PLATFORM, mode, ids::USER, Utc::now())
+            .await
+            .expect("the stop is recorded");
+    }
+
+    /// A [`stranded_in`] `PLATFORM` run of `item` whose lease `runtime`'s process took for a day:
+    /// leased here, with no walk of it live.
+    async fn held_here(fixture: &Fixture, runtime: &RunRuntime, item: ItemId) -> RunId {
+        let run = stranded_in(fixture, item, ids::WORKSPACE_PLATFORM).await;
+        let owner = testing::probe(runtime).owner();
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, owner, TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "this process holds the run"
+        );
+        run
+    }
+
+    /// D2, D4: a graceful stop of a run this process walks while its session is parked: the poll
+    /// preempts the walk through the cancel seam with the runtime's grace, the parked request is
+    /// answered `cancelled` once (I-7), and `settle_stop` leaves the run and its step `stopped`,
+    /// unfinished, with no cancel row; the walk's own requester hears it was preempted.
+    #[tokio::test]
+    async fn the_command_poll_stops_a_live_walk_gracefully() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(3));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        assert_eq!(
+            fixture.run(run).await.workspace_id,
+            Some(ids::WORKSPACE_PLATFORM)
+        );
+        let item = fixture.item(ids::HTUI_ANA_2).await.status;
+        stop_platform(&fixture, StopMode::Graceful).await;
+
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the walk's own requester is answered once, as preempted"
+        );
+        assert_answered_cancelled_once(&fixture, &parked).await;
+        assert_eq!(
+            park.grace(),
+            Some(Duration::from_secs(3)),
+            "a graceful stop gives the session the runtime's grace"
+        );
+        let step = fixture
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.id == parked.run_step_id)
+            .expect("the parked step");
+        assert_eq!(step.status, StepStatus::Stopped);
+        assert_eq!(
+            fixture.run(run).await.finished_at,
+            None,
+            "stopped, not ended"
+        );
+        assert!(
+            commands_of(&fixture, run).is_empty(),
+            "a stop writes no row"
+        );
+        assert_eq!(
+            fixture.item(ids::HTUI_ANA_2).await.status,
+            item,
+            "the item is untouched"
+        );
+    }
+
+    /// D2: a forced stop interrupts the session with zero grace; the run and step settle
+    /// `stopped` all the same, and the parked request is still answered `cancelled`.
+    #[tokio::test]
+    async fn a_forced_stop_cancels_with_zero_grace() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(3));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        stop_platform(&fixture, StopMode::Forced).await;
+
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
+        );
+        assert_eq!(park.grace(), Some(Duration::ZERO), "a forced stop");
+        assert_answered_cancelled_once(&fixture, &parked).await;
+        let step = step_at(&fixture, run, 0).await;
+        assert_eq!(
+            (step.id, step.status),
+            (parked.run_step_id, StepStatus::Stopped)
+        );
+    }
+
+    /// The `Deaf` walk of `ANA-2` in `PLATFORM`, started under a 60 s grace and live in its
+    /// session, then stopped gracefully: the worker, the start's seq, the run and the session.
+    async fn deaf_walk_stopped_gracefully(fixture: &Fixture) -> (Worker, u64, RunId, Deaf) {
+        let deaf = Deaf::default();
+        fixture.sessions.push(Play::Deaf(deaf.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(60));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        within("the session starting", deaf.started.notified()).await;
+        let run = within("the run being read", async {
+            loop {
+                if let Some(run) = fixture
+                    .store
+                    .runs(ids::HTUI_ANA_2)
+                    .await
+                    .expect("the read answers")
+                    .into_iter()
+                    .find(|run| run.status == RunStatus::Running)
+                {
+                    return run.id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop_platform(fixture, StopMode::Graceful).await;
+        within("the graceful cancel reaching the session", async {
+            while deaf.graces().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(deaf.graces(), [Duration::from_secs(60)], "a graceful stop");
+        (worker, start, run, deaf)
+    }
+
+    /// D2: the relay does not re-read its control inside `cancel`, so a forced stop over a
+    /// graceful one in flight is the token drop, now: the run settles `stopped` long before the
+    /// 60 s grace and its 5 s slack. No `Done(Cancelled)` row is asserted: the drop path's cleanup
+    /// is `abandoned`.
+    #[tokio::test]
+    async fn a_forced_poll_escalates_a_graceful_stop() {
+        let fixture = Fixture::new().await;
+        let (mut worker, start, run, deaf) = deaf_walk_stopped_gracefully(&fixture).await;
+
+        stop_platform(&fixture, StopMode::Forced).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
+        );
+        assert_eq!(
+            deaf.graces(),
+            [Duration::from_secs(60)],
+            "the escalation sent no second cancel: it dropped the walk"
+        );
+        assert_eq!(step_at(&fixture, run, 0).await.status, StepStatus::Stopped);
+    }
+
+    /// D4.1: a stop in flight is not applied again: later polls list the same stop, and the
+    /// session still received exactly one cancel. An escalation then ends the walk.
+    #[tokio::test]
+    async fn a_second_poll_does_not_restop() {
+        let fixture = Fixture::new().await;
+        let (_worker, _start, run, deaf) = deaf_walk_stopped_gracefully(&fixture).await;
+
+        tokio::time::sleep(2 * htui_worker::worker::COMMAND_POLL + Duration::from_millis(200))
+            .await;
+        assert_eq!(deaf.graces().len(), 1, "one cancel: {:?}", deaf.graces());
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Running,
+            "still waiting out its grace"
+        );
+
+        stop_platform(&fixture, StopMode::Forced).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert_eq!(deaf.graces().len(), 1, "{:?}", deaf.graces());
+    }
+
+    /// D4 (blueprint F9): a pending cancel of a run in a stopped workspace wins: the poll leaves
+    /// the stop to it, the run is `cancelled` and the row `applied`, whichever task runs first.
+    /// The cancel's B-5 guard is held over a first poll, so only the poll's own skip keeps the
+    /// stop from settling the run before the cancel applies.
+    #[tokio::test]
+    async fn a_pending_cancel_beats_a_stop() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        stop_platform(&fixture, StopMode::Graceful).await;
+
+        {
+            let probe = testing::probe(&runtime);
+            let _held = probe
+                .hold_applying(id)
+                .expect("nothing applies the row yet");
+            polled(&mut runtime, &fixture).await;
+        }
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Running,
+            "the stop was left to the pending cancel"
+        );
+
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Applied)]
+        );
+    }
+
+    /// D4: a run this process leases with no live walk (a sweep adoption before its child, a dead
+    /// walk) goes straight to `settle_stop`: `stopped`, its lease given back.
+    #[tokio::test]
+    async fn a_leased_run_with_no_walk_is_settled_directly() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
+        let owner = testing::probe(&runtime).owner();
+        stop_platform(&fixture, StopMode::Forced).await;
+
+        polled(&mut runtime, &fixture).await;
+        let row = fixture.run(run).await;
+        assert_eq!((row.status, row.finished_at), (RunStatus::Stopped, None));
+        assert!(
+            !fixture
+                .store
+                .refresh_lease(run, owner, TimeDelta::days(1))
+                .await
+                .expect("the refresh answers"),
+            "the stop gave the lease back"
+        );
+        assert!(commands_of(&fixture, run).is_empty());
+    }
+
+    /// D4: the TUI's store loop ticks the command poll, so a stop of a run this process holds is
+    /// applied without any request (twin of `the_store_loop_applies_a_pending_cancel_on_its_own`).
+    #[tokio::test]
+    async fn the_store_loop_applies_a_workspace_stop_on_its_own() {
+        let fixture = Fixture::new().await;
+        let runtime = fixture.runtime();
+        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
+        stop_platform(&fixture, StopMode::Graceful).await;
+
+        let _worker = Worker::spawn(&fixture.store, runtime);
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(commands_of(&fixture, run).is_empty());
     }
 
     // -----------------------------------------------------------------------------------------

@@ -19,8 +19,8 @@ use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     AgentId, AgentSummary, BatchId, BatchStop, BoxId, BoxProfile, CancelRequest, CapError,
     Executor, ItemId, ProjectCaps, ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId,
-    RunKind, RunStatus, SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order,
-    batch_budget, free_slots, min_budget_micros,
+    RunKind, RunStatus, SnapshotCandidate, StopMode, UserId, WorkspaceId, admission_limit,
+    admission_order, batch_budget, free_slots, min_budget_micros,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
@@ -255,6 +255,10 @@ struct Shared<P: ReplySink> {
     /// MOD-42 B-5: the run commands a task of this process is applying now, so the poll never
     /// applies a row the inline path (or an earlier tick) is still applying.
     applying: StdMutex<HashSet<RunCommandId>>,
+    /// MOD-125 M2 D4: the runs a stop task of this process is settling, with the strongest mode
+    /// asked so far. Not on `Walks::Parent`, which a preempt removes. Same or weaker mode: the
+    /// poll does nothing; `forced` over `graceful`: the walk is dropped at once (escalation).
+    stopping: StdMutex<HashMap<RunId, StopMode>>,
     /// MOD-24 D3 (B5): the live chats the last command poll was handed; the sweep's own cancels
     /// honour them as the poll does (D212). Always empty for the worker.
     last_live: StdMutex<LiveChats>,
@@ -638,6 +642,51 @@ impl<P: ReplySink> Shared<P> {
             }
             notified.await;
         }
+    }
+}
+
+/// What a polled stop of a run does (MOD-125 M2 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopTurn {
+    /// No stop task of this process settles the run: spawn one.
+    First,
+    /// `forced` over a `graceful` stop in flight: drop the walk now.
+    Escalate,
+    /// A stop task settles it already, in this mode or a stronger one: nothing.
+    InFlight,
+}
+
+impl<P: ReplySink> Shared<P> {
+    /// MOD-125 M2 D4: records `mode` for `run` and says what the poll does with it.
+    fn stop_turn(&self, run: RunId, mode: StopMode) -> StopTurn {
+        let mut map = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
+        match map.get(&run).copied() {
+            None => {
+                map.insert(run, mode);
+                StopTurn::First
+            }
+            Some(StopMode::Graceful) if mode == StopMode::Forced => {
+                map.insert(run, StopMode::Forced);
+                StopTurn::Escalate
+            }
+            Some(_) => StopTurn::InFlight,
+        }
+    }
+}
+
+/// MOD-125 M2 D4: removes `run` from [`Shared::stopping`] however its stop task ends.
+struct StopInFlight<P: ReplySink> {
+    shared: Arc<Shared<P>>,
+    run: RunId,
+}
+
+impl<P: ReplySink> Drop for StopInFlight<P> {
+    fn drop(&mut self) {
+        self.shared
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.run);
     }
 }
 
@@ -1272,6 +1321,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
                 applying: StdMutex::default(),
+                stopping: StdMutex::default(),
                 last_live: StdMutex::default(),
                 applied: Notify::new(),
                 cancel_grace: CANCEL_GRACE,
@@ -3168,7 +3218,8 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// MOD-42 plan D13: one command poll. Every pending row this process may apply
 /// (`pending_commands(owner, box)`, B-4), unless a task of this process is applying it already
-/// (B-5), runs as an internal cancel on a supervised task of its own.
+/// (B-5), runs as an internal cancel on a supervised task of its own; and every pending workspace
+/// stop (`pending_stops(owner)`, MOD-125 M2 D4) runs as [`stop_walk`] on a task of its own.
 async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     live: LiveChats,
@@ -3193,6 +3244,7 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
                 return;
             }
         };
+    let cancelling: HashSet<RunId> = rows.iter().map(|row| row.run_id).collect();
     for row in rows {
         if ctx.shared.is_applying(row.id) {
             continue;
@@ -3205,6 +3257,87 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
             cancel_run(task, row.run_id, &live, Some(row.id)).await;
         });
     }
+    // MOD-125 M2 D4: the stops this process applies, after the cancels. A run with a pending
+    // cancel in this listing is left to it (blueprint F9): the cancel's task applies first, and the
+    // next poll no longer lists a cancelled run.
+    let stops = match htui_core::store::WorkerStore::pending_stops(&writer, ctx.shared.owner).await
+    {
+        Ok(stops) => stops,
+        Err(err) => {
+            tracing::warn!(%err, "reading the pending workspace stops failed");
+            return;
+        }
+    };
+    for stop in stops {
+        if cancelling.contains(&stop.run) {
+            continue;
+        }
+        match ctx.shared.stop_turn(stop.run, stop.mode) {
+            StopTurn::InFlight => {}
+            // D2: the relay does not re-read its control inside `cancel`, so a forced stop over a
+            // graceful one in flight is the token drop, now; the first task then settles.
+            StopTurn::Escalate => {
+                ctx.shared.walks.preempt(stop.run);
+            }
+            StopTurn::First => {
+                let task = ctx.unaddressed("stop_run");
+                let in_flight = StopInFlight {
+                    shared: Arc::clone(&ctx.shared),
+                    run: stop.run,
+                };
+                spawn_supervised(task.clone(), async move {
+                    stop_walk(task, stop.run, stop.mode, in_flight).await;
+                });
+            }
+        }
+    }
+}
+
+/// MOD-125 M2 D4: one run's workspace stop. A live walk of the run is preempted through the
+/// cancel seam — `Cancel { grace }`, graceful = the runtime's cancel grace, forced = zero — and its
+/// token drops at grace + [`STOP_SLACK`]; the walk publishes its own `PREEMPTED` and runs
+/// `abandoned`. Then, under the run's lock (taken directly, not through a walk token, so an
+/// escalation's `preempt` reaches only the walk, blueprint F10), `Engine::settle_stop`. A run
+/// leased here with no live walk goes straight to the settle. Every failure is logged: the stop
+/// row stays, so the next poll retries.
+async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    mode: StopMode,
+    _in_flight: StopInFlight<P>,
+) {
+    let _ = ctx.tag.run.set(run);
+    if ctx.shared.walks.is_live(run) {
+        let grace = match mode {
+            StopMode::Graceful => ctx.shared.cancel_grace,
+            StopMode::Forced => Duration::ZERO,
+        };
+        ctx.shared
+            .walks
+            .preempt_gracefully(run, grace, STOP_SLACK)
+            .await;
+    }
+    let guard = ctx.shared.locks.lock(run).await;
+    if ctx.shared.walks.closed() {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%run, %message, "a stop could not build its engine; the next poll retries");
+            return;
+        }
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match Box::pin(engine.settle_stop(run)).await {
+        Ok(true) => tracing::info!(%run, %mode, "run {run} stopped ({mode})"),
+        Ok(false) => {
+            tracing::debug!(%run, "the stop found the run no longer running under this process");
+        }
+        Err(err) => tracing::warn!(%run, %err, "settling a stop failed; the next poll retries"),
+    }
+    drop(guard);
 }
 
 /// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
