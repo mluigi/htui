@@ -38,15 +38,15 @@ use ratatui::widgets::Paragraph;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, PersonaId, ProjectId, Scope, StepGraphId, StepGraphPatch,
-    StepGraphPhase,
+    ItemKind, ItemKindId, ItemKindPatch, PersonaId, ProjectId, Scope, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase,
 };
 
 use htui_core::store::CasOutcome;
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{
-    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, graph_label,
+    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, WorkspaceNames,
 };
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
@@ -645,8 +645,7 @@ impl KindsSection {
     /// it missing), or it names nothing at all.
     fn not_a_project_graph(&self, p: usize, id: StepGraphId) -> String {
         self.project(p)
-            .and_then(|project| project.graph_name(id))
-            .map(|(name, scope)| graph_label(name, scope))
+            .and_then(|project| project.label_of(id))
             .map_or_else(
                 || GRAPH_MISSING.to_owned(),
                 |label| format!("graph {label} is not edited here"),
@@ -1222,10 +1221,9 @@ impl KindsSection {
         // the one thing in `theme.error` (the band covers it on the cursor row).
         // MOD-138 D12: a workspace or library graph is named with its scope, and has no phase
         // rows under it (`rows` expands the project's own graphs only).
-        let tail = match project.graph_name(kind.default_graph_id) {
-            Some((name, scope)) => {
-                Span::styled(format!("graph {}", graph_label(name, scope)), theme.base)
-            }
+        // MOD-141 M3 D1: a workspace graph names its workspace too.
+        let tail = match project.label_of(kind.default_graph_id) {
+            Some(label) => Span::styled(format!("graph {label}"), theme.base),
             None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
         };
         Some(Line::from(vec![Span::styled(head, theme.base), tail]))
@@ -1758,12 +1756,11 @@ fn new_kind_fields(project: &ProjectCatalogue) -> Vec<Field> {
 }
 
 /// The same five fields, prefilled from the row (B-5's whole patch goes out from them). The
-/// graph reads as its [`graph_label`] (MOD-138 D12), so a workspace or library graph keeps its
-/// scope on screen and [`graph_named`] does not mistake it for a project graph of that name.
+/// graph reads as its [`ProjectCatalogue::label`] (MOD-138 D12, MOD-141 M3 D1), so a workspace or
+/// library graph keeps its scope (and a workspace graph its workspace) on screen, and
+/// [`graph_named`] does not mistake it for a project graph of that name.
 fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
-    let graph = project
-        .graph_name(kind.default_graph_id)
-        .map_or_else(String::new, |(name, scope)| graph_label(name, scope));
+    let graph = project.label_of(kind.default_graph_id).unwrap_or_default();
     vec![
         Field::required("prefix", &kind.prefix),
         Field::required("name", &kind.name),
@@ -1794,12 +1791,19 @@ fn next_position(positions: impl Iterator<Item = i32>) -> String {
 }
 
 /// The graph the typed text names (B-7). A graph name is unique within one scope only (MOD-138
-/// D12), so the text is matched as a [`graph_label`]: the project's own graph by its bare name
-/// first, then a workspace or library graph the project may use as `name · workspace` /
-/// `name · library`, in [`ProjectCatalogue::shared`]'s order; a bare name no project graph has
-/// still finds a shared graph of that name. `current` is the edited kind's graph: text that still
-/// reads as its label keeps it, so an untouched field never moves the kind, not even between two
-/// workspaces' graphs that share a name and so a label.
+/// D12), so the text is matched as a [`ProjectCatalogue::label`] (MOD-141 M3 D3, M-2), in order:
+///
+/// 1. `current`, the edited kind's graph, when the text still reads as its label: an untouched
+///    field never moves the kind;
+/// 2. else every graph the project may name, its own (by bare name) and each
+///    [`shared`](ProjectCatalogue::shared) one (`name · workspace <workspace>`,
+///    `name · library`), whose label is the text;
+/// 3. else every shared graph whose bare name is the text, or whose label before M3
+///    (`name · workspace`) is.
+///
+/// One candidate resolves; two or more are refused with [`ambiguous_graph`], listing their labels
+/// in `shared` order; none is [`NO_GRAPH_NAMED`]. [`kept`](ProjectCatalogue::kept) graphs stay
+/// out: no kind may newly take one.
 ///
 /// A name rather than an id because that is what is on screen; the store checks the rule again
 /// on the write, so this resolution is a convenience and not the guard.
@@ -1808,22 +1812,43 @@ fn graph_named(
     text: &str,
     current: Option<StepGraphId>,
 ) -> Result<StepGraphId, String> {
-    if let Some(id) = current.filter(|&id| {
-        project
-            .graph_name(id)
-            .is_some_and(|(name, scope)| graph_label(name, scope) == text)
-    }) {
+    if let Some(id) = current.filter(|&id| project.label_of(id).as_deref() == Some(text)) {
         return Ok(id);
     }
-    project
+    let mut candidates: Vec<&StepGraph> = project
         .graphs
         .iter()
         .map(|entry| &entry.graph)
         .chain(&project.shared)
-        .find(|graph| graph_label(&graph.name, graph.scope) == text)
-        .or_else(|| project.shared.iter().find(|graph| graph.name == text))
-        .map(|graph| graph.id)
-        .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
+        .filter(|graph| project.label(graph) == text)
+        .collect();
+    if candidates.is_empty() {
+        let unnamed = WorkspaceNames::default();
+        candidates = project
+            .shared
+            .iter()
+            .filter(|graph| graph.name == text || unnamed.label(&graph.name, graph.scope) == text)
+            .collect();
+    }
+    match candidates.as_slice() {
+        [] => Err(NO_GRAPH_NAMED.to_owned()),
+        [graph] => Ok(graph.id),
+        several => {
+            let labels: Vec<String> = several.iter().map(|graph| project.label(graph)).collect();
+            Err(ambiguous_graph(text, &labels))
+        }
+    }
+}
+
+/// MOD-141 M3 D3 (M-2): what a typed graph name that names two or more graphs is told: the text,
+/// how many graphs it names, and the label of each to type instead, e.g. `"flow" names 2 graphs;
+/// type one of: flow · workspace Platform, flow · workspace Graphics`.
+pub(crate) fn ambiguous_graph(text: &str, labels: &[String]) -> String {
+    format!(
+        "\"{text}\" names {} graphs; type one of: {}",
+        labels.len(),
+        labels.join(", ")
+    )
 }
 
 /// A bound persona's name, or its id when the loaded list does not know it (a persona created
@@ -2263,5 +2288,148 @@ mod tests {
             details += listed.end - at;
         }
         assert!(details > 0, "a phase with its detail was walked");
+    }
+
+    /// The demo's Vulkan project joins Platform too, so it may use both workspaces' graphs; each
+    /// workspace gets a graph named `flow`, and Platform one named `solo`. The catalogue the
+    /// Graphics scope reads then, and the ids of Platform's `flow`, Graphics' `flow` and `solo`.
+    async fn two_flows() -> (ProjectCatalogue, StepGraphId, StepGraphId, StepGraphId) {
+        use htui_core::fixtures::ids;
+        use htui_core::model::{GraphScope, NewStepGraph, WorkspaceProject};
+        use htui_core::store::{MemStore, WriteStore as _};
+
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_id: ids::PROJECT_VULKAN,
+                position: 9,
+            })
+            .await
+            .expect("vulkan joins platform");
+        let mut created = Vec::new();
+        for (workspace, name) in [
+            (ids::WORKSPACE_PLATFORM, "flow"),
+            (ids::WORKSPACE_GRAPHICS, "flow"),
+            (ids::WORKSPACE_PLATFORM, "solo"),
+        ] {
+            let graph = store
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    scope: GraphScope::Workspace(workspace),
+                    name: name.to_owned(),
+                    description: String::new(),
+                    is_override: false,
+                })
+                .await
+                .expect("a workspace graph");
+            created.push(graph.id);
+        }
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let mut read = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        (read.projects.remove(0), created[0], created[1], created[2])
+    }
+
+    /// The labels of the shared `flow`s, in `shared` order: what an ambiguity refusal lists.
+    fn flow_labels(project: &ProjectCatalogue) -> Vec<String> {
+        project
+            .shared
+            .iter()
+            .filter(|graph| graph.name == "flow")
+            .map(|graph| project.label(graph))
+            .collect()
+    }
+
+    /// MOD-141 M3 D3 (M-2): the exact qualified label always resolves.
+    #[tokio::test]
+    async fn graph_named_resolves_an_exact_qualified_label() {
+        let (project, platform, graphics, _) = two_flows().await;
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Platform", None),
+            Ok(platform)
+        );
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Graphics", None),
+            Ok(graphics)
+        );
+    }
+
+    /// D3: a bare name, or the old `name · workspace`, resolves while it names exactly one graph;
+    /// a project graph's bare name is its label.
+    #[tokio::test]
+    async fn graph_named_resolves_a_unique_bare_name() {
+        let (project, _, _, solo) = two_flows().await;
+        assert_eq!(graph_named(&project, "solo", None), Ok(solo));
+        assert_eq!(
+            graph_named(&project, "solo \u{b7} workspace", None),
+            Ok(solo)
+        );
+        let own = &project.graphs[0].graph;
+        assert_eq!(graph_named(&project, &own.name, None), Ok(own.id));
+        assert_eq!(
+            graph_named(&project, "nope", None),
+            Err(NO_GRAPH_NAMED.to_owned())
+        );
+    }
+
+    /// D3: a bare name two graphs share is refused, and the refusal lists both labels.
+    #[tokio::test]
+    async fn graph_named_refuses_an_ambiguous_bare_name_with_both_labels() {
+        let (project, ..) = two_flows().await;
+        let labels = flow_labels(&project);
+        assert_eq!(labels.len(), 2);
+        let refused = graph_named(&project, "flow", None).expect_err("ambiguous");
+        assert_eq!(refused, ambiguous_graph("flow", &labels));
+        assert!(
+            refused.contains("flow \u{b7} workspace Platform")
+                && refused.contains("flow \u{b7} workspace Graphics"),
+            "{refused}"
+        );
+    }
+
+    /// D3: the old-style `flow · workspace` names both `flow`s too, and is refused the same way.
+    #[tokio::test]
+    async fn graph_named_refuses_an_ambiguous_old_style_label() {
+        let (project, ..) = two_flows().await;
+        let text = "flow \u{b7} workspace";
+        assert_eq!(
+            graph_named(&project, text, None),
+            Err(ambiguous_graph(text, &flow_labels(&project)))
+        );
+    }
+
+    /// D3 step 1: text that reads as the edited kind's own graph keeps it, even where the same
+    /// text names two graphs (here no workspace row was read, so both `flow`s read alike).
+    #[tokio::test]
+    async fn graph_named_keeps_current_when_ambiguous() {
+        let (mut project, platform, graphics, _) = two_flows().await;
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Graphics", Some(graphics)),
+            Ok(graphics)
+        );
+        project.workspaces = WorkspaceNames::default();
+        let text = "flow \u{b7} workspace";
+        assert_eq!(graph_named(&project, text, Some(graphics)), Ok(graphics));
+        assert_eq!(graph_named(&project, text, Some(platform)), Ok(platform));
+        assert!(graph_named(&project, text, None).is_err());
+    }
+
+    /// D3: the refusal names the text, how many graphs it names, and the labels to type instead.
+    #[test]
+    fn ambiguous_graph_names_the_count_and_the_labels() {
+        let labels = [
+            "flow \u{b7} workspace Platform".to_owned(),
+            "flow \u{b7} workspace Graphics".to_owned(),
+        ];
+        assert_eq!(
+            ambiguous_graph("flow", &labels),
+            "\"flow\" names 2 graphs; type one of: flow \u{b7} workspace Platform, \
+             flow \u{b7} workspace Graphics"
+        );
     }
 }
