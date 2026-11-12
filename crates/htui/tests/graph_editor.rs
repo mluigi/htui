@@ -1402,6 +1402,9 @@ struct M2Case {
     prepare: Option<NodeEdit>,
     /// The chords after `e`; `"SAVE"` saves and lets the store answer, mid-case.
     chords: Vec<String>,
+    /// The prepared node, changed as the case expects the mid-case `"SAVE"` to store it; `None`
+    /// when the chords hold no `"SAVE"`.
+    mid: Option<NodeEdit>,
     /// The prepared node, changed as the case expects it stored.
     expect: NodeEdit,
 }
@@ -1437,6 +1440,7 @@ async fn every_m2_node_field_round_trips() {
             compete: false,
             prepare: None,
             chords: retyped(row(DEADLINE), "900"),
+            mid: None,
             expect: Box::new(|node| node.phase.deadline_seconds = Some(900)),
         },
         M2Case {
@@ -1444,6 +1448,7 @@ async fn every_m2_node_field_round_trips() {
             compete: false,
             prepare: Some(Box::new(|node| node.phase.deadline_seconds = Some(60))),
             chords: retyped(row(DEADLINE), ""),
+            mid: None,
             expect: Box::new(|node| node.phase.deadline_seconds = None),
         },
         M2Case {
@@ -1451,6 +1456,7 @@ async fn every_m2_node_field_round_trips() {
             compete: false,
             prepare: None,
             chords: at_row(row(SPLIT), &["l"]),
+            mid: None,
             expect: Box::new(|node| node.phase.split = Split::Divide),
         },
         M2Case {
@@ -1458,6 +1464,7 @@ async fn every_m2_node_field_round_trips() {
             compete: false,
             prepare: None,
             chords: joined(at_row(row(SPLIT), &["l"]), at_row(PLANNER - SPLIT, &["l"])),
+            mid: None,
             expect: Box::new(move |node| {
                 node.phase.split = Split::Divide;
                 node.phase.planner_persona_id = Some(persona);
@@ -1471,6 +1478,7 @@ async fn every_m2_node_field_round_trips() {
                 at_row(row(SPLIT), &["l"]),
                 at_row(PLANNER_AGENT - SPLIT, &["l"]),
             ),
+            mid: None,
             expect: Box::new({
                 let first = first.clone();
                 move |node| {
@@ -1487,6 +1495,7 @@ async fn every_m2_node_field_round_trips() {
                 at_row(row(SPLIT), &["l"]),
                 at_row(INTEGRATE - SPLIT, &["l"]),
             ),
+            mid: None,
             expect: Box::new(move |node| {
                 node.phase.split = Split::Divide;
                 node.phase.integrate_persona_id = Some(persona);
@@ -1500,6 +1509,7 @@ async fn every_m2_node_field_round_trips() {
                 at_row(row(SPLIT), &["l"]),
                 at_row(INTEGRATE_AGENT - SPLIT, &["l"]),
             ),
+            mid: None,
             expect: Box::new({
                 let first = first.clone();
                 move |node| {
@@ -1513,6 +1523,7 @@ async fn every_m2_node_field_round_trips() {
             compete: false,
             prepare: None,
             chords: joined(at_row(row(SPLIT), &["l"]), retyped(MAX_PARTS - SPLIT, "3")),
+            mid: None,
             expect: Box::new(|node| {
                 node.phase.split = Split::Divide;
                 node.phase.max_parts = Some(3);
@@ -1526,6 +1537,7 @@ async fn every_m2_node_field_round_trips() {
                 at_row(row(SPLIT), &["l"]),
                 at_row(PLAN_SCOPE - SPLIT, &["l"]),
             ),
+            mid: None,
             expect: Box::new(|node| {
                 node.phase.split = Split::Divide;
                 node.phase.plan_scope = Some(PlanScope::Parts);
@@ -1562,6 +1574,7 @@ async fn every_m2_node_field_round_trips() {
                 chords.extend(at_row(1, &["l", "tab", "l", "enter"]));
                 chords
             },
+            mid: None,
             expect: Box::new({
                 let first = first.clone();
                 move |node| {
@@ -1593,6 +1606,7 @@ async fn every_m2_node_field_round_trips() {
                 );
                 chords
             },
+            mid: None,
             expect: Box::new(move |node| {
                 node.phase.split = Split::Divide;
                 node.parts = vec![
@@ -1613,6 +1627,7 @@ async fn every_m2_node_field_round_trips() {
             })),
             // The second part's title, typed in the form `alt-e` opens.
             chords: at_row(row(FIRST_PART) + 1, &["alt-e", "tab", "D", "B", "enter"]),
+            mid: None,
             expect: Box::new(move |node| {
                 node.parts[1].title = "DB".to_owned();
             }),
@@ -1629,6 +1644,11 @@ async fn every_m2_node_field_round_trips() {
                 chords.extend(at_row(row(FIRST_PART) + 1, &["alt-d"]));
                 chords
             },
+            // The first write stores both parts, so the second removes a stored one.
+            mid: Some(Box::new(move |node| {
+                node.phase.split = Split::Divide;
+                node.parts = vec![bare_part(research, 0, "ui"), bare_part(research, 1, "db")];
+            })),
             expect: Box::new(move |node| {
                 node.phase.split = Split::Divide;
                 node.parts = vec![bare_part(research, 0, "ui")];
@@ -1652,6 +1672,7 @@ async fn every_m2_node_field_round_trips() {
                 }
             })),
             chords: at_row(row(SPLIT), &["h"]),
+            mid: None,
             // The seven divide columns, the parts and the plan scope go (D7).
             expect: Box::new(|node| {
                 let phase = &mut node.phase;
@@ -1697,6 +1718,7 @@ async fn every_m2_node_field_round_trips() {
             // The deadline is the only column typed: the divide columns and the parts the form
             // opened with are saved as they were.
             chords: retyped(row(DEADLINE), "900"),
+            mid: None,
             expect: Box::new(|node| node.phase.deadline_seconds = Some(900)),
         },
         M2Case {
@@ -1710,6 +1732,7 @@ async fn every_m2_node_field_round_trips() {
                 chords.extend(at_row(JUDGE - FAN_OUT, &["l"]));
                 chords
             },
+            mid: None,
             expect: Box::new({
                 let first = first.clone();
                 move |node| {
@@ -1731,6 +1754,17 @@ async fn every_m2_node_field_round_trips() {
         }
         let (bench, mut section, backend) = analysis_bench(&store, None).await;
         let before = body_of(&store, ANALYSIS).await;
+        let at = before
+            .nodes
+            .iter()
+            .position(|node| node.phase.id == research)
+            .expect("research");
+        assert_eq!(
+            case.mid.is_some(),
+            case.chords.iter().any(|chord| chord == "SAVE"),
+            "{}: a mid-case shape is for a mid-case save",
+            case.column
+        );
         bench.key(&mut section, "e");
         assert_eq!(
             stack_of(&section),
@@ -1740,8 +1774,8 @@ async fn every_m2_node_field_round_trips() {
         );
         for chord in &case.chords {
             if chord == "SAVE" {
-                // Review R1 C-L5: the mid-case save went out and was stored, so what the next
-                // write changes is a stored part, not a draft.
+                // Review R1 C-L5: the mid-case save went out and stored what the case says, so
+                // what the next write changes is a stored part, not a draft.
                 bench.key(&mut section, "enter");
                 let served = bench_round(&bench, &mut section, &backend).await;
                 let frame = bench.render_section(&section, 100);
@@ -1753,9 +1787,15 @@ async fn every_m2_node_field_round_trips() {
                     case.column
                 );
                 assert!(frame.contains("saved: "), "{}: {frame}", case.column);
-                assert_ne!(
+                let mid = case
+                    .mid
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{}: what the first save stores", case.column));
+                let mut expected = before.clone();
+                mid(&mut expected.nodes[at]);
+                assert_eq!(
                     shape(&body_of(&store, ANALYSIS).await),
-                    shape(&before),
+                    shape(&expected),
                     "{}: the first save was stored",
                     case.column
                 );
@@ -1775,11 +1815,6 @@ async fn every_m2_node_field_round_trips() {
         );
         let stored = body_of(&store, ANALYSIS).await;
         let mut expected = before.clone();
-        let at = expected
-            .nodes
-            .iter()
-            .position(|node| node.phase.id == research)
-            .expect("research");
         (case.expect)(&mut expected.nodes[at]);
         assert_eq!(shape(&stored), shape(&expected), "{}", case.column);
         assert_ne!(
