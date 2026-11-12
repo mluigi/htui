@@ -1044,11 +1044,13 @@ pub trait WriteStore: ReadStore {
     /// ([`reserved_phase_name`]); a node CHECK
     /// [`phase_row_refusal`](crate::store::phase_row_refusal) decides (`split`/`fan_out`, divide
     /// columns off a divide node, `max_parts` below one, then `fan_out` below one, a negative
-    /// `retry_limit` and a `token_budget` below 1 ([`phase_token_budget_refusal`])); a `graph_id`
+    /// `retry_limit`, a `token_budget` below 1 ([`phase_token_budget_refusal`]), a `judge_model`
+    /// without a judge agent ([`judge_model_without_agent`]) and a `deadline_seconds` below 1
+    /// ([`deadline_below_one`])); a `graph_id`
     /// that names no row; a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id`
     /// any phase holds ([`already_exists`]); then `persona_id`,
-    /// `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id`
-    /// naming no row, in that order and worded
+    /// `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id`,
+    /// `judge_agent_id` naming no row, in that order and worded
     /// `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
@@ -1099,9 +1101,8 @@ pub trait WriteStore: ReadStore {
     ///
     /// Answers `Applied` with the body as stored (nodes, candidates and parts by `position`,
     /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
-    /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
-    /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
-    /// new one.
+    /// Every column [`StepGraphPhase`] carries is written, on a kept node and on a new one alike
+    /// (MOD-141 M2 D1).
     ///
     /// # Errors
     /// In this order, and nothing is written on any of them:
@@ -3563,6 +3564,22 @@ pub fn phase_token_budget_refusal(budget: i32) -> Option<String> {
         None,
     )
     .err()
+}
+
+/// 0003's `ck_phase_judge_model` (MOD-141 M2 D2), in words.
+#[must_use]
+pub fn judge_model_without_agent(phase: &str) -> String {
+    format!(
+        "phase `{phase}` has a judge_model and no judge_agent_id; a judge model needs its judge \
+         agent"
+    )
+}
+
+/// 0003's `step_graph_phase.deadline_seconds` CHECK (`deadline_seconds > 0`, MOD-141 M2 D2), in
+/// words.
+#[must_use]
+pub fn deadline_below_one(phase: &str, seconds: i32) -> String {
+    format!("phase `{phase}` has deadline_seconds {seconds}; a step deadline is at least 1 second")
 }
 
 /// MOD-137 D8: only a `divide` node has `phase_part` rows (a store check, not a CHECK).

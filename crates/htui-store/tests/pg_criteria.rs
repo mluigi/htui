@@ -12756,12 +12756,14 @@ async fn racer_copies_phase(
                 retry_limit, input_kinds, output_kind, isolation, command_queue, verify_command, \
                 template_name, template_version, token_budget, persona_id, split, palette, \
                 plan_scope, planner_persona_id, planner_agent_id, planner_model, \
-                integrate_persona_id, integrate_agent_id, integrate_model, max_parts) \
+                integrate_persona_id, integrate_agent_id, integrate_model, max_parts, \
+                deadline_seconds, judge_agent_id, judge_model) \
          SELECT $1, graph_id, $2, $3, fan_out, gate, gate_hard, retry_limit, input_kinds, \
                 output_kind, isolation, command_queue, verify_command, template_name, \
                 template_version, token_budget, persona_id, split, false, plan_scope, \
                 planner_persona_id, planner_agent_id, planner_model, integrate_persona_id, \
-                integrate_agent_id, integrate_model, max_parts \
+                integrate_agent_id, integrate_model, max_parts, deadline_seconds, \
+                judge_agent_id, judge_model \
            FROM step_graph_phase WHERE id = $4",
     )
     .bind(id.as_uuid())
@@ -13214,6 +13216,11 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
     phase.integrate_agent_id = Some(ids::AGENT_AGY);
     phase.integrate_model = Some("sonnet".to_owned());
     phase.max_parts = Some(3);
+    phase.deadline_seconds = Some(900);
+    // Review R1 A-L1: an agent and a model no other column holds, so a swapped bind reads back
+    // wrong.
+    phase.judge_agent_id = Some(ids::AGENT_CLAUDE_CLI);
+    phase.judge_model = Some("haiku".to_owned());
     let phase = phase.clone();
     let graph = data
         .graphs
@@ -13241,6 +13248,27 @@ async fn load_demo_keeps_every_graph_and_phase_column() {
         "every step_graph_phase column loaded"
     );
 
+    db.drop_db().await;
+}
+
+/// MOD-141 M2 D2: `phase_fk_refused` maps the judge's foreign key by the name Postgres gave
+/// it (0003 declared `REFERENCES agent(id)` with no `CONSTRAINT`); a renamed key fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_judge_agent_foreign_key_has_the_name_the_writer_maps() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let name: String = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint \
+          WHERE conrelid = 'step_graph_phase'::regclass AND contype = 'f' \
+            AND conkey = ARRAY[(SELECT attnum FROM pg_attribute \
+                                 WHERE attrelid = 'step_graph_phase'::regclass \
+                                   AND attname = 'judge_agent_id')]",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("one foreign key on judge_agent_id");
+    assert_eq!(name, "step_graph_phase_judge_agent_id_fkey");
     db.drop_db().await;
 }
 

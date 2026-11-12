@@ -10,6 +10,8 @@
 //! - `history`: undo, redo and the one write in flight (D4, D6).
 //! - `canvas`: the rataflow projection, layout, selection and mouse (D7, D11).
 //! - `node_form`, `edge_form`, `links`: the forms and the links list (D8, D9, D10).
+//! - `notes`: what a run of one step would be refused with today, in resolve's own words (M2 D11).
+//! - `part_form`: one default part of a divide step (M2 D9).
 //! - [`GraphEditor`] (this module): the modes, every key through the key catalogue (D12), the
 //!   writes and the replies (D4), the mouse (D11) and the drawing (D2). Only this module names
 //!   `Act`, `Keys`, `Stack`, `Ctx` or `StoreRequest`.
@@ -20,6 +22,8 @@ pub(crate) mod history;
 pub(crate) mod links;
 pub(crate) mod model;
 pub(crate) mod node_form;
+pub(crate) mod notes;
+pub(crate) mod part_form;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -41,15 +45,18 @@ use self::canvas::{Canvas, CanvasEvent};
 use self::edge_form::{EdgeForm, EdgeRow, EdgeTarget, cycle_kind};
 use self::history::{History, Write};
 use self::links::Links;
-use self::node_form::{NodeForm, NodeRow, NodeTarget};
+use self::node_form::{FormKeys, ListFocus, NodeForm, NodeRow, NodeTarget, PartOpen};
+use self::part_form::{PartForm, PartRow};
 use crate::app::{Ctx, Handled};
-use crate::catalogue::PersonaSummary;
+use crate::catalogue::{EditorSettings, PersonaSummary};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplatesSnapshot;
-use crate::ui::FieldOutcome;
+use crate::ui::cells::cell_width;
+use crate::ui::kit::form::FormLines;
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::{FieldOutcome, Theme};
 
 /// What the host hands the editor beside the body (D1): the persona registry, always known (the
 /// catalogue carries it), and the agents and the templates once their reads answered.
@@ -174,11 +181,12 @@ fn cannot(write: &Write, refusal: &str) -> String {
 }
 
 /// The delete question (D10, C3): the editor cannot see the step's skill bindings, so it always
-/// says what undo does not bring back. `answers` is the question's own keys.
+/// says what undo does not bring back. Since M2 (M-3, C13) the body carries the deadline and the
+/// judge, so undo brings those back. `answers` is the question's own keys.
 fn delete_question(name: &str, answers: &str) -> String {
     format!(
         "delete step {name}? its links go with it, and what led into it now leads to what came \
-         after; undo brings the step back but not its skill bindings, deadline or judge. {answers}"
+         after; undo brings the step back but not its skill bindings. {answers}"
     )
 }
 
@@ -187,10 +195,93 @@ fn connecting(from: &str) -> String {
     format!("linking from {from}: pick the step it leads to")
 }
 
-/// The notice of a lookup read the store refused (`agents`, `templates`): the editor still works
-/// without it.
+/// The notice of a lookup read the store refused (`agents`, `templates`, the run limits): the
+/// editor still works without it.
 fn unavailable(what: &str, message: &str) -> String {
     format!("{what} unavailable: {message}")
+}
+
+/// The header's second line before the settings read answered (M2 D6).
+const LIMITS_NOT_READ: &str = "limits not read yet";
+
+/// What ends a [`limits_row`] that had to drop part of the line.
+const LIMITS_MORE: &str = " \u{b7} \u{2026}";
+
+/// M2 D13: the run limits resolve freezes, read-only (M-1): exactly what a run would freeze.
+fn limits_line(settings: Option<&EditorSettings>) -> String {
+    settings.map_or_else(
+        || LIMITS_NOT_READ.to_owned(),
+        |settings| {
+            let bounds = &settings.bounds;
+            format!(
+                "limits \u{b7} fan-out {} \u{b7} agents {} \u{b7} plan revisions {} \u{b7} parallel {} \
+                 \u{b7} child runs {} \u{b7} run-time changes {}",
+                bounds.max_fan_out,
+                bounds.max_agents_per_run,
+                bounds.max_plan_revisions,
+                bounds.max_parallel_sessions,
+                bounds.max_child_runs,
+                bounds.runtime_changes.as_str(),
+            )
+        },
+    )
+}
+
+/// [`limits_line`] in its one row, `width` cells wide: the editor clips it, it never wraps
+/// (Open risk 5). What does not fit goes a whole `label value` at a time and ` · …` says so,
+/// so no number is cut in half; a row too narrow for the first is `…`.
+fn limits_row(settings: Option<&EditorSettings>, width: u16) -> String {
+    let line = limits_line(settings);
+    let width = usize::from(width);
+    if cell_width(&line) <= width {
+        return line;
+    }
+    let mut kept = String::new();
+    for segment in line.split(" \u{b7} ") {
+        let longer = if kept.is_empty() {
+            segment.to_owned()
+        } else {
+            format!("{kept} \u{b7} {segment}")
+        };
+        if cell_width(&longer) + cell_width(LIMITS_MORE) > width {
+            break;
+        }
+        kept = longer;
+    }
+    if kept.is_empty() {
+        "\u{2026}".to_owned()
+    } else {
+        kept + LIMITS_MORE
+    }
+}
+
+/// The step form's rows and its notes in `height` rows (M2 D11, D14), all of them when they fit.
+/// Else the notes stay on screen under the rows, taking at most half of them (`…` ending the
+/// notes when some were cut), and the rows above scroll the focused row into view.
+fn fitted(
+    form: FormLines,
+    mut notes: Vec<Line<'static>>,
+    height: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if form.lines.len() + notes.len() <= height {
+        let mut lines = form.lines;
+        lines.extend(notes);
+        return lines;
+    }
+    let room = height / 2;
+    if notes.len() > room {
+        notes.truncate(room.saturating_sub(1));
+        if room > 0 {
+            notes.push(notice("  \u{2026}", Tone::Error, theme));
+        }
+    }
+    let rows = height - notes.len();
+    let offset = form.offset(u16::try_from(rows).unwrap_or(u16::MAX));
+    let mut lines: Vec<Line<'static>> = form.lines.into_iter().skip(offset).take(rows).collect();
+    lines.extend(notes);
+    lines
 }
 
 /// The canvas's keys.
@@ -214,7 +305,7 @@ const HINT_CONNECT: HintSpec = &[
     Hint::One(Act::GraphEditorClose, "cancel"),
 ];
 
-/// The step form's keys.
+/// The step form's keys while any row but a part row has the focus.
 const HINT_NODE_FORM: HintSpec = &[
     Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
     Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "value"),
@@ -226,6 +317,30 @@ const HINT_NODE_FORM: HintSpec = &[
         "order",
     ),
     Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
+];
+
+/// The step form's keys while a part row has the focus (M2 D14): the list acts name parts.
+const HINT_NODE_FORM_PARTS: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "value"),
+    Hint::One(Act::GraphEditorCandidateAdd, "add part"),
+    Hint::One(Act::GraphEditorOpenPart, "edit part"),
+    Hint::One(Act::GraphEditorCandidateRemove, "remove part"),
+    Hint::Pair(
+        Act::GraphEditorCandidateUp,
+        Act::GraphEditorCandidateDown,
+        "order",
+    ),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
+];
+
+/// The part form's keys (M2 D9): `Enter` keeps the part in the step form, nothing is written.
+const HINT_PART_FORM: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "value"),
+    Hint::One(Act::FieldSubmit, "done"),
     Hint::One(Act::FieldCancel, "cancel"),
 ];
 
@@ -279,6 +394,14 @@ struct NodeEditing {
     base: htui_core::model::NodeBody,
 }
 
+/// The part form over the step form it came from (M2 D9).
+struct PartEditing {
+    /// The part form.
+    form: PartForm,
+    /// The step form it returns to, unchanged until the part is kept.
+    node: Box<NodeEditing>,
+}
+
 /// What the editor is doing.
 enum Mode {
     /// The canvas has the keys.
@@ -290,6 +413,8 @@ enum Mode {
     },
     /// The step form is open.
     NodeForm(Box<NodeEditing>),
+    /// The part form is open over the step form (M2 D9).
+    PartForm(Box<PartEditing>),
     /// The link form is open.
     EdgeForm(Box<EdgeForm>),
     /// The links list of one step.
@@ -308,6 +433,7 @@ impl Mode {
             Self::Canvas => "canvas",
             Self::Connecting { .. } => "connecting",
             Self::NodeForm(_) => "step form",
+            Self::PartForm(_) => "part form",
             Self::EdgeForm(_) => "link form",
             Self::Links(_) => "links",
             Self::ConfirmDelete { .. } => "delete question",
@@ -338,6 +464,9 @@ pub struct GraphEditor {
     history: History,
     /// The personas, agents and templates (D1).
     lookups: Lookups,
+    /// The run limits and the compete switch (M2 D6, C8); `None` until the settings read
+    /// answered, which reads as the switch off and the limits not read.
+    settings: Option<EditorSettings>,
     /// The canvas; rataflow draws through `&mut`, so `render(&self)` borrows it.
     canvas: RefCell<Canvas>,
     /// The body, the selection or the lookups changed since the canvas last synced.
@@ -366,8 +495,8 @@ impl core::fmt::Debug for GraphEditor {
 
 impl GraphEditor {
     /// Opens on `body` with the host's persona registry, and answers the reads to send now:
-    /// `[StoreRequest::Agents, StoreRequest::Templates(scope)]`. Selects the first flow step
-    /// (position order), else none.
+    /// `[StoreRequest::Agents, StoreRequest::Templates(scope), StoreRequest::GraphEditorSettings]`.
+    /// Selects the first flow step (position order), else none.
     #[must_use]
     pub fn open(
         body: GraphBody,
@@ -385,6 +514,7 @@ impl GraphEditor {
                 agents: None,
                 templates: None,
             },
+            settings: None,
             canvas: RefCell::new(Canvas::new()),
             resync: Cell::new(true),
             canvas_area: Cell::new(None),
@@ -423,7 +553,7 @@ impl GraphEditor {
             self.refuse(NO_STEP_SELECTED);
             return;
         };
-        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id));
+        let form = NodeForm::new(node, NodeTarget::Edit(node.phase.id), self.compete());
         self.mode = Mode::NodeForm(Box::new(NodeEditing {
             form,
             base: node.clone(),
@@ -431,10 +561,21 @@ impl GraphEditor {
         self.notice = None;
     }
 
-    /// The reads the host re-sends on activation: `Agents`, `Templates(scope)`.
+    /// The reads the host re-sends on activation: `Agents`, `Templates(scope)` and (M2 D6) the
+    /// run limits and the compete switch, `GraphEditorSettings`.
     #[must_use]
     pub fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Agents, StoreRequest::Templates(scope.clone())]
+        vec![
+            StoreRequest::Agents,
+            StoreRequest::Templates(scope.clone()),
+            StoreRequest::GraphEditorSettings,
+        ]
+    }
+
+    /// The compete switch as last read (M2 D5): off until the settings read answers. A step form
+    /// keeps the switch it opened with, but one opened before the first read takes that read.
+    fn compete(&self) -> bool {
+        self.settings.is_some_and(|settings| settings.compete)
     }
 
     /// The persona registry changed (every catalogue the host adopts).
@@ -449,27 +590,34 @@ impl GraphEditor {
     }
 
     /// The current mode's stack: the canvas `GRAPH_EDITOR`, connecting `GRAPH_EDITOR_CONNECT`,
-    /// the step form `GRAPH_EDITOR_NODE_FORM`, the link form `GRAPH_EDITOR_EDGE_FORM`, the links
-    /// list `GRAPH_EDITOR_LINKS` and the delete question `GRAPH_EDITOR_CONFIRM`.
+    /// the step form `GRAPH_EDITOR_NODE_FORM`, the part form `GRAPH_EDITOR_PART_FORM` (M2 D14),
+    /// the link form `GRAPH_EDITOR_EDGE_FORM`, the links list `GRAPH_EDITOR_LINKS` and the delete
+    /// question `GRAPH_EDITOR_CONFIRM`.
     #[must_use]
     pub const fn stack(&self) -> Stack<'static> {
         match self.mode {
             Mode::Canvas => views::GRAPH_EDITOR,
             Mode::Connecting { .. } => views::GRAPH_EDITOR_CONNECT,
             Mode::NodeForm(_) => views::GRAPH_EDITOR_NODE_FORM,
+            Mode::PartForm(_) => views::GRAPH_EDITOR_PART_FORM,
             Mode::EdgeForm(_) => views::GRAPH_EDITOR_EDGE_FORM,
             Mode::Links(_) => views::GRAPH_EDITOR_LINKS,
             Mode::ConfirmDelete { .. } => views::GRAPH_EDITOR_CONFIRM,
         }
     }
 
-    /// The mode's keys through its stack, plus ` · saving…` while a write is in flight.
+    /// The mode's keys through its stack, plus ` · saving…` while a write is in flight. The step
+    /// form's list acts name the focused list's noun (M2 D14).
     #[must_use]
     pub fn hint_text(&self, keys: &Keys) -> String {
-        let spec = match self.mode {
+        let spec = match &self.mode {
             Mode::Canvas => HINT_CANVAS,
             Mode::Connecting { .. } => HINT_CONNECT,
-            Mode::NodeForm(_) => HINT_NODE_FORM,
+            Mode::NodeForm(editing) => match editing.form.list_focus() {
+                ListFocus::Candidates => HINT_NODE_FORM,
+                ListFocus::Parts => HINT_NODE_FORM_PARTS,
+            },
+            Mode::PartForm(_) => HINT_PART_FORM,
             Mode::EdgeForm(_) => HINT_EDGE_FORM,
             Mode::Links(_) => HINT_LINKS,
             Mode::ConfirmDelete { .. } => HINT_CONFIRM,
@@ -487,6 +635,7 @@ impl GraphEditor {
     pub fn takes_paste(&self) -> bool {
         match &self.mode {
             Mode::NodeForm(editing) => editing.form.focused() == NodeRow::Text,
+            Mode::PartForm(editing) => editing.form.focused() == PartRow::Text,
             Mode::EdgeForm(form) => form.focused() != EdgeRow::Relation,
             _ => false,
         }
@@ -497,6 +646,7 @@ impl GraphEditor {
     pub fn on_paste(&mut self, text: &str) -> Handled {
         match &mut self.mode {
             Mode::NodeForm(editing) => editing.form.on_paste(text),
+            Mode::PartForm(editing) => editing.form.on_paste(text),
             Mode::EdgeForm(form) => form.on_paste(text),
             _ => return Handled::Pass,
         }
@@ -581,7 +731,7 @@ impl GraphEditor {
     }
 
     /// Every reply the host receives; the editor takes its own: its write's answer, and the
-    /// agents and templates it reads.
+    /// agents, templates and settings it reads.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::GraphReplaced { outcome, .. } => match outcome {
@@ -622,28 +772,49 @@ impl GraphEditor {
             StoreReply::Failed { request, message } if *request == "templates" => {
                 self.notice = Some(Notice::Info(unavailable("templates", message)));
             }
+            // M2 D6: the limits on the header, the switch for the next step form, and the
+            // canvas's markers, which need `max_fan_out`.
+            StoreReply::GraphEditorSettings(settings) => {
+                // Open risk 4: a step form opened before the first read (Kinds' `e` opens it
+                // before the reads leave) opened with the switch off; that read reaches it.
+                if self.settings.is_none() {
+                    match &mut self.mode {
+                        Mode::NodeForm(editing) => editing.form.switch_read(settings.compete),
+                        Mode::PartForm(editing) => {
+                            editing.node.form.switch_read(settings.compete);
+                        }
+                        _ => {}
+                    }
+                }
+                self.settings = Some(**settings);
+                self.resync.set(true);
+            }
+            StoreReply::Failed { request, message } if *request == "graph_editor_settings" => {
+                self.notice = Some(Notice::Info(unavailable("run limits", message)));
+            }
             _ => {}
         }
     }
 
-    /// Draws over the whole `area` (D2): the header, the canvas (and the open panel beside it),
-    /// then the notice or the delete question.
+    /// Draws over the whole `area` (D2): the header and its limits line (M2 D13), the canvas
+    /// (and the open panel beside it), then the notice or the delete question.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let mut bottom = self.bottom_lines(area.width, ctx);
         bottom.truncate(NOTICE_ROWS);
+        let heading = vec![
+            Line::styled(self.header(ctx.keys()), theme.title),
+            Line::styled(limits_row(self.settings.as_ref(), area.width), theme.dim),
+        ];
         let [header, middle, foot] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(u16::try_from(bottom.len()).unwrap_or(0)),
         ])
         .areas(area);
-        frame.render_widget(
-            Paragraph::new(Line::styled(self.header(ctx.keys()), theme.title)),
-            header,
-        );
+        frame.render_widget(Paragraph::new(heading), header);
         let panel = match &self.mode {
-            Mode::NodeForm(_) | Mode::EdgeForm(_) | Mode::Links(_) => true,
+            Mode::NodeForm(_) | Mode::PartForm(_) | Mode::EdgeForm(_) | Mode::Links(_) => true,
             Mode::Canvas | Mode::Connecting { .. } | Mode::ConfirmDelete { .. } => false,
         };
         if panel {
@@ -653,7 +824,10 @@ impl GraphEditor {
             ])
             .areas(middle);
             self.draw_canvas(frame, canvas, ctx);
-            frame.render_widget(Paragraph::new(self.panel_lines(side.width, ctx)), side);
+            frame.render_widget(
+                Paragraph::new(self.panel_lines(side.width, side.height, ctx)),
+                side,
+            );
         } else {
             self.draw_canvas(frame, middle, ctx);
         }
@@ -681,24 +855,42 @@ impl GraphEditor {
         header
     }
 
-    /// The panel beside the canvas: the open form's or the links list's title, then its rows.
-    fn panel_lines(&self, width: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+    /// The panel beside the canvas, `width` x `height`: the open form's or the links list's title,
+    /// then its rows; the step form's notes under its rows (M2 D11), the rows scrolled to the
+    /// focused one when the step form is taller than the panel.
+    fn panel_lines(&self, width: u16, height: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let (title, rows) = match &self.mode {
             Mode::NodeForm(editing) => {
-                let add = ctx
-                    .keys()
-                    .label(views::GRAPH_EDITOR_NODE_FORM, Act::GraphEditorCandidateAdd);
+                let label = |act| ctx.keys().label(views::GRAPH_EDITOR_NODE_FORM, act);
+                let (add, open) = (
+                    label(Act::GraphEditorCandidateAdd),
+                    label(Act::GraphEditorOpenPart),
+                );
+                let form = editing.form.layout(
+                    &editing.base,
+                    &self.lookups,
+                    FormKeys {
+                        add: add.as_deref(),
+                        open: open.as_deref(),
+                    },
+                    width,
+                    ctx.accent(),
+                    theme,
+                );
+                let notes = self.note_lines(editing, width, theme);
+                // The title takes the panel's first row.
+                let rows = fitted(form, notes, height.saturating_sub(1), theme);
+                (editing.form.title(&self.body), rows)
+            }
+            Mode::PartForm(editing) => {
+                let step =
+                    step_name(&self.body, editing.node.base.phase.id).unwrap_or("the new step");
                 (
-                    editing.form.title(&self.body),
-                    editing.form.lines(
-                        &editing.base,
-                        &self.lookups,
-                        add.as_deref(),
-                        width,
-                        ctx.accent(),
-                        theme,
-                    ),
+                    editing.form.title(step),
+                    editing
+                        .form
+                        .lines(&self.lookups, width, ctx.accent(), theme),
                 )
             }
             Mode::EdgeForm(form) => (
@@ -719,6 +911,31 @@ impl GraphEditor {
         let mut lines = vec![Line::styled(title, theme.title)];
         lines.extend(rows);
         lines
+    }
+
+    /// M2 D11 (B5): what a run of the step as the form holds it would be refused with today,
+    /// `width` cells wide, `! ` before each note's first line. While the form does not build, the
+    /// notes are the node's as it opened.
+    fn note_lines(&self, editing: &NodeEditing, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let node = editing
+            .form
+            .build(&editing.base, &self.lookups)
+            .unwrap_or_else(|_| editing.base.clone());
+        let width = usize::from(width.saturating_sub(2)).max(1);
+        let mut lines = Vec::new();
+        for note in notes::notes(&node, self.max_fan_out()) {
+            for (at, line) in wrapped(&note, width).iter().enumerate() {
+                let lead = if at == 0 { "! " } else { "  " };
+                lines.push(notice(&format!("{lead}{line}"), Tone::Error, theme));
+            }
+        }
+        lines
+    }
+
+    /// `max_fan_out` once the settings read answered (M2 D11, C9): the notes skip the checks that
+    /// need it until then.
+    fn max_fan_out(&self) -> Option<u32> {
+        self.settings.map(|settings| settings.bounds.max_fan_out)
     }
 
     /// The rows under the canvas: the delete question, else the notice, wrapped to `width`.
@@ -750,28 +967,45 @@ impl GraphEditor {
         self.canvas_area.set(Some(area));
     }
 
-    /// Rebuilds the canvas from the body, the selection and the agents when any changed.
+    /// Rebuilds the canvas from the body, the selection and the agents when any changed; a step
+    /// a run would refuse today is marked (M2 D11, D12).
     fn sync_canvas(&self, ctx: &Ctx<'_>) {
         if self.resync.replace(false) {
             let agents = self.lookups.agents.as_deref().unwrap_or(&[]);
-            self.canvas
-                .borrow_mut()
-                .sync(&self.body, self.selected, agents, ctx.theme);
+            let max_fan_out = self.max_fan_out();
+            let warned = self
+                .body
+                .nodes
+                .iter()
+                .filter(|node| !notes::notes(node, max_fan_out).is_empty())
+                .map(|node| node.phase.id)
+                .collect();
+            let mut canvas = self.canvas.borrow_mut();
+            canvas.set_warned(warned);
+            canvas.sync(&self.body, self.selected, agents, ctx.theme);
         }
     }
 
     /// A form's focused text row takes `key` first; `None` when it passes it on (or no text row
     /// has the focus).
     fn on_text_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Option<Handled> {
-        let outcome = match &mut self.mode {
+        let (outcome, part) = match &mut self.mode {
             Mode::NodeForm(editing) if editing.form.focused() == NodeRow::Text => {
-                editing.form.on_text_key(key)
+                (editing.form.on_text_key(key), false)
             }
-            Mode::EdgeForm(form) if form.focused() != EdgeRow::Relation => form.on_text_key(key),
+            Mode::PartForm(editing) if editing.form.focused() == PartRow::Text => {
+                (editing.form.on_text_key(key), true)
+            }
+            Mode::EdgeForm(form) if form.focused() != EdgeRow::Relation => {
+                (form.on_text_key(key), false)
+            }
             _ => return None,
         };
         match outcome {
             FieldOutcome::Consumed => {}
+            // The part form's `Enter` keeps the part and its `Esc` drops it: back to the step form.
+            FieldOutcome::Submit if part => self.keep_part(),
+            FieldOutcome::Cancel if part => self.back_to_step_form(),
             FieldOutcome::Submit => self.save(ctx),
             FieldOutcome::Cancel => self.back_to_canvas(),
             FieldOutcome::Pass => return None,
@@ -789,6 +1023,7 @@ impl GraphEditor {
             }
             Mode::Connecting { from } => self.on_connecting_act(from, act),
             Mode::NodeForm(_) => self.on_node_form_act(act, ctx),
+            Mode::PartForm(_) => self.on_part_form_act(act),
             Mode::EdgeForm(_) => self.on_edge_form_act(act, ctx),
             Mode::Links(_) => self.on_links_act(act, ctx),
             Mode::ConfirmDelete { node } => self.on_confirm_act(node, act, ctx),
@@ -809,6 +1044,7 @@ impl GraphEditor {
                         NodeTarget::New {
                             after: self.selected,
                         },
+                        self.compete(),
                     );
                     self.mode = Mode::NodeForm(Box::new(NodeEditing { form, base }));
                     self.notice = None;
@@ -930,10 +1166,15 @@ impl GraphEditor {
                 Ok(())
             }
             Act::ChoicePrev | Act::ChoiceNext => form.cycle(act == Act::ChoiceNext, &self.lookups),
-            Act::GraphEditorCandidateAdd => form.candidate_add(&self.lookups),
-            Act::GraphEditorCandidateRemove => form.candidate_remove(),
-            Act::GraphEditorCandidateUp => form.candidate_move(true),
-            Act::GraphEditorCandidateDown => form.candidate_move(false),
+            // M2 D14: the four list acts work on the focused list, candidates or parts.
+            Act::GraphEditorCandidateAdd => match form.list_focus() {
+                ListFocus::Candidates => form.candidate_add(&self.lookups),
+                ListFocus::Parts => return self.open_part(PartOpen::New),
+            },
+            Act::GraphEditorOpenPart => return self.open_part(PartOpen::Focused),
+            Act::GraphEditorCandidateRemove => form.list_remove(),
+            Act::GraphEditorCandidateUp => form.list_move(true),
+            Act::GraphEditorCandidateDown => form.list_move(false),
             Act::FieldSubmit => {
                 self.save(ctx);
                 return true;
@@ -948,6 +1189,83 @@ impl GraphEditor {
             self.refuse(&refusal);
         }
         true
+    }
+
+    /// The step form's part form (M2 D9): [`PartOpen::New`] a blank part, [`PartOpen::Focused`]
+    /// the focused one; the step form waits under it. What the step form refuses is said and it
+    /// stays open. Refused while a write is in flight, as [`Self::open_node_form`] is: its reply
+    /// would close the part form and drop what was typed.
+    fn open_part(&mut self, open: PartOpen) -> bool {
+        let Mode::NodeForm(editing) = &self.mode else {
+            return false;
+        };
+        if self.busy() {
+            self.refuse(history::IN_FLIGHT);
+            return true;
+        }
+        match editing.form.open_part(open) {
+            Ok(form) => {
+                self.mode = match core::mem::replace(&mut self.mode, Mode::Canvas) {
+                    Mode::NodeForm(node) => Mode::PartForm(Box::new(PartEditing { form, node })),
+                    other => other,
+                };
+                self.notice = None;
+            }
+            Err(refusal) => self.refuse(&refusal),
+        }
+        true
+    }
+
+    /// The part form's acts, once its focused text row passed the key on: `Enter` keeps the
+    /// part, `Esc` drops the edit; neither writes.
+    fn on_part_form_act(&mut self, act: Act) -> bool {
+        let Mode::PartForm(editing) = &mut self.mode else {
+            return false;
+        };
+        match act {
+            Act::FormNextField => editing.form.next_field(),
+            Act::FormPrevField => editing.form.prev_field(),
+            Act::ChoicePrev | Act::ChoiceNext => {
+                editing.form.cycle(act == Act::ChoiceNext, &self.lookups);
+            }
+            Act::FieldSubmit => self.keep_part(),
+            Act::FieldCancel => self.back_to_step_form(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The part form's `Enter`: the step form takes the part (nothing is written until the step
+    /// is saved) and has the focus again. A refusal (a key that is empty or taken) is said and
+    /// the part form stays.
+    fn keep_part(&mut self) {
+        let editing = match core::mem::replace(&mut self.mode, Mode::Canvas) {
+            Mode::PartForm(editing) => editing,
+            other => {
+                self.mode = other;
+                return;
+            }
+        };
+        let PartEditing { form, mut node } = *editing;
+        match node.form.put_part(&form) {
+            Ok(()) => {
+                self.mode = Mode::NodeForm(node);
+                self.notice = None;
+            }
+            Err(refusal) => {
+                self.mode = Mode::PartForm(Box::new(PartEditing { form, node }));
+                self.refuse(&refusal);
+            }
+        }
+    }
+
+    /// The part form's `Esc`: back to the step form as it was, the notice cleared.
+    fn back_to_step_form(&mut self) {
+        self.mode = match core::mem::replace(&mut self.mode, Mode::Canvas) {
+            Mode::PartForm(editing) => Mode::NodeForm(editing.node),
+            other => other,
+        };
+        self.notice = None;
     }
 
     /// The link form's acts, once its focused text row passed the key on.
@@ -1254,7 +1572,8 @@ mod tests {
     use chrono::{DateTime, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        EdgeId, NodeBody, PersonaId, ProjectRef, StepGraph, StepGraphEdge, StepGraphPhase,
+        EdgeId, NodeBody, PersonaId, PhasePart, ProjectRef, Split, StepGraph, StepGraphEdge,
+        StepGraphPhase,
     };
     use htui_core::seed::{PhaseSeed, phase_row};
     use htui_core::store::{
@@ -1268,6 +1587,7 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
 
+    use super::part_form::PartTarget;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keys::{KeyChord, load_str};
     use crate::store_worker::{self, Origin};
@@ -1389,9 +1709,15 @@ mod tests {
 
         /// The editor drawn into 100x30, as text.
         fn render(&self, editor: &GraphEditor) -> String {
-            let area = Rect::new(0, 0, 100, 30);
+            self.render_in(editor, 100, 30)
+        }
+
+        /// The editor drawn into `width` x `height`, as text. The shell's 100x30 gives it 98x27
+        /// (the Kinds pane's border, the top bar and the hint row).
+        fn render_in(&self, editor: &GraphEditor, width: u16, height: u16) -> String {
+            let area = Rect::new(0, 0, width, height);
             let mut terminal = Terminal::with_options(
-                TestBackend::new(100, 30),
+                TestBackend::new(width, height),
                 TerminalOptions {
                     viewport: Viewport::Fixed(area),
                 },
@@ -1555,14 +1881,33 @@ mod tests {
         (*body, snapshot.personas.clone())
     }
 
+    /// The settings read's answer (M2 D6): the code defaults, the compete switch as given.
+    fn settings(compete: bool) -> StoreReply {
+        StoreReply::GraphEditorSettings(Box::new(EditorSettings {
+            bounds: htui_orch::graph::run_bounds(&std::collections::BTreeMap::new()),
+            compete,
+        }))
+    }
+
+    /// Line `n` of the editor drawn into 100x30.
+    fn drawn_line(bench: &Bench, editor: &GraphEditor, n: usize) -> String {
+        bench
+            .render(editor)
+            .lines()
+            .nth(n)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     #[tokio::test]
-    async fn opening_asks_for_agents_and_templates() {
+    async fn opening_asks_for_agents_templates_and_settings() {
         let bench = Bench::new().await;
         let (editor, requests) =
             GraphEditor::open(flow(0, GraphScope::Library, 0), Vec::new(), &bench.scope);
         let reads = vec![
             StoreRequest::Agents,
             StoreRequest::Templates(bench.scope.clone()),
+            StoreRequest::GraphEditorSettings,
         ];
         let reads = format!("{reads:?}");
         assert_eq!(format!("{requests:?}"), reads);
@@ -1571,6 +1916,132 @@ mod tests {
         assert_eq!(editor.selected, Some(phase(1)), "the first flow step");
         assert_eq!(editor.stack(), views::GRAPH_EDITOR);
         assert!(!editor.busy());
+    }
+
+    /// M2 D13: the header's second line is the run limits resolve freezes, read-only; before the
+    /// settings read answers it says so (D6).
+    #[tokio::test]
+    async fn the_header_shows_the_limits_once_read() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        assert_eq!(drawn_line(&bench, &editor, 1), LIMITS_NOT_READ);
+        bench.reply(&mut editor, &settings(false));
+        assert_eq!(
+            drawn_line(&bench, &editor, 1),
+            "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4 \
+             \u{b7} child runs 8 \u{b7} run-time changes ask"
+        );
+        assert!(
+            drawn_line(&bench, &editor, 0).starts_with("flow \u{b7} library graph"),
+            "the first line is the graph's"
+        );
+        // Narrower, it is clipped to its one row (Open risk 5), a whole `label value` at a time
+        // and ` · …` saying so: no number is cut in half.
+        let read = settings(false);
+        let StoreReply::GraphEditorSettings(read) = &read else {
+            unreachable!("a settings answer");
+        };
+        let whole = limits_line(Some(read));
+        assert_eq!(limits_row(Some(read), 99), whole);
+        assert_eq!(
+            limits_row(Some(read), 98),
+            "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} parallel 4 \
+             \u{b7} child runs 8 \u{b7} \u{2026}"
+        );
+        assert_eq!(
+            limits_row(Some(read), 30),
+            "limits \u{b7} fan-out 4 \u{b7} \u{2026}"
+        );
+        assert_eq!(limits_row(None, 60), LIMITS_NOT_READ);
+        assert_eq!(limits_row(None, 10), "\u{2026}");
+        for width in 0..=110 {
+            let row = limits_row(Some(read), width);
+            assert!(
+                cell_width(&row) <= usize::from(width.max(1)),
+                "{width}: {row}"
+            );
+            let kept = row.trim_end_matches(" \u{b7} \u{2026}");
+            assert!(
+                row == whole || row == "\u{2026}" || whole.starts_with(&format!("{kept} \u{b7} ")),
+                "{width}: {row}"
+            );
+        }
+        // In the shell's 98 columns the header stays two rows: the third is the canvas's.
+        let screen = bench.render_in(&editor, 98, 27);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert_eq!(rows[1], limits_row(Some(read), 98));
+        assert!(!screen.contains("run-time changes"), "{screen}");
+    }
+
+    /// M2 D6: a refused settings read is said like the other lookups', and the limits stay unread.
+    #[tokio::test]
+    async fn a_refused_settings_read_says_so() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        bench.reply(
+            &mut editor,
+            &StoreReply::Failed {
+                request: "graph_editor_settings",
+                message: "refused".to_owned(),
+            },
+        );
+        assert_eq!(
+            notice_text(&editor),
+            Some("run limits unavailable: refused")
+        );
+        assert_eq!(drawn_line(&bench, &editor, 1), LIMITS_NOT_READ);
+        assert!(bench.requests().is_empty(), "nothing asked again");
+    }
+
+    /// The split the step form holds after `e`, the focus on the split row and `presses` times
+    /// `l`; the form is cancelled after.
+    fn split_after(bench: &Bench, editor: &mut GraphEditor, presses: usize) -> Split {
+        bench.key(editor, "e");
+        // M1's 13 rows, the candidates' placeholder, the deadline and the palette.
+        bench.keys(editor, &["tab"; 16]);
+        bench.keys(editor, &vec!["l"; presses]);
+        let Mode::NodeForm(editing) = &editor.mode else {
+            panic!("the step form is open");
+        };
+        let split = editing
+            .form
+            .build(&editing.base, &editor.lookups)
+            .expect("the form builds")
+            .phase
+            .split;
+        bench.key(editor, "esc");
+        split
+    }
+
+    /// M2 D5, D7: compete is offered only once the settings read says the switch is on; until
+    /// then it is off. A form already open keeps the switch it opened with.
+    #[tokio::test]
+    async fn compete_is_offered_once_the_switch_reads_on() {
+        let bench = Bench::new().await;
+        let mut editor = library(&bench, 0);
+        assert_eq!(split_after(&bench, &mut editor, 1), Split::Divide);
+        assert_eq!(
+            split_after(&bench, &mut editor, 2),
+            Split::None,
+            "not read yet: off"
+        );
+        bench.reply(&mut editor, &settings(false));
+        assert_eq!(split_after(&bench, &mut editor, 2), Split::None, "off");
+
+        // A form open while the switch reads on keeps it off.
+        bench.key(&mut editor, "e");
+        bench.reply(&mut editor, &settings(true));
+        bench.keys(&mut editor, &["tab"; 16]);
+        bench.keys(&mut editor, &["l", "l"]);
+        let Mode::NodeForm(editing) = &editor.mode else {
+            panic!("the step form is open");
+        };
+        let built = editing.form.build(&editing.base, &editor.lookups);
+        assert_eq!(built.map(|node| node.phase.split), Ok(Split::None));
+        bench.key(&mut editor, "esc");
+
+        assert_eq!(split_after(&bench, &mut editor, 2), Split::Compete, "on");
+        assert_eq!(split_after(&bench, &mut editor, 3), Split::None);
     }
 
     #[tokio::test]
@@ -2057,8 +2528,8 @@ mod tests {
         assert_eq!(editor.stack(), views::GRAPH_EDITOR_CONFIRM);
         assert!(bench.requests().is_empty(), "nothing before the answer");
         let question = "delete step plan? its links go with it, and what led into it now leads to \
-                        what came after; undo brings the step back but not its skill bindings, \
-                        deadline or judge. y delete \u{b7} n/Esc keep";
+                        what came after; undo brings the step back but not its skill bindings. y \
+                        delete \u{b7} n/Esc keep";
         let ctx = bench.ctx();
         let shown: Vec<String> = editor
             .bottom_lines(1000, &ctx)
@@ -2168,7 +2639,7 @@ mod tests {
             ),
             (
                 Mode::NodeForm(Box::new(NodeEditing {
-                    form: NodeForm::new(&node, NodeTarget::Edit(phase(1))),
+                    form: NodeForm::new(&node, NodeTarget::Edit(phase(1)), false),
                     base: node.clone(),
                 })),
                 views::GRAPH_EDITOR_NODE_FORM,
@@ -2176,6 +2647,16 @@ mod tests {
             (
                 Mode::EdgeForm(Box::new(EdgeForm::new(phase(1), phase(3)))),
                 views::GRAPH_EDITOR_EDGE_FORM,
+            ),
+            (
+                Mode::PartForm(Box::new(PartEditing {
+                    form: PartForm::new(None, PartTarget::New, Vec::new()),
+                    node: Box::new(NodeEditing {
+                        form: NodeForm::new(&node, NodeTarget::Edit(phase(1)), false),
+                        base: node.clone(),
+                    }),
+                })),
+                views::GRAPH_EDITOR_PART_FORM,
             ),
             (Mode::Links(Links::new(phase(1))), views::GRAPH_EDITOR_LINKS),
             (
@@ -2203,6 +2684,385 @@ mod tests {
         assert!(!printed.contains("swordfish"), "{printed}");
         assert!(!printed.contains("research"), "{printed}");
         assert!(printed.contains("step form"), "{printed}");
+
+        // M2 D9: the part form's typed text stays out too.
+        let (mut editor, _) = GraphEditor::open(divided(&[]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        bench.key(&mut editor, "alt-n");
+        bench.typed(&mut editor, "hunter");
+        assert!(editor.takes_paste());
+        assert_eq!(editor.on_paste("swordfish"), Handled::Consumed);
+        let printed = format!("{editor:?}");
+        assert!(!printed.contains("hunter"), "{printed}");
+        assert!(!printed.contains("swordfish"), "{printed}");
+        assert!(!printed.contains("research"), "{printed}");
+        assert!(printed.contains("part form"), "{printed}");
+    }
+
+    /// The step form's row of a divide step's first part (or its placeholder) on [`divided`]:
+    /// M1's 13 rows, the candidates' placeholder, the deadline, the palette, the split and the
+    /// six divide rows.
+    const FIRST_PART_ROW: usize = 23;
+
+    /// [`flow`] with research a divide step holding a part per key, titled in capitals.
+    fn divided(keys: &[&str]) -> GraphBody {
+        let mut body = flow(0, GraphScope::Library, 0);
+        let research = &mut body.nodes[0];
+        research.phase.split = Split::Divide;
+        research.parts = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| PhasePart {
+                phase_id: phase(1),
+                position: i32::try_from(at).expect("a few parts"),
+                key: (*key).to_owned(),
+                title: key.to_uppercase(),
+                brief: String::new(),
+                owned_paths: Vec::new(),
+                acceptance: None,
+                agent_id: None,
+                model: None,
+                persona_id: None,
+            })
+            .collect();
+        body
+    }
+
+    /// The parts of the open step form, as it would save them: `(key, title)`.
+    fn form_parts(editor: &GraphEditor) -> Vec<(String, String)> {
+        let Mode::NodeForm(editing) = &editor.mode else {
+            panic!("the step form is open");
+        };
+        editing
+            .form
+            .build(&editing.base, &editor.lookups)
+            .expect("the form builds")
+            .parts
+            .into_iter()
+            .map(|part| (part.key, part.title))
+            .collect()
+    }
+
+    /// The notes under the open step form, each note's wrapped lines joined back.
+    fn shown_notes(bench: &Bench, editor: &GraphEditor) -> Vec<String> {
+        let ctx = bench.ctx();
+        let mut shown: Vec<String> = Vec::new();
+        for line in editor.panel_lines(PANEL_WIDTH, u16::MAX, &ctx) {
+            let line = line.to_string();
+            if let Some(first) = line.strip_prefix("! ") {
+                shown.push(first.to_owned());
+            } else if let (Some(rest), Some(note)) = (line.strip_prefix("  "), shown.last_mut()) {
+                note.push(' ');
+                note.push_str(rest);
+            }
+        }
+        shown
+    }
+
+    /// M2 D14: on the parts list the add act opens a blank part form; `Enter` keeps the part in
+    /// the step form (writing nothing), a taken key is refused with the part form kept, and the
+    /// step form's save writes the part.
+    #[tokio::test]
+    async fn alt_n_on_the_parts_list_opens_a_new_part_form_and_enter_keeps_it() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&[]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        bench.key(&mut editor, "alt-n");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_PART_FORM);
+        let screen = bench.render(&editor);
+        assert!(screen.contains("new part of research"), "{screen}");
+        bench.typed(&mut editor, "ui");
+        bench.key(&mut editor, "tab");
+        bench.typed(&mut editor, "Front");
+        bench.key(&mut editor, "enter");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        assert_eq!(form_parts(&editor), [("ui".to_owned(), "Front".to_owned())]);
+        assert!(bench.requests().is_empty(), "keeping a part writes nothing");
+
+        // The focus is on the kept part: the add act opens another, which may not take its key.
+        bench.key(&mut editor, "alt-n");
+        bench.typed(&mut editor, "ui");
+        bench.key(&mut editor, "enter");
+        let taken = part_form::part_key_taken("ui");
+        assert_eq!(notice_text(&editor), Some(taken.as_str()));
+        assert_eq!(
+            editor.stack(),
+            views::GRAPH_EDITOR_PART_FORM,
+            "the part form stays"
+        );
+        bench.key(&mut editor, "esc");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        assert_eq!(notice_text(&editor), None);
+
+        bench.key(&mut editor, "enter");
+        let (_, _, sent, _) = bench.write();
+        let parts = &sent.nodes[0].parts;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            (
+                parts[0].key.as_str(),
+                parts[0].title.as_str(),
+                parts[0].position
+            ),
+            ("ui", "Front", 0)
+        );
+    }
+
+    /// M1's rule for forms holds for the part form: while the step form's save is in flight its
+    /// reply would close a part form and drop what was typed, so neither list act opens one.
+    #[tokio::test]
+    async fn no_part_form_opens_while_a_write_is_in_flight() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&["ui"]), Vec::new(), &bench.scope);
+        bench.keys(&mut editor, &["e", "enter"]);
+        let (_, _, sent, _) = bench.write();
+        assert!(editor.busy());
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        for chord in ["alt-e", "alt-n"] {
+            editor.notice = None;
+            bench.key(&mut editor, chord);
+            assert_eq!(notice_text(&editor), Some(history::IN_FLIGHT), "{chord}");
+            assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM, "{chord}");
+        }
+        assert!(bench.requests().is_empty());
+        bench.reply(&mut editor, &applied(stored(sent)));
+        assert!(!editor.busy());
+    }
+
+    /// M2 D14: the open act edits the focused part (off a part row it says there is none); `Esc`
+    /// leaves the part as it was, `Enter` keeps the edit, and the order acts move the part.
+    #[tokio::test]
+    async fn alt_e_edits_the_focused_part_and_esc_leaves_it_unchanged() {
+        let bench = Bench::new().await;
+        let (mut editor, _) =
+            GraphEditor::open(divided(&["ui", "store"]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.key(&mut editor, "alt-e");
+        assert_eq!(notice_text(&editor), Some(node_form::NO_PART));
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW + 1]);
+        bench.key(&mut editor, "alt-e");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_PART_FORM);
+        assert_eq!(notice_text(&editor), None);
+        let screen = bench.render(&editor);
+        assert!(screen.contains("part store of research"), "{screen}");
+        bench.typed(&mut editor, "x");
+        bench.key(&mut editor, "esc");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_NODE_FORM);
+        let unchanged = [
+            ("ui".to_owned(), "UI".to_owned()),
+            ("store".to_owned(), "STORE".to_owned()),
+        ];
+        assert_eq!(form_parts(&editor), unchanged);
+
+        bench.key(&mut editor, "alt-e");
+        bench.key(&mut editor, "tab");
+        bench.typed(&mut editor, "d");
+        bench.key(&mut editor, "enter");
+        bench.key(&mut editor, "alt-up");
+        assert_eq!(
+            form_parts(&editor),
+            [
+                ("store".to_owned(), "STOREd".to_owned()),
+                ("ui".to_owned(), "UI".to_owned()),
+            ]
+        );
+        bench.key(&mut editor, "alt-d");
+        assert_eq!(form_parts(&editor), [("ui".to_owned(), "UI".to_owned())]);
+        assert!(
+            bench.requests().is_empty(),
+            "nothing is written until saved"
+        );
+    }
+
+    /// M2 D14: the hint row names the focused list's noun, from the editor's own words.
+    #[tokio::test]
+    async fn the_hint_names_the_focused_lists_noun() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&["ui"]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        let hint = bench.hint(&editor);
+        assert!(hint.contains("Alt+n add agent"), "{hint}");
+        assert!(hint.contains("Alt+d remove agent"), "{hint}");
+        assert!(!hint.contains("part"), "{hint}");
+
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        let hint = bench.hint(&editor);
+        for words in ["Alt+n add part", "Alt+e edit part", "Alt+d remove part"] {
+            assert!(hint.contains(words), "{words}: {hint}");
+        }
+        assert!(!hint.contains("agent"), "{hint}");
+
+        bench.key(&mut editor, "alt-e");
+        let hint = bench.hint(&editor);
+        assert!(hint.contains("done"), "{hint}");
+        assert!(!hint.contains("part"), "{hint}");
+    }
+
+    /// M2 D11, D12 (B5): a step a run would refuse today is marked `!` on the canvas, and its
+    /// form lists resolve's sentences under its rows, live as the form changes. A warning never
+    /// refuses the save.
+    #[tokio::test]
+    async fn a_noted_step_is_marked_and_its_form_lists_the_notes() {
+        let bench = Bench::new().await;
+        let body = divided(&[]);
+        let expected = notes::notes(&body.nodes[0], None);
+        assert!(!expected.is_empty(), "a part-less divide step cannot run");
+        let (mut editor, _) = GraphEditor::open(body, Vec::new(), &bench.scope);
+        let screen = bench.render(&editor);
+        assert!(screen.contains("! research"), "{screen}");
+        assert!(!screen.contains("! plan"), "{screen}");
+
+        bench.key(&mut editor, "e");
+        assert_eq!(shown_notes(&bench, &editor), expected);
+        // Divide to none: nothing to say; back to divide: the notes again.
+        bench.keys(&mut editor, &["tab"; 16]);
+        bench.key(&mut editor, "h");
+        assert_eq!(shown_notes(&bench, &editor), Vec::<String>::new());
+        bench.key(&mut editor, "l");
+        assert_eq!(shown_notes(&bench, &editor), expected);
+
+        bench.key(&mut editor, "enter");
+        let (_, _, sent, _) = bench.write();
+        assert_eq!(sent.nodes[0].phase.split, Split::Divide);
+        assert!(sent.nodes[0].parts.is_empty());
+    }
+
+    /// M2 D11, D14: a divide step's form is taller than the panel in the shell's 98x27 (and in
+    /// less), so the panel scrolls the focused row into view and keeps the notes under it.
+    #[tokio::test]
+    async fn a_tall_step_form_scrolls_to_its_focus_and_keeps_its_notes() {
+        let bench = Bench::new().await;
+        let note = "! phase `research` cannot run yet";
+        for (width, height) in [(98, 27), (98, 18)] {
+            let (mut editor, _) = GraphEditor::open(divided(&[]), Vec::new(), &bench.scope);
+            bench.reply(&mut editor, &settings(false));
+            bench.key(&mut editor, "e");
+            let screen = bench.render_in(&editor, width, height);
+            for shown in ["step research", "\u{258c}name", note, "MOD-140"] {
+                assert!(
+                    screen.contains(shown),
+                    "{width}x{height} {shown}:\n{screen}"
+                );
+            }
+
+            bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+            let screen = bench.render_in(&editor, width, height);
+            for shown in ["step research", "\u{258c}parts", note, "MOD-140"] {
+                assert!(
+                    screen.contains(shown),
+                    "{width}x{height} {shown}:\n{screen}"
+                );
+            }
+            assert!(!screen.contains("\u{258c}name"), "{screen}");
+        }
+    }
+
+    /// M2 D11: notes taller than half the panel keep the rows' half, and `…` says some were cut.
+    #[test]
+    fn notes_past_half_the_panel_end_in_an_ellipsis() {
+        let theme = Theme::default();
+        let row = |n: usize| Line::raw(format!("row {n}"));
+        let form = FormLines {
+            lines: (0..10).map(row).collect(),
+            focus: Some(9..10),
+        };
+        let notes: Vec<Line<'static>> = (0..6)
+            .map(|n| notice(&format!("! note {n}"), Tone::Error, &theme))
+            .collect();
+        let shown: Vec<String> = fitted(form, notes, 8, &theme)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "row 6",
+                "row 7",
+                "row 8",
+                "row 9",
+                "! note 0",
+                "! note 1",
+                "! note 2",
+                "  \u{2026}"
+            ]
+        );
+    }
+
+    /// M2 D5 (Open risk 4): Kinds' `e` on a phase row opens the step form before the editor's
+    /// reads leave, so before the switch is read. The first read reaches that form: on, the
+    /// split offers compete and a compete step is no longer locked. A later read does not.
+    #[tokio::test]
+    async fn a_form_opened_before_the_first_settings_read_takes_its_switch() {
+        let bench = Bench::new().await;
+        // As `KindsSection::open_editor` opens it.
+        let opened = |body: GraphBody| {
+            let (mut editor, _) = GraphEditor::open(body, Vec::new(), &bench.scope);
+            editor.select(phase(1));
+            editor.open_node_form();
+            editor
+        };
+        let built = |editor: &GraphEditor| {
+            let Mode::NodeForm(editing) = &editor.mode else {
+                panic!("the step form is open");
+            };
+            editing
+                .form
+                .build(&editing.base, &editor.lookups)
+                .expect("the form builds")
+        };
+
+        let mut editor = opened(flow(0, GraphScope::Library, 0));
+        bench.reply(&mut editor, &settings(true));
+        bench.keys(&mut editor, &["tab"; 16]);
+        bench.keys(&mut editor, &["l", "l"]);
+        assert_eq!(built(&editor).phase.split, Split::Compete);
+
+        let mut body = flow(0, GraphScope::Library, 0);
+        body.nodes[0].phase.split = Split::Compete;
+        body.nodes[0].phase.fan_out = 2;
+        let locked = "read-only while";
+        let mut editor = opened(body.clone());
+        assert!(bench.render(&editor).contains(locked));
+        bench.reply(&mut editor, &settings(true));
+        let screen = bench.render(&editor);
+        assert!(!screen.contains(locked), "{screen}");
+        // The fan-out row (after the split) takes a key now.
+        bench.keys(&mut editor, &["tab"; 17]);
+        bench.keys(&mut editor, &["backspace"]);
+        bench.typed(&mut editor, "3");
+        assert_eq!(built(&editor).phase.fan_out, 3);
+
+        // Read off first, then on: the form keeps the switch it had read.
+        let mut editor = opened(body);
+        bench.reply(&mut editor, &settings(false));
+        bench.reply(&mut editor, &settings(true));
+        assert!(bench.render(&editor).contains(locked));
+    }
+
+    /// M2 D14: a focused part row names the open act's key under it, from the editor's keys.
+    #[tokio::test]
+    async fn a_focused_part_names_the_key_that_edits_it() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&["ui"]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW]);
+        let screen = bench.render(&editor);
+        assert!(screen.contains("\u{258c}part 1"), "{screen}");
+        assert!(screen.contains("Alt+e edits it"), "{screen}");
+
+        let keys = load_str("[graph_editor]\nopen_part = [\"alt-o\"]\n").expect("the file loads");
+        let rebound = Bench::new().await.with_keys(keys);
+        let screen = rebound.render(&editor);
+        assert!(screen.contains("Alt+o edits it"), "{screen}");
+        assert!(!screen.contains("Alt+e"), "{screen}");
+        assert!(rebound.hint(&editor).contains("Alt+o edit part"));
+        rebound.key(&mut editor, "alt-o");
+        assert_eq!(editor.stack(), views::GRAPH_EDITOR_PART_FORM);
     }
 
     #[tokio::test]
@@ -2241,6 +3101,27 @@ mod tests {
         let bench = Bench::new().await;
         let mut editor = library(&bench, 2);
         bench.keys(&mut editor, &["c", "j", "j"]);
+        insta::assert_snapshot!(bench.render(&editor));
+    }
+
+    /// M2 D9: the open act on a divide step's second part.
+    #[tokio::test]
+    async fn editor_part_form() {
+        let bench = Bench::new().await;
+        let (mut editor, _) =
+            GraphEditor::open(divided(&["ui", "store"]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
+        bench.keys(&mut editor, &["tab"; FIRST_PART_ROW + 1]);
+        bench.key(&mut editor, "alt-e");
+        insta::assert_snapshot!(bench.render(&editor));
+    }
+
+    /// M2 D11, D12: a part-less divide step's form with its notes, its canvas node marked.
+    #[tokio::test]
+    async fn editor_notes() {
+        let bench = Bench::new().await;
+        let (mut editor, _) = GraphEditor::open(divided(&[]), Vec::new(), &bench.scope);
+        bench.key(&mut editor, "e");
         insta::assert_snapshot!(bench.render(&editor));
     }
 

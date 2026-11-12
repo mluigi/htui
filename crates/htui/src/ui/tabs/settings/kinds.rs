@@ -762,14 +762,19 @@ impl KindsSection {
                 }
                 true
             }
-            StoreReply::Agents(_) | StoreReply::Templates(_) => {
+            StoreReply::Agents(_)
+            | StoreReply::Templates(_)
+            | StoreReply::GraphEditorSettings(_) => {
                 if let Mode::Graph { editor } = &mut self.mode {
                     editor.on_reply(reply, ctx);
                 }
                 true
             }
             StoreReply::Failed { request, .. }
-                if matches!(*request, "replace_graph" | "agents" | "templates") =>
+                if matches!(
+                    *request,
+                    "replace_graph" | "agents" | "templates" | "graph_editor_settings"
+                ) =>
             {
                 if let Mode::Graph { editor } = &mut self.mode {
                     editor.on_reply(reply, ctx);
@@ -1551,6 +1556,8 @@ impl SettingsSection for KindsSection {
             StoreReply::Failed { request, message } if *request == "catalogue" => {
                 self.unavailable = Some(message.clone());
             }
+            // MOD-141 M2 D6 (C7): the editor's read, after it closed; nothing of the section's.
+            StoreReply::Failed { request, .. } if *request == "graph_editor_settings" => {}
             // Every other refusal of this section's own: the shell has already put
             // `{request}: {message}` on the status line, so all this owes is the sentence and a
             // state the next key can start from.
@@ -1922,6 +1929,7 @@ fn doing(busy: &str) -> &'static str {
         "replace_graph" => "replacing the graph",
         "delete_phase" => "deleting the phase",
         "graph_body" => "reading the graph",
+        "graph_editor_settings" => "reading the run limits",
         _ => "writing",
     }
 }
@@ -2119,6 +2127,99 @@ mod tests {
             hint.ends_with(" \u{b7} saving the budget\u{2026}"),
             "{hint}"
         );
+    }
+
+    /// MOD-141 M2 D6 (C7): the editor's settings read is the editor's own. While the editor is
+    /// open its answer and its refusal go to the editor; a refusal that lands after it closed is
+    /// nobody's, never a refusal of the section's, though its name is in `REQUEST_NAMES`.
+    #[tokio::test]
+    async fn the_editors_settings_read_is_never_the_sections() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, WriteStore};
+
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::settings::SettingsTab;
+
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let body = store
+            .graph_body(ids::GRAPH_VULKAN_ANA)
+            .await
+            .expect("a memory read")
+            .expect("the analysis graph");
+        let (projects, top_bar, theme, emit) = (
+            Vec::new(),
+            TopBarState::default(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let keys = Keys::compiled().clone();
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keys,
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let (editor, _) = GraphEditor::open(body, Vec::new(), &scope);
+        let mut section = KindsSection {
+            mode: Mode::Graph {
+                editor: Box::new(editor),
+            },
+            ..KindsSection::new()
+        };
+        let answer = StoreReply::GraphEditorSettings(Box::new(crate::catalogue::EditorSettings {
+            bounds: htui_orch::graph::run_bounds(&std::collections::BTreeMap::new()),
+            compete: false,
+        }));
+        let refused = StoreReply::Failed {
+            request: "graph_editor_settings",
+            message: "refused".to_owned(),
+        };
+        assert!(
+            section.on_editor_reply(&answer, &mut ctx),
+            "the answer is the editor's"
+        );
+        assert!(
+            section.on_editor_reply(&refused, &mut ctx),
+            "so is its refusal"
+        );
+        // Review R1 C-L4: the refusal reached the editor, which says so in its own words.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(98, 27))
+            .expect("a test terminal");
+        terminal
+            .draw(|frame| section.render(frame, frame.area(), &ctx))
+            .expect("the section draws");
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("run limits unavailable: refused"),
+            "{screen}"
+        );
+
+        section.mode = Mode::Browse;
+        section.busy = Some(REQUEST_NAMES[8]);
+        section.on_reply(&refused, &mut ctx);
+        assert_eq!(
+            section.busy,
+            Some(REQUEST_NAMES[8]),
+            "the section's write stays"
+        );
+        assert!(section.notice.is_none(), "{:?}", section.notice);
     }
 
     /// MOD-115 M3 RV2 L2: the list is handed the cursor's own line, which `list_rows` answers,

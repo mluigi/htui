@@ -1,0 +1,18 @@
+---
+source: crates/htui/src/ui/graph_editor/canvas.rs
+expression: "rows(&draw_at(&mut canvas, 100, 28)).join(\"\\n\")"
+---
+
+                                      ╭─ ! research ─────────╮
+                                      │template research     │
+                                      │gate always · retries…│
+                                      │any agent             │
+                                      ╰───────────●──────────╯
+                                                  │
+                                                  │
+                                                  ▼
+                                      ╭─ verdict ────────────╮
+                                      │template verdict      │
+                                      │gate always · hard · …│
+                                      │any agent             │
+                                      ╰───────────●──────────╯

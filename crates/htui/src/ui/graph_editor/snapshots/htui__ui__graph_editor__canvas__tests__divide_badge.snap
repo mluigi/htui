@@ -14,5 +14,5 @@ expression: "drawn(&body, None, &demo_agents().await, (100, 28))"
                                       ╭─ verdict ────────────╮
                                       │template verdict      │
                                       │gate always · hard · …│
-                                      │divide · needs MOD-139│
+                                      │divide · 2 parts      │
                                       ╰───────────●──────────╯

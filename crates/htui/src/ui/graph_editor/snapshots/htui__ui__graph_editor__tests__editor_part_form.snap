@@ -1,0 +1,28 @@
+---
+source: crates/htui/src/ui/graph_editor/mod.rs
+expression: bench.render(&editor)
+---
+flow · library graph · revision 0
+limits not read yet
+                                                  part store of research
+             ╭─ research ───────────╮             ▌key           store
+             │template research     │                            unique in this step
+             │gate always · retries…│              title         STORE
+             │divide · 2 parts      │              brief
+             ╰───────────●──────────╯              owned paths
+                         │                         acceptance
+                         │                         agent         ‹ none ›
+                         ▼                         persona       ‹ none ›
+             ╭─ plan ───────────────╮
+             │template plan         │
+             │gate always · retries…│
+             │any agent             │
+             ╰───────────●──────────╯
+                         │
+                         │
+                         ▼
+             ╭─ review ─────────────╮
+             │template review       │
+             │gate always · retries…│
+             │any agent             │
+             ╰───────────●──────────╯

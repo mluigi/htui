@@ -428,8 +428,8 @@ pub const GRAPH_EDITOR_CONNECT: Stack<'static> = Stack::new(&[
     MODAL,
 ]);
 
-/// The graph editor's step form (MOD-141 D12): text fields, choices, the field moves and the
-/// candidate list.
+/// The graph editor's step form (MOD-141 D12, M2 D14): text fields, choices, the field moves,
+/// the candidate and part lists, and the part form's open.
 pub const GRAPH_EDITOR_NODE_FORM: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::GraphEditor,
@@ -438,6 +438,7 @@ pub const GRAPH_EDITOR_NODE_FORM: Stack<'static> = Stack::new(&[
             Act::GraphEditorCandidateRemove,
             Act::GraphEditorCandidateUp,
             Act::GraphEditorCandidateDown,
+            Act::GraphEditorOpenPart,
         ],
     ),
     FIELD,
@@ -449,6 +450,15 @@ pub const GRAPH_EDITOR_NODE_FORM: Stack<'static> = Stack::new(&[
 /// The graph editor's link form (MOD-141 D12): relation (a choice), predicate and loop limit
 /// (text fields).
 pub const GRAPH_EDITOR_EDGE_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::GraphEditor, &[]),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
+]);
+
+/// The graph editor's part form (MOD-141 M2 D9, D14): text fields and choices, as the link form.
+pub const GRAPH_EDITOR_PART_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::GraphEditor, &[]),
     FIELD,
     PICK,
@@ -1386,6 +1396,7 @@ mod tests {
         GRAPH_EDITOR_CONNECT,
         GRAPH_EDITOR_NODE_FORM,
         GRAPH_EDITOR_EDGE_FORM,
+        GRAPH_EDITOR_PART_FORM,
         GRAPH_EDITOR_LINKS,
         GRAPH_EDITOR_CONFIRM,
         PROMPT_BROWSE,
@@ -1563,6 +1574,14 @@ mod tests {
             [Act::GraphEditorCandidateAdd]
         );
         assert_eq!(resolve(GRAPH_EDITOR_NODE_FORM, "tab"), [Act::FormNextField]);
+        // MOD-141 M2 D14: the step form opens the focused part; the part form is a plain form.
+        assert_eq!(
+            resolve(GRAPH_EDITOR_NODE_FORM, "alt-e"),
+            [Act::GraphEditorOpenPart]
+        );
+        assert_eq!(resolve(GRAPH_EDITOR_PART_FORM, "tab"), [Act::FormNextField]);
+        assert_eq!(resolve(GRAPH_EDITOR_PART_FORM, "alt-e"), []);
+        assert_eq!(resolve(GRAPH_EDITOR_PART_FORM, "enter"), [Act::FieldSubmit]);
         assert_eq!(resolve(GRAPH_EDITOR_LINKS, "h"), [Act::ChoicePrev]);
         assert_eq!(resolve(GRAPH_EDITOR_LINKS, "d"), [Act::LinksDelete]);
         assert_eq!(resolve(GRAPH_EDITOR_LINKS, "j"), [Act::ListDown]);
@@ -2032,6 +2051,7 @@ mod tests {
                 "KINDS_EDITOR",
                 "GRAPH_EDITOR_NODE_FORM",
                 "GRAPH_EDITOR_EDGE_FORM",
+                "GRAPH_EDITOR_PART_FORM",
                 "BOXES_EDITOR",
                 "PERSONAS_FORM",
                 "PERSONAS_EDITOR",
@@ -2129,8 +2149,9 @@ mod tests {
             .collect();
         // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
-        // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90.
-        assert_eq!(views.len(), 90);
+        // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
+        // D14: the part form's, 91.
+        assert_eq!(views.len(), 91);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

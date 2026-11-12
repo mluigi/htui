@@ -18,9 +18,10 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, EdgeId, Gate,
     GraphBody, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, NodeBody,
     PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps, ProjectId, ProjectSettings,
-    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding, SkillBindingKey,
-    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona, SnapshotPhase,
-    SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
+    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, RuntimeChanges, SkillBinding,
+    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId,
+    StepGraphPhase,
 };
 use htui_core::model::{
     EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
@@ -155,6 +156,25 @@ pub struct Resolved {
     pub snapshot: GraphSnapshot,
     /// `run.repo_scope` (ANA-2 §4.7), from [`crate::overlap::resolve`].
     pub repo_scope: Vec<RepoId>,
+}
+
+/// MOD-141 M2 D4: the run limits [`resolve`] freezes into [`SnapshotSettings`], over the same
+/// `app_setting` keys and code defaults; the graph editor's header shows exactly these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunBounds {
+    /// `app_setting.max_fan_out`, else 4.
+    pub max_fan_out: u32,
+    /// `app_setting.max_agents_per_run`, else 8.
+    pub max_agents_per_run: u32,
+    /// `app_setting.max_parallel_sessions`, else
+    /// [`SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS`].
+    pub max_parallel_sessions: u32,
+    /// `app_setting.max_plan_revisions`, else [`SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS`].
+    pub max_plan_revisions: u32,
+    /// `app_setting.max_child_runs`, else [`SnapshotSettings::DEFAULT_MAX_CHILD_RUNS`].
+    pub max_child_runs: u32,
+    /// `app_setting.runtime_changes`, else `ask`.
+    pub runtime_changes: RuntimeChanges,
 }
 
 /// Why a graph could not be resolved into a snapshot.
@@ -618,25 +638,18 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         });
     }
 
+    let bounds = run_bounds(app);
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
         per_token_cap_run: caps.run_micros,
         per_token_cap_batch: caps.batch_micros,
-        max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
-        max_agents_per_run: app_u32(app, "max_agents_per_run")
-            .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        max_fan_out: bounds.max_fan_out,
+        max_agents_per_run: bounds.max_agents_per_run,
         // MOD-138 D13: the bounds, frozen over their code defaults like the caps above.
-        max_parallel_sessions: app_u32(app, "max_parallel_sessions")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS),
-        max_plan_revisions: app_u32(app, "max_plan_revisions")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS),
-        max_child_runs: app_u32(app, "max_child_runs")
-            .unwrap_or(SnapshotSettings::DEFAULT_MAX_CHILD_RUNS),
-        runtime_changes: app
-            .get("runtime_changes")
-            .and_then(Value::as_str)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default(),
+        max_parallel_sessions: bounds.max_parallel_sessions,
+        max_plan_revisions: bounds.max_plan_revisions,
+        max_child_runs: bounds.max_child_runs,
+        runtime_changes: bounds.runtime_changes,
     };
     check_fan_out_caps(&phases, &settings)?;
 
@@ -1595,6 +1608,28 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
     app_positive(app, key).and_then(|n| i32::try_from(n).ok())
 }
 
+/// MOD-141 M2 D4: [`RunBounds`] over `app`, each key under [`app_u32`]'s "positive or silent"
+/// rule; `runtime_changes` a known word or `ask`.
+#[must_use]
+pub fn run_bounds(app: &BTreeMap<String, Value>) -> RunBounds {
+    RunBounds {
+        max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
+        max_agents_per_run: app_u32(app, "max_agents_per_run")
+            .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        max_parallel_sessions: app_u32(app, "max_parallel_sessions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS),
+        max_plan_revisions: app_u32(app, "max_plan_revisions")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS),
+        max_child_runs: app_u32(app, "max_child_runs")
+            .unwrap_or(SnapshotSettings::DEFAULT_MAX_CHILD_RUNS),
+        runtime_changes: app
+            .get("runtime_changes")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    }
+}
+
 /// ANA-2 §4.10's one line (`R-ORCH-6`, `R-ORCH-2`): in auto mode a phase whose gate is not hard is
 /// snapshotted `never`, so its steps land `done` with `gate_outcome = skipped`; a hard gate, and
 /// every gate of a manual run, is kept. Applied **only** here, at snapshot time (MOD-12 D10):
@@ -1667,12 +1702,14 @@ async fn snapshot_phase<G: GraphSource>(
         isolation,
         command_queue: phase.command_queue,
         verify_command: phase.verify_command.clone(),
-        // `StepGraphPhase` carries no `deadline_seconds` field at HEAD though `0003` added the
-        // column, so the chain starts one rung down, at the project (blueprint H-14). Adding the
-        // field is a model change and would touch `.sqlx`; it is recorded rather than fixed.
+        // MOD-141 M2 D3: the phase rung first (a positive column), then the project, the app and
+        // two hours. A NULL column resolves exactly as before, so no digest moves.
         deadline_seconds: Some(
-            settings
-                .step_deadline_seconds
+            phase
+                .deadline_seconds
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| u32::try_from(seconds).ok())
+                .or(settings.step_deadline_seconds)
                 .or_else(|| app_u32(app, "step_deadline_seconds"))
                 .unwrap_or(DEFAULT_DEADLINE_SECONDS),
         ),
@@ -1686,14 +1723,18 @@ async fn snapshot_phase<G: GraphSource>(
             .or_else(|| settings.token_budget.filter(|n| *n > 0))
             .or_else(|| app_i32(app, "token_budget")),
         candidates: candidates(source, phase, rung_one, settings, box_id).await?,
-        // `StepGraphPhase` carries no `judge_agent_id` / `judge_model` either (blueprint H-14), so
-        // this chain also starts at the project rung; `None` means human selection (§4.5).
-        judge: match settings.judge_agent_id {
+        // MOD-141 M2 D3: the phase's judge with its own model, else the project's with none;
+        // `None` means human selection (§4.5).
+        judge: match phase
+            .judge_agent_id
+            .map(|id| (id, phase.judge_model.clone()))
+            .or_else(|| settings.judge_agent_id.map(|id| (id, None)))
+        {
             None => None,
-            Some(id) => Some(SnapshotJudge {
+            Some((id, model)) => Some(SnapshotJudge {
                 agent_id: id,
                 agent_name: agent_name(source, &phase.name, id).await?,
-                model: None,
+                model,
                 template: judge_template(source, project).await?,
             }),
         },
@@ -1900,10 +1941,10 @@ mod tests {
     use super::{
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSnapshot,
         GraphSource, Isolation, Item, ItemId, NotRunnable, PhaseAgent, PhaseId, PhasePart,
-        ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunMode,
-        SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
+        ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunBounds,
+        RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
         effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
-        resolve, snapshot_walk_refusal, topology_v2,
+        resolve, run_bounds, snapshot_walk_refusal, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -2375,8 +2416,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
         // 120_000, so the project rung answers.
         assert_eq!(prd.token_budget, Some(120_000));
 
-        // `deadline_seconds`: no phase column exists at HEAD (blueprint H-14) and neither the
-        // project nor `app_setting` answers, so the built-in two hours does.
+        // `deadline_seconds`: the phase carries none, and neither does the project nor
+        // `app_setting`, so the built-in two hours answers.
         assert_eq!(prd.deadline_seconds, Some(7200));
 
         // `candidates`: rung 1, with `agent_name` denormalised off the registry.
@@ -2385,7 +2426,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(prd.candidates[0].agent_name, "claude");
         assert_eq!(prd.candidates[0].model, "sonnet");
 
-        // `judge_agent_id`: no phase column and no project setting, so none — human selection.
+        // `judge_agent_id`: no phase judge and no project judge, so none — human selection.
         assert_eq!(prd.judge, None);
 
         // The `app_setting` rungs of the envelope.
@@ -2421,7 +2462,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let judge = prd.judge.as_ref().expect("the project names a judge");
         assert_eq!(judge.agent_id, ids::AGENT_AGY);
         assert_eq!(judge.agent_name, "agy");
-        assert_eq!(judge.model, None, "no phase column carries a judge model");
+        assert_eq!(judge.model, None, "the project rung carries no model");
         assert_eq!(
             judge.template,
             Some(SnapshotTemplate {
@@ -2437,6 +2478,126 @@ question and not a test fix. Decide the version bump first, then paste the new d
             snapshot.topology, FEATURE_TOPOLOGY_V2,
             "a resolved value moving is a different topology, which is the point of the digest"
         );
+    }
+
+    /// MOD-141 M2 D3: a phase's own `deadline_seconds` answers before the project's; a phase
+    /// that carries none still reads the project rung.
+    #[tokio::test]
+    async fn the_phase_deadline_answers_before_the_project() {
+        let store = store_with_settings(json!({ "step_deadline_seconds": 600 }));
+        replace_feature(&store, |body| {
+            let prd = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "prd")
+                .expect("the feature graph has a prd phase");
+            prd.phase.deadline_seconds = Some(90);
+        })
+        .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the edited feature graph resolves")
+            .snapshot;
+
+        assert_eq!(snapshot.phases[0].name, "prd");
+        assert_eq!(
+            snapshot.phases[0].deadline_seconds,
+            Some(90),
+            "the phase rung answers first"
+        );
+        for phase in &snapshot.phases[1..] {
+            assert_eq!(
+                phase.deadline_seconds,
+                Some(600),
+                "`{}` carries no deadline, so the project rung answers",
+                phase.name
+            );
+        }
+    }
+
+    /// MOD-141 M2 D3: a phase's own judge answers with its own `judge_model`, before the
+    /// project's judge; a phase that names none falls through to the project's, with no model.
+    #[tokio::test]
+    async fn a_phase_judge_carries_its_model_and_beats_the_project_judge() {
+        let store = store_with_settings(json!({ "judge_agent_id": ids::AGENT_AGY }));
+        replace_feature(&store, |body| {
+            let implement = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has an implement phase");
+            implement.phase.judge_agent_id = Some(ids::AGENT_CLAUDE);
+            implement.phase.judge_model = Some("opus".to_owned());
+        })
+        .await;
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the edited feature graph resolves")
+            .snapshot;
+        let judge_of = |name: &str| {
+            snapshot
+                .phases
+                .iter()
+                .find(|phase| phase.name == name)
+                .unwrap_or_else(|| panic!("the snapshot has a `{name}` phase"))
+                .judge
+                .clone()
+        };
+
+        let implement = judge_of("implement").expect("implement names its own judge");
+        assert_eq!(implement.agent_id, ids::AGENT_CLAUDE);
+        assert_eq!(implement.agent_name, "claude");
+        assert_eq!(
+            implement.model.as_deref(),
+            Some("opus"),
+            "the phase's judge carries the phase's model"
+        );
+        assert_eq!(
+            implement.template,
+            Some(SnapshotTemplate {
+                name: "judge".to_owned(),
+                version: 1
+            }),
+            "the seeded `judge` template is pinned whichever rung names the judge"
+        );
+
+        let prd = judge_of("prd").expect("prd falls through to the project's judge");
+        assert_eq!(prd.agent_id, ids::AGENT_AGY);
+        assert_eq!(prd.agent_name, "agy");
+        assert_eq!(prd.model, None, "the project rung carries no model");
+    }
+
+    /// MOD-141 M2 D3: the seeded phases carry no deadline and no judge, so the phase rung is
+    /// silent and resolve answers exactly as before: the same digest, two hours, no judge.
+    #[tokio::test]
+    async fn null_phase_columns_resolve_as_before() {
+        let store = MemStore::demo();
+        let stored = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            stored.iter().all(|phase| phase.deadline_seconds.is_none()
+                && phase.judge_agent_id.is_none()
+                && phase.judge_model.is_none()),
+            "every seeded phase leaves the three columns NULL"
+        );
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+        assert_eq!(snapshot.v, 2, "{TOPOLOGY_MOVED}");
+        assert_eq!(snapshot.topology, FEATURE_TOPOLOGY_V2, "{TOPOLOGY_MOVED}");
+        for phase in &snapshot.phases {
+            assert_eq!(
+                phase.deadline_seconds,
+                Some(7200),
+                "`{}`: the built-in two hours",
+                phase.name
+            );
+            assert_eq!(phase.judge, None, "`{}`: human selection", phase.name);
+        }
     }
 
     /// An unrelated malformed key must not erase the caps: the lenient `ProjectSettings` decode
@@ -3087,6 +3248,54 @@ question and not a test fix. Decide the version bump first, then paste the new d
             source_rows,
             "and the source rows are untouched"
         );
+    }
+
+    /// MOD-141 M2 D1 (blueprint C4): the clone spreads the source phase, so a phase's deadline
+    /// and judge reach its clone, and a phase with none keeps none.
+    #[tokio::test]
+    async fn override_clone_keeps_the_deadline_and_the_judge() {
+        let store = MemStore::demo();
+        replace_feature(&store, |body| {
+            let implement = body
+                .nodes
+                .iter_mut()
+                .find(|node| node.phase.name == "implement")
+                .expect("the feature graph has an implement phase");
+            implement.phase.deadline_seconds = Some(900);
+            implement.phase.judge_agent_id = Some(ids::AGENT_AGY);
+            implement.phase.judge_model = Some("opus".to_owned());
+        })
+        .await;
+
+        let clone = override_graph(&store, &TestSource::claude(&store), &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+
+        let cloned = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            cloned.iter().any(|phase| phase.name == "implement"),
+            "the clone has an implement phase"
+        );
+        for phase in &cloned {
+            let want = if phase.name == "implement" {
+                (Some(900), Some(ids::AGENT_AGY), Some("opus"))
+            } else {
+                (None, None, None)
+            };
+            assert_eq!(
+                (
+                    phase.deadline_seconds,
+                    phase.judge_agent_id,
+                    phase.judge_model.as_deref()
+                ),
+                want,
+                "`{}`'s clone keeps its deadline and judge",
+                phase.name
+            );
+        }
     }
 
     /// MOD-9 D96 (the maintainer's "check first, then refuse"): a source phase attachment whose
@@ -5198,6 +5407,109 @@ question and not a test fix. Decide the version bump first, then paste the new d
             })
         );
         assert_eq!(pin.topology, snapshot.topology, "the source is not hashed");
+    }
+
+    /// Every key [`run_bounds`] reads, each set to a value no code default holds.
+    /// `max_agents_per_run` stays at or above the four agents `feature` plans, so it resolves.
+    fn every_bound_set() -> BTreeMap<String, Value> {
+        [
+            ("max_fan_out".to_owned(), json!(2)),
+            ("max_agents_per_run".to_owned(), json!(5)),
+            ("max_parallel_sessions".to_owned(), json!(7)),
+            ("max_plan_revisions".to_owned(), json!(1)),
+            ("max_child_runs".to_owned(), json!(3)),
+            ("runtime_changes".to_owned(), json!("off")),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// MOD-141 M2 D4: over no `app_setting` row, every bound is its code default.
+    #[test]
+    fn run_bounds_are_the_code_defaults_over_no_row() {
+        assert_eq!(
+            run_bounds(&BTreeMap::new()),
+            RunBounds {
+                max_fan_out: 4,
+                max_agents_per_run: 8,
+                max_parallel_sessions: 4,
+                max_plan_revisions: 3,
+                max_child_runs: 8,
+                runtime_changes: RuntimeChanges::Ask,
+            }
+        );
+    }
+
+    /// MOD-141 M2 D4: each key answers for itself, and a silent one (zero, negative, a string, a
+    /// bool, `null`, too large for `u32`, an unknown word) falls through to its code default.
+    #[test]
+    fn run_bounds_read_each_key_and_fall_through_on_silence() {
+        assert_eq!(
+            run_bounds(&every_bound_set()),
+            RunBounds {
+                max_fan_out: 2,
+                max_agents_per_run: 5,
+                max_parallel_sessions: 7,
+                max_plan_revisions: 1,
+                max_child_runs: 3,
+                runtime_changes: RuntimeChanges::Off,
+            }
+        );
+
+        let silent: BTreeMap<String, Value> = [
+            ("max_fan_out".to_owned(), json!(0)),
+            ("max_agents_per_run".to_owned(), json!("6")),
+            ("max_parallel_sessions".to_owned(), json!(-1)),
+            ("max_plan_revisions".to_owned(), json!(true)),
+            ("max_child_runs".to_owned(), json!(u64::from(u32::MAX) + 1)),
+            ("runtime_changes".to_owned(), json!("maybe")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            run_bounds(&silent),
+            run_bounds(&BTreeMap::new()),
+            "every silent key reads as its code default"
+        );
+        let null: BTreeMap<String, Value> = [("runtime_changes".to_owned(), Value::Null)]
+            .into_iter()
+            .collect();
+        assert_eq!(run_bounds(&null).runtime_changes, RuntimeChanges::Ask);
+    }
+
+    /// MOD-141 M2 D4: what `resolve` freezes into the snapshot's settings is exactly
+    /// [`run_bounds`] over the same `app_setting` map, so the editor's header cannot disagree.
+    #[tokio::test]
+    async fn resolve_freezes_exactly_run_bounds() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        for app in [BTreeMap::new(), every_bound_set()] {
+            let settings = resolve(
+                &store,
+                &TestSource::claude(&store),
+                &item,
+                RunMode::Manual,
+                &app,
+                None,
+                ids::BOX,
+            )
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot
+            .settings;
+            assert_eq!(
+                RunBounds {
+                    max_fan_out: settings.max_fan_out,
+                    max_agents_per_run: settings.max_agents_per_run,
+                    max_parallel_sessions: settings.max_parallel_sessions,
+                    max_plan_revisions: settings.max_plan_revisions,
+                    max_child_runs: settings.max_child_runs,
+                    runtime_changes: settings.runtime_changes,
+                },
+                run_bounds(&app),
+                "{app:?}"
+            );
+        }
     }
 
     /// MOD-138 D11, MOD-139 M3 D10: a `divide` node is expanded (so the validator checks the

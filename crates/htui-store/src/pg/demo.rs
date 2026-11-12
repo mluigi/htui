@@ -245,7 +245,8 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
-        // Every column `StepGraphPhase` carries, MOD-137 D7's ten included (review R1 A-L5).
+        // Every column `StepGraphPhase` carries, MOD-137 D7's ten and MOD-141 M2's three included
+        // (review R1 A-L5).
         for row in &data.phases {
             sqlx::query!(
                 "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, \
@@ -253,9 +254,9 @@ impl PgStore {
                  verify_command, template_name, template_version, token_budget, updated_at, \
                  persona_id, split, palette, plan_scope, planner_persona_id, planner_agent_id, \
                  planner_model, integrate_persona_id, integrate_agent_id, integrate_model, \
-                 max_parts) \
+                 max_parts, deadline_seconds, judge_agent_id, judge_model) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)",
                 row.id.as_uuid(),
                 StepGraphId::as_uuid(row.graph_id),
                 row.position,
@@ -284,6 +285,9 @@ impl PgStore {
                 row.integrate_agent_id.map(AgentId::as_uuid),
                 row.integrate_model.as_deref(),
                 row.max_parts,
+                row.deadline_seconds,
+                row.judge_agent_id.map(AgentId::as_uuid),
+                row.judge_model.as_deref(),
             )
             .execute(&mut *tx)
             .await

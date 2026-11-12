@@ -56,7 +56,7 @@ use tokio::time::MissedTickBehavior;
 use crate::agent_settings::{self, AgentDraft, AgentWrite};
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::box_settings::{self, BoxesSnapshot};
-use crate::catalogue::{self, CatalogueSnapshot};
+use crate::catalogue::{self, CatalogueSnapshot, EditorSettings};
 use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServed};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hand_written::{self, DocumentFormContext, HandText};
@@ -653,11 +653,11 @@ pub enum StoreRequest {
         show_hidden: bool,
     },
 
-    // MOD-15 milestone 4 (D5): the twelve catalogue requests (M4's nine, MOD-137 D12's
-    // `ReplaceGraph` and `DeletePhase`, then MOD-141 D13's `GraphBody`), served by
-    // [`crate::catalogue`]. Every write carries the `Scope` because the tree the reply re-reads
-    // *is* the scope (M4 D7), and all twelve are served through one further or-ed arm of
-    // [`try_serve`].
+    // MOD-15 milestone 4 (D5): the thirteen catalogue requests (M4's nine, MOD-137 D12's
+    // `ReplaceGraph` and `DeletePhase`, then MOD-141 D13's `GraphBody` and M2 D6's
+    // `GraphEditorSettings`), served by [`crate::catalogue`]. Every write carries the `Scope`
+    // because the tree the reply re-reads *is* the scope (M4 D7), and all thirteen are served
+    // through one further or-ed arm of [`try_serve`].
     /// The catalogue of every project in the scope (M4 D2): kinds, graphs, phases. One request per
     /// event, never one per project — the staleness index keeps only the newest of a variant, so N
     /// requests of one variant would leave all but one project undrawn.
@@ -797,6 +797,9 @@ pub enum StoreRequest {
     /// editor opens a graph by id (MOD-124's Toolbox hook). A read. Answers
     /// [`StoreReply::GraphBody`].
     GraphBody(StepGraphId),
+    /// MOD-141 M2 D6: the run limits and the compete switch the graph editor shows and obeys, from
+    /// one `app_setting` read. A read. Answers [`StoreReply::GraphEditorSettings`].
+    GraphEditorSettings,
     /// The ten prompt keys on `App` plus the `Project`-rung keys of every scope project (M5 D3).
     PromptSettings(Scope),
     /// `set_setting` on `App` or `Project` (M5 D7). `expected: None` is "I expect no row", accepted
@@ -1406,8 +1409,8 @@ impl StoreRequest {
             Self::InferRepoPaths(..) => "infer_repo_paths",
             // MOD-49: outside `hierarchy::REQUEST_NAMES` on purpose (blueprint D2).
             Self::ListDir { .. } => LIST_DIR,
-            // The twelve of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5, MOD-137 D12,
-            // MOD-141 D13).
+            // The thirteen of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5, MOD-137
+            // D12, MOD-141 D13, MOD-141 M2 D6).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
             Self::UpdateKind { .. } => "update_kind",
@@ -1420,6 +1423,7 @@ impl StoreRequest {
             Self::ReplaceGraph { .. } => "replace_graph",
             Self::DeletePhase { .. } => "delete_phase",
             Self::GraphBody(..) => "graph_body",
+            Self::GraphEditorSettings => "graph_editor_settings",
             // The three of `prompt_settings::REQUEST_NAMES`, in that order (MOD-15 M5 D7).
             Self::PromptSettings(..) => "prompt_settings",
             Self::SetSetting { .. } => "set_setting",
@@ -1690,6 +1694,8 @@ pub enum StoreReply {
     },
     /// MOD-141 D13: the answer to [`StoreRequest::GraphBody`]; `None` when no graph has the id.
     GraphBody(Option<Box<GraphBody>>),
+    /// MOD-141 M2 D6: the answer to [`StoreRequest::GraphEditorSettings`].
+    GraphEditorSettings(Box<EditorSettings>),
     /// The scope's prompt settings, freshly read: the answer to [`StoreRequest::PromptSettings`]
     /// and to every settings write that applied (M5 D3/D7).
     PromptSettings(Box<SettingsSnapshot>),
@@ -2490,9 +2496,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::InferRepoPaths(..)
         | StoreRequest::SetProjectSecretScope { .. }
         | StoreRequest::SecretsTree(..) => hierarchy::serve(backend, request).await?,
-        // The twelve catalogue requests, or-ed for the same reason the fourteen above are: a guard
-        // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
+        // The thirteen catalogue requests, or-ed for the same reason the fourteen above are: a
+        // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
+        // be an E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
         StoreRequest::Catalogue(..)
         | StoreRequest::CreateKind { .. }
         | StoreRequest::UpdateKind { .. }
@@ -2504,7 +2510,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetPhaseBudget { .. }
         | StoreRequest::ReplaceGraph { .. }
         | StoreRequest::DeletePhase { .. }
-        | StoreRequest::GraphBody(..) => catalogue::serve(backend, request).await?,
+        | StoreRequest::GraphBody(..)
+        | StoreRequest::GraphEditorSettings => catalogue::serve(backend, request).await?,
         // The three prompt settings requests, or-ed for the same reason the twenty-five above are:
         // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
         // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).

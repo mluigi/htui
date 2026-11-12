@@ -92,22 +92,26 @@ catalogue action.
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Editor core in `Settings > Kinds` | A project graph opens as nodes and edges; add, delete, connect; base node form (gate and hard flag, retry limit, isolation, command queue, verify command, token budget, template, persona, candidate agents) and edge form (relation, `if` predicate, loop limit); validated save through `replace_graph`; undo and redo; catalogue keys with per-context collisions resolved; the position-based phase forms retired; the store worker answers the written body so any scope can be edited | complete | `.claude/plans/mod-141-m1-step-graph-editor-core.plan.md` |
-| 2 | Splits, palette and graph header | Split none, divide (planner and integrate persona and agent, default parts, `max_parts`) or compete behind the new later-tier toggle; palette flag and plan scope; the step **deadline** (moved from M1 at the plan fact-check: `GraphBody` lacks `deadline_seconds` and the judge columns, so M2 widens it); the header shows the project's bounds, tightens them and carries the graph's `runtime_changes` override | pending | — |
+| 2 | Splits, palette and graph header | Split none, divide (planner and integrate persona and agent, default parts, `max_parts`) or compete behind the new later-tier toggle; palette flag and plan scope; the step **deadline** and the compete judge (`GraphBody` widened by `deadline_seconds`, `judge_agent_id`, `judge_model`; resolve reads the phase rung first); the header shows the run limits read-only (tightening and the `runtime_changes` override moved to MOD-171, 2026-11-11) | complete | `.claude/plans/mod-141-m2-splits-palette-header.plan.md` |
 | 3 | Every scope, and the picker fix | The scope-generic entry point opens workspace and library graphs (MOD-124's hook); item and kind pickers qualify duplicate `name · workspace` labels and refuse an ambiguous typed match | pending | — |
 
 ## Open Questions
 
-- [ ] Key collisions: `c`, `x`, `r` differ between Runs and the editor, `Ctrl-Z` meets pane zoom, and MOD-124's
-  spec names `F9`-era keys; F9 was rejected as a reserved key. Which contexts and defaults? — settle in the M1
-  plan against the key catalogue.
+- [x] Key collisions: `c`, `x`, `r` differ between Runs and the editor, `Ctrl-Z` meets pane zoom, and MOD-124's
+  spec names `F9`-era keys; F9 was rejected as a reserved key. Which contexts and defaults? — settled by the M1
+  plan's D12 (contexts `graph_editor`/`graph_editor.links`, no F-keys).
 - [x] Undo across a CAS conflict: reload and clear undo and redo (M1 plan D4).
 - [x] Layout: computed on every change from the forward edges, not stored; no node move in M1 (M1 plan D7).
-- [ ] Graph-level `runtime_changes` override and bound tightening: does storage carry them on `step_graph`
-  today, or does M2 need a migration? — TBD, verify in the M2 plan.
-- [ ] Where the later-tier compete toggle lives (project settings rung or UI settings) and whether the engine
-  honours it or only the editor does — TBD, M2 plan.
-- [ ] What `resolve` and the engine do with a divide node before MOD-139 (refuse at run start, run it as a
-  plain step, or park) — TBD, verify in the M2 plan; decides the note's wording.
+- [x] Graph-level `runtime_changes` override and bound tightening: does storage carry them on `step_graph`
+  today, or does M2 need a migration? — Neither is stored; the bounds are global `app_setting` keys. M2 shows
+  them read-only; tightening and the override are MOD-171 (M2 plan M-1, 2026-11-11).
+- [x] Where the later-tier compete toggle lives (project settings rung or UI settings) and whether the engine
+  honours it or only the editor does — an App-rung `compete_fan_out` switch, off by default, read by the
+  editor only (M2 plan M-2).
+- [x] What `resolve` and the engine do with a divide node before MOD-139 (refuse at run start, run it as a
+  plain step, or park) — MOD-139 runs it; resolve still refuses a planner agent, a part-less divide, a plan
+  scope past `parts`, palette nodes and default parts admission refuses. The editor warns with resolve's
+  sentence and saves (M2 plan M-4).
 
 ## Risks
 

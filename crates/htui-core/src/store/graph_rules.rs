@@ -10,10 +10,11 @@ use crate::model::{
 };
 use crate::seed::{default_edge_plan, default_edges};
 use crate::store::traits::{
-    already_exists, back_asks_you_beside_another_asks_you, divide_columns_off_divide,
-    edge_endpoint_outside_graph, edge_is_taken, edge_loop_limit_negative, edge_loops_to_itself,
-    edge_needs_loop_limit, edge_predicate_mismatch, fan_out_below_one, forward_edges_form_a_cycle,
-    if_predicate_outside_the_closed_set, loop_edge_runs_forward, max_parts_below_one,
+    already_exists, back_asks_you_beside_another_asks_you, deadline_below_one,
+    divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
+    edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
+    fan_out_below_one, forward_edges_form_a_cycle, if_predicate_outside_the_closed_set,
+    judge_model_without_agent, loop_edge_runs_forward, max_parts_below_one,
     palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_name_refusal,
     phase_part_key_is_taken, phase_position_is_taken, phase_token_budget_refusal,
     retry_limit_negative, row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
@@ -23,8 +24,10 @@ use crate::store::traits::{
 /// `ck_phase_max_parts`; then 0001's column CHECKs `fan_out >= 1` and `retry_limit >= 0`, so
 /// `MemStore` never stores a row Postgres refuses (`Split::None` with `fan_out 0` passes
 /// `ck_phase_split_fan_out`); then a `token_budget` below 1, which no CHECK refuses but
-/// `set_setting`'s `Phase` rung does ([`phase_token_budget_refusal`], review R1 B-L2). `None` when
-/// the row passes. `create_phase` and `replace_graph` call it.
+/// `set_setting`'s `Phase` rung does ([`phase_token_budget_refusal`], review R1 B-L2); then 0003's
+/// `ck_phase_judge_model` (a `judge_model` with no `judge_agent_id`) and its
+/// `deadline_seconds > 0` CHECK (MOD-141 M2 D2). `None` when the row passes. `create_phase` and
+/// `replace_graph` call it.
 #[must_use]
 pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if (phase.split == Split::Compete) != (phase.fan_out > 1) {
@@ -53,7 +56,16 @@ pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if phase.retry_limit < 0 {
         return Some(retry_limit_negative(&phase.name, phase.retry_limit));
     }
-    phase.token_budget.and_then(phase_token_budget_refusal)
+    if let Some(refusal) = phase.token_budget.and_then(phase_token_budget_refusal) {
+        return Some(refusal);
+    }
+    if phase.judge_model.is_some() && phase.judge_agent_id.is_none() {
+        return Some(judge_model_without_agent(&phase.name));
+    }
+    phase
+        .deadline_seconds
+        .filter(|seconds| *seconds < 1)
+        .map(|seconds| deadline_below_one(&phase.name, seconds))
 }
 
 /// The predicate an edge carries, a JSON `null` read as none (review R1 B-L1): serde reads
@@ -269,7 +281,8 @@ pub fn body_persona_refs(body: &GraphBody) -> Vec<(&'static str, PersonaId)> {
 }
 
 /// D10 step 6's walk after the personas: per node in body order, `planner_agent_id`,
-/// `integrate_agent_id`, its candidates' `agent_id`, then its parts' `agent_id`, each as the
+/// `integrate_agent_id`, `judge_agent_id` (MOD-141 M2 D2), its candidates' `agent_id`, then its
+/// parts' `agent_id`, each as the
 /// `(column, id)` [`references_no_row`](crate::store::references_no_row) words against
 /// `"agent"`.
 #[must_use]
@@ -284,6 +297,7 @@ pub fn body_agent_refs(body: &GraphBody) -> Vec<(&'static str, AgentId)> {
                     "step_graph_phase.integrate_agent_id",
                     phase.integrate_agent_id,
                 ),
+                ("step_graph_phase.judge_agent_id", phase.judge_agent_id),
             ]
             .into_iter()
             .filter_map(|(column, id)| id.map(|id| (column, id))),
@@ -689,9 +703,10 @@ mod tests {
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
     use crate::store::traits::{
-        back_asks_you_beside_another_asks_you, fan_out_below_one, forward_edges_form_a_cycle,
-        if_predicate_outside_the_closed_set, loop_edge_runs_forward, phase_token_budget_refusal,
-        plan_suffix_phase_name, retry_limit_negative,
+        back_asks_you_beside_another_asks_you, deadline_below_one, fan_out_below_one,
+        forward_edges_form_a_cycle, if_predicate_outside_the_closed_set, judge_model_without_agent,
+        loop_edge_runs_forward, phase_token_budget_refusal, plan_suffix_phase_name,
+        retry_limit_negative,
     };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
@@ -723,6 +738,9 @@ mod tests {
             integrate_agent_id: None,
             integrate_model: None,
             max_parts: None,
+            deadline_seconds: None,
+            judge_agent_id: None,
+            judge_model: None,
             updated_at: Utc::now(),
         }
     }
@@ -866,6 +884,64 @@ mod tests {
             Some(retry_limit_negative("implement", -1)),
             "then 0001's retry_limit CHECK"
         );
+        // MOD-141 M2 D2: the token budget, then 0003's judge model, then its deadline.
+        row.retry_limit = 0;
+        row.token_budget = Some(0);
+        row.judge_model = Some("m".to_owned());
+        row.deadline_seconds = Some(0);
+        assert_eq!(
+            phase_row_refusal(&row),
+            phase_token_budget_refusal(0),
+            "then the token budget"
+        );
+        row.token_budget = None;
+        assert_eq!(
+            phase_row_refusal(&row),
+            Some(judge_model_without_agent("implement")),
+            "then 0003's ck_phase_judge_model"
+        );
+        row.judge_model = None;
+        assert_eq!(
+            phase_row_refusal(&row),
+            Some(deadline_below_one("implement", 0)),
+            "then 0003's deadline CHECK"
+        );
+    }
+
+    /// MOD-141 M2 D2: 0003's `ck_phase_judge_model`: a judge model needs its judge agent, on any
+    /// split (the store ties the judge to no split).
+    #[test]
+    fn judge_model_needs_a_judge_agent() {
+        for (split, fan_out) in [(Split::Compete, 2), (Split::None, 1)] {
+            let mut row = phase(split, fan_out);
+            row.judge_model = Some("m".to_owned());
+            assert_eq!(
+                phase_row_refusal(&row),
+                Some(judge_model_without_agent("implement")),
+                "{split}: a judge model alone"
+            );
+            row.judge_agent_id = Some(AgentId::new());
+            assert_eq!(phase_row_refusal(&row), None, "{split}: with its agent");
+        }
+    }
+
+    /// MOD-141 M2 D2: 0003's `deadline_seconds > 0` CHECK.
+    #[test]
+    fn deadline_is_at_least_one_second() {
+        for seconds in [0, -5] {
+            let mut row = phase(Split::None, 1);
+            row.deadline_seconds = Some(seconds);
+            assert_eq!(
+                phase_row_refusal(&row),
+                Some(deadline_below_one("implement", seconds)),
+                "{seconds}"
+            );
+        }
+        for seconds in [Some(1), None] {
+            let mut row = phase(Split::None, 1);
+            row.deadline_seconds = seconds;
+            assert_eq!(phase_row_refusal(&row), None, "{seconds:?}");
+        }
     }
 
     /// 0001's `fan_out >= 1`: `Split::None` with `fan_out 0` passes `ck_phase_split_fan_out`
@@ -1441,7 +1517,7 @@ mod tests {
     fn body_refs_walk_personas_then_agents_in_body_order() {
         let (_, mut body) = body();
         let ids: Vec<PersonaId> = (0..5).map(|_| PersonaId::new()).collect();
-        let agents: Vec<AgentId> = (0..4).map(|_| AgentId::new()).collect();
+        let agents: Vec<AgentId> = (0..5).map(|_| AgentId::new()).collect();
         let plan = body.nodes[0].phase.id;
         body.nodes[0].phase.split = Split::Divide;
         body.nodes[0].phase.persona_id = Some(ids[0]);
@@ -1449,6 +1525,7 @@ mod tests {
         body.nodes[0].phase.integrate_persona_id = Some(ids[2]);
         body.nodes[0].phase.planner_agent_id = Some(agents[0]);
         body.nodes[0].phase.integrate_agent_id = Some(agents[1]);
+        body.nodes[0].phase.judge_agent_id = Some(agents[4]);
         let mut p = part(plan, 0, "a");
         p.persona_id = Some(ids[3]);
         p.agent_id = Some(agents[3]);
@@ -1477,6 +1554,7 @@ mod tests {
             vec![
                 ("step_graph_phase.planner_agent_id", agents[0]),
                 ("step_graph_phase.integrate_agent_id", agents[1]),
+                ("step_graph_phase.judge_agent_id", agents[4]),
                 ("phase_agent.agent_id", agents[2]),
                 ("phase_part.agent_id", agents[3]),
                 ("phase_agent.agent_id", implement_agent),

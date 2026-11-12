@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE step_graph_phase SET\n                name          = COALESCE($3, name),\n                position      = COALESCE($4, position),\n                template_name = COALESCE($5, template_name),\n                gate_hard     = COALESCE($6, gate_hard),\n                input_kinds   = COALESCE($7, input_kinds),\n                persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id                   AS \"id: PhaseId\",\n                      graph_id             AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate                 AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation            AS \"isolation: Isolation\",\n                      command_queue        AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      persona_id           AS \"persona_id: PersonaId\",\n                      split                AS \"split: Split\",\n                      palette,\n                      plan_scope           AS \"plan_scope: PlanScope\",\n                      planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                      planner_agent_id     AS \"planner_agent_id: AgentId\",\n                      planner_model,\n                      integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                      integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                      integrate_model,\n                      max_parts,\n                      updated_at\n            ",
+  "query": "\n            SELECT id                   AS \"id: PhaseId\",\n                   graph_id             AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate                 AS \"gate: htui_core::model::Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation            AS \"isolation: Isolation\",\n                   command_queue        AS \"command_queue: htui_core::model::CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id           AS \"persona_id: PersonaId\",\n                   split                AS \"split: Split\",\n                   palette,\n                   plan_scope           AS \"plan_scope: PlanScope\",\n                   planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                   planner_agent_id     AS \"planner_agent_id: AgentId\",\n                   planner_model,\n                   integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                   integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                   integrate_model,\n                   max_parts,\n                   deadline_seconds,\n                   judge_agent_id       AS \"judge_agent_id: AgentId\",\n                   judge_model,\n                   updated_at\n              FROM step_graph_phase WHERE id = $1\n               FOR UPDATE\n            ",
   "describe": {
     "columns": [
       {
@@ -302,6 +302,39 @@
       },
       {
         "ordinal": 27,
+        "name": "deadline_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "deadline_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "judge_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "judge_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 29,
+        "name": "judge_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "judge_model"
+          }
+        }
+      },
+      {
+        "ordinal": 30,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -314,14 +347,6 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz",
-        "Text",
-        "Int4",
-        "Text",
-        "Bool",
-        "TextArray",
-        "Bool",
         "Uuid"
       ]
     },
@@ -353,8 +378,11 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "816f2c717d3e6a71b4e8d9e71dea163da6f749b65a5b22977d9dd988819ca48f"
+  "hash": "0bee4bbcb3f19f09c6c5ae37e5fdeaa1e115467045f36460b8ec56b9156f53ef"
 }

@@ -1,0 +1,26 @@
+---
+source: crates/htui/src/ui/graph_editor/node_form.rs
+expression: text(&lines)
+---
+ name           research
+ template       ‹ research ›
+ version        ‹ latest ›
+ persona        ‹ reviewer ›
+ gate           ‹ always ›
+ hard gate      ○ off
+ retry limit    1
+ isolation      ‹ project default ›
+ commands       ‹ queued when fanned out ›
+ verify
+ token budget
+ inputs
+ output         research
+ agent 1        ‹ claude · sonnet ›
+ agent 2        ‹ agy · gemini ›
+ deadline
+ palette        ○ off
+ split          ‹ compete ›
+ fan-out        3
+▌judge          ‹ claude · opus ›
+                picks the winner; project default asks
+                the project's judge, else you

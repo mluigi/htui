@@ -51,6 +51,18 @@ pub struct PersonaSummary {
     pub name: String,
 }
 
+/// MOD-141 M2 D6: what the graph editor reads beside the body, from one `app_setting` read: the
+/// run limits resolve freezes and the compete switch. The answer to
+/// [`StoreRequest::GraphEditorSettings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorSettings {
+    /// [`htui_orch::graph::run_bounds`] over the `app_setting` rows.
+    pub bounds: htui_orch::graph::RunBounds,
+    /// [`htui_core::prompt::settings::resolve_compete_fan_out`]: whether the compete split is
+    /// offered.
+    pub compete: bool,
+}
+
 /// One project with everything the Kinds section shows of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectCatalogue {
@@ -206,7 +218,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 ///
 /// # Errors
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
-/// [`StoreError::Backend`] for a request that is not one of this module's twelve.
+/// [`StoreError::Backend`] for a request that is not one of this module's thirteen.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -401,7 +413,16 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         StoreRequest::GraphBody(graph) => Ok(StoreReply::GraphBody(
             writer.graph_body(*graph).await?.map(Box::new),
         )),
-        // `try_serve` routes exactly this module's twelve variants here, so the last arm is
+        // MOD-141 M2 D6: one `app_setting` read, the editor's limits and switch. Offline it never
+        // gets here: `writer()` is `None` and the request answers `Unreachable` like the rest.
+        StoreRequest::GraphEditorSettings => {
+            let app = backend.app_settings().await?;
+            Ok(StoreReply::GraphEditorSettings(Box::new(EditorSettings {
+                bounds: htui_orch::graph::run_bounds(&app),
+                compete: htui_core::prompt::settings::resolve_compete_fan_out(&app),
+            })))
+        }
+        // `try_serve` routes exactly this module's thirteen variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -432,12 +453,12 @@ async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Resu
     })
 }
 
-/// The twelve request names, in [`StoreRequest`] order: MOD-15 M4's nine, MOD-137 D12's two, then
-/// MOD-141 D13's one.
+/// The thirteen request names, in [`StoreRequest`] order: MOD-15 M4's nine, MOD-137 D12's two,
+/// then MOD-141 D13's one and M2 D6's one.
 ///
 /// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a
-/// thirteenth request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 12] = [
+/// fourteenth request cannot be named in one place and matched in the other.
+pub const REQUEST_NAMES: [&str; 13] = [
     "catalogue",
     "create_kind",
     "update_kind",
@@ -450,4 +471,5 @@ pub const REQUEST_NAMES: [&str; 12] = [
     "replace_graph",
     "delete_phase",
     "graph_body",
+    "graph_editor_settings",
 ];

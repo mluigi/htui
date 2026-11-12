@@ -74,6 +74,7 @@ use crate::store::traits::{
     forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
     loop_edge_runs_forward, workspace_graph_is_held,
 };
+use crate::store::traits::{deadline_below_one, judge_model_without_agent};
 use crate::store::traits::{
     divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
     fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
@@ -385,6 +386,10 @@ pub const CASES: &[&str] = &[
     "admit_plan_refuses_a_plan_not_proposed_or_not_its_own",
     "abandon_plans_abandons_admitted_and_proposed",
     "resolve_inputs_skips_part_documents",
+    // MOD-141 M2: the phase's judge and deadline columns (plan D1, D2)
+    "a_judge_model_needs_a_judge_agent",
+    "a_step_deadline_is_at_least_one_second",
+    "a_phase_naming_no_judge_agent_is_refused",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1209,6 +1214,15 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "resolve_inputs_skips_part_documents" => {
             Box::pin(resolve_inputs_skips_part_documents(store)).await;
+        }
+        "a_judge_model_needs_a_judge_agent" => {
+            Box::pin(a_judge_model_needs_a_judge_agent(store)).await;
+        }
+        "a_step_deadline_is_at_least_one_second" => {
+            Box::pin(a_step_deadline_is_at_least_one_second(store)).await;
+        }
+        "a_phase_naming_no_judge_agent_is_refused" => {
+            Box::pin(a_phase_naming_no_judge_agent_is_refused(store)).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3382,6 +3396,9 @@ fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
         integrate_agent_id: None,
         integrate_model: None,
         max_parts: None,
+        deadline_seconds: None,
+        judge_agent_id: None,
+        judge_model: None,
         updated_at: Utc::now(),
     }
 }
@@ -25684,9 +25701,10 @@ async fn a_persona_held_by_divide_columns_or_parts_is_not_deleted<S: WriteStore>
     );
 }
 
-/// MOD-137 D7 (blueprint §1.2, F13): every phase column, on a kept node (the replace's `UPDATE`)
-/// and on a new one (the shared insert), and an `if` edge's JSON predicate read back field for
-/// field: the struct-order guard for the Postgres lists.
+/// MOD-137 D7 (blueprint §1.2, F13): every phase column, MOD-141 M2's deadline and judge
+/// included, on a kept node (the replace's `UPDATE`) and on a new one (the shared insert), and an
+/// `if` edge's JSON predicate read back field for field: the struct-order guard for the Postgres
+/// lists. A kept node's deadline and judge then clear back to none (D1 replaced F14's keep).
 async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_round_trips_every_node_field";
     let (graph, phases) = scratch_graph(CASE, store, "every-field", &["plan", "split"]).await;
@@ -25714,6 +25732,11 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
         row.integrate_agent_id = Some(ids::AGENT_AGY);
         row.integrate_model = Some("sonnet".to_owned());
         row.max_parts = Some(2);
+        row.deadline_seconds = Some(900);
+        // Review R1 A-L1: an agent and a model no other column of the row holds, so a judge
+        // bound in the planner's or the integrator's place reads back wrong.
+        row.judge_agent_id = Some(ids::AGENT_CLAUDE_CLI);
+        row.judge_model = Some("haiku".to_owned());
         row
     };
     let mut body = body_now(CASE, store, graph).await;
@@ -25790,6 +25813,48 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
             ..next
         }],
         "{CASE}: a `next` edge's JSON null predicate is stored as none"
+    );
+
+    // MOD-141 M2 D1 replaced F14's keep: a kept node takes the body's `None` too. A write that
+    // kept the stored deadline or judge when the body clears them reads the old values back here;
+    // the other kept node keeps its own.
+    let mut cleared = stored.clone();
+    cleared.nodes[1].phase.deadline_seconds = None;
+    cleared.nodes[1].phase.judge_agent_id = None;
+    cleared.nodes[1].phase.judge_model = None;
+    let back = applied(
+        CASE,
+        store
+            .replace_graph(graph, stored.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        back.nodes
+            .iter()
+            .map(|node| (
+                node.phase.name.as_str(),
+                node.phase.deadline_seconds,
+                node.phase.judge_agent_id,
+                node.phase.judge_model.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("plan", None, None, None),
+            ("split", None, None, None),
+            (
+                "merge",
+                Some(900),
+                Some(ids::AGENT_CLAUDE_CLI),
+                Some("haiku")
+            ),
+        ],
+        "{CASE}: a kept node's deadline and judge clear to none; the other kept node keeps its own"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        back,
+        "{CASE}: graph_body reads the cleared node back"
     );
 }
 
@@ -25899,6 +25964,253 @@ async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S)
         store.phases(graph).await.expect(CASE),
         vec![raced],
         "{CASE}: only the valid row was written"
+    );
+}
+
+// ---- MOD-141 M2: the phase's judge and deadline columns (plan D1, D2) -------------------------
+
+/// MOD-141 M2 D2: 0003's `ck_phase_judge_model` on both writers, after the token budget; with its
+/// agent the pair is written.
+async fn a_judge_model_needs_a_judge_agent<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_judge_model_needs_a_judge_agent";
+    let before = store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE);
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                judge_model: Some("opus".to_owned()),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "judged")
+            })
+            .await,
+        &judge_model_without_agent("judged"),
+        "create: a judge model alone",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                judge_model: Some("opus".to_owned()),
+                token_budget: Some(0),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "judged")
+            })
+            .await,
+        &phase_token_budget_refusal(0).expect("a budget of 0 is refused"),
+        "create: the token budget first",
+    );
+    assert_eq!(
+        store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE),
+        before,
+        "{CASE}: no refused create wrote a row"
+    );
+
+    let (graph, _) = scratch_graph(CASE, store, "judged", &["plan", "build"]).await;
+    let body = body_now(CASE, store, graph).await;
+    let mut kept = body.clone();
+    kept.nodes[1].phase.judge_model = Some("opus".to_owned());
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, body.graph.revision, kept).await,
+        &judge_model_without_agent("build"),
+        "replace: a kept node's judge model alone",
+    );
+    let mut fresh = body.clone();
+    fresh.nodes.push(bare_node(StepGraphPhase {
+        judge_model: Some("opus".to_owned()),
+        ..new_phase(graph, 2, "merge")
+    }));
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, body.graph.revision, fresh).await,
+        &judge_model_without_agent("merge"),
+        "replace: a new node's judge model alone",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        body,
+        "{CASE}: no refused replace wrote anything"
+    );
+
+    let mut judged = body.clone();
+    judged.nodes[1].phase.judge_agent_id = Some(ids::AGENT_AGY);
+    judged.nodes[1].phase.judge_model = Some("opus".to_owned());
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, judged)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            answer.nodes[1].phase.judge_agent_id,
+            answer.nodes[1].phase.judge_model.as_deref()
+        ),
+        (Some(ids::AGENT_AGY), Some("opus")),
+        "{CASE}: with its judge agent the pair is written"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body reads the pair back"
+    );
+}
+
+/// MOD-141 M2 D2: 0003's `deadline_seconds > 0` CHECK on both writers, after the judge rule; a
+/// deadline of at least 1 second is written and read back.
+async fn a_step_deadline_is_at_least_one_second<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_step_deadline_is_at_least_one_second";
+    let (graph, _) = scratch_graph(CASE, store, "deadlines", &["plan"]).await;
+    for seconds in [0, -5] {
+        constraint_exactly(
+            CASE,
+            store
+                .create_phase(&StepGraphPhase {
+                    deadline_seconds: Some(seconds),
+                    ..new_phase(graph, 1, "late")
+                })
+                .await,
+            &deadline_below_one("late", seconds),
+            "create: a deadline below 1 second",
+        );
+    }
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                judge_model: Some("m".to_owned()),
+                deadline_seconds: Some(0),
+                ..new_phase(graph, 1, "late")
+            })
+            .await,
+        &judge_model_without_agent("late"),
+        "create: the judge rule first",
+    );
+    let late = store
+        .create_phase(&StepGraphPhase {
+            deadline_seconds: Some(1),
+            ..new_phase(graph, 1, "late")
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        late.deadline_seconds,
+        Some(1),
+        "{CASE}: create answers the deadline"
+    );
+    assert_eq!(
+        store
+            .phases(graph)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|phase| (phase.name.as_str(), phase.deadline_seconds))
+            .collect::<Vec<_>>(),
+        [("plan", None), ("late", Some(1))],
+        "{CASE}: phases reads the deadline back, and no refused create wrote a row"
+    );
+
+    let body = body_now(CASE, store, graph).await;
+    let mut zero = body.clone();
+    zero.nodes[0].phase.deadline_seconds = Some(0);
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, body.graph.revision, zero).await,
+        &deadline_below_one("plan", 0),
+        "replace: a kept node's deadline of 0",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        body,
+        "{CASE}: the refused replace wrote nothing"
+    );
+    let mut long = body.clone();
+    long.nodes[0].phase.deadline_seconds = Some(7200);
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, long)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.nodes[0].phase.deadline_seconds,
+        Some(7200),
+        "{CASE}: replace answers the deadline"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body reads the deadline back"
+    );
+}
+
+/// MOD-141 M2 D2: a judge agent that names no row is refused on both writers, in its place:
+/// the personas first, then the planner and integrate agents, then the judge, then the
+/// candidates; nothing is written.
+async fn a_phase_naming_no_judge_agent_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_phase_naming_no_judge_agent_is_refused";
+    let before = store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE);
+    let ghost = AgentId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                judge_agent_id: Some(ghost),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "ghostly")
+            })
+            .await,
+        &references_no_row("step_graph_phase.judge_agent_id", ghost, "agent"),
+        "create: an unknown judge agent",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                split: Split::Divide,
+                integrate_agent_id: Some(ghost),
+                judge_agent_id: Some(AgentId::new()),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "ghostly")
+            })
+            .await,
+        &references_no_row("step_graph_phase.integrate_agent_id", ghost, "agent"),
+        "create: the integrate agent before the judge",
+    );
+    let persona = PersonaId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                persona_id: Some(persona),
+                judge_agent_id: Some(ghost),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "ghostly")
+            })
+            .await,
+        &references_no_row("step_graph_phase.persona_id", persona, "persona"),
+        "create: the personas before the judge",
+    );
+    assert_eq!(
+        store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE),
+        before,
+        "{CASE}: no refused create wrote a row"
+    );
+
+    let (graph, phases) = scratch_graph(CASE, store, "ghost-judge", &["plan", "build"]).await;
+    let body = body_now(CASE, store, graph).await;
+    let mut ghosted = body.clone();
+    ghosted.nodes[0].phase.judge_agent_id = Some(ghost);
+    ghosted.nodes[0].agents = vec![candidate(phases[0].id, 0, AgentId::new())];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, ghosted)
+            .await,
+        &references_no_row("step_graph_phase.judge_agent_id", ghost, "agent"),
+        "replace: the judge before the candidates",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        body,
+        "{CASE}: the refused replace wrote nothing"
     );
 }
 

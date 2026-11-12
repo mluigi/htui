@@ -7,7 +7,9 @@
 
 use chrono::{Duration, Utc};
 use htui::app::{Action, Handled};
-use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, PersonaSummary, REQUEST_NAMES};
+use htui::catalogue::{
+    self, CatalogueSnapshot, EditorSettings, GraphEntry, PersonaSummary, REQUEST_NAMES,
+};
 use htui::hierarchy::MirrorAfterDelete;
 use htui::keys::views;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
@@ -22,20 +24,23 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch,
     NewProject, NewStepGraph, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch,
-    ProjectId, Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase,
-    WorkspaceId,
+    ProjectId, RuntimeChanges, Scope, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch,
+    StepGraphPhase, WorkspaceId,
 };
+use htui_core::prompt::SettingKey;
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
-    CasOutcome, MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held,
+    CasOutcome, MemStore, ReadStore, SettingRung, StoreError, WriteStore, item_kind_is_held,
     palette_phase_has_edges, plan_suffix_phase_name, reserved_phase_name,
 };
+use htui_orch::graph::RunBounds;
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use serde_json::json;
 
 /// The demo world behind a memory backend: a `Writer::Memory` and the seeded catalogue M2 gave
 /// every project (F-9), so no worker test here writes a row by hand.
@@ -87,8 +92,8 @@ async fn demo_catalogue(backend: &Backend) -> CatalogueSnapshot {
     catalogue(serve(backend, &StoreRequest::Catalogue(vulkan_scope())).await)
 }
 
-/// The empty scope every name-only request is built against: the twelve names are a property of the
-/// enum, not of a store.
+/// The empty scope every name-only request is built against: the thirteen names are a property of
+/// the enum, not of a store.
 fn nil_scope() -> Scope {
     Scope {
         workspace_id: WorkspaceId::default(),
@@ -96,7 +101,7 @@ fn nil_scope() -> Scope {
     }
 }
 
-/// One of each of the twelve, in [`REQUEST_NAMES`] order. The ids are nil where the request never
+/// One of each of the thirteen, in [`REQUEST_NAMES`] order. The ids are nil where the request never
 /// reaches a store.
 fn catalogue_requests() -> Vec<StoreRequest> {
     vec![
@@ -177,20 +182,26 @@ fn catalogue_requests() -> Vec<StoreRequest> {
             phase: PhaseId::default(),
         },
         StoreRequest::GraphBody(StepGraphId::default()),
+        StoreRequest::GraphEditorSettings,
     ]
 }
 
-/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a thirteenth
+/// `REQUEST_NAMES` and [`StoreRequest::name`] are one list read from two places (D5): a fourteenth
 /// request cannot be named in one and matched in the other.
 #[test]
 fn catalogue_names_are_stable() {
     let requests = catalogue_requests();
     assert_eq!(requests.len(), REQUEST_NAMES.len());
-    assert_eq!(REQUEST_NAMES.len(), 12);
+    assert_eq!(REQUEST_NAMES.len(), 13);
     assert_eq!(
         REQUEST_NAMES[9..],
-        ["replace_graph", "delete_phase", "graph_body"],
-        "the two MOD-137 verbs follow the nine (D12), then MOD-141's read (D13)"
+        [
+            "replace_graph",
+            "delete_phase",
+            "graph_body",
+            "graph_editor_settings"
+        ],
+        "the two MOD-137 verbs follow the nine (D12), then MOD-141's read (D13), then M2's (D6)"
     );
     for (request, name) in requests.iter().zip(REQUEST_NAMES) {
         assert_eq!(request.name(), name);
@@ -308,7 +319,7 @@ async fn an_unknown_project_id_is_skipped() {
     assert_eq!(snapshot.projects[0].project.slug, "vulkan-tutorials");
 }
 
-/// Offline, every one of the twelve is refused by its own name with MOD-25's one sentence:
+/// Offline, every one of the thirteen is refused by its own name with MOD-25's one sentence:
 /// `Backend::writer()` is `None`, so `serve` never reaches the seam — the read included (D7).
 #[tokio::test]
 async fn offline_refuses_every_catalogue_request_by_name() {
@@ -331,7 +342,7 @@ async fn offline_refuses_every_catalogue_request_by_name() {
     }
 }
 
-/// `catalogue::serve` is reachable only through `try_serve`'s twelve or-ed patterns, so a request
+/// `catalogue::serve` is reachable only through `try_serve`'s thirteen or-ed patterns, so a request
 /// from anywhere else is told which one it sent rather than panicking.
 #[tokio::test]
 async fn serve_refuses_a_foreign_request_by_name() {
@@ -1289,6 +1300,104 @@ async fn replace_graph_on_a_library_graph_answers_its_body() {
     assert!(
         snapshot.projects[0].graph(library).is_none(),
         "the project's catalogue does not list a library graph"
+    );
+}
+
+/// `GraphEditorSettings`' answer (MOD-141 M2 D6), or a panic naming what came back instead.
+#[track_caller]
+fn editor_settings(reply: StoreReply) -> EditorSettings {
+    match reply {
+        StoreReply::GraphEditorSettings(settings) => *settings,
+        other => panic!("expected the editor's settings: {other:?}"),
+    }
+}
+
+/// MOD-141 M2 D6: with no `app_setting` row the editor reads the code defaults resolve freezes,
+/// and the compete switch is off.
+#[tokio::test]
+async fn graph_editor_settings_answers_the_code_defaults() {
+    let settings = editor_settings(serve(&demo(), &StoreRequest::GraphEditorSettings).await);
+
+    assert_eq!(
+        settings.bounds,
+        RunBounds {
+            max_fan_out: 4,
+            max_agents_per_run: 8,
+            max_parallel_sessions: 4,
+            max_plan_revisions: 3,
+            max_child_runs: 8,
+            runtime_changes: RuntimeChanges::Ask,
+        }
+    );
+    assert!(!settings.compete, "compete is off until a row turns it on");
+}
+
+/// MOD-141 M2 D6: each of the six bounds is read from its own `app_setting` row, the same rows
+/// resolve freezes, so the header can never show a limit a run would not use.
+#[tokio::test]
+async fn graph_editor_settings_reads_every_bound() {
+    let store = MemStore::demo();
+    for (key, value) in [
+        ("max_fan_out", json!(2)),
+        ("max_agents_per_run", json!(5)),
+        ("max_parallel_sessions", json!(7)),
+        ("max_plan_revisions", json!(1)),
+        ("max_child_runs", json!(3)),
+        ("runtime_changes", json!("off")),
+    ] {
+        store.set_app_setting(key, value);
+    }
+
+    let settings =
+        editor_settings(serve(&Backend::memory(store), &StoreRequest::GraphEditorSettings).await);
+
+    assert_eq!(
+        settings.bounds,
+        RunBounds {
+            max_fan_out: 2,
+            max_agents_per_run: 5,
+            max_parallel_sessions: 7,
+            max_plan_revisions: 1,
+            max_child_runs: 3,
+            runtime_changes: RuntimeChanges::Off,
+        }
+    );
+    assert!(!settings.compete, "no bound turns the switch on");
+}
+
+/// MOD-141 M2 D6: the compete switch is the `App` rung's `compete_fan_out`, written through the
+/// prompt section's own `SetSetting`: on, then off again over the row's token.
+#[tokio::test]
+async fn graph_editor_settings_reads_the_compete_switch() {
+    let backend = demo();
+    let set = |value: bool, expected| StoreRequest::SetSetting {
+        scope: vulkan_scope(),
+        rung: SettingRung::App,
+        key: SettingKey::CompeteFanOut,
+        value: json!(value),
+        expected,
+    };
+
+    let StoreReply::PromptSettings(applied) = serve(&backend, &set(true, None)).await else {
+        panic!("the switch is set on");
+    };
+    assert!(
+        editor_settings(serve(&backend, &StoreRequest::GraphEditorSettings).await).compete,
+        "the switch on offers compete"
+    );
+
+    let token = applied
+        .app_entry(SettingKey::CompeteFanOut)
+        .and_then(|entry| entry.updated_at)
+        .expect("an applied write leaves the row a token");
+    let reply = serve(&backend, &set(false, Some(token))).await;
+    assert!(
+        matches!(reply, StoreReply::PromptSettings(..)),
+        "the switch is set off: {reply:?}"
+    );
+    assert!(
+        !editor_settings(serve(&backend, &StoreRequest::GraphEditorSettings).await).compete,
+        "the switch off hides compete"
     );
 }
 
@@ -3362,11 +3471,15 @@ fn cursor_row(bench: &SectionBench, section: &KindsSection) -> String {
     text.clone()
 }
 
-/// Answers the editor's two reads (`Agents`, `Templates`) from the demo world, as the worker would.
+/// Answers the editor's three reads (`Agents`, `Templates`, `GraphEditorSettings`) from the demo
+/// world, as the worker would.
 async fn answer_lookups(bench: &SectionBench, section: &mut KindsSection) {
     let backend = demo();
     for request in store_requests(bench) {
-        if matches!(request, StoreRequest::Agents | StoreRequest::Templates(_)) {
+        if matches!(
+            request,
+            StoreRequest::Agents | StoreRequest::Templates(_) | StoreRequest::GraphEditorSettings
+        ) {
             let reply = serve(&backend, &request).await;
             bench.reply(section, &reply);
         }
@@ -3390,7 +3503,8 @@ async fn bench_with_unreferenced_analysis() -> (SectionBench, KindsSection) {
 const ANALYSIS_HEADER: &str = "analysis \u{b7} project graph \u{b7} revision";
 
 /// MOD-141 D3: `Enter` on a graph row opens the editor over the section; it asks for the agents
-/// and the templates its step form picks from, and the section's keys are the editor's.
+/// and the templates its step form picks from, and (M2 D6) the run limits and the compete switch;
+/// the section's keys are the editor's.
 #[tokio::test]
 async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates() {
     let (bench, mut section) = bench_with_unreferenced_analysis().await;
@@ -3403,7 +3517,11 @@ async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates
     assert!(
         matches!(
             asked.as_slice(),
-            [StoreRequest::Agents, StoreRequest::Templates(asked_scope)] if *asked_scope == scope
+            [
+                StoreRequest::Agents,
+                StoreRequest::Templates(asked_scope),
+                StoreRequest::GraphEditorSettings
+            ] if *asked_scope == scope
         ),
         "{asked:?}"
     );
@@ -3421,7 +3539,8 @@ async fn enter_on_a_graph_row_opens_the_editor_and_asks_for_agents_and_templates
             [
                 StoreRequest::Catalogue(_),
                 StoreRequest::Agents,
-                StoreRequest::Templates(_)
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings
             ]
         ),
         "an open editor reads again on activation: {wanted:?}"
@@ -3466,7 +3585,11 @@ async fn e_on_a_phase_row_opens_its_step_form_in_the_editor() {
     assert!(
         matches!(
             asked.as_slice(),
-            [StoreRequest::Agents, StoreRequest::Templates(_)]
+            [
+                StoreRequest::Agents,
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings
+            ]
         ),
         "only the editor's reads: {asked:?}"
     );

@@ -250,7 +250,9 @@ pub fn admission_refusal(
 }
 
 /// D10 (blueprint P-16): why `path` (trimmed) is not a repo-relative `repo:glob`, or `None`.
-fn owned_path_refusal(path: &str) -> Option<String> {
+/// Public for the graph editor's warnings (MOD-141 M2 D11).
+#[must_use]
+pub fn owned_path_refusal(path: &str) -> Option<String> {
     let glob = match SkillGlob::parse(path) {
         Ok(glob) => glob,
         Err(err) => return Some(format!("is not a glob: {err}")),
