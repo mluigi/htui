@@ -113,6 +113,10 @@ pub fn workspace_is_stopped(slug: &str) -> String {
     format!("workspace `{slug}` is stopped: resume it first")
 }
 
+/// MOD-125 M2 R1 (review L-3): a walking command whose run row could not be read, so whether its
+/// workspace is stopped is unknown; the check fails closed.
+pub const RUN_UNREADABLE: &str = "the run could not be read: try again";
+
 /// MOD-42 OQ-3: `p` on a step the box's worker walks. Promotion hands a live session to this
 /// TUI's chat, which cannot cross processes.
 #[must_use]
@@ -3414,8 +3418,12 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// cancel of the run is pending by then: D4's pending cancel wins, and a cancel requested while
 /// the stop waited out its grace is not in the poll's listing F9 skips on, so the task reads the
 /// same rows (`pending_commands(owner, box)`) and leaves the run to it here. A run leased here
-/// with no live walk goes straight to the settle. Every failure is logged: the stop row stays,
-/// so the next poll retries.
+/// with no live walk goes straight to the settle. Every failure is logged and the
+/// `workspace_stop` row stays (review L-1): while this process still holds the run's lease (no
+/// walk was live, so nothing gave it back) the next poll lists the run again; once the lease was
+/// given back (by the abandoned or preempted walk, or by `settle_stop`'s own leased window on an
+/// error) `pending_stops` no longer lists it and the sweep's `adopt_runs` settles it instead
+/// (M1 D6).
 async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     run: RunId,
@@ -3440,7 +3448,7 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => {
-            tracing::warn!(%run, %message, "a stop could not build its engine; the next poll retries");
+            tracing::warn!(%run, %message, "a stop could not build its engine; the next poll or the sweep settles it");
             return;
         }
     };
@@ -3453,7 +3461,7 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
         Ok(_) => {}
         Err(err) => {
-            tracing::warn!(%run, %err, "a stop could not read the pending cancels; the next poll retries");
+            tracing::warn!(%run, %err, "a stop could not read the pending cancels; the next poll or the sweep settles it");
             return;
         }
     }
@@ -3469,19 +3477,26 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
         Ok(false) => {
             tracing::debug!(%run, "the stop found the run no longer running under this process");
         }
-        Err(err) => tracing::warn!(%run, %err, "settling a stop failed; the next poll retries"),
+        Err(err) => {
+            tracing::warn!(%run, %err, "settling a stop failed; the next poll or the sweep settles it")
+        }
     }
     drop(guard);
 }
 
-/// MOD-125 M2 D7: the refusal of a walking command on `row`, when its workspace is stopped. A
-/// store failure refuses too (fail closed), in its own words.
+/// MOD-125 M2 D7: the refusal of a walking command on `row`, when its workspace is stopped. It
+/// fails closed (review L-3): a row that could not be read refuses with [`RUN_UNREADABLE`], and a
+/// store failure on the stop read refuses in its own words. A run with no workspace is never
+/// refused.
 async fn stopped_workspace_refusal<H: htui_core::store::WorkerHost>(
     host: &H,
     writer: &H::Store,
     row: Option<&Run>,
 ) -> Option<String> {
-    let workspace = row?.workspace_id?;
+    let Some(row) = row else {
+        return Some(RUN_UNREADABLE.to_owned());
+    };
+    let workspace = row.workspace_id?;
     match htui_core::store::WorkerStore::workspace_stop(writer, workspace).await {
         Ok(None) => None,
         Ok(Some(_)) => {
@@ -4111,6 +4126,37 @@ mod tests {
             assert_eq!(lines.len(), 1, "{needle}: said once: {lines:?}");
             assert!(lines[0].contains(level), "{needle} at{level}: {lines:?}");
         }
+    }
+
+    /// MOD-125 M2 R1 (review L-3): the stopped-workspace check fails closed. A run row that could
+    /// not be read refuses; a readable row of a workspace that is not stopped, and a run with no
+    /// workspace at all, pass.
+    #[tokio::test]
+    async fn the_stopped_workspace_check_refuses_an_unreadable_run_only() {
+        let backend = Backend::memory(MemStore::demo());
+        let writer =
+            htui_core::store::WorkerHost::writer(&backend).expect("the memory backend writes");
+        assert_eq!(
+            super::stopped_workspace_refusal(&backend, &writer, None).await,
+            Some(super::RUN_UNREADABLE.to_owned()),
+            "an unreadable row refuses"
+        );
+        let mut row = htui_core::store::WorkerStore::run(&writer, ids::RUN_8)
+            .await
+            .expect("the demo's store answers")
+            .expect("the demo has RUN_8");
+        assert!(row.workspace_id.is_some(), "RUN_8 records its workspace");
+        assert_eq!(
+            super::stopped_workspace_refusal(&backend, &writer, Some(&row)).await,
+            None,
+            "a workspace with no stop row passes"
+        );
+        row.workspace_id = None;
+        assert_eq!(
+            super::stopped_workspace_refusal(&backend, &writer, Some(&row)).await,
+            None,
+            "a run with no workspace passes"
+        );
     }
 
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
