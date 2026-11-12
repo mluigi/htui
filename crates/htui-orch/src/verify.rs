@@ -955,12 +955,30 @@ mod shell_tests {
             remaining: None,
             step: htui_core::model::StepId::new(),
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), check)
-                .await
-                .is_err(),
-            "still running when dropped"
-        );
+        // MOD-125 M2 R1 (review L-5): drop the check only once both backgrounded sleeps are seen
+        // running, by a pattern anchored on the exec'd `sleep` (the `sh -c` line, which also
+        // contains PATTERN, never matches it), while the check is still pending; otherwise a slow
+        // fork would let `until_gone` pass with nothing to kill.
+        let mut check = Box::pin(check);
+        let started = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = &mut check => panic!("the check ended before it was dropped"),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            let seen = std::process::Command::new("pgrep")
+                .args(["-f", r"^sleep 30\.4307"])
+                .output()
+                .expect("`pgrep` runs: without it this check would pass vacuously");
+            if String::from_utf8_lossy(&seen.stdout).lines().count() >= 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "both sleeps of the check never started"
+            );
+        }
+        drop(check);
         until_gone(PATTERN, "the check's group outlived the dropped verify").await;
     }
 

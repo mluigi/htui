@@ -35,9 +35,10 @@ use htui_core::model::{
     FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpView,
     ItemId, NewFollowUp, OpenPermission, PermissionChoice, PermissionId, PermissionStatus,
     ProjectId, QueuedFollowUp, RelayOption, RelaySessionId, RelayView, RunCommand, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, Scope, SettleOutcome, StepId, StepPermission,
-    StepStatus, UserId, WaitingPermission,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, RunStatus, Scope, SettleOutcome, StepId,
+    StepPermission, StepStatus, UserId, WaitingPermission,
 };
+use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{Result, StoreError, references_no_row};
 use sqlx::types::Json;
 use uuid::Uuid;
@@ -58,7 +59,7 @@ const FOLLOW_UP_ATTEMPTS: usize = 3;
 /// on each statement taking a fresh snapshot (see the module doc); `SET TRANSACTION` must be the
 /// transaction's first statement, which is why this is a helper (`write.rs`'
 /// `begin_repeatable_read` is the same shape).
-async fn begin_read_committed(
+pub(super) async fn begin_read_committed(
     pool: &sqlx::PgPool,
 ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
     let mut tx = pool.begin().await.map_err(map_sqlx)?;
@@ -422,6 +423,14 @@ pub(super) async fn answer_permission(
 /// MOD-70 D5, B-14: an `Inserted` cancel refuses the run's pending follow-ups with
 /// [`FOLLOW_UP_RUN_CANCELLED`] in its insert's transaction; an `AlreadyPending` one refuses them
 /// too (a follow-up that slipped in between a first cancel's two statements, R-5). Idempotent.
+///
+/// MOD-125 M2 R1 (review M-1): each attempt first reads the run `FOR SHARE`, which conflicts
+/// with [`stop_run`](htui_core::store::WriteStore::stop_run)'s `FOR NO KEY UPDATE` of the run:
+/// a stop committed first is seen (`READ COMMITTED` re-reads the locked row) and refused with
+/// [`cancel_of_a_stopped_run`], writing nothing; a cancel committed first is seen by the stop,
+/// which then answers `false`. Lock order: the run, then `run_command` rows; no transaction
+/// takes them the other way round, and `stop_run`'s steps-then-run order touches no
+/// `run_command` row.
 pub(super) async fn request_cancel(
     store: &PgStore,
     run: RunId,
@@ -431,6 +440,25 @@ pub(super) async fn request_cancel(
     for _ in 0..CANCEL_ATTEMPTS {
         // F-18: the refusal after the insert reads a fresh snapshot.
         let mut tx = begin_read_committed(&store.pool).await?;
+        let status = sqlx::query_scalar!(
+            r#"SELECT status AS "status: RunStatus" FROM run WHERE id = $1 FOR SHARE"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        match status {
+            None => {
+                return Err(StoreError::NotFound {
+                    entity: "run",
+                    id: run.to_string(),
+                });
+            }
+            Some(RunStatus::Stopped) => {
+                return Err(StoreError::Constraint(cancel_of_a_stopped_run(run)));
+            }
+            Some(_) => {}
+        }
         let inserted = sqlx::query_scalar!(
             r#"INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
                VALUES ($1, $2, 'cancel', $3, $4)

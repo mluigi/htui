@@ -35,6 +35,7 @@ use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
+use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
@@ -7994,6 +7995,152 @@ async fn delete_workspace_recounts_a_run_stopped_under_it() {
         "the workspace stays"
     );
 
+    db.drop_db().await;
+}
+
+/// MOD-125 M2 R1: waits until a session is blocked on a lock `holder_pid` holds, so a test knows
+/// the racing writer reached the held row before the holder commits.
+async fn wait_blocked_on(db: &common::TestDb, holder_pid: i32, what: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'
+                AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{what} never waited on the held run"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// MOD-125 M2 R1 (review M-1): a cancel requested while a stop of the run is in flight waits on
+/// the stop's run lock (`request_cancel` reads the run `FOR SHARE`) and, once the stop commits,
+/// is refused in [`cancel_of_a_stopped_run`]'s sentence, writing no `run_command` row that no
+/// executor would ever apply. A raw transaction holds the run as `stop_run` does (`FOR NO KEY
+/// UPDATE`, then the move), uncommitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_racing_a_stop_waits_for_it_and_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, _step, _owner) = leased_running_step(&db).await;
+    let mut holder = db.pool.begin().await.expect("begin holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the holder's pid");
+    sqlx::query("SELECT 1 FROM run WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(run.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("the holder locks the run as stop_run does");
+    sqlx::query("UPDATE run SET status = 'stopped', lease_owner = NULL WHERE id = $1")
+        .bind(run.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("the holder stops the run, uncommitted");
+    let store = db.store.clone();
+    let cancel = tokio::spawn(async move { store.request_cancel(run, ids::USER, ids::BOX).await });
+    wait_blocked_on(&db, holder_pid, "the cancel").await;
+    assert!(
+        !cancel.is_finished(),
+        "the cancel answered while the stop was in flight"
+    );
+    holder.commit().await.expect("the holder commits the stop");
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), cancel)
+        .await
+        .expect("the cancel answers within 5 s")
+        .expect("the cancel task joins");
+    assert_eq!(
+        answer,
+        Err(htui_core::store::StoreError::Constraint(
+            cancel_of_a_stopped_run(run)
+        )),
+        "the cancel sees the committed stop and is refused"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM run_command WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the run's commands");
+    assert_eq!(rows, 0, "no cancel row was left on the stopped run");
+    db.drop_db().await;
+}
+
+/// MOD-125 M2 R1 (review M-1): the reverse order. A cancel in flight (the run share-locked as
+/// `request_cancel` locks it, its row inserted, uncommitted) holds a stop off: `stop_run` waits on
+/// the run and, once the cancel commits, reads the pending cancel and answers `false` (the cancel
+/// wins, D4); the run stays `running` and its owner's, for the cancel's executor to apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_racing_a_cancel_waits_for_it_and_leaves_the_run_to_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, _step, owner) = leased_running_step(&db).await;
+    let mut holder = db.pool.begin().await.expect("begin holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the holder's pid");
+    sqlx::query("SELECT 1 FROM run WHERE id = $1 FOR SHARE")
+        .bind(run.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("the holder share-locks the run as request_cancel does");
+    sqlx::query(
+        "INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
+         VALUES ($1, $2, 'cancel', $3, $4)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(run.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .execute(&mut *holder)
+    .await
+    .expect("the holder writes the cancel, uncommitted");
+    let store = db.store.clone();
+    let stop = tokio::spawn(async move { store.stop_run(run, owner).await });
+    wait_blocked_on(&db, holder_pid, "the stop").await;
+    assert!(
+        !stop.is_finished(),
+        "the stop answered while the cancel was in flight"
+    );
+    holder
+        .commit()
+        .await
+        .expect("the holder commits the cancel");
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), stop)
+        .await
+        .expect("the stop answers within 5 s")
+        .expect("the stop task joins");
+    assert_eq!(
+        answer,
+        Ok(false),
+        "the stop reads the committed cancel and leaves the run to it"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM run WHERE id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the run's status");
+    assert_eq!(status, "running", "the run still runs");
+    assert!(
+        db.store
+            .refresh_lease(run, owner, TimeDelta::minutes(30))
+            .await
+            .expect("refresh the lease"),
+        "and is still the owner's"
+    );
     db.drop_db().await;
 }
 
