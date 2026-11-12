@@ -1922,6 +1922,7 @@ fn doing(busy: &str) -> &'static str {
         "replace_graph" => "replacing the graph",
         "delete_phase" => "deleting the phase",
         "graph_body" => "reading the graph",
+        "graph_editor_settings" => "reading the run limits",
         _ => "writing",
     }
 }
