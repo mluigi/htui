@@ -1,4 +1,4 @@
-//! The tool table (MOD-11 blueprint §2.10): eight tools, one file each, fixed here once.
+//! The tool table (MOD-11 blueprint §2.10): nine tools, one file each, fixed here once.
 //!
 //! [`ALL`]'s order is `tools/list`'s order and a pin. Each file exports a [`ToolDef`] named `DEF`
 //! and an `async fn call`; a tool's owning task replaces both in its own file and never edits this
@@ -15,6 +15,7 @@ use crate::protocol::Progress;
 
 mod box_profile;
 mod command;
+mod command_log;
 mod document;
 mod link;
 mod note;
@@ -42,7 +43,7 @@ pub(crate) struct HostCaps {
 }
 
 /// Table order is `tools/list` order and a pin.
-pub(crate) const ALL: [&ToolDef; 8] = [
+pub(crate) const ALL: [&ToolDef; 9] = [
     &box_profile::DEF,
     &document::DEF,
     &note::DEF,
@@ -50,6 +51,7 @@ pub(crate) const ALL: [&ToolDef; 8] = [
     &link::DEF,
     &search::DEF,
     &command::DEF,
+    &command_log::DEF,
     &permission::DEF,
 ];
 
@@ -85,6 +87,7 @@ pub(crate) async fn dispatch<H: htui_core::store::WorkerHost>(
         "item_link" => link::call(ctx, args).await,
         "search_concepts" => search::call(ctx, args).await,
         "command_run" => command::call(ctx, args).await,
+        "command_output_read" => command_log::call(ctx, args).await,
         "permission_prompt" => permission::call(ctx, args).await,
         other => Err(ToolError(format!("unknown tool: {other}"))),
     }
@@ -158,6 +161,7 @@ mod tests {
                 "item_link",
                 "search_concepts",
                 "command_run",
+                "command_output_read",
                 "permission_prompt",
             ]
         );

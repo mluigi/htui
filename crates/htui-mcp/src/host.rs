@@ -714,6 +714,7 @@ pub(crate) mod tests {
                 "item_status",
                 "item_link",
                 "command_run",
+                "command_output_read",
                 "permission_prompt",
             ]
         );
