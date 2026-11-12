@@ -111,6 +111,7 @@ pub mod stop;
 pub mod usage;
 pub mod user;
 pub mod waiting;
+pub mod worker_log;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
@@ -215,6 +216,9 @@ pub use stop::{PendingStop, StopMode, WorkspaceStop};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 pub use waiting::{WaitingCandidate, WaitingPermission};
+pub use worker_log::{
+    LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
+};
 
 #[cfg(test)]
 mod tests {

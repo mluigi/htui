@@ -8,6 +8,7 @@ pub mod graph_rules;
 pub mod mem;
 pub mod traits;
 mod worker;
+mod worker_log;
 
 #[cfg(feature = "test-support")]
 pub mod conformance;
@@ -58,3 +59,4 @@ pub use traits::{
     workspace_prefix_taken,
 };
 pub use worker::{RecorderStore, RelayStore, WorkerHost, WorkerStore};
+pub use worker_log::WorkerLogStore;

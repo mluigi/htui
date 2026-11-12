@@ -24,6 +24,13 @@ async fn mem_store_read_conformance() {
     conformance::run_all_reads(|| async { MemStore::demo() }).await;
 }
 
+/// The worker log half of the suite (MOD-122 M2, blueprint F1), bound to the same fixture: a third
+/// binding, because `run_all_worker_logs` is generic over `WriteStore + WorkerLogStore`.
+#[tokio::test]
+async fn mem_store_worker_log_conformance() {
+    conformance::run_all_worker_logs(|| async { MemStore::demo() }).await;
+}
+
 #[tokio::test]
 async fn demo_store_loads_the_fixture() {
     let store = MemStore::demo();
@@ -93,5 +100,10 @@ async fn demo_store_loads_the_fixture() {
         "milestone 9's four `ReadStore` additions, the upstream walk taking three cases (D96), \
          MOD-4 milestone 1's three for ANA-2 §8's mirrored reads (plan D12), MOD-38's five \
          requirement reads (plan D12), and MOD-72's tool-call counts (plan D2)"
+    );
+    assert_eq!(
+        conformance::WORKER_LOG_CASES.len(),
+        5,
+        "MOD-122 M2's five worker log cases (plan D1, D4, D7; blueprint F1, F2)"
     );
 }

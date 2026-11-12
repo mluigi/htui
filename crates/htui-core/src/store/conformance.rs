@@ -47,6 +47,9 @@ use crate::model::{
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
+use crate::model::{
+    LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
+};
 use crate::model::{NewOwnerDocument, Project, StepRole};
 use crate::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
 use crate::model::{PlanAdmission, PlanToAdmit};
@@ -99,6 +102,7 @@ use crate::store::traits::{
     scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run,
     workspace_has_stopped_run,
 };
+use crate::store::worker_log::WorkerLogStore;
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -1376,6 +1380,375 @@ where
 {
     for name in READ_CASES {
         run_read_case(name, &make().await).await;
+    }
+}
+
+/// The worker log half of the suite (MOD-122 M2 plan D1, blueprint F1), in run order. A name
+/// never changes.
+///
+/// A third list beside [`CASES`] and [`READ_CASES`] rather than more entries in `CASES`: these
+/// cases need [`WorkerLogStore`], a narrow trait only `MemStore` and `PgStore` implement, and
+/// widening [`run_case`]'s bound would ask it of every `WriteStore`. Each case writes, so
+/// [`run_all_worker_logs`] builds a fresh store per case.
+///
+/// What a generic case cannot plant (another user's box, a second box of this user, a settings
+/// blob that is not an object) is shown per backend: `mem.rs` and `worker_log_pg.rs`.
+pub const WORKER_LOG_CASES: &[&str] = &[
+    "worker_log_append_then_read_in_id_order",
+    "worker_log_unknown_box_is_not_found",
+    "worker_log_text_is_capped_and_nul_free",
+    "worker_log_prune_cuts_by_age_then_caps_per_box",
+    "worker_log_set_box_log_level_keeps_the_rest_of_the_blob",
+];
+
+/// Runs one [`WORKER_LOG_CASES`] case by name against an already-loaded store. Every arm is
+/// boxed, as [`run_case`]'s are (MOD-137).
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_worker_log_case<S: WriteStore + WorkerLogStore>(name: &str, store: &S) {
+    Box::pin(run_worker_log_case_inline(name, store)).await;
+}
+
+async fn run_worker_log_case_inline<S: WriteStore + WorkerLogStore>(name: &str, store: &S) {
+    match name {
+        "worker_log_append_then_read_in_id_order" => {
+            Box::pin(worker_log_append_then_read_in_id_order(store)).await;
+        }
+        "worker_log_unknown_box_is_not_found" => {
+            Box::pin(worker_log_unknown_box_is_not_found(store)).await;
+        }
+        "worker_log_text_is_capped_and_nul_free" => {
+            Box::pin(worker_log_text_is_capped_and_nul_free(store)).await;
+        }
+        "worker_log_prune_cuts_by_age_then_caps_per_box" => {
+            Box::pin(worker_log_prune_cuts_by_age_then_caps_per_box(store)).await;
+        }
+        "worker_log_set_box_log_level_keeps_the_rest_of_the_blob" => {
+            Box::pin(worker_log_set_box_log_level_keeps_the_rest_of_the_blob(
+                store,
+            ))
+            .await;
+        }
+        other => panic!(
+            "unknown worker log case `{other}`; WORKER_LOG_CASES and run_worker_log_case disagree"
+        ),
+    }
+}
+
+/// Runs every case in [`WORKER_LOG_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_worker_logs<S, F, Fut>(make: F)
+where
+    S: WriteStore + WorkerLogStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in WORKER_LOG_CASES {
+        run_worker_log_case(name, &make().await).await;
+    }
+}
+
+/// One line at `level` with `text`, logged now at Postgres's precision.
+fn worker_line(level: WorkerLogLevel, text: &str) -> NewWorkerLog {
+    NewWorkerLog {
+        logged_at: seam_clock(),
+        level,
+        target: "htui::worker".to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+/// The fixture box's row, read through [`WriteStore::boxes`].
+async fn fixture_box_row<S: WriteStore>(store: &S, case: &str) -> BoxRow {
+    store
+        .boxes()
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|record| record.row.id == ids::BOX)
+        .unwrap_or_else(|| panic!("{case}: the fixture box is one of this user's"))
+        .row
+}
+
+/// Every stored line's text, in read order.
+fn texts(lines: &[WorkerLogLine]) -> Vec<&str> {
+    lines.iter().map(|line| line.text.as_str()).collect()
+}
+
+/// MOD-122 M2 plan D1: a batch is stored in order and stamped with the box; ids rise; a read is
+/// in id order, `after` is exclusive, and `None` is the newest `limit` rows, oldest first.
+async fn worker_log_append_then_read_in_id_order<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_append_then_read_in_id_order";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    assert_eq!(
+        store.worker_logs(None, 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the fixture ships no worker log"
+    );
+    assert_eq!(
+        store.append_worker_logs(ids::BOX, &[]).await.expect(CASE),
+        0,
+        "{CASE}: an empty batch writes nothing"
+    );
+
+    let first = [
+        worker_line(WorkerLogLevel::Error, "one"),
+        worker_line(WorkerLogLevel::Warn, "two"),
+    ];
+    let second = [
+        worker_line(WorkerLogLevel::Info, "three"),
+        worker_line(WorkerLogLevel::Debug, "four"),
+        worker_line(WorkerLogLevel::Trace, "five"),
+    ];
+    assert_eq!(
+        store
+            .append_worker_logs(ids::BOX, &first)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: the first batch's two rows"
+    );
+    assert_eq!(
+        store
+            .append_worker_logs(ids::BOX, &second)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: the second batch's three rows"
+    );
+
+    let all = store.worker_logs(None, 100).await.expect(CASE);
+    assert_eq!(
+        texts(&all),
+        ["one", "two", "three", "four", "five"],
+        "{CASE}"
+    );
+    assert!(
+        all.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "{CASE}: ids rise in read order: {all:?}"
+    );
+    for (line, wrote) in all.iter().zip(first.iter().chain(&second)) {
+        assert_eq!(line.box_id, Some(ids::BOX), "{CASE}: stamped with the box");
+        assert_eq!(
+            line.box_name, hostname,
+            "{CASE}: stamped with the box's hostname"
+        );
+        assert_eq!(line.level, wrote.level, "{CASE}");
+        assert_eq!(line.target, wrote.target, "{CASE}");
+        assert_eq!(
+            line.logged_at, wrote.logged_at,
+            "{CASE}: the worker's clock, kept"
+        );
+    }
+
+    let ids: Vec<i64> = all.iter().map(|line| line.id).collect();
+    assert_eq!(
+        texts(&store.worker_logs(Some(ids[0]), 100).await.expect(CASE)),
+        ["two", "three", "four", "five"],
+        "{CASE}: `after` is exclusive"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(Some(ids[1]), 2).await.expect(CASE)),
+        ["three", "four"],
+        "{CASE}: `after` reads forward, oldest first, at most `limit`"
+    );
+    assert_eq!(
+        store.worker_logs(Some(ids[4]), 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: nothing after the newest"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 2).await.expect(CASE)),
+        ["four", "five"],
+        "{CASE}: `None` is the newest `limit`, oldest first"
+    );
+    assert_eq!(
+        store.worker_logs(None, 0).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: a zero limit reads nothing"
+    );
+}
+
+/// MOD-122 M2 plan D1: an unknown box is `NotFound` and writes nothing. Another user's box is
+/// the same answer; that half is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_unknown_box_is_not_found<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_unknown_box_is_not_found";
+    let unknown = BoxId::new();
+    let answer = store
+        .append_worker_logs(unknown, &[worker_line(WorkerLogLevel::Error, "lost")])
+        .await;
+    assert!(
+        matches!(answer, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        store.worker_logs(None, 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the refused batch wrote nothing"
+    );
+    assert!(
+        !store
+            .set_box_log_level(unknown, Some(LogShipLevel::Debug))
+            .await
+            .expect(CASE),
+        "{CASE}: an unknown box's level is `false`"
+    );
+}
+
+/// MOD-122 M2 plan T1: a text over [`WORKER_LOG_TEXT_MAX`] bytes is stored cut, with a `…`; a NUL
+/// (which Postgres text refuses) is stored as U+FFFD, in the text and in the target.
+async fn worker_log_text_is_capped_and_nul_free<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_text_is_capped_and_nul_free";
+    let long = "x".repeat(WORKER_LOG_TEXT_MAX + 100);
+    let mut nul = worker_line(WorkerLogLevel::Warn, "a\0b");
+    nul.target = "t\0".to_owned();
+    let written = store
+        .append_worker_logs(ids::BOX, &[worker_line(WorkerLogLevel::Warn, &long), nul])
+        .await
+        .expect(CASE);
+    assert_eq!(written, 2, "{CASE}");
+    let read = store.worker_logs(None, 10).await.expect(CASE);
+    assert_eq!(read.len(), 2, "{CASE}");
+    assert_eq!(
+        read[0].text.len(),
+        WORKER_LOG_TEXT_MAX,
+        "{CASE}: cut to the cap"
+    );
+    assert!(read[0].text.ends_with('…'), "{CASE}: the cut is marked");
+    assert_eq!(read[1].text, "a\u{FFFD}b", "{CASE}");
+    assert_eq!(read[1].target, "t\u{FFFD}", "{CASE}");
+}
+
+/// MOD-122 M2 plan D4: the age cut deletes the rows received before it, the cap then keeps each
+/// box's newest rows, and a second sweep deletes nothing. The cap's per-box partition (another
+/// box's rows untouched) is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_prune_cuts_by_age_then_caps_per_box<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_prune_cuts_by_age_then_caps_per_box";
+    let far_past = seam_clock() - TimeDelta::days(3650);
+    let old = [
+        worker_line(WorkerLogLevel::Error, "old-1"),
+        worker_line(WorkerLogLevel::Info, "old-2"),
+    ];
+    store.append_worker_logs(ids::BOX, &old).await.expect(CASE);
+    // Both stores stamp `received_at` from a real clock; the pause keeps the two batches apart.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let new: Vec<NewWorkerLog> = (1..=5)
+        .map(|n| worker_line(WorkerLogLevel::Info, &format!("new-{n}")))
+        .collect();
+    store.append_worker_logs(ids::BOX, &new).await.expect(CASE);
+    let all = store.worker_logs(None, 100).await.expect(CASE);
+    assert_eq!(all.len(), 7, "{CASE}");
+    let cut = all[2].received_at;
+    assert!(
+        all[1].received_at < cut,
+        "{CASE}: the batches were received apart: {all:?}"
+    );
+
+    assert_eq!(
+        store.prune_worker_logs(far_past, 100).await.expect(CASE),
+        0,
+        "{CASE}: nothing is older than the far past, and nothing is over the cap"
+    );
+    assert_eq!(
+        store.prune_worker_logs(cut, 100).await.expect(CASE),
+        2,
+        "{CASE}: the rows received before the cut go"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 100).await.expect(CASE)),
+        ["new-1", "new-2", "new-3", "new-4", "new-5"],
+        "{CASE}: a row received at the cut stays"
+    );
+    assert_eq!(
+        store.prune_worker_logs(far_past, 3).await.expect(CASE),
+        2,
+        "{CASE}: the cap removes the two oldest of five"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 100).await.expect(CASE)),
+        ["new-3", "new-4", "new-5"],
+        "{CASE}: the cap keeps the newest"
+    );
+    assert_eq!(
+        store.prune_worker_logs(cut, 3).await.expect(CASE),
+        0,
+        "{CASE}: a second sweep deletes nothing"
+    );
+}
+
+/// MOD-122 M2 plan D7: setting the level writes `log_level` alone and clearing it removes that
+/// key alone; the rest of the blob is compared whole, and `edit_version` does not move. The
+/// non-object blob is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_set_box_log_level_keeps_the_rest_of_the_blob<S: WriteStore + WorkerLogStore>(
+    store: &S,
+) {
+    const CASE: &str = "worker_log_set_box_log_level_keeps_the_rest_of_the_blob";
+    let token = fixture_box_row(store, CASE).await.edit_version;
+    let edited = store
+        .edit_box(
+            ids::BOX,
+            token,
+            BoxEdit {
+                executor: Some(Executor::Worker),
+                ..BoxEdit::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(edited, CasOutcome::Applied(_)),
+        "{CASE}: {edited:?}"
+    );
+    let before = fixture_box_row(store, CASE).await;
+    let Value::Object(blob) = before.settings.clone() else {
+        panic!("{CASE}: the fixture blob is an object: {}", before.settings);
+    };
+    assert!(!blob.contains_key(LogShipLevel::KEY), "{CASE}: {blob:?}");
+    assert_eq!(
+        LogShipLevel::of(&before.settings),
+        LogShipLevel::Warn,
+        "{CASE}"
+    );
+
+    for level in [LogShipLevel::Debug, LogShipLevel::Off] {
+        assert!(
+            store
+                .set_box_log_level(ids::BOX, Some(level))
+                .await
+                .expect(CASE),
+            "{CASE}: this user's box answers `true`"
+        );
+        let after = fixture_box_row(store, CASE).await;
+        let mut want = blob.clone();
+        want.insert(
+            LogShipLevel::KEY.to_owned(),
+            Value::String(level.as_str().to_owned()),
+        );
+        assert_eq!(after.settings, Value::Object(want), "{CASE}: {level}");
+        assert_eq!(LogShipLevel::of(&after.settings), level, "{CASE}");
+        assert_eq!(
+            after.edit_version, before.edit_version,
+            "{CASE}: a level is not under the compare-and-set"
+        );
+    }
+
+    for _ in 0..2 {
+        assert!(
+            store.set_box_log_level(ids::BOX, None).await.expect(CASE),
+            "{CASE}: clearing answers `true`, twice"
+        );
+        let cleared = fixture_box_row(store, CASE).await;
+        assert_eq!(
+            cleared.settings,
+            Value::Object(blob.clone()),
+            "{CASE}: clearing removes `log_level` alone"
+        );
+        assert_eq!(cleared.edit_version, before.edit_version, "{CASE}");
     }
 }
 
@@ -31455,7 +31828,9 @@ async fn new_kinds_never_gate_readiness<S: WriteStore>(store: &S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CASES, READ_CASES, run_case, run_read_case};
+    use super::{
+        CASES, READ_CASES, WORKER_LOG_CASES, run_case, run_read_case, run_worker_log_case,
+    };
     use crate::store::MemStore;
 
     #[test]
@@ -31465,15 +31840,20 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
 
-        // The two lists are reported separately by MOD-6's binding, so a name may not be in both
+        // The three lists are reported separately by MOD-6's binding, so a name may not be in two
         // either: a duplicate across them would be run twice and reported once.
-        let mut both: Vec<&str> = CASES.iter().chain(READ_CASES).copied().collect();
-        both.sort_unstable();
-        both.dedup();
+        let mut all: Vec<&str> = CASES
+            .iter()
+            .chain(READ_CASES)
+            .chain(WORKER_LOG_CASES)
+            .copied()
+            .collect();
+        all.sort_unstable();
+        all.dedup();
         assert_eq!(
-            both.len(),
-            CASES.len() + READ_CASES.len(),
-            "a case name is unique across both lists"
+            all.len(),
+            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len(),
+            "a case name is unique across the three lists"
         );
     }
 
@@ -31626,6 +32006,15 @@ mod tests {
         let store = MemStore::demo();
         for name in READ_CASES {
             run_read_case(name, &store).await;
+        }
+    }
+
+    /// The same guard for the worker log half (MOD-122 M2, blueprint F1): each case writes, so
+    /// each gets a fresh store.
+    #[tokio::test]
+    async fn run_worker_log_case_accepts_every_name() {
+        for name in WORKER_LOG_CASES {
+            run_worker_log_case(name, &MemStore::demo()).await;
         }
     }
 }
