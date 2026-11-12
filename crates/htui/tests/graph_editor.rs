@@ -8,7 +8,8 @@
 //! assertion reads the store the requests were served from.
 //!
 //! MOD-141 milestone 2, T9: the same drivers over the M2 node fields (the deadline, the palette
-//! flag, the split and its rows, the default parts through the part form) and the compete switch.
+//! flag, the split and its rows, the default parts through the part form), the compete switch,
+//! `htui_orch`'s resolve over the saved body, and the header's limits line.
 #![cfg(feature = "testkit")]
 
 use std::collections::BTreeMap;
@@ -25,14 +26,16 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::predicate::IfPredicate;
 use htui_core::model::{
-    AgentId, CommandQueue, EdgeKind, Gate, GraphBody, Isolation, ItemId, NodeBody, PersonaId,
-    PhaseAgent, PhaseId, PhasePart, PlanScope, RunMode, Split, StepGraphEdge, StepGraphId,
+    AgentId, CommandQueue, EdgeKind, Gate, GraphBody, GraphSnapshot, Isolation, ItemId, ItemPatch,
+    NodeBody, NodeRole, PersonaId, PhaseAgent, PhaseId, PhasePart, PlanScope, RunMode,
+    SnapshotPart, SnapshotPhase, Split, StepGraphEdge, StepGraphId,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
-    CasOutcome, MemStore, SettingRung, WorkerStore, WriteStore, loop_edge_runs_forward,
-    reserved_phase_name,
+    CasOutcome, MemStore, SettingRung, UpdateOutcome, WorkerStore, WriteStore,
+    loop_edge_runs_forward, reserved_phase_name,
 };
+use htui_orch::graph::{NotRunnable, ResolveError};
 use htui_store::Backend;
 use serde_json::json;
 
@@ -1307,6 +1310,55 @@ async fn store_edit(store: &MemStore, name: &str, edit: impl FnOnce(&mut NodeBod
     assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
 }
 
+/// Points the demo item `VULKAN_FEAT_1` at `graph` (`item.step_graph_id`), so resolve reads it.
+async fn pin_feat_1(store: &MemStore, graph: StepGraphId) {
+    let item = WorkerStore::item(store, ids::VULKAN_FEAT_1)
+        .await
+        .expect("a memory read never fails")
+        .expect("the demo item");
+    let outcome = store
+        .update_item(
+            ids::VULKAN_FEAT_1,
+            item.version,
+            ItemPatch {
+                step_graph_id: Some(Some(graph)),
+                author_id: ids::USER,
+                reason: "edited".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("a memory write never fails");
+    assert!(matches!(outcome, UpdateOutcome::Updated(_)), "{outcome:?}");
+}
+
+/// What the orchestrator's own resolver freezes for `VULKAN_FEAT_1` over the store's
+/// `app_setting` rows, or its refusal.
+async fn resolved(store: &MemStore) -> Result<GraphSnapshot, ResolveError> {
+    let item = WorkerStore::item(store, ids::VULKAN_FEAT_1)
+        .await
+        .expect("a memory read never fails")
+        .expect("the demo item");
+    let app = store
+        .app_settings()
+        .await
+        .expect("a memory read never fails");
+    htui_orch::graph::resolve(store, store, &item, RunMode::Manual, &app, None, ids::BOX)
+        .await
+        .map(|resolved| resolved.snapshot)
+}
+
+/// Gives research and verdict one candidate each, the first (agent, model) pair, one write
+/// apiece. The analysis steps have none, and the box's two enabled agents leave the candidate
+/// chain's third rung ambiguous, so resolve needs them.
+async fn with_candidates(bench: &SectionBench, section: &mut KindsSection, backend: &Backend) {
+    for name in ["research", "verdict"] {
+        bench_select(bench, section, name);
+        press(bench, section, &["e", "alt-n"]);
+        saved(bench, section, backend).await;
+    }
+}
+
 /// The node of `body` with phase id `id`.
 #[track_caller]
 fn node_of(body: &GraphBody, id: PhaseId) -> &NodeBody {
@@ -1314,6 +1366,16 @@ fn node_of(body: &GraphBody, id: PhaseId) -> &NodeBody {
         .iter()
         .find(|node| node.phase.id == id)
         .unwrap_or_else(|| panic!("no step {id}: {body:?}"))
+}
+
+/// The resolved phase keyed `name`.
+#[track_caller]
+fn frozen<'a>(snapshot: &'a GraphSnapshot, name: &str) -> &'a SnapshotPhase {
+    snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.name == name)
+        .unwrap_or_else(|| panic!("no phase {name}: {:?}", snapshot.phases))
 }
 
 /// The word the frame's `label` choice row shows between `‹` and `›`.
@@ -1811,4 +1873,308 @@ async fn with_the_switch_off_a_compete_node_saves_byte_identical() {
     node.phase.fan_out = 3;
     (node.phase.judge_agent_id, node.phase.judge_model) = seat(&pairs[0]);
     assert_eq!(shape(&stored), shape(&expected), "fan-out and judge edited");
+}
+
+/// PRD metric "every saved divide that resolve accepts resolves": a divide step with one part,
+/// made with keys and saved, freezes through the orchestrator's own resolver over the same store,
+/// as a planner node and an integrate node carrying the part; the canvas marks nothing.
+#[tokio::test]
+async fn a_divide_step_with_one_part_saves_and_resolves() {
+    let store = MemStore::demo();
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    with_candidates(&bench, &mut section, &backend).await;
+    let before = body_of(&store, ANALYSIS).await;
+    let research = node_of(&before, step(&before, "research")).clone();
+
+    bench_select(&bench, &mut section, "research");
+    bench.key(&mut section, "e");
+    let mut chords = at_row(m2_row(&research, SPLIT), &["l"]);
+    chords.extend(at_row(
+        FIRST_PART - SPLIT,
+        &["alt-n", "u", "i", "tab", "tab", "tab"],
+    ));
+    chords.extend("src/ui/**".chars().map(|character| character.to_string()));
+    chords.push("enter".to_owned());
+    play(&bench, &mut section, &chords);
+    saved(&bench, &mut section, &backend).await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let divided = node_of(&stored, research.phase.id);
+    assert_eq!(divided.phase.split, Split::Divide);
+    let part = PhasePart {
+        owned_paths: vec!["src/ui/**".to_owned()],
+        ..bare_part(research.phase.id, 0, "ui")
+    };
+    assert_eq!(divided.parts, core::slice::from_ref(&part));
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains('!'), "no step is marked: {frame}");
+
+    pin_feat_1(&store, ANALYSIS).await;
+    let snapshot = resolved(&store)
+        .await
+        .unwrap_or_else(|refusal| panic!("the divided graph resolves: {refusal}"));
+    let nodes: Vec<(&str, NodeRole)> = snapshot
+        .phases
+        .iter()
+        .map(|phase| (phase.name.as_str(), phase.role))
+        .collect();
+    assert_eq!(
+        nodes,
+        [
+            ("research:plan", NodeRole::Planner),
+            ("research", NodeRole::Integrate),
+            ("verdict", NodeRole::Step),
+        ]
+    );
+    let frozen_part = SnapshotPart {
+        position: part.position,
+        key: part.key,
+        title: part.title,
+        brief: part.brief,
+        owned_paths: part.owned_paths,
+        acceptance: part.acceptance,
+        agent_id: part.agent_id,
+        model: part.model,
+        persona_id: part.persona_id,
+    };
+    for name in ["research:plan", "research"] {
+        let divide = frozen(&snapshot, name)
+            .divide
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} carries the divide block"));
+        assert_eq!(
+            divide.default_parts,
+            core::slice::from_ref(&frozen_part),
+            "{name}"
+        );
+    }
+}
+
+/// M2 D11 (M-4): a divide step with no part is saved anyway; its form shows resolve's own
+/// `NoParts` sentence, the canvas marks it, and resolve refuses it with that same sentence.
+#[tokio::test]
+async fn a_part_less_divide_shows_no_parts_and_still_saves() {
+    let store = MemStore::demo();
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    with_candidates(&bench, &mut section, &backend).await;
+    let before = body_of(&store, ANALYSIS).await;
+    let research = node_of(&before, step(&before, "research")).clone();
+
+    bench_select(&bench, &mut section, "research");
+    bench.key(&mut section, "e");
+    play(
+        &bench,
+        &mut section,
+        &at_row(m2_row(&research, SPLIT), &["l"]),
+    );
+    saved(&bench, &mut section, &backend).await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let divided = node_of(&stored, research.phase.id);
+    assert_eq!(divided.phase.split, Split::Divide);
+    assert!(divided.parts.is_empty(), "{:?}", divided.parts);
+
+    let sentence = ResolveError::NotYetRunnable {
+        node: "research".to_owned(),
+        reason: NotRunnable::NoParts,
+    }
+    .to_string();
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    assert!(flat(&frame).contains(&format!("! {sentence}")), "{frame}");
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("! research"), "the canvas marks it: {frame}");
+
+    pin_feat_1(&store, ANALYSIS).await;
+    let refusal = resolved(&store)
+        .await
+        .expect_err("a part-less divide does not run yet");
+    assert_eq!(refusal.to_string(), sentence);
+}
+
+/// M2 D3: a deadline and a judge saved in the editor are what the orchestrator freezes: the
+/// phase rung answers first.
+#[tokio::test]
+async fn a_saved_deadline_and_judge_reach_the_resolved_snapshot() {
+    let store = MemStore::demo();
+    compete_on(&Backend::memory(store.clone())).await;
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    with_candidates(&bench, &mut section, &backend).await;
+    let before = body_of(&store, ANALYSIS).await;
+    let pairs = agent_pairs(&backend).await;
+
+    bench_select(&bench, &mut section, "research");
+    bench.key(&mut section, "e");
+    let research = node_of(&before, step(&before, "research"));
+    play(
+        &bench,
+        &mut section,
+        &retyped(m2_row(research, DEADLINE), "900"),
+    );
+    saved(&bench, &mut section, &backend).await;
+
+    bench_select(&bench, &mut section, "verdict");
+    bench.key(&mut section, "e");
+    let verdict = node_of(&before, step(&before, "verdict"));
+    // Back one from none is compete, its fan-out 2; the judge forward from the project default
+    // is the first pair.
+    let mut chords = at_row(m2_row(verdict, SPLIT), &["h"]);
+    chords.extend(at_row(JUDGE - SPLIT, &["l"]));
+    play(&bench, &mut section, &chords);
+    saved(&bench, &mut section, &backend).await;
+
+    pin_feat_1(&store, ANALYSIS).await;
+    let snapshot = resolved(&store)
+        .await
+        .unwrap_or_else(|refusal| panic!("the graph resolves: {refusal}"));
+    assert_eq!(frozen(&snapshot, "research").deadline_seconds, Some(900));
+    let verdict = frozen(&snapshot, "verdict");
+    assert_ne!(verdict.deadline_seconds, Some(900), "research's alone");
+    assert_eq!(verdict.fan_out, 2);
+    let judge = verdict.judge.as_ref().expect("the phase's judge");
+    assert_eq!(
+        (Some(judge.agent_id), judge.model.clone()),
+        seat(&pairs[0]),
+        "{judge:?}"
+    );
+}
+
+/// M2 D10: a step saved with palette on is added with no links and takes nothing over; palette
+/// on a linked step is refused in words and nothing is written.
+#[tokio::test]
+async fn a_palette_step_is_added_with_no_edges() {
+    let store = MemStore::demo();
+    let (bench, mut section, backend) = analysis_bench(&store, None).await;
+    let before = body_of(&store, ANALYSIS).await;
+    let research = node_of(&before, step(&before, "research")).clone();
+    let forward = link(&before, "research", "verdict");
+
+    // `a` with research selected; the draft takes research's template.
+    bench.key(&mut section, "a");
+    type_in(&bench, &mut section, "triage");
+    let draft = NodeBody {
+        agents: Vec::new(),
+        ..research.clone()
+    };
+    play(
+        &bench,
+        &mut section,
+        &at_row(m2_row(&draft, PALETTE), &["l"]),
+    );
+    saved(&bench, &mut section, &backend).await;
+    let stored = body_of(&store, ANALYSIS).await;
+    let triage = node_of(&stored, step(&stored, "triage"));
+    assert!(triage.phase.palette);
+    assert!(!triage.phase.template_name.is_empty(), "a template");
+    assert!(
+        stored
+            .edges
+            .iter()
+            .all(|edge| edge.from != triage.phase.id && edge.to != triage.phase.id),
+        "{:?}",
+        stored.edges
+    );
+    assert_eq!(link(&stored, "research", "verdict"), forward, "intact");
+    assert_eq!(stored.edges.len(), 1, "{:?}", stored.edges);
+
+    // Palette on research, which has its one link. The new step is selected, in the band under
+    // verdict: up twice is research (`bench_select`'s cycle never moves up twice in a row).
+    press(&bench, &mut section, &["k", "k"]);
+    bench_select(&bench, &mut section, "research");
+    bench.key(&mut section, "e");
+    play(
+        &bench,
+        &mut section,
+        &at_row(m2_row(&research, PALETTE), &["l", "enter"]),
+    );
+    assert!(bench_round(&bench, &mut section, &backend).await.is_empty());
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        flat(&frame).contains("a palette step has no links; delete its 1 link first"),
+        "{frame}"
+    );
+    assert_eq!(
+        body_of(&store, ANALYSIS).await.graph.revision,
+        stored.graph.revision,
+        "nothing written"
+    );
+}
+
+/// The section bench opened on [`ANALYSIS`] as [`analysis_bench`] does, its agents and templates
+/// read but its settings read held back.
+async fn analysis_bench_unread(store: &MemStore) -> (SectionBench, KindsSection, Backend) {
+    let backend = Backend::memory(store.clone());
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let scope = bench.ctx().scope.clone();
+    let catalogue = serve(&backend, &StoreRequest::Catalogue(scope)).await;
+    bench.reply(&mut section, &catalogue);
+    let _ = bench_round(&bench, &mut section, &backend).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "enter");
+    let asked: Vec<StoreRequest> = bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|request| matches!(request, StoreRequest::GraphEditorSettings)),
+        "{asked:?}"
+    );
+    for request in asked
+        .iter()
+        .filter(|request| !matches!(request, StoreRequest::GraphEditorSettings))
+    {
+        let reply = serve(&backend, request).await;
+        bench.reply(&mut section, &reply);
+    }
+    assert_eq!(section.key_stack(), Some(views::GRAPH_EDITOR));
+    (bench, section, backend)
+}
+
+/// The header's second row of a section frame.
+fn limits_shown(frame: &str) -> &str {
+    frame.lines().nth(1).unwrap_or_default().trim_end()
+}
+
+/// M2 D13 (M-1), W6: the header's second row is the run limits resolve freezes, read-only:
+/// `limits not read yet` until the settings read answers, then the stored values over the code
+/// defaults, clipped to its one row a whole segment at a time.
+#[tokio::test]
+async fn the_header_shows_the_limits() {
+    let defaults = "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} \
+                    parallel 4 \u{b7} child runs 8 \u{b7} run-time changes ask";
+    let store = MemStore::demo();
+    let (bench, mut section, backend) = analysis_bench_unread(&store).await;
+    let frame = bench.render_section(&section, 120);
+    assert_eq!(limits_shown(&frame), "limits not read yet", "{frame}");
+
+    let reply = serve(&backend, &StoreRequest::GraphEditorSettings).await;
+    bench.reply(&mut section, &reply);
+    let frame = bench.render_section(&section, 120);
+    assert_eq!(limits_shown(&frame), defaults, "{frame}");
+    assert_eq!(limits_shown(&frame).chars().count(), 99);
+
+    // Narrower than the line: whole segments go and ` · …` says so; the row never wraps.
+    let frame = bench.render_section(&section, 60);
+    assert_eq!(
+        limits_shown(&frame),
+        "limits \u{b7} fan-out 4 \u{b7} agents 8 \u{b7} plan revisions 3 \u{b7} \u{2026}",
+        "{frame}"
+    );
+    assert!(!frame.contains("run-time changes"), "{frame}");
+
+    let store = MemStore::demo();
+    store.set_app_setting("max_fan_out", json!(2));
+    let (bench, section, _) = analysis_bench(&store, None).await;
+    let frame = bench.render_section(&section, 120);
+    assert_eq!(
+        limits_shown(&frame),
+        defaults.replace("fan-out 4", "fan-out 2"),
+        "{frame}"
+    );
 }
