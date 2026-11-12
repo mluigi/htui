@@ -2,7 +2,8 @@
 //! layered by longest path; back edges leave and enter by the sides (`changes_requested` and a
 //! back `asks_you` on the right, `fails` on the left); palette nodes sit in a band below. The flow
 //! keeps no selection of its own and never sees a key; the mouse reaches it only through
-//! `Canvas::on_mouse`, and `FlowAction::Delete` is never routed to it.
+//! `Canvas::on_mouse`, and `FlowAction::Delete` is never routed to it. A step a run would refuse
+//! today is titled `! {name}` (MOD-141 M2 D12, `Canvas::set_warned`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,9 +46,6 @@ const Y_STEP: f64 = NODE_H + V_GAP;
 const LABEL_W: usize = 24;
 /// The sign between a relation and its loop limit.
 const TIMES: char = '\u{d7}';
-/// D8: a divide node's badge. The node form says "runs once MOD-139 lands"; that is 32 cells,
-/// and the node's interior is 22, so the canvas says it in 22.
-const DIVIDE: &str = "divide \u{b7} needs MOD-139";
 
 /// Layout of one body, rataflow-free (unit-tested alone).
 #[derive(Debug, Clone, PartialEq)]
@@ -322,7 +320,7 @@ const CONNECTION_RADIUS: f64 = NODE_W / 2.0 + 2.0;
 /// kit pane titled by the step's name.
 #[derive(Debug, Clone, PartialEq)]
 struct StepNode {
-    /// The top border's title: the step's name.
+    /// The top border's title: the step's name, after `! ` on a warned step (MOD-141 M2 D12).
     title: String,
     /// The template, the gate and the agents lines (`node_lines`).
     lines: [String; 3],
@@ -333,10 +331,16 @@ struct StepNode {
 }
 
 impl StepNode {
-    /// The node of `node`, its candidates named from `agents`.
-    fn new(node: &NodeBody, agents: &[AgentSummary], theme: &Theme) -> Self {
+    /// The node of `node`, its candidates named from `agents`; a `warned` one is titled
+    /// `! {name}` (MOD-141 M2 D12).
+    fn new(node: &NodeBody, agents: &[AgentSummary], theme: &Theme, warned: bool) -> Self {
+        let title = if warned {
+            format!("! {}", node.phase.name)
+        } else {
+            node.phase.name.clone()
+        };
         Self {
-            title: node.phase.name.clone(),
+            title,
             lines: node_lines(node, agents),
             palette: node.phase.palette,
             theme: *theme,
@@ -382,7 +386,8 @@ impl NodeContent for StepNode {
 }
 
 /// D7: a node's three lines: the template (and its pinned version), the gate (hard, retries),
-/// then the first of split, palette and the first candidate agent that applies.
+/// then the first of split, palette and the first candidate agent that applies. A divide's
+/// badge counts its default parts (MOD-141 M2 D12).
 fn node_lines(node: &NodeBody, agents: &[AgentSummary]) -> [String; 3] {
     let phase = &node.phase;
     let template = match phase.template_version {
@@ -397,7 +402,10 @@ fn node_lines(node: &NodeBody, agents: &[AgentSummary]) -> [String; 3] {
         gate.push_str(&format!(" \u{b7} retries {}", phase.retry_limit));
     }
     let who = match phase.split {
-        Split::Divide => DIVIDE.to_owned(),
+        Split::Divide => format!(
+            "divide \u{b7} {}",
+            label::plural(node.parts.len(), "part", "parts")
+        ),
         Split::Compete => format!("compete {TIMES}{}", phase.fan_out),
         Split::None if phase.palette => "palette".to_owned(),
         Split::None => candidate_line(node, agents),
@@ -461,20 +469,21 @@ fn handles(palette: bool) -> Vec<Handle> {
     ]
 }
 
-/// One step's node at `at`, `selected` baked in.
+/// One step's node at `at`, `selected` and `warned` baked in.
 fn flow_node(
     node: &NodeBody,
     at: (f64, f64),
     selected: bool,
     agents: &[AgentSummary],
     theme: &Theme,
+    warned: bool,
 ) -> Node<StepNode> {
     let palette = node.phase.palette;
     Node::new(
         node.phase.id.to_string(),
         at,
         (NODE_W, NODE_H),
-        StepNode::new(node, agents, theme),
+        StepNode::new(node, agents, theme, warned),
     )
     .with_selected(selected)
     .with_draggable(false)
@@ -742,6 +751,8 @@ pub(crate) struct Canvas {
     drawn: Option<(u16, u16)>,
     /// The terminal cell of a live pan's last pointer, `None` with no pan (MOD-74 D6).
     pan: Option<(u16, u16)>,
+    /// MOD-141 M2 D12: the steps drawn with `!` before their name ([`Canvas::set_warned`]).
+    warned: HashSet<PhaseId>,
 }
 
 impl Default for Canvas {
@@ -769,7 +780,15 @@ impl Canvas {
             reveal: Reveal::None,
             drawn: None,
             pan: None,
+            warned: HashSet::new(),
         }
+    }
+
+    /// MOD-141 M2 D11, D12: the steps a run would refuse today, drawn with `!` before their name
+    /// from the next [`Canvas::sync`] on.
+    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    pub(crate) fn set_warned(&mut self, warned: HashSet<PhaseId>) {
+        self.warned = warned;
     }
 
     /// Rebuilds the flow from `body` with `selected` selected (baked into the node builder:
@@ -797,7 +816,14 @@ impl Canvas {
             .iter()
             .filter_map(|(id, at)| {
                 let node = body.nodes.iter().find(|node| node.phase.id == *id)?;
-                Some(flow_node(node, *at, selected == Some(*id), agents, theme))
+                Some(flow_node(
+                    node,
+                    *at,
+                    selected == Some(*id),
+                    agents,
+                    theme,
+                    self.warned.contains(id),
+                ))
             })
             .collect();
         let known: HashSet<PhaseId> = body.nodes.iter().map(|node| node.phase.id).collect();
@@ -1511,7 +1537,7 @@ mod tests {
     // --- the flow ---
 
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use htui_core::model::{AgentSummary, PhaseAgent, Split};
+    use htui_core::model::{AgentSummary, PhaseAgent, PhasePart, Split};
     use ratatui::buffer::Buffer;
 
     /// A canvas synced to `body`, `selected` selected, no agents.
@@ -2060,12 +2086,85 @@ mod tests {
         node.phase.split = Split::Compete;
         node.phase.fan_out = 3;
         assert_eq!(node_lines(&node, &[])[2], "compete \u{d7}3");
-        node.phase.split = Split::Divide;
-        assert_eq!(node_lines(&node, &[])[2], "divide \u{b7} needs MOD-139");
-        assert!(
-            cells::cell_width(DIVIDE) <= 22,
-            "the badge fits the interior"
+    }
+
+    /// Default part `key` of step `phase` at `position`, titled `key`, nothing else set.
+    fn part(phase: PhaseId, position: i32, key: &str) -> PhasePart {
+        PhasePart {
+            phase_id: phase,
+            position,
+            key: key.to_owned(),
+            title: key.to_owned(),
+            brief: String::new(),
+            owned_paths: Vec::new(),
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        }
+    }
+
+    /// MOD-141 M2 D12: a divide node's badge counts its default parts and fits the interior;
+    /// compete and palette read as in M1.
+    #[test]
+    fn the_divide_badge_counts_its_parts() {
+        let mut divide = node(StepGraphId::new(), 0, "verdict");
+        divide.phase.split = Split::Divide;
+        let id = divide.phase.id;
+        let mut badges = vec![node_lines(&divide, &[])[2].clone()];
+        for (position, key) in [(0, "ui"), (1, "store")] {
+            divide.parts.push(part(id, position, key));
+            badges.push(node_lines(&divide, &[])[2].clone());
+        }
+        assert_eq!(
+            badges,
+            [
+                "divide \u{b7} 0 parts",
+                "divide \u{b7} 1 part",
+                "divide \u{b7} 2 parts"
+            ]
         );
+        assert!(
+            badges.iter().all(|badge| cells::cell_width(badge) <= 22),
+            "every badge fits the interior: {badges:?}"
+        );
+
+        let mut compete = node(StepGraphId::new(), 0, "review");
+        compete.phase.split = Split::Compete;
+        compete.phase.fan_out = 3;
+        assert_eq!(node_lines(&compete, &[])[2], "compete \u{d7}3");
+
+        let mut palette = node(StepGraphId::new(), 0, "triage");
+        palette.phase.palette = true;
+        assert_eq!(node_lines(&palette, &[])[2], "palette");
+    }
+
+    /// MOD-141 M2 D11, D12: a warned step is titled `! {name}` from the next sync on, and only
+    /// it; an empty set clears the mark at the sync after.
+    #[tokio::test]
+    async fn a_warned_step_is_marked_from_the_next_sync() {
+        let theme = Theme::default();
+        let body = demo(ids::GRAPH_VULKAN_ANA).await;
+        let research = id_of(&body, "research");
+        let mut canvas = synced(&body, None);
+        canvas.set_warned(HashSet::from([research]));
+        let before = rows(&draw(&mut canvas)).join("\n");
+        assert!(
+            !before.contains('!'),
+            "no mark before the next sync:\n{before}"
+        );
+
+        canvas.sync(&body, None, &[], &theme);
+        let marked = rows(&draw(&mut canvas)).join("\n");
+        assert!(marked.contains("\u{2500} ! research "), "{marked}");
+        assert!(marked.contains("\u{2500} verdict "), "{marked}");
+        assert_eq!(marked.matches('!').count(), 1, "only research:\n{marked}");
+
+        canvas.set_warned(HashSet::new());
+        canvas.sync(&body, None, &[], &theme);
+        let cleared = rows(&draw(&mut canvas)).join("\n");
+        assert!(!cleared.contains('!'), "{cleared}");
+        assert!(cleared.contains("\u{2500} research "), "{cleared}");
     }
 
     #[tokio::test]
@@ -2152,12 +2251,23 @@ mod tests {
         for node in &mut body.nodes {
             if node.phase.id == verdict {
                 node.phase.split = Split::Divide;
+                node.parts = vec![part(verdict, 0, "ui"), part(verdict, 1, "store")];
             }
         }
         insta::assert_snapshot!(
             "divide_badge",
             drawn(&body, None, &demo_agents().await, (100, 28))
         );
+    }
+
+    /// MOD-141 M2 D12: the analysis graph with research warned.
+    #[tokio::test]
+    async fn snapshot_warned() {
+        let body = demo(ids::GRAPH_VULKAN_ANA).await;
+        let mut canvas = Canvas::new();
+        canvas.set_warned(HashSet::from([id_of(&body, "research")]));
+        canvas.sync(&body, None, &demo_agents().await, &Theme::default());
+        insta::assert_snapshot!("warned", rows(&draw_at(&mut canvas, 100, 28)).join("\n"));
     }
 
     #[test]
