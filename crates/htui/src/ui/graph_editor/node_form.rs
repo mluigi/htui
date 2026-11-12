@@ -1140,8 +1140,8 @@ impl NodeForm {
     }
 }
 
-/// One drawn row of the node form: label, value, help and whether it is read-only (dim).
-#[derive(Debug)]
+/// One drawn row of the node form: label, value, help and whether it is read-only (dim). No
+/// `Debug`: a text row holds what was typed (H-7).
 struct View<'f> {
     /// The label column's words.
     label: Cow<'static, str>,
@@ -1153,8 +1153,7 @@ struct View<'f> {
     dim: bool,
 }
 
-/// A [`View`]'s value, owned where the form computes it.
-#[derive(Debug)]
+/// A [`View`]'s value, owned where the form computes it. No `Debug`, as [`View`].
 enum Shown<'f> {
     /// A text field of the form.
     Text(&'f TextField),
