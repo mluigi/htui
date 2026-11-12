@@ -24,6 +24,7 @@ use htui_core::model::{
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
+use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::kill_point::{KillPoint, Site};
 use htui_orch::tools::ToolHost;
@@ -3289,6 +3290,17 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         )) => {
             resolve(RunCommandStatus::Applied, None).await;
             refuse(&ctx, err.to_string());
+        }
+        // MOD-125 M2 R1 (review M-1, defence in depth): a `stopped` run's cancel row would stay
+        // pending until a resume retook the lease and fired it, so it is refused now, in the
+        // store's sentence (the store refuses a new one and holds a stop off a pending one).
+        Some(Err(EngineError::RunStatus {
+            status: RunStatus::Stopped,
+            ..
+        })) => {
+            let sentence = cancel_of_a_stopped_run(run);
+            resolve(RunCommandStatus::Refused, Some(sentence.clone())).await;
+            refuse(&ctx, sentence);
         }
         // D13, B-4: otherwise already terminal → refused with the actual status.
         Some(Err(err @ EngineError::RunStatus { status, .. })) if status.is_terminal() => {

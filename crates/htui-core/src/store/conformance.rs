@@ -56,6 +56,7 @@ use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::error::StoreError;
+use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
@@ -279,6 +280,8 @@ pub const CASES: &[&str] = &[
     "pending_stops_is_empty_after_resume",
     "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
     "create_run_naming_a_gone_workspace_reads_switch_workspace",
+    // MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise
+    "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -943,6 +946,10 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
                 store,
             ))
             .await;
+        }
+        "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop" => {
+            Box::pin(a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop(store))
+                .await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
@@ -8844,6 +8851,77 @@ async fn create_run_naming_a_gone_workspace_reads_switch_workspace<S: WriteStore
         store.runs(ids::HTUI_ANA_2).await.expect(CASE),
         before,
         "{CASE}: and the item has no new run"
+    );
+}
+
+/// MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise in the store, so no
+/// cancel row is ever left pending on a `stopped` run, where no executor's poll would apply it
+/// (`pending_commands` lists a run only for its lease owner, which a stop clears, or as a free or
+/// finished run of the box). `request_cancel` refuses a stopped run and writes nothing, and
+/// `stop_run` answers `false` while a cancel of the run is pending (D4: the cancel wins); once
+/// that cancel is resolved the stop goes through.
+async fn a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop";
+    let owner = Uuid::now_v7();
+    let stopped = claimed_in(CASE, store, ids::HTUI_ANA_2, None, owner).await;
+    assert!(
+        store.stop_run(stopped, owner).await.expect(CASE),
+        "{CASE}: the first run stops"
+    );
+    let cancels_before = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels;
+    assert_eq!(
+        store.request_cancel(stopped, ids::USER, ids::BOX).await,
+        Err(StoreError::Constraint(cancel_of_a_stopped_run(stopped))),
+        "{CASE}: a stopped run's cancel is refused in one readable sentence"
+    );
+    assert_eq!(
+        store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels,
+        cancels_before,
+        "{CASE}: and no pending cancel row was written"
+    );
+    assert_eq!(
+        run_row(CASE, store, stopped).await.status,
+        RunStatus::Stopped,
+        "{CASE}: the run is still stopped"
+    );
+
+    let running = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
+    let CancelRequest::Inserted(cancel) = cancel_of(CASE, store, running).await else {
+        panic!("{CASE}: a running run's cancel writes its row");
+    };
+    assert!(
+        !store.stop_run(running, owner).await.expect(CASE),
+        "{CASE}: a pending cancel holds the stop off"
+    );
+    assert_eq!(
+        run_row(CASE, store, running).await.status,
+        RunStatus::Running,
+        "{CASE}: the run is still running"
+    );
+    assert!(
+        store
+            .refresh_lease(running, owner, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: and still the owner's"
+    );
+    assert_eq!(
+        pending_ids(CASE, store, owner, ids::BOX).await,
+        vec![cancel],
+        "{CASE}: the cancel stays pending for the owner's poll"
+    );
+    assert!(
+        store
+            .resolve_command(cancel, RunCommandStatus::Refused, Some("test".to_owned()))
+            .await
+            .expect(CASE),
+        "{CASE}: the cancel is resolved"
+    );
+    assert!(
+        store.stop_run(running, owner).await.expect(CASE),
+        "{CASE}: with no cancel pending the stop goes through"
     );
 }
 

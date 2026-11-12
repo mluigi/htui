@@ -4591,6 +4591,42 @@ pub(crate) mod tests {
         );
     }
 
+    /// MOD-125 M2 R1 (review M-1, defence in depth): a pending cancel that reaches a `stopped` run
+    /// (one requested before a stop the store did not yet serialise against it) is resolved
+    /// `refused` in the store's sentence by the poll that lists it, rather than left pending for
+    /// the run's resume to fire; the run stays `stopped` and the next poll lists nothing.
+    #[tokio::test]
+    async fn a_polled_cancel_of_a_stopped_run_is_resolved_refused() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        assert!(
+            fixture
+                .store
+                .transition_run(run, RunStatus::Running, RunStatus::Stopped, Utc::now())
+                .await
+                .expect("the move answers"),
+            "the run stops under its pending cancel"
+        );
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status, row.resolution.clone()))
+                .collect::<Vec<_>>(),
+            [(
+                id,
+                RunCommandStatus::Refused,
+                Some(htui_core::store::traits::cancel_of_a_stopped_run(run))
+            )],
+            "the stranded cancel is refused in the store's words"
+        );
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
+    }
+
     /// D4: a run this process leases with no live walk (a sweep adoption before its child, a dead
     /// walk) goes straight to `settle_stop`: `stopped`, its lease given back.
     #[tokio::test]

@@ -68,6 +68,7 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
+use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
@@ -6721,10 +6722,20 @@ impl State {
 
     /// MOD-125 D7: a compare-and-set `running -> stopped` on the owner's lease. The run's
     /// `running` steps stop with it, and the lease is released as [`State::release_lease`]
-    /// releases it; `false` writes nothing.
+    /// releases it; `false` writes nothing, as it does while a cancel of the run is pending
+    /// (MOD-125 M2 R1).
     fn stop_run(&mut self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
         let status = self.require_run(run)?.status;
         if self.lease_owners.get(&run) != Some(&owner) || status != RunStatus::Running {
+            return Ok(false);
+        }
+        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4); stopping the run would strand
+        // it, since no executor's poll lists a stopped run's cancel.
+        if self.run_commands.values().any(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        }) {
             return Ok(false);
         }
         self.lease_owners.remove(&run);
@@ -9608,7 +9619,11 @@ impl State {
         box_id: BoxId,
         now: DateTime<Utc>,
     ) -> Result<CancelRequest> {
-        self.require_run(run)?;
+        // MOD-125 M2 R1 (review M-1): a stopped run takes no cancel row, which no executor's
+        // poll would apply; the state's one lock serialises this with `stop_run`.
+        if self.require_run(run)?.status == RunStatus::Stopped {
+            return Err(StoreError::Constraint(cancel_of_a_stopped_run(run)));
+        }
         self.require_actor(user, box_id, "run_command", "issued")?;
         // MOD-70 D5, B-14: both answers refuse the run's pending follow-ups, idempotently.
         if let Some(pending) = self

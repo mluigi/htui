@@ -7192,14 +7192,16 @@ impl WriteStore for PgStore {
     /// The first read is unlocked and only decides the early exit (unknown run, not running, not
     /// ours), which takes no lock. The steps are then locked `FOR NO KEY UPDATE`, which waits,
     /// since the run is ours; the run is re-checked under its own lock, and a run that is no
-    /// longer running or ours rolls back as `false`. The lease is released as
-    /// [`WriteStore::release_lease`] releases it.
+    /// longer running or ours rolls back as `false`, and so does one with a pending cancel
+    /// (MOD-125 M2 R1). The lease is released as [`WriteStore::release_lease`] releases it.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }`, read first.
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        // MOD-125 M2 R1 (review M-1): pinned at `READ COMMITTED`, so the pending-cancel read
+        // after the run's lock sees a `request_cancel` that committed while this waited on it.
+        let mut tx = super::relay::begin_read_committed(&self.pool).await?;
         let seen = sqlx::query!(
             r#"SELECT status AS "status: RunStatus", lease_owner AS "lease_owner?" FROM run WHERE id = $1"#,
             run.as_uuid(),
@@ -7231,6 +7233,22 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)?;
         if locked.status != RunStatus::Running || locked.lease_owner != Some(owner) {
+            return Ok(false);
+        }
+        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4). `request_cancel` share-locks
+        // the run, so its row is either committed before the lock above was granted (and read
+        // here) or refused once this commits; a stopped run would strand it, since no
+        // executor's poll lists a stopped run's cancel.
+        let cancel_pending = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM run_command
+                               WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending')
+                      AS "pending!""#,
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if cancel_pending {
             return Ok(false);
         }
 
