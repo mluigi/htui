@@ -4294,8 +4294,19 @@ pub(crate) mod tests {
     /// graceful one in flight is the token drop, now: the run settles `stopped` long before the
     /// 60 s grace and its 5 s slack. No `Done(Cancelled)` row is asserted: the drop path's cleanup
     /// is `abandoned`.
+    /// The stop's info line names the mode applied: `forced` once escalated (plan D3: the line is
+    /// the only record of a stop's mode).
     #[tokio::test]
     async fn a_forced_poll_escalates_a_graceful_stop() {
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
         let fixture = Fixture::new().await;
         let (mut worker, start, run, deaf, _probe) = deaf_walk_stopped_gracefully(&fixture).await;
 
@@ -4310,6 +4321,42 @@ pub(crate) mod tests {
             "the escalation sent no second cancel: it dropped the walk"
         );
         assert_eq!(step_at(&fixture, run, 0).await.status, StepStatus::Stopped);
+        let text = logs.text();
+        assert!(
+            text.contains(&format!("run {run} stopped (forced)"))
+                && !text.contains(&format!("run {run} stopped (graceful)")),
+            "the escalated stop is logged forced: {text}"
+        );
+    }
+
+    /// A `tracing` writer into a shared buffer, for a case that asserts a line was logged.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned()
+        }
     }
 
     /// D4.1: a stop in flight is not applied again: later polls list the same stop, spawn no
@@ -4335,6 +4382,38 @@ pub(crate) mod tests {
         stop_platform(&fixture, StopMode::Forced).await;
         rests_within(&fixture, run, RunStatus::Stopped, ESCALATED).await;
         assert_eq!(deaf.graces().len(), 1, "{:?}", deaf.graces());
+    }
+
+    /// D7, Q1: `p` on a run whose workspace's stop is still waiting out the session's grace is
+    /// refused before it preempts anything: the session gets no second cancel, the walk is not
+    /// cut short at the cancel path's slack, and the run is `running` until the stop settles it.
+    #[tokio::test]
+    async fn a_promote_during_a_stop_is_refused_before_it_preempts() {
+        let fixture = Fixture::new().await;
+        let (mut worker, _start, run, deaf, _probe) = deaf_walk_stopped_gracefully(&fixture).await;
+        let step = step_at(&fixture, run, 0).await;
+
+        let asked = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+                run,
+                step: step.id,
+                chat_open: false,
+            })),
+        );
+        let reply = worker
+            .envelope_within(asked, Duration::from_secs(5))
+            .await
+            .reply;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "promote_step", message } if *message == workspace_is_stopped("platform")),
+            "{reply:?}"
+        );
+        assert_eq!(deaf.graces(), [Duration::from_secs(60)], "no second cancel");
+        assert_eq!(fixture.run(run).await.status, RunStatus::Running);
+
+        stop_platform(&fixture, StopMode::Forced).await;
+        rests_within(&fixture, run, RunStatus::Stopped, ESCALATED).await;
     }
 
     /// D4: a cancel of the run requested while its stop is still inside the session's grace wins
@@ -4396,8 +4475,10 @@ pub(crate) mod tests {
 
     /// D4 (blueprint F9): a pending cancel of a run in a stopped workspace wins: the poll leaves
     /// the stop to it, the run is `cancelled` and the row `applied`, whichever task runs first.
-    /// The cancel's B-5 guard is held over a first poll, so only the poll's own skip keeps the
-    /// stop from settling the run before the cancel applies.
+    /// Over a first poll the cancel's B-5 guard and the run's lock are held: a stop task would
+    /// wait on that lock and the poll would never settle, so only the poll's own skip lets it
+    /// settle with the run still `running`. (`stop_walk`'s re-read of the pending cancels under
+    /// the lock is the second guard, pinned by `a_cancel_requested_during_a_stop_wins`.)
     #[tokio::test]
     async fn a_pending_cancel_beats_a_stop() {
         let fixture = Fixture::new().await;
@@ -4411,6 +4492,7 @@ pub(crate) mod tests {
             let _held = probe
                 .hold_applying(id)
                 .expect("nothing applies the row yet");
+            let _locked = probe.try_lock(run).expect("nobody holds the run's lock");
             polled(&mut runtime, &fixture).await;
         }
         assert_eq!(

@@ -678,6 +678,16 @@ impl<P: ReplySink> Shared<P> {
             Some(_) => StopTurn::InFlight,
         }
     }
+
+    /// MOD-125 M2 D3: the strongest mode asked of `run`'s stop in flight, an escalation's
+    /// included; `None` with no stop task of the run.
+    fn stop_mode(&self, run: RunId) -> Option<StopMode> {
+        self.stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&run)
+            .copied()
+    }
 }
 
 /// MOD-125 M2 D4: removes `run` from [`Shared::stopping`] however its stop task ends.
@@ -2974,6 +2984,18 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
     }
     if preempt == Preempt::IfLive && ctx.shared.walks.is_live(run) {
+        // MOD-125 M2 D7 (+ Q1): `p` in a stopped workspace is refused before it preempts, on the
+        // row read before the lock, so a stop in flight keeps its own grace and `STOP_SLACK`. A
+        // cancel preempts all the same; the check under the lock below still covers a stop that
+        // lands meanwhile.
+        if matches!(command, Command::PromoteStep { .. })
+            && let Some(writer) = ctx.host.writer()
+            && let Some(refusal) =
+                stopped_workspace_refusal(&ctx.host, &writer, early.as_ref()).await
+        {
+            ctx.refuse(refusal);
+            return None;
+        }
         ctx.shared
             .walks
             .preempt_gracefully(run, ctx.shared.cancel_grace, CANCEL_SLACK)
@@ -3411,7 +3433,12 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     match Box::pin(engine.settle_stop(run)).await {
-        Ok(true) => tracing::info!(%run, %mode, "run {run} stopped ({mode})"),
+        Ok(true) => {
+            // D3: the line is the stop's only record of its mode, so it names the mode applied:
+            // `forced` once an escalation reached the walk, though this task was spawned graceful.
+            let mode = ctx.shared.stop_mode(run).unwrap_or(mode);
+            tracing::info!(%run, %mode, "run {run} stopped ({mode})");
+        }
         Ok(false) => {
             tracing::debug!(%run, "the stop found the run no longer running under this process");
         }
