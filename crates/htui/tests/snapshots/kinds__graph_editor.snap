@@ -3,6 +3,7 @@ source: crates/htui/tests/kinds.rs
 expression: frame
 ---
 analysis · project graph · revision 0
+limits · fan-out 4 · agents 8 · plan revisions 3 · parallel 4 · child runs 8 · run-time changes ask
 
                                       ╭─ research ───────────╮
                                       │template research     │

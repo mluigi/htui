@@ -129,8 +129,7 @@ pub(crate) enum NodeRow {
 pub(crate) struct FormKeys<'a> {
     /// `graph_editor.candidate_add`'s label: the placeholder rows.
     pub(crate) add: Option<&'a str>,
-    /// `graph_editor.open_part`'s label: a part row's help. `None` until T8 binds it.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
+    /// `graph_editor.open_part`'s label: a part row's help, `None` while nothing is bound to it.
     pub(crate) open: Option<&'a str>,
 }
 
@@ -145,7 +144,6 @@ pub(crate) enum ListFocus {
 
 /// What [`NodeForm::open_part`] opens (M2 D14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
 pub(crate) enum PartOpen {
     /// A blank part, appended on keep.
     New,
@@ -697,7 +695,6 @@ impl NodeForm {
 
     /// Which list the four list acts work on (M2 D14): the parts on a part row or their
     /// placeholder, else the candidates.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn list_focus(&self) -> ListFocus {
         match self.current() {
             Row::Part(_) | Row::NoParts => ListFocus::Parts,
@@ -709,7 +706,6 @@ impl NodeForm {
     ///
     /// # Errors
     /// [`NO_PART`] on the parts placeholder; [`NO_CANDIDATE`] off both lists.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn list_remove(&mut self) -> Result<(), String> {
         match self.list_focus() {
             ListFocus::Parts => self.part_remove(),
@@ -721,7 +717,6 @@ impl NodeForm {
     ///
     /// # Errors
     /// [`NO_PART`] on the parts placeholder; [`NO_CANDIDATE`] off both lists.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn list_move(&mut self, up: bool) -> Result<(), String> {
         match self.list_focus() {
             ListFocus::Parts => self.part_move(up),
@@ -786,7 +781,6 @@ impl NodeForm {
     /// # Errors
     /// [`PARTS_ON_DIVIDE_ONLY`] for a new part off divide; [`NO_PART`] for the focused part off a
     /// part row.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn open_part(&self, open: PartOpen) -> Result<PartForm, String> {
         let candidates = self.candidates.clone();
         match open {
@@ -811,7 +805,6 @@ impl NodeForm {
     /// # Errors
     /// What [`PartForm::build`] refuses (the key, against every other part's); [`NO_PART`] for an
     /// edit of a part the step no longer has.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn put_part(&mut self, form: &PartForm) -> Result<(), String> {
         let edited = match form.target() {
             PartTarget::New => None,

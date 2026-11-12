@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/ui/graph_editor/mod.rs
+expression: bench.render(&editor)
+---
+flow · library graph · revision 0
+limits not read yet
+                                                  step research
+             ╭─ ! research ─────────╮             ▌name              research
+             │template research     │              template          ‹ research ›
+             │gate always · retries…│              version           ‹ latest ›
+             │divide · 0 parts      │              persona           ‹ none ›
+             ╰───────────●──────────╯              gate              ‹ always ›
+                         │                         hard gate         ○ off
+                         │                         retry limit       1
+                         ▼                         isolation         ‹ project default ›
+             ╭─ plan ───────────────╮              commands          ‹ queued when fanned out ›
+             │template plan         │              verify
+             │gate always · retries…│              token budget
+             │any agent             │              inputs
+             ╰───────────●──────────╯              output            research
+                         │                         agents            none (Alt+n adds one)
+                         │                         deadline
+                         ▼                         palette           ○ off
+             ╭─ review ─────────────╮              split             ‹ divide ›
+             │template review       │              planner           ‹ none ›
+             │gate always · retries…│              planner agent     ‹ none ›
+             │any agent             │              integrate         ‹ none ›
+             ╰───────────●──────────╯              integrate agent   ‹ none ›
+                                                   max parts
+                                                   plan scope        ‹ none ›
+                                                   parts             none (Alt+n adds one)
+                                                  ! phase `research` cannot run yet: a divided node
+                                                    with no default parts needs its planner, which
+                                                    runs from MOD-140 on

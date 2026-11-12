@@ -3,6 +3,7 @@ source: crates/htui/src/ui/graph_editor/mod.rs
 expression: bench.render(&editor)
 ---
 flow · library graph · revision 2
+limits not read yet
                                                   links of plan
              ╭─ research ───────────╮             ▌→ review · next
              │template research     │              ← research · next

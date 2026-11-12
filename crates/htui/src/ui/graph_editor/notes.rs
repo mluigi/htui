@@ -18,7 +18,6 @@ use htui_orch::status::{PlanCap, RunFailure};
 ///
 /// Resolve stops at its first refusal; this lists every check that fails (C11), each in the
 /// sentence resolve would give were it the first.
-#[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
 pub(crate) fn notes(node: &NodeBody, max_fan_out: Option<u32>) -> Vec<String> {
     let phase = &node.phase;
     let name = &phase.name;

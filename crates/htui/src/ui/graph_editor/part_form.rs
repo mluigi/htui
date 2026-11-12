@@ -55,7 +55,6 @@ pub(crate) enum PartRow {
 }
 
 /// The open part form (D9).
-#[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
 pub(crate) struct PartForm {
     /// The part it writes back to.
     target: PartTarget,
@@ -90,7 +89,6 @@ impl core::fmt::Debug for PartForm {
     }
 }
 
-#[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
 impl PartForm {
     /// The form prefilled from `part` (blank for `None`), writing back to `target`. `candidates`
     /// are the step form's own, as they are now: the agents the part's agent row offers.

@@ -786,7 +786,6 @@ impl Canvas {
 
     /// MOD-141 M2 D11, D12: the steps a run would refuse today, drawn with `!` before their name
     /// from the next [`Canvas::sync`] on.
-    #[allow(dead_code, reason = "MOD-141 M2 T8 wires it")]
     pub(crate) fn set_warned(&mut self, warned: HashSet<PhaseId>) {
         self.warned = warned;
     }

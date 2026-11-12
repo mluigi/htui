@@ -183,10 +183,11 @@ down             = ["down", "j"]      # select down
 up               = ["up", "k"]        # select up
 right            = ["right", "l"]     # select right
 close            = []                 # close; Esc always
-candidate_add    = ["alt-n"]          # add agent
-candidate_remove = ["alt-d"]          # remove agent
-candidate_up     = ["alt-up"]         # agent up
-candidate_down   = ["alt-down"]       # agent down
+candidate_add    = ["alt-n"]          # add agent or part
+candidate_remove = ["alt-d"]          # remove agent or part
+candidate_up     = ["alt-up"]         # agent or part up
+candidate_down   = ["alt-down"]       # agent or part down
+open_part        = ["alt-e"]          # edit part
 next_field       = ["tab", "down"]    # next field
 prev_field       = ["backtab", "up"]  # previous field
 
