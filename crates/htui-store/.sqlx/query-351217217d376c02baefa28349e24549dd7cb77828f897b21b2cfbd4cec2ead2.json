@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO command_log (command_run_id, text, truncated, total_bytes, written_at) SELECT id, $2, $3, $4, $5 FROM command_run WHERE id = $1 ON CONFLICT (command_run_id) DO UPDATE SET text = EXCLUDED.text, truncated = EXCLUDED.truncated, total_bytes = EXCLUDED.total_bytes, written_at = EXCLUDED.written_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "351217217d376c02baefa28349e24549dd7cb77828f897b21b2cfbd4cec2ead2"
+}

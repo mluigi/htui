@@ -51,14 +51,15 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::ItemState;
+use crate::model::StoredCommandLog;
 use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
-    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
-    CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
+    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandLog,
+    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
     FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
     MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
@@ -2584,6 +2585,30 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }`.
     async fn cancel_command(&self, id: CommandRunId) -> Result<bool>;
 
+    /// MOD-152 D1, D5: the log of one `command_run` row, upserted by `command_run_id` (the second
+    /// write replaces the first). Unfenced like the queue's own writes: the row is the fence. The
+    /// text arrives scrubbed and capped by the caller (D2, D3); the store only refuses more than
+    /// [`COMMAND_LOG_STORE_MAX`](crate::model::COMMAND_LOG_STORE_MAX) bytes.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }` for
+    /// an unknown row; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a text
+    /// over the maximum (before any write).
+    async fn put_command_log(&self, log: CommandLog) -> Result<()>;
+
+    /// MOD-152 D5: a `command_run` row of `run` (a row of any of the run's steps) with its log, if
+    /// one was written. `id: None` is the run's latest row by `(queued_at, id)`. `Ok(None)`: `id`
+    /// names no row of that run (an unknown row, or another run's), or `id` is `None` and the run
+    /// has no command row. A read on `WriteStore` by the `command_runs` precedent.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>>;
+
     /// MOD-69 plan D4: every `pending` permission request of a scope project's **item** runs whose
     /// owner holds the run's lease live by the store's clock — [`relay_view`](Self::relay_view)'s
     /// predicate over a scope instead of one item — each with the item's key and project, the
@@ -4000,6 +4025,16 @@ pub fn command_not_queued() -> String {
 #[must_use]
 pub fn command_not_claimable(status: CommandRunStatus) -> String {
     format!("command is {status}, not queued")
+}
+
+/// MOD-152 D2: [`WriteStore::put_command_log`] refuses a text over
+/// [`COMMAND_LOG_STORE_MAX`](crate::model::COMMAND_LOG_STORE_MAX) bytes.
+#[must_use]
+pub fn command_log_too_large(len: usize) -> String {
+    format!(
+        "a command log holds at most {} bytes, not {len}",
+        crate::model::COMMAND_LOG_STORE_MAX
+    )
 }
 
 /// D14: [`WriteStore::finish_command`] ends a row; `queued` and `running` are not ends.

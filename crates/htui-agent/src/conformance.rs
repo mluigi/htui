@@ -1484,6 +1484,16 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> StoreResult<bool> {
         self.inner.cancel_command(id).await
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> StoreResult<()> {
+        self.inner.put_command_log(log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> StoreResult<Option<htui_core::model::StoredCommandLog>> {
+        self.inner.command_log_of_run(run, id).await
+    }
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
     async fn set_requirement_spec(
         &self,
