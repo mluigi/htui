@@ -1136,6 +1136,29 @@ T5 `b8b05d0a`). Where a lane went past this blueprint after its verifiers, the c
   whose split is not compete is cleared when the step is saved through the form (§5.4).
 - **W3 Wave allows** to remove in T8: `git grep -n 'MOD-141 M2 T8 wires it'`.
 
+## T8 outcomes (main thread, 2026-11-12, binding on T9 and review)
+
+T8's repair 1 (`d919caa7`) went past §8.2 after its verifiers; the code wins. W4 and W5 are T8's
+additions to `node_form.rs`, a T5 file that §8.2 otherwise opens only for its allow attributes.
+
+- **W4 The switch's first read.** `NodeForm::switch_read(compete)` is new. On `true` the form offers
+  compete and a locked compete step unlocks: its split, fan-out and judge hold the step's own values,
+  and the rows unlocking adds come after every focusable row a locked form has, so the focus keeps its
+  row. On `false` it changes nothing. `GraphEditor::on_reply` calls it on the **first**
+  `GraphEditorSettings` reply only (`self.settings.is_none()`), on the open step form or the step form
+  under a part form: Kinds' `e` opens the step form before the editor's reads leave. So §8.2's "An open
+  form keeps the switch it opened with" and Open risk 4 hold only for reads after the first. Pin:
+  `a_form_opened_before_the_first_settings_read_takes_its_switch` (mod.rs).
+- **W5 The step form's layout.** `NodeForm::layout(..) -> kit::form::FormLines` is new: the rows and
+  the focused row's lines among them. `NodeForm::lines` (W2's `FormKeys` signature) is `#[cfg(test)]`
+  now, `layout`'s lines alone. `panel_lines` takes the panel's height, and `fitted` keeps the D11 notes
+  under the rows (at most half the panel, `…` ending them when cut) and scrolls the rows to the focused
+  one. Pins: `a_tall_step_form_scrolls_to_its_focus_and_keeps_its_notes`,
+  `notes_past_half_the_panel_end_in_an_ellipsis`.
+- **W6 The limits row.** The header keeps §8.2's `Length(2)`. `limits_row` puts `limits_line` in its
+  one row: past the width it drops whole `label value` segments and ends ` · …`, and a row too narrow
+  for the first segment is `…` (Open risk 5). Pin: `the_header_shows_the_limits_once_read`.
+
 ---
 
 ## T7 - Editor settings read (D6) (wave 2, serial)
@@ -1308,7 +1331,7 @@ PY
   - `on_reply` (`:585-627`) adds:
     - `StoreReply::GraphEditorSettings(settings) => { self.settings = Some(**settings); self.resync.set(true); }`
     - `StoreReply::Failed { request, message } if *request == "graph_editor_settings" => self.notice = Some(Notice::Info(unavailable("run limits", message)))`
-- **Compete**: both `NodeForm::new(..)` call sites pass `self.settings.is_some_and(|settings| settings.compete)`. An open form keeps the switch it opened with.
+- **Compete**: both `NodeForm::new(..)` call sites pass `self.settings.is_some_and(|settings| settings.compete)`. An open form keeps the switch it opened with (except on the first read: W4).
 - **Header** (D13): `render` (`:631-661`) uses `Constraint::Length(2)` for the header. The paragraph becomes `vec![Line::styled(self.header(keys), theme.title), Line::styled(limits_line(self.settings.as_ref()), theme.dim)]`.
   ```rust
   /// The header's second line before the settings read answered (D6).
@@ -1542,7 +1565,7 @@ bash scripts/gate.sh                                     # sandbox Qdrant timeou
    - a save is never refused.
    Graph-wide refusals (`FanOutEdge`, `LocalConcurrent`, `ReviewFanOut`, `AgentCap`) and those that need the project rungs (a project-default `local`, candidate rungs 2-3) stay resolve's. The editor cannot see them.
 3. **A part key holding `/`.** `divide::part_key` splits a node key at its last `/` (`divide.rs:51-55`), so a key such as `a/b` would be mis-read at run time. Neither the store nor the plan refuses it. Flag it in review; it is outside M2's settled scope.
-4. **An open form keeps the switch it opened with.** If the settings read answers after the form opened, a compete node stays read-only until the form is reopened.
+4. **An open form keeps the switch it opened with.** If the settings read answers after the form opened, a compete node stays read-only until the form is reopened. T8 narrowed it (W4): the first read reaches an open form, so this holds for later reads only.
 5. **The header line width.** At 99 characters the line is clipped in a narrow editor. The editor clips; it does not wrap.
 6. **Snapshot churn** across the Prompt, editor and Kinds frames in T3, T5 and T8. Full insta runs, reviewed (memory).
 7. **The settings key renumbering.** Only `SPECS[self as usize]` reads the discriminant. If anything else shows up in T3's run, stop and report.
