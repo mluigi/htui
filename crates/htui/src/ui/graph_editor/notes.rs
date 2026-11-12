@@ -2,7 +2,7 @@
 //! `htui_orch::graph::resolve`'s own sentences and order. A warning beside the form and a `!` on
 //! the canvas, never a refused save. Pure: no keys, no store.
 
-use htui_core::model::{Isolation, NodeBody, PhasePart, PlanScope, Split};
+use htui_core::model::{Isolation, NodeBody, PLAN_SUFFIX, PhasePart, PlanScope, Split};
 use htui_orch::divide::owned_path_refusal;
 use htui_orch::graph::{NotRunnable, ResolveError};
 use htui_orch::status::{PlanCap, RunFailure};
@@ -10,9 +10,10 @@ use htui_orch::status::{PlanCap, RunFailure};
 /// MOD-141 M2 D11 (M-4): every sentence `htui_orch::graph::resolve` would refuse a run of `node`
 /// with today, each the `ResolveError` resolve raises, in resolve's order; empty when none.
 /// `max_fan_out` is `RunBounds::max_fan_out` once the editor's settings read answered; `None`
-/// skips the two checks that need it. Known limits: `max_agents_per_run` needs the whole graph,
-/// the project's default isolation and candidate rungs are not visible here, and the graph-wide
-/// checks (`FanOutEdge`, `LocalConcurrent`, `ReviewFanOut`) stay resolve's.
+/// skips the two checks that need it. Known limits: `max_agents_per_run` needs the whole graph;
+/// the project's default isolation (a `LocalFanOut` through it) and candidate rungs are not
+/// visible here; and the graph-wide checks (`FanOutEdge`, `LocalConcurrent`, and the
+/// `ReviewFanOut` of a step that reads its verdict) stay resolve's.
 ///
 /// Resolve stops at its first refusal; this lists every check that fails (C11), each in the
 /// sentence resolve would give were it the first.
@@ -21,26 +22,47 @@ pub(crate) fn notes(node: &NodeBody, max_fan_out: Option<u32>) -> Vec<String> {
     let phase = &node.phase;
     let name = &phase.name;
     let divide = phase.split == Split::Divide;
-    // `not_yet_runnable` names a planner node by `divided_name`: the divided node's own name.
-    let not_yet = |reason| {
-        ResolveError::NotYetRunnable {
-            node: name.clone(),
-            reason,
-        }
-        .to_string()
-    };
+    let not_yet = |node: String, reason| ResolveError::NotYetRunnable { node, reason }.to_string();
     let mut notes = Vec::new();
+    // `snapshot_phase`'s two, raised as each phase is built, before every check below: a
+    // fan-out under the step's own `local`, then plan D64's name rule.
+    if phase.isolation == Some(Isolation::Local) && phase.fan_out > 1 {
+        notes.push(
+            ResolveError::LocalFanOut {
+                phase: name.clone(),
+                fan_out: phase.fan_out,
+            }
+            .to_string(),
+        );
+    }
+    if name == "review" && phase.fan_out > 1 {
+        notes.push(
+            ResolveError::ReviewFanOut {
+                phase: name.clone(),
+                fan_out: phase.fan_out,
+            }
+            .to_string(),
+        );
+    }
+    // `not_yet_runnable` names a planner node by `divided_name`: the divided node's own name.
     if divide && phase.planner_agent_id.is_some() {
-        notes.push(not_yet(NotRunnable::PlannerAgent));
+        notes.push(not_yet(name.clone(), NotRunnable::PlannerAgent));
     }
     if divide && node.parts.is_empty() {
-        notes.push(not_yet(NotRunnable::NoParts));
+        notes.push(not_yet(name.clone(), NotRunnable::NoParts));
     }
     if divide && !matches!(phase.plan_scope, None | Some(PlanScope::Parts)) {
-        notes.push(not_yet(NotRunnable::PlanScope));
+        notes.push(not_yet(name.clone(), NotRunnable::PlanScope));
     }
+    // Its palette arm names the first palette phase of the expanded graph instead, so a divide
+    // step's palette is its planner's, `N:plan`.
     if phase.palette {
-        notes.push(not_yet(NotRunnable::Palette));
+        let palette = if divide {
+            format!("{name}{PLAN_SUFFIX}")
+        } else {
+            name.clone()
+        };
+        notes.push(not_yet(palette, NotRunnable::Palette));
     }
     // `check_fan_out_caps`' first cap; its second, `max_agents_per_run`, needs the whole graph.
     if let Some(max) = max_fan_out
@@ -141,13 +163,18 @@ fn part_refusals(node: &NodeBody, max_fan_out: Option<u32>) -> Vec<RunFailure> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::Utc;
+    use htui_core::fixtures::ids;
     use htui_core::model::{
-        AgentId, Isolation, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, PlanScope, Split,
-        StepGraphId,
+        AgentId, GraphBody, Isolation, NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart,
+        PlanScope, RunMode, Split, StepGraphId,
     };
     use htui_core::seed::{PhaseSeed, phase_row};
-    use htui_orch::graph::{NotRunnable, ResolveError};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+    use htui_orch::fake::FakeGraphSource;
+    use htui_orch::graph::{NotRunnable, ResolveError, resolve};
     use htui_orch::status::{PlanCap, RunFailure};
 
     use super::notes;
@@ -318,6 +345,87 @@ mod tests {
             notes_of(&node),
             vec![not_yet("security", NotRunnable::Palette)]
         );
+
+        // Resolve's palette arm names the first expanded palette phase: a divide step's
+        // planner, `N:plan`, where its planner arms name the divided node.
+        let mut divided = divide("implement", &["api"]);
+        divided.phase.palette = true;
+        assert_eq!(
+            notes_of(&divided),
+            vec![not_yet("implement:plan", NotRunnable::Palette)]
+        );
+    }
+
+    /// `snapshot_phase` refuses a fanned-out step under its own `local` as each phase is built,
+    /// before every other check.
+    #[test]
+    fn a_local_fan_out_is_noted_first() {
+        let mut node = step("draft");
+        node.phase.split = Split::Compete;
+        node.phase.fan_out = 3;
+        node.phase.isolation = Some(Isolation::Local);
+        assert_eq!(
+            notes(&node, Some(2)),
+            vec![
+                ResolveError::LocalFanOut {
+                    phase: "draft".to_owned(),
+                    fan_out: 3,
+                }
+                .to_string(),
+                ResolveError::FanOutCap {
+                    phase: "draft".to_owned(),
+                    fan_out: 3,
+                    max: 2,
+                }
+                .to_string(),
+            ]
+        );
+
+        // The project's default isolation is not visible here; a worktree is no refusal.
+        for isolation in [None, Some(Isolation::Worktree)] {
+            node.phase.isolation = isolation;
+            assert_eq!(notes_of(&node), Vec::<String>::new(), "{isolation:?}");
+        }
+
+        // One candidate under `local` runs.
+        let mut single = step("draft");
+        single.phase.isolation = Some(Isolation::Local);
+        assert_eq!(notes_of(&single), Vec::<String>::new());
+    }
+
+    /// Plan D64's name rule is per step: a step called `review` cannot fan out. The rule for a
+    /// step that reads its verdict needs its edges and stays resolve's.
+    #[test]
+    fn a_fanned_out_review_step_is_noted() {
+        let review_fan_out = ResolveError::ReviewFanOut {
+            phase: "review".to_owned(),
+            fan_out: 2,
+        }
+        .to_string();
+        let mut node = step("review");
+        node.phase.split = Split::Compete;
+        node.phase.fan_out = 2;
+        assert_eq!(notes_of(&node), vec![review_fan_out.clone()]);
+
+        node.phase.isolation = Some(Isolation::Local);
+        assert_eq!(
+            notes_of(&node),
+            vec![
+                ResolveError::LocalFanOut {
+                    phase: "review".to_owned(),
+                    fan_out: 2,
+                }
+                .to_string(),
+                review_fan_out,
+            ],
+            "resolve checks `local` first"
+        );
+
+        let mut other = step("reviewer");
+        other.phase.split = Split::Compete;
+        other.phase.fan_out = 2;
+        assert_eq!(notes_of(&other), Vec::<String>::new(), "only the name");
+        assert_eq!(notes_of(&step("review")), Vec::<String>::new());
     }
 
     #[test]
@@ -471,7 +579,7 @@ mod tests {
             vec![
                 not_yet("implement", NotRunnable::PlannerAgent),
                 not_yet("implement", NotRunnable::PlanScope),
-                not_yet("implement", NotRunnable::Palette),
+                not_yet("implement:plan", NotRunnable::Palette),
                 persona("api"),
                 path("/etc/x", "is an absolute path"),
                 path("src/../x", "leaves its repository through `..`"),
@@ -540,6 +648,124 @@ mod tests {
 
         candidate(&mut node, stranger);
         assert_eq!(notes_of(&node), Vec::<String>::new(), "now a candidate");
+    }
+
+    /// The seeded `feature` graph with `edit` saved through `replace_graph`, then resolved for
+    /// `HTUI_FEAT-1` (manual, no `app_setting`): resolve's refusal, if any, and the saved body.
+    async fn resolved_feature(edit: impl FnOnce(&mut GraphBody)) -> (Option<String>, GraphBody) {
+        let store = MemStore::demo();
+        let mut body = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("a memory read")
+            .expect("the seeded feature graph");
+        edit(&mut body);
+        let outcome = store
+            .replace_graph(ids::GRAPH_HTUI_FEAT, body.graph.revision, body)
+            .await
+            .expect("the store takes the edited graph");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        let item = store
+            .item(ids::HTUI_FEAT_1)
+            .await
+            .expect("a memory read")
+            .expect("the fixture holds HTUI_FEAT-1");
+        let refusal = resolve(
+            &store,
+            &FakeGraphSource::new(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .err()
+        .map(|refusal| refusal.to_string());
+        let saved = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("a memory read")
+            .expect("the feature graph");
+        (refusal, saved)
+    }
+
+    /// The node `name` of `body`.
+    fn node_named<'a>(body: &'a GraphBody, name: &str) -> &'a NodeBody {
+        body.nodes
+            .iter()
+            .find(|node| node.phase.name == name)
+            .unwrap_or_else(|| panic!("no step `{name}`"))
+    }
+
+    /// The node `name` of `body`, to edit.
+    fn node_mut<'a>(body: &'a mut GraphBody, name: &str) -> &'a mut NodeBody {
+        body.nodes
+            .iter_mut()
+            .find(|node| node.phase.name == name)
+            .unwrap_or_else(|| panic!("no step `{name}`"))
+    }
+
+    /// `body` with every edge on `name` removed, as a palette step must be.
+    fn unlink(body: &mut GraphBody, name: &str) {
+        let id = node_named(body, name).phase.id;
+        body.edges.retain(|edge| edge.from != id && edge.to != id);
+    }
+
+    /// M-4 against the real thing: a step's first note is the sentence `resolve` refuses the
+    /// stored graph with, and a graph resolve takes has no noted step.
+    #[tokio::test]
+    async fn the_first_note_is_the_refusal_resolve_raises() {
+        let (refusal, body) = resolved_feature(|_| {}).await;
+        assert_eq!(refusal, None, "the seeded feature graph resolves");
+        for node in &body.nodes {
+            assert_eq!(
+                notes(node, None),
+                Vec::<String>::new(),
+                "{}",
+                node.phase.name
+            );
+        }
+
+        first_note_is_resolves("implement", |body| {
+            let phase = &mut node_mut(body, "implement").phase;
+            phase.split = Split::Compete;
+            phase.fan_out = 3;
+            phase.isolation = Some(Isolation::Local);
+        })
+        .await;
+        first_note_is_resolves("review", |body| {
+            let phase = &mut node_mut(body, "review").phase;
+            phase.split = Split::Compete;
+            phase.fan_out = 2;
+        })
+        .await;
+        first_note_is_resolves("prd", |body| {
+            unlink(body, "prd");
+            node_mut(body, "prd").phase.palette = true;
+        })
+        .await;
+        first_note_is_resolves("implement", |body| {
+            unlink(body, "implement");
+            let node = node_mut(body, "implement");
+            node.phase.split = Split::Divide;
+            node.phase.fan_out = 1;
+            node.phase.palette = true;
+            node.parts = vec![part(node.phase.id, 0, "api")];
+        })
+        .await;
+    }
+
+    /// With `edit` saved, resolve refuses the feature graph, and the first note of its step
+    /// `name` is resolve's sentence.
+    async fn first_note_is_resolves(name: &str, edit: impl FnOnce(&mut GraphBody)) {
+        let (refusal, body) = resolved_feature(edit).await;
+        let refusal = refusal.unwrap_or_else(|| panic!("`{name}` is refused"));
+        assert_eq!(
+            notes(node_named(&body, name), None).first(),
+            Some(&refusal),
+            "`{name}`"
+        );
     }
 
     /// `notes` under a generous `max_fan_out`, so the caps stay quiet.
