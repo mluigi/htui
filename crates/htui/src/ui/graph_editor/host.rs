@@ -34,12 +34,19 @@ enum State {
     },
     /// The editor is open.
     Open(Box<GraphEditor>),
-    /// The body read found no graph or was refused: nothing opens, close still answers.
+    /// The body read found no graph or was refused: nothing is open, close still answers. A
+    /// later body of the graph asked for still opens the editor.
     Refused {
         /// The graph asked for.
         graph: StepGraphId,
         /// What the read said, in words.
         message: String,
+        /// The persona registry once a `Personas` or `Catalogue` reply arrived, for the editor a
+        /// later body opens.
+        personas: Option<Vec<PersonaSummary>>,
+        /// The store refused the read (`Failed`), rather than found no graph: activation re-sends
+        /// it, and its answer is the host's.
+        retry: bool,
     },
 }
 
@@ -48,10 +55,18 @@ enum State {
 /// reply comes back through [`on_reply`](Self::on_reply).
 ///
 /// While the body is read, or after that read found nothing or was refused, the host stands in for
-/// the editor: one line drawn, every key swallowed but `graph_editor.close`.
+/// the editor: one line drawn, every key swallowed but `graph_editor.close`. A refused read is
+/// re-sent on activation; a graph not found is final.
+///
+/// Limit (R1 L1, owed to MOD-124): a `GraphBody(None)` or `Failed{"graph_body"}` names no graph, so
+/// a late one from an open this host replaced can refuse the newer open. Telling them apart needs
+/// the reply to carry the graph id.
 pub struct GraphEditorHost {
     /// Loading, open or refused.
     state: State,
+    /// Opened by id (the Toolbox hook): no caller's catalogue refreshes the personas, so the open
+    /// editor's activation reads add the registry's.
+    by_id: bool,
 }
 
 /// The close key, alone: what a host offers while no editor is open.
@@ -76,6 +91,7 @@ impl GraphEditorHost {
                 graph,
                 personas: None,
             },
+            by_id: true,
         };
         (
             host,
@@ -95,6 +111,7 @@ impl GraphEditorHost {
         let (editor, requests) = GraphEditor::open(body, personas, scope);
         let host = Self {
             state: State::Open(Box::new(editor)),
+            by_id: false,
         };
         (host, requests)
     }
@@ -102,11 +119,13 @@ impl GraphEditorHost {
     /// Every reply the host's view receives; `true` when the host took it.
     ///
     /// In any state the persona registry (`Personas`, a `Catalogue`'s) is taken: held while
-    /// loading, else handed to the editor. Loading, the body of the graph asked for opens the
-    /// editor and sends its reads with `ctx.scope`; `GraphBody(None)` or a refused `graph_body`
-    /// read refuses with a sentence; a refused `personas` read is taken and the editor opens
-    /// without them. Open, the editor's own replies pass through (`GraphReplaced` hands its
-    /// catalogue's personas on first).
+    /// nothing is open, else handed to the editor. Loading, or refused, the body of the graph
+    /// asked for opens the editor with the held personas and sends its reads with `ctx.scope`.
+    /// While the body read is out (loading, or refused after a refused read, which activation
+    /// re-sends), `GraphBody(None)` or a refused `graph_body` read refuses with a sentence, and a
+    /// refused `personas` read is taken: the editor opens without them. Open, the editor's own
+    /// replies pass through (`GraphReplaced` hands its catalogue's personas on first), and a host
+    /// opened by id takes its re-sent `personas` read's refusal.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
         match reply {
             StoreReply::Personas(rows) => {
@@ -118,19 +137,31 @@ impl GraphEditorHost {
                 true
             }
             _ => match &mut self.state {
-                State::Loading { .. } => self.on_loading_reply(reply, ctx),
-                State::Open(editor) => on_open_reply(editor, reply, ctx),
-                State::Refused { .. } => false,
+                State::Loading { .. } | State::Refused { .. } => self.on_closed_reply(reply, ctx),
+                State::Open(editor) => {
+                    if self.by_id
+                        && matches!(reply, StoreReply::Failed { request, .. } if *request == "personas")
+                    {
+                        return true;
+                    }
+                    on_open_reply(editor, reply, ctx)
+                }
             },
         }
     }
 
-    /// A reply while the body is read.
-    fn on_loading_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
-        let State::Loading { graph, personas } = &mut self.state else {
-            return false;
+    /// A reply while no editor is open: loading, or refused.
+    fn on_closed_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
+        let (graph, personas, reading) = match &mut self.state {
+            State::Loading { graph, personas } => (*graph, personas, true),
+            State::Refused {
+                graph,
+                personas,
+                retry,
+                ..
+            } => (*graph, personas, *retry),
+            State::Open(_) => return false,
         };
-        let graph = *graph;
         match reply {
             StoreReply::GraphBody(Some(body)) if body.graph.id == graph => {
                 let personas = personas.take().unwrap_or_default();
@@ -141,21 +172,27 @@ impl GraphEditorHost {
                 }
                 true
             }
-            StoreReply::GraphBody(None) => {
+            StoreReply::GraphBody(None) if reading => {
+                let personas = personas.take();
                 self.state = State::Refused {
                     graph,
                     message: GRAPH_NOT_FOUND.to_owned(),
+                    personas,
+                    retry: false,
                 };
                 true
             }
-            StoreReply::Failed { request, message } if *request == "graph_body" => {
+            StoreReply::Failed { request, message } if reading && *request == "graph_body" => {
+                let personas = personas.take();
                 self.state = State::Refused {
                     graph,
                     message: message.clone(),
+                    personas,
+                    retry: true,
                 };
                 true
             }
-            StoreReply::Failed { request, .. } if *request == "personas" => true,
+            StoreReply::Failed { request, .. } if reading && *request == "personas" => true,
             _ => false,
         }
     }
@@ -178,12 +215,13 @@ impl GraphEditorHost {
         }
     }
 
-    /// The persona registry changed: held while loading, handed to the open editor.
+    /// The persona registry changed: held while nothing is open, handed to the open editor.
     pub fn set_personas(&mut self, personas: &[PersonaSummary]) {
         match &mut self.state {
-            State::Loading { personas: held, .. } => *held = Some(personas.to_vec()),
+            State::Loading { personas: held, .. } | State::Refused { personas: held, .. } => {
+                *held = Some(personas.to_vec());
+            }
             State::Open(editor) => editor.set_personas(personas),
-            State::Refused { .. } => {}
         }
     }
 
@@ -217,15 +255,34 @@ impl GraphEditorHost {
     }
 
     /// The reads to re-send on activation: loading, the body and the personas again; open, the
-    /// editor's; refused, none.
+    /// editor's, and the personas when opened by id (no catalogue refreshes them); refused after
+    /// a refused read, the body again and the personas unless held; not found, none.
     #[must_use]
     pub fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
         match &self.state {
             State::Loading { graph, .. } => {
                 vec![StoreRequest::GraphBody(*graph), StoreRequest::Personas]
             }
-            State::Open(editor) => editor.wants_requests(scope),
-            State::Refused { .. } => Vec::new(),
+            State::Open(editor) => {
+                let mut requests = editor.wants_requests(scope);
+                if self.by_id {
+                    requests.push(StoreRequest::Personas);
+                }
+                requests
+            }
+            State::Refused {
+                graph,
+                personas,
+                retry: true,
+                ..
+            } => {
+                let mut requests = vec![StoreRequest::GraphBody(*graph)];
+                if personas.is_none() {
+                    requests.push(StoreRequest::Personas);
+                }
+                requests
+            }
+            State::Refused { retry: false, .. } => Vec::new(),
         }
     }
 
@@ -599,6 +656,13 @@ mod tests {
         }
     }
 
+    /// What an open host opened by id re-sends on activation: the editor's three and the personas.
+    fn by_id_reads(scope: &Scope) -> Vec<StoreRequest> {
+        let mut reads = editor_reads(scope);
+        reads.push(StoreRequest::Personas);
+        reads
+    }
+
     /// The three reads `GraphEditor::open` sends.
     fn editor_reads(scope: &Scope) -> Vec<StoreRequest> {
         vec![
@@ -690,11 +754,14 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", host.wants_requests(&bench.scope)),
-            format!("{:?}", editor_reads(&bench.scope)),
-            "open: the editor's reads"
+            format!("{:?}", by_id_reads(&bench.scope)),
+            "open by id: the editor's reads and the personas"
         );
-        // Once open, a refused registry read is not the host's.
-        assert!(!bench.reply(&mut host, &refused("personas", "refused")));
+        // Open by id, the host re-reads the registry, so that read's refusal is its own; the
+        // editor keeps what it holds.
+        assert!(bench.reply(&mut host, &refused("personas", "refused")));
+        assert!(open(&host).lookups.personas.is_empty());
+        assert!(notice_text(open(&host)).is_none());
     }
 
     /// The pattern of `each_scope_saves_its_own_graph_and_revision`, opened by id over the store:
@@ -792,8 +859,10 @@ mod tests {
         assert!(bench.reply(&mut host, &refused("graph_body", sentence)));
         assert!(matches!(&host.state, State::Refused { message, .. } if message == sentence));
         assert_eq!(bench.render(&host, 40, 3).lines().next(), Some(sentence));
-        // Only a loading host takes it: refused, and open, it is another view's.
-        assert!(!bench.reply(&mut host, &refused("graph_body", "again")));
+        // The retry's refusal is the host's too, and says the newer sentence; open, it is
+        // another view's.
+        assert!(bench.reply(&mut host, &refused("graph_body", "again")));
+        assert!(matches!(&host.state, State::Refused { message, .. } if message == "again"));
         let (mut open_host, _) =
             GraphEditorHost::with_body(library_body(), Vec::new(), &bench.scope);
         assert!(!bench.reply(&mut open_host, &refused("graph_body", sentence)));
@@ -915,6 +984,13 @@ mod tests {
             host.hint_text(&bench.keys),
             open(&host).hint_text(&bench.keys)
         );
+        assert_eq!(
+            format!("{:?}", host.wants_requests(&bench.scope)),
+            format!("{:?}", editor_reads(&bench.scope)),
+            "reactivated, still exactly the editor's three"
+        );
+        // Its catalogue owns the registry read: that read's refusal is not the host's.
+        assert!(!bench.reply(&mut host, &refused("personas", "refused")));
     }
 
     #[tokio::test]
@@ -1005,6 +1081,125 @@ mod tests {
         );
         assert!(matches!(host.state, State::Loading { .. }));
         assert_eq!(bench.key(&mut host, &close), EditorKey::Close);
+    }
+
+    /// R1 L1: a transient refusal of the body read is not final. The personas that arrived stay
+    /// held, and a later body of the graph asked for opens the editor with them.
+    #[tokio::test]
+    async fn a_refused_body_read_recovers_when_the_body_arrives() {
+        let bench = HostBench::new().await;
+        let (mut host, _) = GraphEditorHost::open_by_id(ids::GRAPH_VULKAN_ANA);
+        assert!(bench.reply(&mut host, &catalogue(vec![reviewer()])));
+        assert!(bench.reply(
+            &mut host,
+            &refused("graph_body", "the database is unreachable")
+        ));
+        assert!(matches!(host.state, State::Refused { .. }));
+
+        // Refused, the registry still lands and is held for the editor.
+        let registry = bench.registry().await;
+        host.set_personas(&registry);
+        host.set_personas(&[reviewer()]);
+
+        // Another graph's body is still not the host's.
+        let other = bench.seeded(GraphScope::Library).await;
+        let foreign = bench.served(&StoreRequest::GraphBody(other)).await;
+        assert!(!bench.reply(&mut host, &foreign));
+        assert!(matches!(host.state, State::Refused { .. }));
+
+        let body = bench
+            .served(&StoreRequest::GraphBody(ids::GRAPH_VULKAN_ANA))
+            .await;
+        assert!(bench.reply(&mut host, &body));
+        let editor = open(&host);
+        assert_eq!(
+            editor.lookups.personas,
+            [reviewer()],
+            "opened with the held personas"
+        );
+        assert_eq!(host.graph(), ids::GRAPH_VULKAN_ANA);
+        assert_eq!(
+            format!("{:?}", bench.requests()),
+            format!("{:?}", editor_reads(&bench.scope)),
+            "the editor's three reads leave as it opens"
+        );
+    }
+
+    /// R1 L1: after a refused read, activation re-sends the body read (and the registry read
+    /// while no personas are held), and answering them opens the editor.
+    #[tokio::test]
+    async fn reactivation_after_a_refused_read_re_sends_it() {
+        let bench = HostBench::new().await;
+
+        // No personas held: both reads again.
+        let (mut host, _) = GraphEditorHost::open_by_id(ids::GRAPH_VULKAN_ANA);
+        assert!(bench.reply(&mut host, &refused("graph_body", "refused")));
+        let again = host.wants_requests(&bench.scope);
+        assert_eq!(
+            format!("{again:?}"),
+            format!(
+                "{:?}",
+                [
+                    StoreRequest::GraphBody(ids::GRAPH_VULKAN_ANA),
+                    StoreRequest::Personas
+                ]
+            )
+        );
+        // The retried registry read's refusal is the host's, as while loading.
+        assert!(bench.reply(&mut host, &refused("personas", "refused")));
+        bench.answer(&mut host, &again).await;
+        assert!(host.editor_mut().is_some(), "the retry opened the editor");
+        assert_eq!(open(&host).lookups.personas, bench.registry().await);
+        assert_eq!(
+            format!("{:?}", bench.requests()),
+            format!("{:?}", editor_reads(&bench.scope))
+        );
+
+        // Personas held: the body read alone.
+        let (mut host, _) = GraphEditorHost::open_by_id(ids::GRAPH_VULKAN_ANA);
+        assert!(bench.reply(&mut host, &catalogue(vec![reviewer()])));
+        assert!(bench.reply(&mut host, &refused("graph_body", "refused")));
+        let again = host.wants_requests(&bench.scope);
+        assert_eq!(
+            format!("{again:?}"),
+            format!("{:?}", [StoreRequest::GraphBody(ids::GRAPH_VULKAN_ANA)])
+        );
+        bench.answer(&mut host, &again).await;
+        assert_eq!(open(&host).lookups.personas, [reviewer()]);
+
+        // The retry found no graph: refused for good, nothing more re-sent.
+        let missing = StepGraphId::new();
+        let (mut host, _) = GraphEditorHost::open_by_id(missing);
+        assert!(bench.reply(&mut host, &refused("graph_body", "refused")));
+        let again = host.wants_requests(&bench.scope);
+        bench.answer(&mut host, &again).await;
+        assert!(
+            matches!(&host.state, State::Refused { message, .. } if message == GRAPH_NOT_FOUND)
+        );
+        assert!(host.wants_requests(&bench.scope).is_empty());
+    }
+
+    /// R1 L1: not-found is final. Activation re-sends nothing, and a refused body read that
+    /// arrives later is another view's; a body of the graph asked for still opens it.
+    #[tokio::test]
+    async fn not_found_re_sends_nothing() {
+        let bench = HostBench::new().await;
+        let (mut host, _) = GraphEditorHost::open_by_id(ids::GRAPH_VULKAN_ANA);
+        assert!(bench.reply(&mut host, &StoreReply::GraphBody(None)));
+        assert!(host.wants_requests(&bench.scope).is_empty());
+        assert!(!bench.reply(&mut host, &refused("graph_body", "refused")));
+        assert!(!bench.reply(&mut host, &StoreReply::GraphBody(None)));
+        assert!(!bench.reply(&mut host, &refused("personas", "refused")));
+        assert!(
+            matches!(&host.state, State::Refused { message, .. } if message == GRAPH_NOT_FOUND)
+        );
+        assert!(host.wants_requests(&bench.scope).is_empty());
+
+        let body = bench
+            .served(&StoreRequest::GraphBody(ids::GRAPH_VULKAN_ANA))
+            .await;
+        assert!(bench.reply(&mut host, &body));
+        assert!(host.editor_mut().is_some());
     }
 
     #[tokio::test]
