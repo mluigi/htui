@@ -2464,7 +2464,9 @@ impl PgStore {
 
     /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11). No
     /// index covers `(target_box_id, status)`; a per-user table scanned every 5 s is accepted
-    /// (R-6).
+    /// (R-6). MOD-125 M2 D8: less the queued runs of a stopped workspace (they hold no slot and
+    /// cannot be claimed until the resume); a run without a workspace makes the subquery empty,
+    /// so it stays.
     ///
     /// # Errors
     ///
@@ -2475,6 +2477,7 @@ impl PgStore {
             SELECT id AS "id: RunId", queued_at
               FROM run
              WHERE target_box_id = $1 AND status = 'queued'
+               AND NOT EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = run.workspace_id)
              ORDER BY queued_at, id
             "#,
             box_id.as_uuid(),

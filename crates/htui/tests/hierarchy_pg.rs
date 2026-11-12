@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use htui::hierarchy::{HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui_core::fixtures::ids;
-use htui_core::model::RepoId;
+use htui_core::model::{RepoId, RunStatus};
 use htui_core::store::{DeleteTarget, ReadStore as _, WriteStore as _};
 use htui_orch::infer::MatchedBy;
 use htui_orch::isolate::git::testkit::repo_with_one_commit;
@@ -287,6 +287,19 @@ async fn a_workspace_delete_rebuilds_the_mirror_its_scope_row_was_in() {
             .is_some()
     );
 
+    // MOD-125 M2 D9: the demo's stopped `RUN_8` would refuse the delete.
+    assert!(
+        db.store
+            .transition_run(
+                ids::RUN_8,
+                RunStatus::Stopped,
+                RunStatus::Cancelled,
+                chrono::Utc::now()
+            )
+            .await
+            .expect("the server answers"),
+        "the demo's stopped member run is cancelled first"
+    );
     let reply = serve(
         &backend,
         &StoreRequest::DeleteWorkspace(ids::WORKSPACE_GRAPHICS),

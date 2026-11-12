@@ -26,21 +26,21 @@ use crate::model::{
     MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
     NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
-    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
-    QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
-    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
-    RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome,
-    Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings,
-    Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport,
-    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    executor_scrub_refusal, missing_tags_failure,
+    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
+    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
+    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId,
+    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
+    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
+    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
+    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
 use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
@@ -92,7 +92,8 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
-    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
+    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run,
+    workspace_has_stopped_run,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -272,6 +273,12 @@ pub const CASES: &[&str] = &[
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
     "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
+    // MOD-125 M2: the executor's read, M-3 and L-3
+    "pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace",
+    "pending_stops_shows_an_escalation",
+    "pending_stops_is_empty_after_resume",
+    "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
+    "create_run_naming_a_gone_workspace_reads_switch_workspace",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -914,6 +921,25 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
             Box::pin(a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(
+                store,
+            ))
+            .await;
+        }
+        "pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace" => {
+            Box::pin(pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace(store))
+                .await;
+        }
+        "pending_stops_shows_an_escalation" => {
+            Box::pin(pending_stops_shows_an_escalation(store)).await;
+        }
+        "pending_stops_is_empty_after_resume" => {
+            Box::pin(pending_stops_is_empty_after_resume(store)).await;
+        }
+        "delete_workspace_refuses_while_a_member_run_of_it_is_stopped" => {
+            Box::pin(delete_workspace_refuses_while_a_member_run_of_it_is_stopped(store)).await;
+        }
+        "create_run_naming_a_gone_workspace_reads_switch_workspace" => {
+            Box::pin(create_run_naming_a_gone_workspace_reads_switch_workspace(
                 store,
             ))
             .await;
@@ -8473,6 +8499,351 @@ async fn a_deleted_workspace_unscopes_its_runs_and_drops_its_stop<S: WriteStore>
             .expect(CASE),
         Claim::Admitted,
         "{CASE}: and the unscoped run is admitted"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-125 M2 (plan D1): the executor's read of a workspace stop. `pending_stops(owner)` lists the
+// owner's `running` runs whose workspace has a stop record, with the record's current mode.
+// ------------------------------------------------------------------------------------------
+
+/// `run` created from `workspace` (as [`create_scoped_run`]) and claimed by `owner`.
+async fn claimed_in<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    workspace: Option<WorkspaceId>,
+    owner: Uuid,
+) -> RunId {
+    let run = create_scoped_run(case, store, item, workspace).await;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, seam_clock(), LEASE)
+            .await
+            .expect(case),
+        Claim::Admitted,
+        "{case}: the run is claimed"
+    );
+    run
+}
+
+/// `stops` in the order `pending_stops` answers: `(run.queued_at, run.id)`, read back.
+async fn in_queue_order<S: WriteStore>(
+    case: &str,
+    store: &S,
+    stops: &[PendingStop],
+) -> Vec<PendingStop> {
+    let mut keyed = Vec::new();
+    for stop in stops {
+        keyed.push((run_row(case, store, stop.run).await.queued_at, *stop));
+    }
+    keyed.sort_unstable_by_key(|(at, stop)| (*at, stop.run));
+    keyed.into_iter().map(|(_, stop)| stop).collect()
+}
+
+/// MOD-125 M2 D1: `pending_stops(owner)` lists the owner's `running` runs whose workspace has a
+/// `workspace_stop` row, each with that row's mode, in `(queued_at, id)` order. Never another
+/// owner's run, a parked, queued or stopped run, or a run without a workspace.
+async fn pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "pending_stops_lists_the_owners_running_runs_of_a_stopped_workspace";
+    let (owner, stranger) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let first = ids::WORKSPACE_PLATFORM;
+    let second = store
+        .create_workspace(new_workspace("second"))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: control: nothing is stopped, nothing is listed (the fixture's running run of \
+         the first workspace is not this fresh owner's)"
+    );
+
+    // The box takes two running claims: A (owner) and C (stranger) run in the first workspace
+    // before it stops, since a stopped workspace's runs are refused at the claim.
+    let a = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(first), owner).await;
+    let foreign = mint_tagged(CASE, store, "Foreign", &[]).await;
+    let c = claimed_in(CASE, store, foreign, Some(first), stranger).await;
+    store
+        .stop_workspace(first, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        vec![PendingStop {
+            run: a,
+            mode: StopMode::Graceful
+        }],
+        "{CASE}: the owner's running run of the stopped workspace, graceful"
+    );
+    assert_eq!(
+        store.pending_stops(stranger).await.expect(CASE),
+        vec![PendingStop {
+            run: c,
+            mode: StopMode::Graceful
+        }],
+        "{CASE}: another owner's run is that owner's, never this one's"
+    );
+
+    assert!(
+        store
+            .transition_run(c, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: C parks at a gate"
+    );
+    assert_eq!(
+        store.pending_stops(stranger).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: a parked run is not listed"
+    );
+
+    let b = claimed_in(CASE, store, ids::HTUI_CLEAN_1, Some(second), owner).await;
+    store
+        .stop_workspace(second, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    let both = [
+        PendingStop {
+            run: a,
+            mode: StopMode::Graceful,
+        },
+        PendingStop {
+            run: b,
+            mode: StopMode::Forced,
+        },
+    ];
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        in_queue_order(CASE, store, &both).await,
+        "{CASE}: each run with its own workspace's mode, in (queued_at, id) order"
+    );
+
+    assert!(
+        store.stop_run(b, owner).await.expect(CASE),
+        "{CASE}: B is stopped"
+    );
+    let only_a = vec![PendingStop {
+        run: a,
+        mode: StopMode::Graceful,
+    }];
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        only_a,
+        "{CASE}: a stopped run is not listed"
+    );
+
+    let unscoped = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    claimed_in(CASE, store, unscoped, None, owner).await;
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        only_a,
+        "{CASE}: a run without a workspace is never listed"
+    );
+
+    let waiting = mint_tagged(CASE, store, "Waiting", &[]).await;
+    create_scoped_run(CASE, store, waiting, Some(first)).await;
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        only_a,
+        "{CASE}: a queued run of the stopped workspace is not listed"
+    );
+
+    assert!(
+        store
+            .transition_run(a, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: A parks at a gate"
+    );
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: and is no longer listed"
+    );
+}
+
+/// MOD-125 M2 D1: the listed mode is the stop record's as read now, so a forced request over a
+/// graceful one shows on the next read, and a later graceful request never downgrades it.
+async fn pending_stops_shows_an_escalation<S: WriteStore>(store: &S) {
+    const CASE: &str = "pending_stops_shows_an_escalation";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    for (mode, expected, what) in [
+        (StopMode::Graceful, StopMode::Graceful, "a graceful stop"),
+        (StopMode::Forced, StopMode::Forced, "the escalation"),
+        (
+            StopMode::Graceful,
+            StopMode::Forced,
+            "a later graceful request, never a downgrade",
+        ),
+    ] {
+        store
+            .stop_workspace(workspace, mode, ids::USER, at)
+            .await
+            .expect(CASE);
+        assert_eq!(
+            store.pending_stops(owner).await.expect(CASE),
+            vec![PendingStop {
+                run,
+                mode: expected
+            }],
+            "{CASE}: {what} reads {expected}"
+        );
+    }
+}
+
+/// MOD-125 M2 D1: a resume deletes the stop record, so nothing is listed any more; the run is
+/// untouched, still `running` under the owner's lease.
+async fn pending_stops_is_empty_after_resume<S: WriteStore>(store: &S) {
+    const CASE: &str = "pending_stops_is_empty_after_resume";
+    let owner = Uuid::now_v7();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, seam_clock())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        vec![PendingStop {
+            run,
+            mode: StopMode::Forced
+        }],
+        "{CASE}: control: the stopped workspace's run is listed"
+    );
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: nothing is listed after the resume"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.status,
+        RunStatus::Running,
+        "{CASE}: the run is still running"
+    );
+    assert!(
+        store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: and still under the owner's lease"
+    );
+}
+
+/// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` refuses while a run of a member project that
+/// recorded the workspace is `stopped`, since the delete would unscope it (`ON DELETE SET NULL`)
+/// and no workspace resume would reach it again. DV-2: a run still `running` under the
+/// workspace's stop is about to be stopped, so it counts too. Nothing is deleted then; once the
+/// runs are settled otherwise the delete goes through and unscopes them.
+async fn delete_workspace_refuses_while_a_member_run_of_it_is_stopped<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_refuses_while_a_member_run_of_it_is_stopped";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = store
+        .create_workspace(new_workspace("held"))
+        .await
+        .expect(CASE)
+        .id;
+    let a = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    assert!(
+        store.stop_run(a, owner).await.expect(CASE),
+        "{CASE}: A is stopped (no workspace stop needed)"
+    );
+    let b = claimed_in(CASE, store, ids::HTUI_CLEAN_1, Some(workspace), owner).await;
+
+    let refused = |runs: u64| {
+        Err(StoreError::Constraint(workspace_has_stopped_run(
+            "held", runs,
+        )))
+    };
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        refused(1),
+        "{CASE}: the stopped member run refuses the delete; the running one does not count \
+         while the workspace is not stopped"
+    );
+    assert!(
+        store.workspace(workspace).await.expect(CASE).is_some(),
+        "{CASE}: the workspace is still there"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await.workspace_id,
+        Some(workspace),
+        "{CASE}: and the stopped run still names it"
+    );
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        refused(2),
+        "{CASE}: DV-2: a run still running under the workspace's stop counts too"
+    );
+    assert!(
+        store.workspace(workspace).await.expect(CASE).is_some(),
+        "{CASE}: the workspace is still there"
+    );
+
+    for (run, from) in [(a, RunStatus::Stopped), (b, RunStatus::Running)] {
+        assert!(
+            store
+                .transition_run(run, from, RunStatus::Cancelled, at)
+                .await
+                .expect(CASE),
+            "{CASE}: {from} -> cancelled is a sanctioned move"
+        );
+    }
+    store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(
+        store.workspace(workspace).await.expect(CASE),
+        None,
+        "{CASE}: with no stopped or stopping run left the workspace goes"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await.workspace_id,
+        None,
+        "{CASE}: and its runs are unscoped"
+    );
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): a run started from a workspace that no longer exists (deleted
+/// while the TUI still had it in scope) is refused in one readable sentence on both stores,
+/// [`workspace_gone`], not the foreign key's name; nothing is written.
+async fn create_run_naming_a_gone_workspace_reads_switch_workspace<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_naming_a_gone_workspace_reads_switch_workspace";
+    let workspace = store
+        .create_workspace(new_workspace("gone"))
+        .await
+        .expect(CASE)
+        .id;
+    store.delete_workspace(workspace).await.expect(CASE);
+    let before = store.runs(ids::HTUI_ANA_2).await.expect(CASE);
+
+    let refused = store
+        .create_run(NewRun {
+            workspace_id: Some(workspace),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        })
+        .await;
+    assert_eq!(
+        refused.map(|run| run.id),
+        Err(StoreError::Constraint(workspace_gone())),
+        "{CASE}: a gone workspace reads \"switch workspace\""
+    );
+    assert_eq!(
+        store.runs(ids::HTUI_ANA_2).await.expect(CASE),
+        before,
+        "{CASE}: and the item has no new run"
     );
 }
 

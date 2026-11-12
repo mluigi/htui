@@ -31,16 +31,16 @@ use htui_core::model::{
     MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
     NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
-    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
+    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
+    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop,
 };
@@ -1674,6 +1674,13 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.pending_commands(owner, box_id).await,
             Self::Online(pg) => pg.pending_commands(owner, box_id).await,
+        }
+    }
+
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        match self {
+            Self::Memory(store) => store.pending_stops(owner).await,
+            Self::Online(pg) => pg.pending_stops(owner).await,
         }
     }
 

@@ -36,19 +36,19 @@ use htui_core::model::{
     NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
     NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
-    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    missing_tags_failure, moved_order, overlaps, scope_of,
+    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    Project, ProjectId, ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch,
+    QueueEntry, QueueMove, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
@@ -93,7 +93,7 @@ use htui_core::store::{
 use htui_core::store::{
     plan_revision_taken, planner_not_in_run, project_slug_refusal, run_plan_refusal,
     scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace, scope_row_slug_is_fixed,
-    workspace_has_live_run,
+    workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -1269,6 +1269,18 @@ fn parent_fk_refused(err: sqlx::Error, parent: Option<StepId>, run: RunId) -> St
             parent,
             &format!("run_step of run {run}"),
         ));
+    }
+    map_sqlx(err)
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): `constraint`'s `23503` (`fk_run_workspace`,
+/// `fk_queue_entry_workspace`) in [`workspace_gone`]'s sentence, `MemStore`'s; anything else
+/// through [`map_sqlx`].
+fn workspace_fk_refused(err: sqlx::Error, constraint: &str) -> StoreError {
+    if let sqlx::Error::Database(db) = &err
+        && db.constraint() == Some(constraint)
+    {
+        return StoreError::Constraint(workspace_gone());
     }
     map_sqlx(err)
 }
@@ -6141,8 +6153,10 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
     /// lost the race, in which case nothing was deleted, or (MOD-138 A3) while a kind or an item
     /// names one of the workspace's graphs, or with [`workspace_has_live_run`] (MOD-147 A1) while
-    /// a run of its scope row is live (queued, running, awaiting_approval or stopped); both are
-    /// checked in the same transaction before the delete.
+    /// a run of its scope row is live (queued, running, awaiting_approval or stopped), or with
+    /// [`workspace_has_stopped_run`] (MOD-125 M2 D9) while a run of a member project that
+    /// recorded the workspace is `stopped` (or `running` under its stop, DV-2); all are checked
+    /// in the same transaction before the delete.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
         for _ in 0..DELETE_ATTEMPTS {
             if let Some(reach) = self.delete_workspace_once(id).await? {
@@ -6221,7 +6235,8 @@ impl WriteStore for PgStore {
     /// its own ([`scope_row_run_workspace`], MOD-147 D8; `None` is filled with it), when the id
     /// is taken, or on any of the keys above.
     /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
-    /// an unknown or closed `new.batch_id` (MOD-12 D7).
+    /// an unknown or closed `new.batch_id` (MOD-12 D7). An unknown workspace is
+    /// [`workspace_gone`]'s sentence (`fk_run_workspace`, MOD-125 M2 D10).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -6380,7 +6395,7 @@ impl WriteStore for PgStore {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| workspace_fk_refused(err, "fk_run_workspace"))?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(run)
@@ -7236,6 +7251,31 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(true)
+    }
+
+    /// MOD-125 M2 D1: starts from `workspace_stop` (one row per stopped workspace) and joins
+    /// `run` on `idx_run_workspace_status` (`0019_stop_runs.sql:37`); no index covers
+    /// `lease_owner`, so the stop rows are the narrow side. Read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        sqlx::query_as!(
+            PendingStop,
+            r#"
+            SELECT r.id    AS "run: RunId",
+                   ws.mode AS "mode: StopMode"
+              FROM workspace_stop ws
+              JOIN run r ON r.workspace_id = ws.workspace_id
+             WHERE r.status = 'running' AND r.lease_owner = $1
+             ORDER BY r.queued_at, r.id
+            "#,
+            owner,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
@@ -10699,6 +10739,39 @@ impl PgStore {
                 rows(live),
             )));
         }
+        // MOD-125 M2 D9 (M-3): a member project's run that recorded this workspace and is
+        // stopped (DV-2: or running under the workspace's stop) refuses. Scope-row runs are A1's
+        // (no double count). No row is locked here (DV-1): `workspace_stop` before `run` would
+        // invert `claim_run`'s and `adopt_runs`' order against the `SET NULL` cascade below. A run
+        // stopped after this snapshot conflicts with that cascade, the `40001` retries the
+        // attempt, and the recount sees it
+        // (`pg_criteria.rs::delete_workspace_recounts_a_run_stopped_under_it`).
+        let held = sqlx::query_scalar!(
+            r#"
+            SELECT count(*) AS "held!"
+              FROM run r JOIN project p ON p.id = r.project_id
+             WHERE r.workspace_id = $1
+               AND p.owner_workspace_id IS DISTINCT FROM $1
+               AND (r.status = 'stopped'
+                    OR (r.status = 'running'
+                        AND EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = $1)))
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if held > 0 {
+            let slug =
+                sqlx::query_scalar!("SELECT slug FROM workspace WHERE id = $1", id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+            return Err(StoreError::Constraint(workspace_has_stopped_run(
+                &slug,
+                rows(held),
+            )));
+        }
         if let Some(scope) = scope_row_id(&mut *tx, id).await? {
             release_repo_references(&mut tx, scope).await?;
             // MOD-147 D7: the scope row goes first. Its kinds and items may hold the workspace's
@@ -10877,7 +10950,7 @@ impl PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] with [`scope_row_run_workspace`] for a scope row's item named
     /// with another workspace, or for an unknown box, workspace or user (23503, through
-    /// [`map_sqlx`]).
+    /// [`map_sqlx`]); an unknown workspace is [`workspace_gone`]'s sentence (MOD-125 M2 D10).
     pub async fn queue_item(
         &self,
         item: ItemId,
@@ -10922,7 +10995,7 @@ impl PgStore {
         )
         .execute(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| workspace_fk_refused(err, "fk_queue_entry_workspace"))?;
         let entry = sqlx::query_as!(
             QueueEntry,
             r#"

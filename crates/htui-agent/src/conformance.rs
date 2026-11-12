@@ -38,10 +38,10 @@ use htui_core::model::{
     MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
     NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewProject, NewPromptTemplate,
     NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PER_TOKEN_CAP_RUN, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource, RelaySessionId,
-    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PER_TOKEN_CAP_RUN, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
     RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
     RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
@@ -1595,6 +1595,10 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
 
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> StoreResult<Vec<RunCommand>> {
         self.inner.pending_commands(owner, box_id).await
+    }
+
+    async fn pending_stops(&self, owner: Uuid) -> StoreResult<Vec<PendingStop>> {
+        self.inner.pending_stops(owner).await
     }
 
     async fn resolve_command(

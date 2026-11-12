@@ -37,11 +37,11 @@ use crate::model::{
     MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
     NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
-    QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
+    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectRef, ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry,
+    QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
     RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
     RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
     Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
@@ -100,7 +100,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
-    scope_row_slug_is_fixed, workspace_has_live_run,
+    scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use uuid::Uuid;
@@ -1051,7 +1051,9 @@ impl MemStore {
     }
 
     /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
-    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order.
+    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order. MOD-125 M2 D8: less the
+    /// queued runs of a stopped workspace (they hold no slot and cannot be claimed until the
+    /// resume).
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
@@ -1060,7 +1062,15 @@ impl MemStore {
             let mut rows: Vec<(RunId, DateTime<Utc>)> = state
                 .runs
                 .values()
-                .filter(|row| row.target_box_id == box_id && row.status == RunStatus::Queued)
+                .filter(|row| {
+                    row.target_box_id == box_id
+                        && row.status == RunStatus::Queued
+                        // MOD-125 M2 D8: a stopped workspace's queued run takes no free slot and
+                        // is not re-claimed every sweep; it reappears at the resume.
+                        && row
+                            .workspace_id
+                            .is_none_or(|ws| !state.workspace_stops.contains_key(&ws))
+                })
                 .map(|row| (row.id, row.queued_at))
                 .collect();
             rows.sort_by_key(|(id, at)| (*at, *id));
@@ -1081,7 +1091,8 @@ impl MemStore {
     /// # Errors
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] for a scope row's item queued under another workspace
-    /// ([`scope_row_run_workspace`]), then for an unknown box, workspace or user.
+    /// ([`scope_row_run_workspace`]), then for an unknown box, workspace or user; an unknown
+    /// workspace is [`workspace_gone`]'s sentence (MOD-125 M2 D10).
     pub async fn queue_item(
         &self,
         item: ItemId,
@@ -1106,11 +1117,8 @@ impl MemStore {
             if let Some(workspace) = workspace
                 && !state.workspaces.contains_key(&workspace)
             {
-                return Err(StoreError::Constraint(references_no_row(
-                    "queue_entry.workspace_id",
-                    workspace,
-                    "workspace",
-                )));
+                // MOD-125 M2 D10: `fk_queue_entry_workspace`, in the readable sentence.
+                return Err(StoreError::Constraint(workspace_gone()));
             }
             state.require_user(by, "queue_entry.queued_by")?;
             let entry = QueueEntry {
@@ -5780,6 +5788,11 @@ impl State {
     /// goes with the workspace (`ON DELETE CASCADE`), and its runs and queue entries outlive it
     /// unscoped (`ON DELETE SET NULL`). A run's `updated_at` moves, as Postgres's trigger moves it
     /// on the `SET NULL`; `queue_entry` has no `updated_at`.
+    ///
+    /// MOD-125 M2 D9 (M1 review M-3): a run of a member project that recorded this workspace and
+    /// is `stopped`, or `running` while the workspace has a stop record (DV-2), refuses the
+    /// delete ([`workspace_has_stopped_run`]), after A1's scope-row check and before anything
+    /// goes.
     fn delete_workspace(&mut self, id: WorkspaceId, now: DateTime<Utc>) -> Result<DeleteReach> {
         if !self.workspaces.contains_key(&id) {
             return Err(StoreError::NotFound {
@@ -5813,6 +5826,27 @@ impl State {
                     rows(live),
                 )));
             }
+        }
+        // MOD-125 M2 D9 (M-3): a stopped run of a member project that recorded this workspace
+        // would lose the only resume that reaches it (`ON DELETE SET NULL`). Scope-row runs are
+        // A1's above. DV-2: a run still `running` under this workspace's stop is about to be.
+        let stopping = self.workspace_stops.contains_key(&id);
+        let held = self
+            .runs
+            .values()
+            .filter(|run| {
+                run.workspace_id == Some(id)
+                    && Some(run.project_id) != scope
+                    && (run.status == RunStatus::Stopped
+                        || (stopping && run.status == RunStatus::Running))
+            })
+            .count();
+        if held > 0 {
+            let slug = &self.workspaces[&id].slug;
+            return Err(StoreError::Constraint(workspace_has_stopped_run(
+                slug,
+                rows(held),
+            )));
         }
         let mut reach = self.workspace_reach_of(id, &graphs, &phases);
         if let Some(scope) = scope {
@@ -6374,15 +6408,11 @@ impl State {
                 "box",
             )));
         }
-        // MOD-125 D3: `fk_run_workspace`.
+        // MOD-125 D3: `fk_run_workspace` (M2 D10: in the readable sentence).
         if let Some(workspace) = workspace_id
             && !self.workspaces.contains_key(&workspace)
         {
-            return Err(StoreError::Constraint(references_no_row(
-                "run.workspace_id",
-                workspace,
-                "workspace",
-            )));
+            return Err(StoreError::Constraint(workspace_gone()));
         }
         self.require_user(new.started_by, "run.started_by")?;
         for repo in &new.repo_scope {
@@ -9642,6 +9672,30 @@ impl State {
         rows
     }
 
+    /// MOD-125 M2 D1: [`WriteStore::pending_stops`]: the owner's running runs whose workspace has
+    /// a stop record, with its mode, by `(queued_at, id)`.
+    fn pending_stops(&self, owner: Uuid) -> Vec<PendingStop> {
+        let mut rows: Vec<(DateTime<Utc>, PendingStop)> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.status == RunStatus::Running && self.lease_owners.get(&row.id) == Some(&owner)
+            })
+            .filter_map(|row| {
+                let stop = self.workspace_stops.get(&row.workspace_id?)?;
+                Some((
+                    row.queued_at,
+                    PendingStop {
+                        run: row.id,
+                        mode: stop.mode,
+                    },
+                ))
+            })
+            .collect();
+        rows.sort_unstable_by_key(|(at, stop)| (*at, stop.run));
+        rows.into_iter().map(|(_, stop)| stop).collect()
+    }
+
     fn resolve_command(
         &mut self,
         id: RunCommandId,
@@ -11129,6 +11183,10 @@ impl WriteStore for MemStore {
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
         let now = self.now();
         Ok(self.read(|state| state.pending_commands(owner, box_id, now)))
+    }
+
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        Ok(self.read(|state| state.pending_stops(owner)))
     }
 
     async fn resolve_command(
@@ -15101,6 +15159,109 @@ mod tests {
         );
     }
 
+    /// MOD-125 M2 D8: `queued_runs_on_box` leaves out the queued runs of a stopped workspace (they
+    /// hold no slot and cannot be claimed until the resume), keeps a run without a workspace, and
+    /// lists the held run again once the workspace resumes. The Postgres half is
+    /// `pg_criteria.rs::queued_runs_on_box_skips_a_stopped_workspaces_runs`.
+    #[tokio::test]
+    async fn queued_runs_on_box_skips_a_stopped_workspaces_runs() {
+        let store = MemStore::demo();
+        let workspace = store
+            .create_workspace(crate::model::NewWorkspace {
+                id: crate::model::WorkspaceId::new(),
+                slug: "held".to_owned(),
+                name: "Held".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the workspace is created")
+            .id;
+        // The fixture already queues a run on this box (of another workspace): it leads.
+        let fixture = store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered");
+        let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let late = early + TimeDelta::seconds(1);
+        let mut queued = Vec::new();
+        for (title, scoped, queued_at) in [
+            ("queued in the workspace", Some(workspace), early),
+            ("queued without a workspace", None, late),
+        ] {
+            let item = store
+                .mint_item(NewItem {
+                    id: ItemId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    kind_id: ids::KIND_HTUI_FEAT,
+                    title: title.to_owned(),
+                    body: String::new(),
+                    required_tags: Vec::new(),
+                    touched_paths: Vec::new(),
+                    priority: 0,
+                    step_graph_id: None,
+                    created_by: ids::USER,
+                    box_id: Some(ids::BOX),
+                })
+                .await
+                .expect("the mint lands")
+                .id;
+            let run = store
+                .create_run(NewRun {
+                    workspace_id: scoped,
+                    queued_at,
+                    ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                })
+                .await
+                .expect("the run is queued")
+                .id;
+            queued.push((run, queued_at));
+        }
+        let [scoped, unscoped] = queued[..] else {
+            panic!("two runs were queued")
+        };
+        let both = [fixture.clone(), vec![scoped, unscoped]].concat();
+        let read = || async {
+            store
+                .queued_runs_on_box(ids::BOX)
+                .await
+                .expect("the read is answered")
+        };
+        assert_eq!(
+            read().await,
+            both,
+            "control: both runs are queued on the box"
+        );
+
+        store
+            .stop_workspace(
+                workspace,
+                crate::model::StopMode::Graceful,
+                ids::USER,
+                Utc::now(),
+            )
+            .await
+            .expect("the stop is recorded");
+        assert_eq!(
+            read().await,
+            [fixture.clone(), vec![unscoped]].concat(),
+            "the stopped workspace's queued run is left out; the unscoped one stays"
+        );
+
+        assert!(
+            store
+                .resume_workspace(workspace)
+                .await
+                .expect("the resume is answered"),
+            "the workspace resumes"
+        );
+        assert_eq!(
+            read().await,
+            both,
+            "the held run is listed again after the resume"
+        );
+    }
+
     /// ANA-2 §4.7's admission: the repo-scope overlap refuses before the slot count does, and the
     /// slot count is `box.settings.max_concurrent_items`.
     #[tokio::test]
@@ -17223,6 +17384,53 @@ mod tests {
         assert_eq!(
             again, entry,
             "a repeat answers the stored entry, its workspace included"
+        );
+    }
+
+    /// MOD-125 M2 D10 (M1 review L-3): queueing an item under a workspace that is gone is refused
+    /// in [`workspace_gone`](crate::store::workspace_gone)'s sentence, and nothing is queued. The
+    /// Postgres half is `pg_criteria.rs::queue_item_naming_a_gone_workspace_reads_switch_workspace`.
+    #[tokio::test]
+    async fn queue_item_naming_a_gone_workspace_reads_switch_workspace() {
+        let store = MemStore::demo();
+        let workspace = store
+            .create_workspace(crate::model::NewWorkspace {
+                id: crate::model::WorkspaceId::new(),
+                slug: "gone".to_owned(),
+                name: "Gone".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the workspace is created")
+            .id;
+        store
+            .delete_workspace(workspace)
+            .await
+            .expect("the workspace is deleted");
+
+        let refused = store
+            .queue_item(
+                ids::HTUI_CLEAN_1,
+                ids::BOX,
+                Some(workspace),
+                ids::USER,
+                Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            refused,
+            Err(StoreError::Constraint(crate::store::workspace_gone())),
+            "a gone workspace reads \"switch workspace\""
+        );
+        assert!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total")
+                .iter()
+                .all(|entry| entry.item_id != ids::HTUI_CLEAN_1),
+            "the refusal queued nothing"
         );
     }
 
