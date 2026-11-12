@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT to_item_id AS \"to_item_id: ItemId\"\n                  FROM item_link\n                 WHERE from_item_id = $1 AND kind = $2 AND to_item_id <> $3\n                   AND deleted_at IS NULL\n                 ORDER BY to_item_id\n                 LIMIT 1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "to_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "to_item_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "419580c53595c4ff92fb66a317e3cc3ab26e9b17a4e1e907efd3d680fff66a68"
+}

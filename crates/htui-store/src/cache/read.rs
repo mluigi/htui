@@ -920,11 +920,11 @@ impl ReadStore for CacheStore {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "WITH RECURSIVE up(item_id, depth) AS ( \
                      SELECT to_item_id, 1 FROM item_link \
-                      WHERE from_item_id = ? AND kind IN ('blocked_by','origin') \
+                      WHERE from_item_id = ? AND kind IN ('blocked_by','origin','parent') \
                  UNION \
                      SELECT l.to_item_id, up.depth + 1 \
                        FROM item_link l JOIN up ON l.from_item_id = up.item_id \
-                      WHERE up.depth < ? AND l.kind IN ('blocked_by','origin') \
+                      WHERE up.depth < ? AND l.kind IN ('blocked_by','origin','parent') \
              ), \
              best AS (SELECT item_id, MIN(depth) AS depth FROM up GROUP BY item_id), \
              scope AS ( \

@@ -1879,8 +1879,9 @@ impl State {
     ///
     /// 1. **Directed.** Only `to_item_id` is followed. `link_graph` follows an edge from either
     ///    end and a conformance case pins that, so the two walks cannot share a step.
-    /// 2. **Kind-filtered.** `blocked_by` and `origin` only; `relates` and `supersedes` are not
-    ///    upstream, they are context.
+    /// 2. **Kind-filtered.** `blocked_by`, `origin` and `parent` only
+    ///    ([`LinkKind::walks_upstream`], MOD-150 D6); `relates`, `supersedes`, `duplicates` and
+    ///    `implements` are not upstream, they are context.
     /// 3. **`MIN(depth)`.** `seen` is written on first arrival and breadth-first order means first
     ///    arrival is the nearest one, so a diamond renders its apex once, at the shorter depth.
     /// 4. **Canonical order**, by [`UpstreamEntry::sort_canonical`], so this backend and the two

@@ -622,12 +622,12 @@ impl ReadStore for PgStore {
                     SELECT l.to_item_id AS item_id, 1 AS depth
                       FROM item_link l
                      WHERE l.from_item_id = $1
-                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL
+                       AND l.kind IN ('blocked_by','origin','parent') AND l.deleted_at IS NULL
                 UNION
                     SELECT l.to_item_id, up.depth + 1
                       FROM item_link l JOIN up ON l.from_item_id = up.item_id
                      WHERE up.depth < $2::int
-                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL
+                       AND l.kind IN ('blocked_by','origin','parent') AND l.deleted_at IS NULL
             ),
             best AS (SELECT item_id, MIN(depth) AS depth FROM up GROUP BY item_id),
             scope AS (

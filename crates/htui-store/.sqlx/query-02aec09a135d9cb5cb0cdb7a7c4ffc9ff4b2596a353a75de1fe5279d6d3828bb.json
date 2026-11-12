@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH RECURSIVE up(item_id, n) AS (\n                        SELECT $1::uuid, 1\n                    UNION ALL\n                        SELECT l.to_item_id, up.n + 1\n                          FROM up\n                          JOIN item_link l ON l.from_item_id = up.item_id\n                         WHERE l.kind = 'parent' AND l.deleted_at IS NULL AND up.n < $3\n                )\n                SELECT COALESCE(bool_or(item_id = $2), FALSE) AS \"cycle!\",\n                       MAX(n)                                AS \"levels!\"\n                  FROM up\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cycle!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "levels!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "02aec09a135d9cb5cb0cdb7a7c4ffc9ff4b2596a353a75de1fe5279d6d3828bb"
+}
