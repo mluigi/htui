@@ -2711,6 +2711,51 @@ where
         })
     }
 
+    /// MOD-125 M2 D3: settles `run` as `stopped` once this process's walk of it is quiesced —
+    /// preempted and abandoned, ended on the run's cancel signal, or never live here (a sweep
+    /// adoption before the walk began, a [`DeadWalks`] entry). `cancel_leased`'s shape minus
+    /// everything terminal: no `finish_run`, no `cleanup_walk`, so the trees, the branch and the
+    /// session banner stay and the item stays `in_progress` (M1 D2).
+    ///
+    /// 1. [`Self::take_lease`]: the preempted walk released the lease (`walk_leased`'s error arm,
+    ///    or [`Self::abandoned`]); a take also drops a dead walk's entry and guards (plan D140,
+    ///    D210). A run that is not `running`/parked, runs on another box, or whose lease a live
+    ///    stranger holds answers `Ok(false)` with nothing written.
+    /// 2. Under the lease: every follow-up window closes and a pending follow-up is refused with
+    ///    [`FOLLOW_UP_SESSION_ENDED`] (D12; idempotent, best-effort), then the store's
+    ///    [`stop_run`](htui_core::store::WorkerStore::stop_run): `running → stopped`, the running
+    ///    steps `stopped`, the lease released in the same transaction.
+    /// 3. `true`: the run's guards are released once more (touching no tree). `false` (it parked
+    ///    meanwhile, or another writer settled it): the lease this call took goes back.
+    ///
+    /// The caller holds the run's lock (MOD-4 plan D157). Writes no activity row, as
+    /// `cancel_leased` writes none; the runtime logs the stop with its mode.
+    ///
+    /// # Errors
+    /// The store's own failures and an unknown run (`NotFound`); every "not this stop's to write"
+    /// answer is `Ok(false)`.
+    pub async fn settle_stop(&self, run: RunId) -> Result<bool, EngineError> {
+        match self.take_lease(run).await {
+            Ok(_) => {}
+            Err(EngineError::RunStatus { .. } | EngineError::LeaseHeld { .. }) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+        let stopped = self
+            .leased_window(run, async {
+                self.close_finished_follow_ups(run, FOLLOW_UP_SESSION_ENDED)
+                    .await;
+                Ok(self.parts.store.stop_run(run, self.parts.owner).await?)
+            })
+            .await?;
+        if stopped {
+            self.release_guards(run, "releasing a stopped run's guards failed")
+                .await;
+        } else {
+            self.release_lease(run).await;
+        }
+        Ok(stopped)
+    }
+
     // -- the lease (ANA-2 §4.9, plan D86, D87, D107, D108) ---------------------------------------
 
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
@@ -10487,6 +10532,22 @@ pub async fn claim_fake(
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.claim(run).await
+}
+
+/// [`Engine::settle_stop`] over a `FakeOrchestrator`'s parts (MOD-125 M2 conformance).
+///
+/// # Errors
+/// As [`Engine::settle_stop`].
+#[cfg(feature = "test-support")]
+pub async fn settle_stop_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: RunId,
+) -> Result<bool, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.settle_stop(run).await
 }
 
 /// MOD-139 M3 D11: [`Engine::enqueue`] over a `FakeOrchestrator`'s parts — `Manual`, the item's
@@ -18444,6 +18505,311 @@ mod tests {
         );
     }
 
+    // -- MOD-125 M2 D3: `Engine::settle_stop` ----------------------------------------------------
+
+    /// `FEAT-3` over a primary repo with `prd` ungated, its walk dropped inside `plan`'s session
+    /// after `prd` settled `done` (a stop's token drop), then [`super::Engine::abandoned`], as the
+    /// runtime runs it: the run `running`, its lease given back. Answers the run.
+    async fn preempted_in_plan(harness: &Harness) -> htui_core::model::RunId {
+        harness.add_primary_repo().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                }
+            })
+            .await;
+        let stalled = harness.orch.stall_after_done("plan", 1, None, false);
+        let walk = harness.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: None,
+        });
+        match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
+            futures::future::Either::Left((outcome, _)) => {
+                panic!("the walk finished instead of stalling: {outcome:?}")
+            }
+            futures::future::Either::Right(((), walk)) => drop(walk),
+        }
+        let run = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.id != ids::RUN_2)
+            .expect("the dropped walk's run exists")
+            .id;
+        harness_engine!(harness.orch, engine);
+        engine.abandoned(run).await;
+        run
+    }
+
+    /// `settle_stop` answers `false` on `run` and writes nothing to it or its steps.
+    async fn assert_stop_writes_nothing(harness: &Harness, run: htui_core::model::RunId) {
+        let (before, steps) = (harness.orch.run(run).await, harness.orch.steps(run).await);
+        harness_engine!(harness.orch, engine);
+        assert!(
+            !engine
+                .settle_stop(run)
+                .await
+                .expect("a run not this stop's answers `false`"),
+            "nothing to settle"
+        );
+        assert_eq!(harness.orch.run(run).await, before, "the run is untouched");
+        assert_eq!(harness.orch.steps(run).await, steps, "and its steps");
+    }
+
+    /// MOD-125 M2 D3: the preempted walk gave the lease back (`abandoned`); the stop retakes it,
+    /// settles the run and its running step `stopped` and gives it back in the same write. The
+    /// `done` step, the trees and the item's run stay: no `finish_run`, no `cleanup_walk`.
+    #[tokio::test]
+    async fn a_stop_retakes_the_released_lease_and_settles_run_and_step_stopped_keeping_the_trees()
+    {
+        let harness = Harness::new().await;
+        let run = preempted_in_plan(&harness).await;
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "`abandoned` gave the lease back"
+        );
+        let before = harness.orch.steps(run).await;
+        let running: Vec<_> = before
+            .iter()
+            .filter(|step| step.status == StepStatus::Running)
+            .cloned()
+            .collect();
+        assert_eq!(running.len(), 1, "`plan` is live: {before:?}");
+        assert!(
+            before.iter().any(|step| step.status == StepStatus::Done),
+            "`prd` settled `done`: {before:?}"
+        );
+        let plan = running[0].id;
+        let trees = harness
+            .orch
+            .store
+            .step_trees(plan)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(!trees.is_empty(), "`plan` recorded its tree");
+        let releases = harness.orch.isolator.releases();
+        harness_engine!(harness.orch, engine);
+
+        assert!(
+            engine.settle_stop(run).await.expect("the stop settles"),
+            "the stop is this process's to write"
+        );
+
+        let row = harness.orch.run(run).await;
+        assert_eq!(
+            (row.status, row.finished_at, row.failure),
+            (RunStatus::Stopped, None, None),
+            "stopped, not finished"
+        );
+        let after = harness.orch.steps(run).await;
+        assert_eq!(after.len(), before.len(), "no step was added");
+        for step in &after {
+            if step.id == plan {
+                assert_eq!(step.status, StepStatus::Stopped, "the live step stops");
+                assert_eq!(step.finished_at, None, "and is not finished");
+            } else {
+                assert_eq!(
+                    Some(step),
+                    before.iter().find(|row| row.id == step.id),
+                    "a settled step is untouched"
+                );
+            }
+        }
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .step_trees(plan)
+                .await
+                .expect("MemStore never fails a read"),
+            trees,
+            "the trees stay"
+        );
+        assert_eq!(harness.orch.isolator.cleanups(), 0, "no `cleanup_walk`");
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            releases + 1,
+            "the guards are released once more"
+        );
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        assert!(
+            !harness
+                .orch
+                .store
+                .refresh_lease(run, harness.orch.owner(), ttl)
+                .await
+                .expect("MemStore refreshes"),
+            "`stop_run` released the lease"
+        );
+        assert_eq!(
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Stopped,
+            "the item reads its stopped run"
+        );
+    }
+
+    /// MOD-125 M2 D3: a run that is not `running` — finished, cancelled, or stopped already — is
+    /// not the stop's: `false`, nothing written, no lease taken.
+    #[tokio::test]
+    async fn a_stop_of_a_run_that_finished_or_was_cancelled_writes_nothing() {
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        harness
+            .orch
+            .store
+            .finish_run(run, RunStatus::Done, None, harness.orch.clock.now())
+            .await
+            .expect("MemStore finishes the run");
+        assert_stop_writes_nothing(&harness, run).await;
+
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        let cancelled = harness
+            .dispatch(Command::CancelRun { run })
+            .await
+            .expect("the cancel lands");
+        assert!(
+            matches!(cancelled, CommandOutcome::Cancelled { .. }),
+            "{cancelled:?}"
+        );
+        assert_stop_writes_nothing(&harness, run).await;
+
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        {
+            harness_engine!(harness.orch, engine);
+            assert!(
+                engine
+                    .settle_stop(run)
+                    .await
+                    .expect("the first stop settles"),
+                "the first stop writes"
+            );
+        }
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Stopped);
+        assert_stop_writes_nothing(&harness, run).await;
+    }
+
+    /// MOD-125 M2 D3: a live lease another process holds, or a run executing on another box,
+    /// refuses the stop with nothing written: that process's poll applies it.
+    #[tokio::test]
+    async fn a_stop_while_another_owner_holds_the_lease_writes_nothing() {
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        let store = &harness.orch.store;
+        assert!(
+            store
+                .release_lease(run, harness.orch.owner())
+                .await
+                .expect("MemStore releases"),
+            "the run's lease was this process's"
+        );
+        let stranger = uuid::Uuid::now_v7();
+        assert!(
+            store
+                .take_lease(run, ids::BOX, stranger, TimeDelta::days(1))
+                .await
+                .expect("MemStore takes the lease"),
+            "a stranger takes the free lease"
+        );
+        assert_stop_writes_nothing(&harness, run).await;
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Running);
+        assert!(
+            store
+                .refresh_lease(run, stranger, TimeDelta::minutes(1))
+                .await
+                .expect("MemStore refreshes"),
+            "the stranger still holds the lease"
+        );
+
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .release_lease(run, harness.orch.owner())
+                .await
+                .expect("MemStore releases")
+        );
+        let before = harness.orch.run(run).await;
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
+        let mut parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        parts.box_id = htui_core::model::BoxId::new();
+        let elsewhere = super::Engine::new(parts);
+        assert!(
+            !elsewhere
+                .settle_stop(run)
+                .await
+                .expect("a run on another box answers `false`"),
+            "not this box's run"
+        );
+        assert_eq!(harness.orch.run(run).await, before, "nothing was written");
+    }
+
+    /// MOD-125 M2 F7: a run that parked between the poll and the settle is taken (`take_lease`
+    /// takes a parked run) but not stopped; the lease the stop took goes back.
+    #[tokio::test]
+    async fn a_stop_of_a_run_that_parked_meanwhile_gives_the_lease_back() {
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        let store = &harness.orch.store;
+        assert!(
+            store
+                .transition_run(
+                    run,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    harness.orch.clock.now(),
+                )
+                .await
+                .expect("MemStore takes the move"),
+            "the run parked"
+        );
+        assert!(
+            store
+                .release_lease(run, harness.orch.owner())
+                .await
+                .expect("MemStore releases"),
+            "the parking walk gave the lease back"
+        );
+        harness_engine!(harness.orch, engine);
+
+        assert!(
+            !engine
+                .settle_stop(run)
+                .await
+                .expect("a parked run answers `false`"),
+            "a parked run is not stopped"
+        );
+
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        assert!(
+            !store
+                .refresh_lease(run, harness.orch.owner(), ttl)
+                .await
+                .expect("MemStore refreshes"),
+            "the lease the stop took went back"
+        );
+    }
+
     /// How long a case waits on a walk or a `prepare` that must not queue behind a stale
     /// `shared_serialized` guard; nothing it waits on sleeps, so reaching it is the hang.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -22864,6 +23230,136 @@ mod tests {
                     false
                 ),
                 "the cancel's close refused the second"
+            );
+            assert_window_closed(&orch.store, prd.id);
+        }
+
+        /// MOD-125 M2 D2, D3: a stop's cancel reaching a parked turn: the walk answers
+        /// `Cancelled`, `abandoned` runs as the runtime runs it, and `settle_stop` settles the run
+        /// and its step `stopped`. Every event the turn played before the cancel has its row, and
+        /// the turn's one `done` row, `cancelled`, is the last (the recorder flushed on it).
+        #[tokio::test(start_paused = true)]
+        async fn a_stop_records_the_turns_cancelled_done() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            let mut scripted = parks("the prd");
+            let chunk = |text: &str| {
+                ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                    text: text.into(),
+                    message_id: None,
+                }))
+            };
+            scripted.script.turns[0]
+                .events
+                .splice(0..0, [chunk("first"), chunk("second")]);
+            harness.orch.script("prd", 1, scripted);
+
+            let (walked, parked) = tokio::join!(
+                walked(harness.dispatch(start_feat_3())),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the request was relayed before the cancel");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            harness_engine!(harness.orch, engine);
+            engine.abandoned(run).await;
+            assert!(
+                engine.settle_stop(run).await.expect("the stop settles"),
+                "the stop is this process's to write"
+            );
+            assert_eq!(harness.orch.run(run).await.status, RunStatus::Stopped);
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::Stopped);
+            let log = log(&harness.orch.store, prd.id).await;
+            let kinds: Vec<EventKind> = log
+                .iter()
+                .filter(|row| row.kind != EventKind::Prompt)
+                .map(|row| row.kind)
+                .collect();
+            // The banner (`other`, `session_started`) the resume reads, both chunks (merged
+            // into one text row), the call, its request, I-7's cancelled answer, the call's
+            // cancelled result, then the `done`.
+            assert_eq!(
+                kinds,
+                [
+                    EventKind::Other,
+                    EventKind::AssistantText,
+                    EventKind::ToolCall,
+                    EventKind::PermissionRequest,
+                    EventKind::PermissionAnswer,
+                    EventKind::ToolResult,
+                    EventKind::Done,
+                ],
+                "every event before the `done` has its row, the `done` last: {log:?}"
+            );
+            assert!(
+                log.iter().any(|row| row.kind == EventKind::Other
+                    && row.payload["update"] == "session_started"),
+                "the session banner stays: {log:?}"
+            );
+            assert!(
+                log.iter().any(|row| row.kind == EventKind::AssistantText
+                    && row.payload["text"] == "firstsecond"),
+                "both chunks were recorded: {log:?}"
+            );
+            let done = log.last().expect("the log holds the `done`");
+            assert_eq!(
+                done.payload["stop_reason"], "cancelled",
+                "the turn's `done` is the cancel's: {done:?}"
+            );
+            assert_cancel_answered_once(&harness.orch, prd.id).await;
+        }
+
+        /// MOD-125 M2 D12: a stop's cancel during a follow-up turn refuses the follow-up queued
+        /// during the turn with the cancelled sentence (the relay's close, as on a cancel), and
+        /// `settle_stop`'s own close keeps it so: the person re-sends after the resume.
+        #[tokio::test(start_paused = true)]
+        async fn a_stopped_steps_pending_follow_up_is_refused_session_cancelled() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, parks_then(hangs_on_a_second_request(), "the prd"));
+            let orch = &harness.orch;
+            let (walked, client) =
+                tokio::join!(walked(Box::pin(harness.dispatch(start_feat_3()))), async {
+                    let queued = queues_into_turn_1(&orch.store, ids::HTUI_FEAT_3).await;
+                    orch.cancel_walks(GRACE);
+                    queued
+                });
+            let (parked, first, second) = client.expect("the client saw turn 1 start");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            harness_engine!(harness.orch, engine);
+            engine.abandoned(run).await;
+
+            assert!(
+                engine.settle_stop(run).await.expect("the stop settles"),
+                "the stop is this process's to write"
+            );
+
+            assert_eq!(orch.run(run).await.status, RunStatus::Stopped);
+            let prd = step_at(orch, run, 0, 0).await;
+            assert_eq!((prd.status, prd.finished_at), (StepStatus::Stopped, None));
+            assert_eq!(
+                the_follow_up(&orch.store, first),
+                (RunCommandStatus::Applied, None, false)
+            );
+            assert_eq!(
+                the_follow_up(&orch.store, second),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_SESSION_CANCELLED.to_owned()),
+                    false
+                ),
+                "the stopped step's pending follow-up is refused, its text gone"
             );
             assert_window_closed(&orch.store, prd.id);
         }

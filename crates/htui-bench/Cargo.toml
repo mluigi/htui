@@ -1,6 +1,6 @@
 [package]
 name        = "htui-bench"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "MOD-162: the retrieval benchmark over htui's own search; a dev tool, never shipped"
 
 edition.workspace      = true

@@ -1072,6 +1072,21 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   `.claude/prds/mod-125-stop-and-resume-runs.prd.md`: M2 the executor applies stops (plus the R1
   deferrals: refuse deleting a workspace with stopped runs, readable FK refusal, minimum version),
   M3 resume through saved sessions, M4 the `htui stop`/`htui resume` verbs.
+  **Phase 2 landed (hr/MOD-125, 2026-11-12; plan `.claude/plans/mod-125-m2-stop-applied.plan.md`):** the
+  executor applies stops. The command poll (TUI and worker alike) lists `pending_stops(owner)`, interrupts each
+  walk through the cancel seam (graceful `CANCEL_GRACE`, forced zero; token drop at grace + `STOP_SLACK` 5 s),
+  retakes the lease and settles `stopped` (`Engine::settle_stop`), trees and session banner kept; a pending
+  cancel wins and a stopped run takes no cancel row (store-serialised); walking commands, `p` and an unblock
+  resume are refused in a stopped workspace; `admit` holds a stopped workspace's entries without using slots or
+  draining the batch; a dropped check kills its process group. M1 deferrals landed: M-3 (also while
+  stopping), L-3, L-7's `admit` half; every crate is `0.2.0` (L-5). Next: M3 resume, M4 the verbs. Owed:
+  **(1) M4 must ship with a migration** (a no-op `0030` if it has none), plus a test that the target rises:
+  `htui_target_version` rises only in `apply_migrations`, so the 0.2.0 bump does not refuse a 0.1.0 worker
+  on an already-migrated database (review H1, deferred by the maintainer); after the merge, reinstall the
+  MCP relay and `htui claude emit --force` on each box (0.1.0 relay refused). **(2) M3** must give every
+  stopped run a way to be resumed or cancelled, including one whose workspace has no `workspace_stop` row
+  (the demo's `RUN_8` in `graphics`, now undeletable), and `select_fanout`'s lists gain `stopped` (L-7).
+  On the host: the live-Qdrant suites (timeouts in the sandbox) and the Postgres gate on the merged tree.
 
 - [ ] **MOD-126 - Light model setting and run-start workflow pick** (from ANA-40, `docs/ANA-40.md` §5.4, §8 P1).
   `R-ORCH-1`, `R-ID-6`, `R-TUI-17`, `R-PRM-1`. One `app_setting` key `{agent_id, model}` (ANA-30 option B), a new

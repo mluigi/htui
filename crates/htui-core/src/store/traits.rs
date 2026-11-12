@@ -65,7 +65,7 @@ use crate::model::{
     MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
     NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
-    NewWorkspace, Note, OpenPermission, OwnerDocument, PermissionChoice, PermissionId,
+    NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting,
     QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
@@ -1477,8 +1477,11 @@ pub trait WriteStore: ReadStore {
     /// holder bytes, project slug bytes) order;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// ([`workspace_has_live_run`], MOD-147 A1) while a run of its scope row is live
-    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped). Nothing is
-    /// deleted then.
+    /// ([`RunStatus::is_active`]: queued, running, awaiting_approval or stopped);
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// ([`workspace_has_stopped_run`], MOD-125 M2 D9) while a run of a member project that
+    /// recorded this workspace is `stopped` (or `running` under the workspace's stop, DV-2),
+    /// checked after A1's. Nothing is deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
     /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts
@@ -1515,6 +1518,8 @@ pub trait WriteStore: ReadStore {
     /// for an unknown batch, `Constraint` ([`batch_is_closed`]) for a closed one. MOD-147 D8: a run
     /// on a scope row carries its workspace ([`run_workspace_for`]: `None` is filled), another
     /// workspace is `Constraint` ([`scope_row_run_workspace`]), checked before any foreign key.
+    /// MOD-125 M2 D10: an unknown (or deleted) `new.workspace_id` is `Constraint` in
+    /// [`workspace_gone`]'s sentence on both stores.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
@@ -1689,9 +1694,11 @@ pub trait WriteStore: ReadStore {
     /// In one transaction every `running` step of the run moves to `stopped` and the lease is
     /// released as [`release_lease`](WriteStore::release_lease) releases it (`lease_owner = NULL`,
     /// `lease_expires_at = <store now>`, `lease_box_id` and `executing_box_id` kept). No
-    /// `finished_at`, no item write. `Ok(false)` when the run is not `running` or not `owner`'s;
-    /// nothing is written then. The caller has quiesced its walk (M2): a step it starts
-    /// concurrently is not this verb's to stop.
+    /// `finished_at`, no item write. `Ok(false)` when the run is not `running` or not `owner`'s,
+    /// or (MOD-125 M2 R1, review M-1) a cancel of it is `pending`, decided under the run's lock:
+    /// a pending cancel wins (M2 D4), and a stopped run would strand it, since no executor's poll
+    /// lists a stopped run's cancel. Nothing is written then. The caller has quiesced its walk
+    /// (M2): a step it starts concurrently is not this verb's to stop.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
@@ -2277,13 +2284,20 @@ pub trait WriteStore: ReadStore {
     ) -> Result<u64>;
 
     /// D12: one `pending` cancel per run. Writes `(id, run, 'cancel', user, box_id)` unless a
-    /// pending cancel exists. Never reads the run's status: the caller decides (B-20). And, in the
-    /// same transaction, refuses every `pending` follow-up of the run with
+    /// pending cancel exists. Otherwise never reads the run's status: the caller decides (B-20).
+    /// And, in the same transaction, refuses every `pending` follow-up of the run with
     /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) (MOD-70 D5, B-14; on
     /// `AlreadyPending` too).
     ///
+    /// MOD-125 M2 R1 (review M-1): a `stopped` run is refused, read under a share lock on the run
+    /// row that [`stop_run`](WriteStore::stop_run)'s own lock waits on (and the reverse), so a
+    /// cancel and a stop of one run serialise: either the row is written first and the stop
+    /// answers `false`, or the stop commits first and the cancel is refused. No row, no
+    /// follow-up refused then.
+    ///
     /// # Errors
-    /// `NotFound { entity: "run" }`; `Constraint` for an unknown user or box (B-7).
+    /// `NotFound { entity: "run" }`; `Constraint` ([`cancel_of_a_stopped_run`]) for a `stopped`
+    /// run; `Constraint` for an unknown user or box (B-7), in that order.
     async fn request_cancel(
         &self,
         run: RunId,
@@ -2300,6 +2314,20 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>>;
+
+    /// MOD-125 M2 D1: the stops this process applies: every `running` run whose
+    /// `lease_owner = owner` (live or lapsed, as [`pending_commands`](Self::pending_commands)'
+    /// owner arm) and whose `workspace_id` has a `workspace_stop` row, with that row's mode, in
+    /// `(queued_at, id)` order. A run without a workspace, a parked, queued or stopped run, and
+    /// another owner's run are never listed: another owner's lapsed lease is the sweep's
+    /// (`adopt_runs` settles it, M1 D6), and its live one is that process's poll. The owner's own
+    /// lapsed lease is listed, as in `pending_commands`: `settle_stop`'s `take_lease` and the
+    /// sweep converge on that run. No row is written: the request is the `workspace_stop` row
+    /// itself.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>>;
 
     /// D12, D13: compare-and-set `pending → to` (`Applied` or `Refused`), with `resolution`,
     /// `resolved_at` the store's clock. `Ok(false)` = not pending any more (I-3). Always clears
@@ -3703,6 +3731,39 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     )
 }
 
+/// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` while `runs` (≥ 1) of its member projects'
+/// runs that recorded this workspace are stopped (DV-2: or still running under its stop). A
+/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names resume: a
+/// stopped run is cancelled or finished only once resumed (M3).
+#[must_use]
+pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
+    let (noun, pronoun) = if runs == 1 {
+        ("run", "it")
+    } else {
+        ("runs", "them")
+    };
+    format!(
+        "workspace `{workspace}` has {runs} stopped {noun}; resume the workspace and finish or \
+         cancel {pronoun} before deleting the workspace"
+    )
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): a run or a queue entry names a workspace that is gone, in
+/// both stores' words (Pg maps `fk_run_workspace` / `fk_queue_entry_workspace` to it).
+#[must_use]
+pub fn workspace_gone() -> String {
+    "this workspace no longer exists: switch workspace".to_owned()
+}
+
+/// MOD-125 M2 R1 (review M-1): a cancel of a `stopped` run. `request_cancel` refuses it in both
+/// stores (no `run_command` row a stopped run's executor would never apply), and the runtime
+/// refuses a pending row that reaches a stopped run in the same words. A stopped run is cancelled
+/// once its workspace is resumed (M3).
+#[must_use]
+pub fn cancel_of_a_stopped_run(run: RunId) -> String {
+    format!("run `{run}` is stopped: resume its workspace first, then cancel it")
+}
+
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
 /// the scope row goes only with its workspace.
 #[must_use]
@@ -4453,8 +4514,8 @@ pub fn queue_token_refusal(
 mod tests {
     use super::{
         LIVE_RUN_STATUSES, not_startable, project_slug_is_reserved, project_slug_refusal,
-        run_workspace_for, scope_row_is_deleted_with_its_workspace, startable,
-        workspace_has_live_run,
+        run_workspace_for, scope_row_is_deleted_with_its_workspace, startable, workspace_gone,
+        workspace_has_live_run, workspace_has_stopped_run,
     };
     use crate::model::{ItemState, RunStatus, Status, WorkspaceId};
     use crate::store::StoreError;
@@ -4527,6 +4588,30 @@ mod tests {
             workspace_has_live_run("shop", 3),
             "workspace `shop` has 3 live runs; finish or cancel them before deleting the \
              workspace"
+        );
+    }
+
+    /// MOD-125 M2 D10: the gone-workspace refusal names what to do.
+    #[test]
+    fn workspace_gone_says_switch_workspace() {
+        assert_eq!(
+            workspace_gone(),
+            "this workspace no longer exists: switch workspace"
+        );
+    }
+
+    /// MOD-125 M2 D9: the stopped-run refusal counts its runs and names the resume.
+    #[test]
+    fn workspace_has_stopped_run_counts_runs() {
+        assert_eq!(
+            workspace_has_stopped_run("shop", 1),
+            "workspace `shop` has 1 stopped run; resume the workspace and finish or cancel it \
+             before deleting the workspace"
+        );
+        assert_eq!(
+            workspace_has_stopped_run("shop", 2),
+            "workspace `shop` has 2 stopped runs; resume the workspace and finish or cancel \
+             them before deleting the workspace"
         );
     }
 

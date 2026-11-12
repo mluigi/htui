@@ -23,7 +23,7 @@ use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection,
 use htui_core::fixtures::ids;
 use htui_core::model::{
     ItemKindId, NewItemKind, NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    RunStatus, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::root_path::{DirEntry, DirListing};
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
@@ -877,6 +877,19 @@ async fn delete_reach_equals_deleted_reach() {
 async fn delete_workspace_keeps_its_projects() {
     let store = MemStore::demo();
     let backend = Backend::memory(store.clone());
+    // MOD-125 M2 D9: the demo's stopped `RUN_8` would refuse the delete.
+    assert!(
+        store
+            .transition_run(
+                ids::RUN_8,
+                RunStatus::Stopped,
+                RunStatus::Cancelled,
+                Utc::now()
+            )
+            .await
+            .expect("the store answers"),
+        "the demo's stopped member run is cancelled first"
+    );
 
     let reply = serve(
         &backend,
@@ -3312,6 +3325,40 @@ async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
     assert!(
         frame.contains("\u{258c}beta/"),
         "the picker is still open: {frame}"
+    );
+}
+
+/// MOD-125 M2 D9 (M1 review M-3): a workspace whose member run is `stopped` refuses the delete,
+/// and the refusal reads on the status line in the store's own words; nothing is deleted. The
+/// demo's `graphics` holds `RUN_8`, a stopped run of `vulkan-tutorials`.
+#[tokio::test]
+async fn a_workspace_with_a_stopped_run_is_refused_on_the_status_line() {
+    let mut harness = hierarchy_over(MemStore::demo()).await.size(200, 30);
+    harness.key("d");
+    harness.settle().await;
+    harness.key("y");
+    harness.settle().await;
+    type_into(&mut harness, "graphics");
+    harness.key("enter");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("delete_workspace: constraint violated"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("workspace `graphics` has 1 stopped run"),
+        "{frame}"
+    );
+    assert_eq!(
+        harness.app().top_bar.workspace,
+        "Graphics",
+        "nothing was deleted: the workspace is still in scope"
+    );
+    assert!(
+        frame.contains("vulkan-tutorials"),
+        "and its tree is still drawn: {frame}"
     );
 }
 

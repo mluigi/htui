@@ -1,6 +1,6 @@
 [package]
 name        = "htui-store"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "Postgres store, per-box SQLite cache and the Backend the TUI holds"
 
 edition.workspace      = true

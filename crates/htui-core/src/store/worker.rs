@@ -12,13 +12,14 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 70 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
-//! MOD-139 M1 `run_plans`), 7 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
+//! `WorkerStore` is 71 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! MOD-139 M1 `run_plans`), 8 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
 //! MOD-139 M2 `admit_plan` and `abandon_plans`),
 //! `write_document`, MOD-42's three command methods, MOD-11's
 //! four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
-//! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; MOD-144 R1 adds the write
+//! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`, MOD-125 M2 the read
+//! `pending_stops`; MOD-144 R1 adds the write
 //! `block_if_idle`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
@@ -37,13 +38,13 @@ use crate::model::{
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
     DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
     MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep, Note,
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
-    PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry,
-    QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
-    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
-    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
+    PhaseId, PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch,
+    QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
+    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -438,6 +439,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         owner: Uuid,
         box_id: BoxId,
     ) -> impl Future<Output = Result<Vec<RunCommand>>> + Send;
+    /// [`WriteStore::pending_stops`].
+    fn pending_stops(&self, owner: Uuid) -> impl Future<Output = Result<Vec<PendingStop>>> + Send;
     /// [`WriteStore::resolve_command`].
     fn resolve_command(
         &self,
@@ -599,7 +602,8 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
 
     // -- MOD-41 T7 (plan D11)
     /// `Backend::queued_runs_on_box`: this box's `queued` runs, `(id, queued_at)` in
-    /// `(queued_at, id)` order.
+    /// `(queued_at, id)` order, less the queued runs of a stopped workspace (MOD-125 M2 D8: they
+    /// hold no slot and cannot be claimed until the resume).
     fn queued_runs_on_box(
         &self,
         box_id: BoxId,
@@ -997,6 +1001,9 @@ impl WorkerStore for MemStore {
     }
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
         WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        WriteStore::pending_stops(self, owner).await
     }
     async fn resolve_command(
         &self,

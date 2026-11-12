@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM run_command\n                               WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending')\n                      AS \"pending!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pending!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6b55eba0e70367e5f7e64a36dd64d21c656515b90bf5de64092dbf678859b938"
+}

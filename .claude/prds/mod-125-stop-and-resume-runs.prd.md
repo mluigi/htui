@@ -122,17 +122,17 @@ Decisions taken at the PRD gate (maintainer, 2026-10-18):
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Stopped state and workspace gate | Runs and steps can be `stopped`; a run knows its workspace; a stopped workspace admits, claims and adopts nothing, on both stores | complete | `.claude/plans/mod-125-m1-stopped-state.plan.md` |
-| 2 | Stop applied by the executor | A durable stop request, graceful or forced, settles every run of the workspace as `stopped` with the conversation recorded, in process and on a worker | pending | — |
+| 2 | Stop applied by the executor | A durable stop request, graceful or forced, settles every run of the workspace as `stopped` with the conversation recorded, in process and on a worker | complete | `.claude/plans/mod-125-m2-stop-applied.plan.md` |
 | 3 | Resume through saved sessions | Resume reopens each agent step's session (ACP load/resume, CLI `--resume`), redoes a forced-stop turn, reruns checks, falls back to a fresh rerun with `resume_failed` | pending | — |
 | 4 | CLI verbs | `htui stop [--force] <workspace>` and `htui resume <workspace>` confirm, report what stopped and how each run resumes, and the workspace's state reads as stopping or stopped | pending | — |
 
 ## Open Questions
 
 - [ ] Do runs created before the migration get a workspace? A project in one workspace is clear. A project in several is not; leaving them unscoped (never stopped by a workspace stop) is the likely answer. TBD — settle in `/plan`.
-- [ ] Mapping onto ACP and the CLI adapter (the HANDOFF line asks for this to be settled in the plan): which cancel path the graceful stop reuses, and how a CLI respawn with `--resume` redoes the turn. TBD — `/plan` fact-check against `acp/mod.rs` and `cli/mod.rs`.
+- [ ] Mapping onto ACP and the CLI adapter (the HANDOFF line asks for this to be settled in the plan): which cancel path the graceful stop reuses, and how a CLI respawn with `--resume` redoes the turn. TBD — `/plan` fact-check against `acp/mod.rs` and `cli/mod.rs`. **Cancel half settled by M2 D2** (graceful = `Cancel{CANCEL_GRACE}`, forced = `Cancel{0}` + token drop at `STOP_SLACK`); the `--resume` redo stays M3's.
 - [ ] Where the resumable session id is read from: the banner row, or a new column. TBD — `/plan`.
 - [ ] How ANA-2's state table and MOD-24's "no mid-step resume" are amended in the docs (amendment wording). TBD — `/plan`.
-- [ ] M1 review findings deferred (R1, 2026-10-19; detail in the M1 plan's "Deferred review findings"): M-3 `delete_workspace` refuses while the workspace has stopped runs (M2); L-3 a readable refusal for a deleted workspace's foreign keys, no fallback to `None` (M2); L-7 `select_fanout`'s loser and judge lists gain `stopped` (M3) and whether a stopped workspace's queued runs count against `admit`'s `free_slots` (M2); L-5 raise the minimum binary/schema version before any `stop_workspace` caller ships (M2); L-6 `queue_entry.workspace_id` stays unindexed (note).
+- [ ] M1 review findings deferred (R1, 2026-10-19; detail in the M1 plan's "Deferred review findings"): M-3 `delete_workspace` refuses while the workspace has stopped runs (M2); L-3 a readable refusal for a deleted workspace's foreign keys, no fallback to `None` (M2); L-7 `select_fanout`'s loser and judge lists gain `stopped` (M3) and whether a stopped workspace's queued runs count against `admit`'s `free_slots` (M2); L-5 raise the minimum binary/schema version before any `stop_workspace` caller ships (M2); L-6 `queue_entry.workspace_id` stays unindexed (note). M2 landed M-3 (D9), L-3 (D10), L-7's `admit` half (D8) and L-5 (D11 a); L-7's `select_fanout` half (M3) and L-6 remain.
 
 ## Risks
 

@@ -391,7 +391,12 @@ impl ShellVerifier {
         };
 
         let mut child = match spawn_supervised(build) {
-            Ok(child) => child,
+            // MOD-125 M2 D5: a check dropped mid-run (a stop's or a cancel's token) kills its
+            // whole group, as `run_shell`'s does (H-18): `kill_on_drop` reaches only the shell.
+            Ok(child) => GroupGuard {
+                child,
+                ended: false,
+            },
             Err(err) => {
                 let reason = cannot_spawn(&self.shell, &err);
                 return self.finished(VerifyOutcome::Unavailable, None, reason, started_at, 0);
@@ -404,13 +409,13 @@ impl ShellVerifier {
         // neither can fill and stall the child, exactly as `Cli::run` does.
         let captured = Arc::new(Mutex::new(TailBuffer::new(CAPTURE_TAIL)));
         let printed = AtomicUsize::new(0);
-        let stdout = child.stdout().take();
-        let stderr = child.stderr().take();
+        let stdout = child.child.stdout().take();
+        let stderr = child.child.stderr().take();
         let run = async {
             tokio::join!(
                 drain_counting(stdout, &captured, &printed),
                 drain_counting(stderr, &captured, &printed),
-                async { child.wait().await }
+                async { child.child.wait().await }
             )
             .2
         };
@@ -421,7 +426,7 @@ impl ShellVerifier {
         };
         let printed = || printed.load(Ordering::SeqCst);
 
-        match ended {
+        let report = match ended {
             Ok(Ok(status)) => {
                 let output = take_output(&captured);
                 match status.code() {
@@ -459,7 +464,7 @@ impl ShellVerifier {
             Err(_elapsed) => {
                 // The group on Unix, the job object on Windows: a `cargo test` that spawned test
                 // binaries must not outlive the verify that started it.
-                crate::isolate::git::kill_within_grace(child.as_mut(), "verify").await;
+                crate::isolate::git::kill_within_grace(child.child.as_mut(), "verify").await;
                 let output = take_output(&captured);
                 self.finished(
                     VerifyOutcome::Unavailable,
@@ -469,7 +474,10 @@ impl ShellVerifier {
                     printed(),
                 )
             }
-        }
+        };
+        // An ending was decided: the shell was reaped, or the elapsed arm killed its group.
+        child.ended = true;
+        report
     }
 }
 
@@ -663,9 +671,10 @@ pub async fn run_shell(
     }
 }
 
-/// H-18: [`run_shell`]'s child, whose whole process group (job object) is killed when the future
-/// is dropped before the child ended — a `command_run` call aborted by `notifications/cancelled`
-/// or by its connection closing must not leave a build running.
+/// H-18: [`run_shell`]'s and the verifier's child (MOD-125 M2 D5), whose whole process group
+/// (job object) is killed when the future is dropped before the child ended — a `command_run`
+/// call aborted by `notifications/cancelled` or by its connection closing, or a check whose walk
+/// a stop or a cancel dropped, must not leave a build running.
 struct GroupGuard {
     /// The supervised child.
     child: Box<dyn process_wrap::tokio::ChildWrapper>,
@@ -919,6 +928,58 @@ mod shell_tests {
             "still running when dropped"
         );
         until_gone(PATTERN, "the group outlived the dropped future").await;
+    }
+
+    /// MOD-125 M2 D5: a verify dropped mid-run (a stop's or a cancel's token dropping the walk)
+    /// kills its check's whole process group, as a dropped `run_shell` does: `kill_on_drop`
+    /// reached only the shell, so a backgrounded process (the binaries `cargo test` starts)
+    /// outlived it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_check_kills_its_process_group() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use super::{ShellVerifier, Verifier as _, VerifyRequest};
+
+        const PATTERN: &str = "sleep 30.4307";
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let verifier = ShellVerifier::new(
+            &BTreeMap::new(),
+            Arc::new(htui_core::scrub::MinimalScrubber::new([])),
+            Arc::new(crate::isolate::SystemClock),
+        );
+        let check = verifier.run(VerifyRequest {
+            command: Some(format!("{PATTERN} & {PATTERN}")),
+            cwd: Some(dir.path().to_path_buf()),
+            remaining: None,
+            step: htui_core::model::StepId::new(),
+        });
+        // MOD-125 M2 R1 (review L-5): drop the check only once both backgrounded sleeps are seen
+        // running, by a pattern anchored on the exec'd `sleep` (the `sh -c` line, which also
+        // contains PATTERN, never matches it), while the check is still pending; otherwise a slow
+        // fork would let `until_gone` pass with nothing to kill.
+        let mut check = Box::pin(check);
+        let started = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = &mut check => panic!("the check ended before it was dropped"),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            let seen = std::process::Command::new("pgrep")
+                .args(["-f", r"^sleep 30\.4307"])
+                .output()
+                .expect("`pgrep` runs: without it this check would pass vacuously");
+            if String::from_utf8_lossy(&seen.stdout).lines().count() >= 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "both sleeps of the check never started"
+            );
+        }
+        drop(check);
+        until_gone(PATTERN, "the check's group outlived the dropped verify").await;
     }
 
     /// Polls until no process matches `pattern`, or fails after five seconds. A host without

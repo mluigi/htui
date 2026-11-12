@@ -1,6 +1,6 @@
 [package]
 name        = "htui-mcp"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "htui's MCP server: the per-session tool host and the stdio relay's channel (MOD-11)"
 
 edition.workspace      = true
