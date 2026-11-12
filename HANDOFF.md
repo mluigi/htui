@@ -32,7 +32,7 @@ MOD-139's migration is `0029_divided_fanout` (renumbered at the merge).
 `settings.api_billing_env` names the variables (seeded on `claude` and `claude-cli`, backfilled by
 `0028_seed_api_billing_env`); both drivers drop them from every session spawn, inherited copies included,
 with a names-only warning, and `per_token` rows keep them; `--bare` is pinned by a seeded-argv test and an
-ignored live case. MOD-143 waits only on ANA-35 and ANA-34.
+ignored live case. MOD-143 waits on MOD-150 and MOD-133.
 Earlier completions, MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
@@ -525,8 +525,8 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   `R-ENT-8`, `R-MCP-2`, `R-ID-6`, `R-TUI-11`. A typed status-request row (requested status from
   `R-ENT-8`'s open/blocked/closed, resolution, reason, step) that a person accepts or rejects, shown as a
   waiting-on-you row and as MOD-135's proposed resolution; it never moves the status (MOD-11 I-4); the
-  enum narrows when ANA-35's status migration lands. Absorbs the refuted close-out proposal tool. Blocked
-  on ANA-35 (the status enum) and MOD-135 (its checklist consumer).
+  enum is the three statuses MOD-144 shipped (`0024_item_status`, `docs/decisions/mod/mod-144.md`). Absorbs the
+  refuted close-out proposal tool. Blocked on MOD-135 (its checklist consumer).
 - [ ] **MOD-155 - Agent link and citation proposals wait for a person** (from ANA-36, `docs/ANA-36.md`
   §7.3, §8 Q2, Q3). `R-ENT-9`, `R-ENT-15`, `R-ID-6`, `R-MCP-1`, `R-MCP-2`. An `item_link` of a kind
   scheduling, status or a subgraph reads (`blocked_by`, `supersedes`, `duplicates`, `parent`) is pending
@@ -536,7 +536,7 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   targets once ANA-35 adds them. `requirement_cite`: a new fenced `WorkerStore` method proposing
   `addresses`, `reserves` or `verifies`, pending until accepted, withdrawing only the run's own and never
   overwriting a person's citation or proposer. MOD-136's coordinator link requests use the same pending
-  state. Blocked on ANA-35 (link kinds, `W-` keys).
+  state. Blocked on MOD-150 (link kinds) and MOD-149 (`W-` keys), both from ANA-35 (concluded).
 - [ ] **MOD-156 - `document_patch` tool (wanted later)** (from ANA-36, `docs/ANA-36.md` §7.3, §8 Q12).
   `R-MCP-2`. Anchored edits (replace a section, upsert a table row, append under a heading) to the latest
   version of the step's own output document in one call, one new version per call, a typed refusal on an
@@ -546,7 +546,7 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   scrubbed, others as metadata) at workspace read scope; `attachment_add` from the run's worktree or a
   stored command log (MOD-152) to the run's item or output document, under the size cap, text and logs
   only unless a person confirms (images cannot be text-scrubbed). Wanted later, by maintainer decision.
-  Blocked on MOD-114 part (3) and ANA-35 (who owns an attachment).
+  Blocked on MOD-114 part (3), which builds the attachment ownership ANA-35 settled (`docs/ANA-35.md` §7.8).
 - [ ] **MOD-164 - Automatic memory capture at run end** (from ANA-38, `docs/ANA-38.md` §7.2 P2, §4.6).
   `R-ENT-13`, `R-ID-6`, `R-ID-7`, `R-ORCH-1`. An extraction turn by the light model (MOD-126) over the run's
   own evidence (errors seen, retries, fixes, measured wins) writing entries with no person's acceptance,
@@ -862,7 +862,8 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   global collection. Coverage beyond MOD-112 (4), which keeps notes, transcripts, workspace-owned items
   and agents' scope: documents owned by a project or the workspace and workspace requirements. Memory is
   MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. MOD-158 is
-  done, so only the coverage parts are blocked, on ANA-35 (MOD-147, MOD-149 on main).
+  done, so only the coverage parts are blocked: on MOD-147 (owner documents, M1 landed) and MOD-149 (workspace
+  requirements).
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
   `R-STO-8`, `R-ID-6`, `R-ENT-9`, `R-MCP-2`. The top 5 nearest items across the workspace (open and
   closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's
@@ -1143,8 +1144,9 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   item_id)`. The `subgraph` node with a frozen child snapshot and an item source (planner-named existing items, or
   ANA-35's `parent` children); one ordinary child run per item through the normal claim, capped by `max_child_runs`;
   done when every child is done, a failed child fails the node; the parent releases its per-box slot while it waits;
-  idempotent recovery; depth 1. MOD-138 is done (`docs/decisions/mod/mod-138.md`). Blocked on ANA-35 (the run waiting state and the `parent` link) and ANA-34
-  (child integration).
+  idempotent recovery; depth 1. MOD-138 is done (`docs/decisions/mod/mod-138.md`). Blocked on MOD-150 (the `parent` link, from ANA-35) and MOD-133
+  (child integration, from ANA-34). ANA-35's status change shipped with MOD-144 (waiting is read from runs);
+  whether a parent run waiting on its children needs a state beyond that is the plan's to check (`docs/ANA-33.md` §7.9).
 - [ ] **MOD-171 - Per-graph run bounds and the `runtime_changes` override** (from MOD-141's M2 plan,
   `.claude/plans/mod-141-m2-splits-palette-header.plan.md` M-1; ANA-33 §7.6, §7.8, §7.10). `R-ORCH-1`, `R-TUI-8`.
   ANA-33 says a graph may tighten the run bounds, never loosen them, and may override `runtime_changes`. Today
