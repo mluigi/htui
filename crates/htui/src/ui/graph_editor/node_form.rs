@@ -2410,6 +2410,20 @@ pub(super) mod tests {
             form.judge,
             Some((ids::AGENT_AGY, Some("gemini".to_owned())))
         );
+        // Review R1 F3: the split left at none, an edit of another row saves the step with no
+        // judge and fan-out 1 (plan M-3/D7, blueprint §5.4, W2): only compete keeps a judge.
+        let mut renamed = edit(&node);
+        set_text(&mut renamed, NAME, "dig");
+        assert_eq!(
+            renamed.build(&node, &lookups).map(|node| (
+                node.phase.name,
+                node.phase.split,
+                node.phase.fan_out,
+                node.phase.judge_agent_id,
+                node.phase.judge_model
+            )),
+            Ok(("dig".to_owned(), Split::None, 1, None, None))
+        );
         focus_on(&mut form, Row::Split);
         form.cycle(true, &lookups).expect("a choice"); // none → divide
         assert_eq!(form.split, Split::Divide);
