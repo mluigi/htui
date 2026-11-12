@@ -2203,6 +2203,33 @@ pub(super) mod tests {
         form.next_field();
         assert_eq!(form.focused(), Text);
         assert_eq!(form.current(), Row::Name);
+
+        // A compete step with the switch off draws its split, fan-out and judge read-only: the
+        // focus goes from the palette straight back to the name, and back again.
+        let mut form = edit(&research_compete((ids::AGENT_AGY, "gemini")));
+        for row in [Row::Split, Row::FanOut, Row::Judge] {
+            assert!(form.shown().contains(&(row, false)), "{row:?} is drawn");
+        }
+        focus_on(&mut form, Row::Palette);
+        form.next_field();
+        assert_eq!(
+            form.current(),
+            Row::Name,
+            "split, fan-out and judge skipped"
+        );
+        form.prev_field();
+        assert_eq!(form.current(), Row::Palette);
+
+        // A plan scope stored off divide is drawn read-only: the split is the last focus.
+        let mut node = research();
+        node.phase.plan_scope = Some(PlanScope::Successors);
+        let mut form = edit(&node);
+        assert!(form.shown().contains(&(Row::PlanScope, false)), "drawn");
+        focus_on(&mut form, Row::Split);
+        form.next_field();
+        assert_eq!(form.current(), Row::Name, "the plan scope skipped");
+        form.prev_field();
+        assert_eq!(form.current(), Row::Split);
     }
 
     #[test]
