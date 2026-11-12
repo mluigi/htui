@@ -38,20 +38,20 @@ use ratatui::widgets::Paragraph;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, PersonaId, ProjectId, Scope, StepGraphId, StepGraphPatch,
-    StepGraphPhase,
+    ItemKind, ItemKindId, ItemKindPatch, PersonaId, ProjectId, Scope, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase,
 };
 
 use htui_core::store::CasOutcome;
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{
-    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, graph_label,
+    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES, WorkspaceNames,
 };
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::graph_editor::{EditorKey, GraphEditor};
+use crate::ui::graph_editor::{EditorKey, GraphEditorHost};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label;
@@ -211,6 +211,10 @@ struct Editor {
     expected: Option<DateTime<Utc>>,
     /// A kind edit's stored prefix, for D10's comparison; `None` for every other editor.
     stored_prefix: Option<String>,
+    /// MOD-141 M3 R1 M1: the label a kind edit's `graph` field was prefilled with; `None` for
+    /// every other editor. While the field still reads it, the save keeps the kind's graph,
+    /// whatever a catalogue that landed since (a workspace renamed) now labels it.
+    prefilled_graph: Option<String>,
 }
 
 impl Editor {
@@ -280,8 +284,9 @@ enum Mode {
     /// MOD-141 D2: the graph editor on one of the project's own graphs, over the whole section. It
     /// takes every key, paste and its own replies while open; its close act returns to Browse.
     Graph {
-        /// The editor (boxed: it is by far the largest variant).
-        editor: Box<GraphEditor>,
+        /// The editor's host (MOD-141 M3 D5), opened on a body the catalogue holds. It boxes
+        /// the editor itself, so the variant stays small.
+        host: GraphEditorHost,
     },
 }
 
@@ -314,7 +319,7 @@ impl core::fmt::Debug for Mode {
                 .field("editor", editor)
                 .field("old", old)
                 .finish_non_exhaustive(),
-            Self::Graph { editor } => f.debug_struct("Graph").field("editor", editor).finish(),
+            Self::Graph { host } => f.debug_struct("Graph").field("host", host).finish(),
         }
     }
 }
@@ -512,17 +517,18 @@ impl KindsSection {
 
     /// Opens an editor, clearing whatever the last one said.
     fn open(&mut self, kind: EditorKind, fields: Vec<Field>, expected: Option<DateTime<Utc>>) {
-        self.open_with(kind, fields, expected, None);
+        self.open_with(kind, fields, expected, None, None);
     }
 
-    /// The same, for the one editor that carries a stored value to compare what was typed
-    /// against: a kind edit's prefix (D10).
+    /// The same, for the one editor that carries stored values to compare what was typed
+    /// against: a kind edit's prefix (D10) and its graph field's prefill (MOD-141 M3 R1 M1).
     fn open_with(
         &mut self,
         kind: EditorKind,
         fields: Vec<Field>,
         expected: Option<DateTime<Utc>>,
         stored_prefix: Option<String>,
+        prefilled_graph: Option<String>,
     ) {
         self.notice = None;
         self.mode = Mode::Editing(Editor {
@@ -531,6 +537,7 @@ impl KindsSection {
             focus: 0,
             expected,
             stored_prefix,
+            prefilled_graph,
         });
     }
 
@@ -581,12 +588,14 @@ impl KindsSection {
                     return;
                 };
                 let (id, expected, prefix) = (kind.id, kind.updated_at, kind.prefix.clone());
+                let graph = project.label_of(kind.default_graph_id);
                 let fields = edit_kind_fields(project, kind);
                 self.open_with(
                     EditorKind::EditKind(id),
                     fields,
                     Some(expected),
                     Some(prefix),
+                    graph,
                 );
             }
             Row::Graph { p, g } => {
@@ -645,8 +654,7 @@ impl KindsSection {
     /// it missing), or it names nothing at all.
     fn not_a_project_graph(&self, p: usize, id: StepGraphId) -> String {
         self.project(p)
-            .and_then(|project| project.graph_name(id))
-            .map(|(name, scope)| graph_label(name, scope))
+            .and_then(|project| project.label_of(id))
             .map_or_else(
                 || GRAPH_MISSING.to_owned(),
                 |label| format!("graph {label} is not edited here"),
@@ -688,9 +696,11 @@ impl KindsSection {
         let Some(entry) = self.graph_at(p, g) else {
             return;
         };
-        let (mut editor, requests) =
-            GraphEditor::open(entry.clone(), self.personas().to_vec(), ctx.scope);
-        if let Some(step) = step {
+        let (mut host, requests) =
+            GraphEditorHost::with_body(entry.clone(), self.personas().to_vec(), ctx.scope);
+        if let Some(step) = step
+            && let Some(editor) = host.editor_mut()
+        {
             editor.select(step);
             if form {
                 editor.open_node_form();
@@ -700,18 +710,16 @@ impl KindsSection {
             ctx.request(request);
         }
         self.notice = None;
-        self.mode = Mode::Graph {
-            editor: Box::new(editor),
-        };
+        self.mode = Mode::Graph { host };
     }
 
     /// MOD-141 D2: the editor closed. Browse again, the cursor on the first row that shows the
     /// graph it was on: the kind pointing at it, or its own row when no kind does.
     fn close_editor(&mut self) {
-        let Mode::Graph { editor } = core::mem::take(&mut self.mode) else {
+        let Mode::Graph { host } = core::mem::take(&mut self.mode) else {
             return;
         };
-        let graph = editor.graph();
+        let graph = host.graph();
         let shows = |row: &Row| match *row {
             Row::Kind { p, k } => self
                 .project(p)
@@ -732,8 +740,9 @@ impl KindsSection {
     ///
     /// The editor's write is answered with the scope's catalogue: the tree behind it is adopted
     /// quietly (no `busy` of the section's is involved, so nothing closes and nothing is said) and
-    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then hands the
-    /// persona registry on. The editor's reads and its refusals are its own.
+    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then on to the
+    /// host, which hands the persona registry on. Every other reply is the host's to take or
+    /// leave (MOD-141 M3 D5): the editor's reads and its refusals are its own.
     fn on_editor_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
         match reply {
             StoreReply::GraphReplaced { catalogue, .. } => {
@@ -742,46 +751,27 @@ impl KindsSection {
                         self.snapshot = Some((**catalogue).clone());
                         self.unavailable = None;
                         self.clamp_cursor();
-                        if let Mode::Graph { editor } = &mut self.mode {
-                            editor.set_personas(&catalogue.personas);
-                        }
                     }
                     // MOD-141 R1 L1: the write's outcome stands; the tree it would have moved is
                     // read again, and its `Catalogue` hands the personas on.
                     None => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
                 }
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
+                if let Mode::Graph { host } = &mut self.mode {
+                    host.on_reply(reply, ctx);
                 }
                 true
             }
             StoreReply::Catalogue(snapshot) => {
                 self.on_catalogue(snapshot);
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.set_personas(&snapshot.personas);
+                if let Mode::Graph { host } = &mut self.mode {
+                    host.on_reply(reply, ctx);
                 }
                 true
             }
-            StoreReply::Agents(_)
-            | StoreReply::Templates(_)
-            | StoreReply::GraphEditorSettings(_) => {
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
-                }
-                true
-            }
-            StoreReply::Failed { request, .. }
-                if matches!(
-                    *request,
-                    "replace_graph" | "agents" | "templates" | "graph_editor_settings"
-                ) =>
-            {
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
-                }
-                true
-            }
-            _ => false,
+            _ => match &mut self.mode {
+                Mode::Graph { host } => host.on_reply(reply, ctx),
+                _ => false,
+            },
         }
     }
 
@@ -1025,6 +1015,14 @@ impl KindsSection {
                 let (owner, kind) = self
                     .locate_kind(id)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+                // MOD-141 M3 R1 M1: a field that still reads its prefill keeps the kind's graph,
+                // however a catalogue that landed since labels it.
+                let text = editor.text(3);
+                let graph = if editor.prefilled_graph.as_deref() == Some(text.as_str()) {
+                    kind.default_graph_id
+                } else {
+                    graph_named(owner, &text, Some(kind.default_graph_id))?
+                };
                 Ok(StoreRequest::UpdateKind {
                     scope: scope.clone(),
                     id,
@@ -1033,11 +1031,7 @@ impl KindsSection {
                         prefix: Some(editor.text(0)),
                         name: Some(editor.text(1)),
                         description: Some(editor.text(2)),
-                        default_graph_id: Some(graph_named(
-                            owner,
-                            &editor.text(3),
-                            Some(kind.default_graph_id),
-                        )?),
+                        default_graph_id: Some(graph),
                         position: Some(position(&editor.text(4))?),
                     },
                 })
@@ -1222,10 +1216,9 @@ impl KindsSection {
         // the one thing in `theme.error` (the band covers it on the cursor row).
         // MOD-138 D12: a workspace or library graph is named with its scope, and has no phase
         // rows under it (`rows` expands the project's own graphs only).
-        let tail = match project.graph_name(kind.default_graph_id) {
-            Some((name, scope)) => {
-                Span::styled(format!("graph {}", graph_label(name, scope)), theme.base)
-            }
+        // MOD-141 M3 D1: a workspace graph names its workspace too.
+        let tail = match project.label_of(kind.default_graph_id) {
+            Some(label) => Span::styled(format!("graph {label}"), theme.base),
             None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
         };
         Some(Line::from(vec![Span::styled(head, theme.base), tail]))
@@ -1252,7 +1245,7 @@ impl KindsSection {
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             // MOD-141 D2: the editor's own row, its write in flight included.
-            Mode::Graph { editor } => return editor.hint_text(keys),
+            Mode::Graph { host } => return host.hint_text(keys),
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Deleting { .. } => HINT_DELETING,
@@ -1288,7 +1281,7 @@ impl KindsSection {
             Mode::Browse => views::KINDS_BROWSE,
             Mode::Editing(_) => views::KINDS_EDITOR,
             Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => views::KINDS_CONFIRM,
-            Mode::Graph { editor } => editor.stack(),
+            Mode::Graph { host } => host.stack(),
         }
     }
 
@@ -1457,8 +1450,8 @@ impl SettingsSection for KindsSection {
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
         let mut wanted = vec![StoreRequest::Catalogue(scope.clone())];
         // MOD-141 D1: an open editor reads its agents and templates again on activation.
-        if let Mode::Graph { editor } = &self.mode {
-            wanted.extend(editor.wants_requests(scope));
+        if let Mode::Graph { host } = &self.mode {
+            wanted.extend(host.wants_requests(scope));
         }
         wanted
     }
@@ -1483,7 +1476,7 @@ impl SettingsSection for KindsSection {
 
     fn takes_paste(&self) -> bool {
         match &self.mode {
-            Mode::Graph { editor } => editor.takes_paste(),
+            Mode::Graph { host } => host.takes_paste(),
             _ => self.captures_input(),
         }
     }
@@ -1491,8 +1484,8 @@ impl SettingsSection for KindsSection {
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
     /// is not a field: a paste there is dropped, so its `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
-        if let Mode::Graph { editor } = &mut self.mode {
-            return editor.on_paste(text);
+        if let Mode::Graph { host } = &mut self.mode {
+            return host.on_paste(text);
         }
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -1506,8 +1499,8 @@ impl SettingsSection for KindsSection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // MOD-141 D2: the graph editor takes every key while it is open; its close act returns to
         // Browse (the memory pane's shape, `hierarchy.rs`).
-        if let Mode::Graph { editor } = &mut self.mode {
-            return match editor.on_key(key, ctx) {
+        if let Mode::Graph { host } = &mut self.mode {
+            return match host.on_key(key, ctx) {
                 EditorKey::Handled(handled) => handled,
                 EditorKey::Close => {
                     self.close_editor();
@@ -1589,14 +1582,14 @@ impl SettingsSection for KindsSection {
 
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
-            Mode::Graph { editor } => editor.on_mouse(mouse, ctx),
+            Mode::Graph { host } => host.on_mouse(mouse, ctx),
             _ => Handled::Pass,
         }
     }
 
     fn on_mouse_lost(&mut self) {
-        if let Mode::Graph { editor } = &mut self.mode {
-            editor.on_mouse_lost();
+        if let Mode::Graph { host } = &mut self.mode {
+            host.on_mouse_lost();
         }
     }
 
@@ -1613,9 +1606,9 @@ impl SettingsSection for KindsSection {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-141 D2: the graph editor draws over the whole section.
-        if let Mode::Graph { editor } = &self.mode {
+        if let Mode::Graph { host } = &self.mode {
             self.scroll.set(None);
-            editor.render(frame, area, ctx);
+            host.render(frame, area, ctx);
             return;
         }
         let theme = ctx.theme;
@@ -1758,12 +1751,11 @@ fn new_kind_fields(project: &ProjectCatalogue) -> Vec<Field> {
 }
 
 /// The same five fields, prefilled from the row (B-5's whole patch goes out from them). The
-/// graph reads as its [`graph_label`] (MOD-138 D12), so a workspace or library graph keeps its
-/// scope on screen and [`graph_named`] does not mistake it for a project graph of that name.
+/// graph reads as its [`ProjectCatalogue::label`] (MOD-138 D12, MOD-141 M3 D1), so a workspace or
+/// library graph keeps its scope (and a workspace graph its workspace) on screen, and
+/// [`graph_named`] does not mistake it for a project graph of that name.
 fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
-    let graph = project
-        .graph_name(kind.default_graph_id)
-        .map_or_else(String::new, |(name, scope)| graph_label(name, scope));
+    let graph = project.label_of(kind.default_graph_id).unwrap_or_default();
     vec![
         Field::required("prefix", &kind.prefix),
         Field::required("name", &kind.name),
@@ -1794,12 +1786,23 @@ fn next_position(positions: impl Iterator<Item = i32>) -> String {
 }
 
 /// The graph the typed text names (B-7). A graph name is unique within one scope only (MOD-138
-/// D12), so the text is matched as a [`graph_label`]: the project's own graph by its bare name
-/// first, then a workspace or library graph the project may use as `name · workspace` /
-/// `name · library`, in [`ProjectCatalogue::shared`]'s order; a bare name no project graph has
-/// still finds a shared graph of that name. `current` is the edited kind's graph: text that still
-/// reads as its label keeps it, so an untouched field never moves the kind, not even between two
-/// workspaces' graphs that share a name and so a label.
+/// D12), so the text is matched as a [`ProjectCatalogue::label`] (MOD-141 M3 D3, M-2), in order:
+///
+/// 1. `current`, the edited kind's graph, when the text still reads as its label: an untouched
+///    field never moves the kind;
+/// 2. else every graph the project may name, its own (by bare name) and each
+///    [`shared`](ProjectCatalogue::shared) one (`name · workspace <workspace>`,
+///    `name · library`), whose label is the text, and every shared workspace graph the text
+///    spells by its workspace's name or by its slug, whichever the label shows (R1 M1,
+///    [`WorkspaceNames::spellings`]): what the list shows depends on what else is listed, so a
+///    label typed under one list stays valid under the next;
+/// 3. else every shared graph whose bare name is the text, or whose label before M3
+///    (`name · workspace`) is.
+///
+/// One candidate resolves; two or more are refused with [`ambiguous_graph`], listing their labels
+/// in `shared` order (two that read alike each with their graph's short id, R1 L5); none is
+/// [`NO_GRAPH_NAMED`]. [`kept`](ProjectCatalogue::kept) graphs stay out: no kind may newly take
+/// one.
 ///
 /// A name rather than an id because that is what is on screen; the store checks the rule again
 /// on the write, so this resolution is a convenience and not the guard.
@@ -1808,22 +1811,72 @@ fn graph_named(
     text: &str,
     current: Option<StepGraphId>,
 ) -> Result<StepGraphId, String> {
-    if let Some(id) = current.filter(|&id| {
-        project
-            .graph_name(id)
-            .is_some_and(|(name, scope)| graph_label(name, scope) == text)
-    }) {
+    if let Some(id) = current.filter(|&id| project.label_of(id).as_deref() == Some(text)) {
         return Ok(id);
     }
-    project
+    let mut candidates: Vec<&StepGraph> = project
         .graphs
         .iter()
         .map(|entry| &entry.graph)
         .chain(&project.shared)
-        .find(|graph| graph_label(&graph.name, graph.scope) == text)
-        .or_else(|| project.shared.iter().find(|graph| graph.name == text))
-        .map(|graph| graph.id)
-        .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
+        .filter(|graph| {
+            project.label(graph) == text
+                || project
+                    .workspaces
+                    .spellings(&graph.name, graph.scope)
+                    .iter()
+                    .any(|spelling| spelling == text)
+        })
+        .collect();
+    if candidates.is_empty() {
+        let unnamed = WorkspaceNames::default();
+        candidates = project
+            .shared
+            .iter()
+            .filter(|graph| graph.name == text || unnamed.label(&graph.name, graph.scope) == text)
+            .collect();
+    }
+    match candidates.as_slice() {
+        [] => Err(NO_GRAPH_NAMED.to_owned()),
+        [graph] => Ok(graph.id),
+        several => Err(ambiguous_graph(text, &choices(project, several))),
+    }
+}
+
+/// MOD-141 M3 R1 L5: the label of each graph an ambiguity refusal lists, in candidate order. Two
+/// that would read alike (two workspaces no read named, or a project graph named like a shared
+/// graph's label) each carry their graph's [`short_id`], so no choice is listed twice.
+fn choices(project: &ProjectCatalogue, graphs: &[&StepGraph]) -> Vec<String> {
+    let labels: Vec<String> = graphs.iter().map(|graph| project.label(graph)).collect();
+    labels
+        .iter()
+        .zip(graphs)
+        .map(|(label, graph)| {
+            if labels.iter().filter(|other| *other == label).count() > 1 {
+                format!("{label} (graph {})", short_id(graph.id))
+            } else {
+                label.clone()
+            }
+        })
+        .collect()
+}
+
+/// The last eight hex digits of a graph id: a UUIDv7's random tail, where its head is the clock
+/// and two graphs minted in one millisecond share it.
+fn short_id(id: StepGraphId) -> String {
+    let text = id.to_string();
+    text[text.len().saturating_sub(8)..].to_owned()
+}
+
+/// MOD-141 M3 D3 (M-2): what a typed graph name that names two or more graphs is told: the text,
+/// how many graphs it names, and the label of each to type instead, e.g. `"flow" names 2 graphs;
+/// type one of: flow · workspace Platform, flow · workspace Graphics`.
+pub(crate) fn ambiguous_graph(text: &str, labels: &[String]) -> String {
+    format!(
+        "\"{text}\" names {} graphs; type one of: {}",
+        labels.len(),
+        labels.join(", ")
+    )
 }
 
 /// A bound persona's name, or its id when the loaded list does not know it (a persona created
@@ -2068,6 +2121,7 @@ mod tests {
             focus: 0,
             expected: None,
             stored_prefix: Some("ANA".to_owned()),
+            prefilled_graph: None,
         };
         let section = KindsSection {
             mode: Mode::ConfirmPrefix {
@@ -2168,11 +2222,9 @@ mod tests {
             Origin::Tab(SettingsTab::ID),
             &emit,
         );
-        let (editor, _) = GraphEditor::open(body, Vec::new(), &scope);
+        let (host, _) = GraphEditorHost::with_body(body, Vec::new(), &scope);
         let mut section = KindsSection {
-            mode: Mode::Graph {
-                editor: Box::new(editor),
-            },
+            mode: Mode::Graph { host },
             ..KindsSection::new()
         };
         let answer = StoreReply::GraphEditorSettings(Box::new(crate::catalogue::EditorSettings {
@@ -2222,6 +2274,95 @@ mod tests {
         assert!(section.notice.is_none(), "{:?}", section.notice);
     }
 
+    /// MOD-141 M3 D5: the section opens its editor through a [`GraphEditorHost`] and hands it
+    /// every reply but its own catalogue. A refused templates read is the editor's, said in its
+    /// own words; a refusal of the section's own reads is not the host's, and a body read is
+    /// never taken once the editor is open.
+    #[tokio::test]
+    async fn a_refused_templates_read_reaches_the_editor_through_the_host() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, WriteStore};
+
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::settings::SettingsTab;
+
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let body = store
+            .graph_body(ids::GRAPH_VULKAN_ANA)
+            .await
+            .expect("a memory read")
+            .expect("the analysis graph");
+        let (projects, top_bar, theme, emit) = (
+            Vec::new(),
+            TopBarState::default(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let keys = Keys::compiled().clone();
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keys,
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let (host, requests) = GraphEditorHost::with_body(body, Vec::new(), &scope);
+        assert_eq!(requests.len(), 3, "the editor's three reads: {requests:?}");
+        let mut section = KindsSection {
+            mode: Mode::Graph { host },
+            ..KindsSection::new()
+        };
+        let refused = |request: &'static str| StoreReply::Failed {
+            request,
+            message: "refused".to_owned(),
+        };
+
+        assert!(
+            section.on_editor_reply(&refused("templates"), &mut ctx),
+            "the refusal is the editor's"
+        );
+        assert!(
+            !section.on_editor_reply(&refused("catalogue"), &mut ctx),
+            "the catalogue read is the section's"
+        );
+        assert!(
+            !section.on_editor_reply(&refused("graph_body"), &mut ctx),
+            "an open host takes no body read"
+        );
+        assert!(
+            !section.on_editor_reply(&StoreReply::GraphBody(None), &mut ctx),
+            "nor its answer"
+        );
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(98, 27))
+            .expect("a test terminal");
+        terminal
+            .draw(|frame| section.render(frame, frame.area(), &ctx))
+            .expect("the section draws");
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("templates unavailable: refused"),
+            "{screen}"
+        );
+        assert!(format!("{section:?}").contains("GraphEditorHost"));
+    }
+
     /// MOD-115 M3 RV2 L2: the list is handed the cursor's own line, which `list_rows` answers,
     /// not the cursor's row index: over the whole demo tree the line it names is the cursor
     /// row's, and the selection's last line closes the detail drawn under it.
@@ -2263,5 +2404,412 @@ mod tests {
             details += listed.end - at;
         }
         assert!(details > 0, "a phase with its detail was walked");
+    }
+
+    /// The demo's Vulkan project joins Platform too, so it may use both workspaces' graphs; each
+    /// workspace gets a graph named `flow`, and Platform one named `solo`. The catalogue the
+    /// Graphics scope reads then, and the ids of Platform's `flow`, Graphics' `flow` and `solo`.
+    async fn two_flows() -> (ProjectCatalogue, StepGraphId, StepGraphId, StepGraphId) {
+        use htui_core::fixtures::ids;
+        use htui_core::model::{GraphScope, NewStepGraph, WorkspaceProject};
+        use htui_core::store::{MemStore, WriteStore as _};
+
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_id: ids::PROJECT_VULKAN,
+                position: 9,
+            })
+            .await
+            .expect("vulkan joins platform");
+        let mut created = Vec::new();
+        for (workspace, name) in [
+            (ids::WORKSPACE_PLATFORM, "flow"),
+            (ids::WORKSPACE_GRAPHICS, "flow"),
+            (ids::WORKSPACE_PLATFORM, "solo"),
+        ] {
+            let graph = store
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    scope: GraphScope::Workspace(workspace),
+                    name: name.to_owned(),
+                    description: String::new(),
+                    is_override: false,
+                })
+                .await
+                .expect("a workspace graph");
+            created.push(graph.id);
+        }
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let mut read = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        (read.projects.remove(0), created[0], created[1], created[2])
+    }
+
+    /// The labels of the shared `flow`s, in `shared` order: what an ambiguity refusal lists.
+    fn flow_labels(project: &ProjectCatalogue) -> Vec<String> {
+        project
+            .shared
+            .iter()
+            .filter(|graph| graph.name == "flow")
+            .map(|graph| project.label(graph))
+            .collect()
+    }
+
+    /// MOD-141 M3 D3 (M-2): the exact qualified label always resolves.
+    #[tokio::test]
+    async fn graph_named_resolves_an_exact_qualified_label() {
+        let (project, platform, graphics, _) = two_flows().await;
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Platform", None),
+            Ok(platform)
+        );
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Graphics", None),
+            Ok(graphics)
+        );
+    }
+
+    /// D3: a bare name, or the old `name · workspace`, resolves while it names exactly one graph;
+    /// a project graph's bare name is its label.
+    #[tokio::test]
+    async fn graph_named_resolves_a_unique_bare_name() {
+        let (project, _, _, solo) = two_flows().await;
+        assert_eq!(graph_named(&project, "solo", None), Ok(solo));
+        assert_eq!(
+            graph_named(&project, "solo \u{b7} workspace", None),
+            Ok(solo)
+        );
+        let own = &project.graphs[0].graph;
+        assert_eq!(graph_named(&project, &own.name, None), Ok(own.id));
+        assert_eq!(
+            graph_named(&project, "nope", None),
+            Err(NO_GRAPH_NAMED.to_owned())
+        );
+    }
+
+    /// D3: a bare name two graphs share is refused, and the refusal lists both labels.
+    #[tokio::test]
+    async fn graph_named_refuses_an_ambiguous_bare_name_with_both_labels() {
+        let (project, ..) = two_flows().await;
+        let labels = flow_labels(&project);
+        assert_eq!(labels.len(), 2);
+        let refused = graph_named(&project, "flow", None).expect_err("ambiguous");
+        assert_eq!(refused, ambiguous_graph("flow", &labels));
+        assert!(
+            refused.contains("flow \u{b7} workspace Platform")
+                && refused.contains("flow \u{b7} workspace Graphics"),
+            "{refused}"
+        );
+    }
+
+    /// D3: the old-style `flow · workspace` names both `flow`s too, and is refused the same way.
+    #[tokio::test]
+    async fn graph_named_refuses_an_ambiguous_old_style_label() {
+        let (project, ..) = two_flows().await;
+        let text = "flow \u{b7} workspace";
+        assert_eq!(
+            graph_named(&project, text, None),
+            Err(ambiguous_graph(text, &flow_labels(&project)))
+        );
+    }
+
+    /// D3 step 1: text that reads as the edited kind's own graph keeps it, even where the same
+    /// text names two graphs (here no workspace row was read, so both `flow`s read alike).
+    #[tokio::test]
+    async fn graph_named_keeps_current_when_ambiguous() {
+        let (mut project, platform, graphics, _) = two_flows().await;
+        assert_eq!(
+            graph_named(&project, "flow \u{b7} workspace Graphics", Some(graphics)),
+            Ok(graphics)
+        );
+        project.workspaces = WorkspaceNames::default();
+        let text = "flow \u{b7} workspace";
+        assert_eq!(graph_named(&project, text, Some(graphics)), Ok(graphics));
+        assert_eq!(graph_named(&project, text, Some(platform)), Ok(platform));
+        assert!(graph_named(&project, text, None).is_err());
+    }
+
+    /// MOD-141 M3 R1 L5: two candidates that read alike (here no workspace row was read) are
+    /// never listed as the same choice twice: each carries its graph's short id.
+    #[tokio::test]
+    async fn an_ambiguity_refusal_never_lists_one_choice_twice() {
+        let (mut project, platform, graphics, _) = two_flows().await;
+        project.workspaces = WorkspaceNames::default();
+        let refused = graph_named(&project, "flow", None).expect_err("ambiguous");
+        let bare = "flow \u{b7} workspace";
+        let labels = [
+            format!("{bare} (graph {})", short_id(platform)),
+            format!("{bare} (graph {})", short_id(graphics)),
+        ];
+        assert_ne!(labels[0], labels[1]);
+        assert_eq!(refused, ambiguous_graph("flow", &labels));
+    }
+
+    /// The demo's Vulkan project joins Platform, which gets a graph `flow`; Vulkan's ANA kind is
+    /// moved onto it. The store, the scope (Graphics, Vulkan alone), the catalogue and `flow`.
+    async fn platform_flow() -> (
+        htui_core::store::MemStore,
+        Scope,
+        CatalogueSnapshot,
+        StepGraphId,
+    ) {
+        use htui_core::fixtures::ids;
+        use htui_core::model::{GraphScope, NewStepGraph, WorkspaceProject};
+        use htui_core::store::{MemStore, WriteStore as _};
+
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_id: ids::PROJECT_VULKAN,
+                position: 9,
+            })
+            .await
+            .expect("vulkan joins platform");
+        let flow = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                name: "flow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let snapshot = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        (store, scope, snapshot, flow.id)
+    }
+
+    /// Renames a workspace in `store`.
+    async fn rename(
+        store: &htui_core::store::MemStore,
+        id: htui_core::model::WorkspaceId,
+        name: &str,
+    ) {
+        use htui_core::model::WorkspacePatch;
+        use htui_core::store::WriteStore as _;
+        let row = store
+            .workspace(id)
+            .await
+            .expect("a memory read")
+            .expect("the workspace");
+        store
+            .update_workspace(
+                id,
+                row.updated_at,
+                WorkspacePatch {
+                    name: Some(name.to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            )
+            .await
+            .expect("the rename");
+    }
+
+    /// R1 M1: a label typed while it read `flow · workspace Platform` still resolves once a
+    /// sibling workspace of the same name gets a graph and the list reads by slug.
+    #[tokio::test]
+    async fn a_sibling_workspace_gets_a_graph_while_the_label_was_typed() {
+        use htui_core::fixtures::ids;
+        use htui_core::model::{GraphScope, NewStepGraph};
+        use htui_core::store::WriteStore as _;
+
+        let (store, scope, before, flow) = platform_flow().await;
+        let typed = before.projects[0].label_of(flow).expect("flow is listed");
+        assert_eq!(typed, "flow \u{b7} workspace Platform");
+
+        rename(&store, ids::WORKSPACE_GRAPHICS, "Platform").await;
+        store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+                name: "other".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("the sibling's graph");
+        let after = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        let project = &after.projects[0];
+        assert_eq!(
+            project.label_of(flow).as_deref(),
+            Some("flow \u{b7} workspace platform"),
+            "the list now reads by slug"
+        );
+        assert_eq!(graph_named(project, &typed, None), Ok(flow));
+        assert_eq!(
+            graph_named(project, "flow \u{b7} workspace platform", None),
+            Ok(flow)
+        );
+    }
+
+    /// R1 M1: the kind form is opened on a kind of `flow`, prefilled `flow · workspace Platform`;
+    /// Platform is renamed and a catalogue lands while the form is open. Saved untouched, the
+    /// kind keeps its graph rather than being told no graph is named.
+    #[tokio::test]
+    async fn a_workspace_rename_while_the_kind_form_is_open_saved_untouched() {
+        use htui_core::fixtures::ids;
+        use htui_core::model::ItemKindPatch;
+        use htui_core::store::WriteStore as _;
+
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::settings::SettingsTab;
+
+        let (store, scope, _, flow) = platform_flow().await;
+        let kind = store
+            .item_kinds(ids::PROJECT_VULKAN)
+            .await
+            .expect("a memory read")
+            .into_iter()
+            .next()
+            .expect("a vulkan kind");
+        store
+            .update_item_kind(
+                kind.id,
+                kind.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(flow),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect("the kind takes flow");
+        let snapshot = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        let (projects, top_bar, theme, emit) = (
+            Vec::new(),
+            TopBarState::default(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let keys = Keys::compiled().clone();
+        let ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keys,
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let mut section = KindsSection {
+            snapshot: Some(snapshot),
+            ..KindsSection::new()
+        };
+        section.open_edit(Row::Kind { p: 0, k: 0 }, &ctx);
+        let Mode::Editing(editor) = &section.mode else {
+            panic!("the kind form is open: {:?}", section.mode);
+        };
+        assert_eq!(editor.text(3), "flow \u{b7} workspace Platform");
+
+        rename(&store, ids::WORKSPACE_PLATFORM, "Plat").await;
+        let renamed = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        section.on_catalogue(&renamed);
+        let Mode::Editing(editor) = &section.mode else {
+            panic!("a read leaves the form open: {:?}", section.mode);
+        };
+        assert_eq!(
+            graph_named(&renamed.projects[0], &editor.text(3), Some(flow)),
+            Err(NO_GRAPH_NAMED.to_owned()),
+            "the old label no longer reads as flow's"
+        );
+        let built = section
+            .build(editor, &scope)
+            .expect("an untouched field saves");
+        let StoreRequest::UpdateKind { id, patch, .. } = built else {
+            panic!("a kind edit: {built:?}");
+        };
+        assert_eq!(id, kind.id);
+        assert_eq!(patch.default_graph_id, Some(flow));
+    }
+
+    /// R1 L6: a `Personas` reply while the editor is open is the editor's: the host takes it, and
+    /// the section's own tree, notice and write are left as they were.
+    #[tokio::test]
+    async fn a_personas_reply_while_the_editor_is_open_is_the_editors() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, WriteStore};
+
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::settings::SettingsTab;
+
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let body = store
+            .graph_body(ids::GRAPH_VULKAN_ANA)
+            .await
+            .expect("a memory read")
+            .expect("the analysis graph");
+        let snapshot = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the catalogue");
+        let rows = store.personas().await.expect("the registry");
+        let (projects, top_bar, theme, emit) = (
+            Vec::new(),
+            TopBarState::default(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let keys = Keys::compiled().clone();
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keys,
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let (host, _) = GraphEditorHost::with_body(body, Vec::new(), &scope);
+        let mut section = KindsSection {
+            snapshot: Some(snapshot.clone()),
+            mode: Mode::Graph { host },
+            ..KindsSection::new()
+        };
+
+        assert!(
+            section.on_editor_reply(&StoreReply::Personas(rows), &mut ctx),
+            "the host takes it"
+        );
+        assert!(matches!(section.mode, Mode::Graph { .. }), "still open");
+        assert_eq!(section.snapshot.as_ref(), Some(&snapshot), "the tree stays");
+        assert!(section.notice.is_none() && section.busy.is_none());
+    }
+
+    /// D3: the refusal names the text, how many graphs it names, and the labels to type instead.
+    #[test]
+    fn ambiguous_graph_names_the_count_and_the_labels() {
+        let labels = [
+            "flow \u{b7} workspace Platform".to_owned(),
+            "flow \u{b7} workspace Graphics".to_owned(),
+        ];
+        assert_eq!(
+            ambiguous_graph("flow", &labels),
+            "\"flow\" names 2 graphs; type one of: flow \u{b7} workspace Platform, \
+             flow \u{b7} workspace Graphics"
+        );
     }
 }

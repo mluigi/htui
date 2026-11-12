@@ -40,7 +40,6 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
-use crate::catalogue::graph_label;
 use crate::editor::{
     ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
@@ -990,7 +989,7 @@ impl ItemForm {
                     .find(|graph| graph.id == id && !graph.is_override)
                     .map_or_else(
                         || "override (this item's)".to_owned(),
-                        |graph| graph_label(&graph.name, graph.scope),
+                        |graph| self.context.label(graph),
                     ),
             },
             Field::Title | Field::Priority | Field::Tags | Field::Paths | Field::Body => {
@@ -1202,7 +1201,7 @@ mod tests {
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::model::{GraphScope, ItemPatch, NewItemKind, NewStepGraph};
+    use htui_core::model::{GraphScope, ItemPatch, NewItemKind, NewStepGraph, WorkspaceProject};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
     use ratatui::buffer::Buffer;
@@ -1761,9 +1760,60 @@ mod tests {
         form.graph = Some(htui.graphs[0].id);
         assert_eq!(form.picker_label(Field::Graph), htui.graphs[0].name);
         form.graph = Some(ids_by_name[0].0);
-        assert_eq!(form.picker_label(Field::Graph), "wsflow \u{b7} workspace");
+        assert_eq!(
+            form.picker_label(Field::Graph),
+            "wsflow \u{b7} workspace Platform"
+        );
         form.graph = Some(ids_by_name[1].0);
         assert_eq!(form.picker_label(Field::Graph), "libflow \u{b7} library");
+    }
+
+    /// MOD-141 M3 (the picker fix): htui sits in both demo workspaces and each has a graph named
+    /// `flow`; cycling the picker reads two labels, each naming its workspace.
+    #[tokio::test]
+    async fn two_workspaces_flow_graphs_cycle_to_two_labels() {
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_GRAPHICS,
+                project_id: ids::PROJECT_HTUI,
+                position: 9,
+            })
+            .await
+            .expect("htui joins graphics");
+        let mut flows = Vec::new();
+        for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+            let graph = store
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    scope: GraphScope::Workspace(workspace),
+                    name: "flow".to_owned(),
+                    description: String::new(),
+                    is_override: false,
+                })
+                .await
+                .expect("a workspace graph");
+            flows.push(graph.id);
+        }
+        let htui = context(&store, ids::PROJECT_HTUI, None).await;
+        let mut form = ItemForm::open_new(htui, &projects(), None);
+        focus_on(&mut form, Field::Graph);
+
+        let mut seen = Vec::new();
+        for _ in 0..form.graph_options().len() {
+            if form.graph.is_some_and(|id| flows.contains(&id)) {
+                seen.push(form.picker_label(Field::Graph));
+            }
+            form.on_key(key(KeyCode::Right), Keys::compiled());
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "flow \u{b7} workspace Graphics",
+                "flow \u{b7} workspace Platform"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1852,7 +1902,10 @@ mod tests {
             "the project may no longer pick it"
         );
         assert_eq!(edit.graph_options().last(), Some(&Some(shared.id)));
-        assert_eq!(edit.picker_label(Field::Graph), "wsflow \u{b7} workspace");
+        assert_eq!(
+            edit.picker_label(Field::Graph),
+            "wsflow \u{b7} workspace Platform"
+        );
     }
 
     #[test]

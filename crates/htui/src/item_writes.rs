@@ -43,6 +43,7 @@ use htui_core::model::{
 use htui_core::store::{ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
+use crate::catalogue::WorkspaceNames;
 use crate::store_worker::{StoreReply, StoreRequest};
 
 /// The three requests, in [`StoreRequest::name`] order. One list, so a name changed in one place
@@ -84,6 +85,10 @@ pub struct ItemFormContext {
     /// (MOD-138 D12) a workspace graph it kept after the project left that workspace, which the
     /// picker labels by scope rather than as an override. `None` otherwise, and for a new item.
     pub item_graph: Option<StepGraph>,
+    /// MOD-141 M3 D2: the workspace of every workspace graph in `graphs` and `item_graph`, so
+    /// [`label`](Self::label) names it. Filled for the replies that reach the UI (the form's
+    /// read and a divergence); empty in the catalogue a mint or an edit validates against.
+    pub workspaces: WorkspaceNames,
 }
 
 impl ItemFormContext {
@@ -95,6 +100,13 @@ impl ItemFormContext {
             graphs: &self.graphs,
             repos: &self.repos,
         }
+    }
+
+    /// MOD-141 M3 D1: how the graph picker and the divergence view name `graph`, through
+    /// [`workspaces`](Self::workspaces) ([`WorkspaceNames::label`]).
+    #[must_use]
+    pub fn label(&self, graph: &StepGraph) -> String {
+        self.workspaces.label(&graph.name, graph.scope)
     }
 }
 
@@ -113,6 +125,7 @@ impl core::fmt::Debug for ItemFormContext {
                 "item_graph",
                 &self.item_graph.as_ref().map(|graph| graph.id),
             )
+            .field("workspaces", &self.workspaces.len())
             .finish()
     }
 }
@@ -235,6 +248,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 context.item_graph = item_graph(&writer, &context.graphs, &row).await?;
                 context.item = Some(row);
             }
+            named(&writer, &mut context).await;
             Ok(StoreReply::ItemForm(Box::new(context)))
         }
         StoreRequest::MintItem { project, spec } => {
@@ -287,6 +301,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     // Milestone 3 D7: the catalogue just read, with the head as its item.
                     context.item_graph = item_graph(&writer, &context.graphs, &head).await?;
                     context.item = Some(head.clone());
+                    named(&writer, &mut context).await;
                     Ok(StoreReply::ItemDiverged(Box::new(ItemDivergence {
                         head,
                         ancestor,
@@ -343,7 +358,18 @@ async fn catalogue(writer: &Writer, project: ProjectId) -> Result<ItemFormContex
         repos,
         item: None,
         item_graph: None,
+        workspaces: WorkspaceNames::default(),
     })
+}
+
+/// MOD-141 M3 D2: fills [`ItemFormContext::workspaces`] over its `graphs` and `item_graph`, one
+/// `workspace` read per distinct workspace ([`WorkspaceNames::read`]). Called once `item_graph`
+/// is set, and only for a context that reaches the UI. Infallible (R1 L3): a failed name read is
+/// logged and leaves that workspace unnamed, so it never fails the form's read nor turns a
+/// divergence into a `Failed`.
+async fn named(writer: &Writer, context: &mut ItemFormContext) {
+    context.workspaces =
+        WorkspaceNames::read(writer, context.graphs.iter().chain(&context.item_graph)).await;
 }
 
 /// [`ItemFormContext::item_graph`]: `item`'s own graph row when `graphs` lacks it. A graph the
@@ -367,12 +393,13 @@ mod tests {
         EDIT_NAME, FORM_NAME, ItemDivergence, ItemFormContext, ItemWrite, MINT_NAME, REQUEST_NAMES,
         is_item_request, item_not_in_project, mint_refused, serve,
     };
+    use crate::catalogue::{WorkspaceName, WorkspaceNames};
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use htui_core::fixtures::ids;
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::model::{
         EditReason, GraphScope, Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo,
-        NewStepGraph, ProjectId, RepoId, SpecChanges, StepGraphId,
+        NewStepGraph, ProjectId, RepoId, SpecChanges, StepGraph, StepGraphId, WorkspaceProject,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, UpdateOutcome, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -619,6 +646,118 @@ mod tests {
             panic!("a mint answers ItemWritten, not {answer:?}")
         };
         assert_eq!(row(&store, item).await.step_graph_id, Some(library.id));
+    }
+
+    /// `htui` joins Graphics too, and each workspace gets a graph named `flow`: the two `flow`s,
+    /// Platform's then Graphics'.
+    async fn two_flows(store: &MemStore) -> (StepGraph, StepGraph) {
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_GRAPHICS,
+                project_id: ids::PROJECT_HTUI,
+                position: 9,
+            })
+            .await
+            .expect("htui joins graphics");
+        let mut flows = Vec::new();
+        for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+            flows.push(
+                store
+                    .create_step_graph(NewStepGraph {
+                        id: StepGraphId::new(),
+                        scope: GraphScope::Workspace(workspace),
+                        name: "flow".to_owned(),
+                        description: String::new(),
+                        is_override: false,
+                    })
+                    .await
+                    .expect("a workspace graph"),
+            );
+        }
+        let graphics = flows.pop().expect("two flows");
+        let platform = flows.pop().expect("two flows");
+        (platform, graphics)
+    }
+
+    /// MOD-141 M3 D2: the form's read names the workspace of each graph it lists, so two
+    /// workspaces' `flow`s read apart.
+    #[tokio::test]
+    async fn the_form_names_each_workspace_of_its_graphs() {
+        let (store, backend) = demo();
+        let (platform, graphics) = two_flows(&store).await;
+
+        let context = form(&backend, ids::PROJECT_HTUI, None).await;
+
+        assert_eq!(context.workspaces.len(), 2);
+        assert_eq!(context.label(&platform), "flow \u{b7} workspace Platform");
+        assert_eq!(context.label(&graphics), "flow \u{b7} workspace Graphics");
+        let own = &context.graphs[0];
+        assert_eq!(context.label(own), own.name);
+    }
+
+    /// D2: a workspace graph the item kept after its project left that workspace is named too,
+    /// though `graphs` no longer lists it.
+    #[tokio::test]
+    async fn a_kept_item_graph_is_named_too() {
+        let (store, backend) = demo();
+        let kept = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                name: "wsflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        store
+            .update_item(
+                ids::HTUI_ANA_2,
+                1,
+                ItemPatch {
+                    step_graph_id: Some(Some(kept.id)),
+                    ..theirs("Theirs")
+                },
+            )
+            .await
+            .expect("the item takes it");
+        store
+            .remove_workspace_project(ids::WORKSPACE_PLATFORM, ids::PROJECT_HTUI)
+            .await
+            .expect("htui leaves platform");
+
+        let context = form(&backend, ids::PROJECT_HTUI, Some(ids::HTUI_ANA_2)).await;
+
+        let item_graph = context.item_graph.as_ref().expect("the kept graph");
+        assert_eq!(item_graph.id, kept.id);
+        assert_eq!(context.workspaces.len(), 1);
+        assert_eq!(
+            context.label(item_graph),
+            "wsflow \u{b7} workspace Platform"
+        );
+    }
+
+    /// D2: a divergence's catalogue names its workspaces as the form's read does.
+    #[tokio::test]
+    async fn a_divergence_context_names_its_workspaces() {
+        let (store, backend) = demo();
+        let (platform, graphics) = two_flows(&store).await;
+        store
+            .update_item(ids::HTUI_ANA_2, 1, theirs("Theirs"))
+            .await
+            .expect("their edit");
+
+        let answer = serve(&backend, &edit(1, retitle("Mine")))
+            .await
+            .expect("a stale edit is an answer");
+
+        let StoreReply::ItemDiverged(divergence) = answer else {
+            panic!("a stale edit diverges, not {answer:?}")
+        };
+        let context = &divergence.context;
+        assert_eq!(context.workspaces.len(), 2);
+        assert_eq!(context.label(&platform), "flow \u{b7} workspace Platform");
+        assert_eq!(context.label(&graphics), "flow \u{b7} workspace Graphics");
     }
 
     /// D3: an edit form carries the item fresh; its version is the token.
@@ -1056,6 +1195,11 @@ mod tests {
             repos: Vec::new(),
             item: Some(item.clone()),
             item_graph: None,
+            workspaces: WorkspaceNames::new([WorkspaceName {
+                id: ids::WORKSPACE_PLATFORM,
+                name: "SECRET-WORKSPACE".to_owned(),
+                slug: "secret-slug".to_owned(),
+            }]),
         };
         let divergence = ItemDivergence {
             head: item.clone(),
@@ -1068,10 +1212,18 @@ mod tests {
         ] {
             let diverged = matches!(reply, StoreReply::ItemDiverged(_));
             for printed in [format!("{reply:?}"), format!("{reply:#?}")] {
-                for secret in ["SECRET-BODY", "SECRET-ANCESTOR", "secret/dir"] {
+                for secret in [
+                    "SECRET-BODY",
+                    "SECRET-ANCESTOR",
+                    "secret/dir",
+                    "SECRET-WORKSPACE",
+                    "secret-slug",
+                ] {
                     assert!(!printed.contains(secret), "{secret}: {printed}");
                 }
                 assert!(printed.contains(&item.key), "{printed}");
+                // MOD-141 M3 D2: the workspace names print as a count.
+                assert!(printed.contains("workspaces: 1"), "{printed}");
                 if diverged {
                     // Milestone 3 D7: the catalogue prints, as counts.
                     assert!(printed.contains("kinds"), "{printed}");

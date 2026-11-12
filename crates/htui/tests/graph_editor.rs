@@ -10,25 +10,32 @@
 //! MOD-141 milestone 2, T9: the same drivers over the M2 node fields (the deadline, the palette
 //! flag, the split and its rows, the default parts through the part form), the compete switch,
 //! `htui_orch`'s resolve over the saved body, and the header's limits line.
+//!
+//! MOD-141 milestone 3, T4: the editor's entry point, [`GraphEditorHost`], driven on its own over
+//! a [`SectionBench`]'s context: a graph of every scope opened by id, edited, saved through the
+//! store worker and resolved; a stale save; an unknown id. And, through the shell, a kind line
+//! that names its workspace and a bare graph name two workspaces share, refused.
 #![cfg(feature = "testkit")]
 
 use std::collections::BTreeMap;
 
 use chrono::DateTime;
-use htui::app::Action;
-use htui::keys::{Stack, load_str, views};
+use htui::app::{Action, Handled};
+use htui::keys::{Act, KeyChord, Keys, Stack, load_str, views};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::graph_editor::{EditorKey, GraphEditorHost};
 use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, SettingsSection, SettingsTab,
 };
 use htui_core::fixtures::ids;
 use htui_core::model::predicate::IfPredicate;
 use htui_core::model::{
-    AgentId, CommandQueue, EdgeKind, Gate, GraphBody, GraphSnapshot, Isolation, ItemId, ItemPatch,
-    NodeBody, NodeRole, PersonaId, PhaseAgent, PhaseId, PhasePart, PlanScope, RunMode,
-    SnapshotPart, SnapshotPhase, Split, StepGraphEdge, StepGraphId,
+    AgentId, CommandQueue, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, GraphSnapshot, Isolation,
+    ItemId, ItemKindId, ItemPatch, NewItemKind, NewStepGraph, NodeBody, NodeRole, PersonaId,
+    PhaseAgent, PhaseId, PhasePart, PlanScope, RunMode, SnapshotPart, SnapshotPhase, Split,
+    StepGraphEdge, StepGraphId, WorkspaceProject,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -37,6 +44,9 @@ use htui_core::store::{
 };
 use htui_orch::graph::{NotRunnable, ResolveError};
 use htui_store::Backend;
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::json;
 
 // -------------------------------------------------------------------------------------------
@@ -474,7 +484,7 @@ async fn bench_round(
 /// open on [`ANALYSIS`] from its kind row and its agents, templates and settings read.
 async fn analysis_bench(
     store: &MemStore,
-    keys: Option<htui::keys::Keys>,
+    keys: Option<Keys>,
 ) -> (SectionBench, KindsSection, Backend) {
     let backend = Backend::memory(store.clone());
     let bench = match keys {
@@ -2286,4 +2296,640 @@ async fn the_header_shows_the_limits() {
          \u{b7} child runs 6 \u{b7} run-time changes off",
         "{frame}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// The entry point (MOD-141 M3 T4)
+// -------------------------------------------------------------------------------------------
+
+/// One chord to the host, written as `KeyChord::parse` reads it.
+fn host_key(bench: &SectionBench, host: &mut GraphEditorHost, chord: &str) -> EditorKey {
+    let parsed = KeyChord::parse(chord).unwrap_or_else(|| panic!("`{chord}` is not a chord"));
+    let mut ctx = bench.ctx();
+    host.on_key(parsed.to_event(), &mut ctx)
+}
+
+/// Every chord in order, to the host.
+fn host_press(bench: &SectionBench, host: &mut GraphEditorHost, chords: &[&str]) {
+    for chord in chords {
+        host_key(bench, host, chord);
+    }
+}
+
+/// Every character of `text` as its own key, to the host (a blank is `space`).
+fn host_type(bench: &SectionBench, host: &mut GraphEditorHost, text: &str) {
+    for character in text.chars() {
+        if character == ' ' {
+            host_key(bench, host, "space");
+        } else {
+            host_key(bench, host, &character.to_string());
+        }
+    }
+}
+
+/// Serves `first`, then everything the host asks for until it asks nothing more, each with the
+/// store worker's own `serve` over `backend`; every reply must be the host's. The requests served
+/// and their replies, in order.
+async fn host_round(
+    bench: &SectionBench,
+    host: &mut GraphEditorHost,
+    backend: &Backend,
+    first: Vec<StoreRequest>,
+) -> Vec<(StoreRequest, StoreReply)> {
+    let mut served = Vec::new();
+    let mut requests = first;
+    loop {
+        requests.extend(
+            bench
+                .drained()
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::Store(request) => Some(request),
+                    _ => None,
+                }),
+        );
+        if requests.is_empty() {
+            return served;
+        }
+        for request in core::mem::take(&mut requests) {
+            let reply = serve(backend, &request).await;
+            let mut ctx = bench.ctx();
+            assert!(
+                host.on_reply(&reply, &mut ctx),
+                "{request:?} answered {reply:?}, which the host did not take"
+            );
+            served.push((request, reply));
+        }
+    }
+}
+
+/// The host drawn `width` columns wide, 30 rows high, as text.
+fn host_frame(bench: &SectionBench, host: &GraphEditorHost, width: u16) -> String {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| host.render(frame, frame.area(), &ctx))
+        .expect("the host draws");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Selects step `name` with the editor's direction keys, `e`'s form title the probe (as
+/// [`select`]).
+#[track_caller]
+fn host_select(bench: &SectionBench, host: &mut GraphEditorHost, name: &str) {
+    let title = format!("step {name}");
+    for chord in ["h", "k", "l", "j"].iter().cycle().take(24) {
+        host_key(bench, host, "e");
+        let frame = host_frame(bench, host, 100);
+        host_key(bench, host, "esc");
+        if frame.contains(&title) {
+            return;
+        }
+        host_key(bench, host, chord);
+    }
+    panic!(
+        "no direction selects `{name}`: {}",
+        host_frame(bench, host, 100)
+    );
+}
+
+/// The chord `graph_editor.close` is bound to in the compiled keys.
+fn close_chord() -> String {
+    Keys::compiled()
+        .label(views::GRAPH_EDITOR, Act::GraphEditorClose)
+        .expect("close is bound")
+}
+
+/// `GraphEditorHost::open_by_id(graph)`, its two reads and then the editor's three served
+/// through the store worker: the editor open on `graph`.
+async fn opened_by_id(
+    bench: &SectionBench,
+    backend: &Backend,
+    graph: StepGraphId,
+) -> GraphEditorHost {
+    let (mut host, requests) = GraphEditorHost::open_by_id(graph);
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [StoreRequest::GraphBody(asked), StoreRequest::Personas] if *asked == graph
+        ),
+        "the body and the personas: {requests:?}"
+    );
+    let served = host_round(bench, &mut host, backend, requests).await;
+    let asked: Vec<&StoreRequest> = served.iter().map(|(request, _)| request).collect();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [
+                StoreRequest::GraphBody(_),
+                StoreRequest::Personas,
+                StoreRequest::Agents,
+                StoreRequest::Templates(_),
+                StoreRequest::GraphEditorSettings,
+            ]
+        ),
+        "the body, then the editor's three reads: {asked:?}"
+    );
+    assert!(
+        host.editor_mut().is_some(),
+        "the editor is open: {}",
+        host_frame(bench, &host, 100)
+    );
+    assert_eq!(host.graph(), graph);
+    host
+}
+
+/// A new graph of `scope` named `name`, holding [`ANALYSIS`]'s steps and links under new ids,
+/// written through the store (a created graph has no steps to edit).
+async fn analysis_copy(store: &MemStore, scope: GraphScope, name: &str) -> StepGraphId {
+    let graph = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            scope,
+            name: name.to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a new graph")
+        .id;
+    let mut body = body_of(store, graph).await;
+    let source = body_of(store, ANALYSIS).await;
+    let renamed: Vec<(PhaseId, PhaseId)> = source
+        .nodes
+        .iter()
+        .map(|node| (node.phase.id, PhaseId::new()))
+        .collect();
+    let new_id = |old: PhaseId| {
+        renamed
+            .iter()
+            .find(|(from, _)| *from == old)
+            .map(|(_, to)| *to)
+            .expect("every link's ends are steps")
+    };
+    body.nodes = source
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut node = node.clone();
+            let id = new_id(node.phase.id);
+            node.phase.id = id;
+            node.phase.graph_id = graph;
+            for agent in &mut node.agents {
+                agent.phase_id = id;
+            }
+            for part in &mut node.parts {
+                part.phase_id = id;
+            }
+            node
+        })
+        .collect();
+    body.edges = source
+        .edges
+        .iter()
+        .map(|edge| StepGraphEdge {
+            id: EdgeId::new(),
+            graph_id: graph,
+            from: new_id(edge.from),
+            to: new_id(edge.to),
+            ..edge.clone()
+        })
+        .collect();
+    let revision = body.graph.revision;
+    let outcome = store
+        .replace_graph(graph, revision, body)
+        .await
+        .expect("the store takes the copy");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    graph
+}
+
+/// Gives every step of `graph` without one the candidate `pair`, one store write: the box's two
+/// enabled agents leave the candidate chain's third rung ambiguous, so resolve needs them
+/// ([`with_candidates`]).
+async fn with_one_candidate(store: &MemStore, graph: StepGraphId, pair: &(AgentId, String)) {
+    let mut body = body_of(store, graph).await;
+    for node in &mut body.nodes {
+        if node.agents.is_empty() {
+            node.agents = candidates(node.phase.id, &[pair]);
+        }
+    }
+    let revision = body.graph.revision;
+    let outcome = store
+        .replace_graph(graph, revision, body)
+        .await
+        .expect("the store takes the candidates");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+}
+
+/// The one `ReplaceGraph` of `served`: it wrote `graph` on `revision - 1` and its answer applied
+/// as `revision`.
+#[track_caller]
+fn applied_once(served: &[(StoreRequest, StoreReply)], graph: StepGraphId, revision: i64) {
+    let writes: Vec<&(StoreRequest, StoreReply)> = served
+        .iter()
+        .filter(|(request, _)| matches!(request, StoreRequest::ReplaceGraph { .. }))
+        .collect();
+    let [
+        (
+            StoreRequest::ReplaceGraph {
+                graph: written,
+                expected_revision,
+                ..
+            },
+            reply,
+        ),
+    ] = writes.as_slice()
+    else {
+        panic!("one write: {served:?}");
+    };
+    assert_eq!(*written, graph);
+    assert_eq!(*expected_revision, revision - 1);
+    let StoreReply::GraphReplaced {
+        outcome: CasOutcome::Applied(body),
+        ..
+    } = reply
+    else {
+        panic!("the write applied: {reply:?}");
+    };
+    assert_eq!(body.graph.id, graph);
+    assert_eq!(body.graph.revision, revision);
+}
+
+/// MOD-141 M3 D4 (PRD "every scope editable"): the entry point opens a project, a workspace and
+/// a library graph by id, takes a new step and a loop back with a limit, saves each write through
+/// the store worker, reads the edit back from `graph_body`, and the saved body resolves through
+/// the orchestrator's own resolver for `VULKAN_FEAT_1` (the workspace graph lives in Graphics,
+/// the item's workspace).
+#[tokio::test]
+async fn the_entry_point_edits_every_scope_by_id_and_the_save_resolves() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let bench = SectionBench::new().await;
+    let pair = agent_pairs(&backend)
+        .await
+        .into_iter()
+        .next()
+        .expect("an agent");
+    let workspace = analysis_copy(
+        &store,
+        GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+        "shared analysis",
+    )
+    .await;
+    let library = analysis_copy(&store, GraphScope::Library, "library analysis").await;
+    let close = close_chord();
+
+    for (graph, scope) in [
+        (ANALYSIS, GraphScope::Project(ids::PROJECT_VULKAN)),
+        (workspace, GraphScope::Workspace(ids::WORKSPACE_GRAPHICS)),
+        (library, GraphScope::Library),
+    ] {
+        with_one_candidate(&store, graph, &pair).await;
+        let before = body_of(&store, graph).await;
+        assert_eq!(before.graph.scope, scope);
+        let mut host = opened_by_id(&bench, &backend, graph).await;
+        let frame = host_frame(&bench, &host, 100);
+        assert!(
+            frame.contains("research") && frame.contains("verdict"),
+            "{scope:?}: {frame}"
+        );
+
+        // `a` with research selected: `check` between research and verdict, with a candidate.
+        host_select(&bench, &mut host, "research");
+        host_key(&bench, &mut host, "a");
+        host_type(&bench, &mut host, "check");
+        host_press(&bench, &mut host, &["alt-n", "enter"]);
+        assert!(host.busy(), "{scope:?}: {}", host_frame(&bench, &host, 100));
+        let added = host_round(&bench, &mut host, &backend, Vec::new()).await;
+        applied_once(&added, graph, before.graph.revision + 1);
+        assert!(!host.busy(), "{scope:?}");
+        let frame = host_frame(&bench, &host, 100);
+        assert!(frame.contains("saved: adding check"), "{scope:?}: {frame}");
+
+        // `c` from check (selected once added) back to research: `changes requested`, at most 3
+        // times round.
+        host_press(&bench, &mut host, &["c", "k", "enter"]);
+        let frame = host_frame(&bench, &host, 100);
+        assert!(
+            frame.contains("link check \u{2192} research"),
+            "{scope:?}: the pick lands on research: {frame}"
+        );
+        host_press(&bench, &mut host, &["l", "l", "l", "tab"]);
+        host_type(&bench, &mut host, "3");
+        host_key(&bench, &mut host, "enter");
+        let linked = host_round(&bench, &mut host, &backend, Vec::new()).await;
+        applied_once(&linked, graph, before.graph.revision + 2);
+        let frame = host_frame(&bench, &host, 100);
+        assert!(
+            frame.contains("saved: linking check \u{2192} research"),
+            "{scope:?}: {frame}"
+        );
+
+        // Read back through the worker: the step, both links it took over and the loop.
+        let StoreReply::GraphBody(Some(reread)) =
+            serve(&backend, &StoreRequest::GraphBody(graph)).await
+        else {
+            panic!("{scope:?}: the graph reads back");
+        };
+        assert_eq!(reread.graph.scope, scope);
+        assert_eq!(reread.graph.revision, before.graph.revision + 2);
+        assert_eq!(reread.nodes.len(), 3, "{scope:?}: {reread:?}");
+        assert_eq!(
+            node_of(&reread, step(&reread, "check")).agents.len(),
+            1,
+            "{scope:?}: one candidate"
+        );
+        assert_eq!(
+            edges_by_name(&reread),
+            vec![
+                (
+                    "check".to_owned(),
+                    "research".to_owned(),
+                    EdgeKind::ChangesRequested,
+                    None,
+                    Some(3),
+                ),
+                (
+                    "check".to_owned(),
+                    "verdict".to_owned(),
+                    EdgeKind::Next,
+                    None,
+                    None,
+                ),
+                (
+                    "research".to_owned(),
+                    "check".to_owned(),
+                    EdgeKind::Next,
+                    None,
+                    None,
+                ),
+            ],
+            "{scope:?}"
+        );
+
+        // The saved body resolves.
+        pin_feat_1(&store, graph).await;
+        let snapshot = resolved(&store)
+            .await
+            .unwrap_or_else(|refusal| panic!("{scope:?}: the saved graph resolves: {refusal}"));
+        let mut phases: Vec<&str> = snapshot
+            .phases
+            .iter()
+            .map(|phase| phase.name.as_str())
+            .collect();
+        phases.sort_unstable();
+        assert_eq!(phases, ["check", "research", "verdict"], "{scope:?}");
+        assert_eq!(snapshot.edges.len(), 3, "{scope:?}: {:?}", snapshot.edges);
+
+        assert_eq!(host_key(&bench, &mut host, &close), EditorKey::Close);
+    }
+}
+
+/// MOD-141 M3 D4: another writer moves the graph on while the entry point holds it open; the
+/// host's save answers `Stale`, the editor adopts the stored body and says so, its undo history
+/// goes, and its next write is made on the adopted revision.
+#[tokio::test]
+async fn a_stale_save_through_the_entry_point_rebases() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let bench = SectionBench::new().await;
+    let mut host = opened_by_id(&bench, &backend, ANALYSIS).await;
+    let opened = body_of(&store, ANALYSIS).await;
+
+    // Another writer, straight to the store.
+    let mut foreign = opened.clone();
+    let verdict = foreign
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.name == "verdict")
+        .expect("verdict");
+    "decide".clone_into(&mut verdict.phase.name);
+    "decide".clone_into(&mut verdict.phase.output_kind);
+    let CasOutcome::Applied(foreign) = store
+        .replace_graph(ANALYSIS, opened.graph.revision, foreign)
+        .await
+        .expect("the foreign write lands")
+    else {
+        panic!("the foreign write applies");
+    };
+
+    host_select(&bench, &mut host, "research");
+    host_press(&bench, &mut host, &["e", "end"]);
+    host_type(&bench, &mut host, "3");
+    host_key(&bench, &mut host, "enter");
+    let served = host_round(&bench, &mut host, &backend, Vec::new()).await;
+    let [
+        (
+            StoreRequest::ReplaceGraph {
+                expected_revision, ..
+            },
+            StoreReply::GraphReplaced {
+                outcome: CasOutcome::Stale(current),
+                ..
+            },
+        ),
+    ] = served.as_slice()
+    else {
+        panic!("one write, answered stale: {served:?}");
+    };
+    assert_eq!(*expected_revision, opened.graph.revision);
+    assert_eq!(shape(current), shape(&foreign));
+    assert!(!host.busy());
+    let frame = host_frame(&bench, &host, 100);
+    assert!(
+        flat(&frame).contains("changed elsewhere, reloaded; undo history cleared"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("decide"),
+        "the stored body on screen: {frame}"
+    );
+    assert!(!frame.contains("research3"), "the edit went: {frame}");
+    let stored = body_of(&store, ANALYSIS).await;
+    assert_eq!(
+        shape(&stored),
+        shape(&foreign),
+        "nothing of the stale write"
+    );
+    assert_eq!(stored.graph.revision, foreign.graph.revision);
+
+    // The undo history went with it.
+    host_key(&bench, &mut host, "u");
+    assert!(
+        host_round(&bench, &mut host, &backend, Vec::new())
+            .await
+            .is_empty()
+    );
+    assert!(
+        host_frame(&bench, &host, 100).contains("nothing to undo"),
+        "{}",
+        host_frame(&bench, &host, 100)
+    );
+
+    // The adopted body is the next write's base: it applies on the foreign revision.
+    host_select(&bench, &mut host, "research");
+    host_press(&bench, &mut host, &["e", "end"]);
+    host_type(&bench, &mut host, "4");
+    host_key(&bench, &mut host, "enter");
+    let served = host_round(&bench, &mut host, &backend, Vec::new()).await;
+    applied_once(&served, ANALYSIS, foreign.graph.revision + 1);
+    let stored = body_of(&store, ANALYSIS).await;
+    let mut names: Vec<&str> = stored
+        .nodes
+        .iter()
+        .map(|node| node.phase.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["decide", "research4"]);
+}
+
+/// MOD-141 M3 D4: an id no graph has opens nothing; the host says so in one line, swallows the
+/// editor's keys, sends nothing more, and its close key still closes.
+#[tokio::test]
+async fn an_unknown_graph_id_opens_nothing() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store);
+    let bench = SectionBench::new().await;
+    let missing = StepGraphId::new();
+    let (mut host, requests) = GraphEditorHost::open_by_id(missing);
+    let served = host_round(&bench, &mut host, &backend, requests).await;
+    assert!(
+        matches!(
+            served.as_slice(),
+            [
+                (StoreRequest::GraphBody(_), StoreReply::GraphBody(None)),
+                (StoreRequest::Personas, StoreReply::Personas(_)),
+            ]
+        ),
+        "the two reads and nothing after: {served:?}"
+    );
+    assert!(host.editor_mut().is_none(), "nothing opened");
+    assert_eq!(host.graph(), missing);
+    assert!(!host.busy());
+    assert!(host.wants_requests(bench.ctx().scope).is_empty());
+    let frame = host_frame(&bench, &host, 60);
+    assert_eq!(frame.lines().next(), Some("graph not found"), "{frame}");
+
+    for chord in ["a", "e", "c", "enter"] {
+        assert_eq!(
+            host_key(&bench, &mut host, chord),
+            EditorKey::Handled(Handled::Consumed),
+            "{chord}"
+        );
+    }
+    assert!(
+        host_round(&bench, &mut host, &backend, Vec::new())
+            .await
+            .is_empty(),
+        "no key sent anything"
+    );
+    let hint = host.hint_text(Keys::compiled());
+    assert!(
+        hint.contains(&close_chord()) && hint.contains("close"),
+        "{hint}"
+    );
+    assert_eq!(
+        host_key(&bench, &mut host, &close_chord()),
+        EditorKey::Close
+    );
+}
+
+/// MOD-141 M3 D1, D3 through the shell: with Vulkan linked into Platform and a graph `flow` in
+/// both Platform and Graphics, a kind on Platform's names its workspace on its line, and a new
+/// kind typed with the bare name `flow` is refused with both qualified labels, nothing written.
+#[tokio::test]
+async fn a_kind_line_names_its_workspace_and_refuses_an_ambiguous_name() {
+    let store = MemStore::demo();
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_id: ids::PROJECT_VULKAN,
+            position: 9,
+        })
+        .await
+        .expect("vulkan joins platform");
+    let mut flows = Vec::new();
+    for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+        let graph = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(workspace),
+                name: "flow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        flows.push(graph.id);
+    }
+    store
+        .create_item_kind(NewItemKind {
+            id: ItemKindId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            prefix: "DOC".to_owned(),
+            name: "docs".to_owned(),
+            description: String::new(),
+            default_graph_id: flows[0],
+            position: 99,
+        })
+        .await
+        .expect("a kind on Platform's flow");
+    let kinds_before = WorkerStore::item_kinds(&store, ids::PROJECT_VULKAN)
+        .await
+        .expect("a memory read never fails")
+        .len();
+
+    let mut harness = kinds_over(store.clone()).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("DOC  docs \u{b7} graph flow \u{b7} workspace Platform"),
+        "the kind's line names the workspace: {frame}"
+    );
+
+    // A new kind, its graph field the bare name both workspaces' graphs share.
+    repeat(&mut harness, "k", 96);
+    harness.key("n");
+    typed(&mut harness, "WSF");
+    harness.key("tab");
+    typed(&mut harness, "wsflow");
+    repeat(&mut harness, "tab", 2);
+    repeat(&mut harness, "backspace", 40);
+    typed(&mut harness, "flow");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = flat(&harness.render());
+    // `ambiguous_graph` is the crate's own; the sentence is written out here.
+    let graphics = "flow \u{b7} workspace Graphics";
+    let platform = "flow \u{b7} workspace Platform";
+    let refusals = [
+        format!("\"flow\" names 2 graphs; type one of: {platform}, {graphics}"),
+        format!("\"flow\" names 2 graphs; type one of: {graphics}, {platform}"),
+    ];
+    assert!(
+        refusals.iter().any(|sentence| frame.contains(sentence)),
+        "the refusal lists both labels: {frame}"
+    );
+    let kinds = WorkerStore::item_kinds(&store, ids::PROJECT_VULKAN)
+        .await
+        .expect("a memory read never fails");
+    assert_eq!(kinds.len(), kinds_before, "nothing is guessed: {kinds:?}");
+    assert!(kinds.iter().all(|kind| kind.prefix != "WSF"), "{kinds:?}");
 }

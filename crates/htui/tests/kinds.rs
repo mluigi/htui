@@ -2116,7 +2116,7 @@ async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
     let frame = bench.render_section(&section, 100);
     let row = frame
         .lines()
-        .position(|line| line.trim() == "DOC  docs \u{b7} graph wsflow \u{b7} workspace")
+        .position(|line| line.trim() == "DOC  docs \u{b7} graph wsflow \u{b7} workspace Graphics")
         .unwrap_or_else(|| panic!("the kind's line names the kept graph: {frame}"));
     assert!(
         !error_text(&bench, &section, 100).contains(&"graph missing".to_owned()),
@@ -2130,7 +2130,7 @@ async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
     let open = bench.render_section(&section, 100);
     assert!(
         open.lines()
-            .any(|line| line.trim() == "graph         wsflow \u{b7} workspace"),
+            .any(|line| line.trim() == "graph         wsflow \u{b7} workspace Graphics"),
         "the graph field names the kept graph: {open}"
     );
     bench.key(&mut section, "tab");
@@ -2160,6 +2160,156 @@ async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
         renamed.default_graph_id, shared.id,
         "an unchanged graph is not re-checked, so the kind keeps it"
     );
+}
+
+/// The demo's Vulkan project joins Platform too, so it may use both workspaces' graphs, and each
+/// workspace in `workspaces` gets a graph named `flow`. Answers their ids in that order.
+async fn flows_in(store: &MemStore, workspaces: &[WorkspaceId]) -> Vec<StepGraphId> {
+    store
+        .upsert_workspace_project(&htui_core::model::WorkspaceProject {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_id: ids::PROJECT_VULKAN,
+            position: 9,
+        })
+        .await
+        .expect("vulkan joins platform");
+    let mut flows = Vec::new();
+    for workspace in workspaces {
+        let graph = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(*workspace),
+                name: "flow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        flows.push(graph.id);
+    }
+    flows
+}
+
+/// MOD-141 M3 D1 (M-1): a kind on a workspace graph names that graph's workspace on its line, and
+/// its edit form opens on the same label.
+#[tokio::test]
+async fn a_kind_line_names_its_workspace() {
+    let store = MemStore::demo();
+    let flows = flows_in(&store, &[ids::WORKSPACE_PLATFORM]).await;
+    store
+        .create_item_kind(htui_core::model::NewItemKind {
+            id: ItemKindId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            prefix: "DOC".to_owned(),
+            name: "docs".to_owned(),
+            description: String::new(),
+            default_graph_id: flows[0],
+            position: 99,
+        })
+        .await
+        .expect("a kind on the workspace graph");
+    let backend = Backend::memory(store);
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(demo_catalogue(&backend).await)),
+    );
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    let row = frame
+        .lines()
+        .position(|line| line.trim() == "DOC  docs \u{b7} graph flow \u{b7} workspace Platform")
+        .unwrap_or_else(|| panic!("the kind's line names the workspace: {frame}"));
+
+    for _ in 0..row {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "e");
+    let open = bench.render_section(&section, 100);
+    assert!(
+        open.lines()
+            .any(|line| line.trim() == "graph         flow \u{b7} workspace Platform"),
+        "the graph field names the workspace: {open}"
+    );
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`Enter` updates once: {asked:?}");
+    };
+    assert_eq!(
+        patch.default_graph_id,
+        Some(flows[0]),
+        "an untouched field keeps the graph"
+    );
+}
+
+/// MOD-141 M3 D3 (M-2): a typed bare name two workspaces' graphs share is refused, and the refusal
+/// lists the qualified labels; pasting one of them resolves to that graph.
+#[tokio::test]
+async fn an_ambiguous_graph_name_is_refused_with_both_labels() {
+    let store = MemStore::demo();
+    let flows = flows_in(&store, &[ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS]).await;
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+    let project = &snapshot.projects[0];
+    let labels: Vec<String> = project
+        .shared
+        .iter()
+        .filter(|graph| graph.name == "flow")
+        .map(|graph| project.label(graph))
+        .collect();
+    let mut sorted = labels.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        [
+            "flow \u{b7} workspace Graphics",
+            "flow \u{b7} workspace Platform"
+        ]
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "DOC");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "docs");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    for _ in 0.."analysis".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "flow");
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "nothing is guessed");
+    let sentence = format!(
+        "\"flow\" names 2 graphs; type one of: {}, {}",
+        labels[0], labels[1]
+    );
+    assert!(
+        error_text(&bench, &section, 100).contains(&sentence),
+        "the refusal lists both labels: {}",
+        bench.render_section(&section, 100)
+    );
+
+    for _ in 0.."flow".len() {
+        bench.key(&mut section, "backspace");
+    }
+    bench.paste(&mut section, "flow \u{b7} workspace Graphics");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::CreateKind { graph, .. })] = asked.as_slice() else {
+        panic!("`Enter` creates once: {asked:?}");
+    };
+    assert_eq!(*graph, flows[1], "the qualified label is Graphics' flow");
 }
 
 /// `e` on a kind sends the whole patch against the row's token, changed columns or not (B-5): one

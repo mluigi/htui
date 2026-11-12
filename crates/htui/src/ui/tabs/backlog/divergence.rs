@@ -30,7 +30,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::catalogue::graph_label;
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::ui::cells;
@@ -452,10 +451,12 @@ impl Labels<'_> {
             )
     }
 
-    /// The graph picker's words: `kind default`, a graph's [`graph_label`] (a project graph's
-    /// name, a workspace or library graph's `name · scope`, MOD-138 D12), or an override. Each
-    /// catalogue's `item_graph` counts too, so a workspace graph the item kept after its project
-    /// left that workspace reads with its scope, as the picker labels it.
+    /// The graph picker's words: `kind default`, a graph's [`ItemFormContext::label`] (a project
+    /// graph's name, a library graph's `name · library`, a workspace graph's `name · workspace
+    /// <workspace>`, MOD-138 D12 and MOD-141 M3 D1), or an override. Each catalogue's
+    /// `item_graph` counts too, so a workspace graph the item kept after its project left that
+    /// workspace reads with its scope, as the picker labels it. The label is read through the
+    /// catalogue that holds the graph, whose workspace names cover it.
     fn graph(&self, id: Option<StepGraphId>) -> String {
         let Some(id) = id else {
             return "kind default".to_owned();
@@ -468,10 +469,11 @@ impl Labels<'_> {
                     .iter()
                     .chain(&context.item_graph)
                     .find(|graph| graph.id == id && !graph.is_override)
+                    .map(|graph| (context, graph))
             })
             .map_or_else(
                 || "override (this item's)".to_owned(),
-                |graph| graph_label(&graph.name, graph.scope),
+                |(context, graph)| context.label(graph),
             )
     }
 }
@@ -661,7 +663,9 @@ mod tests {
     use crate::ui::layout::chrome;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::model::{EditReason, GraphScope, ItemPatch, NewStepGraph, SpecChanges};
+    use htui_core::model::{
+        EditReason, GraphScope, ItemPatch, NewStepGraph, SpecChanges, WorkspaceProject,
+    };
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -905,7 +909,53 @@ mod tests {
         .await;
         let ancestor = context.item.clone().expect("an edit context");
         let view = Divergence::open(&ancestor, &context, ItemSpec::of(&ancestor), &divergence);
-        assert_eq!(graph_cells(&view).1, "wsflow \u{b7} workspace");
+        assert_eq!(graph_cells(&view).1, "wsflow \u{b7} workspace Platform");
+    }
+
+    /// MOD-141 M3 (the picker fix): htui sits in both demo workspaces and each has a graph named
+    /// `flow`; theirs took one and mine the other, and the Graph row tells them apart.
+    #[tokio::test]
+    async fn two_workspaces_flow_graphs_read_apart() {
+        let store = MemStore::demo();
+        store
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: ids::WORKSPACE_GRAPHICS,
+                project_id: ids::PROJECT_HTUI,
+                position: 9,
+            })
+            .await
+            .expect("htui joins graphics");
+        let mut flows = Vec::new();
+        for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+            let graph = store
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    scope: GraphScope::Workspace(workspace),
+                    name: "flow".to_owned(),
+                    description: String::new(),
+                    is_override: false,
+                })
+                .await
+                .expect("a workspace graph");
+            flows.push(graph.id);
+        }
+        let (context, divergence) = diverged(&store, |_| ItemPatch {
+            step_graph_id: Some(Some(flows[1])),
+            ..patch()
+        })
+        .await;
+        let ancestor = context.item.clone().expect("an edit context");
+        let mut mine = ItemSpec::of(&ancestor);
+        mine.step_graph_id = Some(flows[0]);
+        let view = Divergence::open(&ancestor, &context, mine, &divergence);
+        assert_eq!(
+            graph_cells(&view),
+            (
+                "kind default".to_owned(),
+                "flow \u{b7} workspace Graphics".to_owned(),
+                "flow \u{b7} workspace Platform".to_owned()
+            )
+        );
     }
 
     /// MOD-138 D12: ANA-1 kept a workspace graph after htui left that workspace, so neither
@@ -972,7 +1022,7 @@ mod tests {
         let mut mine = ItemSpec::of(&ancestor);
         mine.step_graph_id = None;
         let view = Divergence::open(&ancestor, &context, mine, &divergence);
-        let label = "wsflow \u{b7} workspace".to_owned();
+        let label = "wsflow \u{b7} workspace Platform".to_owned();
         assert_eq!(
             graph_cells(&view),
             (label.clone(), label, "kind default".to_owned())

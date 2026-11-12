@@ -13,12 +13,16 @@
 //! - `notes`: what a run of one step would be refused with today, in resolve's own words (M2 D11).
 //! - `part_form`: one default part of a divide step (M2 D9).
 //! - [`GraphEditor`] (this module): the modes, every key through the key catalogue (D12), the
-//!   writes and the replies (D4), the mouse (D11) and the drawing (D2). Only this module names
-//!   `Act`, `Keys`, `Stack`, `Ctx` or `StoreRequest`.
+//!   writes and the replies (D4), the mouse (D11) and the drawing (D2).
+//! - `host`: [`GraphEditorHost`], the entry point (M3 D4): opens a graph by id or on a held body,
+//!   routes the replies and stands in for the editor while the body is read or was refused.
+//!
+//! Only this module and `host` name `Act`, `Keys`, `Stack`, `Ctx` or `StoreRequest`.
 
 pub(crate) mod canvas;
 pub(crate) mod edge_form;
 pub(crate) mod history;
+mod host;
 pub(crate) mod links;
 pub(crate) mod model;
 pub(crate) mod node_form;
@@ -57,6 +61,8 @@ use crate::ui::kit::form::FormLines;
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::{FieldOutcome, Theme};
+
+pub use self::host::GraphEditorHost;
 
 /// What the host hands the editor beside the body (D1): the persona registry, always known (the
 /// catalogue carries it), and the agents and the templates once their reads answered.
