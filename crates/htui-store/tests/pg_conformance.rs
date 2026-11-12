@@ -126,3 +126,28 @@ async fn pg_store_read_conformance() {
         db.drop_db().await;
     }
 }
+
+/// MOD-122 M2's worker log suite (`WORKER_LOG_CASES`, blueprint F1) run against `PgStore`.
+///
+/// A third loop for `pg_store_read_conformance`'s reason: `run_worker_log_case` is bound to
+/// `WriteStore + WorkerLogStore`, a narrow trait only the two stores implement. Every case
+/// writes, so each gets its own database, boxed as `pg_store_conformance`'s are (MOD-137).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_worker_log_conformance() {
+    use htui_core::store::conformance;
+
+    assert_eq!(
+        conformance::WORKER_LOG_CASES.len(),
+        5,
+        "MOD-122 M2's five worker log cases, as `mem_store.rs` pins them"
+    );
+    for name in conformance::WORKER_LOG_CASES {
+        let Some(db) = Box::pin(common::demo_db()).await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("worker log case {name}");
+        conformance::run_worker_log_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}
