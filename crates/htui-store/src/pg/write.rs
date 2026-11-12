@@ -93,7 +93,7 @@ use htui_core::store::{
 use htui_core::store::{
     plan_revision_taken, planner_not_in_run, project_slug_refusal, run_plan_refusal,
     scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace, scope_row_slug_is_fixed,
-    workspace_has_live_run, workspace_has_stopped_run,
+    workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -1269,6 +1269,18 @@ fn parent_fk_refused(err: sqlx::Error, parent: Option<StepId>, run: RunId) -> St
             parent,
             &format!("run_step of run {run}"),
         ));
+    }
+    map_sqlx(err)
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): `constraint`'s `23503` (`fk_run_workspace`,
+/// `fk_queue_entry_workspace`) in [`workspace_gone`]'s sentence, `MemStore`'s; anything else
+/// through [`map_sqlx`].
+fn workspace_fk_refused(err: sqlx::Error, constraint: &str) -> StoreError {
+    if let sqlx::Error::Database(db) = &err
+        && db.constraint() == Some(constraint)
+    {
+        return StoreError::Constraint(workspace_gone());
     }
     map_sqlx(err)
 }
@@ -6223,7 +6235,8 @@ impl WriteStore for PgStore {
     /// its own ([`scope_row_run_workspace`], MOD-147 D8; `None` is filled with it), when the id
     /// is taken, or on any of the keys above.
     /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
-    /// an unknown or closed `new.batch_id` (MOD-12 D7).
+    /// an unknown or closed `new.batch_id` (MOD-12 D7). An unknown workspace is
+    /// [`workspace_gone`]'s sentence (`fk_run_workspace`, MOD-125 M2 D10).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -6382,7 +6395,7 @@ impl WriteStore for PgStore {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| workspace_fk_refused(err, "fk_run_workspace"))?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(run)
@@ -10937,7 +10950,7 @@ impl PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] with [`scope_row_run_workspace`] for a scope row's item named
     /// with another workspace, or for an unknown box, workspace or user (23503, through
-    /// [`map_sqlx`]).
+    /// [`map_sqlx`]); an unknown workspace is [`workspace_gone`]'s sentence (MOD-125 M2 D10).
     pub async fn queue_item(
         &self,
         item: ItemId,
@@ -10982,7 +10995,7 @@ impl PgStore {
         )
         .execute(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| workspace_fk_refused(err, "fk_queue_entry_workspace"))?;
         let entry = sqlx::query_as!(
             QueueEntry,
             r#"

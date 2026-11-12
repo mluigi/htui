@@ -1510,6 +1510,8 @@ pub trait WriteStore: ReadStore {
     /// for an unknown batch, `Constraint` ([`batch_is_closed`]) for a closed one. MOD-147 D8: a run
     /// on a scope row carries its workspace ([`run_workspace_for`]: `None` is filled), another
     /// workspace is `Constraint` ([`scope_row_run_workspace`]), checked before any foreign key.
+    /// MOD-125 M2 D10: an unknown (or deleted) `new.workspace_id` is `Constraint` in
+    /// [`workspace_gone`]'s sentence on both stores.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
@@ -3720,6 +3722,13 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
     )
 }
 
+/// MOD-125 M2 D10 (M1 review L-3): a run or a queue entry names a workspace that is gone, in
+/// both stores' words (Pg maps `fk_run_workspace` / `fk_queue_entry_workspace` to it).
+#[must_use]
+pub fn workspace_gone() -> String {
+    "this workspace no longer exists: switch workspace".to_owned()
+}
+
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
 /// the scope row goes only with its workspace.
 #[must_use]
@@ -4446,7 +4455,7 @@ pub fn queue_token_refusal(
 mod tests {
     use super::{
         LIVE_RUN_STATUSES, not_startable, project_slug_is_reserved, project_slug_refusal,
-        run_workspace_for, scope_row_is_deleted_with_its_workspace, startable,
+        run_workspace_for, scope_row_is_deleted_with_its_workspace, startable, workspace_gone,
         workspace_has_live_run, workspace_has_stopped_run,
     };
     use crate::model::{ItemState, RunStatus, Status, WorkspaceId};
@@ -4520,6 +4529,15 @@ mod tests {
             workspace_has_live_run("shop", 3),
             "workspace `shop` has 3 live runs; finish or cancel them before deleting the \
              workspace"
+        );
+    }
+
+    /// MOD-125 M2 D10: the gone-workspace refusal names what to do.
+    #[test]
+    fn workspace_gone_says_switch_workspace() {
+        assert_eq!(
+            workspace_gone(),
+            "this workspace no longer exists: switch workspace"
         );
     }
 

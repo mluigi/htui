@@ -92,7 +92,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_is_reserved, scope_row_is_deleted_with_its_workspace,
-    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_has_live_run,
+    scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run,
     workspace_has_stopped_run,
 };
 
@@ -278,6 +278,7 @@ pub const CASES: &[&str] = &[
     "pending_stops_shows_an_escalation",
     "pending_stops_is_empty_after_resume",
     "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
+    "create_run_naming_a_gone_workspace_reads_switch_workspace",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -936,6 +937,12 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "delete_workspace_refuses_while_a_member_run_of_it_is_stopped" => {
             Box::pin(delete_workspace_refuses_while_a_member_run_of_it_is_stopped(store)).await;
+        }
+        "create_run_naming_a_gone_workspace_reads_switch_workspace" => {
+            Box::pin(create_run_naming_a_gone_workspace_reads_switch_workspace(
+                store,
+            ))
+            .await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
@@ -8806,6 +8813,37 @@ async fn delete_workspace_refuses_while_a_member_run_of_it_is_stopped<S: WriteSt
         run_row(CASE, store, a).await.workspace_id,
         None,
         "{CASE}: and its runs are unscoped"
+    );
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): a run started from a workspace that no longer exists (deleted
+/// while the TUI still had it in scope) is refused in one readable sentence on both stores,
+/// [`workspace_gone`], not the foreign key's name; nothing is written.
+async fn create_run_naming_a_gone_workspace_reads_switch_workspace<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_naming_a_gone_workspace_reads_switch_workspace";
+    let workspace = store
+        .create_workspace(new_workspace("gone"))
+        .await
+        .expect(CASE)
+        .id;
+    store.delete_workspace(workspace).await.expect(CASE);
+    let before = store.runs(ids::HTUI_ANA_2).await.expect(CASE);
+
+    let refused = store
+        .create_run(NewRun {
+            workspace_id: Some(workspace),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        })
+        .await;
+    assert_eq!(
+        refused.map(|run| run.id),
+        Err(StoreError::Constraint(workspace_gone())),
+        "{CASE}: a gone workspace reads \"switch workspace\""
+    );
+    assert_eq!(
+        store.runs(ids::HTUI_ANA_2).await.expect(CASE),
+        before,
+        "{CASE}: and the item has no new run"
     );
 }
 

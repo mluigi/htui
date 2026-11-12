@@ -37,7 +37,7 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
-    WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken,
+    WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
     workspace_has_stopped_run,
 };
 use htui_store::PgStore;
@@ -12277,6 +12277,56 @@ async fn last_closed_batch_answers_alike_on_both_stores() {
         pg.last_closed_batch(BoxId::new()).await.expect("read"),
         None,
         "another box has none"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 M2 D10 (M1 review L-3): `fk_queue_entry_workspace`'s refusal reads in
+/// [`workspace_gone`]'s sentence, `MemStore`'s
+/// (`mem.rs::queue_item_naming_a_gone_workspace_reads_switch_workspace`); nothing is queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_item_naming_a_gone_workspace_reads_switch_workspace() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let workspace = pg
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "gone".to_owned(),
+            name: "Gone".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    pg.delete_workspace(workspace)
+        .await
+        .expect("the workspace is deleted");
+
+    let refused = pg
+        .queue_item(
+            ids::HTUI_CLEAN_1,
+            ids::BOX,
+            Some(workspace),
+            ids::USER,
+            Utc::now(),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        Err(htui_core::store::StoreError::Constraint(workspace_gone())),
+        "a gone workspace reads \"switch workspace\""
+    );
+    assert!(
+        pg.queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .all(|entry| entry.item_id != ids::HTUI_CLEAN_1),
+        "the refusal queued nothing"
     );
 
     db.drop_db().await;

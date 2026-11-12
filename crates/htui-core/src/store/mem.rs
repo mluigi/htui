@@ -100,7 +100,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
-    scope_row_slug_is_fixed, workspace_has_live_run, workspace_has_stopped_run,
+    scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use uuid::Uuid;
@@ -1091,7 +1091,8 @@ impl MemStore {
     /// # Errors
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] for a scope row's item queued under another workspace
-    /// ([`scope_row_run_workspace`]), then for an unknown box, workspace or user.
+    /// ([`scope_row_run_workspace`]), then for an unknown box, workspace or user; an unknown
+    /// workspace is [`workspace_gone`]'s sentence (MOD-125 M2 D10).
     pub async fn queue_item(
         &self,
         item: ItemId,
@@ -1116,11 +1117,8 @@ impl MemStore {
             if let Some(workspace) = workspace
                 && !state.workspaces.contains_key(&workspace)
             {
-                return Err(StoreError::Constraint(references_no_row(
-                    "queue_entry.workspace_id",
-                    workspace,
-                    "workspace",
-                )));
+                // MOD-125 M2 D10: `fk_queue_entry_workspace`, in the readable sentence.
+                return Err(StoreError::Constraint(workspace_gone()));
             }
             state.require_user(by, "queue_entry.queued_by")?;
             let entry = QueueEntry {
@@ -6410,15 +6408,11 @@ impl State {
                 "box",
             )));
         }
-        // MOD-125 D3: `fk_run_workspace`.
+        // MOD-125 D3: `fk_run_workspace` (M2 D10: in the readable sentence).
         if let Some(workspace) = workspace_id
             && !self.workspaces.contains_key(&workspace)
         {
-            return Err(StoreError::Constraint(references_no_row(
-                "run.workspace_id",
-                workspace,
-                "workspace",
-            )));
+            return Err(StoreError::Constraint(workspace_gone()));
         }
         self.require_user(new.started_by, "run.started_by")?;
         for repo in &new.repo_scope {
@@ -17390,6 +17384,53 @@ mod tests {
         assert_eq!(
             again, entry,
             "a repeat answers the stored entry, its workspace included"
+        );
+    }
+
+    /// MOD-125 M2 D10 (M1 review L-3): queueing an item under a workspace that is gone is refused
+    /// in [`workspace_gone`](crate::store::workspace_gone)'s sentence, and nothing is queued. The
+    /// Postgres half is `pg_criteria.rs::queue_item_naming_a_gone_workspace_reads_switch_workspace`.
+    #[tokio::test]
+    async fn queue_item_naming_a_gone_workspace_reads_switch_workspace() {
+        let store = MemStore::demo();
+        let workspace = store
+            .create_workspace(crate::model::NewWorkspace {
+                id: crate::model::WorkspaceId::new(),
+                slug: "gone".to_owned(),
+                name: "Gone".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the workspace is created")
+            .id;
+        store
+            .delete_workspace(workspace)
+            .await
+            .expect("the workspace is deleted");
+
+        let refused = store
+            .queue_item(
+                ids::HTUI_CLEAN_1,
+                ids::BOX,
+                Some(workspace),
+                ids::USER,
+                Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            refused,
+            Err(StoreError::Constraint(crate::store::workspace_gone())),
+            "a gone workspace reads \"switch workspace\""
+        );
+        assert!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total")
+                .iter()
+                .all(|entry| entry.item_id != ids::HTUI_CLEAN_1),
+            "the refusal queued nothing"
         );
     }
 
