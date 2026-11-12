@@ -51,7 +51,7 @@ use crate::catalogue::{
 use crate::hierarchy::MirrorAfterDelete;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::graph_editor::{EditorKey, GraphEditor};
+use crate::ui::graph_editor::{EditorKey, GraphEditorHost};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label;
@@ -280,8 +280,9 @@ enum Mode {
     /// MOD-141 D2: the graph editor on one of the project's own graphs, over the whole section. It
     /// takes every key, paste and its own replies while open; its close act returns to Browse.
     Graph {
-        /// The editor (boxed: it is by far the largest variant).
-        editor: Box<GraphEditor>,
+        /// The editor's host (MOD-141 M3 D5), opened on a body the catalogue holds. It boxes
+        /// the editor itself, so the variant stays small.
+        host: GraphEditorHost,
     },
 }
 
@@ -314,7 +315,7 @@ impl core::fmt::Debug for Mode {
                 .field("editor", editor)
                 .field("old", old)
                 .finish_non_exhaustive(),
-            Self::Graph { editor } => f.debug_struct("Graph").field("editor", editor).finish(),
+            Self::Graph { host } => f.debug_struct("Graph").field("host", host).finish(),
         }
     }
 }
@@ -687,9 +688,11 @@ impl KindsSection {
         let Some(entry) = self.graph_at(p, g) else {
             return;
         };
-        let (mut editor, requests) =
-            GraphEditor::open(entry.clone(), self.personas().to_vec(), ctx.scope);
-        if let Some(step) = step {
+        let (mut host, requests) =
+            GraphEditorHost::with_body(entry.clone(), self.personas().to_vec(), ctx.scope);
+        if let Some(step) = step
+            && let Some(editor) = host.editor_mut()
+        {
             editor.select(step);
             if form {
                 editor.open_node_form();
@@ -699,18 +702,16 @@ impl KindsSection {
             ctx.request(request);
         }
         self.notice = None;
-        self.mode = Mode::Graph {
-            editor: Box::new(editor),
-        };
+        self.mode = Mode::Graph { host };
     }
 
     /// MOD-141 D2: the editor closed. Browse again, the cursor on the first row that shows the
     /// graph it was on: the kind pointing at it, or its own row when no kind does.
     fn close_editor(&mut self) {
-        let Mode::Graph { editor } = core::mem::take(&mut self.mode) else {
+        let Mode::Graph { host } = core::mem::take(&mut self.mode) else {
             return;
         };
-        let graph = editor.graph();
+        let graph = host.graph();
         let shows = |row: &Row| match *row {
             Row::Kind { p, k } => self
                 .project(p)
@@ -731,8 +732,9 @@ impl KindsSection {
     ///
     /// The editor's write is answered with the scope's catalogue: the tree behind it is adopted
     /// quietly (no `busy` of the section's is involved, so nothing closes and nothing is said) and
-    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then hands the
-    /// persona registry on. The editor's reads and its refusals are its own.
+    /// the outcome is the editor's. A fresh catalogue still goes the section's way, then on to the
+    /// host, which hands the persona registry on. Every other reply is the host's to take or
+    /// leave (MOD-141 M3 D5): the editor's reads and its refusals are its own.
     fn on_editor_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) -> bool {
         match reply {
             StoreReply::GraphReplaced { catalogue, .. } => {
@@ -741,46 +743,27 @@ impl KindsSection {
                         self.snapshot = Some((**catalogue).clone());
                         self.unavailable = None;
                         self.clamp_cursor();
-                        if let Mode::Graph { editor } = &mut self.mode {
-                            editor.set_personas(&catalogue.personas);
-                        }
                     }
                     // MOD-141 R1 L1: the write's outcome stands; the tree it would have moved is
                     // read again, and its `Catalogue` hands the personas on.
                     None => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
                 }
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
+                if let Mode::Graph { host } = &mut self.mode {
+                    host.on_reply(reply, ctx);
                 }
                 true
             }
             StoreReply::Catalogue(snapshot) => {
                 self.on_catalogue(snapshot);
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.set_personas(&snapshot.personas);
+                if let Mode::Graph { host } = &mut self.mode {
+                    host.on_reply(reply, ctx);
                 }
                 true
             }
-            StoreReply::Agents(_)
-            | StoreReply::Templates(_)
-            | StoreReply::GraphEditorSettings(_) => {
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
-                }
-                true
-            }
-            StoreReply::Failed { request, .. }
-                if matches!(
-                    *request,
-                    "replace_graph" | "agents" | "templates" | "graph_editor_settings"
-                ) =>
-            {
-                if let Mode::Graph { editor } = &mut self.mode {
-                    editor.on_reply(reply, ctx);
-                }
-                true
-            }
-            _ => false,
+            _ => match &mut self.mode {
+                Mode::Graph { host } => host.on_reply(reply, ctx),
+                _ => false,
+            },
         }
     }
 
@@ -1250,7 +1233,7 @@ impl KindsSection {
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             // MOD-141 D2: the editor's own row, its write in flight included.
-            Mode::Graph { editor } => return editor.hint_text(keys),
+            Mode::Graph { host } => return host.hint_text(keys),
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Deleting { .. } => HINT_DELETING,
@@ -1286,7 +1269,7 @@ impl KindsSection {
             Mode::Browse => views::KINDS_BROWSE,
             Mode::Editing(_) => views::KINDS_EDITOR,
             Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => views::KINDS_CONFIRM,
-            Mode::Graph { editor } => editor.stack(),
+            Mode::Graph { host } => host.stack(),
         }
     }
 
@@ -1455,8 +1438,8 @@ impl SettingsSection for KindsSection {
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
         let mut wanted = vec![StoreRequest::Catalogue(scope.clone())];
         // MOD-141 D1: an open editor reads its agents and templates again on activation.
-        if let Mode::Graph { editor } = &self.mode {
-            wanted.extend(editor.wants_requests(scope));
+        if let Mode::Graph { host } = &self.mode {
+            wanted.extend(host.wants_requests(scope));
         }
         wanted
     }
@@ -1481,7 +1464,7 @@ impl SettingsSection for KindsSection {
 
     fn takes_paste(&self) -> bool {
         match &self.mode {
-            Mode::Graph { editor } => editor.takes_paste(),
+            Mode::Graph { host } => host.takes_paste(),
             _ => self.captures_input(),
         }
     }
@@ -1489,8 +1472,8 @@ impl SettingsSection for KindsSection {
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
     /// is not a field: a paste there is dropped, so its `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
-        if let Mode::Graph { editor } = &mut self.mode {
-            return editor.on_paste(text);
+        if let Mode::Graph { host } = &mut self.mode {
+            return host.on_paste(text);
         }
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -1504,8 +1487,8 @@ impl SettingsSection for KindsSection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // MOD-141 D2: the graph editor takes every key while it is open; its close act returns to
         // Browse (the memory pane's shape, `hierarchy.rs`).
-        if let Mode::Graph { editor } = &mut self.mode {
-            return match editor.on_key(key, ctx) {
+        if let Mode::Graph { host } = &mut self.mode {
+            return match host.on_key(key, ctx) {
                 EditorKey::Handled(handled) => handled,
                 EditorKey::Close => {
                     self.close_editor();
@@ -1587,14 +1570,14 @@ impl SettingsSection for KindsSection {
 
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
-            Mode::Graph { editor } => editor.on_mouse(mouse, ctx),
+            Mode::Graph { host } => host.on_mouse(mouse, ctx),
             _ => Handled::Pass,
         }
     }
 
     fn on_mouse_lost(&mut self) {
-        if let Mode::Graph { editor } = &mut self.mode {
-            editor.on_mouse_lost();
+        if let Mode::Graph { host } = &mut self.mode {
+            host.on_mouse_lost();
         }
     }
 
@@ -1611,9 +1594,9 @@ impl SettingsSection for KindsSection {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-141 D2: the graph editor draws over the whole section.
-        if let Mode::Graph { editor } = &self.mode {
+        if let Mode::Graph { host } = &self.mode {
             self.scroll.set(None);
-            editor.render(frame, area, ctx);
+            host.render(frame, area, ctx);
             return;
         }
         let theme = ctx.theme;
@@ -2193,11 +2176,9 @@ mod tests {
             Origin::Tab(SettingsTab::ID),
             &emit,
         );
-        let (editor, _) = GraphEditor::open(body, Vec::new(), &scope);
+        let (host, _) = GraphEditorHost::with_body(body, Vec::new(), &scope);
         let mut section = KindsSection {
-            mode: Mode::Graph {
-                editor: Box::new(editor),
-            },
+            mode: Mode::Graph { host },
             ..KindsSection::new()
         };
         let answer = StoreReply::GraphEditorSettings(Box::new(crate::catalogue::EditorSettings {
@@ -2245,6 +2226,95 @@ mod tests {
             "the section's write stays"
         );
         assert!(section.notice.is_none(), "{:?}", section.notice);
+    }
+
+    /// MOD-141 M3 D5: the section opens its editor through a [`GraphEditorHost`] and hands it
+    /// every reply but its own catalogue. A refused templates read is the editor's, said in its
+    /// own words; a refusal of the section's own reads is not the host's, and a body read is
+    /// never taken once the editor is open.
+    #[tokio::test]
+    async fn a_refused_templates_read_reaches_the_editor_through_the_host() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, WriteStore};
+
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::settings::SettingsTab;
+
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let body = store
+            .graph_body(ids::GRAPH_VULKAN_ANA)
+            .await
+            .expect("a memory read")
+            .expect("the analysis graph");
+        let (projects, top_bar, theme, emit) = (
+            Vec::new(),
+            TopBarState::default(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let keys = Keys::compiled().clone();
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keys,
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let (host, requests) = GraphEditorHost::with_body(body, Vec::new(), &scope);
+        assert_eq!(requests.len(), 3, "the editor's three reads: {requests:?}");
+        let mut section = KindsSection {
+            mode: Mode::Graph { host },
+            ..KindsSection::new()
+        };
+        let refused = |request: &'static str| StoreReply::Failed {
+            request,
+            message: "refused".to_owned(),
+        };
+
+        assert!(
+            section.on_editor_reply(&refused("templates"), &mut ctx),
+            "the refusal is the editor's"
+        );
+        assert!(
+            !section.on_editor_reply(&refused("catalogue"), &mut ctx),
+            "the catalogue read is the section's"
+        );
+        assert!(
+            !section.on_editor_reply(&refused("graph_body"), &mut ctx),
+            "an open host takes no body read"
+        );
+        assert!(
+            !section.on_editor_reply(&StoreReply::GraphBody(None), &mut ctx),
+            "nor its answer"
+        );
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(98, 27))
+            .expect("a test terminal");
+        terminal
+            .draw(|frame| section.render(frame, frame.area(), &ctx))
+            .expect("the section draws");
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("templates unavailable: refused"),
+            "{screen}"
+        );
+        assert!(format!("{section:?}").contains("GraphEditorHost"));
     }
 
     /// MOD-115 M3 RV2 L2: the list is handed the cursor's own line, which `list_rows` answers,
