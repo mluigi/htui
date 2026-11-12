@@ -15,13 +15,14 @@ use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
     GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry, MemoryState, NewCommandRun,
-    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope, PromptTemplate,
-    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
-    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope,
+    PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath,
+    RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
+    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
+    WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -388,6 +389,9 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
         WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        WriteStore::pending_stops(self, owner).await
     }
     async fn resolve_command(
         &self,
@@ -808,6 +812,9 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
         WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        WriteStore::pending_stops(self, owner).await
     }
     async fn resolve_command(
         &self,

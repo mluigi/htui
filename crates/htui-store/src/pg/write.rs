@@ -36,19 +36,19 @@ use htui_core::model::{
     NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
     NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
-    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    missing_tags_failure, moved_order, overlaps, scope_of,
+    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    Project, ProjectId, ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch,
+    QueueEntry, QueueMove, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
@@ -7236,6 +7236,31 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(true)
+    }
+
+    /// MOD-125 M2 D1: starts from `workspace_stop` (one row per stopped workspace) and joins
+    /// `run` on `idx_run_workspace_status` (`0019_stop_runs.sql:37`); no index covers
+    /// `lease_owner`, so the stop rows are the narrow side. Read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        sqlx::query_as!(
+            PendingStop,
+            r#"
+            SELECT r.id    AS "run: RunId",
+                   ws.mode AS "mode: StopMode"
+              FROM workspace_stop ws
+              JOIN run r ON r.workspace_id = ws.workspace_id
+             WHERE r.status = 'running' AND r.lease_owner = $1
+             ORDER BY r.queued_at, r.id
+            "#,
+            owner,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge

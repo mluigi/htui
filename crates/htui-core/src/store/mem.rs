@@ -37,11 +37,11 @@ use crate::model::{
     MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
     NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
-    QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
+    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectRef, ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry,
+    QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
     RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
     RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
     Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
@@ -9642,6 +9642,30 @@ impl State {
         rows
     }
 
+    /// MOD-125 M2 D1: [`WriteStore::pending_stops`]: the owner's running runs whose workspace has
+    /// a stop record, with its mode, by `(queued_at, id)`.
+    fn pending_stops(&self, owner: Uuid) -> Vec<PendingStop> {
+        let mut rows: Vec<(DateTime<Utc>, PendingStop)> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.status == RunStatus::Running && self.lease_owners.get(&row.id) == Some(&owner)
+            })
+            .filter_map(|row| {
+                let stop = self.workspace_stops.get(&row.workspace_id?)?;
+                Some((
+                    row.queued_at,
+                    PendingStop {
+                        run: row.id,
+                        mode: stop.mode,
+                    },
+                ))
+            })
+            .collect();
+        rows.sort_unstable_by_key(|(at, stop)| (*at, stop.run));
+        rows.into_iter().map(|(_, stop)| stop).collect()
+    }
+
     fn resolve_command(
         &mut self,
         id: RunCommandId,
@@ -11129,6 +11153,10 @@ impl WriteStore for MemStore {
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
         let now = self.now();
         Ok(self.read(|state| state.pending_commands(owner, box_id, now)))
+    }
+
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>> {
+        Ok(self.read(|state| state.pending_stops(owner)))
     }
 
     async fn resolve_command(

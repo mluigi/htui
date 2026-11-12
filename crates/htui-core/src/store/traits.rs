@@ -65,7 +65,7 @@ use crate::model::{
     MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
     NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
-    NewWorkspace, Note, OpenPermission, OwnerDocument, PermissionChoice, PermissionId,
+    NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting,
     QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
@@ -2292,6 +2292,18 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>>;
+
+    /// MOD-125 M2 D1: the stops this process applies: every `running` run whose
+    /// `lease_owner = owner` (live or lapsed, as [`pending_commands`](Self::pending_commands)'
+    /// owner arm) and whose `workspace_id` has a `workspace_stop` row, with that row's mode, in
+    /// `(queued_at, id)` order. A run without a workspace, a parked, queued or stopped run, and
+    /// another owner's run are never listed: a lapsed lease is the sweep's (`adopt_runs` settles
+    /// it, M1 D6), and a run leased elsewhere is that process's poll. No row is written: the
+    /// request is the `workspace_stop` row itself.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn pending_stops(&self, owner: Uuid) -> Result<Vec<PendingStop>>;
 
     /// D12, D13: compare-and-set `pending → to` (`Applied` or `Refused`), with `resolution`,
     /// `resolved_at` the store's clock. `Ok(false)` = not pending any more (I-3). Always clears
