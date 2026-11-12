@@ -2212,4 +2212,26 @@ async fn the_header_shows_the_limits() {
         defaults.replace("fan-out 4", "fan-out 2"),
         "{frame}"
     );
+
+    // Review R1 C-L4: every bound set, each to a value no other bound and no default holds, so
+    // a field drawn under another's label fails.
+    let store = MemStore::demo();
+    for (key, value) in [
+        ("max_fan_out", json!(2)),
+        ("max_agents_per_run", json!(5)),
+        ("max_plan_revisions", json!(1)),
+        ("max_parallel_sessions", json!(7)),
+        ("max_child_runs", json!(6)),
+        ("runtime_changes", json!("off")),
+    ] {
+        store.set_app_setting(key, value);
+    }
+    let (bench, section, _) = analysis_bench(&store, None).await;
+    let frame = bench.render_section(&section, 120);
+    assert_eq!(
+        limits_shown(&frame),
+        "limits \u{b7} fan-out 2 \u{b7} agents 5 \u{b7} plan revisions 1 \u{b7} parallel 7 \
+         \u{b7} child runs 6 \u{b7} run-time changes off",
+        "{frame}"
+    );
 }

@@ -2191,6 +2191,25 @@ mod tests {
             section.on_editor_reply(&refused, &mut ctx),
             "so is its refusal"
         );
+        // Review R1 C-L4: the refusal reached the editor, which says so in its own words.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(98, 27))
+            .expect("a test terminal");
+        terminal
+            .draw(|frame| section.render(frame, frame.area(), &ctx))
+            .expect("the section draws");
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("run limits unavailable: refused"),
+            "{screen}"
+        );
 
         section.mode = Mode::Browse;
         section.busy = Some(REQUEST_NAMES[8]);
