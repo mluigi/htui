@@ -11,9 +11,10 @@ use htui_orch::status::{PlanCap, RunFailure};
 /// with today, each the `ResolveError` resolve raises, in resolve's order; empty when none.
 /// `max_fan_out` is `RunBounds::max_fan_out` once the editor's settings read answered; `None`
 /// skips the two checks that need it. Known limits: `max_agents_per_run` needs the whole graph;
-/// the project's default isolation (a `LocalFanOut` through it) and candidate rungs are not
-/// visible here; and the graph-wide checks (`FanOutEdge`, `LocalConcurrent`, and the
-/// `ReviewFanOut` of a step that reads its verdict) stay resolve's.
+/// the project's default isolation (a `LocalFanOut` through it), its templates (the `NoTemplate`
+/// of a step with no pinned version) and candidate rungs are not visible here; and the
+/// graph-wide checks (`FanOutEdge`, `LocalConcurrent`, and the `ReviewFanOut` of a step that
+/// reads its verdict) stay resolve's.
 ///
 /// Resolve stops at its first refusal; this lists every check that fails (C11), each in the
 /// sentence resolve would give were it the first.
@@ -754,6 +755,31 @@ mod tests {
             node.parts = vec![part(node.phase.id, 0, "api")];
         })
         .await;
+    }
+
+    /// A known limit: the item's project's templates are not visible here, so a step naming a
+    /// template its project does not hold is resolve's `NoTemplate` alone.
+    #[tokio::test]
+    async fn a_missing_template_is_left_to_resolve() {
+        let (refusal, body) = resolved_feature(|body| {
+            node_mut(body, "implement").phase.template_name = "no-such-template".to_owned();
+        })
+        .await;
+        assert_eq!(
+            refusal,
+            Some(
+                ResolveError::NoTemplate {
+                    phase: "implement".to_owned(),
+                    name: "no-such-template".to_owned(),
+                    project: ids::PROJECT_HTUI,
+                }
+                .to_string()
+            )
+        );
+        assert_eq!(
+            notes(node_named(&body, "implement"), Some(4)),
+            Vec::<String>::new()
+        );
     }
 
     /// With `edit` saved, resolve refuses the feature graph, and the first note of its step
