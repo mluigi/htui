@@ -1158,6 +1158,9 @@ additions to `node_form.rs`, a T5 file that §8.2 otherwise opens only for its a
 - **W6 The limits row.** The header keeps §8.2's `Length(2)`. `limits_row` puts `limits_line` in its
   one row: past the width it drops whole `label value` segments and ends ` · …`, and a row too narrow
   for the first segment is `…` (Open risk 5). Pin: `the_header_shows_the_limits_once_read`.
+- **W7 The part form waits for a write.** `open_part` refuses with `history::IN_FLIGHT` while a write is
+  in flight, as `open_node_form` does (the reply would close the part form). Main thread, `16d50afe`,
+  from the last unrepaired verifier finding. Pin: `no_part_form_opens_while_a_write_is_in_flight`.
 
 ---
 
