@@ -52,6 +52,12 @@ pub(crate) fn no_candidates(add: Option<&str>) -> String {
     add.map_or_else(|| "none".to_owned(), |key| format!("none ({key} adds one)"))
 }
 
+/// The parts placeholder's text while a divide step has none: `none ({add} adds one)`, or
+/// `none` alone while nothing is bound to adding one (R-TUI-10).
+pub(crate) fn no_parts(add: Option<&str>) -> String {
+    no_candidates(add)
+}
+
 /// The split row of a compete step while the compete switch is off (M2 D7): shown, never edited.
 const COMPETE_LOCKED: &str =
     "compete \u{b7} read-only while compete is off (Settings \u{203a} Prompt)";
@@ -107,6 +113,10 @@ pub(crate) enum NodeRow {
     Candidate(usize),
     /// The placeholder row shown while there is no candidate.
     NoCandidates,
+    /// Default part `n` (0-based) of a divide step: the part form opens it.
+    Part(usize),
+    /// The placeholder row shown while a divide step has no part.
+    NoParts,
 }
 
 /// The key labels the form's own words name (R-TUI-10); the editor resolves them from its stack.
@@ -140,6 +150,16 @@ enum Row {
     Deadline,
     Palette,
     Split,
+    FanOut,
+    Judge,
+    PlannerPersona,
+    PlannerAgent,
+    IntegratePersona,
+    IntegrateAgent,
+    MaxParts,
+    PlanScope,
+    Part(usize),
+    NoParts,
 }
 
 /// A seat: an agent and its model, `None` when the pair's model is empty.
@@ -279,8 +299,9 @@ impl NodeForm {
     }
 
     /// Every row drawn, in order, each with whether it takes the focus (B3): M1's fixed rows,
-    /// the candidates or their placeholder, the deadline, the palette and the split. A locked
-    /// compete step's split is drawn read-only.
+    /// the candidates or their placeholder, the deadline, the palette and the split, then the
+    /// split's own rows. A locked compete step's split, fan-out and judge are drawn read-only,
+    /// and so is a plan scope stored on a step that does not divide (M2 D9).
     fn shown(&self) -> Vec<(Row, bool)> {
         let mut rows: Vec<(Row, bool)> = FIXED.iter().map(|row| (*row, true)).collect();
         if self.candidates.is_empty() {
@@ -292,6 +313,32 @@ impl NodeForm {
             (Row::Palette, true),
             (Row::Split, !self.locked),
         ]);
+        match self.split {
+            Split::Compete => {
+                rows.extend([(Row::FanOut, !self.locked), (Row::Judge, !self.locked)]);
+            }
+            Split::Divide => {
+                rows.extend(
+                    [
+                        Row::PlannerPersona,
+                        Row::PlannerAgent,
+                        Row::IntegratePersona,
+                        Row::IntegrateAgent,
+                        Row::MaxParts,
+                        Row::PlanScope,
+                    ]
+                    .map(|row| (row, true)),
+                );
+                if self.parts.is_empty() {
+                    rows.push((Row::NoParts, true));
+                }
+                rows.extend((0..self.parts.len()).map(|at| (Row::Part(at), true)));
+            }
+            Split::None => {}
+        }
+        if self.split != Split::Divide && self.plan_scope.is_some() {
+            rows.push((Row::PlanScope, false));
+        }
         rows
     }
 
@@ -321,17 +368,27 @@ impl NodeForm {
             | Row::Budget
             | Row::Inputs
             | Row::Output
-            | Row::Deadline => NodeRow::Text,
+            | Row::Deadline
+            | Row::FanOut
+            | Row::MaxParts => NodeRow::Text,
             Row::HardGate | Row::Palette => NodeRow::Toggle,
             Row::Candidate(at) => NodeRow::Candidate(at),
             Row::NoCandidates => NodeRow::NoCandidates,
+            Row::Part(at) => NodeRow::Part(at),
+            Row::NoParts => NodeRow::NoParts,
             Row::Template
             | Row::Version
             | Row::Persona
             | Row::Gate
             | Row::Isolation
             | Row::Commands
-            | Row::Split => NodeRow::Choice,
+            | Row::Split
+            | Row::Judge
+            | Row::PlannerPersona
+            | Row::PlannerAgent
+            | Row::IntegratePersona
+            | Row::IntegrateAgent
+            | Row::PlanScope => NodeRow::Choice,
         }
     }
 
@@ -356,6 +413,8 @@ impl NodeForm {
             Row::Inputs => Some(&mut self.input_kinds),
             Row::Output => Some(&mut self.output_kind),
             Row::Deadline => Some(&mut self.deadline),
+            Row::FanOut => Some(&mut self.fan_out),
+            Row::MaxParts => Some(&mut self.max_parts),
             _ => None,
         }
     }
@@ -380,7 +439,8 @@ impl NodeForm {
     ///
     /// # Errors
     /// [`NO_TEMPLATE`] on the template row with no name to choose; [`AGENTS_NOT_READ`] or
-    /// [`NO_AGENTS`] on a candidate row.
+    /// [`NO_AGENTS`] on a candidate row; [`AGENTS_NOT_READ`] on the judge, planner agent and
+    /// integrate agent rows.
     pub(crate) fn cycle(&mut self, forward: bool, lookups: &Lookups) -> Result<(), String> {
         match self.current() {
             Row::Name
@@ -390,7 +450,11 @@ impl NodeForm {
             | Row::Inputs
             | Row::Output
             | Row::Deadline
-            | Row::NoCandidates => {}
+            | Row::FanOut
+            | Row::MaxParts
+            | Row::NoCandidates
+            | Row::Part(_)
+            | Row::NoParts => {}
             Row::HardGate => self.gate_hard = !self.gate_hard,
             Row::Palette => self.palette = !self.palette,
             Row::Candidate(at) => {
@@ -439,6 +503,46 @@ impl NodeForm {
                 };
                 let split = step(options, &self.split, forward);
                 self.set_split(split);
+            }
+            Row::Judge => {
+                self.judge = step(&seat_options(lookups, &self.judge)?, &self.judge, forward);
+            }
+            Row::PlannerAgent => {
+                self.planner = step(
+                    &seat_options(lookups, &self.planner)?,
+                    &self.planner,
+                    forward,
+                );
+            }
+            Row::IntegrateAgent => {
+                self.integrate = step(
+                    &seat_options(lookups, &self.integrate)?,
+                    &self.integrate,
+                    forward,
+                );
+            }
+            Row::PlannerPersona => {
+                self.planner_persona = step(
+                    &persona_options(lookups, self.planner_persona),
+                    &self.planner_persona,
+                    forward,
+                );
+            }
+            Row::IntegratePersona => {
+                self.integrate_persona = step(
+                    &persona_options(lookups, self.integrate_persona),
+                    &self.integrate_persona,
+                    forward,
+                );
+            }
+            Row::PlanScope => {
+                let options = [
+                    None,
+                    Some(PlanScope::Parts),
+                    Some(PlanScope::Successors),
+                    Some(PlanScope::Graph),
+                ];
+                self.plan_scope = step(&options, &self.plan_scope, forward);
             }
         }
         Ok(())
@@ -719,7 +823,7 @@ impl NodeForm {
         &self,
         row: Row,
         focusable: bool,
-        _base: &NodeBody,
+        base: &NodeBody,
         lookups: &Lookups,
         keys: FormKeys<'_>,
     ) -> View<'_> {
@@ -781,6 +885,61 @@ impl NodeForm {
                 })
             }
             Row::Split => View::read_only("split", COMPETE_LOCKED).dim(),
+            Row::FanOut if focusable => {
+                View::text("fan-out", &self.fan_out).help("agents that compete, 2 or more")
+            }
+            Row::FanOut => View::read_only("fan-out", base.phase.fan_out.to_string()).dim(),
+            Row::Judge if focusable => {
+                View::choice("judge", seat_word(&self.judge, "project default", lookups))
+                    .help("picks the winner; project default asks the project's judge, else you")
+            }
+            Row::Judge => {
+                let phase = &base.phase;
+                let judge = phase
+                    .judge_agent_id
+                    .map(|agent| (agent, phase.judge_model.clone()));
+                View::read_only("judge", seat_word(&judge, "project default", lookups)).dim()
+            }
+            Row::PlannerPersona => {
+                View::choice("planner", persona_word(self.planner_persona, lookups))
+                    .help("the persona that plans the parts")
+            }
+            Row::PlannerAgent => {
+                View::choice("planner agent", seat_word(&self.planner, "none", lookups))
+                    .help("an agent and model, or none")
+            }
+            Row::IntegratePersona => {
+                View::choice("integrate", persona_word(self.integrate_persona, lookups))
+                    .help("the persona that merges the parts")
+            }
+            Row::IntegrateAgent => View::choice(
+                "integrate agent",
+                seat_word(&self.integrate, "none", lookups),
+            )
+            .help("an agent and model, or none"),
+            Row::MaxParts => {
+                View::text("max parts", &self.max_parts).help("empty for no cap, else at least 1")
+            }
+            Row::PlanScope if focusable => {
+                View::choice("plan scope", plan_scope_word(self.plan_scope))
+                    .help("what the planner may plan")
+            }
+            Row::PlanScope => View::read_only("plan scope", plan_scope_word(self.plan_scope)).dim(),
+            Row::Part(at) => {
+                let words = self.parts.get(at).map_or_else(String::new, |part| {
+                    if part.title.is_empty() {
+                        part.key.clone()
+                    } else {
+                        format!("{} \u{b7} {}", part.key, part.title)
+                    }
+                });
+                let view = View::read_only(format!("part {}", at + 1), words);
+                match keys.open {
+                    Some(open) => view.help(format!("{open} edits it")),
+                    None => view,
+                }
+            }
+            Row::NoParts => View::read_only("parts", no_parts(keys.add)),
         }
     }
 }
@@ -882,6 +1041,47 @@ const fn split_word(split: Split) -> &'static str {
         Split::Divide => "divide",
         Split::Compete => "compete",
     }
+}
+
+/// What a planner node may plan, in words; `none` for none.
+const fn plan_scope_word(scope: Option<PlanScope>) -> &'static str {
+    match scope {
+        None => "none",
+        Some(PlanScope::Parts) => "its parts",
+        Some(PlanScope::Successors) => "its successors",
+        Some(PlanScope::Graph) => "the whole graph",
+    }
+}
+
+/// A seat in words: `claude · opus`, the agent alone with no model, `none` for none.
+fn seat_word(seat: &Option<Seat>, none: &str, lookups: &Lookups) -> String {
+    seat.as_ref().map_or_else(
+        || none.to_owned(),
+        |(agent, model)| pair_word(*agent, model.as_deref().unwrap_or(""), lookups),
+    )
+}
+
+/// The seats to choose from: none, every (agent, model) pair (an empty model is `None`), then
+/// `current` when the pairs lack it.
+///
+/// # Errors
+/// [`AGENTS_NOT_READ`] while the agents' read has not answered.
+fn seat_options(lookups: &Lookups, current: &Option<Seat>) -> Result<Vec<Option<Seat>>, String> {
+    let agents = lookups
+        .agents
+        .as_deref()
+        .ok_or_else(|| AGENTS_NOT_READ.to_owned())?;
+    let mut options: Vec<Option<Seat>> = core::iter::once(None)
+        .chain(
+            agent_pairs(agents)
+                .into_iter()
+                .map(|(agent, model)| Some((agent, (!model.is_empty()).then_some(model)))),
+        )
+        .collect();
+    if !options.contains(current) {
+        options.push(current.clone());
+    }
+    Ok(options)
 }
 
 /// An optional whole number as a text row holds it: empty for `None`.
@@ -2010,6 +2210,343 @@ mod tests {
     }
 
     #[test]
+    fn a_compete_node_with_the_switch_off_is_read_only_and_kept_byte_for_byte() {
+        let lookups = lookups();
+        let base = research_compete((ids::AGENT_AGY, "gemini"));
+        let mut form = edit(&base);
+        let rows = form.rows();
+        for row in [Row::Split, Row::FanOut, Row::Judge] {
+            assert!(!rows.contains(&row), "{row:?} takes no focus");
+            assert!(form.shown().contains(&(row, false)), "{row:?} is drawn");
+        }
+        let shown = text(&form.lines(&base, &lookups, KEYS, 120, accent(), &Theme::default()));
+        assert!(shown.contains(COMPETE_LOCKED), "{shown}");
+        assert!(shown.contains("agy \u{b7} gemini"), "{shown}");
+
+        set_text(&mut form, NAME, "dig");
+        let node = form.build(&base, &lookups).expect("a valid form");
+        let mut want = base.clone();
+        want.phase.name = "dig".to_owned();
+        assert_eq!(node, want, "split, fan-out and judge as they were");
+
+        // The switch on, the same step edits them.
+        let rows = open(&base, true).rows();
+        for row in [Row::Split, Row::FanOut, Row::Judge] {
+            assert!(rows.contains(&row), "{row:?} takes the focus");
+        }
+    }
+
+    #[test]
+    fn fan_out_is_a_whole_number_2_or_more() {
+        let node = research_compete((ids::AGENT_AGY, "gemini"));
+        for (typed, want) in [
+            ("2", Ok(2)),
+            (" 5 ", Ok(5)),
+            ("1", Err(FAN_OUT_IS_A_NUMBER.to_owned())),
+            ("0", Err(FAN_OUT_IS_A_NUMBER.to_owned())),
+            ("x", Err(FAN_OUT_IS_A_NUMBER.to_owned())),
+        ] {
+            let mut form = open(&node, true);
+            set_row_text(&mut form, Row::FanOut, typed);
+            assert_eq!(form.focused(), NodeRow::Text);
+            assert_eq!(
+                form.build(&node, &lookups()).map(|node| node.phase.fan_out),
+                want,
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judge_cycles_project_default_then_every_pair_and_needs_the_agents_read() {
+        let lookups = lookups();
+        let mut node = research_bound();
+        node.phase.split = Split::Compete;
+        node.phase.fan_out = 2;
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Judge);
+        assert_eq!(form.focused(), NodeRow::Choice);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            form.cycle(true, &lookups).expect("the agents read");
+            seen.push(form.judge.clone());
+        }
+        assert_eq!(
+            seen,
+            [
+                Some((ids::AGENT_CLAUDE, Some("opus".to_owned()))),
+                Some((ids::AGENT_CLAUDE, Some("sonnet".to_owned()))),
+                Some((ids::AGENT_AGY, Some("gemini".to_owned()))),
+                None,
+            ],
+            "project default first, then every pair, wrapping"
+        );
+        form.cycle(false, &lookups).expect("the agents read");
+        assert_eq!(
+            form.build(&node, &lookups)
+                .map(|node| (node.phase.judge_agent_id, node.phase.judge_model)),
+            Ok((Some(ids::AGENT_AGY), Some("gemini".to_owned())))
+        );
+
+        // Unread agents: refused, the judge kept.
+        let unread = Lookups {
+            agents: None,
+            ..lookups.clone()
+        };
+        assert_eq!(form.cycle(true, &unread), Err(AGENTS_NOT_READ.to_owned()));
+        assert_eq!(
+            form.judge,
+            Some((ids::AGENT_AGY, Some("gemini".to_owned())))
+        );
+
+        // An agent with no model is a judge with no model.
+        let bare = summary(AgentId::new(), "bare", &[], None);
+        let only_bare = Lookups {
+            agents: Some(vec![bare.clone()]),
+            ..lookups.clone()
+        };
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Judge);
+        form.cycle(true, &only_bare).expect("the agents read");
+        assert_eq!(form.judge, Some((bare.agent.id, None)));
+
+        // A judge the agents lack is kept, shown by id, and sits last.
+        let ghost = AgentId::new();
+        node.phase.judge_agent_id = Some(ghost);
+        node.phase.judge_model = Some("old".to_owned());
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Judge);
+        let shown = text(&form.lines(&node, &lookups, KEYS, 120, accent(), &Theme::default()));
+        assert!(shown.contains(&ghost.to_string()), "{shown}");
+        form.cycle(true, &lookups).expect("the agents read");
+        assert_eq!(
+            form.judge, None,
+            "forward from the last wraps to the default"
+        );
+    }
+
+    #[test]
+    fn divide_seats_cycle_personas_and_pairs() {
+        let lookups = lookups();
+        let node = research_divide();
+        let mut form = edit(&node);
+        for row in [
+            Row::PlannerPersona,
+            Row::PlannerAgent,
+            Row::IntegratePersona,
+            Row::IntegrateAgent,
+        ] {
+            focus_on(&mut form, row);
+            assert_eq!(form.focused(), NodeRow::Choice, "{row:?}");
+            form.cycle(true, &lookups).expect("a choice");
+        }
+        // architect → none; claude · opus → claude · sonnet; reviewer → architect; agy with no
+        // model is none of the pairs, so it sits last and forward wraps to none.
+        assert_eq!(form.planner_persona, None);
+        assert_eq!(
+            form.planner,
+            Some((ids::AGENT_CLAUDE, Some("sonnet".to_owned())))
+        );
+        assert_eq!(form.integrate_persona, Some(ids::PERSONA_ARCHITECT));
+        assert_eq!(form.integrate, None);
+        let built = form.build(&node, &lookups).expect("a valid form");
+        let phase = &built.phase;
+        assert_eq!(
+            (
+                phase.planner_persona_id,
+                phase.planner_agent_id,
+                phase.planner_model.as_deref(),
+                phase.integrate_persona_id,
+                phase.integrate_agent_id,
+                phase.integrate_model.as_deref(),
+            ),
+            (
+                None,
+                Some(ids::AGENT_CLAUDE),
+                Some("sonnet"),
+                Some(ids::PERSONA_ARCHITECT),
+                None,
+                None,
+            )
+        );
+        form.cycle(true, &lookups).expect("a choice");
+        assert_eq!(
+            form.integrate,
+            Some((ids::AGENT_CLAUDE, Some("opus".to_owned())))
+        );
+
+        let unread = Lookups {
+            agents: None,
+            ..lookups.clone()
+        };
+        for row in [Row::PlannerAgent, Row::IntegrateAgent] {
+            focus_on(&mut form, row);
+            assert_eq!(
+                form.cycle(true, &unread),
+                Err(AGENTS_NOT_READ.to_owned()),
+                "{row:?}"
+            );
+        }
+        focus_on(&mut form, Row::PlannerPersona);
+        form.cycle(true, &unread).expect("personas need no read");
+    }
+
+    #[test]
+    fn max_parts_empty_is_none_and_below_1_is_refused() {
+        let node = research_divide();
+        for (typed, want) in [
+            ("", Ok(None)),
+            ("  ", Ok(None)),
+            ("1", Ok(Some(1))),
+            ("4", Ok(Some(4))),
+            ("0", Err(MAX_PARTS_IS_A_NUMBER.to_owned())),
+            ("-2", Err(MAX_PARTS_IS_A_NUMBER.to_owned())),
+            ("many", Err(MAX_PARTS_IS_A_NUMBER.to_owned())),
+        ] {
+            let mut form = edit(&node);
+            set_row_text(&mut form, Row::MaxParts, typed);
+            assert_eq!(form.focused(), NodeRow::Text);
+            assert_eq!(
+                form.build(&node, &lookups())
+                    .map(|node| node.phase.max_parts),
+                want,
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_scope_cycles_none_parts_successors_graph() {
+        let lookups = lookups();
+        let mut node = research_divide();
+        node.phase.plan_scope = None;
+        let mut form = edit(&node);
+        focus_on(&mut form, Row::PlanScope);
+        assert_eq!(form.focused(), NodeRow::Choice);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            form.cycle(true, &lookups).expect("a choice");
+            seen.push(form.plan_scope);
+        }
+        assert_eq!(
+            seen,
+            [
+                Some(PlanScope::Parts),
+                Some(PlanScope::Successors),
+                Some(PlanScope::Graph),
+                None,
+            ]
+        );
+        form.cycle(false, &lookups).expect("a choice");
+        assert_eq!(
+            form.build(&node, &lookups)
+                .map(|node| node.phase.plan_scope),
+            Ok(Some(PlanScope::Graph))
+        );
+    }
+
+    #[test]
+    fn a_stored_plan_scope_off_divide_is_read_only_and_kept() {
+        let lookups = lookups();
+        let mut node = research();
+        node.phase.plan_scope = Some(PlanScope::Successors);
+        let mut form = edit(&node);
+        assert!(!form.rows().contains(&Row::PlanScope), "no focus");
+        assert!(form.shown().contains(&(Row::PlanScope, false)), "drawn");
+        let shown = text(&form.lines(&node, &lookups, KEYS, 56, accent(), &Theme::default()));
+        assert!(shown.contains("its successors"), "{shown}");
+        set_text(&mut form, NAME, "dig");
+        assert_eq!(
+            form.build(&node, &lookups)
+                .map(|node| node.phase.plan_scope),
+            Ok(Some(PlanScope::Successors))
+        );
+        // A step with none draws no plan scope row off divide.
+        assert!(
+            !edit(&research())
+                .shown()
+                .iter()
+                .any(|(row, _)| *row == Row::PlanScope)
+        );
+        // Divide makes it a choice again.
+        focus_on(&mut form, Row::Split);
+        form.cycle(true, &lookups).expect("a choice");
+        assert!(form.rows().contains(&Row::PlanScope));
+        assert_eq!(form.plan_scope, Some(PlanScope::Successors));
+    }
+
+    #[test]
+    fn the_divide_rows_follow_the_split_and_the_parts_name_their_keys() {
+        let node = research_divide();
+        let form = edit(&node);
+        let tail: Vec<Row> = form.rows().split_off(FIXED_ROWS + node.agents.len());
+        assert_eq!(
+            tail,
+            [
+                Row::Deadline,
+                Row::Palette,
+                Row::Split,
+                Row::PlannerPersona,
+                Row::PlannerAgent,
+                Row::IntegratePersona,
+                Row::IntegrateAgent,
+                Row::MaxParts,
+                Row::PlanScope,
+                Row::Part(0),
+                Row::Part(1),
+            ]
+        );
+        let mut form = edit(&node);
+        focus_on(&mut form, Row::Part(1));
+        assert_eq!(form.focused(), NodeRow::Part(1));
+        let shown = text(&form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default()));
+        assert!(shown.contains("store \u{b7} Store"), "{shown}");
+        assert!(shown.contains("Alt+e edits it"), "{shown}");
+        let quiet = FormKeys {
+            add: None,
+            open: None,
+        };
+        let shown = text(&form.lines(&node, &lookups(), quiet, 56, accent(), &Theme::default()));
+        assert!(
+            !shown.contains("edits it"),
+            "nothing bound, no help: {shown}"
+        );
+
+        // A part with no title is its key alone; none shows the placeholder.
+        let mut bare = node.clone();
+        bare.parts[0].title = String::new();
+        let shown =
+            text(&edit(&bare).lines(&bare, &lookups(), KEYS, 56, accent(), &Theme::default()));
+        assert!(
+            shown
+                .lines()
+                .any(|line| line.trim_start().starts_with("part 1") && line.ends_with(" ui")),
+            "{shown}"
+        );
+        bare.parts.clear();
+        let mut form = edit(&bare);
+        focus_on(&mut form, Row::NoParts);
+        assert_eq!(form.focused(), NodeRow::NoParts);
+        let shown = text(&form.lines(&bare, &lookups(), KEYS, 56, accent(), &Theme::default()));
+        assert!(shown.contains("none (Alt+n adds one)"), "{shown}");
+        assert_eq!(no_parts(None), "none");
+
+        // A compete step shows fan-out and judge; none shows neither.
+        let compete = open(&research_compete((ids::AGENT_AGY, "gemini")), true);
+        let tail: Vec<Row> = compete.rows().split_off(FIXED_ROWS + 2);
+        assert_eq!(
+            tail,
+            [
+                Row::Deadline,
+                Row::Palette,
+                Row::Split,
+                Row::FanOut,
+                Row::Judge
+            ]
+        );
+    }
+
+    #[test]
     fn debug_never_prints_typed_text() {
         let mut form = edit(&research());
         set_text(&mut form, NAME, "hunter2");
@@ -2087,8 +2624,25 @@ mod tests {
     fn node_form_divide() {
         let node = research_divide();
         let mut form = edit(&node);
-        focus(&mut form, OUTPUT);
+        focus_on(&mut form, Row::Part(0));
         let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
         insta::assert_snapshot!("node_form_divide", text(&lines));
+    }
+
+    #[test]
+    fn node_form_compete_switch_on() {
+        let node = research_compete((ids::AGENT_CLAUDE, "opus"));
+        let mut form = open(&node, true);
+        focus_on(&mut form, Row::Judge);
+        let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
+        insta::assert_snapshot!("node_form_compete_switch_on", text(&lines));
+    }
+
+    #[test]
+    fn node_form_compete_switch_off() {
+        let node = research_compete((ids::AGENT_CLAUDE, "opus"));
+        let form = edit(&node);
+        let lines = form.lines(&node, &lookups(), KEYS, 56, accent(), &Theme::default());
+        insta::assert_snapshot!("node_form_compete_switch_off", text(&lines));
     }
 }
