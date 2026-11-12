@@ -71,8 +71,8 @@ use crate::store::graph_rules::{
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
-    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, QueueStored, QueueTarget, QueueToken, ReadStore,
-    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
+    EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, ParkOutcome, QueueStored, QueueTarget, QueueToken,
+    ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     batch_is_closed, branch_refusal, chat_step_status, check_attachment, citation_key,
     close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
     document_needs_a_step, expected_on_row, failure_disagrees_with_status,
@@ -80,14 +80,14 @@ use crate::store::traits::{
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
     link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
-    phase_name_refusal, project_settings_not_an_object, prompt_template_key,
+    not_a_terminal_status, note_needs_a_step, parent_cycle, parent_too_deep, persona_is_bound,
+    persona_patch_refusal, phase_name_refusal, project_settings_not_an_object, prompt_template_key,
     prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
     references_no_row, requirement_withdrawn, resolution_not_closable, row_names_another_phase,
-    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, startable, step_document_refusal, step_is_not_promotable, step_note_refusal,
-    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    row_names_another_step, run_is_terminal, second_canonical, second_parent, self_link,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
+    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -1879,8 +1879,9 @@ impl State {
     ///
     /// 1. **Directed.** Only `to_item_id` is followed. `link_graph` follows an edge from either
     ///    end and a conformance case pins that, so the two walks cannot share a step.
-    /// 2. **Kind-filtered.** `blocked_by` and `origin` only; `relates` and `supersedes` are not
-    ///    upstream, they are context.
+    /// 2. **Kind-filtered.** `blocked_by`, `origin` and `parent` only
+    ///    ([`LinkKind::walks_upstream`], MOD-150 D6); `relates`, `supersedes`, `duplicates` and
+    ///    `implements` are not upstream, they are context.
     /// 3. **`MIN(depth)`.** `seen` is written on first arrival and breadth-first order means first
     ///    arrival is the nearest one, so a diamond renders its apex once, at the shorter depth.
     /// 4. **Canonical order**, by [`UpstreamEntry::sort_canonical`], so this backend and the two
@@ -1905,7 +1906,7 @@ impl State {
             for current in &frontier {
                 for link in self.links.iter().filter(|link| {
                     link.deleted_at.is_none()
-                        && matches!(link.kind, LinkKind::BlockedBy | LinkKind::Origin)
+                        && link.kind.walks_upstream()
                         && link.from_item_id == *current
                 }) {
                     let target = link.to_item_id;
@@ -3903,6 +3904,53 @@ impl State {
                         .iter()
                         .any(|m| m.workspace_id == *ws && m.project_id == to)
             })
+    }
+
+    /// MOD-150 D4: the `to` of `from`'s live `kind` link other than `to`, if any.
+    fn live_other(&self, from: ItemId, kind: LinkKind, to: ItemId) -> Option<ItemId> {
+        self.links
+            .iter()
+            .find(|row| {
+                row.deleted_at.is_none()
+                    && row.kind == kind
+                    && row.from_item_id == from
+                    && row.to_item_id != to
+            })
+            .map(|row| row.to_item_id)
+    }
+
+    /// MOD-150 D2: walks live `parent` links level by level from `start` (level 1), upward
+    /// (`from` -> `to`) or downward (`to` -> `from`), at most `MAX_PARENT_DEPTH + 1` levels.
+    /// Answers the levels reached and whether `seek` was among the items reached. This mirrors
+    /// PgStore's recursive CTEs row for row (a level is every item one more hop out), so both
+    /// stores count the same depth even on data a backstop-skipping writer left inconsistent.
+    fn parent_walk(&self, start: ItemId, upward: bool, seek: Option<ItemId>) -> (usize, bool) {
+        let cap = usize::from(MAX_PARENT_DEPTH) + 1;
+        let mut level = vec![start];
+        let mut levels = 1;
+        let mut found = seek == Some(start);
+        while levels < cap {
+            let next: Vec<ItemId> = self
+                .links
+                .iter()
+                .filter(|row| row.deleted_at.is_none() && row.kind == LinkKind::Parent)
+                .filter_map(|row| {
+                    let (near, far) = if upward {
+                        (row.from_item_id, row.to_item_id)
+                    } else {
+                        (row.to_item_id, row.from_item_id)
+                    };
+                    level.contains(&near).then_some(far)
+                })
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            found |= seek.is_some_and(|item| next.contains(&item));
+            level = next;
+            levels += 1;
+        }
+        (levels, found)
     }
 
     /// MOD-147 D5: the slug of the first member (by `position`, then slug bytes) of the workspace
@@ -8769,9 +8817,12 @@ impl State {
     }
 
     /// MOD-11 D13, B-6: the upsert. Refusals run self link, step, fence, own item, `to`, its
-    /// reach (MOD-147 D3, [`Self::link_reaches`]); then a new row is live and the step's, a
-    /// tombstone revives as the step's, and a live row keeps its proposer (only `updated_at`
-    /// moves, as Postgres's trigger moves it).
+    /// reach (MOD-147 D3, [`Self::link_reaches`]), then (MOD-150 D4) a second live `parent` or
+    /// `duplicates`, a `parent` that closes a cycle and one that passes [`MAX_PARENT_DEPTH`],
+    /// before the upsert, so a tombstone's revival is checked like an insert; then a new row is
+    /// live and the step's, a tombstone revives as the step's, and a live row keeps its proposer
+    /// (only `updated_at` moves, as Postgres's trigger moves it). The state lock serialises the
+    /// MOD-150 walks (D3).
     fn propose_link(
         &mut self,
         fence: StepFence,
@@ -8790,6 +8841,28 @@ impl State {
         let target = self.require_item(link.to)?.project_id;
         if !self.link_reaches(project, target) {
             return Err(StoreError::Constraint(link_outside_reach(link.to)));
+        }
+        // MOD-150 D4: one live parent, one live canonical. A live row with the same `to` is the
+        // upsert below, never a second one; a tombstone's revival is checked like an insert.
+        if matches!(link.kind, LinkKind::Parent | LinkKind::Duplicates)
+            && let Some(current) = self.live_other(link.from, link.kind, link.to)
+        {
+            return Err(StoreError::Constraint(if link.kind == LinkKind::Parent {
+                second_parent(link.from, current)
+            } else {
+                second_canonical(link.from, current)
+            }));
+        }
+        if link.kind == LinkKind::Parent {
+            let (above, cycle) = self.parent_walk(link.to, true, Some(link.from));
+            if cycle {
+                return Err(StoreError::Constraint(parent_cycle(link.from, link.to)));
+            }
+            let (below, _) = self.parent_walk(link.from, false, None);
+            let depth = above + below;
+            if depth > usize::from(MAX_PARENT_DEPTH) {
+                return Err(StoreError::Constraint(parent_too_deep(depth)));
+            }
         }
         let at = self.links.iter().position(|row| {
             row.from_item_id == link.from && row.to_item_id == link.to && row.kind == link.kind

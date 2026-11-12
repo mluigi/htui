@@ -15,6 +15,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::render::HostnameLine;
 use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
+use htui_core::store::traits::second_parent;
 use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
 use htui_mcp::protocol::CallResult;
 use htui_mcp::{ENV_TOKEN, McpClient, McpHost};
@@ -627,6 +628,117 @@ async fn item_link_add_resolves_the_key_in_the_project() {
     );
     assert!(fx.live_link(ids::HTUI_FEAT_1, LinkKind::Relates).await);
     assert!(!fx.live_link(ids::AGY_FEAT_1, LinkKind::Relates).await);
+}
+
+/// MOD-150 D9: `parent`, `duplicates` and `implements` go live at once, as the four old kinds do.
+#[tokio::test]
+async fn item_link_takes_the_new_kinds_live() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+
+    for (to, id, kind, link_kind) in [
+        ("FEAT-1", ids::HTUI_FEAT_1, "parent", LinkKind::Parent),
+        (
+            "FEAT-2",
+            ids::HTUI_FEAT_2,
+            "duplicates",
+            LinkKind::Duplicates,
+        ),
+        ("ANA-1", ids::HTUI_ANA_1, "implements", LinkKind::Implements),
+    ] {
+        let answer = ok(&client
+            .call("item_link", json!({"op": "add", "to": to, "kind": kind}))
+            .await
+            .expect("a call"));
+        assert_eq!(
+            answer,
+            json!({"from": "ANA-2", "to": to, "kind": kind, "live": true}),
+            "{kind}"
+        );
+        assert!(fx.live_link(id, link_kind).await, "{kind} is live");
+    }
+}
+
+/// MOD-150 D4: a second `parent` is the store's one-line refusal, naming the current parent; the
+/// first stays and the second never lands.
+#[tokio::test]
+async fn item_link_second_parent_is_one_line_naming_the_current_parent() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+
+    ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "FEAT-1", "kind": "parent"}),
+        )
+        .await
+        .expect("a call"));
+    let answer = client
+        .call(
+            "item_link",
+            json!({"op": "add", "to": "FEAT-3", "kind": "parent"}),
+        )
+        .await
+        .expect("a call");
+
+    let reason = refused(&answer);
+    assert_eq!(
+        reason,
+        format!(
+            "refused: {}",
+            second_parent(ids::HTUI_ANA_2, ids::HTUI_FEAT_1)
+        )
+    );
+    assert!(!reason.contains('\n'), "one line: {reason}");
+    assert!(!fx.live_link(ids::HTUI_FEAT_3, LinkKind::Parent).await);
+    assert!(fx.live_link(ids::HTUI_FEAT_1, LinkKind::Parent).await);
+}
+
+/// MOD-150 D9: the schema offers the seven kinds and reads each one in a single line.
+#[tokio::test]
+async fn item_link_offers_the_seven_kinds() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+
+    let listed = client
+        .request("tools/list", json!({}))
+        .await
+        .expect("tools/list");
+    let item_link = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "item_link")
+        .expect("item_link is offered")
+        .clone();
+    let kind = &item_link["inputSchema"]["properties"]["kind"];
+    assert_eq!(
+        kind["enum"],
+        json!([
+            "blocked_by",
+            "origin",
+            "relates",
+            "supersedes",
+            "parent",
+            "duplicates",
+            "implements"
+        ])
+    );
+    let description = kind["description"]
+        .as_str()
+        .expect("kind has a description");
+    assert_eq!(
+        description,
+        "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item \
+         cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: \
+         see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; \
+         `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s \
+         decision. An item has at most one `parent` and one `duplicates`."
+    );
+    assert!(!description.contains('\n'), "one line: {description}");
 }
 
 #[tokio::test]

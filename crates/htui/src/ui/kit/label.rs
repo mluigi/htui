@@ -278,7 +278,7 @@ pub const fn os_family(os: OsFamily) -> &'static str {
 }
 
 /// How one item links to another, as the Graph's edge reads it (`from` *kind* `to`; MOD-115 M4
-/// D-1).
+/// D-1), `parent` as `part of` (MOD-150 D1).
 #[must_use]
 pub const fn link_kind(kind: LinkKind) -> &'static str {
     match kind {
@@ -286,6 +286,9 @@ pub const fn link_kind(kind: LinkKind) -> &'static str {
         LinkKind::Origin => "origin",
         LinkKind::Relates => "relates",
         LinkKind::Supersedes => "supersedes",
+        LinkKind::Parent => "part of",
+        LinkKind::Duplicates => "duplicates",
+        LinkKind::Implements => "implements",
     }
 }
 
@@ -778,7 +781,8 @@ mod tests {
         );
     }
 
-    /// MOD-115 M4 D-1: the Graph's edges read as words, `blocked by` for `blocked_by`.
+    /// MOD-115 M4 D-1, MOD-150 D1: the Graph's edges read as words, `blocked by` for
+    /// `blocked_by` and `part of` for `parent`.
     #[test]
     fn a_link_kind_reads_as_the_edge_says() {
         assert_eq!(
@@ -788,6 +792,9 @@ mod tests {
                 ("origin", "origin"),
                 ("relates", "relates"),
                 ("supersedes", "supersedes"),
+                ("parent", "part of"),
+                ("duplicates", "duplicates"),
+                ("implements", "implements"),
             ]
         );
     }

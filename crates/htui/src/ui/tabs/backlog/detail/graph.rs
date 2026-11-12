@@ -488,7 +488,8 @@ fn in_workspace(node: &LinkNode, projects: &[ProjectRef]) -> bool {
 }
 
 /// The cells the kind column is padded to: the widest of `label::link_kind`'s words (`blocked
-/// by`, `supersedes`), so the column is as wide as its longest word and no wider.
+/// by`, `supersedes`, `duplicates`, `implements`, ten cells each), so the column is as wide as
+/// its longest word and no wider.
 fn kind_width() -> usize {
     LinkKind::ALL
         .iter()
@@ -1861,6 +1862,40 @@ mod tests {
         );
     }
 
+    /// MOD-150 D1: the new kinds read as words in the kind column, `part of` padded to the ten
+    /// cells `duplicates` and `implements` already fill, so the column keeps its width.
+    #[tokio::test]
+    async fn the_new_link_kinds_read_as_words_and_keep_the_column() {
+        let shell = Shell::platform().await;
+        let r = node(1, "R", 0);
+        let p = node(2, "P", 1);
+        let d = node(3, "D", 1);
+        let i = node(4, "I", 1);
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![
+                edge(&r, LinkKind::Parent, &p),
+                edge(&r, LinkKind::Duplicates, &d),
+                edge(&r, LinkKind::Implements, &i),
+            ],
+            nodes: vec![r, p, d, i],
+        };
+        assert_eq!(kind_width(), 10);
+        let drawn: Vec<String> = lines(&rows(&graph, 3), &shell.projects, ROW, &shell.theme)
+            .iter()
+            .map(text)
+            .collect();
+        // Children sort by key bytes: D, I, P.
+        assert_eq!(
+            drawn[1..],
+            [
+                " \u{2192} duplicates D \u{25cb} open D title",
+                " \u{2192} implements I \u{25cb} open I title",
+                " \u{2192} part of    P \u{25cb} open P title",
+            ]
+        );
+    }
+
     /// L7: a pane shorter than the tree scrolls it so the cursor row stays on screen, the footer
     /// kept below it (its keys the shell's hint row since MOD-67 M6 T2).
     #[tokio::test]
@@ -2001,7 +2036,11 @@ mod tests {
     /// wider than its word's column (D-1).
     #[test]
     fn the_kind_column_is_the_widest_label() {
-        assert_eq!(kind_width(), 10, "`blocked by` and `supersedes`");
+        assert_eq!(
+            kind_width(),
+            10,
+            "`blocked by`, `supersedes`, `duplicates` and `implements`"
+        );
         for kind in LinkKind::ALL {
             assert!(
                 cell_width(label::link_kind(*kind)) <= kind_width(),

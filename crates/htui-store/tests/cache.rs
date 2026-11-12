@@ -2477,6 +2477,89 @@ async fn a_cycle_never_renders_the_root_as_its_own_upstream() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-150 D6: the mirror's upstream walk follows `parent` as Postgres's and MemStore's do.
+/// `agy:FIX-1 parent agy:FEAT-1 parent htui:FEAT-3` puts FEAT-1 at depth 1 and FEAT-3 at depth 2;
+/// `htui:FEAT-2`, which `agy:FEAT-1` only `relates` to, stays out.
+#[tokio::test]
+async fn the_mirror_upstream_follows_parent() {
+    use htui_core::model::{ItemLink, LinkKind};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let mut data = fixtures::demo_data();
+    for (from, to) in [
+        (ids::AGY_FIX_1, ids::AGY_FEAT_1),
+        (ids::AGY_FEAT_1, ids::HTUI_FEAT_3),
+    ] {
+        let link = ItemLink {
+            from_item_id: from,
+            to_item_id: to,
+            kind: LinkKind::Parent,
+            proposed_by_step_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+        };
+        sqlx::query(
+            "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+             VALUES ($1, $2, 'parent', $3, $4)",
+        )
+        .bind(link.from_item_id.as_uuid())
+        .bind(link.to_item_id.as_uuid())
+        .bind(link.created_at)
+        .bind(link.updated_at)
+        .execute(&db.pool)
+        .await
+        .expect("the parent link lands in Postgres");
+        data.links.push(link);
+    }
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("a pass mirrors the parent links");
+    let mem = MemStore::from_demo(data);
+
+    let scope = PromptScope::from_scope(&platform_scope().await, ids::PROJECT_AGY);
+    let pg = db
+        .store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("pg upstream_summaries");
+    let mirrored = cache
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("cache upstream_summaries");
+    let reference = mem
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("mem upstream_summaries");
+
+    for (backend, entries) in [("pg", &pg), ("mirror", &mirrored), ("mem", &reference)] {
+        let depth = |item| {
+            entries
+                .iter()
+                .find(|entry| entry.item_id == item)
+                .map(|entry| entry.depth)
+        };
+        assert_eq!(
+            (
+                depth(ids::AGY_FEAT_1),
+                depth(ids::HTUI_FEAT_3),
+                depth(ids::HTUI_FEAT_2)
+            ),
+            (Some(1), Some(2), None),
+            "{backend}: the parent at 1, the grandparent at 2, a relates target never, got \
+             {entries:?}"
+        );
+    }
+    assert_eq!(pg, reference, "Postgres agrees with the reference store");
+    assert_eq!(mirrored, reference, "the mirror agrees with it too");
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-147 D9: with a workspace scope, the mirror's upstream walk counts the workspace's own
 /// scope row as in scope, as Postgres does: a member item `blocked_by` a `WS` item on
 /// `@platform` sees it in scope, summary column and all, offline and online alike. The cache's

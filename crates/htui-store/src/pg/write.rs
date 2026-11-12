@@ -58,11 +58,12 @@ use htui_core::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
-    command_not_claimable, command_not_queued, document_needs_a_step, link_key,
-    link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
-    note_needs_a_step, project_settings_not_an_object, reaped_note, run_workspace_for,
-    scope_row_run_workspace, self_link, step_document_refusal, step_note_refusal,
+    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, batch_is_closed,
+    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
+    link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
+    memory_subject_taken, note_needs_a_step, parent_cycle, parent_too_deep,
+    project_settings_not_an_object, reaped_note, run_workspace_for, scope_row_run_workspace,
+    second_canonical, second_parent, self_link, step_document_refusal, step_note_refusal,
     step_writes_own_item, workspace_prefix_taken,
 };
 use htui_core::store::{
@@ -9638,8 +9639,10 @@ impl WriteStore for PgStore {
     }
 
     /// D13, B-6: the upsert, one transaction after `step_scope`, the own-item check and `to`'s
-    /// reach (MOD-147 D3: the step's project, its workspaces' scope rows and members). A live row
-    /// keeps its proposer; a tombstone revives with the step as proposer.
+    /// reach (MOD-147 D3: the step's project, its workspaces' scope rows and members), then the
+    /// MOD-150 link rules (D4, under D3's advisory locks: one database-wide key for `parent`, one
+    /// key per proposing item for `duplicates`, review R1). A live row keeps its
+    /// proposer; a tombstone revives with the step as proposer.
     /// `updated_at` is the `BEFORE UPDATE` trigger's.
     ///
     /// # Errors
@@ -9690,6 +9693,109 @@ impl WriteStore for PgStore {
         })?;
         if !reachable {
             return Err(StoreError::Constraint(link_outside_reach(link.to)));
+        }
+        // MOD-150 D3: parent writes are serialised database-wide (one key: parent writes are rare
+        // and cycles cross projects), so the walks below see every committed parent link.
+        // `duplicates` writes are serialised per proposing item (review R1): the upsert's
+        // `ON CONFLICT` absorbs only a primary-key conflict, so without the lock a concurrent
+        // identical first-time proposal trips uq_item_link_one_canonical (23505) instead of
+        // upserting. Under READ COMMITTED each statement after the lock reads a fresh snapshot.
+        // This is `claim_command`'s statement text verbatim, so it reuses that query's `.sqlx`
+        // entry; the key is built here.
+        let lock_key = match link.kind {
+            LinkKind::Parent => Some("item_link:parent".to_owned()),
+            LinkKind::Duplicates => Some(format!("item_link:duplicates:{}", link.from)),
+            _ => None,
+        };
+        if let Some(lock_key) = lock_key {
+            sqlx::query!(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                lock_key,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        // MOD-150 D4: one live parent, one live canonical. A live row with the same `to` is the
+        // upsert below; a tombstone's revival is checked like an insert. uq_item_link_one_parent
+        // and uq_item_link_one_canonical back both checks (D5).
+        if matches!(link.kind, LinkKind::Parent | LinkKind::Duplicates) {
+            let current = sqlx::query_scalar!(
+                r#"
+                SELECT to_item_id AS "to_item_id: ItemId"
+                  FROM item_link
+                 WHERE from_item_id = $1 AND kind = $2 AND to_item_id <> $3
+                   AND deleted_at IS NULL
+                 ORDER BY to_item_id
+                 LIMIT 1
+                "#,
+                link.from.as_uuid(),
+                link.kind.as_str(),
+                link.to.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if let Some(current) = current {
+                return Err(StoreError::Constraint(if link.kind == LinkKind::Parent {
+                    second_parent(link.from, current)
+                } else {
+                    second_canonical(link.from, current)
+                }));
+            }
+        }
+        if link.kind == LinkKind::Parent {
+            // Each walk stops at MAX_PARENT_DEPTH + 1 levels, as MemStore's does: the guard ends a
+            // cycle another writer left behind, and both stores report the same depth.
+            let levels = i32::from(MAX_PARENT_DEPTH) + 1;
+            // `to` and its ancestors (level 1 is `to`); `cycle` when `from` is among them.
+            let above = sqlx::query!(
+                r#"
+                WITH RECURSIVE up(item_id, n) AS (
+                        SELECT $1::uuid, 1
+                    UNION ALL
+                        SELECT l.to_item_id, up.n + 1
+                          FROM up
+                          JOIN item_link l ON l.from_item_id = up.item_id
+                         WHERE l.kind = 'parent' AND l.deleted_at IS NULL AND up.n < $3
+                )
+                SELECT COALESCE(bool_or(item_id = $2), FALSE) AS "cycle!",
+                       MAX(n)                                AS "levels!"
+                  FROM up
+                "#,
+                link.to.as_uuid(),
+                link.from.as_uuid(),
+                levels,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if above.cycle {
+                return Err(StoreError::Constraint(parent_cycle(link.from, link.to)));
+            }
+            // The height of `from`'s subtree (level 1 is `from`): live parent links pointing at it.
+            let below = sqlx::query_scalar!(
+                r#"
+                WITH RECURSIVE down(item_id, n) AS (
+                        SELECT $1::uuid, 1
+                    UNION ALL
+                        SELECT l.from_item_id, down.n + 1
+                          FROM down
+                          JOIN item_link l ON l.to_item_id = down.item_id
+                         WHERE l.kind = 'parent' AND l.deleted_at IS NULL AND down.n < $2
+                )
+                SELECT MAX(n) AS "levels!" FROM down
+                "#,
+                link.from.as_uuid(),
+                levels,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            let depth = usize::try_from(above.levels + below).unwrap_or(usize::MAX);
+            if depth > usize::from(MAX_PARENT_DEPTH) {
+                return Err(StoreError::Constraint(parent_too_deep(depth)));
+            }
         }
 
         let row = sqlx::query_as!(

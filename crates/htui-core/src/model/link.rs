@@ -20,8 +20,27 @@ str_enum!(
         Relates => "relates",
         /// `from` supersedes `to`.
         Supersedes => "supersedes",
+        /// `from` is a part of `to`, its parent (MOD-150, ANA-35 §7.6): at most one live parent
+        /// per `from`, no cycles, a chain at most `MAX_PARENT_DEPTH` items deep. Walks upstream,
+        /// never gates readiness.
+        Parent => "parent",
+        /// `from` is the same as `to`, its canonical item: at most one live canonical per `from`.
+        Duplicates => "duplicates",
+        /// `from` carries out `to`'s decision or specification.
+        Implements => "implements",
     }
 );
+
+impl LinkKind {
+    /// MOD-150 D6: whether the upstream prompt walk
+    /// ([`ReadStore::upstream_summaries`](crate::store::ReadStore::upstream_summaries)) follows
+    /// this kind from `from` to `to`: `blocked_by`, `origin` and `parent`. The SQL backends spell
+    /// the same list literally (`pg/read.rs`, `cache/read.rs`).
+    #[must_use]
+    pub const fn walks_upstream(self) -> bool {
+        matches!(self, Self::BlockedBy | Self::Origin | Self::Parent)
+    }
+}
 
 /// A row of `item_link` (§5.5). Removal is a tombstone: a live edge has `deleted_at == None`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,9 +66,10 @@ pub struct ItemLink {
 pub struct ProposeLink {
     /// `item_link.from_item_id`: the proposing step's own item.
     pub from: ItemId,
-    /// `item_link.to_item_id`: an item of the same project.
+    /// `item_link.to_item_id`: an item within the run's reach (MOD-147 D3).
     pub to: ItemId,
-    /// `item_link.kind`.
+    /// `item_link.kind`. `parent` and `duplicates` are single-valued, and a `parent` is checked
+    /// for cycles and depth (MOD-150 D4).
     pub kind: LinkKind,
     /// The proposing step, written to `item_link.proposed_by_step_id`.
     pub step: StepId,
@@ -131,8 +151,8 @@ impl LinkGraph {
 }
 
 /// One upstream item of the prompt's upstream section (`docs/ANA-5.md` §4.3, amending §7.3): an
-/// item reached from the step's item over `blocked_by` and `origin` edges, at its **minimum**
-/// depth, classified against the active scope. Not a table.
+/// item reached from the step's item over `blocked_by`, `origin` and `parent` edges (MOD-150 D6),
+/// at its **minimum** depth, classified against the active scope. Not a table.
 ///
 /// `in_scope` and `summary` are separate facts on purpose. "Outside the active workspace" is the
 /// `R-PRM-2` stub and "in the workspace but nobody has written a summary yet" is a state the agent
@@ -268,6 +288,21 @@ mod tests {
                 .map(|e| e.qualified_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["Z:x", "a:x", "Ångström:x"]
+        );
+    }
+
+    /// MOD-150 D6: the upstream walk follows exactly `blocked_by`, `origin` and `parent`, in
+    /// `LinkKind::ALL`'s order.
+    #[test]
+    fn walks_upstream_is_blocked_by_origin_and_parent() {
+        let walked: Vec<LinkKind> = LinkKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| kind.walks_upstream())
+            .collect();
+        assert_eq!(
+            walked,
+            vec![LinkKind::BlockedBy, LinkKind::Origin, LinkKind::Parent]
         );
     }
 

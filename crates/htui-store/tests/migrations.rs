@@ -116,7 +116,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29
+            25, 26, 27, 28, 29, 30
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -130,7 +130,8 @@ async fn migrations_apply_on_a_clean_database() {
          0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
-         0028_seed_api_billing_env.sql and MOD-139's 0029_divided_fanout.sql, in ordinal order"
+         0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql and MOD-150's \
+         0030_link_kinds.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -4164,8 +4165,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(29),
-        "twenty-nine embedded migrations, none applied (through MOD-139's 0029_divided_fanout.sql)"
+        MigrationState::Pending(30),
+        "thirty embedded migrations, none applied (through MOD-150's 0030_link_kinds.sql)"
     );
 
     db.drop_db().await;
@@ -4265,8 +4266,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(29),
-        "twenty-nine embedded migrations, through MOD-139's 0029_divided_fanout.sql"
+        MigrationState::Pending(30),
+        "thirty embedded migrations, through MOD-150's 0030_link_kinds.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4274,8 +4275,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(29),
-        "every one of the twenty-nine, through MOD-139's 0029_divided_fanout.sql, is pending"
+        HeadlessError::MigrationsPending(30),
+        "every one of the thirty, through MOD-150's 0030_link_kinds.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4297,8 +4298,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(29),
-        "every one of the twenty-nine, through MOD-139's 0029_divided_fanout.sql, is pending"
+        HeadlessError::MigrationsPending(30),
+        "every one of the thirty, through MOD-150's 0030_link_kinds.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4449,9 +4450,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        29,
-        "the later applies migrate nothing: the twenty-nine embedded migrations (through MOD-139's \
-         0029_divided_fanout.sql) are applied once"
+        30,
+        "the later applies migrate nothing: the thirty embedded migrations (through MOD-150's \
+         0030_link_kinds.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -7356,6 +7357,136 @@ async fn cache_0010_applies_over_a_populated_0009_mirror() {
     assert_eq!(index, 1, "idx_cache_run_plan_run exists");
 
     pool.close().await;
+}
+
+/// Inserts `from --kind--> to` straight into `item_link`, live.
+async fn insert_link(
+    pool: &sqlx::PgPool,
+    from: uuid::Uuid,
+    to: uuid::Uuid,
+    kind: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO item_link (from_item_id, to_item_id, kind) VALUES ($1, $2, $3)")
+        .bind(from)
+        .bind(to)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// MOD-150 (plan D5, D8): 0030 swaps the unnamed kind CHECK for `chk_item_link_kind` with seven
+/// kinds, keeps every existing link, and adds two partial unique indexes: one live `parent` and
+/// one live `duplicates` per item, a tombstone outside both. Staged at v29, as on a real box.
+#[tokio::test]
+async fn migration_0030_widens_link_kinds_and_backs_one_parent() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(29, &db.pool)
+        .await
+        .expect("apply 0001 through 0029");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod150").await;
+    let pk = plant_project_kind(pool, user, "links").await;
+    let mut items = Vec::new();
+    for number in 1..=4 {
+        items.push(plant_item(pool, pk, number, "open", None, user).await);
+    }
+    let [a, b, c, d] = items[..] else {
+        unreachable!("four items")
+    };
+    for kind in ["blocked_by", "origin", "relates", "supersedes"] {
+        insert_link(pool, a, b, kind)
+            .await
+            .unwrap_or_else(|err| panic!("plant a v29 {kind} link: {err}"));
+    }
+
+    MIGRATOR.run(pool).await.expect("apply 0030");
+
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM item_link WHERE from_item_id = $1 ORDER BY kind")
+            .bind(a)
+            .fetch_all(pool)
+            .await
+            .expect("read the kept links");
+    assert_eq!(
+        kinds,
+        ["blocked_by", "origin", "relates", "supersedes"],
+        "every link from before 0030 survives it"
+    );
+    let old: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'item_link'::regclass AND conname = 'item_link_kind_check'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("look up the old CHECK");
+    assert_eq!(old, 0, "0001's unnamed kind CHECK is dropped");
+    let check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conrelid = 'item_link'::regclass AND conname = 'chk_item_link_kind'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read chk_item_link_kind");
+    assert_eq!(
+        check,
+        "CHECK ((kind = ANY (ARRAY['blocked_by'::text, 'origin'::text, 'relates'::text, \
+         'supersedes'::text, 'parent'::text, 'duplicates'::text, 'implements'::text])))",
+        "chk_item_link_kind lists LinkKind::ALL in order"
+    );
+    for (index, kind) in [
+        ("uq_item_link_one_parent", "parent"),
+        ("uq_item_link_one_canonical", "duplicates"),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {index}: {err}"));
+        assert_eq!(
+            definition,
+            format!(
+                "CREATE UNIQUE INDEX {index} ON public.item_link USING btree (from_item_id) \
+                 WHERE ((kind = '{kind}'::text) AND (deleted_at IS NULL))"
+            ),
+            "{index} is unique on from_item_id over live {kind} links"
+        );
+    }
+
+    for (kind, index, first, second) in [
+        ("parent", "uq_item_link_one_parent", b, c),
+        ("duplicates", "uq_item_link_one_canonical", b, d),
+    ] {
+        insert_link(pool, a, first, kind)
+            .await
+            .unwrap_or_else(|err| panic!("the first live {kind} link: {err}"));
+        let err = insert_link(pool, a, second, kind)
+            .await
+            .expect_err("a second live link of a single-valued kind is refused");
+        assert_refused_by(err, index, &format!("a second live {kind} link"));
+        sqlx::query(
+            "UPDATE item_link SET deleted_at = now() WHERE from_item_id = $1 AND kind = $2",
+        )
+        .bind(a)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("tombstone the {kind} link: {err}"));
+        insert_link(pool, a, second, kind)
+            .await
+            .unwrap_or_else(|err| panic!("a tombstone is outside {index}: {err}"));
+    }
+    let err = insert_link(pool, c, d, "blocks")
+        .await
+        .expect_err("a kind outside the list is refused");
+    assert_refused_by(err, "chk_item_link_kind", "item_link.kind = 'blocks'");
+
+    db.drop_db().await;
 }
 
 /// MOD-147 (blueprint T3.10): 0026 writes no scope row, so the bootstrap gives every workspace

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH RECURSIVE down(item_id, n) AS (\n                        SELECT $1::uuid, 1\n                    UNION ALL\n                        SELECT l.from_item_id, down.n + 1\n                          FROM down\n                          JOIN item_link l ON l.to_item_id = down.item_id\n                         WHERE l.kind = 'parent' AND l.deleted_at IS NULL AND down.n < $2\n                )\n                SELECT MAX(n) AS \"levels!\" FROM down\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "levels!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c090f01c14faff146161b2bbb2f79b3c6cc89ae0f25a9ddc786136f8ac31be38"
+}
