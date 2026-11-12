@@ -199,7 +199,7 @@ pub(crate) mod tests {
 
     use htui_worker::{
         CANCEL_ALREADY_REQUESTED, CANCEL_GRACE, CANCEL_REQUESTED, Role, promote_needs_the_walker,
-        testing, unknown_executor,
+        testing, unknown_executor, workspace_is_stopped,
     };
 
     use super::{
@@ -4358,6 +4358,166 @@ pub(crate) mod tests {
         let _worker = Worker::spawn(&fixture.store, runtime);
         rests_at(&fixture, run, RunStatus::Stopped).await;
         assert!(commands_of(&fixture, run).is_empty());
+    }
+
+    /// D7 (+ Q1): a run of `HTUI_ANA_2` in `PLATFORM` parked at `research`'s gate, then
+    /// `PLATFORM` stopped: the run and the parked step. A parked run is not the poll's to stop
+    /// (`pending_stops` lists `running` runs only), so it stays parked.
+    async fn parked_in_a_stopped_workspace(
+        fixture: &Fixture,
+        worker: &mut Worker,
+    ) -> (RunId, RunStep) {
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let CommandOutcome::Started { run, rest } = outcome(worker.reply(start).await) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        stop_platform(fixture, StopMode::Graceful).await;
+        (run, step_at(fixture, run, 0).await)
+    }
+
+    /// D7, Q1: every walking command on a run whose workspace is stopped is refused with
+    /// [`workspace_is_stopped`], and writes nothing: `a`/`x`, `r`, `s`, `A`, `p`, and `u` in its
+    /// resume case.
+    #[tokio::test]
+    async fn walking_commands_are_refused_in_a_stopped_workspace() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, research) = parked_in_a_stopped_workspace(&fixture, &mut worker).await;
+        let before = (fixture.run(run).await.status, fixture.steps(run).await);
+        let refusal = workspace_is_stopped("platform");
+
+        for command in [
+            Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            },
+            Command::RetryStep {
+                run,
+                step: research.id,
+            },
+            Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: 1,
+                winner: research.id,
+            },
+            Command::AcceptArtifact {
+                run,
+                step: research.id,
+                chat_live: false,
+            },
+            Command::PromoteStep {
+                run,
+                step: research.id,
+                chat_open: false,
+            },
+        ] {
+            let request = StoreRequest::Orch(OrchRequest::Command(command));
+            let name = request.name();
+            let asked = worker.send(Origin::App, request);
+            let reply = worker.reply(asked).await;
+            assert!(
+                matches!(&reply, StoreReply::Failed { request, message } if *request == name && *message == refusal),
+                "{name}: {reply:?}"
+            );
+            assert_eq!(
+                (fixture.run(run).await.status, fixture.steps(run).await),
+                before,
+                "{name} wrote nothing"
+            );
+        }
+
+        // `u` in its resume case: an `open` item over a parked run whose cursor is a crashed
+        // command's (no step yet, `Create`). A stopped workspace refuses the claim (M1), so the
+        // run is seeded between a resume and a second stop, its lease a stranger's for a day so no
+        // sweep adopts it meanwhile.
+        assert!(
+            fixture
+                .store
+                .resume_workspace(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect("the resume answers")
+        );
+        let crashed = stranded_in(&fixture, ids::AGY_FEAT_1, ids::WORKSPACE_PLATFORM).await;
+        assert!(
+            fixture
+                .store
+                .take_lease(crashed, ids::BOX, Uuid::now_v7(), TimeDelta::days(1))
+                .await
+                .expect("the take answers")
+        );
+        assert!(
+            fixture
+                .store
+                .transition_run(
+                    crashed,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    Utc::now()
+                )
+                .await
+                .expect("the transition answers"),
+            "the run parks over no step"
+        );
+        stop_platform(&fixture, StopMode::Graceful).await;
+        assert_eq!(fixture.item(ids::AGY_FEAT_1).await.status, Status::Open);
+        let asked = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::Unblock {
+                item: ids::AGY_FEAT_1,
+            })),
+        );
+        let reply = worker.reply(asked).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "unblock", message } if *message == refusal),
+            "{reply:?}"
+        );
+        assert_eq!(
+            fixture.run(crashed).await.status,
+            RunStatus::AwaitingApproval,
+            "not resumed"
+        );
+        assert!(fixture.steps(crashed).await.is_empty(), "nothing walked");
+
+        // The same `u` once the workspace is resumed walks again.
+        assert!(
+            fixture
+                .store
+                .resume_workspace(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect("the resume answers")
+        );
+        let asked = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::Unblock {
+                item: ids::AGY_FEAT_1,
+            })),
+        );
+        let reply = worker.reply(asked).await;
+        assert!(
+            !matches!(&reply, StoreReply::Failed { message, .. } if *message == refusal),
+            "{reply:?}"
+        );
+    }
+
+    /// D7: `c` is never refused in a stopped workspace: the parked run is cancelled.
+    #[tokio::test]
+    async fn a_cancel_is_not_refused_in_a_stopped_workspace() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, _) = parked_in_a_stopped_workspace(&fixture, &mut worker).await;
+
+        let asked = worker.send(Origin::App, cancel(run));
+        assert!(matches!(
+            outcome(worker.reply(asked).await),
+            CommandOutcome::Cancelled { .. }
+        ));
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
     }
 
     // -----------------------------------------------------------------------------------------

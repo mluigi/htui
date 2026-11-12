@@ -106,6 +106,12 @@ pub const CANCEL_REQUESTED: &str = "cancel requested: the run's executor applies
 pub const CANCEL_ALREADY_REQUESTED: &str =
     "a cancel is already requested: the run's executor applies it";
 
+/// MOD-125 M2 D7: a walking command on a run whose workspace is stopped.
+#[must_use]
+pub fn workspace_is_stopped(slug: &str) -> String {
+    format!("workspace `{slug}` is stopped: resume it first")
+}
+
 /// MOD-42 OQ-3: `p` on a step the box's worker walks. Promotion hands a live session to this
 /// TUI's chat, which cannot cross processes.
 #[must_use]
@@ -2952,6 +2958,21 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     // `project_id` never changes, so the row read before the lock stands in for a failed one.
     let row = ctx.tag_run(&kit.writer, run).await.or(early);
+    // MOD-125 M2 D7 (+ Q1): the walking commands, `p` included, wait for the workspace's resume.
+    // `R` is the claim's refusal (M1), and `c`, `C` and `T` walk nothing.
+    if matches!(
+        command,
+        Command::AnswerGate { .. }
+            | Command::RetryStep { .. }
+            | Command::SelectFanout { .. }
+            | Command::AcceptArtifact { .. }
+            | Command::PromoteStep { .. }
+    ) && let Some(refusal) =
+        stopped_workspace_refusal(&ctx.host, &kit.writer, row.as_ref()).await
+    {
+        ctx.refuse(refusal);
+        return None;
+    }
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     let promoting = matches!(command, Command::PromoteStep { .. });
@@ -3340,6 +3361,30 @@ async fn stop_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
     drop(guard);
 }
 
+/// MOD-125 M2 D7: the refusal of a walking command on `row`, when its workspace is stopped. A
+/// store failure refuses too (fail closed), in its own words.
+async fn stopped_workspace_refusal<H: htui_core::store::WorkerHost>(
+    host: &H,
+    writer: &H::Store,
+    row: Option<&Run>,
+) -> Option<String> {
+    let workspace = row?.workspace_id?;
+    match htui_core::store::WorkerStore::workspace_stop(writer, workspace).await {
+        Ok(None) => None,
+        Ok(Some(_)) => {
+            let slug = host.workspaces().await.ok().and_then(|all| {
+                all.into_iter()
+                    .find(|ws| ws.workspace_id == workspace)
+                    .map(|ws| ws.slug)
+            });
+            Some(workspace_is_stopped(
+                slug.as_deref().unwrap_or(&workspace.to_string()),
+            ))
+        }
+        Err(err) => Some(err.to_string()),
+    }
+}
+
 /// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
 /// the case again under the lock (§8.6).
 async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, item: ItemId) {
@@ -3380,6 +3425,14 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
     };
     if engine.unblock_case(item).await.ok() != Some(case) {
         return ctx.refuse(UNBLOCK_MOVED.to_owned());
+    }
+    // MOD-125 M2 D7 (blueprint F11): the resume case walks, so it waits for the workspace's resume.
+    if matches!(case, UnblockCase::Resume(_)) {
+        let row = ctx.tag_run(&kit.writer, run).await;
+        if let Some(refusal) = stopped_workspace_refusal(&ctx.host, &kit.writer, row.as_ref()).await
+        {
+            return ctx.refuse(refusal);
+        }
     }
     match walked(&walk, engine.dispatch(Command::Unblock { item })).await {
         // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
