@@ -93,7 +93,7 @@ catalogue action.
 |---|---|---|---|---|
 | 1 | Editor core in `Settings > Kinds` | A project graph opens as nodes and edges; add, delete, connect; base node form (gate and hard flag, retry limit, isolation, command queue, verify command, token budget, template, persona, candidate agents) and edge form (relation, `if` predicate, loop limit); validated save through `replace_graph`; undo and redo; catalogue keys with per-context collisions resolved; the position-based phase forms retired; the store worker answers the written body so any scope can be edited | complete | `.claude/plans/mod-141-m1-step-graph-editor-core.plan.md` |
 | 2 | Splits, palette and graph header | Split none, divide (planner and integrate persona and agent, default parts, `max_parts`) or compete behind the new later-tier toggle; palette flag and plan scope; the step **deadline** and the compete judge (`GraphBody` widened by `deadline_seconds`, `judge_agent_id`, `judge_model`; resolve reads the phase rung first); the header shows the run limits read-only (tightening and the `runtime_changes` override moved to MOD-171, 2026-11-11) | complete | `.claude/plans/mod-141-m2-splits-palette-header.plan.md` |
-| 3 | Every scope, and the picker fix | The scope-generic entry point opens workspace and library graphs (MOD-124's hook); item and kind pickers qualify duplicate `name · workspace` labels and refuse an ambiguous typed match | pending | — |
+| 3 | Every scope, and the picker fix | The scope-generic entry point opens workspace and library graphs (MOD-124's hook); item and kind pickers qualify duplicate `name · workspace` labels and refuse an ambiguous typed match | in-progress | `.claude/plans/mod-141-m3-every-scope-picker-fix.plan.md` |
 
 ## Open Questions
 
