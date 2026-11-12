@@ -100,6 +100,13 @@ use crate::store::error::Result;
 /// anything failing).
 pub const MAX_UPSTREAM_HOPS: u8 = 2;
 
+/// MOD-150 D2 (ANA-35 §7.6): a parent chain holds at most this many items, the bottom child and
+/// the top parent included. `from parent to` is refused when the ancestors of `to` (`to`
+/// included) plus the height of `from`'s subtree (`from` included) exceed it: attaching a subtree
+/// moves every descendant down. Both stores walk at most `MAX_PARENT_DEPTH + 1` levels each way,
+/// so the depth the refusal names is the same on both.
+pub const MAX_PARENT_DEPTH: u8 = 8;
+
 /// Everything a view can ask for. Implemented by every backend, online or offline.
 #[allow(async_fn_in_trait)] // D2 / plan V3: rustc 1.98 warns on async fn in public traits; the
 // signatures are ANA-9 §6.1 verbatim and `Backend` is concrete, so
@@ -141,16 +148,17 @@ pub trait ReadStore: Send + Sync {
     /// because both need `run_step` rows MOD-4 owns. MOD-4 layers that on top (blueprint P-12).
     async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>>;
 
-    /// Upstream items reached over `blocked_by` and `origin` edges, up to `hops` (clamped to
-    /// `1..=2`; `0` returns nothing), **one row per item at its minimum depth**, classified
+    /// Upstream items reached over `blocked_by`, `origin` and `parent` edges, up to `hops` (clamped
+    /// to `1..=2`; `0` returns nothing), **one row per item at its minimum depth**, classified
     /// against `scope` (`R-PRM-1`, `R-PRM-2`).
     ///
     /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, returned in canonical order
     /// ([`UpstreamEntry::sort_canonical`](crate::model::UpstreamEntry::sort_canonical)) so the
     /// three backends hand the assembler the same bytes.
     ///
-    /// Directed, unlike [`links`](ReadStore::links): only `to_item_id` is followed, and only those
-    /// two link kinds. `in_scope` and `summary.is_some()` are separable facts — an in-scope item
+    /// Directed, unlike [`links`](ReadStore::links): only `to_item_id` is followed, and only the
+    /// kinds [`LinkKind::walks_upstream`](crate::model::LinkKind::walks_upstream) names (MOD-150
+    /// D6). `in_scope` and `summary.is_some()` are separable facts — an in-scope item
     /// with no summary renders as `no summary yet`, an out-of-scope one as the `R-PRM-2` stub
     /// whose summary is not read at all.
     async fn upstream_summaries(
@@ -2436,14 +2444,21 @@ pub trait WriteStore: ReadStore {
 
     /// D13, B-6: upserts a live `item_link` proposed by `link.step`; revives a tombstone with the
     /// new proposer, keeps a live row's proposer. `updated_at` is the trigger's (Pg) / the clock's
-    /// (Mem).
+    /// (Mem). MOD-150 D3: on Postgres a `parent` proposal takes one database-wide advisory lock
+    /// before its walks.
     ///
     /// # Errors
     /// `Constraint(self_link(..))` when `from == to` (before any read); `NotFound { run_step }`;
     /// `Fenced`; `Constraint(step_writes_own_item(..))` when `from` is not the run's item;
     /// `NotFound { entity: "item" }` for `to`; `Constraint(link_outside_reach(..))` when `to` is
     /// outside the run's reach (MOD-147 D3): not in the run's project, in no workspace holding it
-    /// (its scope row) and in none of those workspaces' member projects.
+    /// (its scope row) and in none of those workspaces' member projects. Then (MOD-150 D4), for
+    /// `parent`: `Constraint(second_parent(..))` when `from` has a live parent other than `to`,
+    /// `Constraint(parent_cycle(..))` when `from` is among `to`'s ancestors, and
+    /// `Constraint(parent_too_deep(..))` when the chain would pass [`MAX_PARENT_DEPTH`]; for
+    /// `duplicates`: `Constraint(second_canonical(..))` when `from` has a live canonical other
+    /// than `to`. A live row with the same `to` is an upsert, never a second one; reviving a
+    /// tombstone runs every check, as an insert does.
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink>;
 
     /// D13, B-5: tombstones the live link `(from, to, kind)` when its `proposed_by_step_id` is a
@@ -3839,6 +3854,30 @@ pub fn self_link(item: ItemId) -> String {
 #[must_use]
 pub fn link_outside_reach(to: ItemId) -> String {
     format!("item {to} is not in this project or its workspaces")
+}
+
+/// MOD-150 D4 (ANA-35 §7.6): an item has at most one live `parent`; `current` is the live one.
+#[must_use]
+pub fn second_parent(from: ItemId, current: ItemId) -> String {
+    format!("item {from} already has a parent ({current}); an item has at most one")
+}
+
+/// MOD-150 D4 (ANA-35 §7.6): an item duplicates at most one live canonical item, `current`.
+#[must_use]
+pub fn second_canonical(from: ItemId, current: ItemId) -> String {
+    format!("item {from} already duplicates {current}; an item has at most one canonical item")
+}
+
+/// MOD-150 D4 (ANA-35 §7.6): `from parent to` would close a cycle, `from` being above `to`.
+#[must_use]
+pub fn parent_cycle(from: ItemId, to: ItemId) -> String {
+    format!("item {to} is already part of {from}; a parent link would close a cycle")
+}
+
+/// MOD-150 D2: `from parent to` would make a parent chain `depth` items deep.
+#[must_use]
+pub fn parent_too_deep(depth: usize) -> String {
+    format!("a parent chain would be {depth} items deep; at most {MAX_PARENT_DEPTH} are allowed")
 }
 
 /// MOD-147 D5: a scope-row kind may not take a prefix a current member project's kind uses.

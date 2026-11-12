@@ -317,7 +317,15 @@ mod tests {
     fn link_kind_matches_check_list() {
         check_enum(
             LinkKind::ALL,
-            &["blocked_by", "origin", "relates", "supersedes"],
+            &[
+                "blocked_by",
+                "origin",
+                "relates",
+                "supersedes",
+                "parent",
+                "duplicates",
+                "implements",
+            ],
         );
     }
 
