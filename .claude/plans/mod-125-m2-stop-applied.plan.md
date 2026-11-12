@@ -4,7 +4,7 @@
 **Selected Milestone**: 2 — Stop applied by the executor
 **Complexity**: Large (one store read verb over five `WriteStore` implementors, an engine settle path, the
 runtime's command poll and walk registry, the admission path, and the four M1 R1 deferrals; no migration)
-**Status**: confirmed 2026-11-12 (fact-checked, table at the end; D11 (a) chosen by the maintainer). Routed PRD (continuing)
+**Status**: complete 2026-11-12 (confirmed and fact-checked 2026-11-12, D11 (a) chosen; T1-T5 and review-fix round R1 landed on `hr/MOD-125`; rust-reviewer: approve with fixes / request changes, findings verified and settled below). Routed PRD (continuing)
 by `/handoff-run MOD-125`; ultracode accepted for implement and the review verify pass. Sandbox run
 `hr/MOD-125`.
 
@@ -299,3 +299,25 @@ store/pins/independence). Falsified claims were amended above before CONFIRM.
 | CASES = 277, pins | TRUE | `conformance.rs:99`; `mem_store.rs:37`; `pg_conformance.rs:59` |
 | Orch conformance count pins | TRUE (230) | `htui-orch/src/conformance.rs:16929`, `tests/fake_conformance.rs:18` → T2 |
 | T1 ∥ T2 ∥ T4 independent | TRUE (after the file-list fixes) | T2 needs only M1's `stop_run`; T1 = core store, htui-store, htui-agent spies, `htui/tests/hierarchy.rs`; T2 = `htui-orch/{engine,conformance,verify}.rs`, `tests/fake_conformance.rs`; T4 = `Cargo.toml`s, `Cargo.lock`: disjoint. T3 (`htui-worker`, `htui/src/run_worker.rs`, `htui/tests/worker_pg.rs`) needs T1's `pending_stops` and T2's `settle_stop` |
+
+## Review (rust-reviewer, two area instances, 2026-11-12)
+
+Each finding was adversarially verified (one read-only verifier each) before the maintainer's call.
+
+| Finding | Verdict | Outcome |
+|---|---|---|
+| H1 the 0.2.0 bump raises `htui_target_version` only in `apply_migrations`; M2 has no migration | confirmed, medium (latent: no production `stop_workspace` caller before M4) | **Deferred by the maintainer to M4**: M4 ships with a migration (a no-op `0030` if it has none) and a test that the target rises. Commit `5c621db4`'s "raises the minimum version" holds only on a fresh database or one with pending migrations |
+| M-1 a cancel during the stop's final write stranded a pending row on a stopped run | confirmed, low | R1 `aec4c42d`: `request_cancel` share-locks the run and refuses a stopped one (`cancel_of_a_stopped_run`); `stop_run` answers `false` while a cancel is pending (read-committed, after its run lock); the runtime refuses a cancel meeting a stopped run |
+| M-2 a cancel during a graceful stop answered `PREEMPTED` | confirmed, low | R1 `2b90addb`: `preempt_gracefully` drops only the parent it signalled |
+| L-1 `stop_walk` claimed the next poll retries | confirmed | R1 `0031a695`: doc and warn lines name the sweep |
+| L-2 `settle_stop` closes follow-ups before knowing the run stops | refuted | no change (same cleanup as `release_after_walk`) |
+| L-3 the stopped-workspace check let an unreadable row through | confirmed, low | R1 `0031a695`: fails closed with `RUN_UNREADABLE` |
+| L-4 `GroupGuard`'s wait-error arm skips the group kill | refuted | no change |
+| L-5 the dropped-check test could pass vacuously | confirmed | R1 `82121e50`: waits for both sleeps (anchored `pgrep`); fails with T2's guard reverted |
+| S-L(a) `pending_stops` doc on lapsed leases (contradicts D1) | confirmed | R1 `4d6f08a8`: the owner's own lapsed lease is listed, as in `pending_commands`; D1's "lapsed leases are not listed" is superseded for the owner's own |
+| S-L(b) the delete refusal's "resume … then cancel" | kept | HANDOFF note: M3 gives every stopped run a way out, incl. one with no `workspace_stop` row (demo `RUN_8`) |
+
+R1's workflow lost its implementer and verifiers to the weekly usage limit after `aec4c42d`; the
+remaining fixes were finished on the main thread, each mutation-checked, and the round was verified
+by hand (no agent verify pass ran on R1).
+
