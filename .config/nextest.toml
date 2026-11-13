@@ -8,7 +8,8 @@ nextest-version = { required = "0.9.151" }
 # two such cases never overlap under nextest's process-per-test model. The
 # rule for a new live Qdrant test: it lives in `qdrant_live`/`qdrant_worker`,
 # or its name starts with `live_qdrant_`. `cargo nextest show-config
-# test-groups` lists what the group holds.
+# test-groups --all-features` lists what the group holds (without the flag the
+# state_cli_pg cases are not built and drop out).
 #
 # The `#[ignore]`d live agent cases in htui-agent's `it` binary whose modules
 # hold an in-process `ONE_AT_A_TIME` lock (agy_live, auth_live, cli_live,

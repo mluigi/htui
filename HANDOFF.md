@@ -14,7 +14,16 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-13):** **MOD-164 is done** (`docs/decisions/mod/mod-164.md`; on `hr/MOD-164`, to
+**Current status (2026-11-13):** **TOOL-17 is done** (`docs/decisions/tool/tool-17.md`; on branch `tool-17`, to merge): the
+gate's `test` step runs `cargo nextest run --workspace --all-features --no-fail-fast --profile gate`, then
+`cargo test --doc` (291 s against `cargo test`'s 381 s); `cargo-nextest` 0.9.151 is required (host: `~/.cargo/bin`;
+sandboxes: `scripts/hr build`, owed). Live Qdrant tests live in `qdrant_live`/`qdrant_worker` or start with
+`live_qdrant_` (the `live-qdrant` group in `.config/nextest.toml`); `qdrant_turn`/`mock_keyring` stay for
+`cargo test` item runs. Each crate's integration tests are modules of one `tests/it/main.rs` binary (TOOL-15;
+exempt `htui-agent/tests/extensibility.rs` and `htui/tests/panic_hook.rs`), so a sandbox run on the old layout
+that adds a `tests/<name>.rs` moves it under `tests/it/` at collect. Gate red only on `claude_plugin`; many
+Postgres cases failing `57P03` means the dev Postgres crashed (TOOL-16, cause unknown, 2 of 7 nextest runs today): re-run.
+**MOD-164 is done** (`docs/decisions/mod/mod-164.md`; on `hr/MOD-164`, to
 collect): a failing or retried run ends with a `capture` stage row (-4) before `finish_run`. The light model
 (new app key `light_model`, which MOD-126 now reads) gets the run's own evidence, and its entries are written as
 `source = run` through `write_run_memory` (cited, scrubbed, capped at 3, provenance from the rows; a person's
@@ -27,26 +36,18 @@ MOD-147 M1 and M2 (M3, M4 open), MOD-162 M1, MOD-122 M1, MOD-125 M1; each item's
 `command_run`, over the same queue rows and limits; every command row keeps a scrubbed log of its last 2 MiB
 (`command_log`, migration `0031`), read by tail, line range or regex with absolute line numbers; a `repo` argument
 picks one of the session's `extra_dirs`. `command_start`/`command_cancel` ask for approval, the reads do not.
-**TOOL-16 is done** (`docs/decisions/tool/tool-16.md`; with TOOL-15 on branch `tool-16`, to merge): each crate's
-integration tests are modules of one `tests/it/main.rs` binary (TOOL-15; exempt `htui-agent/tests/extensibility.rs`
-and `htui/tests/panic_hook.rs`), so run one file as `cargo test -p <crate> --all-features --test it <name>::`, and a
-sandbox run on the old layout that adds a `tests/<name>.rs` moves it under `tests/it/` at collect. The gate runs at
-default threads and takes about 8 min (was 30), red only on the three base failures; Postgres tests copy a template
-database, live Qdrant tests hold `testkit::qdrant_turn()`, a test that writes and execs a script uses
-`tests/rust/write_executable.rs`, and `gate.sh --detach` no longer ignores SIGINT (the cancel/interrupt "load
-flakes" were that). Many Postgres cases failing `57P03` means the dev Postgres crashed: re-run. TOOL-17 is next.
 MOD-141 (`docs/decisions/mod/mod-141.md`): M3 is on `hr/MOD-141`, to collect. MOD-139
 (`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and Postgres gate; its migration is
 `0029_divided_fanout` (MOD-97 took `0028`).
 MOD-143 waits on MOD-150 and MOD-133.
-Earlier completions, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
+Earlier completions, TOOL-16, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
 text and others; `R-ENT-8`'s and §10.11 already applied) and ANA-40's (`R-TUI-7` and others). Open
 from ANA-29: **MOD-94** behind a maintainer decision. **MOD-99** (hard-coded Sentry DSN in a public
 repo) owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host: the
-Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-14's `gate.ps1
+Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-17's `gate.ps1` test step and `-SelfTest`, TOOL-14's `gate.ps1
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-97's live `cli_live` case 11 (an inherited key, `apiKeySource` stays `none`) and Windows build of its
@@ -1271,18 +1272,6 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
   CLEAN, NEXT, VAL as well as ANA and MOD), for open lines and write-ups alike. Backfill the write-ups
   that newly fall under it, or exempt items archived before 2026-10-15 if that list is long, and
   record which choice was made.
-- [ ] **TOOL-17 - cargo-nextest as the gate's test runner** (from TOOL-16). `cargo test` runs the test
-  binaries one after another (default threads, TOOL-16: htui unit 95 s, htui `it` 87 s, htui-store `it`
-  221 s, about 440 s summed); nextest runs every test of every binary in one pool, one process per test.
-  Gains: cross-binary overlap; the process-wide hazards (fake keyring, `panic_hook`, environment, the
-  `ETXTBSY` fork window) end; the live Qdrant cases become a one-thread test group in
-  `.config/nextest.toml` instead of `testkit::qdrant_turn`; `--retries` reports FLAKY rather than red or
-  green; per-test times. Costs: an install on the host and in the hr image; doctests as a separate
-  `cargo test --doc` step; both gate twins change; about 8,500 process spawns; per-process setup (the
-  `concepts_worker` model load, the template lookup) repeated per test. First a measured spike: prebuilt
-  binary, the Qdrant group, time `cargo nextest run --workspace --all-features` against TOOL-16's
-  default-thread run (532 s with the build). TOOL-15's plan D3 kept nextest as the fallback. Not blocked.
-
 ## Summary
 
 | Area    | Open                                                                                     |
@@ -1290,4 +1279,4 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
 | MOD-N   | 79 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
-| TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-17 cargo-nextest) |
+| TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

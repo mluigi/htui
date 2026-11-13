@@ -204,6 +204,6 @@ work before the start. Prebuild 7 s (warm). Sequential, `/usr/bin/time -v`, logs
 - **Verdict per D2: go**, since (b)+(c) ≤ (a) and there are no unexplained failures. The maintainer decides.
 
 ## Acceptance
-- [ ] T1, S done; go/no-go recorded
-- [ ] On go: T2, T3 done; full gate red only on the known base failures; reviewer findings applied
-- [ ] `docs/decisions/tool/tool-17.md` holds the measurement either way
+- [x] T1, S done; go/no-go recorded (go)
+- [x] On go: T2, T3 done; full gate red only on the known base failures; reviewer findings applied (`31ddad13`)
+- [x] `docs/decisions/tool/tool-17.md` holds the measurement either way
