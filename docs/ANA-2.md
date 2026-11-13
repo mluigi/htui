@@ -729,9 +729,10 @@ offline resumes its runs when it comes back. The cancel row is `cancel_stopped_r
 `cancelled` with `finished_at`, its non-terminal steps `cancelled` and its pending follow-ups
 refused, in one transaction; a stopped run of another box is cancelled through its durable command
 row, which that box's poll applies. The M1 row `stopped -> failed` ("resume impossible and no rerun")
-is retired: a resumed run fails as any `running` run does, from its steps, and a stopped run whose
-box is gone cannot be resumed (its CLI sessions live there) and is cancelled. Moving it to another
-box is out of scope.
+leaves this table but stays allowed by `RunStatus::can_move_to`, written by nothing: `fail_run`
+admits a stopped run on both stores, and no path fails one. A resumed run fails as any `running`
+run does, from its steps, and a stopped run whose box is gone cannot be resumed (its CLI sessions
+live there) and is cancelled. Moving it to another box is out of scope.
 
 `run.status` is **derived from its steps** at every step transition, except `queued` (set at insert)
 and `cancelled` (only a human sets it). That derivation is the single reason the two machines cannot

@@ -169,7 +169,8 @@ str_enum!(
         /// Interrupted by a workspace stop (MOD-125 D1). Resumes to `running` on its own row (M3):
         /// its agent session reopened, or, when that cannot be done, a fresh session on the same
         /// row and attempt opened with the handoff text (M3's fallback). Otherwise cancelled or
-        /// failed with its run.
+        /// failed with its run, or superseded when `select_fanout` passes over it: a stopped
+        /// fan-out loser, or a stopped judge whose group was decided (MOD-125 M1 L-7).
         Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
@@ -1733,6 +1734,8 @@ mod tests {
         (RunStatus::Running, RunStatus::Stopped),
         (RunStatus::Stopped, RunStatus::Running),
         (RunStatus::Stopped, RunStatus::Cancelled),
+        // M3 dropped `stopped -> failed` from the document's table; the law keeps it, written by
+        // nothing (`docs/ANA-2.md`'s M3 amendment): `fail_run` admits a stopped run on both stores.
         (RunStatus::Stopped, RunStatus::Failed),
         // `done`, `failed`, `cancelled` are terminal.
     ];
