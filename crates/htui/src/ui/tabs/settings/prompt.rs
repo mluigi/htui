@@ -16,7 +16,8 @@
 //! own resolver and is therefore an exhaustive `match key` with no wildcard, so a new key is a
 //! compile error naming the missing arm rather than a silent blank (blueprint flag G, O-4); and a
 //! new [`SettingKind`] needs its parse in `submit` and its line in the pane — MOD-33's `Boolean`
-//! did.
+//! did. MOD-164's `AgentModel` (`light_model`) is the one kind that is never typed: the edit act
+//! cycles its row through the enabled agents' models, then `not set`, one write per press (D7).
 //!
 //! The section parses **shape** and nothing else (D11). Every bound — `min`, `max`, `not_above`,
 //! the phase narrowing — belongs to
@@ -39,12 +40,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use htui_core::model::Scope;
+use htui_core::model::{AgentSummary, Scope};
 use htui_core::prompt::settings::{
     resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_compete_fan_out,
-    resolve_excerpt_caps, resolve_hops, resolve_max_skill_tokens, resolve_memory_capture,
+    resolve_excerpt_caps, resolve_hops, resolve_light_model, resolve_max_skill_tokens,
+    resolve_memory_capture,
 };
-use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
+use htui_core::prompt::{Budget, BudgetSource, LightModel, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
 use serde_json::Value;
 
@@ -144,6 +146,22 @@ const FRACTION_UNIT: &str = "fraction";
 
 /// What a [`SettingKind::Boolean`] row's pane says in place of a numeric range.
 const SWITCH_RANGE: &str = "on or off";
+
+/// What a [`SettingKind::AgentModel`] row says while nothing usable is configured (MOD-164 D7).
+const NOT_SET: &str = "not set";
+
+/// What a [`SettingKind::AgentModel`] row's pane says in place of a numeric range: how the edit
+/// act picks its value (MOD-164 D7).
+const AGENT_MODEL_RANGE: &str = "cycles through the enabled agents' models, then not set";
+
+/// The edit act on an unset [`SettingKind::AgentModel`] row with nothing to pick: no enabled agent
+/// lists a model or names a default one.
+const NO_LIGHT_MODELS: &str =
+    "no enabled agent offers a model: probe one, or give it a default model, in Settings > Agents";
+
+/// A stored [`SettingKind::AgentModel`] value its resolver does not read: a row the writer never
+/// validated, which the capture treats as not configured.
+const NOT_A_LIGHT_MODEL: &str = "not an agent and a model; read as not set";
 
 /// One line of the tree, by index into the snapshot (D9).
 ///
@@ -420,6 +438,65 @@ impl PromptSection {
         self.snapshot.as_ref()?.projects.get(p)
     }
 
+    /// The agent registry of the snapshot; empty before the first reply.
+    fn agents(&self) -> &[AgentSummary] {
+        self.snapshot
+            .as_ref()
+            .map_or(&[], |snapshot| snapshot.agents.as_slice())
+    }
+
+    /// Whether `row` is a [`SettingKind::AgentModel`] row, which the edit act cycles rather than
+    /// opening an editor on (MOD-164 D7).
+    fn is_choice(&self, row: Row) -> bool {
+        self.target_of(row)
+            .is_some_and(|opening| opening.target.key.spec().kind == SettingKind::AgentModel)
+    }
+
+    /// The edit act on a [`SettingKind::AgentModel`] row (MOD-164 D7): one write, never an editor.
+    ///
+    /// The next of [`light_models`] after the one the `App` rung resolves to, the first when it
+    /// resolves to none or to a pair no enabled agent offers any more, and past the last a clear
+    /// (`not set`), which deletes the row. With nothing to pick and nothing stored there is no
+    /// write, and the notice says why.
+    fn cycle_choice(&mut self, row: Row, ctx: &Ctx<'_>) {
+        let Some((target, expected, next)) = self.target_of(row).and_then(|opening| {
+            let snapshot = self.snapshot.as_ref()?;
+            let pairs = light_models(&snapshot.agents);
+            let current = resolve_light_model(&snapshot.app_map());
+            let next = match current.and_then(|now| pairs.iter().position(|pair| *pair == now)) {
+                Some(at) => pairs.get(at + 1).cloned(),
+                None => pairs.first().cloned(),
+            };
+            Some((opening.target, opening.expected, next))
+        }) else {
+            return;
+        };
+        self.notice = None;
+        match (next, expected) {
+            (Some(next), _) => self.send(
+                StoreRequest::SetSetting {
+                    scope: ctx.scope.clone(),
+                    rung: target.rung,
+                    key: target.key,
+                    value: next.to_value(),
+                    expected,
+                },
+                ctx,
+            ),
+            // `expected` is `Some` exactly when the `App` rung holds a row (D4, F-2).
+            (None, Some(expected)) => self.send(
+                StoreRequest::ClearSetting {
+                    scope: ctx.scope.clone(),
+                    rung: target.rung,
+                    key: target.key,
+                    expected,
+                },
+                ctx,
+            ),
+            (None, None) => self.say(NO_LIGHT_MODELS),
+        }
+    }
+
     /// A value row's key, what its rung stores, and what the reader would use (D6).
     ///
     /// `None` on a header: those carry no value and open no editor.
@@ -432,7 +509,7 @@ impl PromptSection {
             Row::AppHeader | Row::ProjectHeader { .. } => None,
             Row::App { i } => {
                 let entry = self.app(i)?;
-                let effective = effective(entry.key, None, None, app);
+                let effective = effective(entry.key, None, None, app, self.agents());
                 Some((entry.key, entry.value.as_ref(), effective))
             }
             Row::Project { p, v } => {
@@ -445,6 +522,7 @@ impl PromptSection {
                     Some(&entry.project.settings),
                     value.value.as_ref(),
                     app,
+                    self.agents(),
                 );
                 Some((value.key, value.value.as_ref(), effective))
             }
@@ -650,6 +728,8 @@ impl PromptSection {
             SettingKind::Boolean => parse_switch(&text)
                 .map(Value::Bool)
                 .ok_or_else(|| switch_sentence(target.key)),
+            // Never opened: the edit act cycles this row instead (MOD-164 D7).
+            SettingKind::AgentModel => Err(choice_sentence(target.key)),
         };
         match value {
             Ok(value) => {
@@ -936,7 +1016,11 @@ impl SettingsSection for PromptSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row, ctx.keys());
+                        if self.is_choice(row) {
+                            self.cycle_choice(row, ctx);
+                        } else {
+                            self.open_edit(row, ctx.keys());
+                        }
                     }
                 }
                 Act::ListDown => self.move_cursor(true),
@@ -1019,7 +1103,8 @@ impl SettingsSection for PromptSection {
                 NextStep(&reads_again(reload.as_deref())),
                 theme,
             ),
-            // There is no empty case below this one: the `App` group is always the registry's twelve.
+            // There is no empty case below this one: the `App` group is always the registry's
+            // thirteen.
             (None, Some(snapshot)) => {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
@@ -1088,11 +1173,14 @@ fn switch(
 ///
 /// `project` is the whole blob on a project row and `None` on an `App` row; `project_value` is that
 /// row's own stored value, which is what the presence rule reads.
+///
+/// `agents` names the agent of the `light_model` row (MOD-164 D7); no other key reads it.
 fn effective(
     key: SettingKey,
     project: Option<&Value>,
     project_value: Option<&Value>,
     app: &BTreeMap<String, Value>,
+    agents: &[AgentSummary],
 ) -> Effective {
     let present = label::setting_source(present_source(project_value, app.contains_key(key.key())));
     let mut notes = Vec::new();
@@ -1137,6 +1225,17 @@ fn effective(
         SettingKey::MaxSkillTokens => {
             let tokens = resolve_max_skill_tokens(app);
             (tokens.to_string(), Some(tokens), present)
+        }
+        // MOD-164 D7: the agent by name and the model, or `not set`; a stored value the resolver
+        // does not read is named under the row rather than shown as a choice.
+        SettingKey::LightModel => {
+            let resolved = resolve_light_model(app);
+            if resolved.is_none() && app.get(key.key()).is_some_and(|value| !value.is_null()) {
+                notes.push(NOT_A_LIGHT_MODEL.to_owned());
+            }
+            let text =
+                resolved.map_or_else(|| NOT_SET.to_owned(), |light| light_text(&light, agents));
+            (text, None, present)
         }
         // `resolve_reserve_bp` is private, so the reserve reaches the screen through the one
         // public door that carries it (blueprint flag A) — still the reader's own arithmetic.
@@ -1196,7 +1295,13 @@ static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
 /// One value row's value column: what the rung stores, what the reader would use, which rung
 /// answered in words, and the unit (D9). The key is the row's label. One space before the unit:
 /// the form wraps the value under its column, and wrapping collapses runs of blanks.
+///
+/// A [`SettingKind::AgentModel`] row is its choice alone, `claude · haiku` or `not set` (MOD-164
+/// D7): the stored JSON would only repeat it, and it has no unit.
 fn value_text(key: SettingKey, stored: Option<&Value>, effective: &Effective) -> String {
+    if key.spec().kind == SettingKind::AgentModel {
+        return effective.text.clone();
+    }
     let held = stored.map_or_else(|| UNSET.to_owned(), Value::to_string);
     format!(
         "{held} | {} ({}) {}",
@@ -1211,7 +1316,7 @@ fn unit(key: SettingKey) -> &'static str {
     let spec = key.spec();
     match spec.kind {
         SettingKind::Fraction => FRACTION_UNIT,
-        SettingKind::Integer | SettingKind::Boolean => spec.unit,
+        SettingKind::Integer | SettingKind::Boolean | SettingKind::AgentModel => spec.unit,
     }
 }
 
@@ -1223,6 +1328,8 @@ fn range_text(key: SettingKey) -> String {
     match spec.kind {
         // `min` 0 and `max` 1 are nominal for a switch; the range it takes is two words.
         SettingKind::Boolean => format!("{SWITCH_RANGE} \u{b7} rungs {}", spec.rungs),
+        // The model's 1..=200 characters are the writer's; the row never types one.
+        SettingKind::AgentModel => format!("{AGENT_MODEL_RANGE} \u{b7} rungs {}", spec.rungs),
         SettingKind::Integer => format!(
             "range {}..={} {} \u{b7} rungs {}",
             spec.min, spec.max, spec.unit, spec.rungs
@@ -1323,6 +1430,47 @@ fn parse_switch(text: &str) -> Option<bool> {
 /// D11's sentence for a switch: shape, never a bound.
 fn switch_sentence(key: SettingKey) -> String {
     format!("`{key}` is on or off, or empty to clear")
+}
+
+/// What an editor over a [`SettingKind::AgentModel`] row would say; none opens (MOD-164 D7).
+fn choice_sentence(key: SettingKey) -> String {
+    format!("`{key}` is picked by cycling its row, never typed")
+}
+
+/// Every `(agent, model)` the `light_model` row cycles through (MOD-164 D7): enabled agents only,
+/// in registry order, each offering its `models` or, with none listed, its `default_model`. An
+/// agent with neither offers nothing — unlike the graph editor's `agent_pairs`, which offers an
+/// empty model — because a capture turn needs a model to ask for.
+fn light_models(agents: &[AgentSummary]) -> Vec<LightModel> {
+    agents
+        .iter()
+        .map(|summary| &summary.agent)
+        .filter(|agent| agent.enabled)
+        .flat_map(|agent| {
+            let models = if agent.models.is_empty() {
+                agent.default_model.iter().cloned().collect()
+            } else {
+                agent.models.clone()
+            };
+            models.into_iter().map(|model| LightModel {
+                agent_id: agent.id,
+                model,
+            })
+        })
+        .collect()
+}
+
+/// A light model as its row reads it, `claude · haiku`: the agent by name, or by id when the
+/// registry no longer lists it.
+fn light_text(light: &LightModel, agents: &[AgentSummary]) -> String {
+    let agent = agents
+        .iter()
+        .find(|summary| summary.agent.id == light.agent_id)
+        .map_or_else(
+            || light.agent_id.to_string(),
+            |summary| summary.agent.name.clone(),
+        );
+    format!("{agent} \u{b7} {}", light.model)
 }
 
 /// What a write in flight is doing, in words (MOD-83): never its request name.
@@ -1541,7 +1689,7 @@ mod tests {
                 || Value::Object(serde_json::Map::new()),
                 |value| blob(key, value.clone()),
             );
-            let row = effective(key, Some(&project), project.get(key.key()), &app);
+            let row = effective(key, Some(&project), project.get(key.key()), &app, &[]);
             assert_eq!(row.text, text, "{stored:?}");
             assert_eq!(row.source, source, "{stored:?}");
         }
@@ -1566,7 +1714,7 @@ mod tests {
                 || Value::Object(serde_json::Map::new()),
                 |value| blob(key, value.clone()),
             );
-            let row = effective(key, Some(&project), project.get(key.key()), &app);
+            let row = effective(key, Some(&project), project.get(key.key()), &app, &[]);
             assert_eq!(row.text, text, "{stored:?}");
             assert_eq!(row.source, source, "{stored:?}");
             assert_eq!(
@@ -1587,23 +1735,23 @@ mod tests {
         let empty = Value::Object(serde_json::Map::new());
         let held = blob(key, json!(true));
 
-        let app_row = effective(key, None, None, &off);
+        let app_row = effective(key, None, None, &off, &[]);
         assert_eq!(
             (app_row.text.as_str(), app_row.source),
             (SWITCH_OFF, app_setting)
         );
-        let inherits = effective(key, Some(&empty), None, &off);
+        let inherits = effective(key, Some(&empty), None, &off, &[]);
         assert_eq!(
             (inherits.text.as_str(), inherits.source),
             (SWITCH_OFF, app_setting),
             "a project row with no value of its own names the App rung that answered"
         );
-        let overrides = effective(key, Some(&held), held.get(key.key()), &off);
+        let overrides = effective(key, Some(&held), held.get(key.key()), &off, &[]);
         assert_eq!(
             (overrides.text.as_str(), overrides.source),
             (SWITCH_ON, PROJECT)
         );
-        let unset = effective(key, None, None, &BTreeMap::new());
+        let unset = effective(key, None, None, &BTreeMap::new(), &[]);
         assert_eq!((unset.text.as_str(), unset.source), (SWITCH_ON, DEFAULT));
         assert_eq!(
             unset.number, None,
@@ -1647,7 +1795,7 @@ mod tests {
                 .iter()
                 .map(|value| (key.key().to_owned(), value.clone()))
                 .collect();
-            let row = effective(key, None, None, &app);
+            let row = effective(key, None, None, &app, &[]);
             assert_eq!(
                 (row.text.as_str(), row.source),
                 (text, source),
@@ -1658,6 +1806,40 @@ mod tests {
                 "D13's clamp arithmetic never reads a switch"
             );
         }
+    }
+
+    /// MOD-164 D7: the `light_model` row reads the resolver's answer — the agent by name, by id
+    /// once the registry no longer lists it, or `not set` — and a stored value the resolver does
+    /// not read is noted under the row rather than shown as a choice.
+    #[test]
+    fn the_light_model_row_names_the_agent_or_says_not_set() {
+        let key = SettingKey::LightModel;
+        let agent = htui_core::model::AgentId::new();
+        let held = json!({ "agent_id": agent.to_string(), "model": "haiku" });
+        let app = BTreeMap::from([(key.key().to_owned(), held)]);
+
+        let row = effective(key, None, None, &app, &[]);
+        assert_eq!(
+            row.text,
+            format!("{agent} \u{b7} haiku"),
+            "an unlisted agent"
+        );
+        assert_eq!(row.number, None, "D13's clamp arithmetic never reads it");
+        assert!(row.notes.is_empty());
+        assert_eq!(value_text(key, app.get(key.key()), &row), row.text);
+
+        let unset = effective(key, None, None, &BTreeMap::new(), &[]);
+        assert_eq!((unset.text.as_str(), unset.source), (NOT_SET, DEFAULT));
+        assert!(unset.notes.is_empty());
+
+        let typo = BTreeMap::from([(key.key().to_owned(), json!("haiku"))]);
+        let malformed = effective(key, None, None, &typo, &[]);
+        assert_eq!(malformed.text, NOT_SET);
+        assert_eq!(malformed.notes, [NOT_A_LIGHT_MODEL]);
+        assert_eq!(
+            row_error(key, typo.get(key.key()), &malformed).as_deref(),
+            Some(NOT_A_LIGHT_MODEL)
+        );
     }
 
     /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
