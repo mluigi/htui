@@ -559,6 +559,27 @@ struct WalkScopes {
     /// still owed (a walk `heartbeaten` abandoned, or one that raised before it drained), each
     /// warned with the manual `Cleanup` retry (R-25) named.
     owed_dropped: std::sync::atomic::AtomicU32,
+    /// MOD-164 F1 (review H2): the runs [`Engine::end_run`] is ending in this engine, its capture
+    /// and its `finish_run` included. Each sender is dropped when that end returns, which wakes
+    /// every later end of the run waiting on it ([`Self::end`]).
+    ends: std::sync::Mutex<BTreeMap<RunId, watch::Sender<()>>>,
+}
+
+/// MOD-164 F1 (review H2): one run end in progress in this engine ([`WalkScopes::end`]); removes
+/// it on drop, which wakes the ends waiting on it.
+struct EndGuard<'e> {
+    scopes: &'e WalkScopes,
+    run: RunId,
+}
+
+impl Drop for EndGuard<'_> {
+    fn drop(&mut self) {
+        self.scopes
+            .ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run);
+    }
 }
 
 /// One open walk (blueprint §3.1).
@@ -608,6 +629,30 @@ impl WalkScopes {
         Self {
             scopes: std::sync::Mutex::new(BTreeMap::new()),
             owed_dropped: std::sync::atomic::AtomicU32::new(0),
+            ends: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// MOD-164 F1 (review H2): `run`'s end, once no other end of it is in progress in this
+    /// engine: a later end waits for the earlier one (its capture and its `finish_run`) to
+    /// return, so it never interrupts a live capture nor finishes the run under it.
+    async fn end(&self, run: RunId) -> EndGuard<'_> {
+        loop {
+            let mut earlier = {
+                let mut ends = self
+                    .ends
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match ends.get(&run) {
+                    Some(end) => end.subscribe(),
+                    None => {
+                        ends.insert(run, watch::channel(()).0);
+                        return EndGuard { scopes: self, run };
+                    }
+                }
+            };
+            // Only a closed channel answers: the earlier end's guard dropped its sender.
+            while earlier.changed().await.is_ok() {}
         }
     }
 
@@ -776,6 +821,28 @@ mod walk_scopes {
         assert!(scopes.control(run).is_some());
         drop(guard);
         assert!(scopes.control(run).is_none());
+    }
+
+    /// MOD-164 F1 (review H2): a second end of a run waits until the first returns; another
+    /// run's end waits for nothing.
+    #[tokio::test]
+    async fn a_second_end_of_a_run_waits_for_the_first() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let first = scopes.end(run).await;
+        let other = scopes.end(RunId::new()).await;
+        let mut second = Box::pin(scopes.end(run));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "the first end is in progress"
+        );
+        drop(first);
+        let second = second.await;
+        let mut third = Box::pin(scopes.end(run));
+        assert!(futures::poll!(third.as_mut()).is_pending());
+        drop(second);
+        drop(third.await);
+        drop(other);
     }
 
     /// A run cancel is forwarded once, its grace kept; the cut then changes nothing. A cut alone
@@ -9173,8 +9240,13 @@ where
         let candidate = Self::candidate_of(step, phase)?;
         // MOD-42 D10, B-17: a cancel that reached the walk between sessions spawns nothing.
         // MOD-138 M3 D3: under an open walk the session drives on the walk's control, which also
-        // carries the walk's cut.
-        let mut control = self.session_control(run.id);
+        // carries the walk's cut. MOD-164 F1 (review H1): the capture is the run's end, not a
+        // sibling of the walk, so it drives on the run's own control, which no cut reaches.
+        let mut control = if capture::is_capture_row(step) {
+            (self.parts.control)(run.id)
+        } else {
+            self.session_control(run.id)
+        };
         if self.cancel_read(run.id, &control) {
             return Err(EngineError::Cancelled { run: run.id });
         }
@@ -9464,14 +9536,21 @@ where
     }
 
     /// MOD-164 D11: the one way the walk ends a run (every terminal `finish_run` the walk and the
-    /// gate write). A run that is not ending `cancelled`, whose snapshot froze a capture and that
-    /// has an item runs its capture step first ([`Self::capture`]), and `finish_run` stays the
-    /// run's last write. The capture never moves `to`: whatever it meets settles its own row.
+    /// gate write). A run that is not ending `cancelled`, is still live (`running` or
+    /// `awaiting_approval`, re-read), whose snapshot froze a capture and that has an item runs its
+    /// capture step first ([`Self::capture`]), and `finish_run` stays the run's last write. The
+    /// capture never moves `to`: whatever it meets settles its own row.
+    ///
+    /// MOD-164 F1 (review H2): the run's outcome is decided here. One end of a run is in progress
+    /// in this engine at a time ([`WalkScopes::end`]): a second, a sibling's terminal path met
+    /// during the capture, waits for the first to return and then finds the run finished, so it
+    /// runs no capture and its `finish_run` is refused, as a second end's always was. A run
+    /// ending `cancelled` waits for nothing: its cancel reaches the capture's session first.
     ///
     /// # Errors
-    /// The capture's fence, lease and cancel errors, before `finish_run` is written (a cancel's
-    /// run is ended by the cancel path); `finish_run`'s own. Any other capture error is warned
-    /// and the run still ends.
+    /// The capture's fence and lease errors and the run's own cancel, before `finish_run` is
+    /// written (a cancel's run is ended by the cancel path); `finish_run`'s own. Any other
+    /// capture error, and a failed read of the run (review L6), is warned and the run still ends.
     pub(crate) async fn end_run(
         &self,
         run: RunId,
@@ -9480,30 +9559,43 @@ where
         at: DateTime<Utc>,
     ) -> Result<(), EngineError> {
         let mut at = at;
-        if to != RunStatus::Cancelled {
-            let row = self.run(run).await?;
-            // A snapshot that does not decode was refused by the walk long before its end; here
-            // it is only "no capture".
-            let capture = Self::snapshot_of(&row)
-                .ok()
-                .and_then(|snapshot| snapshot.capture);
-            if let Some(capture) = capture
-                && row.item_id.is_some()
-            {
-                // Boxed: the run end sits at the bottom of the walk's frames, near the 2 MiB
-                // debug stack (MOD-10 M3).
-                match Box::pin(self.capture(&row, &capture)).await {
-                    Ok(()) => {}
-                    Err(err) if capture::passes_through(&err) => return Err(err),
-                    // A store error before the capture row settled (its read, its insert):
-                    // the capture never moves the run's end, so the run still ends.
-                    Err(err) => {
-                        tracing::warn!(%run, %err, "the capture step did not settle; the run ends without it");
+        let _end = if to == RunStatus::Cancelled {
+            None
+        } else {
+            let end = self.walks.end(run).await;
+            match self.run(run).await {
+                Ok(row) => {
+                    // A snapshot that does not decode was refused by the walk long before its
+                    // end; here it is only "no capture".
+                    let capture = Self::snapshot_of(&row)
+                        .ok()
+                        .and_then(|snapshot| snapshot.capture);
+                    if let Some(capture) = capture
+                        && row.item_id.is_some()
+                        && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                    {
+                        // Boxed: the run end sits at the bottom of the walk's frames, near the
+                        // 2 MiB debug stack (MOD-10 M3).
+                        match Box::pin(self.capture(&row, &capture)).await {
+                            Ok(()) => {}
+                            Err(err) if self.passes_through(run, &err) => return Err(err),
+                            // A store error before the capture row settled (its read, its
+                            // insert): the capture never moves the run's end, so the run still
+                            // ends.
+                            Err(err) => {
+                                tracing::warn!(%run, %err, "the capture step did not settle; the run ends without it");
+                            }
+                        }
+                        at = at.max(self.now());
                     }
                 }
-                at = at.max(self.now());
+                // Review L6: the capture is skipped, never the run's end.
+                Err(err) => {
+                    tracing::warn!(%run, %err, "the run could not be read for its capture; the run ends without it");
+                }
             }
-        }
+            Some(end)
+        };
         self.parts.store.finish_run(run, to, failure, at).await?;
         Ok(())
     }

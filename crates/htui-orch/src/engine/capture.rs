@@ -1,16 +1,15 @@
 //! MOD-164 D11: the run-end capture step, [`Engine::capture`].
 //!
 //! [`Engine::end_run`] calls it before the run's `finish_run` when the run is not ending
-//! `cancelled`, its snapshot froze a capture and it has an item. It runs at most once per run, on
-//! one `stage` row at [`CAPTURE_POSITION`] keyed [`CAPTURE_KEY`]: a one-off light-model turn
-//! shaped like the judge's (`run_judge`), shown the run's evidence pack and asked for at most
+//! `cancelled`, is still live, its snapshot froze a capture and it has an item. It runs at most
+//! once per run, on one `stage` row at [`CAPTURE_POSITION`] keyed [`CAPTURE_KEY`]: a one-off
+//! light-model turn shaped like the judge's (`run_judge`), shown the run's evidence pack and
+//! asked for at most
 //! [`MEMORY_RUN_WRITE_CAP`](htui_core::model::MEMORY_RUN_WRITE_CAP) memory entries, which are
 //! checked against the pack and written through `write_run_memory`. Whatever the turn meets settles
 //! the capture row; the run's own status never moves.
 
 use std::collections::BTreeMap;
-
-use futures::future::{Either, select};
 
 use htui_core::capture::{
     CAPTURE_TEMPLATE, CaptureOutput, EvidencePack, capture_prompt, capture_trigger, parse_capture,
@@ -36,9 +35,14 @@ pub(super) const CAPTURE_DEADLINE: std::time::Duration = std::time::Duration::fr
 /// `run_step.gate_note` of a capture row passed without a turn (D11 step 3).
 pub(super) const NO_LIGHT_MODEL: &str = "skipped: no light model configured";
 
-/// `run_step.gate_note` of a capture row a crash left `running` (D11 step 1): settled, not re-run.
+/// `run_step.gate_note` of a capture row a crash left `running` or `pending` (D11 step 1):
+/// settled, not re-run.
 pub(super) const CAPTURE_INTERRUPTED: &str =
     "interrupted: the capture step did not finish; it is not run again";
+
+/// MOD-164 F1 (review H1): the reason a capture row fails with when a cancel that is not the
+/// run's own (a walk's cut) reached it. The run still ends.
+pub(super) const CAPTURE_CUT: &str = "cut by the walk";
 
 /// The capture turn's output kind: what `open_tools` offers `document_write` for.
 pub(super) const CAPTURE_KIND: &str = "memory_capture";
@@ -111,14 +115,9 @@ fn capture_phase(model: &SnapshotCaptureModel) -> SnapshotPhase {
     }
 }
 
-/// Whether `err` leaves the capture unsettled for its owner: a lost fence or lease, or a cancel,
-/// whose run another path ends. Every other error settles the capture row.
-pub(super) const fn passes_through(err: &EngineError) -> bool {
-    is_fenced(err)
-        || matches!(
-            err,
-            EngineError::Cancelled { .. } | EngineError::LeaseLost { .. }
-        )
+/// Whether `step` is a run's capture row (D3): `stage`, keyed [`CAPTURE_KEY`].
+pub(super) fn is_capture_row(step: &RunStep) -> bool {
+    step.role == StepRole::Stage && step.node_key.as_deref() == Some(CAPTURE_KEY)
 }
 
 impl<S, G, I, V, C, A, K> Engine<'_, S, G, I, V, C, A, K>
@@ -131,33 +130,40 @@ where
     A: AgentSelector + ?Sized,
     K: SessionSink + ?Sized,
 {
+    /// Whether `err` leaves `run`'s capture unsettled for its owner: a lost fence or lease, or
+    /// the run's own cancel, whose run the cancel path ends. Every other error settles the capture
+    /// row, a cancel that is not the run's own (a walk's cut, review H1) included.
+    pub(super) fn passes_through(&self, run: RunId, err: &EngineError) -> bool {
+        is_fenced(err)
+            || matches!(err, EngineError::LeaseLost { .. })
+            || (matches!(err, EngineError::Cancelled { .. })
+                && (self.parts.control)(run).signal().is_cancel())
+    }
+
     /// MOD-164 D11: the run-end capture of `run`, whose snapshot froze `capture`.
     ///
-    /// 1. At most once: a capture row a crash left `running` is interrupted, not re-run; a capture
-    ///    row in any other state means it ran.
+    /// 1. At most once: a capture row a crash left `running` or `pending` is interrupted, not
+    ///    re-run; a capture row in any other state means it ran. A live capture of this engine
+    ///    is never met here: [`Engine::end_run`] runs one end of a run at a time.
     /// 2. No D9 trigger over the run's steps: nothing, no row and no note.
     /// 3. No light model: the row is created and passed `skipped` with [`NO_LIGHT_MODEL`].
-    /// 4. Otherwise the turn: the row on the frozen agent and model, its evidence pack and prompt,
-    ///    one session under [`CAPTURE_DEADLINE`], and the answer checked and written.
+    /// 4. Otherwise the turn: the walk's siblings are cut first (review H2: the run's outcome is
+    ///    decided, so nothing new is admitted while the capture runs), then the row on the frozen
+    ///    agent and model, its evidence pack and prompt, one session under [`CAPTURE_DEADLINE`]
+    ///    on the run's own control, and the answer checked and written.
     ///
     /// # Errors
-    /// Only a lost fence or lease, or a cancel, which leave the row for its owner. Every other
-    /// failure settles the row `failed` with its reason and an item note.
+    /// Only a lost fence or lease, or the run's own cancel, which leave the row for its owner
+    /// ([`Self::passes_through`]). Every other failure settles the row `failed` with its reason
+    /// and an item note.
     pub(super) async fn capture(
         &self,
         run: &Run,
         capture: &SnapshotCapture,
     ) -> Result<(), EngineError> {
         let steps = self.parts.store.run_steps(run.id).await?;
-        if let Some(row) = steps.iter().find(|step| {
-            step.role == StepRole::Stage && step.node_key.as_deref() == Some(CAPTURE_KEY)
-        }) {
-            if row.status == StepStatus::Running {
-                self.parts
-                    .store
-                    .interrupt_step(row.id, CAPTURE_INTERRUPTED, self.now())
-                    .await?;
-            }
+        if let Some(row) = steps.iter().find(|step| is_capture_row(step)) {
+            self.interrupt_leftover(row).await?;
             return Ok(());
         }
         if capture_trigger(&steps).is_none() {
@@ -193,6 +199,7 @@ where
             return Ok(());
         };
 
+        self.walks.cut(run.id);
         let row = self.capture_row(run, Some(model)).await?;
         self.move_step(
             run.id,
@@ -204,9 +211,14 @@ where
         .await?;
         self.step_started(run, row.id);
         let settled = match self.capture_turn(run, item, &steps, &row, model).await {
-            Ok(Ok(written)) => self.capture_done(run, item, &row, &written).await,
-            Ok(Err(reason)) => Err(reason),
-            Err(err) if passes_through(&err) => return Err(err),
+            Ok(Ok(written)) => self.capture_done(run, item, &row, &written).await.map(Ok),
+            Ok(Err(reason)) => Ok(Err(reason)),
+            Err(err) => Err(err),
+        };
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(err) if self.passes_through(run.id, &err) => return Err(err),
+            Err(EngineError::Cancelled { .. }) => Err(CAPTURE_CUT.to_owned()),
             Err(err) => Err(failure_text(CAPTURE_KEY, &err)),
         };
         if let Err(reason) = settled {
@@ -222,6 +234,29 @@ where
                 now,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    /// D11 step 1: a capture row a crash left `running` is interrupted, and one it left `pending`
+    /// (review M4) is moved `running` first and interrupted the same way; any other is settled.
+    async fn interrupt_leftover(&self, row: &RunStep) -> Result<(), EngineError> {
+        let now = self.now();
+        let running = match row.status {
+            StepStatus::Running => true,
+            StepStatus::Pending => {
+                self.parts
+                    .store
+                    .transition_step(row.id, StepStatus::Pending, StepStatus::Running, now)
+                    .await?
+            }
+            _ => false,
+        };
+        if running {
+            self.parts
+                .store
+                .interrupt_step(row.id, CAPTURE_INTERRUPTED, now)
+                .await?;
         }
         Ok(())
     }
@@ -253,20 +288,17 @@ where
     }
 
     /// D11 step 6's success: the row `running -> done` and the item note of what was written.
+    /// The move's engine error is returned whole, for [`Self::capture`] to sort (review L5).
     async fn capture_done(
         &self,
         run: &Run,
         item: ItemId,
         row: &RunStep,
         written: &Written,
-    ) -> Result<(), String> {
+    ) -> Result<(), EngineError> {
         let now = self.now();
-        let done = self
-            .move_step(run.id, row.id, StepStatus::Running, StepStatus::Done, now)
-            .await;
-        if let Err(err) = done {
-            return Err(err.to_string());
-        }
+        self.move_step(run.id, row.id, StepStatus::Running, StepStatus::Done, now)
+            .await?;
         // The row is settled: a note that cannot be written is warned, not a second settle.
         if let Err(err) = self.note(item, written.note(), Some(row.id), now).await {
             tracing::warn!(run = %run.id, step = %row.id, %err, "the capture's item note was not written");
@@ -317,12 +349,9 @@ where
             false,
             &mut recorder,
         ));
-        // The run end is not a flight of the walk's scheduler, which is what copies a run cancel
-        // into the walk's control: the capture forwards it itself while its session runs.
-        let driven = match select(driving, Box::pin(self.forward_run_cancel(run.id))).await {
-            Either::Left((driven, _)) => driven,
-            Either::Right((never, _)) => match never {},
-        };
+        // MOD-164 F1 (review H1): the session drives on the run's own control (`drive_once` reads
+        // the capture row), so neither the walk's cut nor its forwarding is needed here.
+        let driven = driving.await;
         let finished = recorder.finish().await;
         let driven = driven?;
         let breach = finished?.cap_breach;
@@ -352,16 +381,6 @@ where
         };
         let commit = self.newest_commit(steps).await?;
         Ok(Ok(self.write_entries(row, output, commit).await?))
-    }
-
-    /// Copies a cancel on `run`'s own control into its open walk's, now and on every change, for
-    /// as long as it is polled. Never ends.
-    async fn forward_run_cancel(&self, run: RunId) -> core::convert::Infallible {
-        let mut own = (self.parts.control)(run);
-        loop {
-            self.walks.forward(run, &own);
-            own.changed().await;
-        }
     }
 
     /// The latest `command_run.output` of every step the trigger reads (D9's rows), for the
@@ -446,5 +465,73 @@ where
             }
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        CAPTURE_KEY, CAPTURE_POSITION, NewRunStep, SnapshotCandidate, SnapshotCapture, StepId,
+        StepRole, StepStatus,
+    };
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::super::{Engine, SessionKey};
+    use super::CAPTURE_INTERRUPTED;
+    use crate::fake::FakeOrchestrator;
+
+    /// Review M4: a capture row a crash left `pending` is settled as a `running` one is:
+    /// interrupted with [`CAPTURE_INTERRUPTED`], never run, and no second row is made.
+    #[tokio::test]
+    async fn a_pending_capture_row_a_crash_left_is_interrupted() {
+        let orch = FakeOrchestrator::demo();
+        let row = orch
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: ids::RUN_2,
+                position: CAPTURE_POSITION,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: CAPTURE_KEY.to_owned(),
+                agent_id: None,
+                model: None,
+                role: StepRole::Stage,
+                parent_step_id: None,
+                node_key: Some(CAPTURE_KEY.to_owned()),
+            })
+            .await
+            .expect("the capture row lands");
+        assert_eq!(row.status, StepStatus::Pending);
+
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
+        let engine = Engine::new(
+            super::super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let run = engine.run(ids::RUN_2).await.expect("the seeded run reads");
+        engine
+            .capture(&run, &SnapshotCapture { model: None })
+            .await
+            .expect("a leftover row is settled");
+
+        let steps = orch
+            .store
+            .run_steps(ids::RUN_2)
+            .await
+            .expect("MemStore never fails a read");
+        let rows: Vec<_> = steps
+            .iter()
+            .filter(|step| step.node_key.as_deref() == Some(CAPTURE_KEY))
+            .collect();
+        assert_eq!(rows.len(), 1, "never run again: {steps:?}");
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(rows[0].status, StepStatus::Failed, "{:?}", rows[0]);
+        assert_eq!(rows[0].gate_note.as_deref(), Some(CAPTURE_INTERRUPTED));
     }
 }

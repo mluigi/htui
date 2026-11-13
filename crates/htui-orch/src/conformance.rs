@@ -1065,6 +1065,8 @@ pub const CASES: &[&str] = &[
     "a_person_entry_on_the_subject_is_kept_and_noted",
     "a_crash_during_capture_interrupts_it_and_finishes_the_run",
     "an_older_snapshot_without_capture_never_captures",
+    "a_capture_after_a_walk_cut_still_finishes_the_run",
+    "a_sibling_ending_during_a_live_capture_leaves_it_be",
 ];
 
 /// Run one case by name.
@@ -1468,6 +1470,12 @@ fn capture_case<'a, H: CaseHarness>(
         ),
         "an_older_snapshot_without_capture_never_captures" => {
             Box::pin(an_older_snapshot_without_capture_never_captures(harness))
+        }
+        "a_capture_after_a_walk_cut_still_finishes_the_run" => {
+            Box::pin(a_capture_after_a_walk_cut_still_finishes_the_run(harness))
+        }
+        "a_sibling_ending_during_a_live_capture_leaves_it_be" => {
+            Box::pin(a_sibling_ending_during_a_live_capture_leaves_it_be(harness))
         }
         _ => return None,
     })
@@ -9304,6 +9312,171 @@ async fn an_older_snapshot_without_capture_never_captures<H: CaseHarness>(harnes
     let steps = steps_of(&orch, run).await;
     assert!(capture_rows(&steps).is_empty(), "{steps:?}");
     assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 F1: FEAT-3 on the diamond with `plan` and `implement` out of retries: `plan`'s
+/// session writes no output, and `implement`'s verify fails with [`FAILING_OUTPUT`] (`prd`'s
+/// passes). Either fails the run; a light model is set and the capture's answer cites the
+/// failing verify.
+async fn diamond_failing_both_branches<O: Orchestrate>(orch: &O) {
+    feat_3_graph(orch, DIAMOND, |phase| match phase.name.as_str() {
+        "plan" => phase.retry_limit = 0,
+        "implement" => {
+            phase.retry_limit = 0;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+        _ => {}
+    })
+    .await;
+    orch.script("plan", 1, ScriptedStep::done_without_output());
+    // `prd`'s verify (FEAT-3 seeds one) passes; `implement`'s is the next.
+    orch.verifier().script_report(FakeVerifier::pass());
+    let mut report = FakeVerifier::fail(1);
+    report.output = FAILING_OUTPUT.to_owned();
+    orch.verifier().script_report(report);
+    set_light_model(orch);
+    script_capture(orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+}
+
+/// Yields long enough for every live node future of a walk to run until it next waits.
+async fn settle_down() {
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// MOD-164 F1 (review H1): a capture under an already-cut walk still finishes the run. On the
+/// diamond, `plan`'s failing settle meets a store fault and raises, which cuts the walk while
+/// `implement` is suspended past its session. Woken with no output, `implement` fails the run,
+/// and its capture drives on the run's own control, not the cut walk's: the capture row settles,
+/// the run ends `failed`, and the cut `plan` row is cancelled.
+async fn a_capture_after_a_walk_cut_still_finishes_the_run<H: CaseHarness>(harness: &H) {
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    diamond_failing_both_branches(&orch).await;
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+    let (suspended, wake) = orch.suspend_after_done("implement", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(plan.live(1), suspended.notified()) },
+            "`plan` live and `implement` suspended",
+        )
+        .await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        let row = latest_row(&steps_of(&orch, run).await, 1)
+            .expect("`plan` runs")
+            .id;
+        orch.store().set_fault(MemFault::TransitionStep(row), true);
+        plan.release();
+        // `plan`'s failing settle raises on the fault, and the walk is cut.
+        settle_down().await;
+        orch.store().set_fault(MemFault::TransitionStep(row), false);
+        wake.notify_one();
+    };
+    let (outcome, ()) = within(
+        async {
+            tokio::join!(
+                orch.dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace: None,
+                }),
+                meddle
+            )
+        },
+        "the end",
+    )
+    .await;
+    let run = feat_3_run(&orch).await.expect("the run exists");
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("missing_output")),
+        "the run is finished: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            &outcome,
+            Ok(CommandOutcome::Started { rest, .. })
+                if rest.run == RunStatus::Failed && rest.position == Some(2)
+        ),
+        "the terminal rest wins over `plan`'s error: {outcome:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let capture = capture_row(&steps);
+    assert_eq!(capture.status, StepStatus::Done, "{capture:?}");
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Cancelled),
+        "the cut `plan` row is cancelled"
+    );
+}
+
+/// MOD-164 F1 (review H2): a live capture is the run's end. `implement`'s verify fails the run
+/// while `plan` is suspended past its session; the capture's session is held, and `plan`, woken,
+/// fails meanwhile. It neither interrupts the live capture nor finishes the run under it: the run
+/// stays `running` until the capture is released, which then settles `done` on its one row with
+/// its entry written, and the run is finished once, with `implement`'s failure.
+async fn a_sibling_ending_during_a_live_capture_leaves_it_be<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    diamond_failing_both_branches(&orch).await;
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    let capture = orch.hold_sessions(&[(htui_core::model::CAPTURE_KEY, 1)]);
+    let (suspended, wake) = orch.suspend_after_done("plan", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(implement.live(1), suspended.notified()) },
+            "`implement` live and `plan` suspended",
+        )
+        .await;
+        implement.release();
+        within(capture.live(1), "the capture session held").await;
+        wake.notify_one();
+        settle_down().await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        assert_eq!(
+            run_of(&orch, run).await.status,
+            RunStatus::Running,
+            "nothing finishes the run under its live capture"
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            capture_row(&steps).status,
+            StepStatus::Running,
+            "the live capture is not interrupted"
+        );
+        capture.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(2)),
+        "{rest:?}"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("verify_outcome: fail")),
+        "finished once, by `implement`"
+    );
+    let capture = capture_row(&steps_of(&orch, run).await);
+    assert_eq!(capture.status, StepStatus::Done, "{capture:?}");
+    assert_eq!(htui_memory(&orch).await.len(), 1);
+    assert!(
+        capture
+            .finished_at
+            .zip(row.finished_at)
+            .is_some_and(|(step, run)| step <= run),
+        "the run's finish is its last write"
+    );
 }
 
 // -- MOD-11 T8: the command queue's exposure and the R-MCP-4 denials (plan D16, D17) --------
@@ -17761,8 +17934,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            246,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 12: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            248,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 12 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -17857,7 +18030,8 @@ mod tests {
              (plan D8, D9, D11: no trigger, a capture with provenance, no light model, the switch \
              off, a failed capture, a failed run, a cancelled run, a cancel during the capture, \
              an uncited quote, a person's entry kept, a crash during the capture, and a \
-             pre-MOD-164 snapshot) 246"
+             pre-MOD-164 snapshot), and MOD-164 F1's two (a capture after a walk cut still \
+             finishing the run, and a sibling ending during a live capture leaving it be) 248"
         );
     }
 
