@@ -151,9 +151,9 @@ pub struct PartTip {
 }
 
 /// ANA-2 §4.6's four verbs plus four reads (milestone 4's two, `changed_paths`, MOD-9 D119, and
-/// `env_files`, MOD-89), milestone 5's two recovery verbs, and MOD-139 M3's pre-merge verb and
-/// post-check read; the four are named there verbatim (`docs/ANA-2.md:1769`), and all twelve sit
-/// behind plan D6's seam.
+/// `env_files`, MOD-89), milestone 5's two recovery verbs, MOD-139 M3's pre-merge verb and
+/// post-check read, and MOD-125 M3's `reacquire`; the four are named there verbatim
+/// (`docs/ANA-2.md:1769`), and all thirteen sit behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -317,4 +317,23 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// [`cleanup`](Isolator::cleanup) also releases them, but it removes trees, which would
     /// destroy what the process that adopts the run has to read.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()>;
+
+    /// MOD-125 M3 D5a: a stopped step resuming on its own row takes back the guards
+    /// [`prepare`](Isolator::prepare) took for `trees` — which `settle_stop`'s
+    /// [`release`](Isolator::release) gave up — and **never** resets, creates or labels anything:
+    /// the trees hold the step's work as the stop left it.
+    ///
+    /// Only `shared_serialized` holds a guard, so `local`, `worktree` and `copy` rows answer `Ok`
+    /// unread. A `shared_serialized` row is checked once its guard is held: its `HEAD` must be
+    /// its `base_ref` or descend from it, and no `htui/<s>` label of another step may lie on
+    /// `base_ref..HEAD`. Otherwise another walk moved the checkout while the step was stopped,
+    /// and the call refuses (`real::moved_while_stopped`) with every guard it took released, so
+    /// the step fails rather than work on someone else's tree. The guards are held to the step's
+    /// own [`capture`](Isolator::capture), as `prepare`'s are.
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()>;
 }
