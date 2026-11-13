@@ -6256,9 +6256,23 @@ where
                     .filter(|step| step.status == StepStatus::Pending),
             )
             .collect();
-        // The group's one prompt is the first `pending` member's, else the first member's: only
-        // a member with no session row (a `pending` one, or one stopped before its recorder
-        // opened) sends it.
+        // Only a member with no session row (a `pending` one, or one stopped before its recorder
+        // opened) sends the group's one prompt, which is the first such member's. A group whose
+        // every member reopens its session assembles none (MOD-125 M3 F1, review L6), so a
+        // prompt that can no longer be built fails none of them before a token.
+        let mut fresh = members
+            .iter()
+            .find(|step| step.status == StepStatus::Pending)
+            .copied();
+        if fresh.is_none() {
+            for step in members.iter().copied() {
+                let events = self.parts.store.step_events(step.id).await?;
+                if events.is_none_or(|events| events.is_empty()) {
+                    fresh = Some(step);
+                    break;
+                }
+            }
+        }
         let Some(first) = members
             .iter()
             .find(|step| step.status == StepStatus::Pending)
@@ -6289,12 +6303,17 @@ where
         // MOD-139 M2 D13: once for the group, as its one prompt is; a compete group's siblings
         // are live, and `fan_out > 1` exposes it anyway.
         let live = crate::divide::live_siblings(&steps, first.id);
-        let prompt = match self
-            .assemble_prompt(run, snapshot, first, phase, item, None, live, None)
-            .await?
-        {
-            Ok(prompt) => prompt,
-            Err(StageThree::MissingInput(missing)) => {
+        let assembled = match fresh {
+            Some(fresh) => Some(
+                self.assemble_prompt(run, snapshot, fresh, phase, item, None, live, None)
+                    .await?,
+            ),
+            None => None,
+        };
+        let prompt = match assembled {
+            None => None,
+            Some(Ok(prompt)) => Some(prompt),
+            Some(Err(StageThree::MissingInput(missing))) => {
                 return self
                     .fail_group_before_a_token(
                         run,
@@ -6308,7 +6327,7 @@ where
             }
             // MOD-4 plan D162 at `drive_group` (blueprint D195): no candidate is live yet, so the
             // whole group fails before a token and the item is blocked.
-            Err(StageThree::Refused(err)) => {
+            Some(Err(StageThree::Refused(err))) => {
                 let failure = RunFailure::PromptRefused {
                     phase: phase.name.clone(),
                     reason: err.to_string(),
@@ -6319,7 +6338,7 @@ where
                     .map(Some);
             }
             // MOD-26 I-4 at `drive_group`: the whole group fails before a token, the item blocked.
-            Err(StageThree::NoPersona(refusal)) => {
+            Some(Err(StageThree::NoPersona(refusal))) => {
                 let failure = RunFailure::PromptRefused {
                     phase: phase.name.clone(),
                     reason: refusal.to_string(),
@@ -6344,7 +6363,7 @@ where
             snapshot,
             phase,
             step,
-            prompt: &prompt,
+            prompt: prompt.as_ref(),
             base: &base,
             persona,
             reads_verdict: snapshot.reads_verdict(&phase.name),
@@ -6677,6 +6696,15 @@ where
             Vec::new()
         };
         let (rows, cwd, extra_dirs, started_at, start, opening) = if events.is_empty() {
+            // `drive_group` assembles the prompt whenever a member has no session row, and a
+            // log only grows, so this member's is there.
+            let prompt = prompt.ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "candidate {} has no session row, but its group assembled no prompt",
+                    step.id
+                ),
+            })?;
             // -- stage 2: prepare, from the group's base (plan D54(a)) ------------------------
             let prepared = self
                 .parts
@@ -8670,8 +8698,9 @@ where
     }
 
     /// MOD-10 D13 on the judge path (blueprint A-2): the run fails with the refusal, not the
-    /// selection. A crash's `pending` judge row (`existing`) is moved `pending -> running` and
-    /// settled by [`fail_hard`](Self::fail_hard) (`pending -> failed` is illegal); with no row, the
+    /// selection. A crash's `pending` judge row, or a `stopped` one (MOD-125 M3 D4) (`existing`),
+    /// is moved from its own status to `running` and settled by [`fail_hard`](Self::fail_hard)
+    /// (neither `pending -> failed` nor `stopped -> failed` is a move it makes); with no row, the
     /// run is failed and cleaned up directly, as `Route::GroupFailed`'s terminal arm does.
     async fn refuse_judge_secrets(
         &self,
@@ -10526,8 +10555,9 @@ struct CandidateStage<'s> {
     phase: &'s SnapshotPhase,
     /// The candidate, still `pending`, or `stopped` (MOD-125 M3 D4) as the group read it.
     step: &'s RunStep,
-    /// The group's one assembled prompt.
-    prompt: &'s AssembledPrompt,
+    /// The group's one assembled prompt; `None` when every member reopens its session (MOD-125
+    /// M3 F1), so none sends it.
+    prompt: Option<&'s AssembledPrompt>,
     /// The group's base per repo (plan D54(a)).
     base: &'s BTreeMap<RepoId, String>,
     /// MOD-26 D12: the phase's frozen persona.
@@ -14567,7 +14597,7 @@ mod tests {
                 snapshot: &snapshot,
                 phase,
                 step: &stale,
-                prompt: &prompt,
+                prompt: Some(&prompt),
                 base: &BTreeMap::new(),
                 persona: None,
                 reads_verdict: false,

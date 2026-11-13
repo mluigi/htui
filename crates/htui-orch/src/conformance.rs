@@ -1098,6 +1098,9 @@ pub const CASES: &[&str] = &[
     // MOD-125 M3 F1 (review L3): a stopped step beside a parked sibling resumes before the run
     // parks again.
     "a_stopped_step_beside_a_park_resumes_before_the_run_parks_again",
+    // MOD-125 M3 F1 (review L6): a group whose every member reopens its session assembles no
+    // prompt, so a prompt that can no longer be built fails none of them.
+    "a_group_of_reopened_members_assembles_no_prompt",
 ];
 
 /// Run one case by name.
@@ -17213,6 +17216,9 @@ fn resume_case<'a, H: CaseHarness>(
         "a_stopped_step_beside_a_park_resumes_before_the_run_parks_again" => {
             Box::pin(a_stopped_step_beside_a_park_resumes_before_the_run_parks_again(harness))
         }
+        "a_group_of_reopened_members_assembles_no_prompt" => {
+            Box::pin(a_group_of_reopened_members_assembles_no_prompt(harness))
+        }
         _ => return None,
     })
 }
@@ -18023,6 +18029,65 @@ async fn a_stopped_step_beside_a_park_resumes_before_the_run_parks_again<H: Case
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
 }
 
+/// MOD-125 M3 F1 (review L6): `research`'s three candidates are stopped after their sessions
+/// (each log holds its banner), and stage 3 would now refuse the phase's prompt. Every member
+/// reopens its own session, so the group assembles no prompt: none fails before a token, each
+/// resumes on its own row with no second prompt row, and the judge selects as ever.
+async fn a_group_of_reopened_members_assembles_no_prompt<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 0, "complete");
+    let stalls: Vec<Arc<Notify>> = (0..3)
+        .map(|index| orch.stall_after_done("research", 1, Some((index, 0)), false))
+        .collect();
+    let run = crash_on_all(&orch, ids::HTUI_ANA_2, &stalls).await;
+    settled_stopped(&orch, run).await;
+    let steps = steps_of(&orch, run).await;
+    let stopped: Vec<RunStep> = (0..3)
+        .map(|index| candidate(&steps, 0, 1, index).clone())
+        .collect();
+    for member in &stopped {
+        assert_eq!(member.status, StepStatus::Stopped, "{member:?}");
+        assert!(
+            promote::banner(&events_of(&orch, member.id).await).is_some(),
+            "each member's log holds its banner"
+        );
+    }
+    orch.refuse_prompt("research");
+
+    let resumed = orch.resume_stopped(run).await;
+
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "no member failed before a token: {resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Done, Some(true)),
+            (1, StepStatus::Superseded, Some(false)),
+            (2, StepStatus::Superseded, Some(false)),
+        ],
+        "the judge's pick selected over three reopened members"
+    );
+    for member in &stopped {
+        assert_eq!(candidate(&steps, 0, 1, member.fanout_index).id, member.id);
+        assert_eq!(
+            opening_of(&orch, run, member.id).await,
+            Some(htui_core::model::StepOpening::Resumed)
+        );
+        assert_eq!(
+            prompts_in(&events_of(&orch, member.id).await),
+            1,
+            "no second prompt row"
+        );
+    }
+}
+
 /// [`a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict`]'s shape: `ANA-2`'s `research`
 /// fanned out three ways with `agy` judging, the judge's walk dropped after call 1's `done` (both
 /// calls' documents written, each naming candidate 0), and the stop settled: the run is `stopped`
@@ -18121,8 +18186,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            248,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            249,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -18217,8 +18282,9 @@ mod tests {
              D9: a stopped step's saved session reopened, a failed resume's fallback, no caps, no \
              rows, no banner, the planner, the pre-merge, integrate, and a stopped run's cancel on \
              this box and on none), and MOD-125 M3 T4's three (plan D4, D9: a stopped part before \
-             its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run), and MOD-125 M3 F1's one (review L3: a \
-             stopped step beside a park resumed before the run parks again) 248"
+             its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run), and MOD-125 M3 F1's two (review L3: a \
+             stopped step beside a park resumed before the run parks again; review L6: a group of \
+             reopened members assembling no prompt) 249"
         );
     }
 
