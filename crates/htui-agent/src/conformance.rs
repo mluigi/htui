@@ -1430,11 +1430,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> StoreResult<Document> {
         self.inner
-            .close_out(item, resolution, summary, commits)
+            .close_out(item, resolution, names, summary, commits)
             .await
     }
     async fn add_note(&self, note: NewNote) -> StoreResult<Note> {

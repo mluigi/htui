@@ -84,6 +84,7 @@ use crate::store::traits::{
     forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
     loop_edge_runs_forward, workspace_graph_is_held,
 };
+use crate::store::traits::{close_out_names_no_link, close_out_needs_a_link};
 use crate::store::traits::{deadline_below_one, judge_model_without_agent};
 use crate::store::traits::{
     divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
@@ -439,6 +440,11 @@ pub const CASES: &[&str] = &[
     "implements_links_like_relates",
     "upstream_follows_parent",
     "new_kinds_never_gate_readiness",
+    // MOD-150 M2: close-out records or requires the link (plan D2, D3)
+    "close_out_duplicate_needs_or_records_its_canonical",
+    "close_out_superseded_needs_or_records_its_supersessor",
+    "close_out_names_only_for_duplicate_and_superseded",
+    "close_out_link_refusals_follow_the_law",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1364,6 +1370,18 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "implements_links_like_relates" => Box::pin(implements_links_like_relates(store)).await,
         "upstream_follows_parent" => Box::pin(upstream_follows_parent(store)).await,
         "new_kinds_never_gate_readiness" => Box::pin(new_kinds_never_gate_readiness(store)).await,
+        "close_out_duplicate_needs_or_records_its_canonical" => {
+            Box::pin(close_out_duplicate_needs_or_records_its_canonical(store)).await;
+        }
+        "close_out_superseded_needs_or_records_its_supersessor" => {
+            Box::pin(close_out_superseded_needs_or_records_its_supersessor(store)).await;
+        }
+        "close_out_names_only_for_duplicate_and_superseded" => {
+            Box::pin(close_out_names_only_for_duplicate_and_superseded(store)).await;
+        }
+        "close_out_link_refusals_follow_the_law" => {
+            Box::pin(close_out_link_refusals_follow_the_law(store)).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -2454,6 +2472,7 @@ async fn no_delete_path<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_ANA_2,
             Resolution::Withdrawn,
+            None,
             new_document(ids::HTUI_ANA_2, "summary", None),
             &[],
         )
@@ -15040,6 +15059,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_FEAT_3,
             Resolution::Withdrawn,
+            None,
             new_document(ids::HTUI_FEAT_3, "summary", None),
             &[],
         )
@@ -15092,6 +15112,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_FEAT_3,
             Resolution::Withdrawn,
+            None,
             new_document(ids::HTUI_FEAT_3, "summary", None),
             &[],
         )
@@ -15141,7 +15162,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
             "the summary must name the item being closed",
         ),
     ] {
-        let refused = store.close_out(item, resolution, summary, &[]).await;
+        let refused = store.close_out(item, resolution, None, summary, &[]).await;
         assert!(
             matches!(refused, Err(StoreError::Constraint(_))),
             "{CASE}: {why}, got {refused:?}"
@@ -15151,6 +15172,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         .close_out(
             ItemId::new(),
             Resolution::Withdrawn,
+            None,
             new_document(ItemId::new(), "summary", None),
             &[],
         )
@@ -15174,6 +15196,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_FEAT_1,
             Resolution::Done,
+            None,
             new_document(ids::HTUI_FEAT_1, "summary", None),
             &commits,
         )
@@ -15409,7 +15432,13 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
                 continue;
             }
             let refused = store
-                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .close_out(
+                    item,
+                    resolution,
+                    None,
+                    new_document(item, "summary", None),
+                    &[],
+                )
                 .await;
             let StoreError::Constraint(sentence) = refused.expect_err(&format!(
                 "{CASE}: `{state}` does not close as `{resolution}`"
@@ -15453,6 +15482,7 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_ANA_2,
             Resolution::Done,
+            None,
             new_document(ids::HTUI_ANA_2, "summary", None),
             &[],
         )
@@ -15466,6 +15496,7 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_ANA_2,
             Resolution::Withdrawn,
+            None,
             new_document(ids::HTUI_ANA_2, "summary", None),
             &[],
         )
@@ -15487,7 +15518,13 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
         let before = item_row(CASE, store, item).await;
         for resolution in Resolution::ALL.iter().copied() {
             let refused = store
-                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .close_out(
+                    item,
+                    resolution,
+                    None,
+                    new_document(item, "summary", None),
+                    &[],
+                )
                 .await;
             assert!(
                 matches!(&refused, Err(StoreError::Constraint(sentence))
@@ -16005,7 +16042,13 @@ async fn close_out_law_reads_the_latest_graph_run<S: WriteStore>(store: &S) {
     let at = seam_clock();
     let close = |item: ItemId, resolution: Resolution| async move {
         store
-            .close_out(item, resolution, new_document(item, "summary", None), &[])
+            .close_out(
+                item,
+                resolution,
+                None,
+                new_document(item, "summary", None),
+                &[],
+            )
             .await
     };
     let refused_as = |result: Result<Document, StoreError>, item, state, resolution| {
@@ -16175,7 +16218,13 @@ async fn a_finished_snapshot_defaults_a_verdict_to_concluded<S: WriteStore>(stor
         "{CASE}: a verdict starts the picker on concluded"
     );
     store
-        .close_out(item, default, new_document(item, "summary", None), &[])
+        .close_out(
+            item,
+            default,
+            None,
+            new_document(item, "summary", None),
+            &[],
+        )
         .await
         .unwrap_or_else(|error| panic!("{CASE}: the default closes the item: {error}"));
     assert_eq!(
@@ -16242,6 +16291,7 @@ async fn item_state_is_derived_from_the_latest_graph_run<S: WriteStore>(store: &
         .close_out(
             closed,
             Resolution::Withdrawn,
+            None,
             new_document(closed, "summary", None),
             &[],
         )
@@ -16336,6 +16386,7 @@ async fn transition_never_touches_closed_at<S: WriteStore>(store: &S) {
         .close_out(
             item,
             Resolution::Withdrawn,
+            None,
             new_document(item, "summary", None),
             &[],
         )
@@ -17264,6 +17315,7 @@ async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
         .close_out(
             ids::HTUI_ANA_2,
             Resolution::Withdrawn,
+            None,
             new_document(ids::HTUI_ANA_2, "summary", None),
             &[],
         )
@@ -33642,6 +33694,523 @@ async fn new_kinds_never_gate_readiness<S: WriteStore>(store: &S) {
         ready().await,
         [ids::HTUI_ANA_2, ids::AGY_FIX_1],
         "{CASE}: control: a blocked_by to the running FEAT-1 gates AGY FEAT-1"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-150 M2: close-out records or requires the link (plan D2, D3). A `duplicate` close-out
+// needs a live `duplicates` link from the item or names its canonical, a `superseded` one a live
+// `supersedes` link to it or names its supersessor; a named link is a person's (no proposer).
+// ------------------------------------------------------------------------------------------
+
+/// MOD-150 M2: [`WriteStore::close_out`] of `item` as `resolution` naming `names`, with a fresh
+/// summary and no commits.
+async fn close_naming<S: WriteStore>(
+    store: &S,
+    item: ItemId,
+    resolution: Resolution,
+    names: Option<ItemId>,
+) -> Result<Document, StoreError> {
+    store
+        .close_out(
+            item,
+            resolution,
+            names,
+            new_document(item, "summary", None),
+            &[],
+        )
+        .await
+}
+
+/// MOD-150 M2: the close-out closes `item` as `resolution`.
+async fn closes_naming<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    resolution: Resolution,
+    names: Option<ItemId>,
+    what: &str,
+) {
+    close_naming(store, item, resolution, names)
+        .await
+        .unwrap_or_else(|error| panic!("{case}: {what} closes: {error:?}"));
+    let row = item_row(case, store, item).await;
+    assert_eq!(
+        (row.status, row.resolution),
+        (Status::Closed, Some(resolution)),
+        "{case}: {what}: the item is closed as `{resolution}`"
+    );
+}
+
+/// MOD-150 M2: the close-out is refused with exactly `outcome`, the item row and its documents
+/// untouched.
+async fn close_naming_refused<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    resolution: Resolution,
+    names: Option<ItemId>,
+    outcome: &StoreError,
+    what: &str,
+) {
+    let before = item_row(case, store, item).await;
+    let documents = store.documents(item).await.expect(case);
+    let refused = close_naming(store, item, resolution, names).await;
+    match (&refused, outcome) {
+        (Err(StoreError::Constraint(got)), StoreError::Constraint(want)) => assert_eq!(
+            got, want,
+            "{case}: {what}: the refusal is worded once for both stores"
+        ),
+        (
+            Err(StoreError::NotFound { entity, id }),
+            StoreError::NotFound {
+                entity: want_entity,
+                id: want_id,
+            },
+        ) => assert_eq!(
+            (entity, id),
+            (want_entity, want_id),
+            "{case}: {what}: NotFound names the missing row"
+        ),
+        _ => panic!("{case}: {what} is {outcome:?}, got {refused:?}"),
+    }
+    assert_eq!(
+        item_row(case, store, item).await,
+        before,
+        "{case}: {what}: the item row is unchanged"
+    );
+    assert_eq!(
+        store.documents(item).await.expect(case),
+        documents,
+        "{case}: {what}: and no summary was written"
+    );
+}
+
+/// MOD-150 M2: a step of a fresh run of `item`, the run cancelled at once: its step still
+/// proposes under the unleased fence, and no live run refuses `item`'s close-out.
+async fn spent_step<S: WriteStore>(case: &str, store: &S, item: ItemId) -> StepId {
+    let (run, step) = agent_step(case, store, ids::PROJECT_HTUI, item, None).await;
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(case);
+    step
+}
+
+/// MOD-150 M2: the proposer of the live `from --kind--> to`, read by proposing it again from
+/// `step`, a step of `from`'s own run: a live row keeps its proposer, so the answer is the
+/// stored one.
+async fn live_proposer<S: WriteStore>(
+    case: &str,
+    store: &S,
+    from: ItemId,
+    kind: LinkKind,
+    to: ItemId,
+    step: StepId,
+) -> Option<StepId> {
+    assert!(
+        live_link(case, store, from, to, kind).await,
+        "{case}: {from} {kind} {to} is live"
+    );
+    propose_unleased(store, from, kind, to, step)
+        .await
+        .expect(case)
+        .proposed_by_step_id
+}
+
+/// MOD-150 M2 D2, D3: a `duplicate` close-out with no live `duplicates` link and no name is
+/// refused; naming B records `item -duplicates-> B` with no proposer; an agent's live link
+/// closes it unnamed and keeps its proposer; naming C beside a live link to B is a second
+/// canonical, naming B again an idempotent upsert; and naming B over a tombstone revives it
+/// with no proposer.
+async fn close_out_duplicate_needs_or_records_its_canonical<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_duplicate_needs_or_records_its_canonical";
+    let (dup, kind) = (Resolution::Duplicate, LinkKind::Duplicates);
+    let b = feat(CASE, store, "canonical b").await;
+    let c = feat(CASE, store, "canonical c").await;
+
+    let lone = feat(CASE, store, "no link").await;
+    close_naming_refused(
+        CASE,
+        store,
+        lone,
+        dup,
+        None,
+        &StoreError::Constraint(close_out_needs_a_link(lone, dup)),
+        "an unnamed duplicate with no link",
+    )
+    .await;
+
+    let named = feat(CASE, store, "names b").await;
+    let step = spent_step(CASE, store, named).await;
+    closes_naming(CASE, store, named, dup, Some(b), "naming b").await;
+    assert_eq!(
+        live_proposer(CASE, store, named, kind, b, step).await,
+        None,
+        "{CASE}: the named link is a person's: no proposer"
+    );
+
+    let proposed = feat(CASE, store, "agent link to b").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, proposed, None).await;
+    propose_unleased(store, proposed, kind, b, step)
+        .await
+        .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    closes_naming(
+        CASE,
+        store,
+        proposed,
+        dup,
+        None,
+        "an unnamed duplicate with a live agent link",
+    )
+    .await;
+    assert_eq!(
+        live_proposer(CASE, store, proposed, kind, b, step).await,
+        Some(step),
+        "{CASE}: the agent's link keeps its proposer"
+    );
+
+    let held = feat(CASE, store, "holds b").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, held, None).await;
+    let first = propose_unleased(store, held, kind, b, step)
+        .await
+        .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    close_naming_refused(
+        CASE,
+        store,
+        held,
+        dup,
+        Some(c),
+        &StoreError::Constraint(second_canonical(held, b)),
+        "naming c beside a live link to b",
+    )
+    .await;
+    assert!(
+        !live_link(CASE, store, held, c, kind).await,
+        "{CASE}: the refused second canonical wrote no link"
+    );
+    closes_naming(
+        CASE,
+        store,
+        held,
+        dup,
+        Some(b),
+        "naming b again over its live link",
+    )
+    .await;
+    let again = propose_unleased(store, held, kind, b, step)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            again.proposed_by_step_id,
+            again.created_at,
+            again.deleted_at
+        ),
+        (Some(step), first.created_at, None),
+        "{CASE}: naming the live canonical is idempotent: the same row, its proposer kept"
+    );
+
+    let revived = feat(CASE, store, "tombstone to b").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, revived, None).await;
+    propose_unleased(store, revived, kind, b, step)
+        .await
+        .expect(CASE);
+    withdraw_unleased(CASE, store, revived, kind, b, step).await;
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    closes_naming(
+        CASE,
+        store,
+        revived,
+        dup,
+        Some(b),
+        "naming b over a tombstone",
+    )
+    .await;
+    assert_eq!(
+        live_proposer(CASE, store, revived, kind, b, step).await,
+        None,
+        "{CASE}: the tombstone revives as a person's link"
+    );
+}
+
+/// MOD-150 M2 D2, D3: [`close_out_duplicate_needs_or_records_its_canonical`]'s mirror for
+/// `named -supersedes-> item`. `supersedes` is multi-valued, so a live one from another item
+/// refuses no second name.
+async fn close_out_superseded_needs_or_records_its_supersessor<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_superseded_needs_or_records_its_supersessor";
+    let (sup, kind) = (Resolution::Superseded, LinkKind::Supersedes);
+    let b = feat(CASE, store, "supersessor b").await;
+    let c = feat(CASE, store, "supersessor c").await;
+    let (_, step_b) = agent_step(CASE, store, ids::PROJECT_HTUI, b, None).await;
+    let (_, step_c) = agent_step(CASE, store, ids::PROJECT_HTUI, c, None).await;
+
+    let lone = feat(CASE, store, "no link").await;
+    close_naming_refused(
+        CASE,
+        store,
+        lone,
+        sup,
+        None,
+        &StoreError::Constraint(close_out_needs_a_link(lone, sup)),
+        "an unnamed superseded with no link",
+    )
+    .await;
+    // Neither a tombstoned `supersedes` to the item nor a live one from it counts.
+    propose_unleased(store, b, kind, lone, step_b)
+        .await
+        .expect(CASE);
+    withdraw_unleased(CASE, store, b, kind, lone, step_b).await;
+    let step = spent_step(CASE, store, lone).await;
+    propose_unleased(store, lone, kind, c, step)
+        .await
+        .expect(CASE);
+    close_naming_refused(
+        CASE,
+        store,
+        lone,
+        sup,
+        None,
+        &StoreError::Constraint(close_out_needs_a_link(lone, sup)),
+        "an unnamed superseded with only a tombstone to it and a link from it",
+    )
+    .await;
+
+    let named = feat(CASE, store, "named by b").await;
+    closes_naming(CASE, store, named, sup, Some(b), "naming b").await;
+    assert_eq!(
+        live_proposer(CASE, store, b, kind, named, step_b).await,
+        None,
+        "{CASE}: the named link is a person's: no proposer"
+    );
+
+    let proposed = feat(CASE, store, "agent link from b").await;
+    propose_unleased(store, b, kind, proposed, step_b)
+        .await
+        .expect(CASE);
+    closes_naming(
+        CASE,
+        store,
+        proposed,
+        sup,
+        None,
+        "an unnamed superseded with a live agent link",
+    )
+    .await;
+    assert_eq!(
+        live_proposer(CASE, store, b, kind, proposed, step_b).await,
+        Some(step_b),
+        "{CASE}: the agent's link keeps its proposer"
+    );
+
+    let second = feat(CASE, store, "superseded twice").await;
+    propose_unleased(store, b, kind, second, step_b)
+        .await
+        .expect(CASE);
+    closes_naming(
+        CASE,
+        store,
+        second,
+        sup,
+        Some(c),
+        "naming c beside a live supersedes from b",
+    )
+    .await;
+    assert_eq!(
+        (
+            live_proposer(CASE, store, b, kind, second, step_b).await,
+            live_proposer(CASE, store, c, kind, second, step_c).await,
+        ),
+        (Some(step_b), None),
+        "{CASE}: both supersessors are live, each with its own proposer"
+    );
+
+    let held = feat(CASE, store, "held by b").await;
+    let first = propose_unleased(store, b, kind, held, step_b)
+        .await
+        .expect(CASE);
+    closes_naming(
+        CASE,
+        store,
+        held,
+        sup,
+        Some(b),
+        "naming b again over its live link",
+    )
+    .await;
+    let again = propose_unleased(store, b, kind, held, step_b)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            again.proposed_by_step_id,
+            again.created_at,
+            again.deleted_at
+        ),
+        (Some(step_b), first.created_at, None),
+        "{CASE}: naming the live supersessor is idempotent: the same row, its proposer kept"
+    );
+
+    let revived = feat(CASE, store, "tombstone from b").await;
+    propose_unleased(store, b, kind, revived, step_b)
+        .await
+        .expect(CASE);
+    withdraw_unleased(CASE, store, b, kind, revived, step_b).await;
+    closes_naming(
+        CASE,
+        store,
+        revived,
+        sup,
+        Some(b),
+        "naming b over a tombstone",
+    )
+    .await;
+    assert_eq!(
+        live_proposer(CASE, store, b, kind, revived, step_b).await,
+        None,
+        "{CASE}: the tombstone revives as a person's link"
+    );
+}
+
+/// MOD-150 M2 D2: only `duplicate` and `superseded` name an item; the named item is not the
+/// item itself, exists, and is within the reach of the item's project (`propose_link`'s, so
+/// a co-member project's item is reached). Every refusal writes nothing.
+async fn close_out_names_only_for_duplicate_and_superseded<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_names_only_for_duplicate_and_superseded";
+    let item = feat(CASE, store, "closing").await;
+    let b = feat(CASE, store, "b").await;
+    for resolution in [Resolution::Withdrawn, Resolution::Rejected] {
+        close_naming_refused(
+            CASE,
+            store,
+            item,
+            resolution,
+            Some(b),
+            &StoreError::Constraint(close_out_names_no_link(resolution)),
+            &format!("`{resolution}` naming b"),
+        )
+        .await;
+    }
+    let unknown = ItemId::new();
+    for resolution in [Resolution::Duplicate, Resolution::Superseded] {
+        close_naming_refused(
+            CASE,
+            store,
+            item,
+            resolution,
+            Some(item),
+            &StoreError::Constraint(self_link(item)),
+            &format!("`{resolution}` naming the item itself"),
+        )
+        .await;
+        close_naming_refused(
+            CASE,
+            store,
+            item,
+            resolution,
+            Some(unknown),
+            &StoreError::NotFound {
+                entity: "item",
+                id: unknown.to_string(),
+            },
+            &format!("`{resolution}` naming an unknown item"),
+        )
+        .await;
+        close_naming_refused(
+            CASE,
+            store,
+            item,
+            resolution,
+            Some(ids::VULKAN_FEAT_1),
+            &StoreError::Constraint(link_outside_reach(ids::VULKAN_FEAT_1)),
+            &format!("`{resolution}` naming another workspace's item"),
+        )
+        .await;
+    }
+    assert!(
+        store.links(item, 1).await.expect(CASE).edges.is_empty(),
+        "{CASE}: no refusal wrote a link"
+    );
+
+    closes_naming(
+        CASE,
+        store,
+        item,
+        Resolution::Duplicate,
+        Some(ids::AGY_FEAT_1),
+        "naming a co-member project's item",
+    )
+    .await;
+    assert!(
+        live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Duplicates).await,
+        "{CASE}: the cross-project canonical is linked"
+    );
+}
+
+/// MOD-150 M2 D2: the link rule runs after `close_out`'s own guards: an unknown item is
+/// `NotFound`, a live run refuses first, and a closed item gets the close-out law's sentence,
+/// never a link refusal, whatever it names.
+async fn close_out_link_refusals_follow_the_law<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_link_refusals_follow_the_law";
+    let closed = ids::HTUI_FIX_1;
+    assert_eq!(
+        state_of(CASE, store, closed).await,
+        ItemState::Closed,
+        "{CASE}: fixture precondition"
+    );
+    for (resolution, names) in [
+        (Resolution::Duplicate, Some(ids::HTUI_ANA_2)),
+        (Resolution::Superseded, Some(ids::HTUI_ANA_2)),
+        (Resolution::Duplicate, None),
+        (Resolution::Withdrawn, Some(ids::HTUI_ANA_2)),
+        (Resolution::Duplicate, Some(closed)),
+        (Resolution::Superseded, Some(ids::VULKAN_FEAT_1)),
+    ] {
+        close_naming_refused(
+            CASE,
+            store,
+            closed,
+            resolution,
+            names,
+            &StoreError::Constraint(resolution_not_closable(
+                closed,
+                ItemState::Closed,
+                resolution,
+            )),
+            &format!("a closed item as `{resolution}` naming {names:?}"),
+        )
+        .await;
+    }
+
+    let live = close_naming(
+        store,
+        ids::HTUI_FEAT_3,
+        Resolution::Duplicate,
+        Some(ids::HTUI_FEAT_3),
+    )
+    .await;
+    assert!(
+        matches!(&live, Err(StoreError::Constraint(sentence))
+            if sentence.contains(&ids::RUN_2.to_string())),
+        "{CASE}: FEAT-3's live run refuses before the self link, got {live:?}"
+    );
+    let unknown = ItemId::new();
+    let missing = close_naming(store, unknown, Resolution::Withdrawn, Some(unknown)).await;
+    assert!(
+        matches!(&missing, Err(StoreError::NotFound { entity: "item", id })
+            if *id == unknown.to_string()),
+        "{CASE}: an unknown item is NotFound before its name is judged, got {missing:?}"
     );
 }
 

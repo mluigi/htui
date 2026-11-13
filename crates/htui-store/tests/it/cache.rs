@@ -3040,6 +3040,7 @@ async fn a_closed_item_mirrors_its_resolution() {
         .close_out(
             ids::AGY_FIX_1,
             Resolution::Withdrawn,
+            None,
             NewDocument {
                 id: DocumentId::new(),
                 item_id: ids::AGY_FIX_1,

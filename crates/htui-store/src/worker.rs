@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
+use htui_core::model::link::{ItemLink, LinkGraph, ProposeLink, WithdrawLink};
 use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
@@ -176,6 +176,9 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
         ReadStore::run_plans(self, run).await
+    }
+    async fn links(&self, id: ItemId, hops: u8) -> Result<LinkGraph> {
+        ReadStore::links(self, id, hops).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
@@ -391,10 +394,11 @@ impl htui_core::store::WorkerStore for PgStore {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        WriteStore::close_out(self, item, resolution, summary, commits).await
+        WriteStore::close_out(self, item, resolution, names, summary, commits).await
     }
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         WriteStore::add_note(self, note).await
@@ -700,6 +704,9 @@ impl htui_core::store::WorkerStore for Writer {
     async fn run_plans(&self, run: RunId) -> Result<Vec<htui_core::model::RunPlan>> {
         ReadStore::run_plans(self, run).await
     }
+    async fn links(&self, id: ItemId, hops: u8) -> Result<LinkGraph> {
+        ReadStore::links(self, id, hops).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -914,10 +921,11 @@ impl htui_core::store::WorkerStore for Writer {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        WriteStore::close_out(self, item, resolution, summary, commits).await
+        WriteStore::close_out(self, item, resolution, names, summary, commits).await
     }
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         WriteStore::add_note(self, note).await

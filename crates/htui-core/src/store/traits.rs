@@ -2178,10 +2178,23 @@ pub trait WriteStore: ReadStore {
     /// unknown repo, or when the summary
     /// duplicates a document id or names an unknown `created_by` / `produced_by_step_id`. Any
     /// refusal writes nothing: every one of these is decided before the first write.
+    ///
+    /// MOD-150 M2 (R-ENT-9): `names` is the item a `duplicate` close-out duplicates or the item
+    /// a `superseded` one is superseded by, and the close-out records that link as a person's
+    /// (`proposed_by_step_id` NULL): `item -duplicates-> named` or `named -supersedes-> item`.
+    /// A live row keeps its proposer; a tombstone revives with none. Without a name, `duplicate`
+    /// needs a live `duplicates` link from the item and `superseded` a live `supersedes` link to
+    /// it. This link rule runs after `closes_from` and before the commit steps, in the order:
+    /// a name on another resolution ([`close_out_names_no_link`]), the item itself
+    /// ([`self_link`]), an unknown named item (`NotFound { entity: "item" }`), one outside the
+    /// reach of the item's project ([`link_outside_reach`]), then a second live canonical
+    /// ([`second_canonical`]) or a missing link ([`close_out_needs_a_link`]). `supersedes` is
+    /// multi-valued: a live one from another item refuses nothing.
     async fn close_out(
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document>;
@@ -3949,6 +3962,32 @@ pub fn resolution_not_closable(item: ItemId, state: ItemState, resolution: Resol
     format!(
         "item {item} is `{}`; it cannot close as `{resolution}` (ANA-11 §4.2)",
         state.word()
+    )
+}
+
+/// MOD-150 M2 D5 (R-ENT-9): a `duplicate` or `superseded` close-out with no live link and no
+/// item named.
+#[must_use]
+pub fn close_out_needs_a_link(item: ItemId, resolution: Resolution) -> String {
+    if resolution == Resolution::Superseded {
+        format!(
+            "item {item} closes as `superseded` only with a live `supersedes` link to it or the \
+             item that supersedes it named (R-ENT-9)"
+        )
+    } else {
+        format!(
+            "item {item} closes as `{resolution}` only with a live `duplicates` link from it or \
+             the item it duplicates named (R-ENT-9)"
+        )
+    }
+}
+
+/// MOD-150 M2 D5 (R-ENT-9): a close-out names an item, but its resolution records no link.
+#[must_use]
+pub fn close_out_names_no_link(resolution: Resolution) -> String {
+    format!(
+        "close-out as `{resolution}` records no link; only `duplicate` and `superseded` name an \
+         item (R-ENT-9)"
     )
 }
 

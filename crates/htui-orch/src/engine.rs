@@ -2779,7 +2779,7 @@ where
         let written = self
             .parts
             .store
-            .close_out(item, resolution, summary, &[])
+            .close_out(item, resolution, None, summary, &[])
             .await?;
         Ok(CommandOutcome::ClosedOut {
             item,

@@ -9259,9 +9259,11 @@ impl WriteStore for PgStore {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
+        let _ = names;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let Some(status) = sqlx::query_scalar!(
