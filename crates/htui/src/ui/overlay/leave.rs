@@ -14,6 +14,8 @@
 //! Every answer resolves through [`Keys`] on [`views::LEAVE`], and the chips name the chords in
 //! force. Shaped like the quit question it replaced: a centred, modal box sized to its text.
 //! `register_all` registers it as `App::leave_overlay`.
+//!
+//! [`Keys`]: crate::keys::Keys
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{ItemState, Scope};

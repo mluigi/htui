@@ -14,6 +14,10 @@
 //! On the kit (MOD-115 M3), as `QueueSection`: one `kit::form` of read-only values, the focused
 //! row's help under it, an open editor on the row it edits. Every key a hint names is the key in
 //! force (MD-A); `e` edits, and `Enter` is no view default here (B7).
+//!
+//! [`LoggingControl`]: crate::logging::LoggingControl
+//! [`LoggingControl::state`]: crate::logging::LoggingControl::state
+//! [`logging::parse_filter`]: crate::logging::parse_filter
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};

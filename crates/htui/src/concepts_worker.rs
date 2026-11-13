@@ -168,7 +168,7 @@ impl core::fmt::Debug for KeySource {
 /// run or a log line says.
 #[derive(Debug, Clone)]
 pub enum Unresolved {
-    /// No override and no row: [`crate::concepts::NO_QDRANT_URL`].
+    /// No override and no row: `NO_QDRANT_URL`.
     NoUrl,
     /// No store published and no override: [`URL_OFFLINE`].
     Offline,
@@ -421,7 +421,7 @@ impl QdrantSource {
     }
 
     /// MOD-160 D5: whether a Qdrant URL resolves, as last read; never awaited. Unknown answers
-    /// `false` and starts a read. Older than [`OFFER_STALE_AFTER`], it answers the old value and
+    /// `false` and starts a read. Older than `OFFER_STALE_AFTER`, it answers the old value and
     /// starts at most one read.
     #[must_use]
     pub fn offered(&self) -> bool {

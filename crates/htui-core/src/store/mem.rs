@@ -182,7 +182,7 @@ pub enum MemFault {
     /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
     /// commit.
     AdmitPlan,
-    /// [`ReadStore::repos`] (MOD-125 M3 F1): a read a stopped step's resume makes beside its
+    /// [`WriteStore::repos`] (MOD-125 M3 F1): a read a stopped step's resume makes beside its
     /// trees, which must fail before any guard is retaken.
     Repos,
 }

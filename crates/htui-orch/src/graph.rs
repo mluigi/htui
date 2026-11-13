@@ -1641,7 +1641,7 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
     app_positive(app, key).and_then(|n| i32::try_from(n).ok())
 }
 
-/// MOD-141 M2 D4: [`RunBounds`] over `app`, each key under [`app_u32`]'s "positive or silent"
+/// MOD-141 M2 D4: [`RunBounds`] over `app`, each key under `app_u32`'s "positive or silent"
 /// rule; `runtime_changes` a known word or `ask`.
 #[must_use]
 pub fn run_bounds(app: &BTreeMap<String, Value>) -> RunBounds {

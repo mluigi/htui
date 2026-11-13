@@ -2123,7 +2123,7 @@ impl Isolator for GixIsolator {
     }
 
     /// MOD-125 M3 D5a: `prepare_in_place`'s guard for the `shared_serialized` rows, then
-    /// [`refuse_moved`](GixIsolator::refuse_moved) under it. Nothing is reset, created or
+    /// `refuse_moved` under it. Nothing is reset, created or
     /// labelled; `local`, `worktree` and `copy` rows are not read. A refusal or a failed read
     /// releases what the call took, as a refused `prepare` does: the step fails, and its trees'
     /// rows reach no `capture`.

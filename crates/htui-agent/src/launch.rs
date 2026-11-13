@@ -311,7 +311,7 @@ pub struct AgentSettings {
     /// editing it. Row data, never source (`R-AGT-5`): the seeds name the vendor's variables, and a
     /// row without the list strips nothing. [`SESSION_VAR`] is never stripped (MOD-91 D4).
     ///
-    /// Read leniently ([`names_or_none`]): `null` is the empty list and a bare string a one-name
+    /// Read leniently (`names_or_none`): `null` is the empty list and a bare string a one-name
     /// list, so a hand-edited value in either shape cannot fail the whole document, whose fallback
     /// to `default()` would strip nothing.
     #[serde(deserialize_with = "names_or_none")]
@@ -513,7 +513,7 @@ pub struct ResolvedLaunch {
     /// Environment for the child, fully substituted. Redacted by `Debug`.
     pub env: BTreeMap<String, String>,
     /// Names [`spawn`] removes from the child's inherited environment, after `.envs` (MOD-97 D5).
-    /// Set per session by [`strip_billing_env`], never by a probe, so a recorded launch carries
+    /// Set per session by `strip_billing_env`, never by a probe, so a recorded launch carries
     /// none and serialises without the key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_remove: Vec<String>,

@@ -95,7 +95,7 @@ impl Overlay for AbortConfirm {
 
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
-    /// A kit question (MOD-115 M4 E7, C7): the question in the box, [`HINT`] on its bottom
+    /// A kit question (MOD-115 M4 E7, C7): the question in the box, `HINT` on its bottom
     /// border.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let hint = ctx.keys().hint(views::ABORT_CONFIRM, HINT);

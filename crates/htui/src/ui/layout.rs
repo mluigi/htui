@@ -34,7 +34,7 @@ pub fn chrome(area: Rect) -> Chrome {
 }
 
 /// Splits a frame into header, the about panel when `about` is asked for and the frame has room
-/// for it (the header, the four panel rows and [`MIN_BODY_WITH_ABOUT`] body rows: 11 in all), and
+/// for it (the header, the four panel rows and `MIN_BODY_WITH_ABOUT` body rows: 11 in all), and
 /// body.
 #[must_use]
 pub fn chrome_with(area: Rect, about: bool) -> Chrome {

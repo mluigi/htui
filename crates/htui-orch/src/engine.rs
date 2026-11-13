@@ -1253,7 +1253,7 @@ pub enum Next {
     Error(String),
 }
 
-/// MOD-164 D11: the gate's terminal `finish_run` goes through [`Engine::end_run`].
+/// MOD-164 D11: the gate's terminal `finish_run` goes through `Engine::end_run`.
 impl<S, G, I, V, C, A, K> gate::RunEnd for Engine<'_, S, G, I, V, C, A, K>
 where
     S: htui_core::store::WorkerStore,
@@ -2950,7 +2950,7 @@ where
     /// everything terminal: no `finish_run`, no `cleanup_walk`, so the trees, the branch and the
     /// session banner stay and the item stays `in_progress` (M1 D2).
     ///
-    /// 1. [`Self::take_lease`]: the preempted walk released the lease (`walk_leased`'s error arm,
+    /// 1. `Self::take_lease`: the preempted walk released the lease (`walk_leased`'s error arm,
     ///    or [`Self::abandoned`]); a take also drops a dead walk's entry and guards (plan D140,
     ///    D210). A run that is not `running`/parked, runs on another box, or whose lease a live
     ///    stranger holds answers `Ok(false)` with nothing written.
@@ -3543,6 +3543,8 @@ where
     ///
     /// # Errors
     /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
+    ///
+    /// [`resumable`]: crate::status::resumable
     pub async fn unblock_case(&self, item: ItemId) -> Result<UnblockCase, EngineError> {
         let row = self.item(item).await?;
         let mut runs = Vec::new();
@@ -8945,7 +8947,7 @@ where
     /// settles the rows, so a store error that stranded a `pending`, `running` or
     /// `awaiting_approval` row under the terminal run (the walk's cut writes, or a recovery's) is
     /// retried by the same request a human already uses for the trees. Each such row moves to
-    /// `cancelled` with the cut's note ([`Self::cancel_unsettled`], best-effort), and then the
+    /// `cancelled` with the cut's note (`Self::cancel_unsettled`, best-effort), and then the
     /// trees are cleaned up as ever. A run a walk of this engine holds open is only cleaned up
     /// (deferred beside a live sibling, A4): its rows are the walk's.
     ///

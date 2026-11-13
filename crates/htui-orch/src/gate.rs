@@ -870,7 +870,7 @@ fn stop_note(
 }
 
 /// MOD-138 M2 D8: whether `step`'s park is the `asks_you` stop of an `ok` settle, read from the
-/// item's `notes`: [`asks_you_stop`] writes its stop note via the step before it parks, and no
+/// item's `notes`: `asks_you_stop` writes its stop note via the step before it parks, and no
 /// other park does. A failed settle parks at the node's own gate with no stop note, and a human's
 /// reject of that park is the ordinary one ([`crate::engine`]'s `rejection`), never a decline.
 #[must_use]
@@ -1110,14 +1110,14 @@ pub enum LoopOutcome {
 /// 1. **Target**: the phase whose key is `edge.to`, looked up by name and never by index. A key
 ///    the snapshot does not name, or a target with **no row** (it never ran: unreached or
 ///    skipped, blueprint A4), is [`LoopOutcome::NoTarget`], and the run fails `no_loop_target`.
-/// 2. **No progress** ([`no_progress`], plan D11), except on an `asks_you` edge (blueprint A5):
+/// 2. **No progress** (`no_progress`, plan D11), except on an `asks_you` edge (blueprint A5):
 ///    a human approves every turn of that one, so its budget alone bounds it.
 /// 3. **Budget**: [`crate::walk::loop_budget_left`], `edge.loop_limit` or else the target's
 ///    `retry_limit`. On a lifted v1 graph the lift's `loop_limit` *is* the target's `retry_limit`
 ///    (V4), so this is the review loop's budget.
 /// 4. **Region**: every node on a forward path from the target to the source, both included
 ///    ([`crate::walk::Graph::region`]), retired target first and source last (blueprint A6), each
-///    slot through [`retire_slot`]. A node off every such path keeps its rows (ANA-33 §7.3: rows
+///    slot through `retire_slot`. A node off every such path keeps its rows (ANA-33 §7.3: rows
 ///    win), so a side branch of a diamond is not re-run.
 ///
 /// **Retiring is status by status** (plan D5, fact-check F14b/F15): `pending`,

@@ -264,7 +264,7 @@ pub fn argv(
 /// keep working under all three (B4). Each flag takes one value, so both pairs are spaced, as probed;
 /// `""` is one argv element. Plugin agents and plugin MCP servers survived MOD-91's levers (its T1
 /// case 5); MOD-96 T1 re-checks them under `--setting-sources ""`. Changing this changes
-/// `isolation_args_are_the_probed_levers`, and [`HOOKS_OFF`]'s or [`SETTING_SOURCES`]'s check.
+/// `isolation_args_are_the_probed_levers`, and `HOOKS_OFF`'s or `SETTING_SOURCES`'s check.
 pub const ISOLATION_ARGS: [&str; 5] = [
     "--settings",
     r#"{"disableAllHooks":true}"#,

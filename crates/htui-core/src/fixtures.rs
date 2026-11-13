@@ -202,7 +202,7 @@ pub mod ids {
 
     demo_ids!(
         /// `project` `@platform`, workspace `Platform`'s scope row (MOD-147), in the scope rows'
-        /// own id block ([`super::SCOPE_BLOCK`]).
+        /// own id block (`SCOPE_BLOCK`).
         PROJECT_SCOPE_PLATFORM: ProjectId = (class::PROJECT, 200),
         /// `project` `@graphics`, workspace `Graphics`'s scope row (MOD-147).
         PROJECT_SCOPE_GRAPHICS: ProjectId = (class::PROJECT, 201),

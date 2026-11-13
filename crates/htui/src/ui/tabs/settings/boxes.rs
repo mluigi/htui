@@ -23,7 +23,7 @@
 //! a save and its reply (a scope change or a tab re-activation) is taken for that reply and closes
 //! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
 //! nothing was written and how to retry. For a probe spec save the early close also shows
-//! [`spec_saved`]'s notice and loses the typed text, as for `edit_box`; the real reply's notice then
+//! `spec_saved`'s notice and loses the typed text, as for `edit_box`; the real reply's notice then
 //! replaces it (`CHANGED_ELSEWHERE_CLOSED`, or the refusal's sentence), and nothing is written
 //! wrongly (MOD-51 F-11, blueprint R-1). The same race can also land a tags or quirks save's
 //! `BoxesStale` in the probe spec editor's branch (opened after the early close), refreshing the

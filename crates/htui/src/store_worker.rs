@@ -465,12 +465,12 @@ pub enum StoreRequest {
         /// The path exactly as typed (one line, never split).
         path: String,
     },
-    /// The project type registry in slug order (MOD-146 D8). Served in [`try_serve`] through the
+    /// The project type registry in slug order (MOD-146 D8). Served in `try_serve` through the
     /// writer: `project_type` is not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
     ProjectTypes,
     /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
-    /// most 2 000; `after: None` is the newest 2 000. Served in [`try_serve`] through
+    /// most 2 000; `after: None` is the newest 2 000. Served in `try_serve` through
     /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
     /// `Unreachable` from the read still drops an `Online` backend onto the mirror. Answered with
     /// [`StoreReply::WorkerLogs`].

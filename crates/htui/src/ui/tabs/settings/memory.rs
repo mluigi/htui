@@ -17,6 +17,10 @@
 //!
 //! Every hint and every sentence that names a key reads it from the stack in force, and every act
 //! resolves from [`Ctx::pressed`].
+//!
+//! [`MemoryPane`]: crate::ui::tabs::settings::memory::MemoryPane
+//! [`MemorySubject::new`]: htui_core::model::MemorySubject::new
+//! [`MemoryBody::new`]: htui_core::model::MemoryBody::new
 
 use core::cell::Cell;
 

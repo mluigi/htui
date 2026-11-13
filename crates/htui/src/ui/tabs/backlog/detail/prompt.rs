@@ -479,7 +479,7 @@ impl DetailTab for PromptTab {
         frame.render_widget(Paragraph::new(Text::from(window)), area);
     }
 
-    /// [`PROMPT_HINT`] once a preview names a template to cycle to (MOD-82: the keys left the
+    /// `PROMPT_HINT` once a preview names a template to cycle to (MOD-82: the keys left the
     /// picker row); nothing before, or with no template.
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         self.item?;

@@ -1339,7 +1339,7 @@ impl Isolator for FakeIsolator {
     }
 
     /// MOD-125 M3 D5a: logged and counted; a scripted refusal answers with the step holding
-    /// nothing. Otherwise a `shared_serialized` row retakes [`serial`](FakeIsolator::serial) as
+    /// nothing. Otherwise a `shared_serialized` row retakes `serial` as
     /// `prepare` does (its own guard dropped first, so a second call never waits on itself), held
     /// to the step's `capture`, and the step's tree window reopens. Nothing is minted or reset.
     fn reacquire<'a>(

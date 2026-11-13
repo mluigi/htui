@@ -1777,7 +1777,7 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) first for a row
     /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -4..-1 or off
-    /// [`STAGE_KEYS`](crate::model::STAGE_KEYS); a negative position on any other role; a NUL key),
+    /// [`STAGE_KEYS`]; a negative position on any other role; a NUL key),
     /// judged before any read and worded alike on every backend; then on an unknown run, agent or
     /// parent step (foreign key, like [`append_events`](WriteStore::append_events)), a duplicate
     /// id, or a repeat of `(run_id, position, attempt, fanout_index)`.
@@ -1958,7 +1958,7 @@ pub trait WriteStore: ReadStore {
     async fn record_branch(&self, fence: StepFence, step: StepId, branch: &Value) -> Result<bool>;
 
     /// MOD-139 D4: inserts one `run_plan` revision of `plan.run_id` at
-    /// [`PlanStatus::Proposed`](crate::model::PlanStatus::Proposed) with no `base_refs`, under
+    /// [`PlanStatus::Proposed`] with no `base_refs`, under
     /// `fence` (as [`write_step_document`](Self::write_step_document) writes under one), and answers
     /// the stored row, `created_at == updated_at`. Admission (the status move, `base_refs`, the part
     /// rows) is MOD-139 M2's one-transaction verb, not this one. MOD-140's `plan_submit` and M2's
@@ -1979,7 +1979,7 @@ pub trait WriteStore: ReadStore {
 
     /// MOD-139 M2 D9: admits one plan revision of `admission.run_id` in one transaction, under
     /// `fence` (fenced on the planner step): the plan moves to (or is inserted at)
-    /// [`PlanStatus::Admitted`](crate::model::PlanStatus::Admitted) with `admission.base_refs`,
+    /// [`PlanStatus::Admitted`] with `admission.base_refs`,
     /// every part row is inserted `pending`, and the planner moves `running -> done` with
     /// `finished_at = COALESCE(finished_at, admission.at)`. Answers the admitted row: a
     /// [`PlanToAdmit::New`] answers `created_at == updated_at`; a [`PlanToAdmit::Proposed`] keeps
@@ -2011,7 +2011,7 @@ pub trait WriteStore: ReadStore {
     async fn admit_plan(&self, fence: StepFence, admission: PlanAdmission) -> Result<RunPlan>;
 
     /// MOD-139 M2 D9, D11: moves every `proposed` and `admitted` plan of `planner_step` to
-    /// [`PlanStatus::Abandoned`](crate::model::PlanStatus::Abandoned) (`updated_at` moves), under
+    /// [`PlanStatus::Abandoned`] (`updated_at` moves), under
     /// `fence`, and answers how many moved; a second call answers `Ok(0)`.
     ///
     /// # Errors

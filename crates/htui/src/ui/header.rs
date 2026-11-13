@@ -17,7 +17,7 @@
 //! Without a flash, the row is filled in this order; each step takes what the earlier ones left:
 //!
 //! 1. the workspace name, then the **active tab chip**: the active chip is never dropped. When
-//!    both do not fit, the workspace is cut to [`WORKSPACE_FLOOR`] cells, then the active chip's
+//!    both do not fit, the workspace is cut to `WORKSPACE_FLOOR` cells, then the active chip's
 //!    label is cut with an ellipsis;
 //! 2. the right side's core: the waiting count, then the `? keys` chip. The core is kept ahead
 //!    of the inactive tab chips, so at 80 cells with five tabs the farthest chips give way;

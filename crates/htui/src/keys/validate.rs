@@ -388,7 +388,7 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
 /// Five passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
 /// context (MOD-57 M2 E9 (d)); a row that must keep a chord and has none (MOD-115 M2 D7's safety
-/// nets, [`must_keep`]); a printable chord on an `in_capture` action. `give_way` ran first, so a
+/// nets, `must_keep`); a printable chord on an `in_capture` action. `give_way` ran first, so a
 /// default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no collision;
 /// a focus chord shared with anything, and an `[editor] abort` entry on a global default, still
 /// are. A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may share

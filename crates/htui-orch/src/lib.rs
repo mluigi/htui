@@ -28,6 +28,8 @@
 //! regions over the snapshot's nodes and edges (plan D2). MOD-139 M2 adds [`divide`], divided
 //! fan-out's pure rules: names, base positions, the admission refusal, part widths and live
 //! siblings.
+//!
+//! [`walk`]: mod@walk
 #![warn(missing_docs)]
 
 pub mod closeout;

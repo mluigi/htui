@@ -237,7 +237,7 @@ impl WorkspaceNames {
 
     /// How a list names a graph a kind or item may use (MOD-138 D12, MOD-141 M3 M-1): a project
     /// graph by its bare name; a library graph as `name · library`; a workspace graph as
-    /// `name · workspace <word>` ([`word`](Self::word): its name, or its slug when the name is
+    /// `name · workspace <word>` (`word`: its name, or its slug when the name is
     /// another listed row's name or slug); and `name · workspace` for a workspace no read found.
     /// A shared graph so never reads as one of the project's own, and two read workspaces'
     /// same-named graphs never read alike.

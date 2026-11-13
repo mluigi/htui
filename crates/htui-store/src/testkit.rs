@@ -294,7 +294,7 @@ pub async fn bare_db() -> Option<TestDb> {
 
 /// A fresh, migrated, empty database - or `None` when [`ENV_URL`] is unset.
 ///
-/// A copy of the [`template`] database, so the migrations run once per process and migration set
+/// A copy of the `template` database, so the migrations run once per process and migration set
 /// rather than once per test (TOOL-16). The connect over the copy seeds and registers, as
 /// [`PgStore::apply_migrations`]'s bootstrap would have, so the store and the rows are what
 /// migrating a bare database gives. The one visible difference: [`TestDb::migrations_at_connect`]

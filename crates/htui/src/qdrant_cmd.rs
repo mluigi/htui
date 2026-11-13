@@ -105,7 +105,7 @@ pub fn clear_key() -> Result<String, StateExit> {
 }
 
 /// [`set_url`]'s core over a connected store: D2, then the row's token, then
-/// [`set_url_expecting`] with it. `env_url` is `HTUI_QDRANT_URL` as the caller read it (a test's
+/// `set_url_expecting` with it. `env_url` is `HTUI_QDRANT_URL` as the caller read it (a test's
 /// literal, never the process's: blueprint P-13). Answers the line to print.
 ///
 /// # Errors
@@ -128,7 +128,7 @@ pub async fn set_url_on(
     })
 }
 
-/// [`clear_url`]'s core over a connected store: the row's token, then [`clear_url_expecting`].
+/// [`clear_url`]'s core over a connected store: the row's token, then `clear_url_expecting`.
 /// No row is [`NOTHING_TO_CLEAR`], not a failure. A malformed row is cleared like any other
 /// (blueprint P-3). Answers the line to print.
 ///

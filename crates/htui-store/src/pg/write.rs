@@ -7698,7 +7698,7 @@ impl WriteStore for PgStore {
     /// (primary key) or a repeated `(run_id, position, attempt, fanout_index)` — the table's own
     /// `UNIQUE`, which is why this writer has no guard of its own. A parent that is no step of the
     /// run (`(run_id, parent_step_id)`'s key, MOD-139 M1 F1) is refused in `MemStore`'s sentence
-    /// through [`parent_fk_refused`]. [`run_step_refusal`] first,
+    /// through `parent_fk_refused`. [`run_step_refusal`] first,
     /// before any statement (MOD-139 blueprint P-7), so both stores refuse a part without its
     /// parent or key, a step that names itself as its parent (MOD-139 M1 R1; 0029's self-parent
     /// CHECK is the database's backstop), or a stage off its reserved positions, in one sentence.
@@ -9195,7 +9195,7 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// Plan M2 D7: the run's terminal move, one transaction ([`finish_run_on`]).
+    /// Plan M2 D7: the run's terminal move, one transaction (`finish_run_on`).
     ///
     /// [`promote_step`](WriteStore::promote_step) is the template: the run is taken `FOR UPDATE`
     /// and every refusal is decided under the lock and before the `UPDATE`. The item is not
@@ -10789,7 +10789,7 @@ impl WriteStore for PgStore {
     // -- MOD-163 M1: project memory entries (plan D3-D6; blueprint T3.4)
 
     /// One statement (row and revision 1) on its own connection, so a refusal needs no
-    /// rollback before [`memory_write_refused`] reads the subject's holder.
+    /// rollback before `memory_write_refused` reads the subject's holder.
     async fn create_memory_entry(
         &self,
         project: ProjectId,
@@ -10817,7 +10817,7 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// [`memory_cas_head`]'s three decisions, then one statement that keeps the state, re-stamps
+    /// `memory_cas_head`'s three decisions, then one statement that keeps the state, re-stamps
     /// `confirmed_at` and writes the `amended` revision (plan D3, D6).
     async fn amend_memory_entry(
         &self,
@@ -10840,7 +10840,7 @@ impl WriteStore for PgStore {
         revise_memory_entry(&self.pool, id, expected_version, edit, subject).await
     }
 
-    /// [`memory_cas_head`]'s three decisions, then `active | suspect → retired` with its revision;
+    /// `memory_cas_head`'s three decisions, then `active | suspect → retired` with its revision;
     /// `confirmed_at` stays (plan D3, D6).
     async fn retire_memory_entry(
         &self,
@@ -10863,7 +10863,7 @@ impl WriteStore for PgStore {
         revise_memory_entry(&self.pool, id, expected_version, edit, None).await
     }
 
-    /// One transaction (plan D6, blueprint P-2): [`memory_cas_head`] on the old entry, then the
+    /// One transaction (plan D6, blueprint P-2): `memory_cas_head` on the old entry, then the
     /// old entry moves to `superseded` naming `new.id` (freeing its subject), then the new entry
     /// is inserted in the old one's project. `superseded_by`'s FK is deferred to `COMMIT`, where
     /// it holds. Any refusal rolls both halves back.
@@ -10929,16 +10929,16 @@ impl WriteStore for PgStore {
         })
     }
 
-    /// One transaction (MOD-164 D4): the step `FOR NO KEY UPDATE`, then [`step_scope`] (`FOR
+    /// One transaction (MOD-164 D4): the step `FOR NO KEY UPDATE`, then `step_scope` (`FOR
     /// SHARE` on the step and its run), the capture-stage check, the evidence check, the cap, then
     /// the folded subject's live holder `FOR UPDATE`. The first lock serializes two writes on one
     /// step, so the cap's count cannot be read twice before either inserts (review L2); it is taken
     /// before `step_scope`, never as an upgrade after it: two transactions both holding `FOR
     /// SHARE` would deadlock upgrading. `FOR NO KEY UPDATE` leaves the step's `FOR KEY SHARE`
     /// (the foreign keys' lock) free. A holder [`run_memory_held_by_a_person`] answers
-    /// `PersonHolds`; any other is superseded by [`apply_memory_edit`] before the new entry is
+    /// `PersonHolds`; any other is superseded by `apply_memory_edit` before the new entry is
     /// inserted (`superseded_by`'s FK is deferred to `COMMIT`). Any refusal rolls back, then
-    /// [`memory_write_refused`] names it.
+    /// `memory_write_refused` names it.
     async fn write_run_memory(
         &self,
         fence: StepFence,

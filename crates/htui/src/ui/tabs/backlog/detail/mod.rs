@@ -398,7 +398,7 @@ impl DetailRegistry {
 
 /// What the list beside the detail is doing this frame (MOD-115 M4 RV, repair 2): the list's
 /// motion chooses an item only while the list takes it and draws an item to choose, so the
-/// detail's no-item and failed-read steps ([`no_item`], [`unavailable`]) read this beside
+/// detail's no-item and failed-read steps (`no_item`, `unavailable`) read this beside
 /// where the list is and which pane holds the focus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ListCue {
@@ -503,7 +503,7 @@ pub fn render(
 }
 
 /// The one line a sub-tab renders while a read is in flight (plan D11): `Loading links…`. An
-/// empty pane or a failed read is not one: it is [`empty_state`] or [`unavailable`], with a next
+/// empty pane or a failed read is not one: it is `empty_state` or `unavailable`, with a next
 /// step (MOD-115 M4 RV2-M1).
 pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
     frame.render_widget(

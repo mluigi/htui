@@ -347,7 +347,7 @@ pub async fn index_loop(source: &impl IndexSource, vectors: &impl VectorStore) -
 /// `settings` (the override or the `qdrant_url` row, and the key); then the store, through `open`
 /// (in production the index's cached connection, so the model loads only once a URL resolves and
 /// a changed URL or key reconnects); then [`index_cycle`]. No URL is one `info` line and the
-/// interval; any other unresolved setting and a failed open are [`open_failure_level`]'s line and
+/// interval; any other unresolved setting and a failed open are `open_failure_level`'s line and
 /// the interval. Answers how long to sleep before the next cycle.
 ///
 /// `forget` keeps the cached connection honest, as a failed search does (MOD-158 R1, B-L1):

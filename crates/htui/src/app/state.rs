@@ -1598,7 +1598,7 @@ impl App {
     }
 
     /// Draws one frame: the one-row header, the about panel when it is up, the active tab, the
-    /// shell's activity pane ([`paint_panes`](Self::paint_panes)), the in-pane editor over it
+    /// shell's activity pane (`paint_panes`), the in-pane editor over it
     /// (MOD-57 P1), the hidden pane's note, then the overlays bottom-up and the help box on top.
     ///
     /// Every pane carries its own hints and is focused through [`Ctx::pane_focus`] (MOD-115 M4

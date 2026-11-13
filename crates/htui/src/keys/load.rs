@@ -1,7 +1,7 @@
 //! `keys.toml` to [`Keys`] (MOD-67 M2; ANA-26 §7.1, §7.4 steps 1-6, §7.5): find the file, parse
 //! it with spans, check names and chords strictly, merge it over the catalogue, and report every
 //! error with its line. The merge lets an entry take its chord from an action the file leaves at
-//! its default (MOD-12 M3 R1 H1, [`Resolved::notices`]); [`validate()`](super::validate) adds
+//! its default (MOD-12 M3 R1 H1, [`Resolved::notices`]); [`validate()`](super::validate()) adds
 //! the checks over the merged keys.
 
 use std::path::{Path, PathBuf};

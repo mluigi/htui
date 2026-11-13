@@ -25,10 +25,10 @@
 //!
 //! MOD-115 M2 (blueprint §1.5) adds the shell's and the text fields' layers. Layer order: view,
 //! **`field`**, **`choice`**, **`answer`**, then the order above, then **`layout`** and
-//! **`history`** right before the unfiltered global layer; an overlay's [`QUIT`] layer sits right
+//! **`history`** right before the unfiltered global layer; an overlay's `QUIT` layer sits right
 //! before its last `global ∩ {help}` layer. A capturing stack is one with a `field` layer
 //! ([`Stack::captures_text`]); no capturing stack has `layout` or `history` (B1), and
-//! [`MODAL`] admits neither pane key (B2). [`LEAVE`] is the leave dialog's.
+//! `MODAL` admits neither pane key (B2). [`LEAVE`] is the leave dialog's.
 
 use super::{Act, Context, Layer, Stack};
 
@@ -698,7 +698,7 @@ pub const MIGRATION: Stack<'static> = Stack::new(&[
 
 /// The abort question (MOD-57 M2 R1 M-2): `editor.abort` again aborts; every other key keeps the
 /// edit, so no other layer: not even `overlay.close` or `global.help` act there. MOD-115 M2 B4:
-/// but [`QUIT`], so `ctrl-c` opens the leave dialog from the question too (Task 6).
+/// but `QUIT`, so `ctrl-c` opens the leave dialog from the question too (Task 6).
 pub const ABORT_CONFIRM: Stack<'static> =
     Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort]), QUIT]);
 

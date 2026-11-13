@@ -3,8 +3,8 @@
 //! MOD-115 M4 E5: the tab draws its own kit panes. The switch is no line of its own any
 //! more: the pane that leads the shown view (the list while browsing, else what
 //! covers the content) carries `Skills` and `Templates` as chips on its top border, the
-//! active one naming the view ([`view_chips`]); a pane that holds the keyboard carries them
-//! only while its whole title fits beside them ([`view_chips_if_room`]). The pane that holds
+//! active one naming the view (`view_chips`); a pane that holds the keyboard carries them
+//! only while its whole title fits beside them (`view_chips_if_room`). The pane that holds
 //! the keyboard is the focused one ([`holder`], M4 C4), and the hints are drawn on it alone
 //! (Q2).
 //!

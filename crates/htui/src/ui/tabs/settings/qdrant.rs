@@ -18,6 +18,9 @@
 //! [`StoreRequest::ProbeQdrant`], a model-free look at the Qdrant this process uses, served off
 //! the store loop; a warning state draws one row in the theme's warning style, a Qdrant that
 //! answers without a key an info line. Offline and `--demo` ask nothing: the URL row says why.
+//!
+//! [`QdrantSnapshot`]: crate::qdrant_settings_info::QdrantSnapshot
+//! [`Redacted`]: crate::secrets_settings::Redacted
 
 use std::borrow::Cow;
 use std::cell::Cell;

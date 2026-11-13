@@ -1903,7 +1903,7 @@ pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateE
 /// itself is not on the range, so the previous step's own label never counts. A label on a
 /// merge's second parent does not count either: integrate's pre-merge takes each part tip in
 /// that way, labelled by its part, and a walk's capture labels its first-parent line. Nor does a
-/// `worktree` step's branch point that nothing moved ([`unmoved_branch_point`], MOD-125 M3 F1):
+/// `worktree` step's branch point that nothing moved (`unmoved_branch_point`, MOD-125 M3 F1):
 /// `worktree add -b` makes `htui/<W>` at the checkout's `HEAD` whoever's work that is. A `gix`
 /// read: the walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
 ///

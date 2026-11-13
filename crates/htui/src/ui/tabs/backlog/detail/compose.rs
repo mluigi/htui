@@ -257,7 +257,7 @@ impl Compose {
     /// The plan's maintainer answer to blueprint §6 Q1: whether this is a `v` form whose title and
     /// body, as the store would keep them, equal the version it opened. A note, an `a` form and
     /// `v` on a kind with no rows are never unchanged; a title or body the validator refuses is
-    /// not either (Ctrl+S says why). [`on_key`](Compose::on_key) asks it on `form.save` and
+    /// not either (Ctrl+S says why). [`on_pressed`](Compose::on_pressed) asks it on `form.save` and
     /// refuses with `NOTHING_TO_SAVE` through [`settle`](Compose::settle) (MOD-67 M5: moved here
     /// from the Docs pane).
     #[must_use]
@@ -629,7 +629,7 @@ impl Compose {
 ///
 /// MOD-115 M4 L-docs: the rule is `kit::rule`'s (C6), in the title role while the area has the
 /// keys, which is while the detail holds the keyboard (C4: a capturing sub-tab's pane) and nothing
-/// covers the tab; a document's rows are a kit form ([`Compose::form`]), the focus its gutter in
+/// covers the tab; a document's rows are a kit form (`Compose::form`), the focus its gutter in
 /// the tab's accent (`ctx.accent()`); the notice is the kit's notice row in the error role.
 ///
 /// `focus` is how the detail pane around the area is drawn this frame (`DetailTab::framing`,

@@ -772,7 +772,7 @@ pub enum InputNeed {
     /// (M3 R1) every producer upstream of it or incomparable with it is skipped.
     SkippedUpstream,
     /// MOD-138 M3 R1: optional because an incomparable producer has not finished while this node
-    /// already runs. The scheduler orders a node after such a producer ([`input_waits`]), so this
+    /// already runs. The scheduler orders a node after such a producer (`input_waits`), so this
     /// is a two-way pair's lower position, or the node a cycle of such waits was broken at.
     Concurrent,
 }
@@ -782,7 +782,7 @@ pub enum InputNeed {
 /// the skipped one.
 ///
 /// MOD-138 M3 R1 ("order by inputs"): a kind produced by a node incomparable with `phase` (see
-/// [`input_waits`]) is [`InputNeed::Concurrent`] while `phase` itself runs (its node holds a live
+/// `input_waits`) is [`InputNeed::Concurrent`] while `phase` itself runs (its node holds a live
 /// row) and such a producer has not finished; before `phase` runs, and once every such producer
 /// finished, it is required as ever, and this run's document is the one resolved. A skipped
 /// incomparable producer counts with the upstream ones of D11.

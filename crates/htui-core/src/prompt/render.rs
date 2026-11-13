@@ -662,7 +662,7 @@ pub fn persona(block: &PersonaBlock) -> Rendered {
 }
 
 /// MOD-163 D15: one `<entry kind="…" subject="…" source="…" trust="…">` block, the `<skill>`
-/// shape one level down: one LF each side of the body ([`content_of`]), `</entry>` closing. The
+/// shape one level down: one LF each side of the body (`content_of`), `</entry>` closing. The
 /// subject goes through [`attr`]; `<`/`>` stay (rule 4), so a body holding `</entry>` or
 /// `</section>` is inert. Ids and versions are never rendered.
 #[must_use]

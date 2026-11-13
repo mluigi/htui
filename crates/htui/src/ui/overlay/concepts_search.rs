@@ -630,7 +630,7 @@ pub fn index_report(report: &SyncReport) -> String {
     )
 }
 
-/// `error` with where it is fixed (MOD-115 M4 E6, MOD-83), [`place`]'s, unless it already names a
+/// `error` with where it is fixed (MOD-115 M4 E6, MOD-83), `place`'s, unless it already names a
 /// Settings place (`set one in Settings > Qdrant`) or no place fixes it.
 #[must_use]
 pub fn with_place(error: &str) -> String {
