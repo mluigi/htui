@@ -7,8 +7,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, NewDocument, Repo, RepoId, Resolution, RunId, RunStepCommit,
-    RunSummary, Status, StepId, UserId,
+    DocumentHead, DocumentId, Item, ItemId, LinkGraph, LinkKind, NewDocument, Repo, RepoId,
+    Resolution, RunId, RunStepCommit, RunSummary, Status, StepId, UserId,
 };
 
 /// `document.kind` of the close-out summary (ANA-2 §4.10).
@@ -35,12 +35,20 @@ pub struct Preview {
     pub rows: usize,
     /// The `summary` document's version once written: `max(existing) + 1`, or 1.
     pub version: i32,
+    /// MOD-150 M2 D7: the item's live `duplicates` canonical, labelled `KEY` in the item's
+    /// project and `slug:KEY` outside it; `None` without one.
+    pub duplicate_of: Option<String>,
+    /// MOD-150 M2 D7: the items with a live `supersedes` link to this one, labelled as
+    /// [`Self::duplicate_of`] is, sorted.
+    pub superseded_by: Vec<String>,
 }
 
 /// The first confirmation's figures, counted over exactly what [`summary`] would write.
 ///
 /// `version` reads only `heads` of this item whose kind is `summary`; `resolution` and `finished`
 /// are the caller's, carried through so the confirmation and the command name the same one.
+/// `links` is the item's one-hop link graph: its live `duplicates` edge from the item and its
+/// live `supersedes` edges to it are the standing close-out links (MOD-150 M2 D7).
 #[must_use]
 pub fn preview(
     item: &Item,
@@ -49,6 +57,7 @@ pub fn preview(
     runs: &[RunSummary],
     commits: &[(StepId, Vec<RunStepCommit>)],
     heads: &[DocumentHead],
+    links: &LinkGraph,
 ) -> Preview {
     let version = heads
         .iter()
@@ -65,7 +74,37 @@ pub fn preview(
         runs: runs.len(),
         rows: rows(runs, commits, &[]).len(),
         version,
+        duplicate_of: links
+            .edges
+            .iter()
+            .find(|edge| edge.kind == LinkKind::Duplicates && edge.from_item_id == item.id)
+            .map(|edge| label(item, links, edge.to_item_id)),
+        superseded_by: {
+            let mut by: Vec<String> = links
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == LinkKind::Supersedes && edge.to_item_id == item.id)
+                .map(|edge| label(item, links, edge.from_item_id))
+                .collect();
+            by.sort();
+            by
+        },
     }
+}
+
+/// MOD-150 M2 D7: how the preview names a linked item: `KEY` in `item`'s project, `slug:KEY`
+/// outside it, and the id when the traversal did not reach it.
+fn label(item: &Item, links: &LinkGraph, id: ItemId) -> String {
+    links.node(id).map_or_else(
+        || id.to_string(),
+        |node| {
+            if node.project_id == item.project_id {
+                node.key.clone()
+            } else {
+                format!("{}:{}", node.project_slug, node.key)
+            }
+        },
+    )
 }
 
 /// The close-out summary document (blueprint D208): `kind = "summary"`, `title = "Close-out
@@ -212,8 +251,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use htui_core::model::{
-        BoxId, ItemId, ItemKindId, ProjectId, RunKind, RunMode, RunStatus, RunStepSummary,
-        StepStatus,
+        BoxId, ItemKindId, LinkEdge, LinkNode, ProjectId, RunKind, RunMode, RunStatus,
+        RunStepSummary, StepStatus,
     };
     use uuid::Uuid;
 
@@ -601,7 +640,15 @@ mod tests {
         let repos = [repo(1, "htui"), repo(2, "docs")];
         let doc = write(&runs, &commits, &repos);
 
-        let first = preview(&item(), Resolution::Done, true, &runs, &commits, &[]);
+        let first = preview(
+            &item(),
+            Resolution::Done,
+            true,
+            &runs,
+            &commits,
+            &[],
+            &unlinked(),
+        );
         assert_eq!(
             first,
             Preview {
@@ -613,6 +660,8 @@ mod tests {
                 runs: 1,
                 rows: table_rows(&doc.body).len(),
                 version: 1,
+                duplicate_of: None,
+                superseded_by: Vec::new(),
             }
         );
         assert_eq!(first.rows, 2);
@@ -620,8 +669,114 @@ mod tests {
         // Another kind's versions are not the summary's.
         let heads = [head(1, "summary"), head(2, "summary"), head(7, "plan")];
         assert_eq!(
-            preview(&item(), Resolution::Done, true, &runs, &commits, &heads).version,
+            preview(
+                &item(),
+                Resolution::Done,
+                true,
+                &runs,
+                &commits,
+                &heads,
+                &unlinked()
+            )
+            .version,
             3
+        );
+    }
+
+    /// The item's own graph node, alone: no link stands.
+    fn unlinked() -> LinkGraph {
+        LinkGraph {
+            root: item().id,
+            nodes: vec![node(item().id, project(), "htui", "FEAT-1", 0)],
+            edges: Vec::new(),
+        }
+    }
+
+    fn node(item_id: ItemId, project_id: ProjectId, slug: &str, key: &str, depth: u8) -> LinkNode {
+        LinkNode {
+            item_id,
+            project_id,
+            project_slug: slug.to_owned(),
+            key: key.to_owned(),
+            title: format!("{key} title"),
+            status: Status::Open,
+            depth,
+            latest_run_status: None,
+        }
+    }
+
+    fn edge(from_item_id: ItemId, kind: LinkKind, to_item_id: ItemId) -> LinkEdge {
+        LinkEdge {
+            from_item_id,
+            to_item_id,
+            kind,
+        }
+    }
+
+    /// MOD-150 M2 D7: the preview carries the standing `duplicates` link from the item and every
+    /// `supersedes` link to it, sorted, as `KEY` in the item's project and `slug:KEY` outside it.
+    /// Other kinds, and links of the item's neighbours, are not the item's close-out links.
+    #[test]
+    fn the_preview_carries_the_standing_links() {
+        let me = item().id;
+        let other = ProjectId::from_uuid(Uuid::from_u128(0x11));
+        let canonical = ItemId::from_uuid(Uuid::from_u128(0x50));
+        let (late, early, relates) = (
+            ItemId::from_uuid(Uuid::from_u128(0x51)),
+            ItemId::from_uuid(Uuid::from_u128(0x52)),
+            ItemId::from_uuid(Uuid::from_u128(0x53)),
+        );
+        let graph = LinkGraph {
+            root: me,
+            nodes: vec![
+                node(me, project(), "htui", "FEAT-1", 0),
+                node(canonical, other, "agy", "FIX-3", 1),
+                node(late, project(), "htui", "TOOL-9", 1),
+                node(early, project(), "htui", "ANA-2", 1),
+                node(relates, project(), "htui", "FEAT-7", 1),
+            ],
+            edges: vec![
+                edge(me, LinkKind::Duplicates, canonical),
+                edge(late, LinkKind::Supersedes, me),
+                edge(early, LinkKind::Supersedes, me),
+                edge(me, LinkKind::Supersedes, relates),
+                edge(relates, LinkKind::Duplicates, me),
+                edge(me, LinkKind::Relates, relates),
+                edge(relates, LinkKind::Supersedes, canonical),
+            ],
+        };
+        let shown = preview(&item(), Resolution::Duplicate, false, &[], &[], &[], &graph);
+        assert_eq!(
+            (shown.duplicate_of.as_deref(), shown.superseded_by),
+            (
+                Some("agy:FIX-3"),
+                vec!["ANA-2".to_owned(), "TOOL-9".to_owned()]
+            ),
+            "the canonical outside the project is qualified; the supersessors sort"
+        );
+        assert_eq!(
+            preview(
+                &item(),
+                Resolution::Withdrawn,
+                false,
+                &[],
+                &[],
+                &[],
+                &unlinked()
+            ),
+            Preview {
+                key: "FEAT-1".to_owned(),
+                title: "Close me".to_owned(),
+                status: Status::Open,
+                finished: false,
+                resolution: Resolution::Withdrawn,
+                runs: 0,
+                rows: 0,
+                version: 1,
+                duplicate_of: None,
+                superseded_by: Vec::new(),
+            },
+            "no link stands"
         );
     }
 }

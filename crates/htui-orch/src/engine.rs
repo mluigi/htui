@@ -1355,9 +1355,11 @@ where
                 chat_live,
             } => Box::pin(self.accept_artifact(run, step, chat_live)).await,
             Command::Unblock { item } => Box::pin(self.unblock(item)).await,
-            Command::CloseOut { item, resolution } => {
-                Box::pin(self.close_out(item, resolution)).await
-            }
+            Command::CloseOut {
+                item,
+                resolution,
+                names,
+            } => Box::pin(self.close_out(item, resolution, names.as_deref())).await,
         }
     }
 
@@ -2759,13 +2761,32 @@ where
     /// run started since is refused there with nothing written. The commit rows already exist, so
     /// none are passed. The guard admits an open or blocked item; `default_for` reads the latest
     /// graph run (MOD-144); `resolution` is the one the Runs pane's picker sent.
+    ///
+    /// MOD-150 M2 D7: `names`, the key the person typed (`slug:KEY` accepted), is resolved in the
+    /// item's project after the guard, and its id handed to the store, which decides whether the
+    /// resolution records a link and refuses everything else (R-ENT-9). A key no item holds is
+    /// `Store(NotFound { entity: "item", id: <key> })`, with nothing written.
     async fn close_out(
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<&str>,
     ) -> Result<CommandOutcome, EngineError> {
         let reads = self.close_out_reads(item).await?;
         crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let names = match names {
+            None => None,
+            Some(key) => Some(
+                self.parts
+                    .store
+                    .item_by_key(reads.item.project_id, key)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "item",
+                        id: key.to_owned(),
+                    })?,
+            ),
+        };
         let repos = self.parts.store.repos(reads.item.project_id).await?;
         let summary = closeout::summary(
             &reads.item,
@@ -2779,7 +2800,7 @@ where
         let written = self
             .parts
             .store
-            .close_out(item, resolution, None, summary, &[])
+            .close_out(item, resolution, names, summary, &[])
             .await?;
         Ok(CommandOutcome::ClosedOut {
             item,
@@ -3566,7 +3587,8 @@ where
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
     /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from,
     /// carrying the resolution the guard answers, which the Runs pane's picker starts on (MOD-38
-    /// plan D6, MOD-39 plan P13).
+    /// plan D6, MOD-39 plan P13), and the item's standing `duplicates` and `supersedes` links read
+    /// from its one-hop link graph (MOD-150 M2 D7).
     ///
     /// # Errors
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
@@ -3574,6 +3596,7 @@ where
         let reads = self.close_out_reads(item).await?;
         let (resolution, finished) = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         let heads = self.parts.store.documents(item).await?;
+        let links = self.parts.store.links(item, 1).await?;
         Ok(closeout::preview(
             &reads.item,
             resolution,
@@ -3581,6 +3604,7 @@ where
             &reads.summaries,
             &reads.commits,
             &heads,
+            &links,
         ))
     }
 
@@ -11617,10 +11641,10 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, ItemState, NewRepo,
-        NewRunStep, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
-        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepRole,
-        StepStatus,
+        BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemLink, ItemPatch, ItemState,
+        LinkKind, NewRepo, NewRunStep, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution,
+        RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase,
+        StepId, StepRole, StepStatus,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -20163,6 +20187,199 @@ mod tests {
             (Status::Open, true, Resolution::Done, 2, 4, 1),
             "the seeded `RUN_2` and this one; one row per step, each committed to the primary; an \
              item whose latest graph run is `done` closes as `done` (MOD-38 plan D6, MOD-144)"
+        );
+        assert_eq!(
+            (preview.duplicate_of, preview.superseded_by),
+            (None, Vec::new()),
+            "`FEAT-3`'s `origin` and `relates` links are no close-out link (MOD-150 M2 D7)"
+        );
+    }
+
+    /// MOD-150 M2: a demo harness whose store also holds `links`, each `(from, kind, to,
+    /// tombstoned)`, under the harness's own clock.
+    async fn linked(
+        links: &[(
+            htui_core::model::ItemId,
+            LinkKind,
+            htui_core::model::ItemId,
+            bool,
+        )],
+    ) -> Harness {
+        let mut harness = Harness::new().await;
+        let mut data = htui_core::fixtures::demo_data();
+        data.links.extend(links.iter().zip(0_i64..).map(
+            |(&(from, kind, to, tombstoned), hour)| {
+                let created_at = htui_core::fixtures::demo_at(3, hour);
+                let deleted_at = tombstoned.then(|| htui_core::fixtures::demo_at(4, hour));
+                ItemLink {
+                    from_item_id: from,
+                    to_item_id: to,
+                    kind,
+                    proposed_by_step_id: None,
+                    created_at,
+                    updated_at: deleted_at.unwrap_or(created_at),
+                    deleted_at,
+                }
+            },
+        ));
+        harness.orch.store =
+            MemStore::from_demo(data).with_clock(std::sync::Arc::new(harness.orch.clock.clone()));
+        harness
+    }
+
+    /// MOD-150 M2 D7: the first confirmation names the item's live canonical, qualified when it
+    /// is another project's, and its live supersessors, sorted; a tombstone is no supersessor.
+    #[tokio::test]
+    async fn close_out_preview_names_the_standing_links() {
+        let harness = linked(&[
+            (
+                ids::HTUI_ANA_2,
+                LinkKind::Duplicates,
+                ids::AGY_FEAT_1,
+                false,
+            ),
+            (
+                ids::HTUI_TOOL_1,
+                LinkKind::Supersedes,
+                ids::HTUI_ANA_2,
+                false,
+            ),
+            (
+                ids::HTUI_CLEAN_1,
+                LinkKind::Supersedes,
+                ids::HTUI_ANA_2,
+                false,
+            ),
+            (
+                ids::HTUI_FEAT_1,
+                LinkKind::Supersedes,
+                ids::HTUI_ANA_2,
+                true,
+            ),
+        ])
+        .await;
+        harness_engine!(harness.orch, engine);
+        let preview = engine
+            .close_out_preview(ids::HTUI_ANA_2)
+            .await
+            .expect("an open item with no run");
+        assert_eq!(
+            (preview.duplicate_of.as_deref(), preview.superseded_by),
+            (
+                Some("agy:FEAT-1"),
+                vec!["CLEAN-1".to_owned(), "TOOL-1".to_owned()]
+            )
+        );
+    }
+
+    /// `item`'s live links of `kind` as `(from, to)`, read through the store.
+    async fn live_links(
+        harness: &Harness,
+        item: htui_core::model::ItemId,
+        kind: LinkKind,
+    ) -> Vec<(htui_core::model::ItemId, htui_core::model::ItemId)> {
+        harness
+            .orch
+            .store
+            .links(item, 1)
+            .await
+            .expect("MemStore never fails a read")
+            .edges
+            .into_iter()
+            .filter(|edge| edge.kind == kind)
+            .map(|edge| (edge.from_item_id, edge.to_item_id))
+            .collect()
+    }
+
+    /// MOD-150 M2 D7: `CloseOut`'s `names` is a key of the item's project, resolved by the engine
+    /// and recorded by the store as `item -duplicates-> named`.
+    #[tokio::test]
+    async fn close_out_records_the_named_key() {
+        let harness = Harness::new().await;
+        let outcome = harness
+            .dispatch(Command::CloseOut {
+                item: ids::HTUI_ANA_2,
+                resolution: Resolution::Duplicate,
+                names: Some("FEAT-1".to_owned()),
+            })
+            .await
+            .expect("`FEAT-1` is an item of `htui`");
+        assert!(
+            matches!(outcome, CommandOutcome::ClosedOut { item, .. } if item == ids::HTUI_ANA_2),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            live_links(&harness, ids::HTUI_ANA_2, LinkKind::Duplicates).await,
+            [(ids::HTUI_ANA_2, ids::HTUI_FEAT_1)]
+        );
+        let row = harness.orch.item(ids::HTUI_ANA_2).await;
+        assert_eq!(
+            (row.status, row.resolution),
+            (Status::Closed, Some(Resolution::Duplicate))
+        );
+    }
+
+    /// MOD-150 M2 D7: a qualified `slug:KEY` resolves in its own project, here a supersessor in
+    /// `agy`: `named -supersedes-> item`.
+    #[tokio::test]
+    async fn close_out_resolves_a_qualified_key() {
+        let harness = Harness::new().await;
+        harness
+            .dispatch(Command::CloseOut {
+                item: ids::HTUI_ANA_2,
+                resolution: Resolution::Superseded,
+                names: Some("agy:FIX-1".to_owned()),
+            })
+            .await
+            .expect("`agy` shares the `platform` workspace with `htui`");
+        assert_eq!(
+            live_links(&harness, ids::HTUI_ANA_2, LinkKind::Supersedes).await,
+            [(ids::AGY_FIX_1, ids::HTUI_ANA_2)]
+        );
+    }
+
+    /// MOD-150 M2 D7: a key no item holds, unqualified or under an unknown slug, is the store's
+    /// `NotFound` naming the key as typed, and nothing is written: no summary, no link, the item
+    /// still open.
+    #[tokio::test]
+    async fn close_out_refuses_an_unknown_key_and_writes_nothing() {
+        let harness = Harness::new().await;
+        for key in ["FEAT-99", "nowhere:FEAT-1"] {
+            let refused = harness
+                .dispatch(Command::CloseOut {
+                    item: ids::HTUI_ANA_2,
+                    resolution: Resolution::Duplicate,
+                    names: Some(key.to_owned()),
+                })
+                .await
+                .expect_err("no item holds the key");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Store(htui_core::store::StoreError::NotFound {
+                        entity: "item",
+                        id,
+                    }) if id == key
+                ),
+                "{key}: {refused}"
+            );
+        }
+        let row = harness.orch.item(ids::HTUI_ANA_2).await;
+        assert_eq!((row.status, row.resolution), (Status::Open, None));
+        assert!(
+            harness
+                .orch
+                .store
+                .documents(ids::HTUI_ANA_2)
+                .await
+                .expect("MemStore never fails a read")
+                .iter()
+                .all(|head| head.kind != "summary")
+        );
+        assert!(
+            live_links(&harness, ids::HTUI_ANA_2, LinkKind::Duplicates)
+                .await
+                .is_empty()
         );
     }
 

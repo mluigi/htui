@@ -1213,6 +1213,7 @@ fn close_out_key(
                 ctx.request(command(Command::CloseOut {
                     item,
                     resolution: preview.resolution,
+                    names: None,
                 }));
                 (CloseOutStage::InFlight, Handled::Consumed)
             }
@@ -4109,6 +4110,8 @@ mod tests {
             runs: 1,
             rows: 3,
             version: 2,
+            duplicate_of: None,
+            superseded_by: Vec::new(),
         }
     }
 
@@ -4220,6 +4223,7 @@ mod tests {
             [&Command::CloseOut {
                 item: ids::HTUI_FEAT_1,
                 resolution: Resolution::Withdrawn,
+                names: None,
             }]
         );
     }
@@ -4422,6 +4426,7 @@ mod tests {
             [&Command::CloseOut {
                 item: ids::HTUI_FEAT_1,
                 resolution: Resolution::Rejected,
+                names: None,
             }]
         );
     }
@@ -4482,6 +4487,7 @@ mod tests {
             [&Command::CloseOut {
                 item: ids::HTUI_FEAT_1,
                 resolution: Resolution::Done,
+                names: None,
             }]
         );
         for swallowed in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {

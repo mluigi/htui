@@ -2657,6 +2657,7 @@ pub(crate) mod tests {
             Command::CloseOut {
                 item: ids::HTUI_FEAT_2,
                 resolution: Resolution::Withdrawn,
+                names: None,
             },
         ] {
             let fixture = Fixture::new().await;
@@ -3208,6 +3209,7 @@ pub(crate) mod tests {
             OrchRequest::Command(Command::CloseOut {
                 item: ids::HTUI_ANA_2,
                 resolution: Resolution::Done,
+                names: None,
             }),
             OrchRequest::CloseOutPreview {
                 item: ids::HTUI_ANA_2,

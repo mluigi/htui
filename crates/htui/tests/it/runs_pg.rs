@@ -1079,6 +1079,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .command(Command::CloseOut {
             item,
             resolution: Resolution::Done,
+            names: None,
         })
         .await;
     let refused = stack.take_status().expect("the close-out was refused");
@@ -1177,6 +1178,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .command(Command::CloseOut {
             item,
             resolution: Resolution::Done,
+            names: None,
         })
         .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
@@ -1292,7 +1294,13 @@ async fn closes_open_ana_2_as(resolution: Resolution) {
         "the fixture holds no summary"
     );
 
-    stack.command(Command::CloseOut { item, resolution }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution,
+            names: None,
+        })
+        .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     assert_eq!(
         stack.summaries(item).await.len(),
