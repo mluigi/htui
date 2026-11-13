@@ -39,8 +39,11 @@ pub const BATCH_LINES: usize = 200;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(2);
 /// Plan D3: the longest pause between two failed flushes.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// Plan D3: the most lines the worker holds, buffered and in flight together.
-pub const BUFFER_CAP: usize = 5_000;
+/// Plan D3: the most lines the worker holds, buffered and in flight together. Raised from the
+/// plan's 5 000 by T2's measurement (10 000 `info` lines a second for 30 s): the sandbox Postgres
+/// stalled single flushes for up to 1.1 s, and at 5 000 one run dropped 22 600 of 300 000 lines;
+/// at 20 000 (about 3 MiB of short lines) nothing dropped, flush p95 4.3 ms, max 0.44 s.
+pub const BUFFER_CAP: usize = 20_000;
 /// Plan D9: the text of a line the scrubber refused.
 pub const WITHHELD: &str = "[line withheld: matched credential rule]";
 
