@@ -44,6 +44,13 @@ Overview: `.claude/skills/handoff-docs.md`.
   the `htui-dev` mod) and `htui/tests/panic_hook.rs` (it installs a process-wide panic hook that
   would see every parallel test's panics). A new test that sets process-wide state (`set_hook`,
   environment, cwd) gets its own top-level `tests/<name>.rs` target, or re-runs itself as a child.
+- Tests run in parallel (TOOL-16): the gate uses libtest's default threads, so a crate's tests share
+  one process and run side by side. A test of the live Qdrant holds `htui_store::testkit::qdrant_turn()`
+  for its whole body; a test that writes a script and executes it writes it with
+  `tests/rust/write_executable.rs` (included through `#[path]`), never `fs::write` plus `chmod`
+  (`ETXTBSY`). `testkit::fresh_db`/`demo_db` copy a template database, so `migrations_at_connect` is
+  `UpToDate`; a test about pending migrations starts from `bare_db`. Item runs:
+  `cargo test -p <crate> --all-features --test it <module>::` at default threads.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.

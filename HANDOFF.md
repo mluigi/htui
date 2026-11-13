@@ -16,7 +16,12 @@
 
 **Current status (2026-11-13):** phases landed on main with the item still open:
 MOD-147 M1 and M2 (M3, M4 open), MOD-162 M1, MOD-122 M1, MOD-125 M1; each item's note says what is next.
-**TOOL-15 is done** (`docs/decisions/tool/tool-15.md`; on branch `tool-15`, to merge): each crate's integration
+**TOOL-16 is done** (`docs/decisions/tool/tool-16.md`; on branch `tool-16`, which carries `tool-15`, to merge): the
+gate runs at default threads and takes about 8 min (was 30), red only on the three base failures. Postgres tests
+copy a template database; live Qdrant tests hold `testkit::qdrant_turn()`; a test that writes and execs a script
+uses `tests/rust/write_executable.rs`; `gate.sh --detach` no longer ignores SIGINT (the cancel/interrupt "load
+flakes" were that). If many Postgres cases fail `57P03`, the dev Postgres crashed: re-run. TOOL-17 (nextest) is next.
+**TOOL-15 is done** (`docs/decisions/tool/tool-15.md`): each crate's integration
 tests are modules of one `tests/it/main.rs` binary (exempt: `htui-agent/tests/extensibility.rs`,
 `htui/tests/panic_hook.rs`); run one file as `cargo test -p <crate> --all-features --test it <name>::`. Cold
 `--no-run` 598 s to 166 s, `target/` 28 to 11 GB, 147 to 21 test executables. A sandbox run on the old layout
@@ -25,13 +30,10 @@ that adds a new `tests/<name>.rs` must move it under `tests/it/` at collect.
 editor saves a graph of any scope through `ReplaceGraph`; `Settings > Kinds` opens it on project graphs, and
 `GraphEditorHost::open_by_id` is the entry point MOD-124 wires into the Toolbox. A workspace graph's label names its
 workspace (`flow · workspace Platform`), and a typed graph name that matches several graphs is refused, listing
-the qualified labels. **MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
-qualifier comes from one Postgres query a tick (`PgStore::waiting_keys`: the scope row and every scope project's
-slug and kind prefixes), where it was 2N+1 serial round trips; the mirror and memory still read per project, and
-the output is unchanged. MOD-139 (`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and
+the qualified labels. MOD-139 (`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and
 Postgres gate; its migration is `0029_divided_fanout` (MOD-97 took `0028`).
 MOD-143 waits on MOD-150 and MOD-133.
-Earlier completions, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
+Earlier completions, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -1241,24 +1243,6 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   CLEAN, NEXT, VAL as well as ANA and MOD), for open lines and write-ups alike. Backfill the write-ups
   that newly fall under it, or exempt items archived before 2026-10-15 if that list is long, and
   record which choice was made.
-- [ ] **TOOL-16 - A gate that fits in a session: template databases, parallel tests, shorter long poles**
-  (from TOOL-15). The TOOL-15 gate took 30 min, 29 of them the test step at `--test-threads=1` (1732 s:
-  htui-store `it` 928 s, htui `it` 376 s). Branch `tool-16`. **Landed (`c9108fb1`, `14025c0a`, `399f356c`):**
-  `testkit::fresh_db`/`demo_db` copy a per-migration-set template database (`htui_tmpl_<hash>`, migrated and
-  target raised, built once per server under an advisory lock) instead of migrating per test;
-  `testkit::qdrant_turn` serialises the live Qdrant cases of one binary (they time out creating collections
-  in parallel); `pg_store_conformance` dealt across four tests; both gate twins drop `--test-threads=1`;
-  `box_probe` scripts written by a `sh` child (`ETXTBSY`). htui-store `it` at default threads 1022 s to
-  169 s; the workspace `cargo test` at default threads 532 s with the build; the gate 30 min to 7.5 min
-  (test step 1732 s to 414-457 s); the gate on `1dd0d52f` is red only on the three base failures. **Landed after:** `tests/rust/write_executable.rs` (a `sh` child writes the
-  fixture executable) for the six files that wrote and exec'd without an `ETXTBSY` retry; `gate.sh --detach`
-  launches through `env --default-signal`: before, the detached gate ignored SIGINT, and `cli_driver::a_cancel_drains…` and
-  `launch::an_interrupt_lets…` failed in every detached gate (TOOL-15's "load flakes"). **Open:** the dev
-  Postgres's load-related crash
-  (a backend `exited with exit code 2`, every case after it `57P03`) hit the first default-thread gate and
-  needs a cause or a guard; mold or `split-debuginfo` measured on a warm rebuild; a change-scoped gate
-  (design to the maintainer first: it changes what a green means); the `migrations::` long poles. Not
-  blocked.
 - [ ] **TOOL-17 - cargo-nextest as the gate's test runner** (from TOOL-16). `cargo test` runs the test
   binaries one after another (default threads, TOOL-16: htui unit 95 s, htui `it` 87 s, htui-store `it`
   221 s, about 440 s summed); nextest runs every test of every binary in one pool, one process per test.
@@ -1278,4 +1262,4 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
 | MOD-N   | 80 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
-| TOOL-N  | 4 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-16 gate in a session, TOOL-17 cargo-nextest) |
+| TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-17 cargo-nextest) |
