@@ -3825,15 +3825,6 @@ pub fn workspace_gone() -> String {
     "this workspace no longer exists: switch workspace".to_owned()
 }
 
-/// MOD-125 M2 R1 (review M-1): a cancel of a `stopped` run, in the runtime's words for a pending
-/// row that reaches a stopped run. MOD-125 M3 D6: the stores accept the cancel now (the box
-/// lists it and applies it with `cancel_stopped_run`); this sentence goes with its last runtime
-/// users.
-#[must_use]
-pub fn cancel_of_a_stopped_run(run: RunId) -> String {
-    format!("run `{run}` is stopped: resume its workspace first, then cancel it")
-}
-
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
 /// the scope row goes only with its workspace.
 #[must_use]
