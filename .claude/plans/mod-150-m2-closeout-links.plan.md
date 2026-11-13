@@ -62,11 +62,16 @@ key, and only when no live link exists. The warning line shows the link that wil
     `uq_item_link_one_canonical` would otherwise trip as 23505 on a concurrent agent proposal.
   - **`superseded`** takes no lock: no partial unique backs it, and a concurrent identical insert meets
     the PK upsert.
-  - **An outgoing `duplicates` cannot be withdrawn concurrently.** Withdrawal needs a step of a live run
-    of the item, `close_out` refuses a live run, and `create_run` takes the item row lock that
-    `close_out` holds.
-  - **An incoming `supersedes` can be.** Another item's run may withdraw it between the check and the
-    commit. Accepted: that is the agent's own later act, and MOD-155 makes `supersedes` pending anyway.
+  - **An unnamed close-out holds the link it rests on.** A step of a finished or cancelled run can
+    still withdraw a link under `StepFence::Unleased`, and `withdraw_link` takes no item lock (review
+    M1). So the unnamed check locks one live row `FOR SHARE` (`LIMIT 1`: the rule needs one): the
+    item's outgoing `duplicates`, or an incoming `supersedes`. A concurrent `withdraw_link` UPDATE then
+    waits for the close-out to commit; a withdrawal that commits first leaves no live row and the
+    close-out is refused with `close_out_needs_a_link`. Withdrawing after the close-out commits stays
+    allowed, as in MemStore, whose state lock already serialises the two.
+  - **With a name, the two item rows are locked in id order** (review L1): `FOR UPDATE` on the closing
+    item and `FOR KEY SHARE` on the named one, the smaller id first, after the advisory lock. Two
+    close-outs naming each other would otherwise deadlock (`40P01`).
 - **D5 — New sentences** go in `store/traits.rs`, beside `resolution_not_closable`, as
   `#[must_use] pub fn … -> String`:
   - `close_out_needs_a_link(item, resolution)` →
@@ -264,7 +269,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | The signature change misses a call site in a featureless build | Medium | `cargo build --workspace --all-features --tests` in T1 plus the featureless clippy in validation |
-| An incoming `supersedes` is withdrawn between the check and the commit (D4) | Low | accepted; MOD-155 makes `supersedes` pending |
+| A link is withdrawn between the unnamed check and the commit (D4) | Low | the check locks the link row `FOR SHARE` (review M1) |
 | A key typed in `Naming` is a typo | Medium | the engine answers `NotFound`, nothing is written, and the person retries |
 | `.sqlx` drift | Medium | `cargo sqlx prepare --check` in T1 and validation |
 | Close-out snapshot churn | Low | the summary text changes only for `duplicate`/`superseded`; full insta run |
