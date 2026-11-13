@@ -1599,10 +1599,11 @@ async fn ctrl_c_passes_through_the_executor_confirmation() {
 
 // ---- the worker log level (MOD-122 M2 D11) ----
 
-/// The detail pane's worker log level row for `level`: the 14-wide label column and the form's
-/// two-cell gap, then the value.
+/// The detail pane's worker level row for `level`: the 14-wide label column and the form's
+/// two-cell gap, then the value. The row is `worker level`, the name the Logs tab and the README
+/// use for it (R1 L2).
 fn log_level_row(level: &str) -> String {
-    format!("{:<16}{level}", "log level")
+    format!("{:<16}{level}", "worker level")
 }
 
 /// The demo snapshot with the fixture box's settings blob replaced by `settings`.
@@ -1699,7 +1700,7 @@ async fn v_cycles_the_worker_log_level_and_saves_at_once() {
 async fn the_browse_hint_offers_the_log_level() {
     let (bench, section) = bench_with(&snap_of(MemStore::demo()).await).await;
     let hint = bench.key_hint(&section);
-    assert!(hint.contains("v log level"), "{hint}");
+    assert!(hint.contains("v worker level"), "{hint}");
 }
 
 /// MOD-122 M2 D11: a refused write shows the store's sentence, keeps the level on screen and frees
@@ -1750,6 +1751,23 @@ async fn a_log_level_write_on_a_vanished_box_says_deleted_elsewhere() {
     assert!(!section.captures_input());
 }
 
+/// MOD-122 M2 R1 L6: `v` cycles from Browse only, so the row's help names the key only there; an
+/// open editor or the executor confirm keeps the rest of the help.
+#[tokio::test]
+async fn the_level_help_names_its_key_only_in_browse() {
+    for key in ["t", "e", "w"] {
+        let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+        assert_eq!(bench.key(&mut section, key), Handled::Consumed, "{key}");
+        let frame = bench.render_section(&section, 100);
+        let words = words(&frame);
+        assert!(
+            words.contains("applies to `htui worker` on this box"),
+            "{key}: {frame}"
+        );
+        assert!(!words.contains("v cycles"), "{key}: {frame}");
+    }
+}
+
 /// MOD-122 M2 D11: `v` over a write in flight sends nothing and says so in words.
 #[tokio::test]
 async fn v_while_a_save_is_in_flight_sends_nothing() {
@@ -1762,7 +1780,7 @@ async fn v_while_a_save_is_in_flight_sends_nothing() {
     assert!(requests(&bench).is_empty(), "the second `v` sends nothing");
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("still saving the worker log level \u{2014} wait for the store's answer"),
+        frame.contains("still saving the worker level \u{2014} wait for the store's answer"),
         "{frame}"
     );
 }

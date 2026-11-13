@@ -17,7 +17,7 @@ Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  
 │                              declared tags   gpu                             │
 │                              quirks          (none)                          │
 │                              executor        tui                             │
-│                              log level       warn                            │
+│                              worker level    warn                            │
 │                                              applies to `htui worker` on this│
 │                                              box · v cycles                  │
 │                              tools           cargo 1.98.0, cmake, git 2.51.0,│

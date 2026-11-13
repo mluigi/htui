@@ -107,7 +107,7 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::BoxesProbe, "probe"),
     Hint::One(Act::BoxesEditSpec, "spec"),
     Hint::One(Act::Reload, "reload"),
-    Hint::One(Act::BoxesLogLevel, "log level"),
+    Hint::One(Act::BoxesLogLevel, "worker level"),
 ];
 
 /// The Browse keys over a read list with no box in it: the spec is app-wide, so `s` still works
@@ -200,7 +200,7 @@ fn doing(busy: &str) -> &'static str {
         "boxes" => "reading the boxes",
         "edit_box" => "saving the box",
         "set_probe_spec" => "saving the probe spec",
-        "set_box_log_level" => "saving the worker log level",
+        "set_box_log_level" => "saving the worker level",
         _ => "writing",
     }
 }
@@ -1204,8 +1204,12 @@ impl BoxesSection {
         // MOD-122 M2 D7, D11: read through `LogShipLevel::of`, so a bad sibling key cannot move
         // it; `v` cycles it from browse. The form shows help only under a focused row, and this
         // one is never focused, so its help is dim lines of the value, as the quirks are lines.
+        // R1 L6: `v` cycles from Browse only, so an open editor or the executor confirm drops
+        // the key clause.
         let worker = Executor::of(&row.settings) == Executor::Worker;
-        let cycle = ctx.keys().label(views::BOXES_BROWSE, Act::BoxesLogLevel);
+        let cycle = matches!(self.mode, Mode::Browse)
+            .then(|| ctx.keys().label(views::BOXES_BROWSE, Act::BoxesLogLevel))
+            .flatten();
         let mut level = vec![Line::styled(
             LogShipLevel::of(&row.settings).to_string(),
             theme.base,
@@ -1217,7 +1221,7 @@ impl BoxesSection {
                     .map(|line| Line::styled(line, theme.dim)),
             );
         }
-        fields.push(form::Field::new("log level", form::Value::Lines(level)));
+        fields.push(form::Field::new("worker level", form::Value::Lines(level)));
 
         let tools: Vec<String> = record
             .tools
