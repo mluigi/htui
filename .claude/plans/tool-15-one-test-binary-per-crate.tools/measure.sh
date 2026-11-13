@@ -17,9 +17,10 @@ build() { # $1 = tag
 say "== $label  $(git -C "$repo" rev-parse --short HEAD)  $(date -Is)"
 build cold
 say "target size: $(du -sh "$tgt" | cut -f1)   incremental: $(du -sh "$tgt/debug/incremental" 2>/dev/null | cut -f1)"
-exes=$(find "$tgt/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.*' | wc -l)
-bytes=$(find "$tgt/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -printf '%s\n' | awk '{s += $1} END {print s + 0}')
-say "executables: $exes   total bytes: $bytes"
+# cargo 1.100 has no target/debug/deps: the executables come from cargo's JSON (names.sh, NAMES_EXES).
+rm -f "$out/$label.exes"
+( cd "$repo" && CARGO_TARGET_DIR="$tgt" NAMES_EXES="$out/$label.exes" bash "$(dirname "$(readlink -f "$0")")/names.sh" > "$out/$label.names" 2>/dev/null )
+say "test executables: $(wc -l < "$out/$label.exes")   total bytes: $(awk -F'\t' '{s += $1} END {print s + 0}' "$out/$label.exes")   test names: $(wc -l < "$out/$label.names")"
 touch_one() { # $1 = old path, $2 = new path
     if [ -f "$repo/$1" ]; then touch "$repo/$1"; else touch "$repo/$2"; fi
 }

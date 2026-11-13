@@ -94,7 +94,8 @@ surface re-exported and would lose per-crate incremental builds. Per crate it is
 
 **D8 — Acceptance numbers.** Measured on the host with `CARGO_BUILD_JOBS=4` and a fresh `CARGO_TARGET_DIR`, same
 recipe before and after (the 7m33s / 29 GB figures came from the hr image, so only the A/B ratio counts):
-executables 148 → at most 21 (12 unit-test + 8 `it` + `extensibility`); `target/` size at most 50% of the base;
+test executables 147 (measured on the base: 136 integration + 11 unit, 19.0 GB; the item's 148 counted one more) →
+at most 20 (11 unit-test + 8 `it` + `extensibility`); `target/` size at most 50% of the base (28 GB on the host);
 cold `--no-run` wall time at most +10% of the base. If the cold time exceeds that (one big crate compiles
 serially, where 68 small targets compiled in parallel), split the largest crate's `it` into at most three
 area binaries (`ui`, `pg`, `chat` for htui) chosen from the numbers, not now.
