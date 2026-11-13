@@ -56,8 +56,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init.sh https://sh.rustup.
 RUN cargo install sqlx-cli --version 0.9.0 --locked --no-default-features --features postgres,rustls \
  && cargo install cargo-insta --version 1.48.0 --locked \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+# The gate's test runner (TOOL-17): cargo-nextest 0.9.151, the pinned prebuilt binary.
+RUN curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C /opt/rust/cargo/bin
 # Runtime CARGO_HOME = shared htui-hr-cargo volume (whole, incl. .package-cache locks).
 ENV CARGO_HOME=${HR_HOME}/.cargo HOME=${HR_HOME} USER=${HR_USER} SHELL=/bin/bash
-LABEL hr.uid=${HR_UID} hr.gid=${HR_GID} hr.home=${HR_HOME} hr.toolchain=1.98.1 hr.sqlx-cli=0.9.0 hr.cargo-insta=1.48.0
+LABEL hr.uid=${HR_UID} hr.gid=${HR_GID} hr.home=${HR_HOME} hr.toolchain=1.98.1 hr.sqlx-cli=0.9.0 hr.cargo-insta=1.48.0 hr.cargo-nextest=0.9.151
 WORKDIR ${HR_HOME}
 CMD ["sleep", "infinity"]

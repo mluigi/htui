@@ -458,7 +458,8 @@ pub fn parse_dsn(dsn: &str) -> PgConnectOptions {
     PgConnectOptions::from_str(dsn).expect("a parseable DSN")
 }
 
-/// Serialises the tests that talk to the test Qdrant (TOOL-16).
+/// Serialises the tests that talk to the test Qdrant within one process: every test under
+/// `cargo test` (TOOL-16), only the one test under cargo-nextest (TOOL-17).
 static QDRANT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One test's turn at the test Qdrant: hold it for the whole test.
@@ -472,6 +473,13 @@ pub type QdrantTurn = tokio::sync::MutexGuard<'static, ()>;
 /// calls time out (`create collection: ... Timeout expired`), where one at a time they all pass.
 /// Before TOOL-15 every test file was its own process and the gate ran single-threaded, so the
 /// cases never overlapped.
+///
+/// The lock only reaches one process. Under `cargo test`, the documented item-run command, a
+/// binary's tests share it, so the lock is what keeps them apart. Under cargo-nextest, which the
+/// gate runs (TOOL-17), each test is its own process and the lock costs nothing: there the
+/// `live-qdrant` test group in `.config/nextest.toml` serialises them instead, and it holds a case
+/// only when the case lives in `qdrant_live`/`qdrant_worker` or its name starts with
+/// `live_qdrant_`. A live Qdrant case needs both.
 pub async fn qdrant_turn() -> QdrantTurn {
     QDRANT.lock().await
 }
