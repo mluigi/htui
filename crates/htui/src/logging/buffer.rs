@@ -225,10 +225,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MemoryLayer {
 
 /// Formats an event's fields as the `fmt` layer does: the message, then ` key=value`.
 #[derive(Default)]
-struct LineVisitor {
+pub(crate) struct LineVisitor {
     message: String,
     fields: String,
-    log_target: Option<String>,
+    /// A `log` record's real target (`log.target`), when the event was bridged by tracing-log.
+    pub(crate) log_target: Option<String>,
 }
 
 impl tracing::field::Visit for LineVisitor {
@@ -261,7 +262,7 @@ impl LineVisitor {
     /// The message then the fields; without a message, the fields alone; `\r` and `\n` folded to
     /// a space, so a line is one row. Most lines hold neither and are not copied again (MOD-122
     /// R1).
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         let text = if self.message.is_empty() {
             self.fields.trim_start().to_owned()
         } else {
