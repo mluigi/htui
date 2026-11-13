@@ -147,20 +147,30 @@ impl Workers {
             .filter(|source| !source.lines.is_empty())
     }
 
-    /// The label the sources list and the lines pane's border show: `worker · <name>`, and
-    /// `worker · <name> (removed)` for a deleted box.
-    pub(super) fn label(&self, key: &WorkerKey) -> String {
+    /// The source's bare name: the box's hostname as its newest row has it, or the name a
+    /// deleted box's rows kept. A box the tab holds no row of has no name yet: its id's first
+    /// group stands in.
+    pub(super) fn name(&self, key: &WorkerKey) -> String {
         match key {
-            // A box the tab holds no row of has no name yet: its id's first group stands in.
-            WorkerKey::Box(id) => match self.sources.get(key) {
-                Some(source) => format!("worker \u{b7} {}", source.name),
-                None => {
+            WorkerKey::Box(id) => self.sources.get(key).map_or_else(
+                || {
                     let id = id.to_string();
-                    let short = id.split('-').next().unwrap_or(&id);
-                    format!("worker \u{b7} {short}")
-                }
-            },
-            WorkerKey::Removed(name) => format!("worker \u{b7} {name} (removed)"),
+                    id.split('-').next().unwrap_or(&id).to_owned()
+                },
+                |source| source.name.clone(),
+            ),
+            WorkerKey::Removed(name) => name.clone(),
+        }
+    }
+
+    /// The label the lines pane's border shows: `worker · <name>`, and
+    /// `worker · <name> (removed)` for a deleted box. The sources list shows the bare
+    /// [`name`](Self::name) under its `workers` heading instead (R1 M1).
+    pub(super) fn label(&self, key: &WorkerKey) -> String {
+        let name = self.name(key);
+        match key {
+            WorkerKey::Box(_) => format!("worker \u{b7} {name}"),
+            WorkerKey::Removed(_) => format!("worker \u{b7} {name} (removed)"),
         }
     }
 }

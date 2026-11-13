@@ -13,10 +13,10 @@ no workspace   ¹Logs    0 working · 0 waiting · memory · no box ·  F9  abou
 │ worker           0 · ⚠ 0   ││                                                                    │
 │ secrets          0 · ⚠ 0   ││                                                                    │
 │ other            1 · ⚠ 1   ││                                                                    │
-│ worker · BUILD-01   5 · ⚠ 2││                                                                    │
-│ worker · GPU-02     2 · ⚠ 1││                                                                    │
-│▌worker · OLD-RIG (… 1 · ⚠ 1││                                                                    │
-│                            ││                                                                    │
+│ workers ───────────────────││                                                                    │
+│ BUILD-01         5 · ⚠ 2   ││                                                                    │
+│ GPU-02           2 · ⚠ 1   ││                                                                    │
+│▌OLD-RIG ✕        1 · ⚠ 1   ││                                                                    │
 │                            ││                                                                    │
 │                            ││                                                                    │
 │                            ││                                                                    │

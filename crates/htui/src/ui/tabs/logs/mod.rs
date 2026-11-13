@@ -1,8 +1,8 @@
 //! Logs tab (MOD-122 D4, `R-TUI-15`): htui's own log as it runs, and its headless workers'.
 //!
 //! The sources on the left (`all`, then each [`Source`] in the requirement's order, `other` only
-//! while it holds a line, then one `worker · <box name>` row per headless worker box with stored
-//! lines, M2 D10), with counts of the lines the tab still holds and of their warnings; the
+//! while it holds a line, then, under a `workers` heading, one row per headless worker box with
+//! stored lines, M2 D10), with counts of the lines the tab still holds and of their warnings; the
 //! selected source's lines on the right, one row each, coloured by level with the level word
 //! always printed, so monochrome loses nothing. `all` keeps its M1 meaning, the process's lines
 //! only: a worker's lines carry its own clock, and one merged timeline would imply an order the
@@ -88,12 +88,19 @@ const HINT: HintSpec = &[
 const NO_LINES_NEXT: &str =
     "htui's own log appears here; Settings \u{203a} Logging sets what is kept";
 
-/// An empty worker source's next step (M2 D10, D11): what a box ships is its own setting.
-const NO_WORKER_LINES_NEXT: &str =
-    "Settings \u{203a} Boxes \u{203a} Worker log level sets what it ships";
-
 /// The level filter's next step when `logs.level` has no key.
 const LOWER_THE_LEVEL: &str = "lower the minimum level";
+
+/// A sources-list row's name column, in cells: a worker's name is cut to it too, so every row's
+/// counts line up (R1 M1).
+const NAME_WIDTH: usize = 12;
+
+/// The heading over the worker rows in the sources list (R1 M1).
+const WORKERS_HEADING: &str = "workers";
+
+/// A deleted box's mark in the sources list (R1 M1): `(removed)` would leave its name two of the
+/// [`NAME_WIDTH`] cells, so the list row carries this mark and the lines pane's title the word.
+const REMOVED_MARK: &str = "\u{2715}";
 
 /// The narrowest lines pane (inner cells) that keeps the source column under `all`.
 const SOURCE_WIDTH: u16 = 48;
@@ -405,36 +412,40 @@ impl LogsTab {
     ) {
         let theme = ctx.theme;
         let inner = Pane::inner(area);
-        let rows = self.rows();
-        let cursor = rows
-            .iter()
-            .position(|row| *row == self.selected)
-            .unwrap_or(0);
         // `list::render` keeps one cell for its cursor gutter.
         let width = usize::from(inner.width.saturating_sub(1));
-        let list_rows: Vec<Row<'static>> = rows
-            .iter()
-            .map(|row| {
-                let line = match row {
-                    Pick::All => source_line(ALL, self.counts.all(), theme),
-                    Pick::Local(source) => {
-                        source_line(source.name(), self.counts.of(*source), theme)
+        let mut cursor = 0;
+        let mut headed = false;
+        let mut list_rows: Vec<Row<'static>> = Vec::new();
+        for row in self.rows() {
+            let line = match &row {
+                Pick::All => source_line(ALL, self.counts.all(), theme),
+                Pick::Local(source) => source_line(source.name(), self.counts.of(*source), theme),
+                Pick::Worker(key) => {
+                    // R1 M1: the worker rows sit under their own heading, so a row needs no
+                    // `worker · ` of its own and takes the local rows' name column.
+                    if !headed {
+                        headed = true;
+                        list_rows.push(heading(width, theme));
                     }
-                    Pick::Worker(key) => {
-                        let counts = self
-                            .workers
-                            .get(key)
-                            .map_or_else(Counts::default, |source| source.counts());
-                        worker_line(&self.workers.label(key), counts, width, theme)
-                    }
-                };
-                Row {
-                    line,
-                    kind: RowKind::Item,
+                    let counts = self
+                        .workers
+                        .get(key)
+                        .map_or_else(Counts::default, |source| source.counts());
+                    let removed = matches!(key, WorkerKey::Removed(_));
+                    let name = worker_name(&self.workers.name(key), removed);
+                    source_line(&name, counts, theme)
                 }
-            })
-            .collect();
-        let offset = window(cursor, rows.len(), usize::from(inner.height));
+            };
+            if row == self.selected {
+                cursor = list_rows.len();
+            }
+            list_rows.push(Row {
+                line,
+                kind: RowKind::Item,
+            });
+        }
+        let offset = window(cursor, list_rows.len(), usize::from(inner.height));
         list::render(
             frame,
             inner,
@@ -447,7 +458,7 @@ impl LogsTab {
         let mut pane = Pane::new("Sources")
             .focus(focus)
             .accent(ctx.accent())
-            .scrollbar(rows.len(), offset);
+            .scrollbar(list_rows.len(), offset);
         if let Some(hints) = hints {
             pane = pane.hints(hints.clone());
         }
@@ -504,17 +515,10 @@ impl LogsTab {
     }
 
     /// Why the lines pane is empty, and the next step: nothing logged yet, nothing at this
-    /// level, or nothing from this source. A worker source with no line points at its box's
-    /// shipping level (M2 D11).
+    /// level, or nothing from this source. A worker source is listed only while it holds a line
+    /// (M2 D10), so only its level filter can empty it.
     fn empty_state(&self, source: &str, level: &str, ctx: &Ctx<'_>) -> (String, String) {
-        let worker = self.selected.is_worker();
-        if worker && self.pool().is_empty() {
-            return (
-                format!("No lines from {source} yet."),
-                NO_WORKER_LINES_NEXT.to_owned(),
-            );
-        }
-        if !worker && self.lines.is_empty() {
+        if !self.selected.is_worker() && self.lines.is_empty() {
             return ("No log lines yet.".to_owned(), NO_LINES_NEXT.to_owned());
         }
         if self.pool().iter().any(|line| self.is_selected_source(line)) {
@@ -587,7 +591,8 @@ impl LogsTab {
     }
 }
 
-/// A sources-list row: `name  lines · ⚠ warnings`, the warnings in the warning role while any.
+/// A sources-list row: `name  lines · ⚠ warnings`, the name in [`NAME_WIDTH`] cells, the
+/// warnings in the warning role while any.
 fn source_line(name: &str, counts: Counts, theme: &Theme) -> Line<'static> {
     let warn = if counts.warnings > 0 {
         theme.warning
@@ -595,26 +600,54 @@ fn source_line(name: &str, counts: Counts, theme: &Theme) -> Line<'static> {
         theme.dim
     };
     Line::from(vec![
-        Span::styled(format!("{name:<12} {:>5} ", counts.lines), theme.base),
+        Span::styled(
+            format!("{} {:>5} ", cells::pad(name, NAME_WIDTH), counts.lines),
+            theme.base,
+        ),
         Span::styled(format!("\u{b7} \u{26a0} {}", counts.warnings), warn),
     ])
 }
 
-/// A worker's sources-list row in `width` cells (M2 D10): its label, clipped so the counts
-/// always show, then `lines · ⚠ warnings`, the warnings in the warning role while any.
-fn worker_line(label: &str, counts: Counts, width: usize, theme: &Theme) -> Line<'static> {
-    let warn = if counts.warnings > 0 {
-        theme.warning
+/// The `workers` heading over the worker rows (R1 M1): the word, then a rule to `width`, dim as
+/// the list's other notes, never selected.
+fn heading(width: usize, theme: &Theme) -> Row<'static> {
+    let rule = "\u{2500}".repeat(width.saturating_sub(WORKERS_HEADING.len() + 1));
+    Row {
+        line: Line::styled(format!("{WORKERS_HEADING} {rule}"), theme.dim),
+        kind: RowKind::Note,
+    }
+}
+
+/// A worker's name in the list's [`NAME_WIDTH`] (R1 M1): hostnames often share their start
+/// (`DESKTOP-…`), so a long one is cut from the left and keeps its distinct end; a deleted box
+/// keeps its [`REMOVED_MARK`] whatever the name's length.
+fn worker_name(name: &str, removed: bool) -> String {
+    if removed {
+        let room = NAME_WIDTH - cells::cell_width(REMOVED_MARK) - 1;
+        format!("{} {REMOVED_MARK}", clip_left(name, room))
     } else {
-        theme.dim
-    };
-    let tail = format!("\u{b7} \u{26a0} {}", counts.warnings);
-    let lines = format!("{} ", counts.lines);
-    let room = width.saturating_sub(cells::cell_width(&tail) + cells::cell_width(&lines) + 1);
-    Line::from(vec![
-        Span::styled(format!("{} {lines}", cells::fit(label, room)), theme.base),
-        Span::styled(tail, warn),
-    ])
+        clip_left(name, NAME_WIDTH)
+    }
+}
+
+/// `text` in at most `width` cells, cut from the left behind a `…` when it does not fit.
+fn clip_left(text: &str, width: usize) -> String {
+    if cells::cell_width(text) <= width {
+        return cells::clip(text, width);
+    }
+    let room = width.saturating_sub(1);
+    let mut used = 0;
+    let mut tail: Vec<&str> = Vec::new();
+    for cluster in cells::graphemes(text).collect::<Vec<_>>().into_iter().rev() {
+        let size = cells::cell_width(cluster);
+        if used + size > room {
+            break;
+        }
+        used += size;
+        tail.push(cluster);
+    }
+    tail.reverse();
+    cells::clip(&format!("{}{}", cells::ELLIPSIS, tail.concat()), width)
 }
 
 /// A level's role (D4): error, warning, base, then dim for debug and trace.
@@ -1362,32 +1395,37 @@ mod tests {
     /// The row index of `BUILD-01` under `mixed()`: `all`, the eight local sources, then it.
     const BUILD_ROW: usize = 9;
 
-    /// A worker's list row as the tab writes it at 100 columns (27 cells after the gutter).
-    fn worker_row(label: &str, lines: usize, warnings: usize) -> String {
-        let tail = format!("{lines} \u{b7} \u{26a0} {warnings}");
-        let room = 27 - tail.chars().count() - 1;
-        format!("{} {tail}", cells::fit(label, room))
-    }
+    /// The `workers` heading over the worker rows, as the tab writes it at 100 columns (27 cells
+    /// after the gutter).
+    const WORKERS_HEADING: &str = "workers \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
 
     #[tokio::test]
     async fn worker_boxes_are_listed_after_the_local_sources_with_their_counts() {
         let mut harness = tab_at(with_workers(mixed(), &two_workers()), 100, 30).await;
         let frame = harness.render();
-        let build = worker_row("worker \u{b7} BUILD-01", 5, 2);
-        let gpu = worker_row("worker \u{b7} GPU-02", 2, 1);
+        // R1 M1: under their heading, worker rows take the local rows' name column, so the
+        // counts line up.
+        let build = "BUILD-01         5 \u{b7} \u{26a0} 2";
+        let gpu = "GPU-02           2 \u{b7} \u{26a0} 1";
         for row in [
-            &build,
-            &gpu,
+            build,
+            gpu,
+            WORKERS_HEADING,
             &source_row("all", 7, 3),
             &source_row("other", 1, 1),
         ] {
-            assert!(frame.contains(row.as_str()), "`{row}` in {frame}");
+            assert!(frame.contains(row), "`{row}` in {frame}");
         }
         assert!(
-            frame.find(&source_row("other", 1, 1)) < frame.find(&build),
-            "the workers follow the local sources"
+            frame.find(&source_row("other", 1, 1)) < frame.find(WORKERS_HEADING),
+            "the heading follows the local sources"
         );
-        assert!(frame.find(&build) < frame.find(&gpu), "by name");
+        assert!(
+            frame.find(WORKERS_HEADING) < frame.find(build),
+            "the workers follow their heading"
+        );
+        assert!(frame.find(build) < frame.find(gpu), "by name");
+        assert!(!frame.contains("worker \u{b7} BUILD-01"), "{frame}");
         insta::assert_snapshot!("logs_workers", frame);
     }
 
@@ -1421,7 +1459,10 @@ mod tests {
             "{frame}"
         );
         assert!(frame.contains("walk failed"), "{frame}");
-        assert!(frame.contains(&worker_row("worker \u{b7} OLD-RIG (removed)", 1, 1)));
+        assert!(
+            frame.contains("\u{258c}OLD-RIG \u{2715}        1 \u{b7} \u{26a0} 1"),
+            "the list row keeps the removed mark: {frame}"
+        );
         insta::assert_snapshot!("logs_worker_removed", frame);
     }
 
@@ -1474,45 +1515,53 @@ mod tests {
         }
         let frame = harness.render();
         assert!(frame.contains("ERROR adapter exited"), "{frame}");
-        assert!(frame.contains("worker \u{b7} BUILD"), "{frame}");
+        assert!(
+            frame.contains("\u{258c}BUILD-01         5 \u{b7} \u{26a0} 2"),
+            "{frame}"
+        );
         insta::assert_snapshot!("logs_worker_narrow", frame);
     }
 
-    /// An empty worker source names the box's shipping level as the next step (D10, D11).
+    /// R1 M1: hostnames that share their start keep their distinct ends in the list, and a
+    /// removed box keeps its mark however long its name.
     #[tokio::test]
-    async fn an_empty_worker_source_points_at_the_box_s_log_level() {
-        let bench = SectionBench::new().await;
-        let mut tab = LogsTab::new(mixed());
-        tab.selected = Pick::Worker(WorkerKey::Box(GPU));
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
-            .expect("a test terminal");
-        let ctx = bench.ctx();
-        term.draw(|frame| tab.render(frame, frame.area(), &ctx))
-            .expect("a frame");
-        let frame = text_of(term.backend().buffer());
+    async fn similar_hostnames_keep_their_ends_and_a_removed_box_its_mark() {
+        let abc = BoxId::from_uuid(uuid::Uuid::from_u128(0xabc1_u128 << 96));
+        let xyz = BoxId::from_uuid(uuid::Uuid::from_u128(0x9876_u128 << 96));
+        let line = |id, box_id, name: &str, level| {
+            row(
+                id,
+                box_id,
+                name,
+                level,
+                "htui_worker",
+                &format!("wline {id}"),
+            )
+        };
+        let rows = vec![
+            line(1, Some(abc), "DESKTOP-ABC1234", WorkerLogLevel::Info),
+            line(2, Some(xyz), "DESKTOP-XYZ9876", WorkerLogLevel::Warn),
+            line(3, None, "LEGACY-BUILDER", WorkerLogLevel::Error),
+            line(4, None, "OLD-RIG", WorkerLogLevel::Info),
+        ];
+        let mut harness = tab_at(with_workers(mixed(), &rows), 100, 30).await;
+        for _ in 0..BUILD_ROW + 2 {
+            harness.key("j");
+        }
+        let frame = harness.render();
+        for row in [
+            " \u{2026}TOP-ABC1234     1 \u{b7} \u{26a0} 0",
+            " \u{2026}TOP-XYZ9876     1 \u{b7} \u{26a0} 1",
+            "\u{258c}\u{2026}Y-BUILDER \u{2715}     1 \u{b7} \u{26a0} 1",
+            " OLD-RIG \u{2715}        1 \u{b7} \u{26a0} 0",
+        ] {
+            assert!(frame.contains(row), "`{row}` in {frame}");
+        }
         assert!(
-            frame.contains("No lines from worker \u{b7} 00006b02 yet."),
-            "{frame}"
+            frame.contains("worker \u{b7} LEGACY-BUILDER (removed) \u{b7} min trace"),
+            "the lines pane's title keeps the full label: {frame}"
         );
-        assert!(
-            frame.contains("Settings \u{203a} Boxes \u{203a} Worker log level sets what it ships"),
-            "{frame}"
-        );
-        insta::assert_snapshot!("logs_worker_empty", frame);
-    }
-
-    /// A buffer as text, one line per row, trailing blanks trimmed.
-    fn text_of(buffer: &Buffer) -> String {
-        let area = buffer.area;
-        (area.top()..area.bottom())
-            .map(|y| {
-                let row: String = (area.left()..area.right())
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect();
-                row.trim_end().to_owned()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        insta::assert_snapshot!("logs_worker_similar", frame);
     }
 
     #[tokio::test]
@@ -1773,7 +1822,7 @@ mod tests {
         harness.settle().await;
         let frame = harness.render();
         assert!(
-            frame.contains(&worker_row("worker \u{b7} DESKTOP-HTUI", 1, 1)),
+            frame.contains("DESKTOP-HTUI     1 \u{b7} \u{26a0} 1"),
             "{frame}"
         );
         store
@@ -1784,7 +1833,7 @@ mod tests {
         harness.settle().await;
         let frame = harness.render();
         assert!(
-            frame.contains(&worker_row("worker \u{b7} DESKTOP-HTUI", 2, 2)),
+            frame.contains("DESKTOP-HTUI     2 \u{b7} \u{26a0} 2"),
             "{frame}"
         );
     }
