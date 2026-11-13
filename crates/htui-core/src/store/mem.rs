@@ -15016,6 +15016,7 @@ mod tests {
             scope: None,
             personas: Vec::new(),
             memory: None,
+            capture: None,
             source: None,
             edges: Vec::new(),
         }

@@ -199,11 +199,12 @@ pub use run::{
     GraphSnapshot, NewCommandRun, NewRun, NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge,
     PartPremerge, PlanAdmission, PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run,
     RunFacts, RunKind, RunMode, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide,
-    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
-    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
-    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
-    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotCapture,
+    SnapshotCaptureModel, SnapshotDivide, SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart,
+    SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow,
+    StepOpening, StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    VerifyOutcome, default_snapshot_edges, edge_sort_key, latest_graph_run, latest_live_graph_run,
+    prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{

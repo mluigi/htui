@@ -726,6 +726,33 @@ pub struct GraphSnapshot {
     /// snapshot written before MOD-163, which renders no memory section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::model::memory::SnapshotMemory>,
+    /// MOD-164 D8: the run-end memory capture, frozen at `StartRun`: `Some` iff the project's
+    /// `memory_capture` switch resolved on, with the light model it resolved to. `None` means
+    /// capture is off: the switch is off, or the snapshot was written before MOD-164. **Not**
+    /// hashed by `topology` and [`GraphSnapshot::V`] not bumped; absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<SnapshotCapture>,
+}
+
+/// MOD-164 D8: [`GraphSnapshot::capture`], what the run's capture step runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCapture {
+    /// The `light_model` App setting at `StartRun`, its agent's name frozen beside it. `None`
+    /// when the setting is unset, malformed, or names an agent that is missing or disabled: the
+    /// capture step is then skipped on its row.
+    #[serde(default)]
+    pub model: Option<SnapshotCaptureModel>,
+}
+
+/// MOD-164 D8: the light model a capture step runs on, as frozen at `StartRun`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCaptureModel {
+    /// `agent.id`.
+    pub agent_id: AgentId,
+    /// `agent.name` at `StartRun`.
+    pub agent_name: String,
+    /// The model the agent is asked for.
+    pub model: String,
 }
 
 impl GraphSnapshot {
@@ -2237,6 +2264,7 @@ mod tests {
             scope: None,
             personas,
             memory: None,
+            capture: None,
         }
     }
 
@@ -2305,6 +2333,36 @@ mod tests {
             (&back.phases, &back.edges),
             (&snapshot.phases, &snapshot.edges)
         );
+    }
+
+    /// MOD-164 D8: a pre-MOD-164 snapshot has no `capture` key and decodes as `None` (capture
+    /// off); a `None` snapshot writes no key; a frozen capture round-trips, its model or not.
+    #[test]
+    fn a_snapshot_without_capture_decodes_as_none_and_writes_no_key() {
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let value = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(value.get("capture").is_none(), "{value}");
+        let back: super::GraphSnapshot = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(back.capture, None);
+
+        for model in [
+            None,
+            Some(super::SnapshotCaptureModel {
+                agent_id: crate::model::AgentId::from_uuid(Uuid::from_u128(7)),
+                agent_name: "agy".to_owned(),
+                model: "light-1".to_owned(),
+            }),
+        ] {
+            let mut with = snapshot.clone();
+            with.capture = Some(super::SnapshotCapture { model });
+            let value = serde_json::to_value(&with).expect("encodes");
+            assert!(value["capture"].is_object(), "{value}");
+            let back: super::GraphSnapshot = serde_json::from_value(value).expect("decodes");
+            assert_eq!(back, with);
+        }
+        let off: super::SnapshotCapture =
+            serde_json::from_value(serde_json::json!({})).expect("a model-less capture decodes");
+        assert_eq!(off.model, None);
     }
 
     #[test]

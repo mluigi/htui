@@ -685,6 +685,7 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         // MOD-163 maintainer decision P-1: [`resolve`] freezes the memory on a resolved graph;
         // a v1 run's resume, which keeps only these phases, never reads it.
         memory: None,
+        capture: None,
     };
     // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
     // expanded phases; after every `NotYetRunnable`, so each of those outranks it.
