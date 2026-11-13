@@ -494,6 +494,32 @@ read again after every sync; without it, or with any other value, the interval i
 
   Nothing is said when Postgres is not connected, or when Qdrant answers with a key.
 
+### Log lines shipped to the database
+
+Besides its file or standard error, the worker sends its log lines to the database, so the TUI on
+another box can read them (the Logs tab lists one source per worker box):
+
+- **What is sent** depends on the box's **worker log level**: `off`, `error`, `warn` (the default),
+  `info` or `debug`. It is stored on the box row (`box.settings.log_level`), set from
+  **Settings › Boxes**, and re-read every two seconds, so a change applies without a restart.
+  `HTUI_LOG_FILTER` still sets what the file or standard error gets, and neither setting changes
+  the other: a box sending `debug` does not print `debug` lines locally. `sqlx`'s own lines below
+  `warn` are never sent (each send would otherwise log its own statement).
+- **When.** Lines are sent every two seconds, or as soon as 200 wait.
+- **While the database is unreachable** the worker keeps up to 20 000 lines and retries, waiting
+  2 s, then 4, 8, 16 and at most 30 s between tries. Past 20 000 the oldest line below `error` goes
+  first, an `error` line only when nothing else is held, and the next successful send starts with
+  one `warn` line saying `N log lines dropped while database unreachable`. The worker logs one
+  `warn` when sending starts failing and one `info` when it recovers, never one per try.
+- **Secrets.** Every line goes through the same credential scrubber as run output before it is
+  kept. A line the scrubber refuses is sent with its level and target and the text
+  `[line withheld: matched credential rule]`; its text is never stored.
+- **How long they stay.** At start and then hourly the worker deletes lines older than
+  `log_retention_days` days (an app setting, a whole number from 1 to 365, default 14), and every
+  box's lines beyond the newest 100 000. Two workers sweeping at once is harmless. When a box row is
+  deleted, its lines go too, except its `error` lines, which stay under the box's name until they
+  age out.
+
 ## Exit codes
 
 | Code | Meaning |
