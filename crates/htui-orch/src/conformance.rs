@@ -1067,6 +1067,7 @@ pub const CASES: &[&str] = &[
     "an_older_snapshot_without_capture_never_captures",
     "a_capture_after_a_walk_cut_still_finishes_the_run",
     "a_sibling_ending_during_a_live_capture_leaves_it_be",
+    "a_live_capture_admits_nothing_new",
 ];
 
 /// Run one case by name.
@@ -1477,6 +1478,7 @@ fn capture_case<'a, H: CaseHarness>(
         "a_sibling_ending_during_a_live_capture_leaves_it_be" => {
             Box::pin(a_sibling_ending_during_a_live_capture_leaves_it_be(harness))
         }
+        "a_live_capture_admits_nothing_new" => Box::pin(a_live_capture_admits_nothing_new(harness)),
         _ => return None,
     })
 }
@@ -9477,6 +9479,94 @@ async fn a_sibling_ending_during_a_live_capture_leaves_it_be<H: CaseHarness>(har
             .is_some_and(|(step, run)| step <= run),
         "the run's finish is its last write"
     );
+}
+
+/// MOD-164 F1 (review: the capture's cut admits nothing): a live capture ends the walk's
+/// admission. On `prd → plan → review` beside `implement`, `implement`'s verify fails the run
+/// while `plan` is suspended past its session; the capture's session is held, and `plan`, woken
+/// with its document written, settles `done` meanwhile. Its successor `review` is never admitted:
+/// no row is created for it, during the capture or after, and the run ends `failed` once.
+async fn a_live_capture_admits_nothing_new<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, CHAIN_AND_SINK, |phase| match phase.name.as_str() {
+        "plan" => phase.output_kind = "plan".to_owned(),
+        "implement" => {
+            phase.retry_limit = 0;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+        _ => {}
+    })
+    .await;
+    // `prd`'s verify (FEAT-3 seeds one) passes; `implement`'s is the next.
+    orch.verifier().script_report(FakeVerifier::pass());
+    let mut report = FakeVerifier::fail(1);
+    report.output = FAILING_OUTPUT.to_owned();
+    orch.verifier().script_report(report);
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    let capture = orch.hold_sessions(&[(htui_core::model::CAPTURE_KEY, 1)]);
+    let (suspended, wake) = orch.suspend_after_done("plan", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(implement.live(1), suspended.notified()) },
+            "`implement` live and `plan` suspended",
+        )
+        .await;
+        implement.release();
+        within(capture.live(1), "the capture session held").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        let plan = latest_row(&steps_of(&orch, run).await, 1)
+            .expect("`plan` runs")
+            .clone();
+        orch.author(ids::HTUI_FEAT_3, &plan, "plan", "the plan, written")
+            .await
+            .expect("the document is written");
+        wake.notify_one();
+        within(
+            until_steps(&orch, run, |steps| {
+                latest_row(steps, 1).is_some_and(|step| step.status == StepStatus::Done)
+            }),
+            "`plan` settled done",
+        )
+        .await;
+        settle_down().await;
+        let steps = steps_of(&orch, run).await;
+        assert!(
+            latest_row(&steps, 3).is_none(),
+            "the capture's cut admits nothing: {steps:?}"
+        );
+        capture.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(2)),
+        "{rest:?}"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("verify_outcome: fail")),
+        "finished once, by `implement`"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        latest_row(&steps, 3).is_none(),
+        "`review` was never admitted: {steps:?}"
+    );
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Done),
+        "`plan` kept its own settle"
+    );
+    assert_eq!(capture_row(&steps).status, StepStatus::Done);
+    assert_eq!(htui_memory(&orch).await.len(), 1);
 }
 
 // -- MOD-11 T8: the command queue's exposure and the R-MCP-4 denials (plan D16, D17) --------
@@ -17934,8 +18024,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            248,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 12 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            249,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 12 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -18030,8 +18120,9 @@ mod tests {
              (plan D8, D9, D11: no trigger, a capture with provenance, no light model, the switch \
              off, a failed capture, a failed run, a cancelled run, a cancel during the capture, \
              an uncited quote, a person's entry kept, a crash during the capture, and a \
-             pre-MOD-164 snapshot), and MOD-164 F1's two (a capture after a walk cut still \
-             finishing the run, and a sibling ending during a live capture leaving it be) 248"
+             pre-MOD-164 snapshot), and MOD-164 F1's three (a capture after a walk cut still \
+             finishing the run, a sibling ending during a live capture leaving it be, and a live \
+             capture admitting nothing new) 249"
         );
     }
 

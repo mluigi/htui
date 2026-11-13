@@ -593,6 +593,9 @@ struct WalkScope {
     cleanup_owed: bool,
     /// A node future of the walk parked the run (D3).
     parked: bool,
+    /// The walk's cut was sent ([`WalkScopes::cut`]), by the scheduler or by a node future's
+    /// run-end capture (MOD-164 F1): the scheduler admits nothing more ([`WalkScopes::is_cut`]).
+    cut: bool,
 }
 
 /// Removes its run's [`WalkScope`] on drop, the drop of a walk `heartbeaten` abandons included.
@@ -713,6 +716,7 @@ impl WalkScopes {
                     in_flight: 0,
                     cleanup_owed: false,
                     parked: false,
+                    cut: false,
                 },
             );
         }
@@ -738,9 +742,21 @@ impl WalkScopes {
         }
     }
 
-    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once.
+    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once, and
+    /// the walk marked cut, so its scheduler admits nothing more ([`Self::is_cut`]).
     fn cut(&self, run: RunId) {
+        if let Some(scope) = self.lock().get_mut(&run) {
+            scope.cut = true;
+        }
         self.send_cancel(run, Signal::Cancel { grace: RELAY_GRACE });
+    }
+
+    /// MOD-164 F1 (review: the capture's cut admits nothing): whether `run`'s walk was cut. A
+    /// node future's run-end capture cuts the walk from inside it, where the scheduler's own
+    /// [`WalkEnd`] cannot see it; the scheduler reads this before it admits. A run cancel
+    /// forwarded into the walk's channel is not a cut.
+    fn is_cut(&self, run: RunId) -> bool {
+        self.lock().get(&run).is_some_and(|scope| scope.cut)
     }
 
     fn send_cancel(&self, run: RunId, signal: Signal) {
@@ -981,7 +997,8 @@ struct WalkEnd {
     ender: Option<i32>,
     /// The walk's cut was sent.
     cut: bool,
-    /// The run was read away from `running` with futures in flight (F21): admit nothing more.
+    /// The run was read away from `running` with futures in flight (F21), or a node future's
+    /// run-end capture cut the walk (MOD-164 F1, [`WalkScopes::is_cut`]): admit nothing more.
     drained: bool,
     /// More than one future was ever in flight at once, or the walk drained (T3 repair 1): a
     /// terminal end may leave a sibling's unsettled row behind with nothing in flight to cut. A
@@ -4210,6 +4227,11 @@ where
         loop {
             self.walks.forward(run, &watched);
             self.walks.forward(run, &(self.parts.control)(run));
+            // MOD-164 F1: a capture cut the walk from inside a node future (the run's outcome is
+            // decided); the futures in flight drain, and nothing more is admitted.
+            if self.walks.is_cut(run) {
+                end.drained = true;
+            }
             if end.admits() {
                 passes += 1;
                 let siblings = !flights.is_empty();
