@@ -1,10 +1,11 @@
 # gate.ps1 - the canonical htui gate (TOOL-9, ANA-29 D5). PowerShell twin of gate.sh: same
 # steps, same step names, same last.json shape, same exit codes. Keep the two in lockstep.
+# The doc step runs cargo doc under the workspace's deny-level rustdoc lints.
 #
 # Usage:
 #   pwsh -NoProfile -File scripts/gate.ps1 [-Only <step>] [-Detach] [-Status] [-SelfTest]
 #
-#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, qdrant, test,
+#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, doc, postgres, qdrant, test,
 #                 abort-grep, migrations, workflow-docs, plugin)
 #   -Detach       relaunch in a hidden process, log to target/gate/run.log, print the PID
 #   -Status       print target/gate/last.json and exit
@@ -21,7 +22,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
+    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'doc', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
     [string]$Only,
     [switch]$Detach,
     [switch]$Status,
@@ -38,7 +39,7 @@ $script:TestLog = if ($env:GATE_TEST_LOG) { $env:GATE_TEST_LOG } else { Join-Pat
 $script:MigrationsDir = if ($env:GATE_MIGRATIONS_DIR) { $env:GATE_MIGRATIONS_DIR } else { Join-Path $RepoRoot 'crates/htui-store/migrations' }
 $PluginDir = Join-Path $RepoRoot '.claude/skills/htui-dev'
 $MinClaude = [version]'2.1.287'
-$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
+$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'doc', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
 # The pinned cargo-nextest (TOOL-17 D3): the test step prints its install line when none is on PATH.
 $NextestVersion = '0.9.151'
 
@@ -76,6 +77,9 @@ function Invoke-Native {
 function Step-Fmt { Invoke-Native cargo @('fmt', '--check') }
 function Step-ClippyAll { Invoke-Native cargo @('clippy', '--workspace', '--all-features', '--', '-D', 'warnings') }
 function Step-ClippyBare { Invoke-Native cargo @('clippy', '--workspace', '--', '-D', 'warnings') }
+# [workspace.lints.rustdoc] denies broken, private and redundant intra-doc links, and only
+# rustdoc reads it: no other step would see one.
+function Step-Doc { Invoke-Native cargo @('doc', '--workspace', '--all-features', '--no-deps') }
 
 function Step-Postgres {
     # TOOL-14: without HTUI_TEST_DATABASE_URL every Postgres suite returns early and passes, so

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # gate.sh - the canonical htui gate (TOOL-9, ANA-29 D5). One sequence, so a green means the
-# same thing everywhere: fmt, clippy with and without --all-features, the whole workspace test
-# suite under cargo-nextest without fail-fast and then its doctests (TOOL-17), a scan of that output for aborts,
-# the migration numbering, the workflow validator, and the htui-dev mod when it exists. Bash twin of gate.ps1
-# - keep the two in lockstep (same step names, same last.json shape).
+# same thing everywhere: fmt, clippy with and without --all-features, cargo doc under the
+# workspace's deny-level rustdoc lints, the whole workspace test suite under cargo-nextest without
+# fail-fast and then its doctests (TOOL-17), a scan of that output for aborts, the migration
+# numbering, the workflow validator, and the htui-dev mod when it exists. Bash twin of gate.ps1 -
+# keep the two in lockstep (same step names, same last.json shape).
 #
 # Usage:
 #   bash scripts/gate.sh [--only <step>] [--detach] [--status] [--self-test]
 #
-#   --only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, qdrant, test,
+#   --only <step>  run one step (fmt, clippy-all, clippy-bare, doc, postgres, qdrant, test,
 #                  abort-grep, migrations, workflow-docs, plugin)
 #   --detach       relaunch under setsid, log to target/gate/run.log, print the PID and return
 #   --status       print target/gate/last.json and exit
@@ -45,7 +46,7 @@ TEST_LOG="${GATE_TEST_LOG:-$GATE_DIR/test.log}"
 MIGRATIONS_DIR="${GATE_MIGRATIONS_DIR:-$REPO_ROOT/crates/htui-store/migrations}"
 PLUGIN_DIR="$REPO_ROOT/.claude/skills/htui-dev"
 MIN_CLAUDE="2.1.287"
-STEPS=(fmt clippy-all clippy-bare postgres qdrant test abort-grep migrations workflow-docs plugin)
+STEPS=(fmt clippy-all clippy-bare doc postgres qdrant test abort-grep migrations workflow-docs plugin)
 # The pinned cargo-nextest (TOOL-17 D3): the test step prints its install line when none is on PATH.
 NEXTEST_VERSION="0.9.151"
 
@@ -88,6 +89,9 @@ version_ge() {
 step_fmt()         { cargo fmt --check; }
 step_clippy_all()  { cargo clippy --workspace --all-features -- -D warnings; }
 step_clippy_bare() { cargo clippy --workspace -- -D warnings; }
+# [workspace.lints.rustdoc] denies broken, private and redundant intra-doc links, and only
+# rustdoc reads it: no other step would see one.
+step_doc()         { cargo doc --workspace --all-features --no-deps; }
 
 step_postgres() {
     # TOOL-14: without HTUI_TEST_DATABASE_URL every Postgres suite returns early and passes, so
