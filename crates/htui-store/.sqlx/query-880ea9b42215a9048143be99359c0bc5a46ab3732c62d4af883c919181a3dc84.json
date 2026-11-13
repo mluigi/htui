@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET status = 'cancelled', finished_at = COALESCE(finished_at, $2) WHERE id = ANY($1::uuid[]) AND status NOT IN ('done', 'cancelled', 'superseded')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "880ea9b42215a9048143be99359c0bc5a46ab3732c62d4af883c919181a3dc84"
+}

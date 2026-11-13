@@ -69,7 +69,6 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
-use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -174,6 +173,9 @@ pub enum MemFault {
     /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
     /// commit.
     AdmitPlan,
+    /// [`ReadStore::repos`] (MOD-125 M3 F1): a read a stopped step's resume makes beside its
+    /// trees, which must fail before any guard is retaken.
+    Repos,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -6785,13 +6787,8 @@ impl State {
         if self.lease_owners.get(&run) != Some(&owner) || status != RunStatus::Running {
             return Ok(false);
         }
-        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4); stopping the run would strand
-        // it, since no executor's poll lists a stopped run's cancel.
-        if self.run_commands.values().any(|c| {
-            c.run_id == run
-                && c.kind == RunCommandKind::Cancel
-                && c.status == RunCommandStatus::Pending
-        }) {
+        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4).
+        if self.cancel_pending(run) {
             return Ok(false);
         }
         self.lease_owners.remove(&run);
@@ -6801,6 +6798,112 @@ impl State {
             row.updated_at = now;
         }
         self.stop_running_steps(run, now);
+        Ok(true)
+    }
+
+    /// MOD-125 M3 D1: [`WriteStore::pending_resumes`]: the box's stopped runs whose workspace has
+    /// no stop record (a run without a workspace has none), by `(queued_at, id)`.
+    fn pending_resumes(&self, box_id: BoxId) -> Vec<RunId> {
+        let mut rows: Vec<(DateTime<Utc>, RunId)> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.status == RunStatus::Stopped
+                    && row.executing_box_id == Some(box_id)
+                    && row
+                        .workspace_id
+                        .is_none_or(|workspace| !self.workspace_stops.contains_key(&workspace))
+            })
+            .map(|row| (row.queued_at, row.id))
+            .collect();
+        rows.sort_unstable();
+        rows.into_iter().map(|(_, run)| run).collect()
+    }
+
+    /// MOD-125 M3 D2: the compare-and-set `stopped -> running` that takes the lease; `false`
+    /// writes nothing.
+    fn resume_run(
+        &mut self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self.require_run(run)?;
+        let gated = row
+            .workspace_id
+            .is_some_and(|workspace| self.workspace_stops.contains_key(&workspace));
+        if row.status != RunStatus::Stopped
+            || row.executing_box_id != Some(box_id)
+            || gated
+            || self.cancel_pending(run)
+        {
+            return Ok(false);
+        }
+        self.lease_owners.insert(run, owner);
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Running;
+            row.lease_box_id = Some(box_id);
+            row.lease_expires_at = Some(now + ttl);
+            row.updated_at = now;
+        }
+        Ok(true)
+    }
+
+    /// Whether a `pending` cancel of `run` exists: the hold-off of [`State::stop_run`] and
+    /// [`State::resume_run`] (the cancel wins).
+    fn cancel_pending(&self, run: RunId) -> bool {
+        self.run_commands.values().any(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        })
+    }
+
+    /// MOD-125 M3 D2, D6: the compare-and-set `stopped -> cancelled`, with the run's unsettled
+    /// steps, its pending follow-ups and windows, and its pending cancel; `false` writes nothing.
+    fn cancel_stopped_run(
+        &mut self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self.require_run(run)?;
+        if row.status != RunStatus::Stopped || row.executing_box_id != box_id {
+            return Ok(false);
+        }
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Cancelled;
+            row.finished_at = row.finished_at.or(Some(at));
+            row.updated_at = now;
+        }
+        for step in self
+            .steps
+            .values_mut()
+            .filter(|step| step.run_id == run && !step.status.is_terminal())
+        {
+            step.status = StepStatus::Cancelled;
+            step.finished_at = step.finished_at.or(Some(at));
+            step.updated_at = now;
+        }
+        // `close_dropped_follow_ups` writes for a lease owner only, and a stopped run has none.
+        for window in self.follow_up_windows.values_mut() {
+            if window.run_id == run && window.closed_at.is_none() {
+                window.closed_at = Some(now);
+            }
+        }
+        self.refuse_follow_ups(|row, _| row.run_id == run, FOLLOW_UP_RUN_CANCELLED, now);
+        for command in self.run_commands.values_mut().filter(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        }) {
+            command.status = RunCommandStatus::Applied;
+            command.resolution = None;
+            command.resolved_at = Some(now);
+        }
         Ok(true)
     }
 
@@ -7503,9 +7606,13 @@ impl State {
         for id in losers {
             if let Some(row) = self.steps.get_mut(&id) {
                 row.selected = Some(false);
+                // MOD-125 M3 (L-7): a stopped loser is superseded too.
                 if matches!(
                     row.status,
-                    StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done
+                    StepStatus::Pending
+                        | StepStatus::AwaitingApproval
+                        | StepStatus::Done
+                        | StepStatus::Stopped
                 ) {
                     row.status = StepStatus::Superseded;
                 }
@@ -7513,16 +7620,20 @@ impl State {
             }
         }
         for id in judges {
-            if let Some(row) = self.steps.get_mut(&id)
-                && matches!(
-                    row.status,
-                    StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
-                )
-            {
-                row.status = StepStatus::Done;
-                row.gate_note.clone_from(&reason);
-                row.updated_at = now;
-            }
+            let Some(row) = self.steps.get_mut(&id) else {
+                continue;
+            };
+            let to = match row.status {
+                StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval => {
+                    StepStatus::Done
+                }
+                // MOD-125 M3 (L-7): `stopped -> done` is illegal; a stopped judge is superseded.
+                StepStatus::Stopped => StepStatus::Superseded,
+                _ => continue,
+            };
+            row.status = to;
+            row.gate_note.clone_from(&reason);
+            row.updated_at = now;
         }
         Ok(())
     }
@@ -9737,11 +9848,9 @@ impl State {
         box_id: BoxId,
         now: DateTime<Utc>,
     ) -> Result<CancelRequest> {
-        // MOD-125 M2 R1 (review M-1): a stopped run takes no cancel row, which no executor's
-        // poll would apply; the state's one lock serialises this with `stop_run`.
-        if self.require_run(run)?.status == RunStatus::Stopped {
-            return Err(StoreError::Constraint(cancel_of_a_stopped_run(run)));
-        }
+        // MOD-125 M3 D6: a stopped run takes the cancel too; its box's poll lists it. The
+        // state's one lock serialises this with `stop_run` (MOD-125 M2 R1).
+        self.require_run(run)?;
         self.require_actor(user, box_id, "run_command", "issued")?;
         // MOD-70 D5, B-14: both answers refuse the run's pending follow-ups, idempotently.
         if let Some(pending) = self
@@ -9786,6 +9895,8 @@ impl State {
             };
             row.executing_box_id == Some(box_id)
                 && (row.status.is_terminal()
+                    // MOD-125 M3 D6: a stopped run holds no lease; its box applies the cancel.
+                    || row.status == RunStatus::Stopped
                     || (matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
                         && (!self.lease_owners.contains_key(&run)
                             || row.lease_expires_at.is_none_or(|expiry| expiry <= now))))
@@ -10541,6 +10652,8 @@ impl WriteStore for MemStore {
     }
 
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::Repos)?;
         Ok(self.read(|state| state.repo_rows(project)))
     }
 
@@ -10910,6 +11023,32 @@ impl WriteStore for MemStore {
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         let now = self.now();
         self.write(|state| state.stop_run(run, owner, now))
+    }
+
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        Ok(self.read(|state| state.pending_resumes(box_id)))
+    }
+
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.resume_run(run, box_id, owner, ttl, now))
+    }
+
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.cancel_stopped_run(run, box_id, at, now))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
@@ -16302,6 +16441,142 @@ mod tests {
             None,
             "another position is not part of this fan-out"
         );
+
+        // MOD-125 M3 (L-7): a stopped loser and a stopped judge, in a slot of their own.
+        let kept = gated_step(&store, new_step(ids::RUN_2, 4, 1, 0)).await;
+        let mut halted = Vec::new();
+        for fanout in [1, -1] {
+            let spec = new_step(ids::RUN_2, 4, 1, fanout);
+            let id = spec.id;
+            store.create_step(spec).await.expect("the step lands");
+            for (from, to) in [
+                (StepStatus::Pending, StepStatus::Running),
+                (StepStatus::Running, StepStatus::Stopped),
+            ] {
+                assert!(
+                    store
+                        .transition_step(id, from, to, at)
+                        .await
+                        .expect("the move reads"),
+                    "{from} -> {to} is a sanctioned move"
+                );
+            }
+            halted.push(id);
+        }
+        store
+            .select_fanout(ids::RUN_2, 4, 1, kept, Some("cut short".to_owned()))
+            .await
+            .expect("the selection lands");
+        assert_eq!(
+            (by_id(halted[0]).selected, by_id(halted[0]).status),
+            (Some(false), StepStatus::Superseded),
+            "a stopped loser is superseded"
+        );
+        assert_eq!(
+            (
+                by_id(halted[1]).status,
+                by_id(halted[1]).gate_note.as_deref()
+            ),
+            (StepStatus::Superseded, Some("cut short")),
+            "a stopped judge is superseded, never done, with the reason"
+        );
+        assert_eq!(by_id(kept).status, StepStatus::Done);
+    }
+
+    /// MOD-125 M3 D2: what the generic case cannot read back once the run is terminal. A stopped
+    /// run's cancel row is resolved `applied` with no resolution, its pending follow-up refused
+    /// with `FOLLOW_UP_RUN_CANCELLED` and its windows closed, all in the one write.
+    #[tokio::test]
+    async fn cancel_stopped_run_applies_the_cancel_and_closes_the_windows() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let at = Utc::now();
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run lands")
+            .id;
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                .await
+                .expect("the claim reads"),
+            Claim::Admitted
+        );
+        let spec = new_step(run, 0, 1, 0);
+        let step = spec.id;
+        store.create_step(spec).await.expect("the step lands");
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect("the move reads")
+        );
+        let session = RelaySessionId::new();
+        assert!(
+            store
+                .open_follow_ups(run, step, session, owner)
+                .await
+                .expect("the window opens")
+        );
+        let asked = crate::model::RunCommandId::new();
+        store
+            .request_follow_up(NewFollowUp {
+                id: asked,
+                run_step_id: step,
+                text: FollowUpText::new("use the smaller fixture".to_owned()).expect("prose"),
+                issued_by: ids::USER,
+                issued_box: ids::BOX,
+            })
+            .await
+            .expect("the follow-up is queued");
+        assert!(store.stop_run(run, owner).await.expect("the stop reads"));
+        let CancelRequest::Inserted(cancel) = store
+            .request_cancel(run, ids::USER, ids::BOX)
+            .await
+            .expect("the cancel lands")
+        else {
+            panic!("a stopped run's cancel writes its row");
+        };
+        // The cancel itself refuses the follow-up; put it back to pending to see this write's.
+        store.write(|state| {
+            let row = state.run_commands.get_mut(&asked).expect("the follow-up");
+            row.status = RunCommandStatus::Pending;
+            row.resolution = None;
+            row.resolved_at = None;
+        });
+
+        assert!(
+            store
+                .cancel_stopped_run(run, Some(ids::BOX), at)
+                .await
+                .expect("the cancel reads")
+        );
+        store.read(|state| {
+            let applied = &state.run_commands[&cancel];
+            assert_eq!(
+                (applied.status, applied.resolution.as_deref()),
+                (RunCommandStatus::Applied, None),
+                "the pending cancel is applied"
+            );
+            let refused = &state.run_commands[&asked];
+            assert_eq!(
+                (refused.status, refused.resolution.as_deref()),
+                (
+                    RunCommandStatus::Refused,
+                    Some(crate::model::FOLLOW_UP_RUN_CANCELLED)
+                ),
+                "the pending follow-up is refused with the run"
+            );
+            assert!(
+                state
+                    .follow_up_windows
+                    .values()
+                    .filter(|window| window.run_id == run)
+                    .all(|window| window.closed_at.is_some()),
+                "every window of the run is closed"
+            );
+        });
     }
 
     /// `run_step_tree` and `run_step_commit` upsert on `(run_step_id, repo_id)` and read back in

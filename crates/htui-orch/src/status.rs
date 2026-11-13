@@ -390,6 +390,10 @@ pub enum Cursor {
     },
     /// A `pending` step exists at the first unfinished position: run it.
     Run(StepId),
+    /// MOD-125 M3 D4: a `stopped` step under a `running` run (the run was resumed): walk it on its
+    /// own row, `stopped → running`, reopening its session or walking it again by what its log
+    /// holds. Scheduled as [`Cursor::Run`] is; never a park.
+    Resume(StepId),
     /// A `running`, `awaiting_approval` or `failed` step: the walk cannot advance on its own, and
     /// what happens next is a session, a human's gate answer or the review loop.
     Rest {
@@ -573,10 +577,9 @@ pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) ->
         match step.status {
             StepStatus::Done => {}
             StepStatus::Pending => return Cursor::Run(step.id),
-            StepStatus::Running
-            | StepStatus::AwaitingApproval
-            | StepStatus::Stopped
-            | StepStatus::Failed => {
+            // MOD-125 M3 D4: as `walk::node_state` reads it, or the parity oracle diverges.
+            StepStatus::Stopped => return Cursor::Resume(step.id),
+            StepStatus::Running | StepStatus::AwaitingApproval | StepStatus::Failed => {
                 return Cursor::Rest {
                     step: step.id,
                     status: step.status,
@@ -600,7 +603,8 @@ pub(crate) fn cursor_by_position(snapshot: &GraphSnapshot, steps: &[RunStep]) ->
 /// `superseded` or `selected`, and no gate is waiting on a human. `Decide` and `Loop` (MOD-138 M2
 /// D2) are writes the engine still owes, which a crash, or a decision the isolator could not
 /// read (D6), cut off. `Parts` (MOD-139 M2 D4) is a write the engine owes, as `Decide`. `Rest`,
-/// `Fan` and `Select` are real parks a human has to answer.
+/// `Fan` and `Select` are real parks a human has to answer. `Resume` (MOD-125 M3) is not one
+/// either: a stopped step resumes only through `Engine::resume_stopped`, never a park's resume.
 /// `Engine::resume`'s own walk and `Unblock`'s third case (plan D161) both read this one
 /// predicate, so the two cannot drift.
 #[must_use]
@@ -667,6 +671,7 @@ pub fn position_of(cursor: &Cursor, steps: &[RunStep]) -> Option<i32> {
         | Cursor::Select { position, .. }
         | Cursor::Parts { position } => return Some(*position),
         Cursor::Run(step)
+        | Cursor::Resume(step)
         | Cursor::Rest { step, .. }
         | Cursor::Decide { step }
         | Cursor::Loop { step, .. } => step,
@@ -697,8 +702,11 @@ pub fn run_resumable(snapshot: &GraphSnapshot, steps: &[RunStep]) -> bool {
 ///
 /// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
 /// position before anything else is read; a slot retired whole is re-created at `attempt + 1`; a
-/// `running` candidate or judge rests the walk before a `pending` sibling is driven; a short or
-/// `pending` slot is driven; anything else is settled and goes to selection.
+/// `running` candidate or judge rests the walk before a `pending` sibling is driven; a short slot,
+/// or one with a `pending` or `stopped` candidate, is driven (MOD-125 M3 D4: `drive_group` resumes
+/// a stopped candidate on its own row; resting on it would rest forever, as only `Fan` reaches
+/// `drive_group`); anything else is settled and goes to selection, which re-runs a `stopped`
+/// judge.
 ///
 /// The slot's attempt is the highest over its candidates (every `fanout_index >= 0` row) rather
 /// than [`latest_at`]'s index-0 reading, which agrees whenever a group was created whole (plan
@@ -743,7 +751,11 @@ pub(crate) fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Op
         });
     }
     let short = i32::try_from(group.len()).is_ok_and(|len| len < fan_out);
-    if short || group.iter().any(|step| step.status == StepStatus::Pending) {
+    if short
+        || group
+            .iter()
+            .any(|step| matches!(step.status, StepStatus::Pending | StepStatus::Stopped))
+    {
         return Some(Cursor::Fan { position, attempt });
     }
     Some(Cursor::Select { position, attempt })

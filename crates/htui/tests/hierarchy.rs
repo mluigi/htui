@@ -23,7 +23,7 @@ use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection,
 use htui_core::fixtures::ids;
 use htui_core::model::{
     ItemKindId, NewItemKind, NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch,
-    RunStatus, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::root_path::{DirEntry, DirListing};
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
@@ -877,15 +877,11 @@ async fn delete_reach_equals_deleted_reach() {
 async fn delete_workspace_keeps_its_projects() {
     let store = MemStore::demo();
     let backend = Backend::memory(store.clone());
-    // MOD-125 M2 D9: the demo's stopped `RUN_8` would refuse the delete.
+    // MOD-125 M2 D9: the demo's stopped `RUN_8` would refuse the delete. M3 D6: it has no box, so
+    // its way out is the cancel verb (`cancel_stopped_run(None)`), never a bare transition.
     assert!(
         store
-            .transition_run(
-                ids::RUN_8,
-                RunStatus::Stopped,
-                RunStatus::Cancelled,
-                Utc::now()
-            )
+            .cancel_stopped_run(ids::RUN_8, None, Utc::now())
             .await
             .expect("the store answers"),
         "the demo's stopped member run is cancelled first"

@@ -57,7 +57,6 @@ use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::error::StoreError;
-use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
@@ -287,8 +286,15 @@ pub const CASES: &[&str] = &[
     "pending_stops_is_empty_after_resume",
     "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
     "create_run_naming_a_gone_workspace_reads_switch_workspace",
-    // MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise
-    "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop",
+    // MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise; M3 D6 lets a
+    // stopped run take the cancel its box lists
+    "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop",
+    // MOD-125 M3 (plan D1, D2): resume and cancel of a stopped run
+    "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes",
+    "resume_run_is_a_cas_that_takes_the_lease",
+    "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists",
+    "cancel_stopped_run_settles_run_and_steps_cancelled",
+    "cancel_and_resume_of_one_stopped_run_race_on_one_cas",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -971,9 +977,30 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             ))
             .await;
         }
-        "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop" => {
-            Box::pin(a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop(store))
+        "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop" => {
+            Box::pin(
+                a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop(
+                    store,
+                ),
+            )
+            .await;
+        }
+        "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes" => {
+            Box::pin(pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes(store))
                 .await;
+        }
+        "resume_run_is_a_cas_that_takes_the_lease" => {
+            Box::pin(resume_run_is_a_cas_that_takes_the_lease(store)).await;
+        }
+        "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists" => {
+            Box::pin(a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists(store))
+                .await;
+        }
+        "cancel_stopped_run_settles_run_and_steps_cancelled" => {
+            Box::pin(cancel_stopped_run_settles_run_and_steps_cancelled(store)).await;
+        }
+        "cancel_and_resume_of_one_stopped_run_race_on_one_cas" => {
+            Box::pin(cancel_and_resume_of_one_stopped_run_race_on_one_cas(store)).await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
@@ -5693,6 +5720,28 @@ async fn gated_step<S: WriteStore>(case: &str, store: &S, spec: NewRunStep) -> S
     id
 }
 
+/// MOD-125 M3: creates `spec` and drives it `pending -> running -> stopped`, a step a stop
+/// interrupted. Only the step moves: its run's status is the case's own.
+async fn stopped_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    spec: NewRunStep,
+    at: DateTime<Utc>,
+) -> StepId {
+    let id = spec.id;
+    store.create_step(spec).await.expect(case);
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::Stopped),
+    ] {
+        assert!(
+            store.transition_step(id, from, to, at).await.expect(case),
+            "{case}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    id
+}
+
 /// The one step of `run` with that id, or a panic naming the case: the cases read steps back
 /// through [`ReadStore::run_steps`], never through a store-specific accessor.
 async fn step_row<S: ReadStore>(case: &str, store: &S, run: RunId, step: StepId) -> RunStep {
@@ -8885,37 +8934,54 @@ async fn create_run_naming_a_gone_workspace_reads_switch_workspace<S: WriteStore
     );
 }
 
-/// MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise in the store, so no
-/// cancel row is ever left pending on a `stopped` run, where no executor's poll would apply it
-/// (`pending_commands` lists a run only for its lease owner, which a stop clears, or as a free or
-/// finished run of the box). `request_cancel` refuses a stopped run and writes nothing, and
-/// `stop_run` answers `false` while a cancel of the run is pending (D4: the cancel wins); once
-/// that cancel is resolved the stop goes through.
-async fn a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop<S: WriteStore>(
+/// MOD-125 M3 D6 (retiring M2 R1's refusal, review M-1): a stopped run takes a cancel. Its row is
+/// listed by the poll of the box the run executes on (the run holds no lease, so the box branch of
+/// `pending_commands` is the one that reaches it), never by another box's, and the box applies it
+/// with [`WriteStore::cancel_stopped_run`]. The R1 hold-off is kept: `stop_run` answers `false`
+/// while a cancel of the run is pending (M2 D4: the cancel wins), and goes through once that
+/// cancel is resolved.
+async fn a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop<
+    S: WriteStore,
+>(
     store: &S,
 ) {
-    const CASE: &str = "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop";
+    const CASE: &str =
+        "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop";
     let owner = Uuid::now_v7();
     let stopped = claimed_in(CASE, store, ids::HTUI_ANA_2, None, owner).await;
     assert!(
         store.stop_run(stopped, owner).await.expect(CASE),
         "{CASE}: the first run stops"
     );
-    let cancels_before = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels;
-    assert_eq!(
-        store.request_cancel(stopped, ids::USER, ids::BOX).await,
-        Err(StoreError::Constraint(cancel_of_a_stopped_run(stopped))),
-        "{CASE}: a stopped run's cancel is refused in one readable sentence"
-    );
-    assert_eq!(
-        store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels,
-        cancels_before,
-        "{CASE}: and no pending cancel row was written"
-    );
+    let CancelRequest::Inserted(listed) = cancel_of(CASE, store, stopped).await else {
+        panic!("{CASE}: a stopped run's cancel writes its row");
+    };
     assert_eq!(
         run_row(CASE, store, stopped).await.status,
         RunStatus::Stopped,
-        "{CASE}: the run is still stopped"
+        "{CASE}: the request moves nothing"
+    );
+    assert_eq!(
+        pending_ids(CASE, store, Uuid::now_v7(), ids::BOX).await,
+        vec![listed],
+        "{CASE}: the box's poll lists the stopped run's cancel, whoever polls"
+    );
+    assert!(
+        pending_ids(CASE, store, owner, BoxId::new())
+            .await
+            .is_empty(),
+        "{CASE}: another box's poll does not"
+    );
+    assert!(
+        store
+            .cancel_stopped_run(stopped, Some(ids::BOX), seam_clock())
+            .await
+            .expect(CASE),
+        "{CASE}: the box applies it"
+    );
+    assert!(
+        pending_ids(CASE, store, owner, ids::BOX).await.is_empty(),
+        "{CASE}: and the row is pending no more"
     );
 
     let running = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
@@ -8953,6 +9019,616 @@ async fn a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop<S
     assert!(
         store.stop_run(running, owner).await.expect(CASE),
         "{CASE}: with no cancel pending the stop goes through"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-125 M3 (plan D1, D2): resume through the absence of the `workspace_stop` row. A stopped
+// run of a box whose workspace has no stop row is owed a resume; `resume_run` takes it back
+// under a fresh lease in one compare-and-set, and `cancel_stopped_run` settles it instead.
+// ------------------------------------------------------------------------------------------
+
+/// `pending_resumes(box_id)` restricted to `ours`, in the order it answers: a case reads its own
+/// runs only, whatever else the fixture or an earlier step left on the box.
+async fn resumes_among<S: WriteStore>(
+    case: &str,
+    store: &S,
+    box_id: BoxId,
+    ours: &[RunId],
+) -> Vec<RunId> {
+    store
+        .pending_resumes(box_id)
+        .await
+        .expect(case)
+        .into_iter()
+        .filter(|run| ours.contains(run))
+        .collect()
+}
+
+/// `runs` in `(queued_at, id)` order, read back.
+async fn runs_in_queue_order<S: WriteStore>(case: &str, store: &S, runs: &[RunId]) -> Vec<RunId> {
+    let mut keyed = Vec::new();
+    for run in runs {
+        keyed.push((run_row(case, store, *run).await.queued_at, *run));
+    }
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, run)| run).collect()
+}
+
+/// A fresh workspace named `slug`.
+async fn fresh_workspace<S: WriteStore>(case: &str, store: &S, slug: &str) -> WorkspaceId {
+    store
+        .create_workspace(new_workspace(slug))
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-125 M3 D1, D2: `pending_resumes(box)` lists the box's `stopped` runs whose workspace has
+/// no `workspace_stop` row, in `(queued_at, id)` order: none while the workspace is stopped, each
+/// of them once it resumes. A run without a workspace has no gate row, so it is listed as soon as
+/// it stops. Another box's run, a box-less run (the fixture's `RUN_8`) and a running run never
+/// are.
+async fn pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "resumes").await;
+    let a = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let b = claimed_in(CASE, store, ids::HTUI_CLEAN_1, Some(workspace), owner).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    for run in [a, b] {
+        assert!(
+            store.stop_run(run, owner).await.expect(CASE),
+            "{CASE}: the poll stops {run}"
+        );
+    }
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b]).await,
+        Vec::new(),
+        "{CASE}: no run is owed a resume while its workspace is stopped"
+    );
+
+    let unscoped = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    let u = claimed_in(CASE, store, unscoped, None, owner).await;
+    assert!(
+        store.stop_run(u, owner).await.expect(CASE),
+        "{CASE}: the run without a workspace stops"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b, u]).await,
+        vec![u],
+        "{CASE}: a run without a workspace has no gate row, so it is listed at once"
+    );
+
+    let live_item = mint_tagged(CASE, store, "Live", &[]).await;
+    let live = claimed_in(CASE, store, live_item, None, owner).await;
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b, u, live]).await,
+        runs_in_queue_order(CASE, store, &[a, b, u]).await,
+        "{CASE}: every stopped run of the box, in (queued_at, id) order; never a running one"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, BoxId::new(), &[a, b, u]).await,
+        Vec::new(),
+        "{CASE}: another box is owed none of them"
+    );
+
+    let box_less = run_row(CASE, store, ids::RUN_8).await;
+    assert_eq!(
+        (box_less.status, box_less.executing_box_id),
+        (RunStatus::Stopped, None),
+        "{CASE}: control: the fixture's RUN_8 is stopped and executes nowhere"
+    );
+    store
+        .resume_workspace(ids::WORKSPACE_GRAPHICS)
+        .await
+        .expect(CASE);
+    assert!(
+        !store
+            .pending_resumes(ids::BOX)
+            .await
+            .expect(CASE)
+            .contains(&ids::RUN_8),
+        "{CASE}: a box-less stopped run is never listed: it can only be cancelled"
+    );
+}
+
+/// MOD-125 M3 D2: `resume_run` is one compare-and-set `stopped -> running` that takes the lease
+/// (`lease_owner`, `lease_box_id`, `lease_expires_at = <store now> + ttl`). It refuses, writing
+/// nothing, a run that is not stopped, one executing on another box, one whose workspace is
+/// stopped (again), and one with a pending cancel. A TTL out of range is `Constraint` before any
+/// read, an unknown run `NotFound`. No step moves, and a run without a workspace passes the gate.
+async fn resume_run_is_a_cas_that_takes_the_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "resume_run_is_a_cas_that_takes_the_lease";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    for ttl in [
+        TimeDelta::microseconds(-1),
+        MAX_LEASE_TTL + TimeDelta::microseconds(1),
+    ] {
+        let answer = store.resume_run(RunId::new(), ids::BOX, resumer, ttl).await;
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: a TTL out of range is Constraint before any read, got {answer:?}"
+        );
+    }
+    let unknown = RunId::new();
+    assert_eq!(
+        store.resume_run(unknown, ids::BOX, resumer, LEASE).await,
+        Err(StoreError::NotFound {
+            entity: "run",
+            id: unknown.to_string(),
+        }),
+        "{CASE}: an unknown run is NotFound"
+    );
+
+    let workspace = fresh_workspace(CASE, store, "resumed").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let step = running_step(CASE, store, run, (1, 1, 0), at).await;
+    assert!(
+        !store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a running run is not stopped"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    let stopped = run_row(CASE, store, run).await;
+    let refused = async |what: &str, box_id: BoxId| {
+        assert!(
+            !store
+                .resume_run(run, box_id, resumer, LEASE)
+                .await
+                .expect(CASE),
+            "{CASE}: {what}: refused"
+        );
+        assert_eq!(
+            run_row(CASE, store, run).await,
+            stopped,
+            "{CASE}: {what}: and nothing is written"
+        );
+    };
+    refused("its workspace is stopped", ids::BOX).await;
+
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    refused("it executes on another box", BoxId::new()).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    refused("its workspace is stopped again", ids::BOX).await;
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes again"
+    );
+    let CancelRequest::Inserted(cancel) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the stopped run's cancel writes its row");
+    };
+    refused("a cancel of it is pending", ids::BOX).await;
+    assert!(
+        store
+            .resolve_command(cancel, RunCommandStatus::Refused, Some("test".to_owned()))
+            .await
+            .expect(CASE),
+        "{CASE}: the cancel is resolved"
+    );
+
+    assert!(
+        store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes"
+    );
+    let resumed = run_row(CASE, store, run).await;
+    assert_eq!(
+        (
+            resumed.status,
+            resumed.executing_box_id,
+            resumed.lease_box_id
+        ),
+        (RunStatus::Running, Some(ids::BOX), Some(ids::BOX)),
+        "{CASE}: running on its box, the lease taken there"
+    );
+    assert_leased_for(CASE, &resumed, LEASE, "the resumed run");
+    assert_eq!(
+        step_row(CASE, store, run, step).await.status,
+        StepStatus::Stopped,
+        "{CASE}: no step moves: the engine resumes its steps"
+    );
+    assert!(
+        !store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: the first owner holds nothing"
+    );
+    assert!(
+        store.refresh_lease(run, resumer, LEASE).await.expect(CASE),
+        "{CASE}: the resumer holds the lease"
+    );
+    assert!(
+        !store
+            .resume_run(run, ids::BOX, Uuid::now_v7(), LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a second resume finds the run running"
+    );
+
+    let unscoped = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    let free = claimed_in(CASE, store, unscoped, None, owner).await;
+    assert!(
+        store.stop_run(free, owner).await.expect(CASE),
+        "{CASE}: the run without a workspace stops"
+    );
+    assert!(
+        store
+            .resume_run(free, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a NULL workspace passes the gate"
+    );
+}
+
+/// MOD-125 M3 D2: a stop committed after a resume finds a `running` run leased to the resumer,
+/// which `pending_stops` lists for that owner, so M2 stops it again; once stopped, its workspace
+/// stopped, it is owed no resume.
+async fn a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "restopped").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert!(
+        store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.pending_stops(resumer).await.expect(CASE),
+        vec![PendingStop {
+            run,
+            mode: StopMode::Forced
+        }],
+        "{CASE}: the resumed run is the resumer's to stop"
+    );
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: never the first owner's"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[run]).await,
+        Vec::new(),
+        "{CASE}: a running run is owed no resume"
+    );
+    assert!(
+        store.stop_run(run, resumer).await.expect(CASE),
+        "{CASE}: M2's stop applies to it again"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[run]).await,
+        Vec::new(),
+        "{CASE}: and, its workspace stopped, it waits for the next resume"
+    );
+}
+
+/// MOD-125 M3 D2, D6: `cancel_stopped_run` is one compare-and-set `stopped -> cancelled`, with
+/// `finished_at` the caller's clock. Every step that is not terminal (stopped, pending, failed)
+/// is cancelled with it, a terminal one keeps its status, pending follow-ups are refused and a
+/// pending cancel of the run is resolved. `Some(box)` needs the run to execute on that box,
+/// `None` needs it to execute nowhere. It refuses, writing nothing, a run that is not stopped;
+/// an unknown run is `NotFound`.
+async fn cancel_stopped_run_settles_run_and_steps_cancelled<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_stopped_run_settles_run_and_steps_cancelled";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let when = at + TimeDelta::minutes(1);
+    let unknown = RunId::new();
+    for box_id in [Some(ids::BOX), None] {
+        assert_eq!(
+            store.cancel_stopped_run(unknown, box_id, when).await,
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: unknown.to_string(),
+            }),
+            "{CASE}: an unknown run is NotFound"
+        );
+    }
+
+    let workspace = fresh_workspace(CASE, store, "cancels").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let halted = running_step(CASE, store, run, (0, 1, 0), at).await;
+    let failed = running_step(CASE, store, run, (1, 1, 0), at).await;
+    assert!(
+        store
+            .transition_step(failed, StepStatus::Running, StepStatus::Failed, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the second step fails"
+    );
+    let done = done_step(CASE, store, run, (2, 1, 0), at).await;
+    let pending = store
+        .create_step(new_run_step(run, 3, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let session = window_of(CASE, store, run, halted, owner).await;
+    let asked = queued(CASE, store, follow_up(halted, "use the smaller fixture")).await;
+    assert!(
+        !store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a running run is refused"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.status,
+        RunStatus::Running,
+        "{CASE}: and stays running"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(asked, owner, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Fenced,
+        "{CASE}: control: the follow-up is still pending, its run's lease released"
+    );
+    let stopped = run_row(CASE, store, run).await;
+    for (box_id, what) in [
+        (Some(BoxId::new()), "another box"),
+        (None, "no box, for a run that executes on one"),
+    ] {
+        assert!(
+            !store
+                .cancel_stopped_run(run, box_id, when)
+                .await
+                .expect(CASE),
+            "{CASE}: {what} is refused"
+        );
+        assert_eq!(
+            run_row(CASE, store, run).await,
+            stopped,
+            "{CASE}: {what}: nothing is written"
+        );
+    }
+
+    assert!(
+        store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: the box cancels its stopped run"
+    );
+    let cancelled = run_row(CASE, store, run).await;
+    assert_eq!(
+        (
+            cancelled.status,
+            cancelled.finished_at,
+            cancelled.failure.as_deref()
+        ),
+        (RunStatus::Cancelled, Some(when), None),
+        "{CASE}: cancelled at the caller's clock, no failure"
+    );
+    for (step, status, what) in [
+        (halted, StepStatus::Cancelled, "the stopped step"),
+        (failed, StepStatus::Cancelled, "the failed step"),
+        (pending, StepStatus::Cancelled, "the pending step"),
+        (done, StepStatus::Done, "the done step keeps its status"),
+    ] {
+        assert_eq!(
+            step_row(CASE, store, run, step).await.status,
+            status,
+            "{CASE}: {what}"
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, run, halted).await.finished_at,
+        Some(when),
+        "{CASE}: a cancelled step finishes at the caller's clock"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(asked, owner, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::NotPending,
+        "{CASE}: the pending follow-up was refused with the run"
+    );
+    assert_eq!(
+        store.next_follow_up(halted, session).await.expect(CASE),
+        None,
+        "{CASE}: and the step's window offers nothing"
+    );
+    assert!(
+        !store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: no lease was taken"
+    );
+    assert!(
+        !store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a second cancel finds the run cancelled"
+    );
+
+    let other = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
+    assert!(
+        store.stop_run(other, owner).await.expect(CASE),
+        "{CASE}: a second run stops"
+    );
+    let CancelRequest::Inserted(cancel) = cancel_of(CASE, store, other).await else {
+        panic!("{CASE}: the stopped run's cancel writes its row");
+    };
+    assert!(
+        store
+            .cancel_stopped_run(other, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: the box applies the cancel"
+    );
+    assert!(
+        !store
+            .resolve_command(cancel, RunCommandStatus::Refused, Some("test".to_owned()))
+            .await
+            .expect(CASE),
+        "{CASE}: the pending cancel row was resolved with the run"
+    );
+
+    let before = store.run_steps(ids::RUN_8).await.expect(CASE);
+    assert!(
+        !store
+            .cancel_stopped_run(ids::RUN_8, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a box-less run is refused under a box"
+    );
+    assert!(
+        store
+            .cancel_stopped_run(ids::RUN_8, None, when)
+            .await
+            .expect(CASE),
+        "{CASE}: and cancelled with none"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_8).await.status,
+        RunStatus::Cancelled,
+        "{CASE}: the box-less run is cancelled"
+    );
+    let after = store.run_steps(ids::RUN_8).await.expect(CASE);
+    for step in before {
+        let expected = if step.status.is_terminal() {
+            step.status
+        } else {
+            StepStatus::Cancelled
+        };
+        assert_eq!(
+            after
+                .iter()
+                .find(|row| row.id == step.id)
+                .map(|row| row.status),
+            Some(expected),
+            "{CASE}: RUN_8's step {} was {}",
+            step.id,
+            step.status
+        );
+    }
+}
+
+/// MOD-125 M3 D2, D6: a cancel and a resume of one stopped run contend for the one `stopped`
+/// compare-and-set, so exactly one of them wins: a cancelled run is not resumed, and a resumed
+/// run is not cancelled as a stopped one (it is `running`, under the resumer's lease).
+async fn cancel_and_resume_of_one_stopped_run_race_on_one_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_and_resume_of_one_stopped_run_race_on_one_cas";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let first = claimed_in(CASE, store, ids::HTUI_ANA_2, None, owner).await;
+    let second = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
+    for run in [first, second] {
+        assert!(
+            store.stop_run(run, owner).await.expect(CASE),
+            "{CASE}: {run} stops"
+        );
+    }
+
+    assert!(
+        store
+            .cancel_stopped_run(first, Some(ids::BOX), at)
+            .await
+            .expect(CASE),
+        "{CASE}: the cancel wins the first run"
+    );
+    assert!(
+        !store
+            .resume_run(first, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: and its resume loses"
+    );
+    assert_eq!(
+        run_row(CASE, store, first).await.status,
+        RunStatus::Cancelled,
+        "{CASE}: the first run stays cancelled"
+    );
+    assert!(
+        !store
+            .refresh_lease(first, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: with no lease taken"
+    );
+
+    assert!(
+        store
+            .resume_run(second, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the resume wins the second run"
+    );
+    assert!(
+        !store
+            .cancel_stopped_run(second, Some(ids::BOX), at)
+            .await
+            .expect(CASE),
+        "{CASE}: and its cancel as a stopped run loses"
+    );
+    assert_eq!(
+        run_row(CASE, store, second).await.status,
+        RunStatus::Running,
+        "{CASE}: the second run is running"
+    );
+    assert!(
+        store
+            .refresh_lease(second, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: under the resumer's lease"
     );
 }
 
@@ -13212,6 +13888,41 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
         settled(beaten).await.status,
         StepStatus::Superseded,
         "{CASE}: and so is its loser"
+    );
+
+    // MOD-125 M3 (L-7): a backstop for a slot a stop interrupted. A stopped loser is superseded
+    // like a pending one, and a stopped judge goes to `superseded`, never `done` (`stopped ->
+    // done` is not a move the law sanctions); it records the reason all the same. A fourth slot,
+    // since a slot holds one judge.
+    let kept = gated_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, 0)).await;
+    let halted = stopped_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, 1), at).await;
+    let halted_judge = stopped_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, -1), at).await;
+    store
+        .select_fanout(
+            ids::RUN_2,
+            4,
+            1,
+            kept,
+            Some("the stop cut it short".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    let loser = settled(halted).await;
+    assert_eq!(
+        (loser.selected, loser.status),
+        (Some(false), StepStatus::Superseded),
+        "{CASE}: a stopped loser is superseded"
+    );
+    let judge = settled(halted_judge).await;
+    assert_eq!(
+        (judge.status, judge.gate_note.as_deref()),
+        (StepStatus::Superseded, Some("the stop cut it short")),
+        "{CASE}: a stopped judge is superseded, with the reason"
+    );
+    assert_eq!(
+        settled(kept).await.status,
+        StepStatus::Done,
+        "{CASE}: and the winner is done"
     );
 
     let listed = store

@@ -12,7 +12,7 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 71 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! `WorkerStore` is 75 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
 //! MOD-139 M1 `run_plans`), 8 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
 //! MOD-139 M2 `admit_plan` and `abandon_plans`),
 //! `write_document`, MOD-42's three command methods, MOD-11's
@@ -20,7 +20,8 @@
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
 //! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`, MOD-125 M2 the read
 //! `pending_stops`; MOD-144 R1 adds the write
-//! `block_if_idle`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `block_if_idle`; MOD-125 M3 the read `pending_resumes` and the writes `resume_run`,
+//! `cancel_stopped_run` and `record_opening`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -44,8 +45,8 @@ use crate::model::{
     QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
     ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan,
     RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    Status, StepGraphId, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -288,6 +289,29 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     fn release_lease(&self, run: RunId, owner: Uuid) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::stop_run`].
     fn stop_run(&self, run: RunId, owner: Uuid) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::pending_resumes`].
+    fn pending_resumes(&self, box_id: BoxId) -> impl Future<Output = Result<Vec<RunId>>> + Send;
+    /// [`WriteStore::resume_run`].
+    fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::cancel_stopped_run`].
+    fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::record_opening`].
+    fn record_opening(
+        &self,
+        step: StepId,
+        opening: StepOpening,
+    ) -> impl Future<Output = Result<()>> + Send;
     /// [`WriteStore::create_step`].
     fn create_step(&self, new: NewRunStep) -> impl Future<Output = Result<RunStep>> + Send;
     /// [`WriteStore::transition_run`].
@@ -875,6 +899,29 @@ impl WorkerStore for MemStore {
     }
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::stop_run(self, run, owner).await
+    }
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        WriteStore::pending_resumes(self, box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        WriteStore::resume_run(self, run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::cancel_stopped_run(self, run, box_id, at).await
+    }
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        WriteStore::record_opening(self, step, opening).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await

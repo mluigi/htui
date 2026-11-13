@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex};
 use chrono::TimeDelta;
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
 use htui_agent::driver::{
-    AgentDriver, AgentSession, DriverCaps, DriverFuture, McpServerSpec, PermissionPolicy,
-    SessionSpec,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
+    PermissionPolicy, SessionSpec,
 };
 use htui_agent::error::DriverError;
 use htui_agent::event::{
-    DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, StopReason, ToolCallEvent,
-    ToolKind, UsageEvent,
+    DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, SESSION_STARTED, StopReason,
+    ToolCallEvent, ToolKind, UsageEvent,
 };
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver, SpecSlot};
 use htui_agent::record::{Control, Signal};
@@ -190,6 +190,15 @@ pub struct FakeIsolator {
     unmerged_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
     /// 1-based `reset` calls that never return (counted by `resets`), with their signal.
     reset_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+    /// MOD-125 M3 D4: 1-based `prepare` calls that never return (counted by `prepares`), with
+    /// their signal (one-shot each): a stop before the step's session opened.
+    prepare_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+    /// MOD-125 M3 D5a: how many times [`reacquire`](Isolator::reacquire) has been called,
+    /// refusals included.
+    reacquires: Mutex<u32>,
+    /// MOD-125 M3 D5a: scripted [`reacquire`](Isolator::reacquire) refusals, FIFO, one consumed
+    /// per call.
+    reacquire_refusals: Mutex<VecDeque<String>>,
 }
 
 /// One scripted `premerge` answer (by part key, blueprint P-15: part step ids are minted at
@@ -231,6 +240,8 @@ pub enum IsolatorCall {
     Premerge(StepId),
     /// MOD-139 M3: `unmerged`, the post-check of the **integrate** step.
     Unmerged(StepId),
+    /// MOD-125 M3 D5a: `reacquire` of a stopped step's trees.
+    Reacquire(StepId),
 }
 
 /// Which of a step's two isolator windows is open (MOD-138 M3 T3).
@@ -510,6 +521,25 @@ impl FakeIsolator {
             .expect("no panic holds the fake isolator's lock")
     }
 
+    /// MOD-125 M3 D5a: how many times [`reacquire`](Isolator::reacquire) has been called,
+    /// refusals included.
+    #[must_use]
+    pub fn reacquires(&self) -> u32 {
+        *self
+            .reacquires
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+    }
+
+    /// MOD-125 M3 D5a: make the next [`reacquire`](Isolator::reacquire) refuse with `reason` —
+    /// the real isolator's `moved_while_stopped` — holding no guard afterwards.
+    pub fn refuse_reacquire(&self, reason: &str) {
+        self.reacquire_refusals
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(reason.to_owned());
+    }
+
     /// Make the `n`-th [`reconcile`](Isolator::reconcile) call (1-based, counting every call this
     /// isolator has seen) record itself, signal the returned [`Notify`] and then **never return**
     /// (blueprint F-A, A-2).
@@ -601,6 +631,22 @@ impl FakeIsolator {
     pub fn stall_nth_reset(&self, n: u32) -> Arc<Notify> {
         let notify = Arc::new(Notify::new());
         self.reset_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&notify)));
+        notify
+    }
+
+    /// MOD-125 M3 D4: the `n`-th [`prepare`](Isolator::prepare) call (1-based, as
+    /// [`prepares`](Self::prepares) counts) logs itself, is counted, signals the returned
+    /// [`Notify`] and then **never returns**: a stop before the step's session opened, so its log
+    /// holds no row.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn stall_nth_prepare(&self, n: u32) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.prepare_stall
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .push((n, Arc::clone(&notify)));
@@ -851,10 +897,18 @@ impl Isolator for FakeIsolator {
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
             self.log(IsolatorCall::Prepare(step));
-            *self
-                .prepares
-                .lock()
-                .expect("no panic holds the fake isolator's lock") += 1;
+            let call = {
+                let mut prepares = self
+                    .prepares
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                *prepares += 1;
+                *prepares
+            };
+            if let Some(stalled) = stall_at(&self.prepare_stall, call) {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
             if let Some(reason) = self
                 .refusals
                 .lock()
@@ -1280,6 +1334,53 @@ impl Isolator for FakeIsolator {
             };
             // Dropped outside the `std` lock: dropping a guard wakes a waiter.
             drop(released);
+            Ok(())
+        })
+    }
+
+    /// MOD-125 M3 D5a: logged and counted; a scripted refusal answers with the step holding
+    /// nothing. Otherwise a `shared_serialized` row retakes [`serial`](FakeIsolator::serial) as
+    /// `prepare` does (its own guard dropped first, so a second call never waits on itself), held
+    /// to the step's `capture`, and the step's tree window reopens. Nothing is minted or reset.
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        Box::pin(async move {
+            self.log(IsolatorCall::Reacquire(step));
+            *self
+                .reacquires
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+            let refusal = self
+                .reacquire_refusals
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front();
+            if let Some(reason) = refusal {
+                drop(self.release_step(step));
+                return Err(IsolateError::Refused(reason));
+            }
+            if trees
+                .iter()
+                .any(|tree| tree.mode == Isolation::SharedSerialized)
+            {
+                drop(self.release_step(step));
+                let guard = Arc::clone(&self.serial).lock_owned().await;
+                self.held
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock")
+                    .insert((run, step), guard);
+            }
+            self.open_window(
+                step,
+                Window::Tree,
+                trees.iter().any(|tree| {
+                    matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized)
+                }),
+            );
             Ok(())
         })
     }
@@ -2170,6 +2271,15 @@ pub struct FakeOrchestrator {
     /// ([`suspend_after_done`](Self::suspend_after_done)), the signal that wakes it. Never carried
     /// by [`restarted`](Self::restarted).
     stalls: Mutex<BTreeMap<ScriptKey, Stall>>,
+    /// MOD-125 M3 D9: the start failures the next driver of a key answers first
+    /// ([`refuse_resume`](Self::refuse_resume)), keyed like `scripts` and taken by that driver.
+    /// Never carried by [`restarted`](Self::restarted).
+    resume_refusals: Mutex<BTreeMap<ScriptKey, Vec<DriverError>>>,
+    /// MOD-125 M3 F1 (review L4): the session id the next driver of a key reports in its banner
+    /// in place of the fake's derived `fake-<step>` ([`rename_banner`](Self::rename_banner)),
+    /// keyed like `scripts` and taken by that driver. Never carried by
+    /// [`restarted`](Self::restarted).
+    banners: Mutex<BTreeMap<ScriptKey, String>>,
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
@@ -2282,6 +2392,8 @@ struct Counted {
     inner: Box<dyn AgentDriver>,
     sessions: Arc<Sessions>,
     hold: Option<Arc<HoldState>>,
+    /// MOD-125 M3 F1: the session id its session reports in place of the fake's own.
+    banner: Option<AgentSessionRef>,
 }
 
 impl AgentDriver for Counted {
@@ -2306,6 +2418,7 @@ impl AgentDriver for Counted {
                 inner,
                 sessions: Arc::clone(&self.sessions),
                 hold: self.hold.clone(),
+                banner: self.banner.clone(),
                 first: true,
                 arrived: false,
                 cancelled: false,
@@ -2320,6 +2433,8 @@ struct CountedSession {
     inner: Box<dyn AgentSession>,
     sessions: Arc<Sessions>,
     hold: Option<Arc<HoldState>>,
+    /// MOD-125 M3 F1: the id its banner and `session_ref` report in place of the inner one's.
+    banner: Option<AgentSessionRef>,
     /// Before the first event: the interleaving yield and the hold still apply.
     first: bool,
     /// The hold counted this session live.
@@ -2335,8 +2450,8 @@ impl Drop for CountedSession {
 }
 
 impl AgentSession for CountedSession {
-    fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
-        self.inner.session_ref()
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.banner.as_ref().or_else(|| self.inner.session_ref())
     }
 
     fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>> {
@@ -2360,7 +2475,14 @@ impl AgentSession for CountedSession {
                 }
                 self.first = false;
             }
-            self.inner.next_event().await
+            let mut envelope = self.inner.next_event().await?;
+            if let (Some(banner), Some(envelope)) = (&self.banner, envelope.as_mut())
+                && let DriverEvent::Other(other) = &mut envelope.event
+                && other.update == SESSION_STARTED
+            {
+                other.body["session_id"] = serde_json::Value::from(banner.as_str());
+            }
+            Ok(envelope)
         })
     }
 
@@ -2419,6 +2541,8 @@ impl FakeOrchestrator {
             candidates: Mutex::new(BTreeMap::new()),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            resume_refusals: Mutex::new(BTreeMap::new()),
+            banners: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
             missing_templates: Mutex::new(BTreeSet::new()),
             tails: Mutex::new(Tails::Walk),
@@ -2478,6 +2602,8 @@ impl FakeOrchestrator {
             candidates: Mutex::new(candidates),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            resume_refusals: Mutex::new(BTreeMap::new()),
+            banners: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(
                 self.refused_prompts
                     .lock()
@@ -2708,6 +2834,72 @@ impl FakeOrchestrator {
             );
     }
 
+    /// MOD-125 M3 D9: the next driver of `(phase, attempt)` (or of one session's `slot`, as
+    /// [`script_candidate`](Self::script_candidate) keys it) answers its first `start` with
+    /// `DriverError::Transport(reason)` and plays its script on the next: a resume that fails on
+    /// the wire, then the fresh start that falls back. One-shot: the driver takes it.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str) {
+        self.resume_refusals
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                (phase.to_owned(), attempt, slot),
+                vec![DriverError::Transport(reason.to_owned())],
+            );
+    }
+
+    /// The start failures [`refuse_resume`](Self::refuse_resume) queued for `key`, the exact
+    /// session's before its `(phase, attempt)`'s, taken.
+    fn take_resume_refusals(&self, key: &SessionKey<'_>) -> Vec<DriverError> {
+        let mut refusals = self
+            .resume_refusals
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock");
+        refusals
+            .remove(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| refusals.remove(&(key.phase.to_owned(), key.attempt, None)))
+            .unwrap_or_default()
+    }
+
+    /// MOD-125 M3 F1 (review L4): the next session of `(phase, attempt)` (or of one session's
+    /// `slot`, as [`script_candidate`](Self::script_candidate) keys it) reports `id` as its
+    /// banner's `session_id` and its `session_ref`, where the fake would derive `fake-<step>`. A
+    /// resume of it then reopens `id`, which the fake's derived id cannot pass for. One-shot: the
+    /// driver takes it.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn rename_banner(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, id: &str) {
+        self.banners
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert((phase.to_owned(), attempt, slot), id.to_owned());
+    }
+
+    /// The banner id [`rename_banner`](Self::rename_banner) queued for `key`, the exact
+    /// session's before its `(phase, attempt)`'s, taken.
+    fn take_banner(&self, key: &SessionKey<'_>) -> Option<AgentSessionRef> {
+        let mut banners = self
+            .banners
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock");
+        banners
+            .remove(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| banners.remove(&(key.phase.to_owned(), key.attempt, None)))
+            .map(AgentSessionRef::new)
+    }
+
     /// Replace the driver capabilities every session is built with.
     ///
     /// The CLI-shaped profile — `permission_requests` and `edit_proposals` both false — is what
@@ -2926,6 +3118,7 @@ impl FakeOrchestrator {
             inner: self.scripted_driver(key),
             sessions: Arc::clone(&self.sessions),
             hold: self.hold_for(key),
+            banner: self.take_banner(key),
         })
     }
 
@@ -2939,7 +3132,9 @@ impl FakeOrchestrator {
                 reason,
             }),
             None => {
-                let driver = FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script);
+                // MOD-125 M3 D9: a refused resume answers the first start, the script the next.
+                let driver = FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script)
+                    .failing_starts(self.take_resume_refusals(key));
                 // MOD-11 D9: the handle is taken before the driver is boxed.
                 self.specs
                     .lock()
@@ -4008,6 +4203,155 @@ mod tests {
             ],
             "each stalled call was logged first"
         );
+    }
+
+    /// Whether a `shared_serialized` prepare of `run` is admitted within `wait` (and its guard
+    /// then given back).
+    async fn fake_isolator_admits(
+        isolator: &FakeIsolator,
+        run: htui_core::model::RunId,
+        wait_ms: u64,
+    ) -> bool {
+        let admitted = tokio::time::timeout(
+            std::time::Duration::from_millis(wait_ms),
+            isolator.prepare(
+                run,
+                StepId::new(),
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .is_ok();
+        isolator.release(run).await.expect("release answers");
+        admitted
+    }
+
+    /// MOD-125 M3 D5a: the fake's `reacquire` logs and counts itself, retakes the serial lock for
+    /// a `shared_serialized` row (without waiting on a guard the step still holds) and keeps it to
+    /// the step's `capture`; rows in no shared mode take nothing.
+    #[tokio::test]
+    async fn fake_isolate_reacquire_retakes_a_shared_guard_until_capture() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(
+                ids::RUN_1,
+                step,
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the step prepares");
+        let rows = prepared
+            .trees
+            .iter()
+            .map(|prepared| prepared.tree.clone())
+            .collect::<Vec<_>>();
+        isolator.release(ids::RUN_1).await.expect("release answers");
+        assert!(fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await);
+
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("the fake reacquires");
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("a second reacquire does not wait on its own guard");
+        assert_eq!(isolator.reacquires(), 2);
+        assert!(
+            !fake_isolator_admits(&isolator, ids::RUN_2, 50).await,
+            "the reacquired guard is held"
+        );
+        let log = isolator.call_log();
+        let reacquires = log
+            .iter()
+            .filter(|call| matches!(call, IsolatorCall::Reacquire(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(reacquires, vec![IsolatorCall::Reacquire(step); 2]);
+        let released = log
+            .iter()
+            .position(|call| *call == IsolatorCall::Release(ids::RUN_1))
+            .expect("the stop's release is logged");
+        let reacquired = log
+            .iter()
+            .position(|call| *call == IsolatorCall::Reacquire(step))
+            .expect("the reacquire is logged");
+        assert!(released < reacquired, "{log:?}");
+
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "capture released the reacquired guard"
+        );
+
+        let local = StepId::new();
+        let local_rows = rows
+            .iter()
+            .map(|row| htui_core::model::RunStepTree {
+                run_step_id: local,
+                mode: Isolation::Local,
+                ..row.clone()
+            })
+            .collect::<Vec<_>>();
+        isolator
+            .reacquire(ids::RUN_1, local, &local_rows)
+            .await
+            .expect("a local row reacquires");
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "a local row takes no guard"
+        );
+    }
+
+    /// MOD-125 M3 D5a: `refuse_reacquire` queues the next `reacquire`'s refusal, which is
+    /// answered verbatim with no guard held afterwards.
+    #[tokio::test]
+    async fn fake_isolate_refuse_reacquire_answers_the_reason_and_holds_nothing() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(
+                ids::RUN_1,
+                step,
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the step prepares");
+        let rows = prepared
+            .trees
+            .iter()
+            .map(|prepared| prepared.tree.clone())
+            .collect::<Vec<_>>();
+        let reason = "moved_while_stopped: /x at a, base_ref b";
+        isolator.refuse_reacquire(reason);
+
+        let err = isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect_err("the scripted refusal answers");
+        assert!(
+            matches!(&err, IsolateError::Refused(refused) if refused == reason),
+            "{err}"
+        );
+        assert_eq!(isolator.reacquires(), 1);
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "a refused reacquire holds nothing, the prepare's guard included"
+        );
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("the queue held one refusal");
     }
 
     /// D99 over F-I's re-key: `release(run)` drops the guard a step of that run holds, and only

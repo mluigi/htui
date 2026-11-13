@@ -20,22 +20,21 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
-    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
-    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemState,
-    MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject,
-    NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus,
-    Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
-    RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
-    RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
-    StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch,
+    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
+    FollowUpSettle, FollowUpText, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemState, MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch,
+    MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem,
+    NewMemoryEntry, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission,
+    PermissionId, PermissionStatus, Priority, ProjectId, QueuedFollowUp, RelayOption,
+    RelayOptionKind, RelaySessionId, RepoId, RequirementId, RunCommandId, RunCommandStatus, RunId,
+    RunMode, RunStatus, RunStepCommit, RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph,
+    SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
+    Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
-use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
@@ -8023,17 +8022,31 @@ async fn wait_blocked_on(db: &common::TestDb, holder_pid: i32, what: &str) {
     }
 }
 
-/// MOD-125 M2 R1 (review M-1): a cancel requested while a stop of the run is in flight waits on
-/// the stop's run lock (`request_cancel` reads the run `FOR SHARE`) and, once the stop commits,
-/// is refused in [`cancel_of_a_stopped_run`]'s sentence, writing no `run_command` row that no
-/// executor would ever apply. A raw transaction holds the run as `stop_run` does (`FOR NO KEY
-/// UPDATE`, then the move), uncommitted.
+/// MOD-125 M2 R1 (review M-1), reworked for M3 D6: a cancel requested while a stop of the run is
+/// in flight waits on the stop's run lock (`request_cancel` reads the run `FOR SHARE`) and, once
+/// the stop commits, writes its row on the `stopped` run, which the box's poll lists (the run
+/// holds no lease) and `cancel_stopped_run` applies. A raw transaction holds the run as
+/// `stop_run` does (`FOR NO KEY UPDATE`, then the move), uncommitted. MOD-125 M3 F2: the step's
+/// open follow-up window closes when `cancel_stopped_run` applies the cancel. The pending
+/// follow-up is refused with [`FOLLOW_UP_RUN_CANCELLED`] already by `request_cancel`'s insert;
+/// `cancel_stopped_run`'s own refusal is pinned by
+/// `a_direct_cancel_of_a_stopped_run_closes_its_window_and_refuses_its_follow_up`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancel_racing_a_stop_waits_for_it_and_is_refused() {
+async fn a_cancel_racing_a_stop_waits_for_it_and_lands_for_the_box() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    let (run, _step, _owner) = leased_running_step(&db).await;
+    let (run, step, _owner, _session) = follow_up_window(&db).await;
+    let follow_up = follow_up_from(&db.store, step, "use the smaller fixture");
+    let follow_up_id = follow_up.id;
+    assert_eq!(
+        db.store
+            .request_follow_up(follow_up)
+            .await
+            .expect("the enqueue is answered"),
+        FollowUpRequest::Queued(follow_up_id),
+        "a follow-up is pending on the running step"
+    );
     let mut holder = db.pool.begin().await.expect("begin holder");
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *holder)
@@ -8061,19 +8074,268 @@ async fn a_cancel_racing_a_stop_waits_for_it_and_is_refused() {
         .await
         .expect("the cancel answers within 5 s")
         .expect("the cancel task joins");
-    assert_eq!(
-        answer,
-        Err(htui_core::store::StoreError::Constraint(
-            cancel_of_a_stopped_run(run)
-        )),
-        "the cancel sees the committed stop and is refused"
+    let Ok(CancelRequest::Inserted(row)) = answer else {
+        panic!("the cancel lands on the stopped run, got {answer:?}");
+    };
+    let listed: Vec<RunCommandId> = db
+        .store
+        .pending_commands(uuid::Uuid::now_v7(), ids::BOX)
+        .await
+        .expect("read the box's commands")
+        .into_iter()
+        .map(|command| command.id)
+        .collect();
+    assert_eq!(listed, vec![row], "the box's poll lists it");
+    assert!(
+        db.store
+            .cancel_stopped_run(run, Some(ids::BOX), Utc::now())
+            .await
+            .expect("apply the cancel"),
+        "the box applies it"
     );
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM run_command WHERE run_id = $1")
-        .bind(run.as_uuid())
+    let status: String = sqlx::query_scalar("SELECT status FROM run_command WHERE id = $1")
+        .bind(row.as_uuid())
         .fetch_one(&db.pool)
         .await
-        .expect("count the run's commands");
-    assert_eq!(rows, 0, "no cancel row was left on the stopped run");
+        .expect("read the cancel row");
+    assert_eq!(status, "applied", "the cancel row is applied with the run");
+    let (windows, open): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL) \
+           FROM follow_up_window WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the run's follow-up windows");
+    assert_eq!(
+        (windows, open),
+        (1, 0),
+        "the cancel closes the run's follow-up window"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![(
+            "refused".to_owned(),
+            Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+            true
+        )],
+        "the pending follow-up is refused as the run was cancelled, and keeps no text"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-125 M3 F2: the direct cancel of a stopped run (no `request_cancel` first, so nothing has
+/// refused the follow-up yet) closes the step's open follow-up window and refuses its pending
+/// follow-up with [`FOLLOW_UP_RUN_CANCELLED`], in `cancel_stopped_run`'s own transaction. The
+/// follow-up is queued while the step runs: once the run is stopped, `request_follow_up` needs a
+/// running step and a live lease, so this is the only way one reaches the cancel unrefused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_cancel_of_a_stopped_run_closes_its_window_and_refuses_its_follow_up() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner, _session) = follow_up_window(&db).await;
+    let follow_up = follow_up_from(&db.store, step, "use the smaller fixture");
+    let follow_up_id = follow_up.id;
+    assert_eq!(
+        db.store
+            .request_follow_up(follow_up)
+            .await
+            .expect("the enqueue is answered"),
+        FollowUpRequest::Queued(follow_up_id),
+        "a follow-up is pending on the running step"
+    );
+    assert!(
+        db.store.stop_run(run, owner).await.expect("stop the run"),
+        "the poll stops the run"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![("pending".to_owned(), None, false)],
+        "the stop leaves the follow-up pending"
+    );
+    assert!(
+        db.store
+            .cancel_stopped_run(run, Some(ids::BOX), Utc::now())
+            .await
+            .expect("apply the cancel"),
+        "the box cancels the stopped run directly"
+    );
+    let (windows, open): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL) \
+           FROM follow_up_window WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the run's follow-up windows");
+    assert_eq!(
+        (windows, open),
+        (1, 0),
+        "the cancel closes the run's follow-up window"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![(
+            "refused".to_owned(),
+            Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+            true
+        )],
+        "the cancel refuses the pending follow-up as the run was cancelled, and drops its text"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-125 M3 D2: a stopped run of a stopped workspace, leased by nobody, for the resume races.
+async fn stopped_in_a_stopped_workspace(db: &common::TestDb) -> RunId {
+    let owner = uuid::Uuid::now_v7();
+    let run = db
+        .store
+        .create_run(NewRun {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("queue a graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, owner, Utc::now(), TimeDelta::minutes(30))
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "the owner leases the run"
+    );
+    db.store
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            StopMode::Graceful,
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("stop the workspace");
+    assert!(
+        db.store.stop_run(run, owner).await.expect("stop the run"),
+        "the poll stops the run"
+    );
+    run
+}
+
+/// MOD-125 M3 D2, the race twin of a resume and a stop: `resume_run` reads the stop row `FOR
+/// SHARE`, so a workspace resume (`DELETE`) in flight holds it until it ends. Rolled back, the
+/// stop stands and the resume is refused; committed, the resume goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_waits_for_a_workspace_resume_in_flight_and_reads_its_outcome() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let run = stopped_in_a_stopped_workspace(&db).await;
+    let resumer = uuid::Uuid::now_v7();
+    for commit in [false, true] {
+        let mut holder = db.pool.begin().await.expect("begin holder");
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .expect("read the holder's pid");
+        sqlx::query("DELETE FROM workspace_stop WHERE workspace_id = $1")
+            .bind(ids::WORKSPACE_PLATFORM.as_uuid())
+            .execute(&mut *holder)
+            .await
+            .expect("the holder resumes the workspace, uncommitted");
+        let store = db.store.clone();
+        let resume = tokio::spawn(async move {
+            store
+                .resume_run(run, ids::BOX, resumer, TimeDelta::minutes(5))
+                .await
+        });
+        wait_blocked_on(&db, holder_pid, "the resume").await;
+        assert!(
+            !resume.is_finished(),
+            "the resume answered while the workspace resume was in flight"
+        );
+        if commit {
+            holder.commit().await.expect("the holder commits");
+        } else {
+            holder.rollback().await.expect("the holder rolls back");
+        }
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), resume)
+            .await
+            .expect("the resume answers within 5 s")
+            .expect("the resume task joins")
+            .expect("the resume reads");
+        assert_eq!(
+            answer, commit,
+            "the resume follows the workspace resume's outcome (committed: {commit})"
+        );
+        let status = db
+            .store
+            .run(run)
+            .await
+            .expect("read the run")
+            .expect("the run exists")
+            .status;
+        let expected = if commit {
+            RunStatus::Running
+        } else {
+            RunStatus::Stopped
+        };
+        assert_eq!(status, expected, "the run (committed: {commit})");
+    }
+    db.drop_db().await;
+}
+
+/// MOD-125 M3 D2, the other half of the twin: a stop inserted after the resume's gate read (the
+/// insert uncommitted, so the read sees no row and takes no lock on it) does not hold the resume
+/// off. The run comes back `running` under the resumer's lease, and once the stop commits
+/// `pending_stops` lists it for that owner, so M2 stops it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_committed_after_a_resume_finds_the_run_running_and_listed() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let run = stopped_in_a_stopped_workspace(&db).await;
+    assert!(
+        db.store
+            .resume_workspace(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("resume the workspace"),
+        "the workspace resumes"
+    );
+    let mut holder = db.pool.begin().await.expect("begin holder");
+    sqlx::query(
+        "INSERT INTO workspace_stop (workspace_id, mode, requested_by, requested_at)
+         VALUES ($1, 'forced', $2, clock_timestamp())",
+    )
+    .bind(ids::WORKSPACE_PLATFORM.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .execute(&mut *holder)
+    .await
+    .expect("the holder stops the workspace, uncommitted");
+    let resumer = uuid::Uuid::now_v7();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.store
+                .resume_run(run, ids::BOX, resumer, TimeDelta::minutes(5)),
+        )
+        .await
+        .expect("the resume does not wait on an uncommitted insert")
+        .expect("the resume reads"),
+        "the resume goes through"
+    );
+    holder.commit().await.expect("the holder commits the stop");
+    assert_eq!(
+        db.store
+            .pending_stops(resumer)
+            .await
+            .expect("read the stops"),
+        vec![htui_core::model::PendingStop {
+            run,
+            mode: StopMode::Forced
+        }],
+        "the resumed run is the resumer's to stop"
+    );
     db.drop_db().await;
 }
 

@@ -166,8 +166,11 @@ str_enum!(
         Running => "running",
         /// Stopped at a gate.
         AwaitingApproval => "awaiting_approval",
-        /// Interrupted by a workspace stop (MOD-125 D1); resumes to `running` (M3), or is
-        /// superseded by a fresh rerun (M3's fallback), or is cancelled or failed with its run.
+        /// Interrupted by a workspace stop (MOD-125 D1). Resumes to `running` on its own row (M3):
+        /// its agent session reopened, or, when that cannot be done, a fresh session on the same
+        /// row and attempt opened with the handoff text (M3's fallback). Otherwise cancelled or
+        /// failed with its run, or superseded when `select_fanout` passes over it: a stopped
+        /// fan-out loser, or a stopped judge whose group was decided (MOD-125 M1 L-7).
         Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
@@ -255,14 +258,16 @@ str_enum!(
 );
 
 str_enum!(
-    /// `run_step.opening` (MOD-37 M5, R-48): how a promoted step's chat opened. `NULL` on a step
-    /// never bound to a promoted chat.
+    /// `run_step.opening` (MOD-37 M5, R-48): how a promoted step's chat opened, or how a stopped
+    /// step's session reopened when it resumed (MOD-125 M3). `NULL` on a step never bound to a
+    /// promoted chat and never resumed through its saved session.
     StepOpening {
         /// The step's own agent session was restored.
         Resumed => "resumed",
         /// A fresh session opened with the handoff prompt.
         Handoff => "handoff",
-        /// A requested resume failed; the chat opened with the handoff prompt instead.
+        /// A requested resume failed; the session opened fresh, with the handoff prompt (a
+        /// promoted chat) or the stop's fallback text on the same row (a resumed stopped step).
         ResumeFailed => "resume_failed",
     }
 );
@@ -1766,6 +1771,8 @@ mod tests {
         (RunStatus::Running, RunStatus::Stopped),
         (RunStatus::Stopped, RunStatus::Running),
         (RunStatus::Stopped, RunStatus::Cancelled),
+        // M3 dropped `stopped -> failed` from the document's table; the law keeps it, written by
+        // nothing (`docs/ANA-2.md`'s M3 amendment): `fail_run` admits a stopped run on both stores.
         (RunStatus::Stopped, RunStatus::Failed),
         // `done`, `failed`, `cancelled` are terminal.
     ];

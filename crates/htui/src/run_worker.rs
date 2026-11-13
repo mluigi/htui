@@ -4657,42 +4657,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// MOD-125 M2 R1 (review M-1, defence in depth): a pending cancel that reaches a `stopped` run
-    /// (one requested before a stop the store did not yet serialise against it) is resolved
-    /// `refused` in the store's sentence by the poll that lists it, rather than left pending for
-    /// the run's resume to fire; the run stays `stopped` and the next poll lists nothing.
-    #[tokio::test]
-    async fn a_polled_cancel_of_a_stopped_run_is_resolved_refused() {
-        let fixture = Fixture::new().await;
-        let mut runtime = fixture.runtime();
-        let run = held_here(&fixture, &runtime, ids::HTUI_ANA_2).await;
-        let id = requested(&fixture, run).await;
-        assert!(
-            fixture
-                .store
-                .transition_run(run, RunStatus::Running, RunStatus::Stopped, Utc::now())
-                .await
-                .expect("the move answers"),
-            "the run stops under its pending cancel"
-        );
-        polled(&mut runtime, &fixture).await;
-        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
-        assert_eq!(
-            commands_of(&fixture, run)
-                .iter()
-                .map(|row| (row.id, row.status, row.resolution.clone()))
-                .collect::<Vec<_>>(),
-            [(
-                id,
-                RunCommandStatus::Refused,
-                Some(htui_core::store::traits::cancel_of_a_stopped_run(run))
-            )],
-            "the stranded cancel is refused in the store's words"
-        );
-        polled(&mut runtime, &fixture).await;
-        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
-    }
-
     /// D4: a run this process leases with no live walk (a sweep adoption before its child, a dead
     /// walk) goes straight to `settle_stop`: `stopped`, its lease given back.
     #[tokio::test]
@@ -4729,6 +4693,375 @@ pub(crate) mod tests {
         let _worker = Worker::spawn(&fixture.store, runtime);
         rests_at(&fixture, run, RunStatus::Stopped).await;
         assert!(commands_of(&fixture, run).is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-125 M3 T5: the command poll resumes a stopped run; a stopped run's cancel (D1, D6, D8)
+    // -----------------------------------------------------------------------------------------
+
+    /// A [`held_here`] run of `item` in `PLATFORM`, stopped by `runtime`'s own poll (`stop_run`
+    /// through `settle_stop`, never a bare transition: D1); `PLATFORM` stays stopped.
+    async fn stopped_here(fixture: &Fixture, runtime: &mut RunRuntime, item: ItemId) -> RunId {
+        let run = held_here(fixture, runtime, item).await;
+        stop_platform(fixture, StopMode::Graceful).await;
+        polled(runtime, fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
+        run
+    }
+
+    /// `PLATFORM` resumed, as M1's verb does: its `workspace_stop` row goes, which is the resume
+    /// request (D1).
+    async fn resume_platform(fixture: &Fixture) {
+        assert!(
+            fixture
+                .store
+                .resume_workspace(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect("the resume answers"),
+            "PLATFORM was stopped"
+        );
+    }
+
+    /// One command poll of `runtime`, not settled: its tasks run on. The receiver keeps the sink's
+    /// channel open.
+    fn polled_unsettled(
+        runtime: &mut RunRuntime,
+        fixture: &Fixture,
+    ) -> mpsc::UnboundedReceiver<ReplyEnvelope> {
+        let (replies, answers) = mpsc::unbounded_channel();
+        runtime.poll_commands(
+            &Backend::memory(fixture.store.clone()),
+            &replies,
+            &LiveChats::default(),
+        );
+        answers
+    }
+
+    /// D1, D8: a run stopped in `PLATFORM` is owed a resume once `PLATFORM` resumes: the next
+    /// command poll lists it (`pending_resumes(box)`) and walks it on a task of its own, under the
+    /// lease `resume_run` takes, to its next rest (the first phase's gate). Nothing is written to
+    /// `run_command`.
+    #[tokio::test(start_paused = true)]
+    async fn the_command_poll_resumes_a_stopped_run_once_its_workspace_resumes() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = stopped_here(&fixture, &mut runtime, ids::HTUI_ANA_2).await;
+        assert!(
+            fixture.steps(run).await.is_empty(),
+            "stopped before its first step"
+        );
+
+        resume_platform(&fixture).await;
+        polled(&mut runtime, &fixture).await;
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.finished_at, row.executing_box_id),
+            (RunStatus::AwaitingApproval, None, Some(ids::BOX)),
+            "resumed on its own box and walked to the gate"
+        );
+        assert_eq!(fixture.steps(run).await.len(), 1, "one walk");
+        assert!(
+            commands_of(&fixture, run).is_empty(),
+            "a resume writes no row"
+        );
+    }
+
+    /// D8: a resume in flight is not applied again. The case holds the run's lock, so the first
+    /// poll's resume task waits on it with the run still `stopped` and listed; later polls spawn
+    /// no second task of it. Released, the one walk rests at the gate with one step.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_is_not_applied_twice() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = stopped_here(&fixture, &mut runtime, ids::HTUI_ANA_2).await;
+        resume_platform(&fixture).await;
+        let probe = testing::probe(&runtime);
+        let lock = probe.try_lock(run).expect("nobody holds the run's lock");
+
+        let mut channels = vec![polled_unsettled(&mut runtime, &fixture)];
+        within("the resume task waiting on the run's lock", async {
+            while probe.tasks_on(run) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        for _ in 0..2 {
+            // Paused time: the sleep ends once every task idles, so the poll before has ended.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            channels.push(polled_unsettled(&mut runtime, &fixture));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(probe.tasks_on(run), 1, "one resume task");
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Stopped,
+            "still listed: the CAS waits on the lock"
+        );
+
+        drop(lock);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+        assert_eq!(fixture.steps(run).await.len(), 1, "one walk");
+        drop(channels);
+    }
+
+    /// D1: a stopped run whose workspace is stopped is owed nothing: polls leave it `stopped` and
+    /// walk nothing, and so does a resume the workspace's second stop undid before any poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_workspace_is_not_resumed() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = stopped_here(&fixture, &mut runtime, ids::HTUI_ANA_2).await;
+        polled(&mut runtime, &fixture).await;
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
+
+        resume_platform(&fixture).await;
+        stop_platform(&fixture, StopMode::Forced).await;
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// D4, D8: a resumed walk is a walk like any other. Stopped while its session parks, resumed,
+    /// stopped again while the resumed session parks, and resumed once more, the step is the same
+    /// row and attempt throughout, and the second resume walks it to the gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_walk_can_be_stopped_again() {
+        let fixture = Fixture::new().await;
+        fixture.sessions.push(Play::Park(Park::new()));
+        fixture.sessions.push(Play::Park(Park::new()));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        stop_platform(&fixture, StopMode::Graceful).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
+        );
+
+        resume_platform(&fixture).await;
+        let again = a_pending_request(&fixture).await;
+        assert_ne!(again.id, parked.id, "the resumed session parked anew");
+        assert_eq!(
+            (again.run_id, again.run_step_id),
+            (run, parked.run_step_id),
+            "the step resumed on its own row"
+        );
+        stop_platform(&fixture, StopMode::Graceful).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        let step = step_at(&fixture, run, 0).await;
+        assert_eq!(
+            (step.id, step.attempt, step.status),
+            (parked.run_step_id, 1, StepStatus::Stopped)
+        );
+
+        resume_platform(&fixture).await;
+        rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+        assert_eq!(
+            fixture
+                .steps(run)
+                .await
+                .iter()
+                .map(|step| (step.id, step.attempt))
+                .collect::<Vec<_>>(),
+            [(parked.run_step_id, 1)],
+            "no second row and no retry spent"
+        );
+    }
+
+    /// Plan acceptance (M3 F2): the walk of `ANA-2` in `PLATFORM`, with no gate on `ANA`'s
+    /// phases, stopped in `mode` while its first session parks, then resumed: it runs to `done`,
+    /// its first step finished on the row and attempt the stop left.
+    async fn a_stop_resumes_to_done(mode: StopMode) {
+        let mut data = htui_core::fixtures::demo_data();
+        for phase in data
+            .phases
+            .iter_mut()
+            .filter(|phase| phase.graph_id == ids::GRAPH_HTUI_ANA)
+        {
+            phase.gate = Gate::Never;
+            phase.gate_hard = false;
+        }
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(3));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        stop_platform(&fixture, mode).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
+        );
+        let grace = match mode {
+            StopMode::Graceful => Duration::from_secs(3),
+            StopMode::Forced => Duration::ZERO,
+        };
+        assert_eq!(park.grace(), Some(grace), "{mode:?}");
+
+        resume_platform(&fixture).await;
+        rests_at(&fixture, run, RunStatus::Done).await;
+        let first = step_at(&fixture, run, 0).await;
+        assert_eq!(
+            (first.id, first.attempt, first.status),
+            (parked.run_step_id, 1, StepStatus::Done),
+            "{mode:?}: the stopped step finished on its own row and attempt"
+        );
+        assert!(
+            fixture.run(run).await.finished_at.is_some(),
+            "{mode:?}: the run ended"
+        );
+    }
+
+    /// Plan acceptance (M3 F2): a graceful stop resumes to `done` on the TUI side.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_stop_resumes_to_done() {
+        a_stop_resumes_to_done(StopMode::Graceful).await;
+    }
+
+    /// Plan acceptance (M3 F2): a forced stop, its session cut with zero grace, resumes to
+    /// `done` on the TUI side.
+    #[tokio::test(start_paused = true)]
+    async fn a_forced_stop_resumes_to_done() {
+        a_stop_resumes_to_done(StopMode::Forced).await;
+    }
+
+    /// D8, I-1: `pending_resumes` lists per box, so on a box whose executor is the worker only the
+    /// worker's runtime resumes: the TUI's poll leaves the run `stopped`, the worker's walks it.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_executing_role_resumes_on_a_shared_box() {
+        let fixture = Fixture::new().await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut worker = fixture.runtime().with_role(Role::Worker);
+        let mut tui = fixture.runtime();
+        let run = stopped_here(&fixture, &mut worker, ids::HTUI_ANA_2).await;
+        resume_platform(&fixture).await;
+
+        polled(&mut tui, &fixture).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Stopped,
+            "the TUI does not execute on a worker box"
+        );
+        assert!(fixture.steps(run).await.is_empty());
+
+        polled(&mut worker, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+        assert_eq!(fixture.steps(run).await.len(), 1);
+    }
+
+    /// D8: the TUI's store loop ticks the command poll, so a stopped run is resumed with no
+    /// request once its workspace resumes (twin of `the_store_loop_applies_a_workspace_stop_on_its_own`).
+    #[tokio::test(start_paused = true)]
+    async fn the_store_loop_resumes_a_stopped_run_on_its_own() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = stopped_here(&fixture, &mut runtime, ids::HTUI_ANA_2).await;
+        resume_platform(&fixture).await;
+
+        let _worker = Worker::spawn(&fixture.store, runtime);
+        rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+        assert_eq!(fixture.steps(run).await.len(), 1);
+    }
+
+    /// D6: `c` on a stopped run is never refused. On this box it is the engine's
+    /// `cancel_stopped_run(Some(box))` and the walk's cleanup; with no executing box (the demo's
+    /// `RUN_8`) the CAS alone. Both apply at once: `cancelled`, ended, no `run_command` row, and a
+    /// later resume of the workspace walks nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_run_is_cancelled_on_its_box_and_a_boxless_one_at_once() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let run = stopped_here(&fixture, &mut runtime, ids::HTUI_ANA_2).await;
+        let boxless = fixture.run(ids::RUN_8).await;
+        assert_eq!(
+            (boxless.status, boxless.executing_box_id),
+            (RunStatus::Stopped, None),
+            "the demo's box-less stopped run"
+        );
+
+        for (seq, run) in [(1, run), (2, ids::RUN_8)] {
+            let reply = served(&mut runtime, &fixture, seq, cancel(run)).await;
+            assert!(
+                matches!(outcome(reply), CommandOutcome::Cancelled { .. }),
+                "{run}"
+            );
+            let row = fixture.run(run).await;
+            assert_eq!(row.status, RunStatus::Cancelled, "{run}");
+            assert!(row.finished_at.is_some(), "{run}: ended");
+            assert!(
+                commands_of(&fixture, run).is_empty(),
+                "{run}: applied at once, with no row"
+            );
+        }
+
+        resume_platform(&fixture).await;
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// D6: a stopped run executing on another box is that box's to cancel (its trees and sessions
+    /// live there). The engine answers "on another box", which the runtime takes as D12 step 2's
+    /// "otherwise": the durable row is written and the answer says it was requested; a second `c`
+    /// finds it pending. The run stays `stopped` until that box's poll applies the row.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_run_on_another_box_gets_a_row() {
+        let mut data = htui_core::fixtures::demo_data();
+        let mut elsewhere = data.boxes[0].clone();
+        elsewhere.id = BoxId::new();
+        elsewhere.hostname = "elsewhere".to_owned();
+        let other = elsewhere.id;
+        data.boxes.push(elsewhere);
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        let run = stranded_on(&fixture, ids::HTUI_ANA_2, other).await;
+        let owner = Uuid::now_v7();
+        assert!(
+            fixture
+                .store
+                .take_lease(run, other, owner, TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "the other box's walk holds the run"
+        );
+        assert!(
+            fixture
+                .store
+                .stop_run(run, owner)
+                .await
+                .expect("the stop answers"),
+            "that box stops it"
+        );
+        let mut runtime = fixture.runtime();
+
+        let reply = served(&mut runtime, &fixture, 1, cancel(run)).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_REQUESTED),
+            "{reply:?}"
+        );
+        let reply = served(&mut runtime, &fixture, 2, cancel(run)).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_ALREADY_REQUESTED),
+            "{reply:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>(),
+            [RunCommandStatus::Pending]
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Stopped);
     }
 
     /// D7 (+ Q1): a run of `HTUI_ANA_2` in `PLATFORM` parked at `research`'s gate, then

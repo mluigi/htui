@@ -1144,6 +1144,38 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        match self {
+            Self::Memory(store) => store.pending_resumes(box_id).await,
+            Self::Online(pg) => pg.pending_resumes(box_id).await,
+        }
+    }
+
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.resume_run(run, box_id, owner, ttl).await,
+            Self::Online(pg) => pg.resume_run(run, box_id, owner, ttl).await,
+        }
+    }
+
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.cancel_stopped_run(run, box_id, at).await,
+            Self::Online(pg) => pg.cancel_stopped_run(run, box_id, at).await,
+        }
+    }
+
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         match self {
             Self::Memory(store) => store.create_step(new).await,

@@ -1077,6 +1077,23 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 293 (`htui-core/te
   stopped run a way to be resumed or cancelled, including one whose workspace has no `workspace_stop` row
   (the demo's `RUN_8` in `graphics`, now undeletable), and `select_fanout`'s lists gain `stopped` (L-7).
   On the host: the live-Qdrant suites (timeouts in the sandbox) and the Postgres gate on the merged tree.
+  **Phase 3 landed (hr/MOD-125, 2026-11-13; plan `.claude/plans/mod-125-m3-resume.plan.md`):** resume through
+  saved sessions. A resume request is the absence of the `workspace_stop` row; the executing box's command poll
+  lists `pending_resumes(box)` (executing role only) and `Engine::resume_stopped` walks each run under a fresh
+  lease. A stopped step resumes on its own row: no rows reruns from stage 1; rows without a banner, or an agent
+  without resume caps, continue fresh with the handoff text; a banner plus caps reopens the session (ACP
+  load/resume, CLI `--resume`), the session id read from the banner row (no column). A reopen that fails on the
+  wire records `resume_failed` and reruns fresh. Trees are retaken without a reset (`Isolator::reacquire`, a
+  checkout moved while stopped refuses); parts and candidates resume in their rounds (stopped first under
+  `shared_serialized`), the judge reruns fresh, `select_fanout` supersedes a stopped loser or judge (L-7). Every
+  stopped run can be cancelled (`cancel_stopped_run`: box-less at once, on its box with cleanup, another box
+  through a cancel row), so the demo's `RUN_8` cancels and `graphics` deletes. ANA-2 and MOD-24 amended. Next:
+  M4 the verbs. Owed: **(1) M4's migration is `0031`, not `0030`** (`0030_link_kinds` is MOD-150's); fold in an
+  index for `pending_resumes` (`run (executing_box_id) WHERE status = 'stopped'`; today a scan per poll).
+  **(2)** `labels_between` skips unmoved `htui/<W>` worktree branch points by their reflog; with reflogs off a
+  resume is still refused, and an unlabelled foreign move a later branch point happens to mark is admitted.
+  On the host: the live probes (`cli_live` cases 12-13, `isolation_live` `reopen`, `--ignored`), the
+  live-Qdrant suites and the Postgres gate on the merged tree.
 
 - [ ] **MOD-126 - Light model setting and run-start workflow pick** (from ANA-40, `docs/ANA-40.md` §5.4, §8 P1).
   `R-ORCH-1`, `R-ID-6`, `R-TUI-17`, `R-PRM-1`. One `app_setting` key `{agent_id, model}` (ANA-30 option B), a new

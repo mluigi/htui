@@ -68,6 +68,14 @@ impl AgentSessionRef {
     }
 }
 
+/// MOD-125 M3 (D7): the follow-up `htui` sends when it reopens a stopped step's own agent session
+/// from its [`AgentSessionRef`]. The stop may have cut the last turn off mid-way, so the agent is
+/// asked to redo what it had not finished rather than to report and wait, as a promotion's opening
+/// does. Defined here, beside the session id it is sent with, so the orchestrator
+/// (`htui_orch::promote` re-exports it) and this crate's live probes send the same text.
+pub const STOP_RESUME_OPENING: &str = "This step was stopped and has been resumed. Your last turn \
+    may have been cut off: continue the task, redoing any unfinished part of it.";
+
 impl core::fmt::Display for AgentSessionRef {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.0)

@@ -1697,13 +1697,78 @@ pub trait WriteStore: ReadStore {
     /// `lease_expires_at = <store now>`, `lease_box_id` and `executing_box_id` kept). No
     /// `finished_at`, no item write. `Ok(false)` when the run is not `running` or not `owner`'s,
     /// or (MOD-125 M2 R1, review M-1) a cancel of it is `pending`, decided under the run's lock:
-    /// a pending cancel wins (M2 D4), and a stopped run would strand it, since no executor's poll
-    /// lists a stopped run's cancel. Nothing is written then. The caller has quiesced its walk
+    /// a pending cancel wins (M2 D4). Nothing is written then. The caller has quiesced its walk
     /// (M2): a step it starts concurrently is not this verb's to stop.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool>;
+
+    // ---- MOD-125 M3 (plan D1, D2): resume and cancel of a stopped run --------------------------
+
+    /// MOD-125 M3 D1: the runs `box_id` owes a resume: `status = 'stopped' AND executing_box_id =
+    /// box_id` and no `workspace_stop` row for the run's `workspace_id`, in `(queued_at, id)`
+    /// order. The request is the absence of the stop row ([`resume_workspace`] deletes it), so a
+    /// box that was offline resumes its runs when it comes back. A run without a workspace has no
+    /// stop row and is listed as soon as it stops; a box-less stopped run never is (it can only be
+    /// cancelled). No index serves the read; a scan of the box's runs is accepted.
+    ///
+    /// [`resume_workspace`]: WriteStore::resume_workspace
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>>;
+
+    /// MOD-125 M3 D2: one compare-and-set `stopped -> running` that takes the lease, in
+    /// [`take_lease`]'s shape: `lease_owner = owner`, `lease_box_id = box_id`, `lease_expires_at =
+    /// <store now> + ttl`. No step moves (the engine resumes them). `Ok(false)`, nothing written,
+    /// when the run is not `stopped`, executes on another box, its workspace has a
+    /// `workspace_stop` row (stopped again), or a cancel of it is `pending` (the hold-off
+    /// [`stop_run`] has: the cancel wins). A run without a workspace passes the gate. On Postgres,
+    /// as [`claim_run`]: the run locked, then the stop row `FOR SHARE`, then the cancel read; a
+    /// stop committed after the gate read finds a `running` run leased to `owner`, which
+    /// [`pending_stops`] lists.
+    ///
+    /// [`take_lease`]: WriteStore::take_lease
+    /// [`stop_run`]: WriteStore::stop_run
+    /// [`claim_run`]: WriteStore::claim_run
+    /// [`pending_stops`]: WriteStore::pending_stops
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range,
+    /// before any read; [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run" }`, the first read.
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool>;
+
+    /// MOD-125 M3 D2, D6: one compare-and-set `stopped -> cancelled`, `finished_at =
+    /// COALESCE(finished_at, at)` (the caller's clock, as [`finish_run`]), lease-less. In the same
+    /// transaction every step of the run that is not terminal (`stopped`, `pending`,
+    /// `awaiting_approval`, `failed`) moves to `cancelled` with the same `finished_at`, every
+    /// `pending` follow-up of the run is refused with
+    /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) and its windows closed
+    /// (`close_dropped_follow_ups` writes only for a lease owner, and the run has none), and a
+    /// `pending` cancel of the run is resolved `applied`. `Some(b)` requires `executing_box_id =
+    /// b`, `None` requires it `NULL`. `Ok(false)`, nothing written, when the run is not `stopped`
+    /// or executes elsewhere. The item is not written (MOD-144). On Postgres the steps are locked
+    /// before the run, as [`stop_run`] locks them.
+    ///
+    /// [`finish_run`]: WriteStore::finish_run
+    /// [`stop_run`]: WriteStore::stop_run
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
 
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted. `role`,
     /// `parent_step_id` and `node_key` (MOD-139 D3) are written once, here.
@@ -1796,10 +1861,12 @@ pub trait WriteStore: ReadStore {
     /// ANA-2 §4.5's bookkeeping, one transaction (plan D6): among the steps of
     /// `(run, position, attempt)` with `fanout_index >= 0`, the winner becomes
     /// `selected = true, status = done`; every other candidate becomes `selected = false` and,
-    /// when its status is `pending`, `awaiting_approval` or `done`, `superseded` (a `failed` or
-    /// `cancelled` loser keeps its status); the judge row (`fanout_index = -1`), when there is
-    /// one, becomes `done` with `gate_note = reason` — but only from `pending`, `running` or
-    /// `awaiting_approval`. A judge that already reached an outcome is left alone entirely, status
+    /// when its status is `pending`, `awaiting_approval`, `done` or (MOD-125 M3, L-7) `stopped`,
+    /// `superseded` (a `failed` or `cancelled` loser keeps its status); the judge row
+    /// (`fanout_index = -1`), when there is one, becomes `done` with `gate_note = reason` — but
+    /// only from `pending`, `running` or `awaiting_approval`; a `stopped` judge becomes
+    /// `superseded` with `gate_note = reason` instead (`stopped -> done` is not a move §4.3
+    /// sanctions). A judge that already reached an outcome is left alone entirely, status
     /// and `gate_note` both: §4.5's judge-failure path (`docs/ANA-2.md:858-862`) parks the run at
     /// `awaiting_approval` with the failure reason in the judge's `gate_note` and has *a human*
     /// pick through this method, so settling it here would be the `failed -> done` §4.3 rejects,
@@ -2290,15 +2357,16 @@ pub trait WriteStore: ReadStore {
     /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) (MOD-70 D5, B-14; on
     /// `AlreadyPending` too).
     ///
-    /// MOD-125 M2 R1 (review M-1): a `stopped` run is refused, read under a share lock on the run
-    /// row that [`stop_run`](WriteStore::stop_run)'s own lock waits on (and the reverse), so a
-    /// cancel and a stop of one run serialise: either the row is written first and the stop
-    /// answers `false`, or the stop commits first and the cancel is refused. No row, no
-    /// follow-up refused then.
+    /// MOD-125 M2 R1 (review M-1): the run row is read under a share lock that
+    /// [`stop_run`](WriteStore::stop_run)'s own lock waits on (and the reverse), so a cancel and a
+    /// stop of one run serialise: either the row is written first and the stop answers `false`,
+    /// or the stop commits first and the cancel is written on the `stopped` run. MOD-125 M3 D6:
+    /// a `stopped` run takes the cancel, which [`pending_commands`](WriteStore::pending_commands)
+    /// lists for the box it executes on, and which
+    /// [`cancel_stopped_run`](WriteStore::cancel_stopped_run) applies.
     ///
     /// # Errors
-    /// `NotFound { entity: "run" }`; `Constraint` ([`cancel_of_a_stopped_run`]) for a `stopped`
-    /// run; `Constraint` for an unknown user or box (B-7), in that order.
+    /// `NotFound { entity: "run" }`; `Constraint` for an unknown user or box (B-7), in that order.
     async fn request_cancel(
         &self,
         run: RunId,
@@ -2309,8 +2377,10 @@ pub trait WriteStore: ReadStore {
     /// D13, B-4: the `pending` commands this process applies, **cancels only** (MOD-70 D5, I-9),
     /// `(issued_at, id)` order: runs whose
     /// `lease_owner = owner`; runs executing on `box_id` whose lease is free or expired by the
-    /// store's clock and whose status is `running` or `awaiting_approval`; and runs executing on
-    /// `box_id` that are already terminal (the caller refuses those with their status).
+    /// store's clock and whose status is `running` or `awaiting_approval`; runs executing on
+    /// `box_id` that are `stopped` (MOD-125 M3 D6: no lease, so the box applies them); and runs
+    /// executing on `box_id` that are already terminal (the caller refuses those with their
+    /// status).
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -3742,7 +3812,7 @@ pub fn scope_row_joins_no_workspace(slug: &str) -> String {
 /// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
 /// Everything else the scope row owns cascades and is counted. The advice is "finish or cancel",
 /// never "stop": a `stopped` run is live too, so stopping cannot clear the refusal (a stopped run
-/// is resumed first, then finishes or is cancelled).
+/// is cancelled directly, or resumed and then finishes, MOD-125 M3).
 #[must_use]
 pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3758,8 +3828,9 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
 
 /// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` while `runs` (≥ 1) of its member projects'
 /// runs that recorded this workspace are stopped (DV-2: or still running under its stop). A
-/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names resume: a
-/// stopped run is cancelled or finished only once resumed (M3).
+/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names the direct
+/// cancel first, then the resume: a stopped run is cancelled directly, or resumed and then
+/// finishes (M3 F2).
 #[must_use]
 pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3768,8 +3839,8 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
         ("runs", "them")
     };
     format!(
-        "workspace `{workspace}` has {runs} stopped {noun}; resume the workspace and finish or \
-         cancel {pronoun} before deleting the workspace"
+        "workspace `{workspace}` has {runs} stopped {noun}; cancel {pronoun}, or resume the \
+         workspace and let {pronoun} finish, before deleting the workspace"
     )
 }
 
@@ -3778,15 +3849,6 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
 #[must_use]
 pub fn workspace_gone() -> String {
     "this workspace no longer exists: switch workspace".to_owned()
-}
-
-/// MOD-125 M2 R1 (review M-1): a cancel of a `stopped` run. `request_cancel` refuses it in both
-/// stores (no `run_command` row a stopped run's executor would never apply), and the runtime
-/// refuses a pending row that reaches a stopped run in the same words. A stopped run is cancelled
-/// once its workspace is resumed (M3).
-#[must_use]
-pub fn cancel_of_a_stopped_run(run: RunId) -> String {
-    format!("run `{run}` is stopped: resume its workspace first, then cancel it")
 }
 
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
@@ -4635,18 +4697,19 @@ mod tests {
         );
     }
 
-    /// MOD-125 M2 D9: the stopped-run refusal counts its runs and names the resume.
+    /// MOD-125 M2 D9: the stopped-run refusal counts its runs; M3 F2: it names the direct
+    /// cancel first, then the resume.
     #[test]
     fn workspace_has_stopped_run_counts_runs() {
         assert_eq!(
             workspace_has_stopped_run("shop", 1),
-            "workspace `shop` has 1 stopped run; resume the workspace and finish or cancel it \
-             before deleting the workspace"
+            "workspace `shop` has 1 stopped run; cancel it, or resume the workspace and let it \
+             finish, before deleting the workspace"
         );
         assert_eq!(
             workspace_has_stopped_run("shop", 2),
-            "workspace `shop` has 2 stopped runs; resume the workspace and finish or cancel \
-             them before deleting the workspace"
+            "workspace `shop` has 2 stopped runs; cancel them, or resume the workspace and let \
+             them finish, before deleting the workspace"
         );
     }
 
