@@ -142,6 +142,7 @@ edit_quirks = ["e"]  # edit quirks
 executor    = ["w"]  # executor
 probe       = ["p"]  # probe
 edit_spec   = ["s"]  # edit probe spec
+log_level   = ["v"]  # worker log level
 
 [settings.personas]
 body       = ["b"]              # edit body
