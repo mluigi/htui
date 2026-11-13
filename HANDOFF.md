@@ -519,6 +519,15 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
   `item_link` documents the seven kinds; Graph words `part of`/`duplicates`/`implements` (D1). `CASES` 284. Plan
   `.claude/plans/mod-150-m1-link-kinds.plan.md`. Owed on the host: merged-tree Postgres gate, live-Qdrant suites,
   `cache.rs::the_spawned_refresher_passes_and_follows_the_scope` (flaked once under sandbox load).
+  **Phase 2 landed (hr/MOD-150, 2026-11-13, `16d0e868..de8e1eb4`):** close-out as `duplicate`/`superseded` needs a live
+  `duplicates` from the item / `supersedes` to it, or records one from the item the person names, in the close-out's
+  transaction; refused with neither (`close_out_needs_a_link`, `close_out_names_no_link`), the law first. `close_out`
+  gains `names: Option<ItemId>`, `WorkerStore` gains `links`; `Command::CloseOut.names` (typed key, `slug:KEY` ok);
+  the Runs pane asks "duplicate of which item?" only when no link stands. Pg: the duplicates advisory lock first,
+  the standing link row `FOR SHARE`, the two item rows in id order (review M1, L1; both races pinned in `pg_criteria`).
+  The Runs pane is the only close-out surface (PRD OQ3). Gap folded into MOD-155: a person cannot correct an agent's
+  wrong canonical at close-out. Store `CASES` 312, orch 265. Plan `.claude/plans/mod-150-m2-closeout-links.plan.md`.
+  Owed on the host: merged-tree Postgres gate, live-Qdrant suites, `claude_plugin` (CLI 2.1.323 TypeScript check).
 - [ ] **MOD-151 - Tell agents about htui's MCP tools (server instructions, prompt section, typed
   results)** (from ANA-36, `docs/ANA-36.md` §7.3, §7.4, §8 Q7). `R-MCP-2`, `R-MCP-4`, `R-PRM-1`,
   `R-PRM-3`. `initialize.instructions` naming each advertised tool and when to use it; a prompt section
