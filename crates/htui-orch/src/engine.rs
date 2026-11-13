@@ -5689,6 +5689,11 @@ where
     /// and the session's `cwd` and extra directories rebuilt from them as a promotion's chat does
     /// ([`chat_dirs`]). A step with no tree (an empty repo scope) has nothing to reset, so its
     /// `cwd` is an empty-scope `prepare`'s. Nothing is reset, created or recorded.
+    ///
+    /// Every fallible read comes before the `reacquire` (MOD-125 M3 F1): the caller is handed the
+    /// trees only once this answers, so a read failing after the guard was retaken would leave
+    /// it held, and a `shared_serialized` sibling's `prepare` waiting on it forever. The
+    /// empty-scope `prepare` after it holds no guard: it has no repository to take one on.
     async fn reopen_trees(
         &self,
         run: &Run,
@@ -5696,12 +5701,13 @@ where
         phase: &SnapshotPhase,
     ) -> Result<(Vec<RunStepTree>, PathBuf, Vec<PathBuf>), EngineError> {
         let trees = self.parts.store.step_trees(step.id).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let dirs = chat_dirs(&trees, &repos);
         self.parts
             .isolator
             .reacquire(run.id, step.id, &trees)
             .await?;
-        let repos = self.parts.store.repos(run.project_id).await?;
-        let (cwd, extra_dirs) = match chat_dirs(&trees, &repos) {
+        let (cwd, extra_dirs) = match dirs {
             Some(dirs) => dirs,
             None => {
                 let prepared = self
@@ -19514,6 +19520,78 @@ mod tests {
                 .expect("MemStore refreshes"),
             "the lease the stop took went back"
         );
+    }
+
+    /// [`preempted_in_plan`] with the stop settled: the run `stopped` over its `stopped` `plan`
+    /// row, which recorded its trees. Answers the run row and the `plan` row.
+    async fn stopped_in_plan(
+        harness: &Harness,
+    ) -> (htui_core::model::Run, htui_core::model::RunStep) {
+        let run = preempted_in_plan(harness).await;
+        {
+            harness_engine!(harness.orch, engine);
+            assert!(
+                engine.settle_stop(run).await.expect("the stop settles"),
+                "the stop is this process's to write"
+            );
+        }
+        let plan = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.status == StepStatus::Stopped)
+            .expect("`plan` stopped");
+        (harness.orch.run(run).await, plan)
+    }
+
+    /// MOD-125 M3 F1 (review M1): every fallible read of [`super::Engine::reopen_trees`] runs
+    /// before its `reacquire`. A read that fails after the guard was retaken would leak it: the
+    /// member's caller releases only the trees `reopen_trees` handed back, so under
+    /// `shared_serialized` the sibling's `prepare` would wait on the guard forever.
+    #[tokio::test]
+    async fn a_read_failing_while_trees_reopen_retakes_no_guard() {
+        use htui_core::store::mem::MemFault;
+
+        let harness = Harness::new().await;
+        let (run, plan) = stopped_in_plan(&harness).await;
+        let snapshot: GraphSnapshot = serde_json::from_value(
+            run.graph_snapshot
+                .clone()
+                .expect("a graph run carries its snapshot"),
+        )
+        .expect("a v2 snapshot decodes");
+        let phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == plan.phase_name)
+            .expect("the snapshot holds `plan`");
+        let reacquires = harness.orch.isolator.reacquires();
+        harness_engine!(harness.orch, engine);
+
+        harness.orch.store.set_fault(MemFault::Repos, true);
+        let reopened = engine.reopen_trees(&run, &plan, phase).await;
+        harness.orch.store.set_fault(MemFault::Repos, false);
+
+        assert!(
+            matches!(
+                reopened,
+                Err(EngineError::Store(
+                    htui_core::store::StoreError::Unreachable(_)
+                ))
+            ),
+            "{reopened:?}"
+        );
+        assert_eq!(
+            harness.orch.isolator.reacquires(),
+            reacquires,
+            "the failed read came before any guard was retaken"
+        );
+        engine
+            .reopen_trees(&run, &plan, phase)
+            .await
+            .expect("the trees reopen once the read answers");
+        assert_eq!(harness.orch.isolator.reacquires(), reacquires + 1);
     }
 
     /// How long a case waits on a walk or a `prepare` that must not queue behind a stale

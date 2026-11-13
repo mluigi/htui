@@ -171,6 +171,9 @@ pub enum MemFault {
     /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
     /// commit.
     AdmitPlan,
+    /// [`ReadStore::repos`] (MOD-125 M3 F1): a read a stopped step's resume makes beside its
+    /// trees, which must fail before any guard is retaken.
+    Repos,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -10604,6 +10607,8 @@ impl WriteStore for MemStore {
     }
 
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::Repos)?;
         Ok(self.read(|state| state.repo_rows(project)))
     }
 
