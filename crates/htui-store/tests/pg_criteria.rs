@@ -8027,8 +8027,10 @@ async fn wait_blocked_on(db: &common::TestDb, holder_pid: i32, what: &str) {
 /// the stop commits, writes its row on the `stopped` run, which the box's poll lists (the run
 /// holds no lease) and `cancel_stopped_run` applies. A raw transaction holds the run as
 /// `stop_run` does (`FOR NO KEY UPDATE`, then the move), uncommitted. MOD-125 M3 F2: the step's
-/// open follow-up window closes and its pending follow-up is refused with
-/// [`FOLLOW_UP_RUN_CANCELLED`], in the cancel's transaction.
+/// open follow-up window closes when `cancel_stopped_run` applies the cancel. The pending
+/// follow-up is refused with [`FOLLOW_UP_RUN_CANCELLED`] already by `request_cancel`'s insert;
+/// `cancel_stopped_run`'s own refusal is pinned by
+/// `a_direct_cancel_of_a_stopped_run_closes_its_window_and_refuses_its_follow_up`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_racing_a_stop_waits_for_it_and_lands_for_the_box() {
     let Some(db) = common::demo_db().await else {
@@ -8118,6 +8120,68 @@ async fn a_cancel_racing_a_stop_waits_for_it_and_lands_for_the_box() {
             true
         )],
         "the pending follow-up is refused as the run was cancelled, and keeps no text"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-125 M3 F2: the direct cancel of a stopped run (no `request_cancel` first, so nothing has
+/// refused the follow-up yet) closes the step's open follow-up window and refuses its pending
+/// follow-up with [`FOLLOW_UP_RUN_CANCELLED`], in `cancel_stopped_run`'s own transaction. The
+/// follow-up is queued while the step runs: once the run is stopped, `request_follow_up` needs a
+/// running step and a live lease, so this is the only way one reaches the cancel unrefused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_cancel_of_a_stopped_run_closes_its_window_and_refuses_its_follow_up() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner, _session) = follow_up_window(&db).await;
+    let follow_up = follow_up_from(&db.store, step, "use the smaller fixture");
+    let follow_up_id = follow_up.id;
+    assert_eq!(
+        db.store
+            .request_follow_up(follow_up)
+            .await
+            .expect("the enqueue is answered"),
+        FollowUpRequest::Queued(follow_up_id),
+        "a follow-up is pending on the running step"
+    );
+    assert!(
+        db.store.stop_run(run, owner).await.expect("stop the run"),
+        "the poll stops the run"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![("pending".to_owned(), None, false)],
+        "the stop leaves the follow-up pending"
+    );
+    assert!(
+        db.store
+            .cancel_stopped_run(run, Some(ids::BOX), Utc::now())
+            .await
+            .expect("apply the cancel"),
+        "the box cancels the stopped run directly"
+    );
+    let (windows, open): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL) \
+           FROM follow_up_window WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the run's follow-up windows");
+    assert_eq!(
+        (windows, open),
+        (1, 0),
+        "the cancel closes the run's follow-up window"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![(
+            "refused".to_owned(),
+            Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+            true
+        )],
+        "the cancel refuses the pending follow-up as the run was cancelled, and drops its text"
     );
     db.drop_db().await;
 }
