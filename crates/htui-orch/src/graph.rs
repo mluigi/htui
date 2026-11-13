@@ -28,8 +28,13 @@ use htui_core::model::{
     SnapshotPart, SnapshotSeat, SnapshotSource, SourceHow, Split, WorkspaceId, edge_sort_key,
     sort_snapshot_edges,
 };
-use htui_core::model::{MemoryState, PlanScope, SnapshotMemory};
-use htui_core::prompt::{MEMORY_TOKEN_CAP, TokenEstimator, select_memory};
+use htui_core::model::{
+    MemoryState, PlanScope, SnapshotCapture, SnapshotCaptureModel, SnapshotMemory,
+};
+use htui_core::prompt::{
+    MEMORY_TOKEN_CAP, TokenEstimator, resolve_light_model, select_memory,
+    settings::resolve_memory_capture,
+};
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
     check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
@@ -467,6 +472,33 @@ async fn frozen_memory<S: htui_core::store::WorkerStore>(
         .and_then(|entries| select_memory(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT)))
 }
 
+/// MOD-164 D8: the run-end capture `GraphSnapshot.capture` freezes. `None` when the item's
+/// project resolves `memory_capture` off; otherwise the `light_model` App setting with its agent's
+/// name, or no model when the setting is unset or malformed, or names an agent that is missing or
+/// disabled (the capture step is then skipped on its row).
+async fn frozen_capture<G: GraphSource>(
+    source: &G,
+    project: &Project,
+    app: &BTreeMap<String, Value>,
+) -> std::result::Result<Option<SnapshotCapture>, ResolveError> {
+    if !resolve_memory_capture(Some(&project.settings), app) {
+        return Ok(None);
+    }
+    let model = match resolve_light_model(app) {
+        Some(light) => source
+            .agent(light.agent_id)
+            .await?
+            .filter(|agent| agent.enabled)
+            .map(|agent| SnapshotCaptureModel {
+                agent_id: agent.id,
+                agent_name: agent.name,
+                model: light.model,
+            }),
+        None => None,
+    };
+    Ok(Some(SnapshotCapture { model }))
+}
+
 /// What [`resolve_or_refused`] found (MOD-138 blueprint A6).
 pub(crate) enum Resolution {
     /// The graph resolved: what [`resolve`] returns.
@@ -685,7 +717,7 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         // MOD-163 maintainer decision P-1: [`resolve`] freezes the memory on a resolved graph;
         // a v1 run's resume, which keeps only these phases, never reads it.
         memory: None,
-        capture: None,
+        capture: frozen_capture(source, &project, app).await?,
     };
     // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
     // expanded phases; after every `NotYetRunnable`, so each of those outranks it.
