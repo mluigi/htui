@@ -2906,6 +2906,10 @@ impl Pipeline {
             .version_dir(&self.plan.registry_id, version)
             .join("bin/demo-server");
         std::fs::create_dir_all(cmd.parent().expect("a parent")).expect("the version directory");
+        // Never a write handle on the cmd in this process (TOOL-16, `crate::write_executable`).
+        #[cfg(unix)]
+        crate::write_executable::write_executable(&cmd, b"#!/bin/sh\nexit 0\n");
+        #[cfg(not(unix))]
         std::fs::write(&cmd, b"#!/bin/sh\nexit 0\n").expect("the seeded cmd");
         // A file the fixture archive does **not** carry, so "the old tree came back" can be told
         // apart from "the new tree was never removed" — the two are otherwise identical on disk.
@@ -2914,14 +2918,8 @@ impl Pipeline {
             b"this tree was here first\n",
         )
         .expect("the marker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&cmd, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        std::fs::File::options()
-            .write(true)
-            .open(&cmd)
+        // Read-only: the owner may set the times through any handle.
+        std::fs::File::open(&cmd)
             .expect("open for mtime")
             .set_modified(at)
             .expect("set mtime");

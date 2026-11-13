@@ -79,11 +79,12 @@ maintainer ruled out hour-long runs.
 
 - base failures, unchanged: `claude_plugin::the_emitted_plugin_validates_and_the_mod_tests_pass_under_claude` and
   `worker_pg::the_worker_binary_never_exposes_its_dsn`;
-- load flakes in htui-agent: `cli_driver::a_cancel_drains_a_late_result_and_reports_its_done_rather_than_a_second_one`
-  and `launch::an_interrupt_lets_the_child_exit_on_its_own_terms`. Both wait on a fixed window. The `it` binary
-  took 36.7 s in the gate; run alone with `--test-threads=1` it passed twice in 12.5 s, and both passed in the
-  default-thread and shuffled runs. The same two failed in the gate on `bd979072`, so they are a load-sensitive
-  pair worth a wider window, not an order dependency.
+- `cli_driver::a_cancel_drains_a_late_result_and_reports_its_done_rather_than_a_second_one` and
+  `launch::an_interrupt_lets_the_child_exit_on_its_own_terms` in htui-agent. Written up here first as load flakes;
+  **corrected by TOOL-16**: `gate.sh --detach` started the gate as a background job of a non-interactive shell,
+  which ignores SIGINT and SIGQUIT for everything under it, and a `sh` child that starts with SIGINT ignored cannot
+  trap it. Both tests interrupt such a child, so they fail in every detached gate (the orphaned children showed
+  `SigIgn: 0x6`) and pass in a foreground run. Not a TOOL-15 regression; TOOL-16 fixes the launcher.
 
 Where the test step's 1732 s go, single-threaded: htui-store `it` 928 s, htui `it` 376 s, htui unit tests 156 s,
 htui-mcp 70 s, htui-agent 50 s, the rest under a minute together.

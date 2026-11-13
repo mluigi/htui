@@ -218,10 +218,7 @@ impl World {
             ("id", STUB_ID),
             ("journalctl", STUB_JOURNALCTL),
         ] {
-            let path = stub.join(name);
-            std::fs::write(&path, text).expect("write a stub");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make a stub executable");
+            crate::write_executable::write_executable(&stub.join(name), text);
         }
         let world = Self {
             _base: base,
@@ -904,10 +901,7 @@ fn world_without_printf_builtin(sudo_mode: &str) -> Option<World> {
         ("sh", stub_sh_without_printf(&bash)),
         ("printf", STUB_PRINTF.to_owned()),
     ] {
-        let path = world.stub.join(name);
-        std::fs::write(&path, text).expect("write a stub");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make a stub executable");
+        crate::write_executable::write_executable(&world.stub.join(name), text);
     }
     Some(world)
 }

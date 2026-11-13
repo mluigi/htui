@@ -3990,7 +3990,6 @@ async fn a_second_isolated_run_that_conflicts_takes_the_merge_conflict_path() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     let Some(git) = skip_without_git!() else {
@@ -4012,10 +4011,10 @@ async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
     let hooks = primary.join(".git").join("hooks");
     std::fs::create_dir_all(&hooks).expect("the hooks directory is made");
     let hook = hooks.join("pre-merge-commit");
-    std::fs::write(&hook, format!("#!/bin/sh\n'{}' 2\n", sleep.display()))
-        .expect("the hook is written");
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-        .expect("the hook is executable");
+    crate::write_executable::write_executable(
+        &hook,
+        format!("#!/bin/sh\n'{}' 2\n", sleep.display()),
+    );
 
     let dropped = tokio::time::timeout(
         Duration::from_millis(300),

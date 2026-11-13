@@ -25,6 +25,8 @@ mod probe_live;
 mod recorder;
 mod relay;
 mod replay;
+#[path = "../../../../tests/rust/write_executable.rs"]
+mod write_executable;
 
 #[cfg(not(feature = "test-support"))]
 #[test]

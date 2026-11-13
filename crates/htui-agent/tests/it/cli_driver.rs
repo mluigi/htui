@@ -1308,13 +1308,11 @@ async fn assert_not_running(pid: u32, what: &str) {
     }
 }
 
-/// Writes `contents` as an executable file, creating its directory.
+/// Writes `contents` as an executable file, creating its directory, without opening the
+/// `ETXTBSY` window (`crate::write_executable`).
 #[cfg(unix)]
 fn executable(path: &Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    std::fs::write(path, contents).expect("write");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    crate::write_executable::write_executable(path, contents);
 }
 
 /// A synthetic `cli` row naming `command` directly.

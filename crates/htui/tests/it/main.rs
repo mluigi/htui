@@ -66,6 +66,8 @@ mod token_scan;
 mod waiting;
 mod worker_crash_pg;
 mod worker_pg;
+#[path = "../../../../tests/rust/write_executable.rs"]
+mod write_executable;
 
 #[cfg(not(feature = "testkit"))]
 #[test]

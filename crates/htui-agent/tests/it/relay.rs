@@ -2088,11 +2088,8 @@ async fn prompting_cli(
     step: StepId,
     port: htui_agent::prompt_bridge::PromptPort,
 ) -> Box<dyn AgentSession> {
-    use std::os::unix::fs::PermissionsExt;
-
     let command = dir.join("prompting-cli");
-    std::fs::write(&command, PROMPTING_CLI).expect("write the child double");
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    crate::write_executable::write_executable(&command, PROMPTING_CLI);
     let row = htui_core::model::Agent {
         id: htui_core::model::AgentId::new(),
         name: "scripted-cli".to_owned(),

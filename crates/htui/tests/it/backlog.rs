@@ -2957,7 +2957,6 @@ async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_
 #[tokio::test]
 async fn a_fake_editor_appends_a_line_and_ctrl_s_saves_it() {
     use htui::editor::EditorCommand;
-    use std::os::unix::fs::PermissionsExt as _;
 
     let store = MemStore::demo();
     let mut harness = backlog_over(store.clone()).await;
@@ -2971,15 +2970,11 @@ async fn a_fake_editor_appends_a_line_and_ctrl_s_saves_it() {
 
     let dir = tempfile::TempDir::new().expect("a temp dir");
     let path = dir.path().join("append");
-    // R-13: `fs::write` closes the handle at once, so a fork elsewhere cannot hold it open for
-    // long.
-    std::fs::write(
+    // R-13, TOOL-16: written by a `sh` child, so no fork in this process can hold it open.
+    crate::write_executable::write_executable(
         &path,
         "#!/bin/sh\nprintf '\\nAppended by the editor.\\n' >> \"$1\"\n",
-    )
-    .expect("the script is written");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("the script is executable");
+    );
     let cmd = EditorCommand::resolve(move |key: &str| {
         (key == "VISUAL").then(|| format!("'{}'", path.display()))
     });

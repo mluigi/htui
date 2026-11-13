@@ -383,6 +383,11 @@ fi
 if [[ $DETACH -eq 1 ]]; then
     mkdir -p "$GATE_DIR"
     args=(); [[ -n "$ONLY" ]] && args=(--only "$ONLY")
+    # `set -m` first (TOOL-16): without job control a non-interactive shell starts a background job
+    # with SIGINT and SIGQUIT ignored, every process under it inherits that, and a shell that starts
+    # with a signal ignored cannot trap it. Two tests interrupt a `trap ... INT` child and failed in
+    # every detached gate; the orphaned children showed `SigIgn: 0x6`.
+    set -m
     setsid bash "${BASH_SOURCE[0]}" "${args[@]}" > "$GATE_DIR/run.log" 2>&1 < /dev/null &
     echo "gate started, pid $! - log $GATE_DIR/run.log, result: bash scripts/gate.sh --status"
     exit 0
