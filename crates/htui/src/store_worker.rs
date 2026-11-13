@@ -33,8 +33,8 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
-    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove, QueueOverview,
-    QueueSetting,
+    LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove,
+    QueueOverview, QueueSetting, WorkerLogLine,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -319,6 +319,16 @@ pub enum StoreRequest {
         /// no row.
         expected: Option<DateTime<Utc>>,
     },
+    /// Set one box's worker log level, `box.settings.log_level` (MOD-122 M2 D7, D11): last write
+    /// wins, no token, `edit_version` untouched. Served by [`box_settings::serve`] over the
+    /// `Writer` (F9); answered with [`StoreReply::Boxes`] when it applied and
+    /// [`StoreReply::BoxesStale`] when the box is gone.
+    SetBoxLogLevel {
+        /// The box, as a snapshot listed it.
+        box_id: BoxId,
+        /// The level to store.
+        level: LogShipLevel,
+    },
     /// Create one `agent` row from the Settings form (MOD-23 D239). The worker mints the id and
     /// the clock, builds `launch` as `{command, args, env: {}}`, and copies `settings` from
     /// `settings_from` (OQ-5) or starts from `{}`. Served in the loop by
@@ -459,6 +469,15 @@ pub enum StoreRequest {
     /// writer: `project_type` is not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
     ProjectTypes,
+    /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
+    /// most 2 000; `after: None` is the newest 2 000. Served in [`try_serve`] through
+    /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
+    /// `Unreachable` from the read still drops an `Online` backend onto the mirror. Answered with
+    /// [`StoreReply::WorkerLogs`].
+    WorkerLogs {
+        /// The highest id the Logs tab already holds, less its re-read margin; `None` at first.
+        after: Option<i64>,
+    },
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
     /// One registry read, one `HEAD`, **no archive byte**: what this box would fetch and how it
@@ -1356,11 +1375,12 @@ impl StoreRequest {
             Self::EditHelp { .. } => EDIT_HELP,
             Self::ProbeAgents => "probe_agents",
             Self::ProbeBox => "probe_box",
-            // The three of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
-            // MOD-51 D4).
+            // The four of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
+            // MOD-51 D4; MOD-122 M2 F9).
             Self::Boxes => "boxes",
             Self::EditBox { .. } => "edit_box",
             Self::SetProbeSpec { .. } => "set_probe_spec",
+            Self::SetBoxLogLevel { .. } => "set_box_log_level",
             // The three of `agent_settings::REQUEST_NAMES`, in that order (MOD-23 D241).
             Self::CreateAgent { .. } => "create_agent",
             Self::EditAgent { .. } => "edit_agent",
@@ -1382,6 +1402,7 @@ impl StoreRequest {
             Self::DeletePersona { .. } => "delete_persona",
             Self::ImportPersonas { .. } => "import_personas",
             Self::ProjectTypes => "project_types",
+            Self::WorkerLogs { .. } => "worker_logs",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -1839,6 +1860,9 @@ pub enum StoreReply {
     /// The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`]
     /// (MOD-146 D8). Read-only; nothing writes a type yet.
     ProjectTypes(Vec<ProjectType>),
+    /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
+    /// offline.
+    WorkerLogs(Vec<WorkerLogLine>),
     /// Answer to [`StoreRequest::QueueState`].
     Queue(QueueView),
     /// Answer to the five queue writes: what was done, and the queue after it.
@@ -2403,6 +2427,9 @@ impl WaitingKeysRead for PgStore {
     }
 }
 
+/// The most rows one [`StoreRequest::WorkerLogs`] answers (MOD-122 M2 D10, blueprint F5).
+pub const WORKER_LOGS_LIMIT: u32 = 2_000;
+
 /// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
 ///
 /// [`spawn`] needs to tell [`StoreError::Unreachable`] from every other failure so it can drop an
@@ -2541,12 +2568,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The three box requests, or-ed for the same reason the thirty-two above are: a guard
+        // The four box requests, or-ed for the same reason the thirty-two above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4).
-        StoreRequest::Boxes | StoreRequest::EditBox { .. } | StoreRequest::SetProbeSpec { .. } => {
-            box_settings::serve(backend, request).await?
-        }
+        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4, MOD-122 M2 F9).
+        StoreRequest::Boxes
+        | StoreRequest::EditBox { .. }
+        | StoreRequest::SetProbeSpec { .. }
+        | StoreRequest::SetBoxLogLevel { .. } => box_settings::serve(backend, request).await?,
         // The three agent registry writes, or-ed for the reason the arms above are: a guard does
         // not count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-23
         // D241). Served here, in the loop: one statement and one read each (`R-NF-3`).
@@ -2569,6 +2597,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .writer()
                 .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
             StoreReply::ProjectTypes(WriteStore::project_types(&writer).await?)
+        }
+        // MOD-122 M2 D10, blueprint F5/F11: one read, inline. Offline answers empty (the tab
+        // merges it, adding nothing); the `?` keeps `go_offline` working for an `Unreachable`.
+        StoreRequest::WorkerLogs { after } => {
+            StoreReply::WorkerLogs(backend.worker_logs(*after, WORKER_LOGS_LIMIT).await?)
         }
         // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
@@ -5174,6 +5207,107 @@ mod tests {
         cache.close().await;
     }
 
+    /// One `info` worker line from `htui::worker`.
+    fn worker_line(text: &str) -> htui_core::model::NewWorkerLog {
+        htui_core::model::NewWorkerLog {
+            logged_at: Utc::now(),
+            level: htui_core::model::WorkerLogLevel::Info,
+            target: "htui::worker".to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    /// MOD-122 M2 D10: the Logs tab's read answers the memory store's rows, oldest first, the
+    /// newest page for `after: None` and the rows past the cursor for `Some`.
+    #[tokio::test]
+    async fn worker_logs_answers_the_memory_store_s_rows() {
+        use htui_core::store::WorkerLogStore as _;
+
+        let store = MemStore::demo();
+        let lines: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(worker_line)
+            .collect();
+        store
+            .append_worker_logs(ids::BOX, &lines)
+            .await
+            .expect("the fixture box takes three");
+        let backend = Backend::memory(store);
+
+        let StoreReply::WorkerLogs(all) =
+            serve(&backend, &StoreRequest::WorkerLogs { after: None }).await
+        else {
+            panic!("wrong reply variant")
+        };
+        let texts: Vec<&str> = all.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three"]);
+
+        let after = Some(all[0].id);
+        let StoreReply::WorkerLogs(newer) =
+            serve(&backend, &StoreRequest::WorkerLogs { after }).await
+        else {
+            panic!("wrong reply variant")
+        };
+        let texts: Vec<&str> = newer.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(texts, ["two", "three"], "only the rows past the cursor");
+    }
+
+    /// MOD-122 M2 blueprint F5: offline there is no worker log to read, so the answer is empty
+    /// (the tab merges it, adding nothing), never a refusal.
+    #[tokio::test]
+    async fn worker_logs_offline_answers_empty() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-logs-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+        let reply = serve(&backend, &StoreRequest::WorkerLogs { after: None }).await;
+        assert!(
+            matches!(&reply, StoreReply::WorkerLogs(lines) if lines.is_empty()),
+            "{reply:?}"
+        );
+        cache.close().await;
+    }
+
+    /// MOD-122 M2 D10: a refused read names itself, so the Logs tab can absorb it.
+    #[tokio::test]
+    async fn a_failed_worker_logs_read_names_the_request() {
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-logs-failed", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+        let reply = serve(&backend, &StoreRequest::WorkerLogs { after: Some(7) }).await;
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::Failed {
+                    request: "worker_logs",
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        cache.close().await;
+    }
+
     #[tokio::test]
     async fn serve_reports_an_empty_store_without_failing() {
         let backend = Backend::memory(MemStore::new());
@@ -5996,6 +6130,10 @@ mod tests {
     fn name_arms_are_stable() {
         assert_eq!(StoreRequest::ProjectTypes.name(), "project_types");
         assert_eq!(
+            StoreRequest::WorkerLogs { after: None }.name(),
+            "worker_logs"
+        );
+        assert_eq!(
             StoreRequest::AuthStart {
                 agent_id: AgentId::new()
             }
@@ -6033,9 +6171,9 @@ mod tests {
         );
     }
 
-    /// The three box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so
+    /// The four box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so
     /// the section's `Failed` match and the worker cannot drift apart (MOD-7 milestone 2, D46;
-    /// MOD-51 D4).
+    /// MOD-51 D4; MOD-122 M2 F9).
     #[test]
     fn box_requests_are_named_as_box_settings_lists_them() {
         assert_eq!(
@@ -6050,6 +6188,11 @@ mod tests {
                 StoreRequest::SetProbeSpec {
                     overlay: None,
                     expected: None,
+                }
+                .name(),
+                StoreRequest::SetBoxLogLevel {
+                    box_id: BoxId::new(),
+                    level: LogShipLevel::Debug,
                 }
                 .name(),
             ],

@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::cli::WorkerArgs;
 use crate::concepts;
 use crate::concepts_worker::{self, KeySource, QdrantCheck, QdrantSource};
+use crate::worker_log::{self, ShipHandle};
 
 /// MOD-158 D4: `--qdrant-key-stdin` was given and its line was blank, or missing. Not "nothing was
 /// read": with `--dsn-stdin` the DSN line before it was (MOD-158 R1, B-L5).
@@ -65,8 +66,8 @@ impl std::error::Error for WorkerExit {}
 ///
 /// [`WorkerExit`]; a clean signal shutdown is `Ok`.
 pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit> {
-    init_worker_tracing(log).map_err(|err| WorkerExit::Refused(format!("{err:#}")))?;
-    let ended = serve(args).await;
+    let ship = init_worker_tracing(log).map_err(|err| WorkerExit::Refused(format!("{err:#}")))?;
+    let ended = serve(args, ship).await;
     if let Err(WorkerExit::Refused(sentence)) = &ended {
         tracing::warn!("{sentence}");
     }
@@ -78,7 +79,10 @@ pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit>
 /// installing a handler replaces the default termination, so a signal the startup did not watch
 /// would be swallowed until the loop began. A signal during the startup is a clean exit 0, with
 /// nothing written after it.
-async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
+///
+/// `ship` is the log shipper's handle `init_worker_tracing` returned: its flusher starts beside the
+/// index job, over the same pool (MOD-122 M2 plan D2).
+async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
     let shutdown = shutdown_signal().map_err(|err| {
         WorkerExit::Refused(format!("the signal handlers could not be installed: {err}"))
     })?;
@@ -124,6 +128,9 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
     // the pool, never the runtime.
     let index_job = concepts::spawn_index_job(pg.clone());
+    // MOD-122 M2 plan D2, D4: this box's log lines to `worker_log`, and the retention sweep. Dropped
+    // on an early return below, it is aborted (R1 L7).
+    let log_flusher = worker_log::spawn_flusher(pg.clone(), ship);
     // MOD-160 D9: one model-free look at Qdrant, said once; never awaited, so a Qdrant that does
     // not answer never delays "htui worker ready".
     let start_check_task = tokio::spawn(start_check(Arc::clone(qdrant.source())));
@@ -146,6 +153,8 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     index_job.abort();
     start_check_task.abort();
+    // R1 M2: the last lines ship, waiting at most `worker_log::FINAL_FLUSH_MAX`.
+    log_flusher.shutdown().await;
     tracing::info!("htui worker stopped");
     Ok(())
 }
@@ -296,7 +305,11 @@ pub async fn connect(dsn: &str, root: &Path, pool: PoolSize) -> Result<PgStore, 
 /// `--log PATH` as the TUI writes it (appended, no ANSI); without it, stderr, with ANSI only on a
 /// terminal. Both add `sentry_tracing::layer()`; `HTUI_LOG_FILTER` overrides the default `info`
 /// level, as for the TUI.
-fn init_worker_tracing(log: Option<&Path>) -> anyhow::Result<()> {
+///
+/// MOD-122 M2 plan D8: that filter sits on the `fmt` and Sentry layers only, and the log shipper's
+/// layer rides beside them behind its own level, so a box shipping `debug` does not print `debug`
+/// on stderr and `HTUI_LOG_FILTER` does not narrow what ships. Returns the shipper's handle.
+fn init_worker_tracing(log: Option<&Path>) -> anyhow::Result<ShipHandle> {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -319,12 +332,17 @@ fn init_worker_tracing(log: Option<&Path>) -> anyhow::Result<()> {
             .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
             .boxed()
     };
+    let ship = ShipHandle::new();
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .with(sentry_tracing::layer())
+        .with(
+            fmt_layer
+                .and_then(sentry_tracing::layer())
+                .with_filter(filter),
+        )
+        .with(ship.layer())
         .try_init()
-        .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))
+        .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))?;
+    Ok(ship)
 }
 
 /// SIGINT or SIGTERM on unix; Ctrl-C, Ctrl-Break, Ctrl-Close and Ctrl-Shutdown on Windows

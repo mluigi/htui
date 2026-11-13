@@ -51,6 +51,7 @@ pub mod templates;
 pub mod terminal;
 pub mod ui;
 pub mod worker_cmd;
+pub mod worker_log;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

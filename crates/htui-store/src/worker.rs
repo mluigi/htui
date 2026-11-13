@@ -512,6 +512,65 @@ impl htui_core::store::RecorderStore for Writer {
     }
 }
 
+/// MOD-122 M2 (blueprint F9): the Settings › Boxes level row writes through `backend.writer()`,
+/// which is `Memory` under every `SectionBench` and Harness test, so the trait forwards per arm.
+impl htui_core::store::WorkerLogStore for Writer {
+    async fn append_worker_logs(
+        &self,
+        box_id: BoxId,
+        lines: &[htui_core::model::NewWorkerLog],
+    ) -> Result<u64> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::append_worker_logs(store, box_id, lines).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::append_worker_logs(pg, box_id, lines).await
+            }
+        }
+    }
+    async fn worker_logs(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<htui_core::model::WorkerLogLine>> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::worker_logs(store, after, limit).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::worker_logs(pg, after, limit).await
+            }
+        }
+    }
+    async fn prune_worker_logs(&self, older_than: DateTime<Utc>, per_box_cap: u32) -> Result<u64> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::prune_worker_logs(store, older_than, per_box_cap)
+                    .await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::prune_worker_logs(pg, older_than, per_box_cap)
+                    .await
+            }
+        }
+    }
+    async fn set_box_log_level(
+        &self,
+        box_id: BoxId,
+        level: Option<htui_core::model::LogShipLevel>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::set_box_log_level(store, box_id, level).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::set_box_log_level(pg, box_id, level).await
+            }
+        }
+    }
+}
+
 impl htui_core::store::RelayStore for Writer {
     async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
         WriteStore::open_permission(self, open).await

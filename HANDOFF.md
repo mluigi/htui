@@ -49,7 +49,8 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-152 (2026-11-13): migrations run through `0031_command_log` (MOD-152: `command_log`, one
+Live coordinates after MOD-152 and MOD-122 M2 (2026-11-13): migrations run through `0032_worker_log` (MOD-122 M2: `worker_log`, per-box
+worker log lines, `ON DELETE CASCADE` from `box`; not mirrored), before it `0031_command_log` (MOD-152: `command_log`, one
 scrubbed, capped log per `command_run` row, `ON DELETE CASCADE`; not mirrored), before it `0030_link_kinds` (MOD-150 M1: `item_link`
 kinds `parent`/`duplicates`/`implements`, `uq_item_link_one_parent`/`_one_canonical`; no new table; not mirrored), before it
 `0029_divided_fanout` (MOD-139: `run_step` role, parent and node key, `run_plan`; mirrored by cache `0010`), before it
@@ -1019,6 +1020,13 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 293 (`htui-core/te
   `v`, follow `F`, `G`, scrolling up pauses, reads on activation); Settings › Logging sets the filter and the
   log file live, saved in `ui-state.toml` `[logging]`, flag/env override for the session; Sentry keeps its
   startup-only `--log` gate and its own fixed filter (MOD-99). Live-Qdrant tests owed on the host. M2, M3 open.
+  **Phase M2 landed (`hr/MOD-122` `8574d4a7`, 2026-11-13):** each `htui worker` ships its log to Postgres
+  (migration 0032 `worker_log`; a per-layer filter at the box's level, default `warn`, set from Settings ›
+  Boxes `worker level`, key `v`; every line scrubbed on the worker; 20 000-line buffer, 200 lines or 2 s per
+  flush, measured at 10 000 lines/s with no drops; 14-day retention plus 100 000 rows per box; a deleted box's
+  rows go with it, errors kept). The Logs tab lists each worker's lines by box under a `workers` heading.
+  Live-Qdrant tests and the Postgres gate on the merged tree owed on the host; migration 0032 (renumbered at merge after MOD-152's `0031_command_log`) renumbers again at
+  collect if a sibling run adds one. M3 open.
 - [ ] **MOD-123 - Settings redesign** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.5). `R-TUI-8`,
   `R-ORCH-15`, `R-ORCH-1`, `R-ENT-17`. Fields edit on their row with help beneath; `←`/`→` change a
   choice or toggle, saved at once; Connection renamed **Postgres**; Backlog › Hierarchy removed (its

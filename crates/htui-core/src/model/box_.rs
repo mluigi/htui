@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::model::ids::{BoxId, UserId};
+use crate::model::worker_log::LogShipLevel;
 
 str_enum!(
     /// `box.os_family` (§5.2).
@@ -315,9 +316,10 @@ pub struct BoxInfo {
 
 /// `box.settings` as ANA-2 §4.7 reads it.
 ///
-/// Never re-serialised onto the row, so unknown keys survive. The blob's only writer is
-/// `WriteStore::edit_box` (MOD-41 plan D10), key by key under the `edit_version` compare-and-set;
-/// no `set_setting` rung reaches it.
+/// Never re-serialised onto the row, so unknown keys survive. The blob has two writers, each one
+/// key at a time: `WriteStore::edit_box` (MOD-41 plan D10) under the `edit_version`
+/// compare-and-set, and `WorkerLogStore::set_box_log_level` (MOD-122 M2 plan D7, last write wins,
+/// `edit_version` untouched). No `set_setting` rung reaches it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BoxSettings {
@@ -334,6 +336,16 @@ pub struct BoxSettings {
     /// reads [`Executor::of`] (a bad sibling key would make this struct fall back to default).
     #[serde(default, deserialize_with = "executor_lenient")]
     pub executor: Executor,
+    /// `box.settings.log_level` (MOD-122 M2 plan D7) for display and round-trips; an unknown
+    /// value reads as the default. The worker and the Settings row read [`LogShipLevel::of`].
+    #[serde(default, deserialize_with = "log_level_lenient")]
+    pub log_level: LogShipLevel,
+}
+
+/// `BoxSettings.log_level`'s decoder: whatever the value, a [`LogShipLevel`], so the field can
+/// never fail the struct's decode (MOD-122 M2 plan D7).
+fn log_level_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LogShipLevel, D::Error> {
+    Value::deserialize(d).map(|value| LogShipLevel::from_value(&value))
 }
 
 /// The value `0003_orchestration.sql` seeds under `app_setting.max_concurrent_items`, and what a
@@ -793,6 +805,64 @@ mod tests {
                 matches!(Executor::of(&blob), Executor::Other(_)),
                 "{blob} reads as `Other`, which fails closed"
             );
+        }
+    }
+
+    /// MOD-122 M2 plan D7: `log_level` reads as its level, through the struct and through
+    /// [`LogShipLevel::of`], and survives a round trip.
+    #[test]
+    fn box_settings_reads_a_known_log_level() {
+        let blob = json!({"log_level": "debug", "max_concurrent_items": 1});
+        let decoded = settings(&blob).expect("the blob decodes");
+        assert_eq!(decoded.log_level, LogShipLevel::Debug);
+        assert_eq!(decoded.max_concurrent_items, Some(1));
+        assert_eq!(LogShipLevel::of(&blob), LogShipLevel::Debug);
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("settings serialise")[LogShipLevel::KEY],
+            json!("debug")
+        );
+        for level in LogShipLevel::ALL {
+            let blob = json!({ LogShipLevel::KEY: level.as_str() });
+            assert_eq!(LogShipLevel::of(&blob), *level, "{blob}");
+            assert_eq!(
+                settings(&blob).expect("the blob decodes").log_level,
+                *level,
+                "{blob}"
+            );
+        }
+    }
+
+    /// MOD-122 M2 plan D7: no `log_level` key is the default, `warn`.
+    #[test]
+    fn box_settings_without_a_log_level_is_warn() {
+        for blob in [json!({}), json!({"executor": "worker"})] {
+            assert_eq!(LogShipLevel::of(&blob), LogShipLevel::Warn, "{blob}");
+            assert_eq!(
+                settings(&blob).expect("the blob decodes").log_level,
+                LogShipLevel::Warn,
+                "{blob}"
+            );
+        }
+        assert_eq!(LogShipLevel::default(), LogShipLevel::Warn);
+    }
+
+    /// MOD-122 M2 plan D7, blueprint F6: an unknown value reads as the default and never fails
+    /// the whole blob, so the rest of it is still read; a non-object blob reads as the default.
+    #[test]
+    fn box_settings_with_an_unknown_log_level_keeps_the_rest() {
+        for blob in [
+            json!({"log_level": 7, "max_concurrent_items": 1, "executor": "worker"}),
+            json!({"log_level": "loud", "max_concurrent_items": 1, "executor": "worker"}),
+            json!({"log_level": null, "max_concurrent_items": 1, "executor": "worker"}),
+        ] {
+            let decoded = settings(&blob).expect("an unknown log level still decodes");
+            assert_eq!(decoded.log_level, LogShipLevel::Warn, "{blob}");
+            assert_eq!(decoded.max_concurrent_items, Some(1), "{blob}");
+            assert_eq!(decoded.executor, Executor::Worker, "{blob}");
+            assert_eq!(LogShipLevel::of(&blob), LogShipLevel::Warn, "{blob}");
+        }
+        for blob in [json!([]), json!("debug"), Value::Null] {
+            assert_eq!(LogShipLevel::of(&blob), LogShipLevel::Warn, "{blob}");
         }
     }
 

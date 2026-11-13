@@ -105,7 +105,7 @@ Decisions taken at the DECIDE gate (2026-11-05):
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Logs tab and logging settings | A Logs tab shows htui's own log, always captured in memory with or without `--log`: sources (ui, store, orchestrator, agents, mcp, worker, secrets) with line and warning counts, lines coloured by level, minimum level `v`, follow `F`, scrolling up pauses following, `G` resumes, new lines stream in. A Settings section sets the level filter and the optional log file, applied without a restart. | complete | `.claude/plans/mod-122-activity-and-logs-m1.plan.md` |
-| 2 | Worker logs in the main instance | Each connected worker uploads its log lines (buffered, batched, at its per-box level set from the main instance); they appear in the main instance's Logs tab as a source per worker/box. Stored lines obey the maximum retention and are deleted with their worker, errors excepted. | pending | — |
+| 2 | Worker logs in the main instance | Each connected worker uploads its log lines (buffered, batched, at its per-box level set from the main instance); they appear in the main instance's Logs tab as a source per worker/box. Stored lines obey the maximum retention and are deleted with their worker, errors excepted. | complete | `.claude/plans/mod-122-activity-and-logs-m2.plan.md` |
 | 3 | Activity panel | Stored activity events from every workspace, the TUI's runtime and workers alike, shown newest first in the activity slot of the layout presets; needs-you events pinned on top, newest first, counted in the panel title; Enter jumps to the item or chat (across workspaces it says which workspace opens) and is recorded in back/forward history; `f` filters all workspaces · needs you · failures · this workspace; new events stream in. Events obey the maximum retention and are deleted with their item, errors excepted. | pending | — |
 
 ## Open Questions
@@ -133,4 +133,4 @@ All questions raised at DECIDE were answered (above). Left for `/plan`, not scop
 | A new migration moves count pins (`Pending(N)`, `TABLES`) | High | Low | Known recipe; renumber at collect if a sibling run adds a migration |
 
 ---
-*Status: M1 complete (`hr/MOD-122` `83dd23c0`, 2026-11-05); M2 and M3 pending `/plan`.*
+*Status: M1 complete (`hr/MOD-122` `83dd23c0`, 2026-11-05); M2 complete (`hr/MOD-122` `8574d4a7`, 2026-11-13); M3 pending `/plan`.*

@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/ui/tabs/logs/mod.rs
+expression: frame
+---
+no workspace   ¹Logs         0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · ⌫ back
+╭─ Sources ──────────────────╮╭─ worker · BUILD-01 · min trace · following ────────────────────────╮
+│ all              7 · ⚠ 3   ││10:15:01 INFO  worker       walk started run=7                      │
+│ ui               2 · ⚠ 0   ││10:15:02 DEBUG store        cache refreshed rows=3                  │
+│ store            2 · ⚠ 1   ││10:15:03 WARN  store        slow statement ms=812                   │
+│ orchestrator     0 · ⚠ 0   ││10:15:05 ERROR agents       adapter exited code=1                   │
+│ agents           2 · ⚠ 1   ││10:15:06 INFO  other        connection reused                       │
+│ mcp              0 · ⚠ 0   ││                                                                    │
+│ worker           0 · ⚠ 0   ││                                                                    │
+│ secrets          0 · ⚠ 0   ││                                                                    │
+│ other            1 · ⚠ 1   ││                                                                    │
+│ workers ───────────────────││                                                                    │
+│▌BUILD-01         5 · ⚠ 2   ││                                                                    │
+│ GPU-02           2 · ⚠ 1   ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+╰────────────────────────────╯╰─v level · F follow · G newest · j/k move───────────────────────────╯

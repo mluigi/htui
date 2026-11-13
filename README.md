@@ -188,7 +188,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
 | **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
 | **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
-| **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow. |
+| **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow, and the log each headless worker ships to the database. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
 
@@ -435,6 +435,11 @@ them are warnings or errors. htui keeps the last 10 000 lines its log filter let
 whether or not it writes a log file. Lines arrive when you switch to the tab, then once a second
 while it is in front; scrolling up pauses following, so the lines you are reading stay put.
 
+Under a `workers` heading, the list then shows one row per headless worker box that has shipped a
+line (`worker · <box>` in the lines pane's title, `✕` beside a box since deleted): that worker's
+shipped log, read from the database about once a second, at the box's `worker level` set in
+Settings › Boxes. `all` stays this process's own lines only.
+
 ### Settings
 
 | Section | What you do there |
@@ -445,7 +450,7 @@ while it is in front; scrolling up pauses following, so the lines you are readin
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
 | **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
-| **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), and a fresh check of its tools (`p`). |
+| **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), how much of its log that worker sends to the database, the `worker level` row (`v` cycles `off`, `error`, `warn`, `info`, `debug`; default `warn`), and a fresh check of its tools (`p`). |
 | **Personas** | Agent personas: create (`n`), edit the fields (`e`), the body (`b`) and the permission rules (`r`), delete (`d`), and import `.md` persona files (`I`). See [`docs/personas.md`](docs/personas.md). |
 | **Logging** | Which lines `htui` keeps (the filter, an `EnvFilter` directive such as `info` or `htui=debug`) and a file to append its log to (`e` edits; `~/` is your home directory, and a path that is not a regular file, such as a pipe, is refused). Both apply at once and are kept in `ui-state.toml`; a field set by `--log` or `HTUI_LOG_FILTER` says so and cannot be changed here for that session. |
 

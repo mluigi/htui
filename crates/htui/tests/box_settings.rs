@@ -20,7 +20,9 @@ use htui::ui::Theme;
 use htui::ui::tabs::settings::{BoxesSection, PromptSection, SettingsSection, SettingsTab};
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
-use htui_core::model::{BoxEdit, BoxId, BoxRecord, Executor, Scope, canonical_declared_tags};
+use htui_core::model::{
+    BoxEdit, BoxId, BoxRecord, Executor, LogShipLevel, Scope, canonical_declared_tags,
+};
 use htui_core::store::traits::BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN;
 use htui_core::store::{MemStore, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
@@ -462,7 +464,58 @@ async fn a_stored_overlay_the_probe_ignores_carries_its_token_and_clears() {
     );
 }
 
-/// Offline, all three are refused by their own names with MOD-25's sentence: `Backend::writer()`
+/// A `SetBoxLogLevel` request (MOD-122 M2 D11).
+fn set_level(box_id: BoxId, level: LogShipLevel) -> StoreRequest {
+    StoreRequest::SetBoxLogLevel { box_id, level }
+}
+
+/// MOD-122 M2 D7, F9: an applied level answers `Boxes` with the key written beside every other
+/// key of the blob, and the box's `edit_version` untouched (last write wins, no token).
+#[tokio::test]
+async fn set_box_log_level_applied_answers_boxes_and_keeps_the_other_keys() {
+    let second = BoxId::from_uuid(Uuid::from_u128(1));
+    let backend = Backend::memory(two_boxes_one_worker());
+
+    let snapshot = boxes(serve(&backend, &set_level(second, LogShipLevel::Debug)).await);
+
+    let row = &record(&snapshot, second).row;
+    assert_eq!(
+        row.settings,
+        json!({ "max_concurrent_items": 2, "executor": "worker", "log_level": "debug" })
+    );
+    assert_eq!(row.edit_version, 0, "a level is not a compare-and-set edit");
+    assert_eq!(LogShipLevel::of(&row.settings), LogShipLevel::Debug);
+    let other = &record(&snapshot, ids::BOX).row;
+    assert_eq!(
+        LogShipLevel::of(&other.settings),
+        LogShipLevel::Warn,
+        "only the named box moves"
+    );
+}
+
+/// MOD-122 M2 F9: a box gone under the section answers `BoxesStale` without it, the `EditBox`
+/// `NotFound` rule.
+#[tokio::test]
+async fn set_box_log_level_on_a_vanished_box_answers_boxes_stale_without_it() {
+    let gone = BoxId::new();
+    let snapshot = stale(serve(&demo(), &set_level(gone, LogShipLevel::Info)).await);
+
+    assert!(
+        snapshot.boxes.iter().all(|record| record.row.id != gone),
+        "the vanished box is not listed: {:?}",
+        snapshot.boxes
+    );
+    assert!(
+        snapshot
+            .boxes
+            .iter()
+            .any(|record| record.row.id == ids::BOX),
+        "the demo box still is: {:?}",
+        snapshot.boxes
+    );
+}
+
+/// Offline, all four are refused by their own names with MOD-25's sentence: `Backend::writer()`
 /// is `None`, so `serve` never reaches the seam (nor, for `SetProbeSpec`, the checker: the overlay
 /// sent is one the checker refuses, review LOW-3), the read included. The length assertion keeps
 /// the `zip` from dropping a request (MOD-51 F-7).
@@ -485,6 +538,7 @@ async fn offline_every_box_request_is_refused_with_the_database_sentence() {
         StoreRequest::Boxes,
         edit(ids::BOX, 0, Some(&["gpu"]), None),
         set_spec(Some(json!({ "nope": 1 })), None),
+        set_level(ids::BOX, LogShipLevel::Debug),
     ];
     assert!(
         spec::check(&json!({ "nope": 1 })).is_err(),
@@ -1541,6 +1595,223 @@ async fn ctrl_c_passes_through_the_executor_confirmation() {
     bench.key(&mut section, "w");
     assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
     assert!(section.captures_input(), "the confirmation is still open");
+}
+
+// ---- the worker log level (MOD-122 M2 D11) ----
+
+/// The detail pane's worker level row for `level`: the 14-wide label column and the form's
+/// two-cell gap, then the value. The row is `worker level`, the name the Logs tab and the README
+/// use for it (R1 L2).
+fn log_level_row(level: &str) -> String {
+    format!("{:<16}{level}", "worker level")
+}
+
+/// The demo snapshot with the fixture box's settings blob replaced by `settings`.
+async fn demo_with_settings(settings: Value) -> BoxesSnapshot {
+    let mut snapshot = snap_of(MemStore::demo()).await;
+    snapshot.boxes[0].row.settings = settings;
+    snapshot
+}
+
+/// The one `SetBoxLogLevel` in `requests`, or a panic naming what went out instead.
+#[track_caller]
+fn only_level(requests: &[StoreRequest]) -> (BoxId, LogShipLevel) {
+    match requests {
+        [StoreRequest::SetBoxLogLevel { box_id, level }] => (*box_id, *level),
+        other => panic!("expected exactly one set_box_log_level: {other:?}"),
+    }
+}
+
+/// MOD-122 M2 D7, D11: the row shows the box's level, `warn` when the key is missing or unknown;
+/// a box that is not a headless worker says where the level applies, a worker box does not.
+#[tokio::test]
+async fn the_boxes_section_shows_each_box_s_worker_log_level() {
+    for settings in [
+        json!({}),
+        json!({ "log_level": "loud" }),
+        json!({ "log_level": 7 }),
+    ] {
+        let (bench, section) = bench_with(&demo_with_settings(settings.clone()).await).await;
+        let frame = bench.render_section(&section, 100);
+        assert!(
+            frame.contains(&log_level_row("warn")),
+            "{settings}: {frame}"
+        );
+        assert!(
+            words(&frame).contains("applies to `htui worker` on this box"),
+            "a TUI box says where the level applies: {frame}"
+        );
+    }
+
+    let snapshot = demo_with_settings(json!({ "executor": "worker", "log_level": "debug" })).await;
+    let (bench, section) = bench_with(&snapshot).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&log_level_row("debug")), "{frame}");
+    assert!(
+        !words(&frame).contains("applies to `htui worker` on this box"),
+        "a worker box needs no such note: {frame}"
+    );
+    assert!(
+        words(&frame).contains("v cycles"),
+        "the help names the key: {frame}"
+    );
+}
+
+/// MOD-122 M2 D11, F8: `v` cycles `off → error → warn → info → debug → off` over the listed box
+/// and sends the next level at once; no editor opens.
+#[tokio::test]
+async fn v_cycles_the_worker_log_level_and_saves_at_once() {
+    for (from, to) in [
+        (json!({}), LogShipLevel::Info),
+        (json!({ "log_level": "off" }), LogShipLevel::Error),
+        (json!({ "log_level": "error" }), LogShipLevel::Warn),
+        (json!({ "log_level": "warn" }), LogShipLevel::Info),
+        (json!({ "log_level": "info" }), LogShipLevel::Debug),
+        (json!({ "log_level": "debug" }), LogShipLevel::Off),
+    ] {
+        let (bench, mut section) = bench_with(&demo_with_settings(from.clone()).await).await;
+
+        assert_eq!(bench.key(&mut section, "v"), Handled::Consumed, "{from}");
+        assert!(!section.captures_input(), "`v` opens no editor");
+        assert_eq!(only_level(&requests(&bench)), (ids::BOX, to), "{from}");
+    }
+
+    // The reply to the write is the read that shows it.
+    let (bench, mut section) = bench_with(&demo_with_settings(json!({})).await).await;
+    bench.key(&mut section, "v");
+    only_level(&requests(&bench));
+    feed(
+        &bench,
+        &mut section,
+        &demo_with_settings(json!({ "log_level": "info" })).await,
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&log_level_row("info")), "{frame}");
+    bench.key(&mut section, "v");
+    assert_eq!(
+        only_level(&requests(&bench)),
+        (ids::BOX, LogShipLevel::Debug),
+        "the reply freed the next write"
+    );
+}
+
+/// MOD-122 M2 D11: the browse hint offers the key.
+#[tokio::test]
+async fn the_browse_hint_offers_the_log_level() {
+    let (bench, section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("v worker level"), "{hint}");
+}
+
+/// MOD-122 M2 D11: a refused write shows the store's sentence, keeps the level on screen and frees
+/// the next write.
+#[tokio::test]
+async fn a_refused_log_level_write_keeps_the_old_level_and_says_why() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "v");
+    only_level(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_box_log_level",
+            message: "store unreachable".to_owned(),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&log_level_row("warn")), "{frame}");
+    assert!(last_line(&frame).contains("store unreachable"), "{frame}");
+    bench.key(&mut section, "v");
+    assert_eq!(
+        only_level(&requests(&bench)),
+        (ids::BOX, LogShipLevel::Info),
+        "a second `v` retries"
+    );
+}
+
+/// MOD-122 M2 F9: a box gone under the write answers `BoxesStale`, and the section says it was
+/// deleted elsewhere over the list without it.
+#[tokio::test]
+async fn a_log_level_write_on_a_vanished_box_says_deleted_elsewhere() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes()).await).await;
+
+    bench.key(&mut section, "k");
+    bench.key(&mut section, "v");
+    let (box_id, _) = only_level(&requests(&bench));
+    assert_eq!(box_id, BoxId::from_uuid(Uuid::from_u128(1)), "SECOND-BOX");
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(snap_of(MemStore::demo()).await)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("deleted elsewhere"), "{frame}");
+    assert!(!frame.contains("SECOND-BOX"), "{frame}");
+    assert!(!section.captures_input());
+}
+
+/// MOD-122 M2 R1 L6: `v` cycles from Browse only, so the row's help names the key only there; an
+/// open editor or the executor confirm keeps the rest of the help.
+#[tokio::test]
+async fn the_level_help_names_its_key_only_in_browse() {
+    for key in ["t", "e", "w"] {
+        let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+        assert_eq!(bench.key(&mut section, key), Handled::Consumed, "{key}");
+        let frame = bench.render_section(&section, 100);
+        let words = words(&frame);
+        assert!(
+            words.contains("applies to `htui worker` on this box"),
+            "{key}: {frame}"
+        );
+        assert!(!words.contains("v cycles"), "{key}: {frame}");
+    }
+}
+
+/// MOD-122 M2 D11: `v` over a write in flight sends nothing and says so in words.
+#[tokio::test]
+async fn v_while_a_save_is_in_flight_sends_nothing() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "v");
+    only_level(&requests(&bench));
+    assert_eq!(bench.key(&mut section, "v"), Handled::Consumed);
+
+    assert!(requests(&bench).is_empty(), "the second `v` sends nothing");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("still saving the worker level \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
+}
+
+/// MOD-122 M2 D11: with no box to act on (before the first read, over a refused read, over an
+/// empty list) `v` passes and sends nothing.
+#[tokio::test]
+async fn v_passes_with_no_box_to_act_on() {
+    let bench = SectionBench::new().await;
+    let mut section = BoxesSection::new();
+    assert_eq!(bench.key(&mut section, "v"), Handled::Pass, "not read yet");
+
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "boxes",
+            message: "store unreachable".to_owned(),
+        },
+    );
+    assert_eq!(
+        bench.key(&mut section, "v"),
+        Handled::Pass,
+        "a refused read"
+    );
+
+    let mut empty = snap_of(MemStore::demo()).await;
+    empty.boxes.clear();
+    let (bench, mut section) = bench_with(&empty).await;
+    assert_eq!(bench.key(&mut section, "v"), Handled::Pass, "an empty list");
+    assert!(requests(&bench).is_empty());
 }
 
 // ---- the probe spec editor (MOD-51 D6) ----
