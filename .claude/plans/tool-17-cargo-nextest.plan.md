@@ -111,7 +111,7 @@ T1 ∩ T2 ∩ T3 = ∅ (checked below). They still run serially, because S (spik
 - **Validate**: `cargo test -p htui --all-features --test it state_cli_pg::live_qdrant_`,
   `cargo test -p htui --all-features --lib concepts_worker::tests::live_qdrant_`,
   `cargo test -p htui-bench --all-features --lib live_qdrant_` (each runs the renamed cases);
-  `cargo nextest show-config test-groups` lists all 32 `qdrant_live::`, the `qdrant_worker::` cases and the six;
+  `cargo nextest show-config test-groups --all-features` lists all 32 `qdrant_live::`, the `qdrant_worker::` cases and the six;
   `cargo clippy -p htui -p htui-bench --all-features --all-targets -- -D warnings`; `cargo fmt --check`.
 
 ### S: Spike (main thread, not an agent)
@@ -176,13 +176,32 @@ TOOL-16 base failures, unless the spike showed otherwise. Then the `rust-reviewe
 | `/opt/rust/cargo/bin` is on the sandbox PATH | ✓ | `compose.hr.yaml:94` |
 | Nothing in `scripts/` checks image labels, so the new label only documents | ✓ | scan for `hr.cargo-insta` / `hr.sqlx-cli` in `scripts/`: no hits |
 | `htui-dev` mod's `GATE_STEPS` is tied to `STEPS`, so D6 keeps the list | ✓ | `gate.sh` self-test compares `GATE_STEPS` in `.claude/skills/htui-dev/hooks/commands.ts` |
-| Test binaries that re-run themselves as a child (`--exact <name>`) work under nextest | open | S: those five sites (TOOL-15 D3) run in (b) |
+| Test binaries that re-run themselves as a child (`--exact <name>`) work under nextest | ✓ | S: no (b)-only failure; the only failure is the `claude_plugin` base case |
 | Host has pwsh for the ps1 self-test | ✓ | `/home/mluigi/.local/share/mise/shims/pwsh` |
 | Task file sets are disjoint | ✓ | T1 {nextest.toml, state_cli_pg.rs, concepts_worker.rs, run.rs} · T2 {gate.sh, gate.ps1} · T3 {Dockerfile, hr-sandbox.md, AGENTS.md, testkit.rs}: pairwise ∅ |
 
 ## Spike result
 
-_(filled in by S)_
+HEAD `07f19f2f`, 2026-11-13 18:02, host (12 cpus, 60 GB), Postgres and Qdrant live, load average ~7 from other
+work before the start. Prebuild 7 s (warm). Sequential, `/usr/bin/time -v`, logs in `/tmp/tool17/`:
+
+| Run | Wall | Result |
+|---|---|---|
+| (a) `cargo test --workspace --all-features --no-fail-fast` | **381 s** | 8,701 passed, 1 failed, 44 ignored (doctests included) |
+| (b) `cargo nextest run --workspace --all-features --no-fail-fast --profile gate` | **287 s** | 8,697 run: 8,696 passed, 1 failed (twice, retry included), 44 skipped; 4 slow, 1 leaky |
+| (c) `cargo test --workspace --all-features --doc` | **4 s** | 5 passed |
+| (b)+(c) against (a) | **291 s vs 381 s, -24 %** | test counts match: 8,697 + 5 = 8,702 = 8,701 + 1 |
+
+- **Failures:** the same one on both sides, `claude_plugin::the_emitted_plugin_validates_and_the_mod_tests_pass_under_claude`
+  (TOOL-16 base failure). `worker_pg` and `worker_crash_pg`, the other two base failures, passed in both. No
+  (b)-only failure: the five self-re-running tests (TOOL-15 D3) pass under nextest. No `57P03`, no aborts.
+- **Leaky:** `editor::tests::suspension::a_dropped_future_kills_the_editor` leaves a handle open past its exit
+  (nextest marks it LEAK and still passes it).
+- **Per-test (JUnit):** 2,513 s of test time in 287 s of wall time (8.8x). The long poles are the four
+  `pg_conformance` shards at ~101 s each, then `keys::validate::…a_version_1_entry_never_takes_a_key…` at 56 s and
+  `migrations::migration_0018…` at 39 s. The 40 `live-qdrant` cases sum to 156 s serially, which fits inside the
+  run.
+- **Verdict per D2: go**, since (b)+(c) ≤ (a) and there are no unexplained failures. The maintainer decides.
 
 ## Acceptance
 - [ ] T1, S done; go/no-go recorded
