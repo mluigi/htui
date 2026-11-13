@@ -87,8 +87,8 @@ later runs better is MOD-169's measurement.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Run write path | Run-written entries can be stored safely: validated, evidenced, scrubbed, capped, stamped and counted. They supersede only run entries, show in prompts and in the pane as model-written, and are exercised by conformance tests through a store-level writer. | in-progress | `.claude/plans/mod-164-capture.plan.md` |
-| 2 | Extraction turn | Runs with failures or retries end with a recorded capture step that writes entries through the M1 path. It uses the light-model setting, is skipped with a reason otherwise, stays under the token cap and never changes the run's outcome. | in-progress | `.claude/plans/mod-164-capture.plan.md` |
+| 1 | Run write path | Run-written entries can be stored safely: validated, evidenced, scrubbed, capped, stamped and counted. They supersede only run entries, show in prompts and in the pane as model-written, and are exercised by conformance tests through a store-level writer. | complete | `.claude/plans/mod-164-capture.plan.md` |
+| 2 | Extraction turn | Runs with failures or retries end with a recorded capture step that writes entries through the M1 path. It uses the light-model setting, is skipped with a reason otherwise, stays under the token cap and never changes the run's outcome. | complete | `.claude/plans/mod-164-capture.plan.md` |
 
 ## Open Questions
 Answered at the PRD gate (maintainer, 2026-11-13):
@@ -128,4 +128,4 @@ Still open (for `/plan`):
 | Migration renumber at collect (parallel branches) | High | Low | Known procedure: renumber at merge and move the count pins (MOD-163 note). |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — both milestones built (MOD-164 done, 2026-11-13; `docs/decisions/mod/mod-164.md`).*
