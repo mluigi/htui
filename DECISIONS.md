@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-152](docs/decisions/mod/mod-152.md)** - Async command queue and stored command logs (done, 2026-11-13)
 - **[MOD-141](docs/decisions/mod/mod-141.md)** - One step-graph editor for Settings and the Toolbox (done, 2026-11-12)
 - **[MOD-170](docs/decisions/mod/mod-170.md)** - Waiting key qualifier: one read per refresh tick (done, 2026-11-11)
 - **[MOD-139](docs/decisions/mod/mod-139.md)** - Divided fan-out runtime: planner, parts, integrate (done, 2026-11-11)
