@@ -207,6 +207,39 @@ async fn n_on_the_workspace_header_opens_a_ws_form() {
     assert_eq!(harness.app().status, None);
 }
 
+/// MOD-147 M3 D5, end to end: `N` on the empty workspace header, a title and `Ctrl+S` mint
+/// `WS-1` through the real store worker, and the re-read lists it under `Platform (1)`, above
+/// the members' groups.
+#[tokio::test]
+async fn n_on_the_workspace_header_mints_ws_1_into_its_group() {
+    let mut harness = backlog(MemStore::demo(), 100, 30, None).await;
+    let frame = harness.render();
+    assert!(frame.contains("\u{25be} Platform (0)"), "{frame}");
+    keys(&mut harness, &["k", "k", "N"]).await;
+    type_text(&mut harness, "Spans the workspace");
+    keys(&mut harness, &["ctrl-s"]).await;
+    assert_eq!(harness.app().status, None, "a mint raises nothing");
+    let frame = harness.render();
+    // The list pane's line holding `text`: left of the `││` between the panes, so the detail
+    // pane's `WS-1` title does not count.
+    let line = |text: &str| {
+        frame
+            .lines()
+            .position(|line| {
+                line.split_once("\u{2502}\u{2502}")
+                    .is_some_and(|(list, _)| list.contains(text))
+            })
+            .unwrap_or_else(|| panic!("{text:?} in\n{frame}"))
+    };
+    let (header, item, htui) = (
+        line("\u{25be} Platform (1)"),
+        line("WS-1"),
+        line("\u{25be} htui ("),
+    );
+    assert!(header < item && item < htui, "{frame}");
+    assert!(!frame.contains("New item"), "the form closed:\n{frame}");
+}
+
 /// MOD-81: the new item form at 80 columns: every row, the pickers' words and the pane's keys.
 #[tokio::test]
 async fn the_item_form_at_80_columns() {

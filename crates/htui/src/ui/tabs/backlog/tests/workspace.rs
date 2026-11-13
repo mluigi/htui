@@ -183,13 +183,25 @@ async fn n_on_the_workspace_header_opens_a_ws_form_that_stays_on_the_row() {
     );
 }
 
-/// D3: a scope change forgets the scope row, so the old workspace's group is not drawn over
-/// the new scope's first reply.
+/// D3: a scope change forgets the scope row at once, so the old workspace's group is neither a
+/// row nor drawn before the new scope's first reply, nor over it.
 #[tokio::test]
 async fn a_scope_change_forgets_the_workspace_group() {
     let bench = Bench::new().await;
     let mut tab = settled(&bench, &MemStore::demo()).await;
+    assert!(
+        tab.rows(&bench.ctx())
+            .contains(&Selection::Project(PROJECT_SCOPE_PLATFORM))
+    );
     tab.on_scope_change(&bench.scope);
+    let rows = tab.rows(&bench.ctx());
+    assert!(
+        !rows.contains(&Selection::Project(PROJECT_SCOPE_PLATFORM)),
+        "{rows:?}"
+    );
+    let frame = drawn(&tab, &bench);
+    assert!(!frame.contains("Platform ("), "{frame}");
+
     tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     let frame = drawn(&tab, &bench);
     assert!(!frame.contains("Platform ("), "{frame}");
