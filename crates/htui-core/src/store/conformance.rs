@@ -42,12 +42,12 @@ use crate::model::{
     WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
-use crate::model::{NewOwnerDocument, Project, StepRole};
 use crate::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
 use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::TemplateRole;
@@ -29867,9 +29867,9 @@ async fn create_step_refuses_a_part_without_parent_or_key<S: WriteStore>(store: 
     .await;
 }
 
-/// MOD-139 D1 (ANA-33 §7.11): positions -3..-1 are the stage rows' and only theirs, and a stage
-/// names pick, prepare or collect. Each refusal is [`run_step_refusal`]'s sentence on every store,
-/// and nothing is written.
+/// MOD-139 D1 (ANA-33 §7.11), MOD-164 D3: positions -4..-1 are the stage rows' and only theirs,
+/// and a stage names capture, pick, prepare or collect. Each refusal is [`run_step_refusal`]'s
+/// sentence on every store, and nothing is written. The capture stage at -4 is accepted.
 async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store: &S) {
     const CASE: &str = "create_step_reserves_negative_positions_for_stages";
     let (run, _) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
@@ -29879,8 +29879,12 @@ async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store
             "a stage at position 0",
         ),
         (
-            role_step(run, -4, StepRole::Stage, None, Some("pick")),
-            "a stage at position -4",
+            role_step(run, -5, StepRole::Stage, None, Some("capture")),
+            "a stage at position -5",
+        ),
+        (
+            role_step(run, -5, StepRole::Step, None, None),
+            "a step at position -5",
         ),
         (
             role_step(run, -1, StepRole::Stage, None, Some("nope")),
@@ -29902,6 +29906,16 @@ async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store
     for (new, what) in refused {
         step_refused_exactly(CASE, store, new, what).await;
     }
+    let capture = role_step(run, -4, StepRole::Stage, None, Some(CAPTURE_KEY));
+    let written = store
+        .create_step(capture.clone())
+        .await
+        .unwrap_or_else(|e| panic!("{CASE}: the capture stage at -4 is accepted: {e:?}"));
+    assert_eq!(
+        (written.position, written.role, written.node_key.as_deref()),
+        (CAPTURE_POSITION, StepRole::Stage, Some(CAPTURE_KEY)),
+        "{CASE}: the capture stage reads back"
+    );
 }
 
 /// The sentence both stores give a `run_step.parent_step_id` that names no step of `run`, an

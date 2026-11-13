@@ -381,9 +381,10 @@ pub struct RunStep {
     /// planner step; `None` on every other row today. Written once.
     #[serde(default)]
     pub parent_step_id: Option<StepId>,
-    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11): a part's `<divided>/<part_key>`, or a
-    /// stage's `pick` | `prepare` | `collect` ([`STAGE_KEYS`]); `None` on a node of the frozen
-    /// snapshot, which `position` names. Written once.
+    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11; MOD-164 D3): a part's
+    /// `<divided>/<part_key>`, or a stage's `capture` | `pick` | `prepare` | `collect`
+    /// ([`STAGE_KEYS`]); `None` on a node of the frozen snapshot, which `position` names. Written
+    /// once.
     #[serde(default)]
     pub node_key: Option<String>,
     /// `run_step.updated_at`.
@@ -1099,16 +1100,26 @@ str_enum!(
         Subgraph => "subgraph",
         /// A read-only consult-mode subagent (MOD-27).
         Consult => "consult",
-        /// One of htui's own stages at positions -3..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
-        /// `chk_run_step_stage`); MOD-126 and MOD-132 write them.
+        /// One of htui's own stages at positions -4..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
+        /// `chk_run_step_stage`); MOD-126 and MOD-132 write pick, prepare and collect, MOD-164
+        /// writes capture.
         Stage => "stage",
     }
 );
 
-/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `pick` at -3,
-/// `prepare` at -2, `collect` at -1 (ANA-33 §7.11). `chk_run_step_stage` lists the same three; the
-/// CHECK does not bind a key to its position (blueprint F-1).
-pub const STAGE_KEYS: [&str; 3] = ["pick", "prepare", "collect"];
+/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `capture` at -4
+/// (MOD-164 D3), `pick` at -3, `prepare` at -2, `collect` at -1 (ANA-33 §7.11).
+/// `chk_run_step_stage` lists the same four (`0031_memory_capture.sql`); the CHECK does not bind a
+/// key to its position (blueprint F-1), so neither does [`run_step_refusal`].
+///
+/// [`run_step_refusal`]: crate::store::run_step_refusal
+pub const STAGE_KEYS: [&str; 4] = ["capture", "pick", "prepare", "collect"];
+
+/// The capture stage's `node_key` and `phase_name` (MOD-164 D3): the run-end memory capture turn.
+pub const CAPTURE_KEY: &str = "capture";
+
+/// The capture stage row's reserved position (MOD-164 D3), the first of [`STAGE_KEYS`]'s.
+pub const CAPTURE_POSITION: i32 = -4;
 
 /// The suffix of an expanded `divide` node's planner key, `<name>:plan` (MOD-138 D11). A phase may
 /// not be named with it (MOD-139 D6, [`phase_name_refusal`](crate::store::phase_name_refusal)), so a
@@ -2981,5 +2992,15 @@ mod tests {
             },
             step
         );
+    }
+
+    /// MOD-164 D3: `capture` is the fourth stage key, at the reserved position -4, ahead of the
+    /// other three in reserved-position order.
+    #[test]
+    fn capture_is_a_stage_key_at_minus_four() {
+        assert_eq!(super::STAGE_KEYS, ["capture", "pick", "prepare", "collect"]);
+        assert_eq!(super::CAPTURE_KEY, "capture");
+        assert_eq!(super::CAPTURE_POSITION, -4);
+        assert!(super::STAGE_KEYS.contains(&super::CAPTURE_KEY));
     }
 }

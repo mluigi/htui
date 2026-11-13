@@ -104,7 +104,8 @@ use uuid::Uuid;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
-use crate::pg::rows::PersonaRow;
+use crate::pg::rows::{MemoryEntryRow, PersonaRow};
+use htui_core::model::{MemoryEvidence, MemorySource};
 
 /// The refusal text for a kind that is unknown or belongs to another project.
 ///
@@ -756,7 +757,7 @@ async fn memory_cas_head(
     expected_version: i32,
 ) -> Result<core::result::Result<MemoryEntry, (MemoryEntry, MemoryRevision)>> {
     let Some(head) = sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         SELECT id            AS "id: MemoryEntryId",
                project_id    AS "project_id: ProjectId",
@@ -769,7 +770,18 @@ async fn memory_cas_head(
                superseded_by AS "superseded_by: MemoryEntryId",
                created_by    AS "created_by: UserId",
                created_at,
-               updated_at
+               updated_at,
+               source        AS "source: MemorySource",
+               run_id        AS "run_id: RunId",
+               step_id       AS "step_id: StepId",
+               item_id       AS "item_id: ItemId",
+               agent_id      AS "agent_id: AgentId",
+               model,
+               commit_hash,
+               evidence      AS "evidence: Json<MemoryEvidence>",
+               shown_steps,
+               shown_done,
+               shown_failed
           FROM memory_entry WHERE id = $1 FOR UPDATE
         "#,
         id.as_uuid(),
@@ -777,7 +789,7 @@ async fn memory_cas_head(
     .fetch_optional(&mut *conn)
     .await
     .map_err(map_sqlx)?
-    else {
+    .map(MemoryEntry::from) else {
         return Err(StoreError::NotFound {
             entity: "memory_entry",
             id: id.to_string(),
@@ -827,7 +839,7 @@ async fn apply_memory_edit(
     edit: MemoryEdit,
 ) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
     sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         WITH u AS (
             UPDATE memory_entry SET
@@ -840,7 +852,9 @@ async fn apply_memory_edit(
                 version       = version + 1
              WHERE id = $1
             RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
-                      superseded_by, created_by, created_at, updated_at
+                      superseded_by, created_by, created_at, updated_at, source, run_id,
+                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,
+                      shown_done, shown_failed
         ), v AS (
             INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
                                                author_id, box_id, reason)
@@ -858,7 +872,18 @@ async fn apply_memory_edit(
                u.superseded_by AS "superseded_by: MemoryEntryId",
                u.created_by    AS "created_by!: UserId",
                u.created_at    AS "created_at!",
-               u.updated_at    AS "updated_at!"
+               u.updated_at    AS "updated_at!",
+               u.source        AS "source!: MemorySource",
+               u.run_id        AS "run_id: RunId",
+               u.step_id       AS "step_id: StepId",
+               u.item_id       AS "item_id: ItemId",
+               u.agent_id      AS "agent_id: AgentId",
+               u.model         AS "model",
+               u.commit_hash   AS "commit_hash",
+               u.evidence      AS "evidence: Json<MemoryEvidence>",
+               u.shown_steps   AS "shown_steps!",
+               u.shown_done    AS "shown_done!",
+               u.shown_failed  AS "shown_failed!"
           FROM u, v
         "#,
         id.as_uuid(),
@@ -874,6 +899,7 @@ async fn apply_memory_edit(
     )
     .fetch_optional(&mut *conn)
     .await
+    .map(|row| row.map(MemoryEntry::from))
 }
 
 /// One statement: the row and its revision 1, `reason = 'created'` (`mint_requirement`'s shape).
@@ -885,14 +911,16 @@ async fn insert_memory_entry(
     new: &NewMemoryEntry,
 ) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
     sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         WITH p AS (SELECT id FROM project WHERE id = $1),
              e AS (
-            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by)
-            SELECT $2, p.id, $3, $4, $5, $6 FROM p
+            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by, source)
+            SELECT $2, p.id, $3, $4, $5, $6, 'person' FROM p
             RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
-                      superseded_by, created_by, created_at, updated_at
+                      superseded_by, created_by, created_at, updated_at, source, run_id,
+                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,
+                      shown_done, shown_failed
         ), v AS (
             INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
                                                author_id, box_id, reason)
@@ -910,7 +938,18 @@ async fn insert_memory_entry(
                e.superseded_by AS "superseded_by: MemoryEntryId",
                e.created_by    AS "created_by!: UserId",
                e.created_at    AS "created_at!",
-               e.updated_at    AS "updated_at!"
+               e.updated_at    AS "updated_at!",
+               e.source        AS "source!: MemorySource",
+               e.run_id        AS "run_id: RunId",
+               e.step_id       AS "step_id: StepId",
+               e.item_id       AS "item_id: ItemId",
+               e.agent_id      AS "agent_id: AgentId",
+               e.model         AS "model",
+               e.commit_hash   AS "commit_hash",
+               e.evidence      AS "evidence: Json<MemoryEvidence>",
+               e.shown_steps   AS "shown_steps!",
+               e.shown_done    AS "shown_done!",
+               e.shown_failed  AS "shown_failed!"
           FROM e, v
         "#,
         project.as_uuid(),
@@ -923,6 +962,7 @@ async fn insert_memory_entry(
     )
     .fetch_optional(&mut *conn)
     .await
+    .map(|row| row.map(MemoryEntry::from))
 }
 
 /// A memory write's refusal in `MemStore`'s sentences (`persona_name_taken`'s rule, plus one

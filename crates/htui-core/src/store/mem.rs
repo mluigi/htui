@@ -56,6 +56,7 @@ use crate::model::{
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
+use crate::model::{MemorySource, MemoryUsage};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::DEFAULT_TEMPLATES;
@@ -6055,6 +6056,39 @@ impl State {
             row.superseded_by = None;
             row.updated_at = now;
         }
+        // MOD-164 D1: a surviving run's entry naming a gone run, step or item loses that pointer
+        // (`ON DELETE SET NULL`), and the trigger stamps it. The capture step writes into its
+        // run's own project, so today such an entry went with the project above.
+        for row in self.memory_entries.values_mut() {
+            let Some(provenance) = row.provenance.as_mut() else {
+                continue;
+            };
+            let mut cleared = false;
+            if provenance
+                .run_id
+                .is_some_and(|run| gone.runs.contains(&run))
+            {
+                provenance.run_id = None;
+                cleared = true;
+            }
+            if provenance
+                .step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                provenance.step_id = None;
+                cleared = true;
+            }
+            if provenance
+                .item_id
+                .is_some_and(|item| gone.items.contains(&item))
+            {
+                provenance.item_id = None;
+                cleared = true;
+            }
+            if cleared {
+                row.updated_at = now;
+            }
+        }
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
@@ -9227,6 +9261,10 @@ impl State {
             created_by: new.created_by,
             created_at: now,
             updated_at: now,
+            source: MemorySource::Person,
+            provenance: None,
+            evidence: None,
+            usage: MemoryUsage::default(),
         };
         self.memory_revisions.push(MemoryRevision {
             entry_id: row.id,

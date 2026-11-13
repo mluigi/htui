@@ -148,9 +148,10 @@ pub use kind::{
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use memory::{
-    MEMORY_BODY_MAX, MEMORY_SUBJECT_MAX, MemoryBody, MemoryEntry, MemoryKind, MemoryPatch,
-    MemoryRevision, MemorySource, MemoryState, MemorySubject, MemorySupersede, MemoryTextError,
-    MemoryUpdate, NewMemoryEntry, SnapshotMemory, SnapshotMemoryEntry, memory_subject_key,
+    MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,
+    MemoryEntry, MemoryEvidence, MemoryKind, MemoryPatch, MemoryRevision, MemorySource,
+    MemoryState, MemorySubject, MemorySupersede, MemoryTextError, MemoryUpdate, MemoryUsage,
+    NewMemoryEntry, RunProvenance, SnapshotMemory, SnapshotMemoryEntry, memory_subject_key,
 };
 pub use note::{NewNote, Note};
 pub use overlap::{
@@ -193,15 +194,15 @@ pub use requirement::{
     RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
 };
 pub use run::{
-    ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
-    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
-    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
-    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
-    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
-    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    CAPTURE_KEY, CAPTURE_POSITION, ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome,
+    GraphSnapshot, NewCommandRun, NewRun, NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge,
+    PartPremerge, PlanAdmission, PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run,
+    RunFacts, RunKind, RunMode, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide,
+    SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat,
+    SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome,
+    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
+    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{

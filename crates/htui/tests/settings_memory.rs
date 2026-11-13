@@ -51,6 +51,10 @@ fn entry(
         created_by: ids::USER,
         created_at: at(1),
         updated_at: at(day),
+        source: htui_core::model::MemorySource::Person,
+        provenance: None,
+        evidence: None,
+        usage: htui_core::model::MemoryUsage::default(),
     }
 }
 

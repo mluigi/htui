@@ -1709,7 +1709,7 @@ pub trait WriteStore: ReadStore {
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) first for a row
-    /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -3..-1 or off
+    /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -4..-1 or off
     /// [`STAGE_KEYS`](crate::model::STAGE_KEYS); a negative position on any other role; a NUL key),
     /// judged before any read and worded alike on every backend; then on an unknown run, agent or
     /// parent step (foreign key, like [`append_events`](WriteStore::append_events)), a duplicate
@@ -2889,12 +2889,13 @@ pub fn phase_name_refusal(name: &str) -> Option<String> {
         .then(|| plan_suffix_phase_name(name))
 }
 
-/// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` and `chk_run_step_stage` of
-/// `0029_divided_fanout.sql`, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
+/// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` of `0029_divided_fanout.sql` and
+/// `chk_run_step_stage` as `0031_memory_capture.sql` restated it, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
 /// both stores give; `None` when the row may be written. Judged before any read. In order: a part
 /// names its parent step and its node key; a step is not its own parent (the self-parent CHECK,
-/// MOD-139 M1 R1); a stage sits at -3..-1; a negative position is a stage's only; a stage's key is
-/// one of [`STAGE_KEYS`]; then the NUL.
+/// MOD-139 M1 R1); a stage sits at -4..-1 (MOD-164 D3 added -4); a negative position is a stage's
+/// only; a stage's key is one of [`STAGE_KEYS`]; then the NUL. As in the CHECK, nothing binds a
+/// key to its position.
 #[must_use]
 pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     let stage = new.role == StepRole::Stage;
@@ -2904,9 +2905,9 @@ pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     if new.parent_step_id == Some(new.id) {
         return Some("a step is not its own parent".to_owned());
     }
-    if stage && !(-3..=-1).contains(&new.position) {
+    if stage && !(-4..=-1).contains(&new.position) {
         return Some(format!(
-            "a stage step sits at position -3, -2 or -1, not {}",
+            "a stage step sits at position -4, -3, -2 or -1, not {}",
             new.position
         ));
     }
@@ -2923,7 +2924,7 @@ pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
             .is_some_and(|key| STAGE_KEYS.contains(&key))
     {
         return Some(format!(
-            "a stage step's node key is pick, prepare or collect, not {}",
+            "a stage step's node key is capture, pick, prepare or collect, not {}",
             new.node_key
                 .as_deref()
                 .map_or_else(|| "none".to_owned(), |key| format!("`{key}`"))
@@ -4750,7 +4751,14 @@ mod tests {
             refused(row(StepRole::Part, 5, parent, Some("implement/api"))),
             None
         );
-        for (position, key) in [(-3, "pick"), (-2, "prepare"), (-1, "collect")] {
+        // MOD-164 D3: capture at -4; nothing binds a key to its position, so -4/pick passes too.
+        for (position, key) in [
+            (-4, "capture"),
+            (-4, "pick"),
+            (-3, "pick"),
+            (-2, "prepare"),
+            (-1, "collect"),
+        ] {
             assert_eq!(
                 refused(row(StepRole::Stage, position, None, Some(key))),
                 None,
@@ -4786,11 +4794,15 @@ mod tests {
         // chk_run_step_stage.
         assert_eq!(
             refused(row(StepRole::Stage, 0, None, Some("pick"))).as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not 0")
+            Some("a stage step sits at position -4, -3, -2 or -1, not 0")
         );
         assert_eq!(
-            refused(row(StepRole::Stage, -4, None, Some("pick"))).as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not -4")
+            refused(row(StepRole::Stage, -5, None, Some("capture"))).as_deref(),
+            Some("a stage step sits at position -4, -3, -2 or -1, not -5")
+        );
+        assert_eq!(
+            refused(row(StepRole::Step, -4, None, None)).as_deref(),
+            Some("position -4 is reserved for stage steps, not a step step")
         );
         assert_eq!(
             refused(row(StepRole::Step, -1, None, None)).as_deref(),
@@ -4802,11 +4814,11 @@ mod tests {
         );
         assert_eq!(
             refused(row(StepRole::Stage, -1, None, Some("nope"))).as_deref(),
-            Some("a stage step's node key is pick, prepare or collect, not `nope`")
+            Some("a stage step's node key is capture, pick, prepare or collect, not `nope`")
         );
         assert_eq!(
             refused(row(StepRole::Stage, -1, None, None)).as_deref(),
-            Some("a stage step's node key is pick, prepare or collect, not none")
+            Some("a stage step's node key is capture, pick, prepare or collect, not none")
         );
 
         // The NUL Postgres `text` cannot hold.
@@ -4947,7 +4959,7 @@ mod tests {
                 part.run_id = RunId::new();
             }))
             .as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not 5")
+            Some("a stage step sits at position -4, -3, -2 or -1, not 5")
         );
         // …then the role…
         let part = clean.parts[0].id;

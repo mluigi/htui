@@ -116,7 +116,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30
+            25, 26, 27, 28, 29, 30, 31
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -130,8 +130,8 @@ async fn migrations_apply_on_a_clean_database() {
          0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql, \
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
-         0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql and MOD-150's \
-         0030_link_kinds.sql, in ordinal order"
+         0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
+         0030_link_kinds.sql and MOD-164's 0031_memory_capture.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -838,11 +838,12 @@ const MOD163_M2_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
 )];
 
 /// The two `COMMENT ON TABLE` texts of `0022_memory.sql` (MOD-163 plan D1), verbatim.
+/// `0031_memory_capture.sql` restates `memory_entry`'s (MOD-164 D1), so that entry carries 0031's.
 const MOD163_TABLE_COMMENTS: [(&str, &str); 2] = [
     (
         "memory_entry",
-        "MOD-163 D1: project memory entries (R-ENT-13), written by a person in M1. Not mirrored \
-         (D7).",
+        "MOD-163 D1, MOD-164 D1: project memory entries (R-ENT-13), written by a person or by a \
+         run's capture step (source). Not mirrored (MOD-163 D7).",
     ),
     (
         "memory_entry_revision",
@@ -850,8 +851,78 @@ const MOD163_TABLE_COMMENTS: [(&str, &str); 2] = [
     ),
 ];
 
+/// The eleven `COMMENT ON COLUMN` texts `0031_memory_capture.sql` adds to `memory_entry`
+/// (MOD-164 plan D1), verbatim and in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD164_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "memory_entry",
+        "source",
+        "MOD-164 D1: who wrote the entry, person or run (a run's capture step). A person's entry \
+         carries no run provenance and no evidence (chk_memory_entry_person_has_no_run).",
+    ),
+    (
+        "memory_entry",
+        "run_id",
+        "MOD-164 D1: the run whose capture step wrote the entry; NULL on a person's entry, and \
+         NULL again if that run is deleted.",
+    ),
+    (
+        "memory_entry",
+        "step_id",
+        "MOD-164 D1: the capture step that wrote the entry; NULL on a person's entry, and NULL \
+         again if that step is deleted. The write cap counts entries per step.",
+    ),
+    (
+        "memory_entry",
+        "item_id",
+        "MOD-164 D1: the item the writing run worked on; NULL on a person's entry, and NULL again \
+         if that item is deleted.",
+    ),
+    (
+        "memory_entry",
+        "agent_id",
+        "MOD-164 D1: the agent that ran the capture step; NULL on a person's entry, and NULL \
+         again if that agent is deleted.",
+    ),
+    (
+        "memory_entry",
+        "model",
+        "MOD-164 D1: the model the capture step ran on, as the step row records it; NULL on a \
+         person's entry.",
+    ),
+    (
+        "memory_entry",
+        "commit_hash",
+        "MOD-164 D1: the newest commit the writing run landed, stamped by htui, never by the \
+         model; NULL on a person's entry or when the run landed none.",
+    ),
+    (
+        "memory_entry",
+        "evidence",
+        "MOD-164 D1: {citations: [{step_id, quote}]}, the verbatim quotes from the run's steps the \
+         entry rests on; NULL on a person's entry.",
+    ),
+    (
+        "memory_entry",
+        "shown_steps",
+        "MOD-164 D5: how many finished steps' prompts showed the entry, counted once when the run \
+         finishes.",
+    ),
+    (
+        "memory_entry",
+        "shown_done",
+        "MOD-164 D5: how many of the steps counted in shown_steps ended done.",
+    ),
+    (
+        "memory_entry",
+        "shown_failed",
+        "MOD-164 D5: how many of the steps counted in shown_steps ended failed.",
+    ),
+];
+
 /// The ten `COMMENT ON COLUMN` texts of `0029_divided_fanout.sql` (MOD-139 plan D1), verbatim and
-/// in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+/// in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason. `0031_memory_capture.sql` restates
+/// `run_step.node_key` to name `capture` (MOD-164 D1), so that entry carries 0031's text.
 const MOD139_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_step",
@@ -870,9 +941,9 @@ const MOD139_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_step",
         "node_key",
-        "MOD-139 D1 (ANA-33 7.4, 7.11): a part's <divided>/<part_key>, or a stage's pick, \
-         prepare or collect; NULL on a node of the frozen snapshot, which position names. \
-         Written once.",
+        "MOD-139 D1 (ANA-33 7.4, 7.11), MOD-164 D3: a part's <divided>/<part_key>, or a stage's \
+         capture, pick, prepare or collect; NULL on a node of the frozen snapshot, which position \
+         names. Written once.",
     ),
     (
         "run_plan",
@@ -1163,6 +1234,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD163_COLUMN_COMMENTS)
         .chain(MOD163_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
+        .chain(MOD164_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -1180,8 +1252,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2 or MOD-139) text byte for \
-             byte"
+             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139 or MOD-164) \
+             text byte for byte"
         );
     }
 
@@ -1208,13 +1280,15 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(expected),
-            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137, MOD-146, MOD-163 or MOD-139) text byte for byte"
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137, MOD-146, MOD-163, MOD-139 or \
+             MOD-164) text byte for byte"
         );
     }
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
     // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12, MOD-125 and
-    // MOD-137, MOD-146, MOD-163, MOD-163 M2 and MOD-139 wrote and no half-finished extra one.
+    // MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139 and MOD-164 wrote and no half-finished extra
+    // one.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -1239,6 +1313,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD163_COLUMN_COMMENTS)
             .chain(MOD163_M2_COLUMN_COMMENTS)
             .chain(MOD139_COLUMN_COMMENTS)
+            .chain(MOD164_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -1263,6 +1338,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD163_COLUMN_COMMENTS)
         .chain(MOD163_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
+        .chain(MOD164_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -4165,8 +4241,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(30),
-        "thirty embedded migrations, none applied (through MOD-150's 0030_link_kinds.sql)"
+        MigrationState::Pending(31),
+        "thirty-one embedded migrations, none applied (through MOD-164's 0031_memory_capture.sql)"
     );
 
     db.drop_db().await;
@@ -4266,8 +4342,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(30),
-        "thirty embedded migrations, through MOD-150's 0030_link_kinds.sql"
+        MigrationState::Pending(31),
+        "thirty-one embedded migrations, through MOD-164's 0031_memory_capture.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4275,8 +4351,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(30),
-        "every one of the thirty, through MOD-150's 0030_link_kinds.sql, is pending"
+        HeadlessError::MigrationsPending(31),
+        "every one of the thirty-one, through MOD-164's 0031_memory_capture.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4298,8 +4374,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(30),
-        "every one of the thirty, through MOD-150's 0030_link_kinds.sql, is pending"
+        HeadlessError::MigrationsPending(31),
+        "every one of the thirty-one, through MOD-164's 0031_memory_capture.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4450,9 +4526,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        30,
-        "the later applies migrate nothing: the thirty embedded migrations (through MOD-150's \
-         0030_link_kinds.sql) are applied once"
+        31,
+        "the later applies migrate nothing: the thirty-one embedded migrations (through MOD-164's \
+         0031_memory_capture.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -6773,8 +6849,9 @@ async fn insert_role_step(
 
 /// MOD-139 plan D1 (blueprint §T1.2 rows 3, 5-8, P-2): `0029_divided_fanout.sql`'s four
 /// `run_step` CHECKs and the parent foreign key. A planner, a part under it with a key, and the
-/// stage rows at -1 and -3 are admitted. A stage outside -3..-1, a stage with an unknown or a NULL
-/// key, a `step` at a negative position, a part missing its parent or its key, an unknown role,
+/// stage rows at -1 and -3 are admitted. A stage outside -4..-1 (0031 widened 0029's -3..-1 to
+/// take MOD-164's capture stage at -4), a stage with an unknown or a NULL key, a `step` at a
+/// negative position, a part missing its parent or its key, an unknown role,
 /// an unknown parent, a parent of another run (MOD-139 M1 F1: the foreign key is
 /// `(run_id, parent_step_id)`) and a step that is its own parent (MOD-139 M1 R1: the foreign key
 /// alone would pass it, since it is checked once the row is in) are each refused by the one rule
@@ -6821,12 +6898,12 @@ async fn the_0029_step_role_checks_refuse_what_they_name() {
 
     for (position, role, parent, key, constraint, what) in [
         (
-            -4,
+            -5,
             "stage",
             None,
             Some("pick"),
             "chk_run_step_stage",
-            "a stage at -4",
+            "a stage at -5",
         ),
         (
             0,
@@ -6937,6 +7014,100 @@ async fn the_0029_step_role_checks_refuse_what_they_name() {
     .await
     .expect("count self-parented steps");
     assert_eq!(listed, 0, "no step names itself as its parent");
+
+    db.drop_db().await;
+}
+
+/// Inserts one `memory_entry` (`kind = 'fact'`) with `source` and `run_id`, and answers its id, or
+/// the statement's error for the 0031 refusal tests (MOD-164 plan D1).
+async fn insert_sourced_memory_entry(
+    pool: &sqlx::PgPool,
+    subject: &str,
+    source: &str,
+    run: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    use htui_core::fixtures::ids;
+    sqlx::query_scalar(
+        "INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by, source, run_id) \
+         VALUES (gen_random_uuid(), $1, 'fact', $2, 'body', $3, $4, $5) RETURNING id",
+    )
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .bind(subject)
+    .bind(ids::USER.as_uuid())
+    .bind(source)
+    .bind(run)
+    .fetch_one(pool)
+    .await
+}
+
+/// MOD-164 plan D1: `0031_memory_capture.sql`'s rules. A person's entry naming a run is refused by
+/// `chk_memory_entry_person_has_no_run`, a source outside person and run by the source CHECK; a
+/// run's entry with its run, and a person's with none, are admitted, and a person's reads back with
+/// zeroed counters. `chk_run_step_stage` now takes -4: `capture` there is admitted, and so is
+/// `pick` (nothing binds a key to its position), while -5 is refused.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn the_0031_checks_refuse_what_they_name() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let run = ids::RUN_1.as_uuid();
+
+    let person = insert_sourced_memory_entry(pool, "mod164 person", "person", None)
+        .await
+        .expect("a person's entry with no run is admitted");
+    let counters: (String, i32, i32, i32) = sqlx::query_as(
+        "SELECT source, shown_steps, shown_done, shown_failed FROM memory_entry WHERE id = $1",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("read the person's entry back");
+    assert_eq!(
+        counters,
+        ("person".to_owned(), 0, 0, 0),
+        "a person's entry defaults its counters to zero"
+    );
+    insert_sourced_memory_entry(pool, "mod164 run", "run", Some(run))
+        .await
+        .expect("a run's entry naming its run is admitted");
+    assert_refused(
+        insert_sourced_memory_entry(pool, "mod164 person with run", "person", Some(run)).await,
+        "23514",
+        "chk_memory_entry_person_has_no_run",
+        "a person's entry naming a run",
+    );
+    assert_refused(
+        insert_sourced_memory_entry(pool, "mod164 robot", "robot", None).await,
+        "23514",
+        "chk_memory_entry_source",
+        "the source robot",
+    );
+    assert_refused(
+        sqlx::query("UPDATE memory_entry SET shown_done = -1 WHERE id = $1")
+            .bind(person)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_memory_entry_shown_done",
+        "a negative shown_done",
+    );
+
+    insert_role_step(pool, run, -4, "stage", None, Some("capture"))
+        .await
+        .expect("the capture stage at -4 is admitted");
+    insert_role_step(pool, ids::RUN_2.as_uuid(), -4, "stage", None, Some("pick"))
+        .await
+        .expect("pick at -4 is admitted: nothing binds a key to its position");
+    assert_refused(
+        insert_role_step(pool, run, -5, "stage", None, Some("capture")).await,
+        "23514",
+        "chk_run_step_stage",
+        "a capture stage at -5",
+    );
 
     db.drop_db().await;
 }
