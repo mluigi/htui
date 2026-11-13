@@ -133,7 +133,9 @@ function Step-Qdrant {
 
 function Step-Test {
     New-Item -ItemType Directory -Force $script:GateDir | Out-Null
-    & cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 2>&1 | Tee-Object -FilePath $script:TestLog
+    # Default threads (TOOL-16): each crate's integration tests are one binary (TOOL-15), so what
+    # must not overlap takes a process-wide turn inside it (testkit::qdrant_turn, mock_keyring).
+    & cargo test --workspace --all-features --no-fail-fast 2>&1 | Tee-Object -FilePath $script:TestLog
     # $LASTEXITCODE is cargo's: Tee-Object is a cmdlet and does not touch it.
     if ($LASTEXITCODE -eq 0) { return $Pass } else { return $Fail }
 }

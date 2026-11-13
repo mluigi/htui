@@ -726,13 +726,14 @@ fn settings(url: &str) -> QdrantSettings {
     QdrantSettings::new(qdrant_url(url), None)
 }
 
-/// The test Qdrant's URL, or the skip line.
-fn test_qdrant() -> Option<String> {
-    let url = std::env::var("HTUI_TEST_QDRANT_URL").ok();
-    if url.is_none() {
+/// The test Qdrant's URL and this case's turn at it (TOOL-16: the live Qdrant cases of one binary
+/// run one at a time), or the skip line. Bind the turn to a named variable so it lives to the end.
+async fn test_qdrant() -> Option<(testkit::QdrantTurn, String)> {
+    let Ok(url) = std::env::var("HTUI_TEST_QDRANT_URL") else {
         eprintln!("skipped: HTUI_TEST_QDRANT_URL not set");
-    }
-    url
+        return None;
+    };
+    Some((testkit::qdrant_turn().await, url))
 }
 
 fn fresh_collection() -> String {
@@ -821,7 +822,7 @@ async fn a_search_reads_the_url_row() {
 /// the override names the test Qdrant, where the throwaway collection does not exist: `empty`.
 #[tokio::test]
 async fn the_env_url_wins_over_the_row() {
-    let Some(url) = test_qdrant() else {
+    let Some((_turn, url)) = test_qdrant().await else {
         return;
     };
     let Some(db) = testkit::demo_db().await else {
@@ -974,7 +975,7 @@ async fn a_search_scope_refusal_comes_before_the_index() {
 /// No collection: `empty`/0 with `hits: []`, nothing created, and no model loaded (review R1 M3).
 #[tokio::test]
 async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
-    let Some(url) = test_qdrant() else {
+    let Some((_turn, url)) = test_qdrant().await else {
         return;
     };
     let Some(db) = testkit::demo_db().await else {
@@ -1009,7 +1010,7 @@ async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
 /// one project, and a model that fails, at load or on the query, is `model_unavailable`/1.
 #[tokio::test]
 async fn a_search_over_an_index_answers_in_scope() {
-    let Some(url) = test_qdrant() else {
+    let Some((_turn, url)) = test_qdrant().await else {
         return;
     };
     let Some(db) = testkit::demo_db().await else {

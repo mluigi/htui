@@ -66,17 +66,24 @@ fn env(tmp: &Path) -> ProbeEnv {
 
 /// Writes an executable `sh` script named `name` into `tmp/bin`.
 ///
-/// Every script of a case is written before that case's first probe: a `fork` elsewhere in the
-/// process while a write handle is open would make `execve` answer `ETXTBSY` (`tests/probe.rs`'s
-/// `executable` explains the window). The gate runs with `--test-threads=1`.
+/// Written by a `sh` child, never by this process. A `fork` anywhere in this test binary while
+/// this process holds a write handle to the script would hand the handle to that child, and the
+/// probe's `execve` answers `ETXTBSY` until the child execs (`probe.rs`'s `executable` explains
+/// the window). The other files retry around it; this one cannot, because the probe execs inside
+/// `htui_agent`. Since TOOL-15/16 every `htui-agent` test shares this process at default threads,
+/// so the window is closed at the source: the only process that ever holds the file open for
+/// writing is the `sh` that wrote it, and it has exited before the probe runs.
 #[cfg(unix)]
 fn script(tmp: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = tmp.join("bin").join(name);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '#!/bin/sh\\n%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&path)
+        .arg(body)
+        .status()
+        .expect("run /bin/sh to write the script");
+    assert!(status.success(), "/bin/sh could not write {}", path.display());
     path
 }
 

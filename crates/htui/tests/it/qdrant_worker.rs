@@ -23,18 +23,22 @@ use htui_store::vector::{QdrantStore, SearchQuery, VectorStore as _};
 
 const ENV_URL: &str = "HTUI_TEST_QDRANT_URL";
 
-async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
+/// A throwaway collection and this case's turn at the test Qdrant (TOOL-16: the live Qdrant cases
+/// of one binary run one at a time), or the skip line.
+async fn throwaway() -> Option<(testkit::QdrantTurn, QdrantStore<HashEmbedder>)> {
     let Ok(url) = std::env::var(ENV_URL) else {
         eprintln!("skipped: {ENV_URL} not set");
         return None;
     };
+    let turn = testkit::qdrant_turn().await;
     let settings = QdrantSettings::new(QdrantUrl::parse(&url).expect("valid URL"), None);
     let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
-    Some(
+    Some((
+        turn,
         QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
             .await
             .expect("Qdrant answers"),
-    )
+    ))
 }
 
 /// Whether a search of the htui project for `key` finds the point of that key.
@@ -56,7 +60,7 @@ async fn found(store: &QdrantStore<HashEmbedder>, key: &str) -> bool {
 /// A new item in Postgres is in the index after the job's next cycle, and not before it.
 #[tokio::test]
 async fn the_worker_job_indexes_a_new_item() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let Some(db) = testkit::demo_db().await else {
@@ -134,6 +138,7 @@ async fn the_worker_job_follows_the_url_row() {
         eprintln!("skipped: {ENV_URL} not set");
         return;
     };
+    let _turn = testkit::qdrant_turn().await;
     let Some(db) = testkit::demo_db().await else {
         return;
     };
