@@ -94,7 +94,13 @@ and the memory note are corrected.
   not recur in the next two gates and predates TOOL-16 (seen 2026-09-16); it struck again during a 20-test run of
   `state_cli_pg::`/`qdrant_worker::`, so it is not load alone. No cause found: the backend logs nothing before
   `exited with exit code 2` (Postgres's SIGQUIT exit), `htui-postgres` runs as uid 999 so the tests cannot signal
-  it, and the server has `log_connections = off`, `log_min_messages = warning`. The gate now drives more concurrent
+  it, and the server had `log_connections = off`, `log_min_messages = warning`. Three crashes on 2026-11-13
+  (12:19, 14:41, 14:46 UTC), two of them about a minute into the gate's test step (the htui unit binary runs
+  first), none in the cgroup's `oom_kill`. Not reproduced by 180 parallel template copies with forced drops, nor
+  by four repeats of htui's Postgres modules. To catch the next one the dev server now logs connections,
+  disconnections, DDL and `%d %a` in its line prefix (`ALTER SYSTEM`; undo with `ALTER SYSTEM RESET` of
+  `log_connections`, `log_disconnections`, `log_statement`, `log_line_prefix`, then `SELECT pg_reload_conf()`).
+  The gate on `732b75af` with that logging on: no crash, red only on `claude_plugin` and `worker_pg`. The gate now drives more concurrent
   create/drop-database work, so a recurrence is more likely than it was; the tell is `57P03` across many cases and
   `exited with exit code` in `docker logs htui-postgres`. Re-run before suspecting the change.
 - `gate.ps1` was not run (no Windows here); its change is the same one-line flag removal, and Windows has no
