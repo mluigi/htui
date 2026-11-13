@@ -2765,7 +2765,9 @@ where
     /// MOD-150 M2 D7: `names`, the key the person typed (`slug:KEY` accepted), is resolved in the
     /// item's project after the guard, and its id handed to the store, which decides whether the
     /// resolution records a link and refuses everything else (R-ENT-9). A key no item holds is
-    /// `Store(NotFound { entity: "item", id: <key> })`, with nothing written.
+    /// `Store(NotFound { entity: "item", id: <key> })`, with nothing written. A name on a
+    /// resolution that records no link is the store's `close_out_names_no_link`, answered before
+    /// the lookup (review L5), so an unknown key does not turn it into `NotFound`.
     async fn close_out(
         &self,
         item: ItemId,
@@ -2774,6 +2776,12 @@ where
     ) -> Result<CommandOutcome, EngineError> {
         let reads = self.close_out_reads(item).await?;
         crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        if names.is_some() && !matches!(resolution, Resolution::Duplicate | Resolution::Superseded)
+        {
+            return Err(EngineError::Store(StoreError::Constraint(
+                htui_core::store::traits::close_out_names_no_link(resolution),
+            )));
+        }
         let names = match names {
             None => None,
             Some(key) => Some(
@@ -20381,6 +20389,36 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// MOD-150 M2 review L5: a resolution that records no link refuses a name with the store's
+    /// `close_out_names_no_link`, before the key is looked up: an unknown key answers that
+    /// refusal, not `NotFound`, as a known one does, and nothing is written.
+    #[tokio::test]
+    async fn close_out_refuses_a_name_on_a_linkless_resolution_before_the_lookup() {
+        let harness = Harness::new().await;
+        for key in ["FEAT-99", "FEAT-1"] {
+            let refused = harness
+                .dispatch(Command::CloseOut {
+                    item: ids::HTUI_ANA_2,
+                    resolution: Resolution::Withdrawn,
+                    names: Some(key.to_owned()),
+                })
+                .await
+                .expect_err("`withdrawn` names no item");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Store(htui_core::store::StoreError::Constraint(why))
+                        if *why == htui_core::store::traits::close_out_names_no_link(
+                            Resolution::Withdrawn
+                        )
+                ),
+                "{key}: {refused}"
+            );
+        }
+        let row = harness.orch.item(ids::HTUI_ANA_2).await;
+        assert_eq!((row.status, row.resolution), (Status::Open, None));
     }
 
     // -- MOD-7 milestone 4: excerpts reach a phase prompt (D107-D109, D125, D133) ---------------
