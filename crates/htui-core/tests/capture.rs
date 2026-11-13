@@ -652,6 +652,68 @@ fn the_fourth_entry_is_dropped_over_the_cap() {
     );
 }
 
+/// Review L7: the cap counts kept entries, not answer positions, so an invalid entry uses up no
+/// slot.
+#[test]
+fn an_invalid_entry_uses_up_no_slot() {
+    let mut bad = entry("Bad kind");
+    bad["kind"] = json!("rumour");
+    let mut entries = vec![bad];
+    entries.extend((0..4).map(|n| entry(&format!("Subject {n}"))));
+    let out = parse_capture(&body(&entries), &sample_pack(), &plain()).expect("valid");
+    let subjects: Vec<&str> = out.kept.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, ["Subject 0", "Subject 1", "Subject 2"]);
+    assert_eq!(
+        out.dropped,
+        [(0, DropReason::BadKind), (4, DropReason::OverCap)]
+    );
+}
+
+/// Review M3: a quote is checked against the block's evidence spans (its output tail and its
+/// `gate_note`), never htui's own fixed wording around them, so a quote lying only in a label
+/// line is uncited.
+#[test]
+fn a_quote_of_a_label_line_only_is_uncited() {
+    let mut lost = failed(1, 0, 1);
+    lost.gate_note = Some("the reviewer asked for a smaller diff".to_owned());
+    let won = step(2, 0, 2);
+    let mut outputs = BTreeMap::new();
+    outputs.insert(lost.id, "error: the sqlx offline data is stale".to_owned());
+    outputs.insert(won.id, "test result: ok. 4 passed".to_owned());
+    let pack = EvidencePack::build(&[lost, won], &outputs);
+    let win = &pack.blocks()[1].text;
+    assert!(win.contains("passed after a failed attempt"), "{win}");
+
+    for (block, quote) in [
+        ("S2", "passed after a failed attempt"),
+        ("S1", "phase: phase0\nattempt"),
+        ("S1", "exit_code: 1\nverify: fail"),
+        ("S1", "gate_note: the reviewer"),
+        ("S1", "<block label=\"S1\">"),
+        ("S2", "output (tail):\ntest result"),
+    ] {
+        let mut e = entry("Label lines");
+        e["evidence"] = json!([{ "block": block, "quote": quote }]);
+        let out = parse_capture(&body(&[e]), &pack, &plain()).expect("valid");
+        assert_eq!(
+            out.dropped,
+            [(0, DropReason::QuoteNotFound)],
+            "{block} {quote:?}"
+        );
+    }
+
+    for (block, quote) in [
+        ("S1", "the reviewer asked for a smaller diff"),
+        ("S1", "the sqlx offline data is stale"),
+        ("S2", "test result: ok. 4 passed"),
+    ] {
+        let mut e = entry("Evidence spans");
+        e["evidence"] = json!([{ "block": block, "quote": quote }]);
+        let out = parse_capture(&body(&[e]), &pack, &plain()).expect("valid");
+        assert_eq!(out.kept.len(), 1, "{block} {quote:?}: {:?}", out.dropped);
+    }
+}
+
 #[test]
 fn every_drop_reason_has_a_stable_spelling() {
     assert_eq!(DropReason::BadKind.as_str(), "bad_kind");

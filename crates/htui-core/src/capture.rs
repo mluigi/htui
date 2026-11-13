@@ -85,7 +85,8 @@ pub fn capture_trigger(steps: &[RunStep]) -> Option<CaptureReason> {
 }
 
 /// The steps D9 reads, in walk order: position, attempt, then fan-out index and id so the order
-/// is total.
+/// is total. Walk order is by position, not by time: the "oldest" blocks the pack drops first are
+/// the ones at the lowest walk positions, which on a branching graph need not be the first to run.
 fn walk_order(steps: &[RunStep]) -> Vec<&RunStep> {
     let mut rows: Vec<&RunStep> = steps.iter().filter(|step| counts(step)).collect();
     rows.sort_by_key(|step| {
@@ -138,9 +139,14 @@ pub struct EvidenceBlock {
     pub label: String,
     /// The step the block describes.
     pub step_id: StepId,
-    /// The rendered block, `<block label="…">` to `</block>`. A citation's quote must be a
-    /// substring of this text.
+    /// The rendered block, `<block label="…">` to `</block>`: htui's fixed label lines around
+    /// the step's [`spans`](Self::spans).
     pub text: String,
+    /// The step's own evidence as the block shows it: its `gate_note` and its output tail (cut
+    /// as rendered). A citation's quote must be a substring of one of these, never of htui's
+    /// fixed wording, so quoting a label line (`passed after a failed attempt`, `phase: …`) cites
+    /// nothing.
+    pub spans: Vec<String>,
 }
 
 /// D10: the evidence a capture step is shown, one [`EvidenceBlock`] per notable step, within
@@ -166,7 +172,8 @@ impl EvidencePack {
     /// says). Blocks are labelled `S1..Sn` in walk order. Over [`CAPTURE_INPUT_TOKEN_CAP`]
     /// (`chars-v2`), the output tails are cut first, every block to the same length and keeping
     /// the end, where a failure prints; when even no tail at all does not fit, the oldest blocks
-    /// are dropped whole and the rest relabelled from `S1`.
+    /// are dropped whole and the rest relabelled from `S1`. "Oldest" is the lowest walk position
+    /// (position, then attempt), not the earliest to run.
     #[must_use]
     pub fn build(steps: &[RunStep], outputs: &BTreeMap<StepId, String>) -> Self {
         let rows = walk_order(steps);
@@ -293,6 +300,7 @@ fn fit(kept: &[Notable<'_>]) -> Option<Vec<EvidenceBlock>> {
 fn render_block(number: usize, notable: &Notable<'_>, limit: usize) -> EvidenceBlock {
     let step = notable.step;
     let label = format!("S{number}");
+    let mut spans = Vec::new();
     let mut text = format!(
         "<block label=\"{label}\">\nphase: {}\nattempt: {}\nstatus: {}\n",
         step.phase_name,
@@ -310,6 +318,7 @@ fn render_block(number: usize, notable: &Notable<'_>, limit: usize) -> EvidenceB
     }
     if let Some(note) = &step.gate_note {
         text.push_str(&format!("gate_note: {note}\n"));
+        spans.push(note.clone());
     }
     if notable.win {
         text.push_str("result: passed after a failed attempt at this phase\n");
@@ -325,8 +334,10 @@ fn render_block(number: usize, notable: &Notable<'_>, limit: usize) -> EvidenceB
                 .map_or(output.len(), |(at, _)| at);
             text.push_str(&format!("[… {cut} earlier characters cut]\n"));
             text.push_str(&output[start..]);
+            spans.push(output[start..].to_owned());
         } else {
             text.push_str(output);
+            spans.push(output.to_owned());
         }
         text.push('\n');
     }
@@ -335,6 +346,7 @@ fn render_block(number: usize, notable: &Notable<'_>, limit: usize) -> EvidenceB
         label,
         step_id: step.id,
         text,
+        spans,
     }
 }
 
@@ -481,7 +493,7 @@ pub enum DropReason {
         /// The scrubber's rule.
         rule: &'static str,
     },
-    /// The entry came after the [`MEMORY_RUN_WRITE_CAP`]th.
+    /// The entry came after [`MEMORY_RUN_WRITE_CAP`] entries were already kept.
     OverCap,
 }
 
@@ -565,11 +577,12 @@ struct RawCitation {
 /// The answer is refused whole when it is estimated over [`CAPTURE_OUTPUT_TOKEN_CAP`], or when it
 /// does not parse as `{"entries":[{"kind","subject","body","evidence":[{"block","quote"}]}]}`
 /// (unknown fields included). Otherwise each entry is kept or dropped with a [`DropReason`]:
-/// entries past the [`MEMORY_RUN_WRITE_CAP`]th are [`DropReason::OverCap`]; a kept entry has a
-/// known kind, a subject and body [`MemorySubject::new`] / [`MemoryBody::new`] accept (scrubbed,
-/// fail-closed), and at least one citation, each naming a block of the pack with a trimmed quote
-/// of at least [`CAPTURE_QUOTE_MIN`] characters found in that block's text. Quotes are scrubbed
-/// and labels mapped to their [`StepId`].
+/// once [`MEMORY_RUN_WRITE_CAP`] entries are kept, every later one is [`DropReason::OverCap`] (an
+/// invalid entry uses up no slot); a kept entry has a known kind, a subject and body
+/// [`MemorySubject::new`] / [`MemoryBody::new`] accept (scrubbed, fail-closed), and at least one
+/// citation, each naming a block of the pack with a trimmed quote of at least
+/// [`CAPTURE_QUOTE_MIN`] characters found in one of that block's evidence
+/// [`spans`](EvidenceBlock::spans). Quotes are scrubbed and labels mapped to their [`StepId`].
 ///
 /// # Errors
 /// [`CaptureRefusal`] when the answer is refused whole.
@@ -596,7 +609,7 @@ pub fn parse_capture(
         dropped: Vec::new(),
     };
     for (index, entry) in answer.entries.into_iter().enumerate() {
-        let checked = if index >= cap {
+        let checked = if output.kept.len() >= cap {
             Err(DropReason::OverCap)
         } else {
             check_entry(entry, pack, scrubber)
@@ -634,7 +647,8 @@ fn check_entry(
     })
 }
 
-/// One citation: a known block, a long enough quote found in it, scrubbed.
+/// One citation: a known block, a long enough quote found in one of its evidence spans (never in
+/// its label lines), scrubbed.
 fn check_citation(
     citation: &RawCitation,
     pack: &EvidencePack,
@@ -647,7 +661,7 @@ fn check_citation(
     if quote.chars().count() < CAPTURE_QUOTE_MIN {
         return Err(DropReason::ShortQuote);
     }
-    if !block.text.contains(quote) {
+    if !block.spans.iter().any(|span| span.contains(quote)) {
         return Err(DropReason::QuoteNotFound);
     }
     let mut value = Value::String(quote.to_owned());
