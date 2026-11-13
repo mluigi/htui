@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ─── Body ›╮
-│ ▾ htui (8)                               ││◐ running · rust · priority 2     │
-│  ANA-1    ● done       Data model, box r…││version 1                         │
-│  ANA-2    ○ open       Orchestrator step…││                                  │
-│  CLEAN-1  ✗ failed     Drop the legacy m…││Stand up the terminal application:│
-│▌ FEAT-1   ◐ running    TUI scaffold      ││a workspace-scoped shell with a   │
-│  FEAT-2   ⊘ blocked    Agent driver and …││tab strip, a top bar and a backlog│
-│  FEAT-3   ◌ queued     Postgres store an…││tab, all reading through the store│
-│  FIX-1    ✓ closed     Terminal left raw…││seam.                             │
-│  TOOL-1   ⚠ needs you  CI matrix for the…││                                  │
-│ ▾ agy (3)                                ││Shape                             │
-│  ANA-1    ● done       Prompt assembly s…││- Two crates: htui-core holds the │
-│  FEAT-1   ○ open       ACP transport upg…││  domain model and the store      │
-│  FIX-1    ○ open       Session leak on c…││  traits, htui holds the terminal │
-│                                          ││  application. Nothing in the view│
+│ ▾ Platform (0)                           ││◐ running · rust · priority 2     │
+│ ▾ htui (8)                               ││version 1                         │
+│  ANA-1    ● done       Data model, box r…││                                  │
+│  ANA-2    ○ open       Orchestrator step…││Stand up the terminal application:│
+│  CLEAN-1  ✗ failed     Drop the legacy m…││a workspace-scoped shell with a   │
+│▌ FEAT-1   ◐ running    TUI scaffold      ││tab strip, a top bar and a backlog│
+│  FEAT-2   ⊘ blocked    Agent driver and …││tab, all reading through the store│
+│  FEAT-3   ◌ queued     Postgres store an…││seam.                             │
+│  FIX-1    ✓ closed     Terminal left raw…││                                  │
+│  TOOL-1   ⚠ needs you  CI matrix for the…││Shape                             │
+│ ▾ agy (3)                                ││- Two crates: htui-core holds the │
+│  ANA-1    ● done       Prompt assembly s…││  domain model and the store      │
+│  FEAT-1   ○ open       ACP transport upg…││  traits, htui holds the terminal │
+│  FIX-1    ○ open       Session leak on c…││  application. Nothing in the view│
 │                                          ││  layer holds a store handle.     │
 │                                          ││- A store worker task owns the    │
 │                                          ││  backend. The UI sends a request,│

@@ -4,7 +4,8 @@ expression: frame
 ---
 Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ Detail ──────‹ Docs  Notes  Prompt  Reqs ╮
-│▌▾ htui (8)                                          ││                                           │
+│▌▾ Platform (0)                                      ││                                           │
+│ ▾ htui (8)                                          ││                                           │
 │  ANA-1    ● done       Data model, box registry and…││                                           │
 │  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
@@ -16,8 +17,7 @@ Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
-│  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││             No item selected.             │
+│  FIX-1    ○ open       Session leak on cancel       ││             No item selected.             │
 │                                                     ││              j/k chooses one              │
 │                                                     ││                                           │
 │                                                     ││                                           │

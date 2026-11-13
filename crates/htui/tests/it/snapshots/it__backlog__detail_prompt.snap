@@ -4,20 +4,20 @@ expression: harness.render()
 ---
 Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Prompt  Reqs ╮
-│ ▾ htui (8)                                          ││template  prd v1                           │
-│  ANA-1    ● done       Data model, box registry and…││picker    8 templates                      │
-│  ANA-2    ○ open       Orchestrator step graphs and…││digest    a3cad86a286f7e936fb4b1457f8c92b7…│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││budget    120000 (project) · reserve 0.10 …│
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││tokens    1067 → 1067 · chars-v2           │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││excerpts  builtin@1 · considered 0 · selec…│
-│  FEAT-3   ◌ queued     Postgres store and cache     ││roots     none · this project has no repo  │
-│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││section                   before   after  …│
-│ ▾ agy (3)                                           ││template                     149     149  …│
-│  ANA-1    ● done       Prompt assembly survey       ││item                         570     570  …│
-│  FEAT-1   ○ open       ACP transport upgrade        ││documents:plan                57      57  …│
-│  FIX-1    ○ open       Session leak on cancel       ││documents:prd                 52      52  …│
-│                                                     ││upstream                      71      71  …│
+│ ▾ Platform (0)                                      ││template  prd v1                           │
+│ ▾ htui (8)                                          ││picker    8 templates                      │
+│  ANA-1    ● done       Data model, box registry and…││digest    a3cad86a286f7e936fb4b1457f8c92b7…│
+│  ANA-2    ○ open       Orchestrator step graphs and…││budget    120000 (project) · reserve 0.10 …│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││tokens    1067 → 1067 · chars-v2           │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││excerpts  builtin@1 · considered 0 · selec…│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││roots     none · this project has no repo  │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││section                   before   after  …│
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││template                     149     149  …│
+│ ▾ agy (3)                                           ││item                         570     570  …│
+│  ANA-1    ● done       Prompt assembly survey       ││documents:plan                57      57  …│
+│  FEAT-1   ○ open       ACP transport upgrade        ││documents:prd                 52      52  …│
+│  FIX-1    ○ open       Session leak on cancel       ││upstream                      71      71  …│
 │                                                     ││box                           80      80  …│
 │                                                     ││skills                        88      88  …│
 │                                                     ││                                           │

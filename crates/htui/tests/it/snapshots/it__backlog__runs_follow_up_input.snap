@@ -4,12 +4,13 @@ expression: frame
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-3 · Postgres store and cach…‹ Runs ›╮
-│ ▾ htui (8)                                          ││kind   status      box          started    │
-│  ANA-1    ● done       Data model, box registry and…││mode                            finished   │
-│  ANA-2    ○ open       Orchestrator step graphs and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││automatic                       —          │
-│  FEAT-1   ◐ running    TUI scaffold                 ││▸ prd             ◐ running         —     …│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    —          claude/sonnet               │
+│ ▾ Platform (0)                                      ││kind   status      box          started    │
+│ ▾ htui (8)                                          ││mode                            finished   │
+│  ANA-1    ● done       Data model, box registry and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
+│  ANA-2    ○ open       Orchestrator step graphs and…││automatic                       —          │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▸ prd             ◐ running         —     …│
+│  FEAT-1   ◐ running    TUI scaffold                 ││    —          claude/sonnet               │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │▌ FEAT-3   ◐ running    Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
@@ -17,7 +18,6 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

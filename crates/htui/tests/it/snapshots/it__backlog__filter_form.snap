@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
-│ ▾ htui (8)                                          ││Data model, box registry and sync topology │
-│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
-│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
-│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││settled first.                             │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
-│  FIX-1    ✓ closed     Terminal left raw after panic││Postgres holds the truth; every box keeps a│
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││read-only cache it refreshes on connect.   │
-│ ▾ agy (3)                                           ││Writes are compare-and-set on a version    │
-│  ANA-1    ● done       Prompt assembly survey       ││column, so a losing edit is shown against  │
-│  FEAT-1   ○ open       ACP transport upgrade        ││its common ancestor rather than silently   │
-│  FIX-1    ○ open       Session leak on cancel       ││dropped.                                   │
-│                                                     ││                                           │
+│ ▾ Platform (0)                                      ││Data model, box registry and sync topology │
+│ ▾ htui (8)                                          ││● done · no tags · priority 0 · version 1  │
+│▌ ANA-1    ● done       Data model, box registry and…││                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││The store seam is the one interface every  │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││other module reaches through, so it is     │
+│  FEAT-1   ◐ running    TUI scaffold                 ││settled first.                             │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││Postgres holds the truth; every box keeps a│
+│  FIX-1    ✓ closed     Terminal left raw after panic││read-only cache it refreshes on connect.   │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││Writes are compare-and-set on a version    │
+│ ▾ agy (3)                                           ││column, so a losing edit is shown against  │
+│  ANA-1    ● done       Prompt assembly survey       ││its common ancestor rather than silently   │
+│  FEAT-1   ○ open       ACP transport upgrade        ││dropped.                                   │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
 │                                                     ││and lets the legacy importer align the     │

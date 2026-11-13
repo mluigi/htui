@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Docs  Notes ›╮
-│ ▾ htui (8)                                          ││ New version of plan (from v2) ────────────│
-│  ANA-1    ● done       Data model, box registry and…││ kind    plan                              │
-│  ANA-2    ○ open       Orchestrator step graphs and…││ title   Plan: TUI scaffold (revised)      │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▌body                                      │
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││# Plan: TUI scaffold (revised)             │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││Demo body for the plan document, version 2.│
+│ ▾ Platform (0)                                      ││ New version of plan (from v2) ────────────│
+│ ▾ htui (8)                                          ││ kind    plan                              │
+│  ANA-1    ● done       Data model, box registry and…││ title   Plan: TUI scaffold (revised)      │
+│  ANA-2    ○ open       Orchestrator step graphs and…││▌body                                      │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││# Plan: TUI scaffold (revised)             │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││                                           │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││Demo body for the plan document, version 2.│
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

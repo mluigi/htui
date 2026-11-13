@@ -4,10 +4,11 @@ expression: frame
 ---
 Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ──‹ Docs ›╮
-│ ▾ htui (8)                               ││ kind ver by   title              │
-│  ANA-1    ● done       Data model, box r…││▌plan v1  step Plan: TUI scaffold │
-│  ANA-2    ○ open       Orchestrator step…││ plan v2  step Plan: TUI scaffold…│
-│  CLEAN-1  ✗ failed     Drop the legacy m…││ prd  v1  hand PRD: TUI scaffold  │
+│ ▾ Platform (0)                           ││ kind ver by   title              │
+│ ▾ htui (8)                               ││▌plan v1  step Plan: TUI scaffold │
+│  ANA-1    ● done       Data model, box r…││ plan v2  step Plan: TUI scaffold…│
+│  ANA-2    ○ open       Orchestrator step…││ prd  v1  hand PRD: TUI scaffold  │
+│  CLEAN-1  ✗ failed     Drop the legacy m…││                                  │
 │▌ FEAT-1   ◐ running    TUI scaffold      ││                                  │
 │  FEAT-2   ⊘ blocked    Agent driver and …││                                  │
 │  FEAT-3   ◌ queued     Postgres store an…││                                  │
@@ -17,7 +18,6 @@ Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  
 │  ANA-1    ● done       Prompt assembly s…││                                  │
 │  FEAT-1   ○ open       ACP transport upg…││                                  │
 │  FIX-1    ○ open       Session leak on c…││                                  │
-│                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │

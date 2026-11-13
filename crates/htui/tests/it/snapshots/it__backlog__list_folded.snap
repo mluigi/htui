@@ -4,12 +4,12 @@ expression: folded
 ---
 Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
+│ ▾ Platform (0)                                      ││                                           │
 │▌▸ htui (8)                                          ││                                           │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

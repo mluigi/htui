@@ -4,10 +4,11 @@ expression: frame
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-2 · Orchestrator step graphs…‹ Runs ›╮
-│ ▾ htui (8)                                          ││research v1 · research of attempt 1        │
-│  ANA-1    ● done       Data model, box registry and…││What the step found.                       │
-│▌ ANA-2    ○ open       Orchestrator step graphs and…││                                           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││Three sources agree; one does not.         │
+│ ▾ Platform (0)                                      ││research v1 · research of attempt 1        │
+│ ▾ htui (8)                                          ││What the step found.                       │
+│  ANA-1    ● done       Data model, box registry and…││                                           │
+│▌ ANA-2    ○ open       Orchestrator step graphs and…││Three sources agree; one does not.         │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
 │  FEAT-1   ◐ running    TUI scaffold                 ││                                           │
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
@@ -17,7 +18,6 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

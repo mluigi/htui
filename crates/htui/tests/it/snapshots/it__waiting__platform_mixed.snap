@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   4 waiting · memory ·  ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
-│ ▾ htui (8)                                          ││Data model, box registry and sync topology │
-│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
-│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
-│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││settled first.                             │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
-│  FIX-1    ✓ closed     Terminal left raw after panic││Postgres holds the truth; every box keeps a│
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││read-only cache it refreshes on connect.   │
-│ ▾ agy (3)                                           ││Writes are compare-and-set on a version    │
-│  ANA-╭ Waiting on you ────────────────────────────────────────────────────────────────────╮inst  │
-│  FEAT│▌ htui:ANA-2   plan 1.1  gate        gate                                           │tly   │
-│  FIX-│  htui:ANA-2   plan 1.1  permission  edit: src/lib.rs                               │      │
-│      │  htui:FEAT-2  —         unblock     blocked, no active run: u reopens it           │      │
+│ ▾ Platform (0)                                      ││Data model, box registry and sync topology │
+│ ▾ htui (8)                                          ││● done · no tags · priority 0 · version 1  │
+│▌ ANA-1    ● done       Data model, box registry and…││                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││The store seam is the one interface every  │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││other module reaches through, so it is     │
+│  FEAT-1   ◐ running    TUI scaffold                 ││settled first.                             │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││Postgres holds the truth; every box keeps a│
+│  FIX-1    ✓ closed     Terminal left raw after panic││read-only cache it refreshes on connect.   │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││Writes are compare-and-set on a version    │
+│ ▾ agy╭ Waiting on you ────────────────────────────────────────────────────────────────────╮inst  │
+│  ANA-│▌ htui:ANA-2   plan 1.1  gate        gate                                           │tly   │
+│  FEAT│  htui:ANA-2   plan 1.1  permission  edit: src/lib.rs                               │      │
+│  FIX-│  htui:FEAT-2  —         unblock     blocked, no active run: u reopens it           │      │
 │      │  htui:TOOL-1  —         unblock     parked by an interrupted command: u resumes it │ct    │
 │      ╰ j/k move · Enter open · Esc close ─────────────────────────────────────────────────╯pless │
 │                                                     ││and lets the legacy importer align the     │

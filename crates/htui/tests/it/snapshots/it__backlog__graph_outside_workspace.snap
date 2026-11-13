@@ -4,12 +4,13 @@ expression: frame
 ---
 Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is outside this workspace
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FIX-1 · Session leak on cancel ─‹ Graph ›╮
-│ ▾ htui (8)                                          ││  FIX-1 ○ open Session leak on cancel      │
-│  ANA-1    ● done       Data model, box registry and…││  → blocked by ANA-1 ● done Prompt assembl…│
-│  ANA-2    ○ open       Orchestrator step graphs and…││    → blocked by htui:ANA-1 ● done Data mo…│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▌ → origin vulkan-tutoria…:FEAT-1 ■ stopped│
-│  FEAT-1   ◐ running    TUI scaffold                 ││  → origin htui:TOOL-1 ⚠ needs you CI matr…│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    → blocked by htui:ANA-1 ● done (*)     │
+│ ▾ Platform (0)                                      ││  FIX-1 ○ open Session leak on cancel      │
+│ ▾ htui (8)                                          ││  → blocked by ANA-1 ● done Prompt assembl…│
+│  ANA-1    ● done       Data model, box registry and…││    → blocked by htui:ANA-1 ● done Data mo…│
+│  ANA-2    ○ open       Orchestrator step graphs and…││▌ → origin vulkan-tutoria…:FEAT-1 ■ stopped│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││  → origin htui:TOOL-1 ⚠ needs you CI matr…│
+│  FEAT-1   ◐ running    TUI scaffold                 ││    → blocked by htui:ANA-1 ● done (*)     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
@@ -17,7 +18,6 @@ Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is o
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │▌ FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog                                                                2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back to Backlog › Notes · list · list+detail
 ╭─ Backlog (11) ─────────────────────────────────────────────────────────────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────────────────── Body  Runs  Graph  Docs  Notes  Prompt  Reqs ╮
-│ ▾ htui (8)                                                                                                 ││template  prd v1                                                                        │
-│  ANA-1    ● done       Data model, box registry and sync topology                                          ││picker    8 templates                                                                   │
-│  ANA-2    ○ open       Orchestrator step graphs and gates                                                  ││digest    a3cad86a286f7e936fb4b1457f8c92b71d4cbd684101a752aedab42e72c49abc              │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exporter                                                   ││budget    120000 (project) · reserve 0.10 · target 108000                               │
-│▌ FEAT-1   ◐ running    TUI scaffold                                                                        ││tokens    1067 → 1067 · chars-v2                                                        │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab                                                           ││excerpts  builtin@1 · considered 0 · selected 0                                         │
-│  FEAT-3   ◌ queued     Postgres store and cache                                                            ││roots     none · this project has no repo                                               │
-│  FIX-1    ✓ closed     Terminal left raw after panic                                                       ││                                                                                        │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes                                                        ││section                   before   after  strategy                                      │
-│ ▾ agy (3)                                                                                                  ││template                     149     149  none                                          │
-│  ANA-1    ● done       Prompt assembly survey                                                              ││item                         570     570  none                                          │
-│  FEAT-1   ○ open       ACP transport upgrade                                                               ││documents:plan                57      57  none                                          │
-│  FIX-1    ○ open       Session leak on cancel                                                              ││documents:prd                 52      52  none                                          │
-│                                                                                                            ││upstream                      71      71  none                                          │
+│ ▾ Platform (0)                                                                                             ││template  prd v1                                                                        │
+│ ▾ htui (8)                                                                                                 ││picker    8 templates                                                                   │
+│  ANA-1    ● done       Data model, box registry and sync topology                                          ││digest    a3cad86a286f7e936fb4b1457f8c92b71d4cbd684101a752aedab42e72c49abc              │
+│  ANA-2    ○ open       Orchestrator step graphs and gates                                                  ││budget    120000 (project) · reserve 0.10 · target 108000                               │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exporter                                                   ││tokens    1067 → 1067 · chars-v2                                                        │
+│▌ FEAT-1   ◐ running    TUI scaffold                                                                        ││excerpts  builtin@1 · considered 0 · selected 0                                         │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab                                                           ││roots     none · this project has no repo                                               │
+│  FEAT-3   ◌ queued     Postgres store and cache                                                            ││                                                                                        │
+│  FIX-1    ✓ closed     Terminal left raw after panic                                                       ││section                   before   after  strategy                                      │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes                                                        ││template                     149     149  none                                          │
+│ ▾ agy (3)                                                                                                  ││item                         570     570  none                                          │
+│  ANA-1    ● done       Prompt assembly survey                                                              ││documents:plan                57      57  none                                          │
+│  FEAT-1   ○ open       ACP transport upgrade                                                               ││documents:prd                 52      52  none                                          │
+│  FIX-1    ○ open       Session leak on cancel                                                              ││upstream                      71      71  none                                          │
 │                                                                                                            ││box                           80      80  none                                          │
 │                                                                                                            ││skills                        88      88  none                                          │
 │                                                                                                            ││                                                                                        │

@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog    1 working · 3 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-3 · Postgres store and cach…‹ Runs ›╮
-│ ▾ htui (8)                                          ││kind   status      box          started    │
-│  ANA-1    ● done       Data model, box registry and…││mode                            finished   │
-│  ANA-2    ○ open       Orchestrator step graphs and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││automatic                       —          │
-│  FEAT-1   ◐ running    TUI scaffold                 ││▸ prd             ○ pending         —     —│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    —          claude/sonnet               │
-│▌ FEAT-3   ◐ running    Postgres store and cache     ││    asks: execute: cargo test              │
-│  FIX-1    ✓ closed     Terminal left raw after panic││answer   1  Allow once   2  Reject once    │
+│ ▾ Platform (0)                                      ││kind   status      box          started    │
+│ ▾ htui (8)                                          ││mode                            finished   │
+│  ANA-1    ● done       Data model, box registry and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
+│  ANA-2    ○ open       Orchestrator step graphs and…││automatic                       —          │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▸ prd             ○ pending         —     —│
+│  FEAT-1   ◐ running    TUI scaffold                 ││    —          claude/sonnet               │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    asks: execute: cargo test              │
+│▌ FEAT-3   ◐ running    Postgres store and cache     ││answer   1  Allow once   2  Reject once    │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

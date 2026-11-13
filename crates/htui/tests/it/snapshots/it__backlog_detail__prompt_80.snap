@@ -4,20 +4,20 @@ expression: frame
 ---
 Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ‹ Prompt ›╮
-│ ▾ htui (8)                               ││template  prd v1                  │
-│  ANA-1    ● done       Data model, box r…││picker    8 templates             │
-│  ANA-2    ○ open       Orchestrator step…││digest    a3cad86a286f7e936fb4b14…│
-│  CLEAN-1  ✗ failed     Drop the legacy m…││budget    120000 (project) · rese…│
-│▌ FEAT-1   ◐ running    TUI scaffold      ││tokens    1067 → 1067 · chars-v2  │
-│  FEAT-2   ⊘ blocked    Agent driver and …││excerpts  builtin@1 · considered …│
-│  FEAT-3   ◌ queued     Postgres store an…││roots     none · this project has…│
-│  FIX-1    ✓ closed     Terminal left raw…││                                  │
-│  TOOL-1   ⚠ needs you  CI matrix for the…││section                   before …│
-│ ▾ agy (3)                                ││template                     149 …│
-│  ANA-1    ● done       Prompt assembly s…││item                         570 …│
-│  FEAT-1   ○ open       ACP transport upg…││documents:plan                57 …│
-│  FIX-1    ○ open       Session leak on c…││documents:prd                 52 …│
-│                                          ││upstream                      71 …│
+│ ▾ Platform (0)                           ││template  prd v1                  │
+│ ▾ htui (8)                               ││picker    8 templates             │
+│  ANA-1    ● done       Data model, box r…││digest    a3cad86a286f7e936fb4b14…│
+│  ANA-2    ○ open       Orchestrator step…││budget    120000 (project) · rese…│
+│  CLEAN-1  ✗ failed     Drop the legacy m…││tokens    1067 → 1067 · chars-v2  │
+│▌ FEAT-1   ◐ running    TUI scaffold      ││excerpts  builtin@1 · considered …│
+│  FEAT-2   ⊘ blocked    Agent driver and …││roots     none · this project has…│
+│  FEAT-3   ◌ queued     Postgres store an…││                                  │
+│  FIX-1    ✓ closed     Terminal left raw…││section                   before …│
+│  TOOL-1   ⚠ needs you  CI matrix for the…││template                     149 …│
+│ ▾ agy (3)                                ││item                         570 …│
+│  ANA-1    ● done       Prompt assembly s…││documents:plan                57 …│
+│  FEAT-1   ○ open       ACP transport upg…││documents:prd                 52 …│
+│  FIX-1    ○ open       Session leak on c…││upstream                      71 …│
 │                                          ││box                           80 …│
 │                                          ││skills                        88 …│
 │                                          ││                                  │

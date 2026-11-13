@@ -4,10 +4,10 @@ expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   0 waiting · memory ·  ?  keys
 ╭─ Backlog (2) ───────────────────────────────────────╮╭─ FEAT-1 · Chapter 12 parity ─ Body  Runs ›╮
-│ ▾ Vulkan Tutorials (2)                              ││■ stopped · gpu, vulkan · priority 0       │
-│▌ FEAT-1  ■ stopped  Chapter 12 parity               ││version 1                                  │
+│ ▾ Graphics (0)                                      ││■ stopped · gpu, vulkan · priority 0       │
+│ ▾ Vulkan Tutorials (2)                              ││version 1                                  │
+│▌ FEAT-1  ■ stopped  Chapter 12 parity               ││                                           │
 │  TOOL-1  ○ open     Shader build script             ││                                           │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

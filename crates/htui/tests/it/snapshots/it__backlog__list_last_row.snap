@@ -4,7 +4,8 @@ expression: last
 ---
 Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FIX-1 · Session leak on cancel ─── Body ›╮
-│ ▾ htui (8)                                          ││○ open · no tags · priority 0 · version 1  │
+│ ▾ Platform (0)                                      ││○ open · no tags · priority 0 · version 1  │
+│ ▾ htui (8)                                          ││                                           │
 │  ANA-1    ● done       Data model, box registry and…││                                           │
 │  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
@@ -17,7 +18,6 @@ Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTU
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │▌ FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
 │                                                     ││          No body for this item.           │
 │                                                     ││               e writes one                │
 │                                                     ││                                           │

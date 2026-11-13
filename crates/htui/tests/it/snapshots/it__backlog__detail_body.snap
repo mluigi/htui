@@ -4,20 +4,20 @@ expression: harness.render()
 ---
 Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────── Body  Runs ›╮
-│ ▾ htui (8)                                          ││◐ running · rust · priority 2 · version 1  │
-│  ANA-1    ● done       Data model, box registry and…││                                           │
-│  ANA-2    ○ open       Orchestrator step graphs and…││Stand up the terminal application: a       │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││workspace-scoped shell with a tab strip, a │
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││top bar and a backlog tab, all reading     │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││through the store seam.                    │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
-│  FIX-1    ✓ closed     Terminal left raw after panic││Shape                                      │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││- Two crates: htui-core holds the domain   │
-│ ▾ agy (3)                                           ││  model and the store traits, htui holds   │
-│  ANA-1    ● done       Prompt assembly survey       ││  the terminal application. Nothing in the │
-│  FEAT-1   ○ open       ACP transport upgrade        ││  view layer holds a store handle.         │
-│  FIX-1    ○ open       Session leak on cancel       ││- A store worker task owns the backend. The│
-│                                                     ││  UI sends a request, the worker replies,  │
+│ ▾ Platform (0)                                      ││◐ running · rust · priority 2 · version 1  │
+│ ▾ htui (8)                                          ││                                           │
+│  ANA-1    ● done       Data model, box registry and…││Stand up the terminal application: a       │
+│  ANA-2    ○ open       Orchestrator step graphs and…││workspace-scoped shell with a tab strip, a │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││top bar and a backlog tab, all reading     │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││through the store seam.                    │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││Shape                                      │
+│  FIX-1    ✓ closed     Terminal left raw after panic││- Two crates: htui-core holds the domain   │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││  model and the store traits, htui holds   │
+│ ▾ agy (3)                                           ││  the terminal application. Nothing in the │
+│  ANA-1    ● done       Prompt assembly survey       ││  view layer holds a store handle.         │
+│  FEAT-1   ○ open       ACP transport upgrade        ││- A store worker task owns the backend. The│
+│  FIX-1    ○ open       Session leak on cancel       ││  UI sends a request, the worker replies,  │
 │                                                     ││  the event loop folds the reply into      │
 │                                                     ││  state. Three select arms: terminal       │
 │                                                     ││  events, store replies, a tick.           │
