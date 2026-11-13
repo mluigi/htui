@@ -5,8 +5,11 @@
 //! and a box without `node` or without the ACP adapter is not a failing build. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test probe_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it probe_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! It **burns no model tokens**: tier 1 runs `--version` children and tier 2 completes `initialize`,
 //! both protocol or CLI traffic, and no prompt is ever sent. `acp_live.rs` proves that the seeded

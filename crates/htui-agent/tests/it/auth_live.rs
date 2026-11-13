@@ -7,8 +7,11 @@
 //! A box where nobody does is not a failing build. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test auth_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it auth_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! `--nocapture` is load-bearing rather than a nicety: the link the maintainer has to open is
 //! printed by this test and by nothing else, so a captured run is a run that waits ten minutes for

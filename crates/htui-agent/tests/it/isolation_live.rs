@@ -6,8 +6,11 @@
 //! tokens** on the credential this box holds. Run it by hand, serially:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test isolation_live -- --ignored --nocapture --test-threads=1
+//! cargo test -p htui-agent --features test-support --test it isolation_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! # What it drives
 //!

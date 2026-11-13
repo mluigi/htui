@@ -1326,9 +1326,13 @@ async fn the_launch_env_cannot_hand_an_agent_htui_qdrant_api_key() {
 async fn an_inherited_htui_qdrant_api_key_never_reaches_an_agent() {
     const CHILD: &str = "HTUI_AGENT_LAUNCH_TEST_ENV_CHILD";
     const NAME: &str = "an_inherited_htui_qdrant_api_key_never_reaches_an_agent";
+    let name = format!(
+        "{}::{NAME}",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([NAME, "--exact", "--test-threads=1"])
+            .args([name.as_str(), "--exact", "--test-threads=1"])
             .env(CHILD, "1")
             .env(htui_core::secret::QDRANT_KEY_ENV, QDRANT_KEY_SENTINEL)
             .output()
@@ -1424,9 +1428,13 @@ async fn env_remove_beats_the_launch_env() {
 async fn an_inherited_variable_in_env_remove_never_reaches_the_child() {
     const CHILD: &str = "HTUI_AGENT_LAUNCH_TEST_ENV_REMOVE_CHILD";
     const NAME: &str = "an_inherited_variable_in_env_remove_never_reaches_the_child";
+    let name = format!(
+        "{}::{NAME}",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([NAME, "--exact", "--test-threads=1"])
+            .args([name.as_str(), "--exact", "--test-threads=1"])
             .env(CHILD, "1")
             .env("HTUI_TEST_VENDOR_KEY", VENDOR_KEY_SENTINEL)
             .output()

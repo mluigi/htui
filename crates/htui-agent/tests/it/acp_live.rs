@@ -4,8 +4,11 @@
 //! without the adapter is not a failing build. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test acp_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it acp_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! It **burns no model tokens**: `initialize` and `session/new` are protocol traffic, and the test
 //! sends no prompt. What it proves is the half of criterion 9 that milestone 3 owns — the seeded

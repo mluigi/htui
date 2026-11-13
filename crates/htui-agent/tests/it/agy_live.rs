@@ -7,8 +7,11 @@
 //! failing build. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test agy_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it agy_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! It **burns no model tokens**: case 1 completes `initialize` through the production probe, case 2
 //! completes (or fails to complete) `initialize` a second time with the platform args withheld,

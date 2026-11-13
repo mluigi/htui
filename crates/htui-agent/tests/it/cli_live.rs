@@ -7,8 +7,11 @@
 //! it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test cli_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it cli_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! What it spawns: the `claude` binary the **seed row's own tier-1 probe** resolves, through
 //! [`htui_agent::tools::resolve`] → [`htui_agent::launch::resolve`] → [`htui_agent::launch::spawn`]
@@ -2047,11 +2050,15 @@ async fn case_11_a_subscription_row_ignores_an_inherited_api_key() {
     const BOGUS_TOKEN: &str = "htui-mod97-bogus-auth-token-never-valid";
 
     let _serial = ONE_AT_A_TIME.lock().await;
+    let name = format!(
+        "{}::{NAME}",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
     if std::env::var_os(CHILD).is_none() {
         println!("\n=== case 11 / subscription row with an exported API key ===");
         let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
             .args([
-                NAME,
+                name.as_str(),
                 "--exact",
                 "--ignored",
                 "--test-threads=1",

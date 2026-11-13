@@ -7,8 +7,11 @@
 //! it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test estimator_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it estimator_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! # What it measures, and why it is a *differential*
 //!
@@ -159,13 +162,13 @@ use tokio::process::ChildStdout;
 /// **20 000 characters, twice** — the module doc's F-61 says why at length. The unit is 20 blocks
 /// of 1 000 characters spread evenly across the whole document, so it samples ANA-5's mix rather
 /// than one stretch of it, and [`assert_corpora_are_intact`] holds the doubling.
-const PROSE: &str = include_str!("fixtures/estimator_prose.txt");
+const PROSE: &str = include_str!("../fixtures/estimator_prose.txt");
 
 /// 40 000 characters of Rust: `crates/htui-core/src/store/conformance.rs` from the top, frozen.
 ///
 /// Contiguous, unlike [`PROSE`], because nothing differences it against a half of itself: it is
 /// read once, at one size, for the code rate.
-const CODE: &str = include_str!("fixtures/estimator_code.txt");
+const CODE: &str = include_str!("../fixtures/estimator_code.txt");
 
 /// Both corpora are exactly this many **characters** — not bytes; the prose one holds multi-byte
 /// punctuation and is 40 106 bytes long. Asserted at the top of the test, before a token is spent.

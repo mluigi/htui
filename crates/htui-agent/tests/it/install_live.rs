@@ -5,8 +5,11 @@
 //! network is not a failing build. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui-agent --features test-support --test install_live -- --ignored --nocapture
+//! cargo test -p htui-agent --features test-support --test it install_live:: -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
 //!
 //! **What it proves.** The PRD's success metric is *a third agent installed with no code change*.
 //! `agy` and `claude` are seeded rows the workspace has been carrying since MOD-2; the agent this
