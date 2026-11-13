@@ -34,7 +34,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::StoredCommandLog;
-use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
+use crate::model::link::{ItemLink, LinkGraph, ProposeLink, WithdrawLink};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus, Document,
@@ -150,7 +150,7 @@ pub trait RelayStore: Send + Sync {
 /// `set_skill_binding`, `update_item`) are deliberately absent: it has no production caller and
 /// keeps its [`WriteStore`] bound.
 pub trait WorkerStore: RecorderStore + RelayStore {
-    // -- 16 ReadStore reads
+    // -- 17 ReadStore reads
     /// [`ReadStore::item`].
     fn item(&self, id: ItemId) -> impl Future<Output = Result<Option<Item>>> + Send;
     /// [`ReadStore::documents`].
@@ -207,6 +207,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<Option<Vec<MemoryEntry>>>> + Send;
     /// [`ReadStore::run_plans`]: MOD-139 M2's admission and recovery read the run's plans.
     fn run_plans(&self, run: RunId) -> impl Future<Output = Result<Vec<RunPlan>>> + Send;
+    /// [`ReadStore::links`]: MOD-150 M2's close-out preview reads the item's live links.
+    fn links(&self, id: ItemId, hops: u8) -> impl Future<Output = Result<LinkGraph>> + Send;
 
     // -- 7 WriteStore reads
     /// [`WriteStore::repos`].
@@ -441,6 +443,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> impl Future<Output = Result<Document>> + Send;
@@ -838,6 +841,9 @@ impl WorkerStore for MemStore {
     async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
         ReadStore::run_plans(self, run).await
     }
+    async fn links(&self, id: ItemId, hops: u8) -> Result<LinkGraph> {
+        ReadStore::links(self, id, hops).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -1044,10 +1050,11 @@ impl WorkerStore for MemStore {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        WriteStore::close_out(self, item, resolution, summary, commits).await
+        WriteStore::close_out(self, item, resolution, names, summary, commits).await
     }
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         WriteStore::add_note(self, note).await

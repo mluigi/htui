@@ -1058,6 +1058,7 @@ async fn a_drained_batch_closes_drained() {
         .close_out(
             item,
             Resolution::Withdrawn,
+            None,
             NewDocument {
                 id: DocumentId::new(),
                 item_id: item,
@@ -2104,6 +2105,7 @@ async fn a_drained_batch_closes_drained_pg() {
         .close_out(
             item,
             Resolution::Withdrawn,
+            None,
             NewDocument {
                 id: DocumentId::new(),
                 item_id: item,

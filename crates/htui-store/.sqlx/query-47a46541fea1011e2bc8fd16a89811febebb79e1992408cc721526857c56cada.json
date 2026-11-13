@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS \"one!\" FROM item_link\n                    WHERE to_item_id = $1 AND kind = 'supersedes' AND deleted_at IS NULL\n                    LIMIT 1\n                      FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "47a46541fea1011e2bc8fd16a89811febebb79e1992408cc721526857c56cada"
+}

@@ -81,16 +81,17 @@ use crate::store::traits::{
     EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, ParkOutcome, QueueStored, QueueTarget, QueueToken,
     ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     batch_is_closed, branch_refusal, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
-    document_needs_a_step, expected_on_row, failure_disagrees_with_status,
-    finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
-    memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, note_needs_a_step, parent_cycle, parent_too_deep, persona_is_bound,
-    persona_patch_refusal, phase_name_refusal, project_settings_not_an_object, prompt_template_key,
-    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
-    references_no_row, requirement_withdrawn, resolution_not_closable, row_names_another_phase,
+    close_out_names_no_link, close_out_needs_a_link, close_out_needs_a_summary,
+    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
+    expected_on_row, failure_disagrees_with_status, finish_run_needs_a_terminal_status,
+    graph_not_usable, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
+    item_not_in_project, lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run,
+    link_outside_reach, memory_entry_closed, memory_subject_taken, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
+    parent_cycle, parent_too_deep, persona_is_bound, persona_patch_refusal, phase_name_refusal,
+    project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
+    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
+    requirement_withdrawn, resolution_not_closable, row_names_another_phase,
     row_names_another_step, run_is_terminal, second_canonical, second_parent, self_link,
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
@@ -8367,11 +8368,15 @@ impl State {
         &mut self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
         now: DateTime<Utc>,
     ) -> Result<Document> {
-        let status = self.require_item(item)?.status;
+        let (status, project) = {
+            let row = self.require_item(item)?;
+            (row.status, row.project_id)
+        };
         if let Some(live) = self
             .runs
             .values()
@@ -8406,6 +8411,7 @@ impl State {
                 resolution,
             )));
         }
+        let link = self.close_out_link(item, project, resolution, names)?;
         for row in commits {
             self.check_step_batch(
                 "run_step_commit",
@@ -8420,6 +8426,9 @@ impl State {
             self.step_commits
                 .insert((row.run_step_id, row.repo_id), row.clone());
         }
+        if let Some((from, to, kind)) = link {
+            self.upsert_link(from, to, kind, None, now);
+        }
         // Plan D5: the direct write `transition` no longer makes, under the same `now`.
         let row = self
             .items
@@ -8430,6 +8439,98 @@ impl State {
         row.updated_at = now;
         row.closed_at = Some(now);
         Ok(document)
+    }
+
+    /// MOD-150 M2 D2: close-out's link rule, decided before any write. Answers the link a named
+    /// item makes (`item -duplicates-> named`, `named -supersedes-> item`), or `None` when no
+    /// name was given and the live link the resolution needs is there.
+    fn close_out_link(
+        &self,
+        item: ItemId,
+        project: ProjectId,
+        resolution: Resolution,
+        names: Option<ItemId>,
+    ) -> Result<Option<(ItemId, ItemId, LinkKind)>> {
+        let kind = match resolution {
+            Resolution::Duplicate => LinkKind::Duplicates,
+            Resolution::Superseded => LinkKind::Supersedes,
+            _ => {
+                return match names {
+                    Some(_) => Err(StoreError::Constraint(close_out_names_no_link(resolution))),
+                    None => Ok(None),
+                };
+            }
+        };
+        let Some(named) = names else {
+            let live = self.links.iter().any(|row| {
+                row.deleted_at.is_none()
+                    && row.kind == kind
+                    && if kind == LinkKind::Duplicates {
+                        row.from_item_id == item
+                    } else {
+                        row.to_item_id == item
+                    }
+            });
+            return if live {
+                Ok(None)
+            } else {
+                Err(StoreError::Constraint(close_out_needs_a_link(
+                    item, resolution,
+                )))
+            };
+        };
+        if named == item {
+            return Err(StoreError::Constraint(self_link(item)));
+        }
+        let target = self.require_item(named)?.project_id;
+        if !self.link_reaches(project, target) {
+            return Err(StoreError::Constraint(link_outside_reach(named)));
+        }
+        if kind == LinkKind::Supersedes {
+            // Multi-valued: a live `supersedes` from another item refuses nothing.
+            return Ok(Some((named, item, kind)));
+        }
+        if let Some(current) = self.live_other(item, kind, named) {
+            return Err(StoreError::Constraint(second_canonical(item, current)));
+        }
+        Ok(Some((item, named, kind)))
+    }
+
+    /// MOD-11 D13, B-6's upsert on `(from, to, kind)`: a new row is live and `proposer`'s, a
+    /// tombstone revives as `proposer`'s, and a live row keeps its proposer (only `updated_at`
+    /// moves, as Postgres's trigger moves it). `None` is a person (MOD-150 M2 D3).
+    fn upsert_link(
+        &mut self,
+        from: ItemId,
+        to: ItemId,
+        kind: LinkKind,
+        proposer: Option<StepId>,
+        now: DateTime<Utc>,
+    ) -> ItemLink {
+        let at = self
+            .links
+            .iter()
+            .position(|row| row.from_item_id == from && row.to_item_id == to && row.kind == kind);
+        let Some(at) = at else {
+            let row = ItemLink {
+                from_item_id: from,
+                to_item_id: to,
+                kind,
+                proposed_by_step_id: proposer,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            self.links.push(row.clone());
+            return row;
+        };
+        let row = &mut self.links[at];
+        if row.deleted_at.is_some() {
+            row.proposed_by_step_id = proposer;
+            row.deleted_at = None;
+        }
+        row.updated_at = now;
+        row.clone()
     }
 
     /// ANA-2 invariant 7's refusal note; every foreign key is checked before the insert.
@@ -9121,29 +9222,7 @@ impl State {
                 return Err(StoreError::Constraint(parent_too_deep(depth)));
             }
         }
-        let at = self.links.iter().position(|row| {
-            row.from_item_id == link.from && row.to_item_id == link.to && row.kind == link.kind
-        });
-        let Some(at) = at else {
-            let row = ItemLink {
-                from_item_id: link.from,
-                to_item_id: link.to,
-                kind: link.kind,
-                proposed_by_step_id: Some(link.step),
-                created_at: now,
-                updated_at: now,
-                deleted_at: None,
-            };
-            self.links.push(row.clone());
-            return Ok(row);
-        };
-        let row = &mut self.links[at];
-        if row.deleted_at.is_some() {
-            row.proposed_by_step_id = Some(link.step);
-            row.deleted_at = None;
-        }
-        row.updated_at = now;
-        Ok(row.clone())
+        Ok(self.upsert_link(link.from, link.to, link.kind, Some(link.step), now))
     }
 
     /// MOD-11 D13, B-5: tombstones the live `(from, to, kind)` when a step of `link.step`'s run
@@ -11436,11 +11515,12 @@ impl WriteStore for MemStore {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         let now = self.now();
-        self.write(|state| state.close_out(item, resolution, summary, commits, now))
+        self.write(|state| state.close_out(item, resolution, names, summary, commits, now))
     }
 
     async fn add_note(&self, note: NewNote) -> Result<Note> {
@@ -17492,6 +17572,7 @@ mod tests {
                     .close_out(
                         ids::HTUI_FEAT_3,
                         Resolution::Withdrawn,
+                        None,
                         summary(ids::HTUI_FEAT_3, "summary"),
                         &[]
                     )
@@ -17512,6 +17593,7 @@ mod tests {
                     .close_out(
                         ids::HTUI_FEAT_1,
                         Resolution::Done,
+                        None,
                         summary(ids::HTUI_FEAT_1, "plan"),
                         &[]
                     )
@@ -17526,6 +17608,7 @@ mod tests {
                     .close_out(
                         ids::HTUI_FEAT_1,
                         Resolution::Done,
+                        None,
                         summary(ids::HTUI_ANA_2, "summary"),
                         &[]
                     )
@@ -17540,6 +17623,7 @@ mod tests {
                     .close_out(
                         ids::HTUI_ANA_2,
                         Resolution::Done,
+                        None,
                         summary(ids::HTUI_ANA_2, "summary"),
                         &[]
                     )
@@ -17553,6 +17637,7 @@ mod tests {
                 .close_out(
                     ItemId::new(),
                     Resolution::Withdrawn,
+                    None,
                     summary(ItemId::new(), "summary"),
                     &[]
                 )
@@ -17573,6 +17658,7 @@ mod tests {
             .close_out(
                 ids::HTUI_FEAT_1,
                 Resolution::Done,
+                None,
                 summary(ids::HTUI_FEAT_1, "summary"),
                 &commits,
             )
@@ -17646,6 +17732,7 @@ mod tests {
             .close_out(
                 ids::HTUI_FEAT_1,
                 Resolution::Done,
+                None,
                 a_document(ids::HTUI_FEAT_1, "summary", None),
                 std::slice::from_ref(&commit),
             )

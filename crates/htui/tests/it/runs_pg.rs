@@ -1079,6 +1079,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .command(Command::CloseOut {
             item,
             resolution: Resolution::Done,
+            names: None,
         })
         .await;
     let refused = stack.take_status().expect("the close-out was refused");
@@ -1101,7 +1102,7 @@ async fn close_out_is_one_transaction_on_postgres() {
     let direct = stack
         .db
         .store
-        .close_out(item, Resolution::Done, direct_summary(item), &[])
+        .close_out(item, Resolution::Done, None, direct_summary(item), &[])
         .await;
     assert!(
         matches!(&direct, Err(StoreError::Constraint(text)) if text.contains(&run.to_string())),
@@ -1142,6 +1143,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .close_out(
             item,
             Resolution::Done,
+            None,
             direct_summary(item),
             &[RunStepCommit {
                 run_step_id: first.id,
@@ -1176,6 +1178,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .command(Command::CloseOut {
             item,
             resolution: Resolution::Done,
+            names: None,
         })
         .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
@@ -1291,7 +1294,13 @@ async fn closes_open_ana_2_as(resolution: Resolution) {
         "the fixture holds no summary"
     );
 
-    stack.command(Command::CloseOut { item, resolution }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution,
+            names: None,
+        })
+        .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     assert_eq!(
         stack.summaries(item).await.len(),

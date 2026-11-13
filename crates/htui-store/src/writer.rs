@@ -1418,12 +1418,20 @@ impl WriteStore for Writer {
         &self,
         item: ItemId,
         resolution: Resolution,
+        names: Option<ItemId>,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         match self {
-            Self::Memory(store) => store.close_out(item, resolution, summary, commits).await,
-            Self::Online(pg) => pg.close_out(item, resolution, summary, commits).await,
+            Self::Memory(store) => {
+                store
+                    .close_out(item, resolution, names, summary, commits)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.close_out(item, resolution, names, summary, commits)
+                    .await
+            }
         }
     }
 

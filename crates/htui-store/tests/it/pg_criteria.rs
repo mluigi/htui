@@ -12079,6 +12079,585 @@ async fn concurrent_identical_duplicates_all_land_one_row() {
     db.drop_db().await;
 }
 
+/// Waits, polling from `pool`, until `n` backends of this database wait on an advisory lock.
+async fn advisory_waiters_reach(pool: &PgPool, n: i64) {
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND NOT granted \
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{n} backends never came to wait on an advisory lock");
+}
+
+/// MOD-150 M2 D4: a close-out naming `x`'s canonical `b` races an agent's `x duplicates c`. Both
+/// take the per-item advisory lock, so exactly one canonical lands live and the loser answers
+/// `second_canonical` naming it, never 23505 from `uq_item_link_one_canonical` and never a
+/// deadlock between the close-out's item row lock and the proposal's foreign-key lock on it. A
+/// close-out that lost leaves `x` open. Fifty-two rounds, each on three fresh items and a
+/// cancelled run of `x` (its step still proposes under the unleased fence). Rounds 0 and 1 fix
+/// the order (review L3): a third connection holds the advisory lock while the first racer and
+/// then the second queue on it, and Postgres grants it in queue order on release, so the
+/// close-out wins round 0 and the proposal round 1 and both sides are seen to win. The other
+/// rounds release the pair together by a barrier. Started at once the close-out nearly always
+/// takes the lock first, so it starts up to 0.9 ms late, the lag cycling with the round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_out_naming_a_canonical_races_an_agent_proposal() {
+    use htui_core::model::link::ProposeLink;
+    use htui_core::model::{LinkKind, Resolution};
+    use htui_core::store::second_canonical;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+    let mut wins = [0_u32; 2];
+
+    for round in 0_u64..52 {
+        let mut minted = Vec::new();
+        for name in ["x", "b", "c"] {
+            minted.push(
+                db.store
+                    .mint_item(race_item(
+                        ids::KIND_HTUI_FEAT,
+                        &format!("round {round} {name}"),
+                    ))
+                    .await
+                    .expect("mint a race item")
+                    .id,
+            );
+        }
+        let [x, b, c] = minted[..] else {
+            unreachable!("three items")
+        };
+        let run = db
+            .store
+            .create_run(race_run(x))
+            .await
+            .expect("queue a graph run")
+            .id;
+        let step = db
+            .store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
+            })
+            .await
+            .expect("create the round's step")
+            .id;
+        db.store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("cancel the run, so it refuses no close-out");
+        let summary = htui_core::model::NewDocument {
+            id: htui_core::model::DocumentId::new(),
+            item_id: x,
+            kind: "summary".to_owned(),
+            title: format!("round {round} summary"),
+            body: String::new(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        };
+
+        // Round 0: the close-out queues first; round 1: the proposal does.
+        let forced = match round {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        };
+        let holder = match forced {
+            Some(_) => {
+                let mut holder = db.pool.begin().await.expect("begin the lock holder");
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(format!("item_link:duplicates:{x}"))
+                    .execute(&mut *holder)
+                    .await
+                    .expect("hold the item's `duplicates` advisory lock");
+                Some(holder)
+            }
+            None => None,
+        };
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(if forced.is_some() {
+            1
+        } else {
+            2
+        }));
+        let lag = if forced.is_some() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_micros(round % 10 * 100)
+        };
+        let spawn_close = {
+            let (pool, start) = (pools[0].clone(), std::sync::Arc::clone(&start));
+            move || {
+                tokio::spawn(async move {
+                    start.wait().await;
+                    // A spin, not `tokio::time::sleep`: the timer's millisecond grain overshoots.
+                    let until = std::time::Instant::now() + lag;
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    pool.close_out(x, Resolution::Duplicate, Some(b), summary, &[])
+                        .await
+                        .map(|_| ())
+                })
+            }
+        };
+        let spawn_propose = {
+            let (pool, start) = (pools[1].clone(), std::sync::Arc::clone(&start));
+            move || {
+                tokio::spawn(async move {
+                    start.wait().await;
+                    pool.propose_link(
+                        StepFence::Unleased,
+                        ProposeLink {
+                            from: x,
+                            to: c,
+                            kind: LinkKind::Duplicates,
+                            step,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            }
+        };
+        let (close, propose) = match forced {
+            None => (spawn_close(), spawn_propose()),
+            Some(true) => {
+                let close = spawn_close();
+                advisory_waiters_reach(&db.pool, 1).await;
+                let propose = spawn_propose();
+                advisory_waiters_reach(&db.pool, 2).await;
+                (close, propose)
+            }
+            Some(false) => {
+                let propose = spawn_propose();
+                advisory_waiters_reach(&db.pool, 1).await;
+                let close = spawn_close();
+                advisory_waiters_reach(&db.pool, 2).await;
+                (close, propose)
+            }
+        };
+        if let Some(holder) = holder {
+            holder.commit().await.expect("release the advisory lock");
+        }
+        let closed = close.await.expect("the close-out task completes");
+        let proposed = propose.await.expect("the proposal task completes");
+        let canonical = match (&closed, &proposed) {
+            (Ok(()), Err(htui_core::store::StoreError::Constraint(sentence))) => {
+                assert_eq!(
+                    *sentence,
+                    second_canonical(x, b),
+                    "round {round}: the proposal lost to the close-out's canonical"
+                );
+                wins[0] += 1;
+                b
+            }
+            (Err(htui_core::store::StoreError::Constraint(sentence)), Ok(())) => {
+                assert_eq!(
+                    *sentence,
+                    second_canonical(x, c),
+                    "round {round}: the close-out lost to the agent's canonical"
+                );
+                wins[1] += 1;
+                c
+            }
+            _ => panic!(
+                "round {round}: exactly one canonical wins, the loser `second_canonical`; got \
+                 close-out {closed:?}, proposal {proposed:?}"
+            ),
+        };
+        let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT to_item_id FROM item_link WHERE kind = 'duplicates' AND deleted_at IS NULL \
+             AND from_item_id = $1",
+        )
+        .bind(x.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("read the item's live canonical links");
+        assert_eq!(
+            live,
+            [canonical.as_uuid()],
+            "round {round}: one live canonical link, the winner's"
+        );
+        let status: String = sqlx::query_scalar("SELECT status::text FROM item WHERE id = $1")
+            .bind(x.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the item's status");
+        assert_eq!(
+            status,
+            if canonical == b { "closed" } else { "open" },
+            "round {round}: the item is closed exactly when the close-out won"
+        );
+    }
+    eprintln!("close-out won {} rounds, the proposal {}", wins[0], wins[1]);
+    assert!(
+        wins[0] > 0 && wins[1] > 0,
+        "both sides win a round (rounds 0 and 1 fix the order): {wins:?}"
+    );
+
+    for pool in pools {
+        pool.close().await;
+    }
+    db.drop_db().await;
+}
+
+/// A step of a fresh graph run of `item`, the run then cancelled: its step still proposes and
+/// withdraws under the unleased fence, and the run refuses no close-out.
+async fn cancelled_run_step(db: &common::TestDb, item: ItemId) -> StepId {
+    let run = db
+        .store
+        .create_run(race_run(item))
+        .await
+        .expect("queue a graph run")
+        .id;
+    let step = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
+        })
+        .await
+        .expect("create the run's step")
+        .id;
+    db.store
+        .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("cancel the run");
+    step
+}
+
+/// `item`'s close-out summary, by the fixture user.
+fn race_summary(item: ItemId, title: String) -> htui_core::model::NewDocument {
+    htui_core::model::NewDocument {
+        id: htui_core::model::DocumentId::new(),
+        item_id: item,
+        kind: "summary".to_owned(),
+        title,
+        body: String::new(),
+        produced_by_step_id: None,
+        created_by: ids::USER,
+        created_at: Utc::now(),
+    }
+}
+
+/// MOD-150 M2 review M1: an unnamed `duplicate` close-out rests on the item's live
+/// `duplicates` link, and an unnamed `superseded` one on a live `supersedes` to it; a step of a
+/// finished run can still withdraw either (the unleased fence), and `withdraw_link` takes no item
+/// lock. The close-out share-locks the link row it rests on, so the withdrawal waits for its
+/// commit: the item is never closed on a link already tombstoned.
+///
+/// Rounds 0 and 1 (`duplicates`, then `supersedes`) fix the order: a third connection holds the
+/// fixture user's row `FOR UPDATE`, so the close-out, past its link check, waits at the summary
+/// insert (its foreign key takes `FOR KEY SHARE` on the user). The withdrawal is then started and
+/// must come to wait on a lock rather than answer; once the holder lets go both land, the item
+/// `closed` and the link tombstoned. The order is read from that wait, not from the
+/// timestamps: the withdrawal's `SET deleted_at = clock_timestamp()` is evaluated before its
+/// row-lock wait, so its `deleted_at` precedes a `closed_at` it committed after.
+///
+/// The other thirty rounds race an unnamed `duplicate` close-out against the withdrawal of the
+/// item's only canonical, released by a barrier, the withdrawal up to 4.5 ms late (started at
+/// once it nearly always lands before the close-out's link check): either the item
+/// closed (the withdrawal landed after it) or the close-out was refused with
+/// `close_out_needs_a_link` and the item is still open; the withdrawal always lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnamed_close_out_holds_its_link_against_a_withdrawal() {
+    use htui_core::model::link::{ProposeLink, WithdrawLink};
+    use htui_core::model::{LinkKind, Resolution};
+    use htui_core::store::StoreError;
+    use htui_core::store::traits::close_out_needs_a_link;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+    let mut outcomes = [0_u32; 2];
+
+    for round in 0_u64..32 {
+        let x = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} x")))
+            .await
+            .expect("mint the closing item")
+            .id;
+        let b = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} b")))
+            .await
+            .expect("mint the linked item")
+            .id;
+        // Round 1 is `b supersedes x`, proposed and withdrawn by a step of `b`'s run; every other
+        // round is `x duplicates b`, by a step of `x`'s.
+        let (kind, resolution, from, to) = if round == 1 {
+            (LinkKind::Supersedes, Resolution::Superseded, b, x)
+        } else {
+            (LinkKind::Duplicates, Resolution::Duplicate, x, b)
+        };
+        let step = cancelled_run_step(&db, from).await;
+        db.store
+            .propose_link(
+                StepFence::Unleased,
+                ProposeLink {
+                    from,
+                    to,
+                    kind,
+                    step,
+                },
+            )
+            .await
+            .expect("the step proposes the link");
+        let summary = race_summary(x, format!("round {round} summary"));
+        let withdrawal = WithdrawLink {
+            from,
+            to,
+            kind,
+            step,
+        };
+
+        let (closed, withdrawn) = if round < 2 {
+            let mut holder = db.pool.begin().await.expect("begin the user-row holder");
+            sqlx::query("SELECT 1 FROM app_user WHERE id = $1 FOR UPDATE")
+                .bind(ids::USER.as_uuid())
+                .execute(&mut *holder)
+                .await
+                .expect("hold the fixture user's row");
+            let close = {
+                let pool = pools[0].clone();
+                tokio::spawn(async move { pool.close_out(x, resolution, None, summary, &[]).await })
+            };
+            a_backend_waits_on_a_lock_in(&db.pool, "INSERT INTO document").await;
+            let withdraw = {
+                let pool = pools[1].clone();
+                tokio::spawn(
+                    async move { pool.withdraw_link(StepFence::Unleased, withdrawal).await },
+                )
+            };
+            let mut waited = false;
+            for _ in 0..200 {
+                assert!(
+                    !withdraw.is_finished(),
+                    "round {round}: the withdrawal landed while the close-out stood on its link"
+                );
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity \
+                      WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                        AND wait_event_type = 'Lock' AND strpos(query, 'UPDATE item_link') > 0",
+                )
+                .fetch_one(&db.pool)
+                .await
+                .expect("read pg_stat_activity");
+                if waiting > 0 {
+                    waited = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(
+                waited,
+                "round {round}: the withdrawal never waited on a lock"
+            );
+            holder.commit().await.expect("release the user row");
+            let closed = close.await.expect("the close-out task completes");
+            assert!(
+                closed.is_ok(),
+                "round {round}: the close-out found its link live, got {closed:?}"
+            );
+            (
+                closed,
+                withdraw.await.expect("the withdrawal task completes"),
+            )
+        } else {
+            let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let lag = std::time::Duration::from_micros(round % 10 * 500);
+            let close = {
+                let (pool, start) = (pools[0].clone(), std::sync::Arc::clone(&start));
+                tokio::spawn(async move {
+                    start.wait().await;
+                    pool.close_out(x, resolution, None, summary, &[]).await
+                })
+            };
+            let withdraw = {
+                let (pool, start) = (pools[1].clone(), std::sync::Arc::clone(&start));
+                tokio::spawn(async move {
+                    start.wait().await;
+                    // A spin, not `tokio::time::sleep`: the timer's millisecond grain overshoots.
+                    let until = std::time::Instant::now() + lag;
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    pool.withdraw_link(StepFence::Unleased, withdrawal).await
+                })
+            };
+            (
+                close.await.expect("the close-out task completes"),
+                withdraw.await.expect("the withdrawal task completes"),
+            )
+        };
+
+        let tombstone = withdrawn
+            .unwrap_or_else(|error| panic!("round {round}: the withdrawal lands, got {error:?}"));
+        assert!(
+            tombstone.deleted_at.is_some(),
+            "round {round}: the withdrawal tombstones the link"
+        );
+        let status: String = sqlx::query_scalar("SELECT status::text FROM item WHERE id = $1")
+            .bind(x.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the item's status");
+        match closed {
+            Ok(_) => {
+                assert_eq!(status, "closed", "round {round}: the close-out closed it");
+                outcomes[0] += 1;
+            }
+            Err(StoreError::Constraint(sentence)) => {
+                assert_eq!(
+                    sentence,
+                    close_out_needs_a_link(x, resolution),
+                    "round {round}: the withdrawal landed first"
+                );
+                assert_eq!(
+                    status, "open",
+                    "round {round}: a refused close-out writes nothing"
+                );
+                outcomes[1] += 1;
+            }
+            Err(error) => panic!("round {round}: closed or refused, got {error:?}"),
+        }
+    }
+    eprintln!("closed {} rounds, refused {}", outcomes[0], outcomes[1]);
+
+    for pool in pools {
+        pool.close().await;
+    }
+    db.drop_db().await;
+}
+
+/// MOD-150 M2 review L1: two close-outs naming each other, `x` as `duplicate` of `y` while `y`
+/// closes as `superseded` by `x` (and the `duplicate`/`duplicate`, `superseded`/`superseded`
+/// pairings, cycling with the round). Each holds its own item `FOR UPDATE` and its link insert's
+/// foreign key wants `FOR KEY SHARE` on the other's; taken in that order the pair deadlocks
+/// (`40P01`). `close_out` takes the two row locks in id order, so the later one waits and each
+/// answers a commit or a store-level refusal. Thirty rounds on two fresh items, released by a
+/// barrier, `y`'s close-out up to 0.9 ms late.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_outs_naming_each_other_do_not_deadlock() {
+    use htui_core::model::Resolution;
+    use htui_core::store::StoreError;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+
+    for round in 0_u64..30 {
+        let x = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} x")))
+            .await
+            .expect("mint x")
+            .id;
+        let y = db
+            .store
+            .mint_item(race_item(ids::KIND_HTUI_FEAT, &format!("round {round} y")))
+            .await
+            .expect("mint y")
+            .id;
+        let (of_x, of_y) = match round % 3 {
+            0 => (Resolution::Duplicate, Resolution::Superseded),
+            1 => (Resolution::Duplicate, Resolution::Duplicate),
+            _ => (Resolution::Superseded, Resolution::Superseded),
+        };
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let lag = std::time::Duration::from_micros(round % 10 * 100);
+        let racers: Vec<_> = [(x, of_x, y, std::time::Duration::ZERO), (y, of_y, x, lag)]
+            .into_iter()
+            .zip(&pools)
+            .map(|((item, resolution, names, lag), pool)| {
+                let (pool, start) = (pool.clone(), std::sync::Arc::clone(&start));
+                let summary = race_summary(item, format!("round {round} summary"));
+                tokio::spawn(async move {
+                    start.wait().await;
+                    // A spin, not `tokio::time::sleep`: the timer's millisecond grain overshoots.
+                    let until = std::time::Instant::now() + lag;
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    pool.close_out(item, resolution, Some(names), summary, &[])
+                        .await
+                })
+            })
+            .collect();
+        for racer in join_all(racers).await {
+            match racer.expect("a close-out task completes") {
+                Ok(_) | Err(StoreError::Constraint(_) | StoreError::NotFound { .. }) => {}
+                Err(error) => panic!(
+                    "round {round} ({of_x}/{of_y}): a commit or a store-level refusal, got \
+                     {error:?}"
+                ),
+            }
+        }
+    }
+
+    for pool in pools {
+        pool.close().await;
+    }
+    db.drop_db().await;
+}
+
 /// MOD-150 D6 (blueprint deviation 3): the inherent `ready_items` and `queue_rows` read only
 /// `blocked_by`, so a `parent`, a `duplicates` and an `implements` link to a running or blocked
 /// item change neither, on Postgres (before and after a raw insert) or on `MemStore` (a store

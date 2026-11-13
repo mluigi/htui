@@ -139,6 +139,11 @@ pub enum Command {
         item: ItemId,
         /// Why it closes (ANA-11 §4.2).
         resolution: Resolution,
+        /// MOD-150 M2 D7 (R-ENT-9): the key of the item a `duplicate` close-out duplicates or a
+        /// `superseded` one is superseded by, as the person typed it; a qualified `slug:KEY` is
+        /// accepted. The engine resolves it in the item's project and the store records the link
+        /// (`WorkerStore::close_out`'s `names`); `None` names no item.
+        names: Option<String>,
     },
 }
 

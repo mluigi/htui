@@ -96,7 +96,7 @@ to, replaces, part of, duplicate of, implements.
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Link kinds in the store | `parent`, `duplicates` and `implements` are stored link kinds (widened CHECK, `LinkKind`); a second live parent or canonical, a parent cycle and a parent chain deeper than 8 are refused on both stores; `parent` joins the upstream prompt walk (a child sees its parent's summary) without touching readiness; MCP `item_link` advertises and accepts the three kinds live; the Graph tab draws them with the legend words (part of, duplicate of, implements) | complete | `.claude/plans/mod-150-m1-link-kinds.plan.md` |
-| 2 | Close-out records duplicates and supersedes | Closing an item as `duplicate` or `superseded` requires a live `duplicates` link from it (or `supersedes` link to it), or records one in the same transaction from the item the person names in the close-out flow; refused with neither | pending | — |
+| 2 | Close-out records duplicates and supersedes | Closing an item as `duplicate` or `superseded` requires a live `duplicates` link from it (or `supersedes` link to it), or records one in the same transaction from the item the person names in the close-out flow; refused with neither | complete | `.claude/plans/mod-150-m2-closeout-links.plan.md` |
 | 3 | Links to documents | An item links to a document version (`item_artifact_link`, kinds origin/relates/implements, `to_attachment_id` reserved without FK), mirrored in the cache; MCP `item_link` takes `to_document` by owner + kind (+ version) and answers the pinned version; the Graph tab shows linked documents as nodes, "v2 (latest v4)" | pending | — |
 
 ## Open Questions
@@ -106,8 +106,9 @@ to, replaces, part of, duplicate of, implements.
   locking the ancestor chain) in `/plan` M1's fact-check against `propose_link`'s transaction.
 - [ ] How the upstream walk bounds itself with `parent` added (hops, de-duplication of an item reached as
   both parent and blocker, depth 8 vs the walk's own hop limit). TBD — read the walk in `/plan` M1.
-- [ ] Which close-out surfaces exist besides the Backlog runs pane (CLI, waiting-row actions, headless
-  worker) and must offer "name the canonical item". TBD — enumerate in `/plan` M2's fact-check.
+- [x] Which close-out surfaces exist besides the Backlog runs pane (CLI, waiting-row actions, headless
+  worker) and must offer "name the canonical item". Settled in M2 (plan D10): only the Runs pane; the worker
+  relays `CloseOut` untouched; MOD-135's waiting rows will send the same command.
 - [ ] Whether a withdrawn link (`deleted_at`) may be re-proposed with the same kind (today's PK
   `(from, to, kind)`) and how that meets the single-parent partial unique. TBD — read `propose_link` and
   `withdraw_link` in `/plan` M1.

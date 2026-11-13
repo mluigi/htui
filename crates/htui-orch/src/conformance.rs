@@ -26,8 +26,8 @@ use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
     AgentBox, AgentId, BatchId, Billing, CommandRun, CommandRunStatus, DocumentId, EdgeId,
     EdgeKind, EventKind, Gate, GateOutcome, Isolation, Item, ItemId, ItemPatch, ItemState,
-    NewDocument, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, Run, RunId,
-    RunMode, RunStatus, RunStep, Status, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
+    LinkKind, NewDocument, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, Run,
+    RunId, RunMode, RunStatus, RunStep, Status, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
     StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
@@ -42,6 +42,7 @@ use htui_core::model::{
     MemorySupersede, MemoryUpdate, NewMemoryEntry, ProjectId,
 };
 use htui_core::prompt::DiffBlock;
+use htui_core::store::traits::close_out_needs_a_link;
 use htui_core::store::{
     CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
 };
@@ -841,6 +842,8 @@ pub const CASES: &[&str] = &[
     "close_out_writes_one_summary_and_closes_the_item",
     // Criterion 20: close-out is refused while a run of the item is live, and writes nothing.
     "close_out_is_refused_while_a_run_is_live",
+    // MOD-150 M2 D7 (R-ENT-9): a `duplicate` close-out names its canonical by key, and records it.
+    "close_out_records_the_named_canonical",
     // MOD-40 plan D1, D2: a walk that wakes after another process adopted its run writes nothing
     // to the step.
     "a_suspended_walk_cannot_write_after_adoption",
@@ -1368,6 +1371,9 @@ fn earlier_case<'a, H: CaseHarness>(
         "close_out_is_refused_while_a_run_is_live" => {
             Box::pin(close_out_is_refused_while_a_run_is_live(harness))
         }
+        "close_out_records_the_named_canonical" => {
+            Box::pin(close_out_records_the_named_canonical(harness))
+        }
         "a_suspended_walk_cannot_write_after_adoption" => {
             Box::pin(a_suspended_walk_cannot_write_after_adoption(harness))
         }
@@ -1842,6 +1848,7 @@ async fn a_stopped_run_holds_its_item<H: CaseHarness>(harness: &H) {
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
             resolution: Resolution::Withdrawn,
+            names: None,
         })
         .await
         .expect_err("a live run");
@@ -1908,6 +1915,7 @@ async fn a_rework_run_on_a_finished_item_is_admitted<H: CaseHarness>(harness: &H
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
             resolution: Resolution::Done,
+            names: None,
         })
         .await
         .expect("a finished item closes `done`");
@@ -7372,6 +7380,7 @@ async fn close_out_writes_one_summary_and_closes_the_item<H: CaseHarness>(harnes
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
             resolution: Resolution::Done,
+            names: None,
         })
         .await
         .expect("a done item with no live run");
@@ -7431,6 +7440,7 @@ async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
             resolution: Resolution::Done,
+            names: None,
         })
         .await
         .expect_err("a live run");
@@ -7447,6 +7457,57 @@ async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
     );
     assert!(summaries_of(&orch, ids::HTUI_FEAT_3).await.is_empty());
     assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
+}
+
+/// MOD-150 M2 D7 (R-ENT-9): a `duplicate` close-out with no canonical standing and none named is
+/// refused with nothing written; naming the canonical by its key closes the item and records
+/// `item -duplicates-> canonical`.
+async fn close_out_records_the_named_canonical<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let close = |names: Option<&str>| Command::CloseOut {
+        item: ids::HTUI_ANA_2,
+        resolution: Resolution::Duplicate,
+        names: names.map(str::to_owned),
+    };
+    let refused = orch
+        .dispatch(close(None))
+        .await
+        .expect_err("no canonical stands or is named");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::Store(StoreError::Constraint(why))
+                if *why == close_out_needs_a_link(ids::HTUI_ANA_2, Resolution::Duplicate)
+        ),
+        "{refused}"
+    );
+    assert!(summaries_of(&orch, ids::HTUI_ANA_2).await.is_empty());
+    assert_eq!(item_of(&orch, ids::HTUI_ANA_2).await.status, Status::Open);
+
+    let outcome = orch
+        .dispatch(close(Some("FEAT-1")))
+        .await
+        .expect("`FEAT-1` is an item of `htui`");
+    let CommandOutcome::ClosedOut { item, version, .. } = outcome else {
+        panic!("`CloseOut` answers `ClosedOut`, not {outcome:?}");
+    };
+    assert_eq!((item, version), (ids::HTUI_ANA_2, 1));
+    let canonicals: Vec<(ItemId, ItemId)> = orch
+        .store()
+        .links(ids::HTUI_ANA_2, 1)
+        .await
+        .expect("MemStore never fails a read")
+        .edges
+        .into_iter()
+        .filter(|edge| edge.kind == LinkKind::Duplicates)
+        .map(|edge| (edge.from_item_id, edge.to_item_id))
+        .collect();
+    assert_eq!(canonicals, [(ids::HTUI_ANA_2, ids::HTUI_FEAT_1)]);
+    let row = item_of(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (row.status, row.resolution),
+        (Status::Closed, Some(Resolution::Duplicate))
+    );
 }
 
 // -- MOD-41 T9: the hand-back (plan D12, OQ-1, OQ-6) ---------------------------------------------
@@ -19074,8 +19135,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            264,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 2 + 12 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            265,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 2 + 12 + 3 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -19178,7 +19239,8 @@ mod tests {
              an uncited quote, a person's entry kept, a crash during the capture, and a \
              pre-MOD-164 snapshot), and MOD-164 F1's three (a capture after a walk cut still \
              finishing the run, a sibling ending during a live capture leaving it be, and a live \
-             capture admitting nothing new) 264"
+             capture admitting nothing new) 264, and MOD-150 M2's named canonical recorded at \
+             close-out (D7) 265"
         );
     }
 
