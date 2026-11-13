@@ -28586,9 +28586,19 @@ async fn usage_of<S: ReadStore>(case: &str, store: &S, id: MemoryEntryId) -> Mem
 /// MOD-164 D5: `finish_run` counts, for each step of the run whose prompt record lists an entry,
 /// one showing, and one done or one failed by the step's status. The run's terminal move happens
 /// once, so a second `finish_run` is refused and the counts stay. The entry's version and history
-/// do not move.
+/// do not move, and neither does its `updated_at`: the prompt's memory section and the Settings
+/// list walk entries newest first by `updated_at` (D6), so a tally that moved it would reorder
+/// them on every run end.
 async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
     const CASE: &str = "finish_run_counts_memory_usage_once";
+    let older = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Toolchain",
+        "Pin the toolchain in rust-toolchain.toml.",
+    )
+    .await;
     let entry = memory_create(
         CASE,
         store,
@@ -28599,7 +28609,7 @@ async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
     .await;
     let a = Uuid::now_v7();
     let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
-    let trim = trim_showing(&[shown_row(entry.id)]);
+    let trim = trim_showing(&[shown_row(older.id), shown_row(entry.id)]);
     shown_step(CASE, store, a, run, 1, Some(&trim), Some(StepStatus::Done)).await;
     shown_step(
         CASE,
@@ -28616,6 +28626,13 @@ async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
         MemoryUsage::default(),
         "{CASE}: nothing is counted before the run ends"
     );
+    let walk = |rows: Vec<MemoryEntry>| {
+        rows.into_iter()
+            .filter(|row| row.id == older.id || row.id == entry.id)
+            .map(|row| (row.id, row.updated_at))
+            .collect::<Vec<_>>()
+    };
+    let before = walk(memory_list(CASE, store, ids::PROJECT_HTUI, None).await);
 
     store
         .finish_run(run, RunStatus::Done, None, seam_clock())
@@ -28630,6 +28647,11 @@ async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
         usage_of(CASE, store, entry.id).await,
         tallied,
         "{CASE}: two steps showed it, one done and one failed"
+    );
+    assert_eq!(
+        walk(memory_list(CASE, store, ids::PROJECT_HTUI, None).await),
+        before,
+        "{CASE}: the tally moved no updated_at, so the newest-first order stands"
     );
 
     let again = store

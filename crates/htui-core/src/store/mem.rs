@@ -8171,7 +8171,7 @@ impl State {
         // second sentence: the law already refuses `done -> done`.
         legal_move(from, to)?;
         // MOD-164 D5: the terminal move happens once, so the usage tally does too.
-        self.tally_memory_usage(run, now);
+        self.tally_memory_usage(run);
 
         if let Some(row) = self.runs.get_mut(&run) {
             row.status = to;
@@ -9518,8 +9518,9 @@ impl State {
     /// MOD-164 D5: [`WriteStore::finish_run`]'s usage tally. For every step of `run` whose
     /// `trim_record.memory.shown` is an array, each distinct listed `id` naming an entry (the
     /// text equal to the entry id's, as Postgres compares `id::text`) gains one showing, and one
-    /// done or one failed by the step's status. `updated_at` moves, as Postgres's trigger moves it.
-    fn tally_memory_usage(&mut self, run: RunId, now: DateTime<Utc>) {
+    /// done or one failed by the step's status. `updated_at` stays, as 0031's trigger keeps it in
+    /// Postgres: memory is walked newest first by it (D6), and a count is not an edit.
+    fn tally_memory_usage(&mut self, run: RunId) {
         let mut shown: Vec<(MemoryEntryId, StepStatus)> = Vec::new();
         for step in self.steps.values().filter(|row| row.run_id == run) {
             let Some(rows) = step
@@ -9551,7 +9552,6 @@ impl State {
                 StepStatus::Failed => entry.usage.failed += 1,
                 _ => {}
             }
-            entry.updated_at = now;
         }
     }
 }

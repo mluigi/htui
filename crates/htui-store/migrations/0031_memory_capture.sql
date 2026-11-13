@@ -16,6 +16,11 @@
 -- existing row passes: no writer before 0031 produced -4 or 'capture'. 0022's and 0029's SQL is
 -- not edited; 0031 restates memory_entry's table comment and run_step.node_key's column comment.
 --
+-- The tally is not an edit: trg_memory_entry_updated_at is recreated so an UPDATE that moves only
+-- the three counters leaves updated_at alone. The prompt's memory section and the Settings list walk
+-- entries newest first by updated_at (D6), so a tally that moved it would reorder them on every run
+-- end. Any other UPDATE, a no-op one included, still moves it, as under 0022's trigger.
+--
 -- Not mirrored: memory is not mirrored (MOD-163 D7), the mirror's run_step has no CHECKs, and
 -- 0031 adds no run_step column, so no cache migration. cache_meta.schema_version moves to 31
 -- through PgStore::schema_version(), so each box rebuilds its mirror once on first start; a
@@ -100,3 +105,16 @@ COMMENT ON COLUMN memory_entry.shown_done IS
     'MOD-164 D5: how many of the steps counted in shown_steps ended done.';
 COMMENT ON COLUMN memory_entry.shown_failed IS
     'MOD-164 D5: how many of the steps counted in shown_steps ended failed.';
+
+-- --------------------------------------------------------------------------------------------
+-- 4. memory_entry's updated_at trigger skips a counters-only UPDATE (D5, D6)
+-- --------------------------------------------------------------------------------------------
+
+DROP TRIGGER trg_memory_entry_updated_at ON memory_entry;
+CREATE TRIGGER trg_memory_entry_updated_at BEFORE UPDATE ON memory_entry
+    FOR EACH ROW
+    WHEN ((OLD.shown_steps, OLD.shown_done, OLD.shown_failed)
+              IS NOT DISTINCT FROM (NEW.shown_steps, NEW.shown_done, NEW.shown_failed)
+          OR (to_jsonb(OLD) - ARRAY['shown_steps', 'shown_done', 'shown_failed'])
+              IS DISTINCT FROM (to_jsonb(NEW) - ARRAY['shown_steps', 'shown_done', 'shown_failed']))
+    EXECUTE FUNCTION set_updated_at();
