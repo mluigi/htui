@@ -239,6 +239,13 @@ const TYPED_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
+/// The close-out's naming stage's hint (MOD-150 M2 review L4): [`TYPED_HINT`]'s keys, but the
+/// submit moves on to the typed stage rather than closing.
+const NAMING_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "next"),
+    Hint::Text("Esc cancel"),
+];
+
 /// What the close-out says while its command is in flight.
 const IN_FLIGHT_HINT: HintSpec = &[Hint::Text("closing\u{2026}")];
 
@@ -1378,7 +1385,9 @@ fn close_out_summary(preview: &Preview, names: Option<&str>) -> String {
 const fn naming_question(resolution: Resolution) -> &'static str {
     match resolution {
         Resolution::Superseded => "superseded by which item? type its key:",
-        _ => "duplicate of which item? type its key:",
+        Resolution::Duplicate => "duplicate of which item? type its key:",
+        // Unreachable: only these two reach the naming stage ([`needs_a_name`]).
+        _ => "which item? type its key:",
     }
 }
 
@@ -2499,9 +2508,8 @@ impl RunsTab {
             Mode::ConfirmCancel { .. } => CONFIRM_CANCEL_HINT,
             Mode::CloseOut(CloseOutStage::Counting) => COUNTING_HINT,
             Mode::CloseOut(CloseOutStage::Warn(_)) => WARN_HINT,
-            Mode::CloseOut(CloseOutStage::Naming { .. } | CloseOutStage::Typed { .. }) => {
-                TYPED_HINT
-            }
+            Mode::CloseOut(CloseOutStage::Naming { .. }) => NAMING_HINT,
+            Mode::CloseOut(CloseOutStage::Typed { .. }) => TYPED_HINT,
             Mode::CloseOut(CloseOutStage::InFlight) => IN_FLIGHT_HINT,
         }
     }
@@ -4574,7 +4582,7 @@ mod tests {
                 "close FEAT-1 as duplicate · 1 run · 3 commit rows · summary v2",
                 "duplicate of which item? type its key:",
                 "",
-                "Enter close · Esc cancel",
+                "Enter next · Esc cancel",
             ]
         );
         type_text(&mut pane, &shell, "FIX-17");
@@ -6434,8 +6442,10 @@ mod tests {
         );
     }
 
-    /// MOD-115 M2 RV1 H2: the rejection note, the follow-up and the close-out's typed stage name
-    /// the submit key in force (`Enter` under the compiled keys); `Esc` is written as is (MD7).
+    /// MOD-115 M2 RV1 H2: the rejection note, the follow-up and the close-out's naming and typed
+    /// stages name the submit key in force (`Enter` under the compiled keys); `Esc` is written as
+    /// is (MD7). MOD-150 M2 review L4: the naming stage's submit moves on to the typed stage, so
+    /// its verb is `next`, not `close`.
     #[test]
     fn the_field_hints_name_the_submit_key_in_force() {
         let keys = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
@@ -6443,6 +6453,7 @@ mod tests {
         for (spec, verb) in [
             (REJECT_HINT, "reject"),
             (FOLLOW_UP_HINT, "send"),
+            (NAMING_HINT, "next"),
             (TYPED_HINT, "close"),
         ] {
             assert_eq!(
