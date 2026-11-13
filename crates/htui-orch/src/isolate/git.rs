@@ -20,7 +20,7 @@
 //! refuses locked entries, so the verb's only reachable effect is on worktrees this orchestrator
 //! did not create. A stale entry is reported instead.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1894,6 +1894,67 @@ pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateE
     Ok(Some(id.detach().to_hex().to_string()))
 }
 
+/// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on `base..head` — reachable
+/// from `head` and not from `base` — in name order (MOD-125 M3 D5a).
+///
+/// `reacquire`'s second check: a `shared_serialized` checkout carrying another step's label above
+/// the stopped step's base was walked by that step while this one was stopped. A label at `base`
+/// itself is not on the range, so the previous step's own label never counts. A `gix` read: the
+/// walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
+///
+/// # Errors
+/// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, the walk
+/// cannot read a commit, or a label cannot be read or peeled.
+pub fn labels_between(path: &Path, base: &str, head: &str) -> Result<Vec<String>, IsolateError> {
+    let (hidden, tip) = (parse_oid(base)?, parse_oid(head)?);
+    if hidden == tip {
+        return Ok(Vec::new());
+    }
+    let repo = open(path)?;
+    let fail =
+        |err: &dyn std::fmt::Display| IsolateError::Git(format!("cannot walk from {head}: {err}"));
+    let mut walk = repo.rev_walk([tip]);
+    // A base this repository does not hold is not hidden (`ancestor_walk`'s own check first);
+    // `reacquire` refuses such a row on its first check anyway.
+    if has_commit_in(&repo, base)? {
+        walk = walk.with_hidden([hidden]);
+    }
+    let mut range = BTreeSet::new();
+    for info in walk.all().map_err(|err| fail(&err))? {
+        range.insert(info.map_err(|err| fail(&err))?.id);
+    }
+
+    let refs = repo.references().map_err(|err| {
+        IsolateError::Git(format!("cannot read the refs of {}: {err}", path.display()))
+    })?;
+    let branches = refs.local_branches().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot list the branches of {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut labels = Vec::new();
+    for branch in branches {
+        let mut branch = branch.map_err(|err| {
+            IsolateError::Git(format!("cannot read a branch of {}: {err}", path.display()))
+        })?;
+        let name = branch.name().as_bstr().to_string();
+        let Some(step) = name.strip_prefix("refs/heads/htui/") else {
+            continue;
+        };
+        let step = step.to_owned();
+        let target = branch
+            .peel_to_id()
+            .map_err(|err| IsolateError::Git(format!("cannot peel {name}: {err}")))?
+            .detach();
+        if range.contains(&target) {
+            labels.push(step);
+        }
+    }
+    labels.sort();
+    Ok(labels)
+}
+
 /// One entry of `worktrees()`, flattened so it can outlive the `Repository` that read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
@@ -2873,6 +2934,46 @@ mod tests {
             super::branch_target(dir.path(), "htui/step").expect("the read succeeds"),
             Some(base),
             "and the label did not move"
+        );
+    }
+
+    /// MOD-125 M3 D5a: the `htui/<s>` labels on `base..head` — reachable from `head`, not from
+    /// `base` — by `s`, in name order; a label at `base` itself, one off the line, and a branch
+    /// outside `htui/` are not on it.
+    #[test]
+    fn labels_between_reads_the_htui_labels_on_the_range() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        let middle = commit_file(dir.path(), "g", "second\n", "two");
+        let tip = commit_file(dir.path(), "h", "third\n", "three");
+        for (name, target) in [
+            ("htui/at-base", &base),
+            ("htui/middle", &middle),
+            ("htui/tip", &tip),
+            ("other", &middle),
+            ("htuix", &tip),
+        ] {
+            super::create_branch(dir.path(), name, target).expect("the branch is written");
+        }
+
+        assert_eq!(
+            super::labels_between(dir.path(), &base, &tip).expect("the labels read"),
+            vec!["middle".to_owned(), "tip".to_owned()]
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &middle, &tip).expect("the labels read"),
+            vec!["tip".to_owned()],
+            "a label at the base is not above it"
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &tip, &tip).expect("the labels read"),
+            Vec::<String>::new(),
+            "an empty range holds no label"
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &tip, &middle).expect("the labels read"),
+            Vec::<String>::new(),
+            "a head below the base has nothing above the base"
         );
     }
 

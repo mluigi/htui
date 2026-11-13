@@ -158,6 +158,18 @@ pub fn local_moved(path: &Path, head: &str, base: &str) -> String {
     )
 }
 
+/// MOD-125 M3 D5a: a stopped step's `shared_serialized` checkout was moved by another walk while
+/// it was stopped — its `HEAD` no longer descends from the step's `base_ref`, or another step's
+/// `htui/<step>` label lies on `base_ref..HEAD` — so the resumed step is refused rather than
+/// work on, or reset, someone else's tree.
+#[must_use]
+pub fn moved_while_stopped(path: &Path, head: &str, base: &str) -> String {
+    format!(
+        "moved_while_stopped: {} at {head}, base_ref {base}",
+        path.display()
+    )
+}
+
 /// Plan D138 (review L1): `reset` failed on a later row after these rows were already labelled and
 /// `reset --hard`, as `(repo, path, head, base)`. Appended to that failure, so the sweep's
 /// `never_reset` reason says which trees *were* moved and where their work is.
@@ -530,7 +542,13 @@ impl GixIsolator {
     /// The guards are taken in `RepoId` order, never scope order: two steps whose scopes name the
     /// same repositories in opposite orders would otherwise each hold one and wait on the other.
     async fn acquire(&self, run: RunId, step: StepId, checkouts: &[(RepoId, RepoCheckout)]) {
-        let mut repos: Vec<RepoId> = checkouts.iter().map(|(repo, _)| *repo).collect();
+        self.acquire_repos(run, step, checkouts.iter().map(|(repo, _)| *repo).collect())
+            .await;
+    }
+
+    /// [`acquire`](GixIsolator::acquire) by repository id alone: `reacquire` (MOD-125 M3 D5a)
+    /// holds rows, not checkouts.
+    async fn acquire_repos(&self, run: RunId, step: StepId, mut repos: Vec<RepoId>) {
         repos.sort_unstable();
         repos.dedup();
         for repo in &repos {
@@ -625,6 +643,36 @@ impl GixIsolator {
             self.reconcile_held.load(Ordering::SeqCst),
             self.reconcile_unheld.load(Ordering::SeqCst),
         )
+    }
+
+    /// MOD-125 M3 D5a: each `shared_serialized` row of a stopped step, read under its guard, is
+    /// where the step left it: `HEAD` is `base_ref` or descends from it, and no other step's
+    /// `htui/<s>` label lies on `base_ref..HEAD`; the step's own label may, since it names the
+    /// step's own work. Reads only, through `gix`.
+    async fn refuse_moved(&self, step: StepId, rows: &[&RunStepTree]) -> Result<(), IsolateError> {
+        let own = step.to_string();
+        for tree in rows {
+            let path = PathBuf::from(&tree.path);
+            let read = path.clone();
+            let head = blocking(move || git::head(&read)).await?;
+            let (read, base, tip) = (path.clone(), tree.base_ref.clone(), head.clone());
+            let mut moved = !blocking(move || git::is_ancestor(&read, &base, &tip)).await?;
+            if !moved {
+                let (read, base, tip) = (path.clone(), tree.base_ref.clone(), head.clone());
+                moved = blocking(move || git::labels_between(&read, &base, &tip))
+                    .await?
+                    .iter()
+                    .any(|label| *label != own);
+            }
+            if moved {
+                return Err(IsolateError::Refused(moved_while_stopped(
+                    &path,
+                    &head,
+                    &tree.base_ref,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Drops every guard `step` is holding; a step that holds none is not an error.
@@ -2072,6 +2120,37 @@ impl Isolator for GixIsolator {
             Ok(())
         })
     }
+
+    /// MOD-125 M3 D5a: `prepare_in_place`'s guard for the `shared_serialized` rows, then
+    /// [`refuse_moved`](GixIsolator::refuse_moved) under it. Nothing is reset, created or
+    /// labelled; `local`, `worktree` and `copy` rows are not read. A refusal or a failed read
+    /// releases what the call took, as a refused `prepare` does: the step fails, and its trees'
+    /// rows reach no `capture`.
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        Box::pin(async move {
+            let shared: Vec<&RunStepTree> = trees
+                .iter()
+                .filter(|tree| tree.mode == Isolation::SharedSerialized)
+                .collect();
+            if shared.is_empty() {
+                return Ok(());
+            }
+            // A step reacquired while it still holds its guard must not wait on itself.
+            self.release_step(step);
+            self.acquire_repos(run, step, shared.iter().map(|tree| tree.repo_id).collect())
+                .await;
+            let checked = self.refuse_moved(step, &shared).await;
+            if checked.is_err() {
+                self.release_step(step);
+            }
+            checked
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2091,7 +2170,7 @@ mod tests {
 
     use super::{
         GixIsolator, IsolatorConfig, RepoCheckout, already_reset, label_conflict, local_moved,
-        part_way,
+        moved_while_stopped, part_way,
     };
 
     /// A repository at `<dir>/<name>` with one commit, and the pieces a config map wants.
@@ -5484,6 +5563,313 @@ mod tests {
             worktree_path.join(".git").exists(),
             "the worktree tree is still there"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-125 M3 T3a: `reacquire` (D5a), a stopped step's guard taken back without a reset.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Asserts some step holds `repo`'s D43 guard: a `shared_serialized` prepare of another run
+    /// still waits after 50 ms.
+    async fn assert_held(isolator: &GixIsolator, repo: RepoId, what: &str) {
+        let run = RunId::new();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            isolator.prepare(
+                run,
+                StepId::new(),
+                &[repo],
+                Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await;
+        isolator.release(run).await.expect("release answers");
+        assert!(waited.is_err(), "{what}: the guard is held");
+    }
+
+    /// Asserts nobody holds `repo`'s D43 guard: a `shared_serialized` prepare of another run is
+    /// admitted, and gives the guard straight back.
+    async fn assert_free(isolator: &GixIsolator, repo: RepoId, what: &str) {
+        let run = RunId::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            isolator.prepare(
+                run,
+                StepId::new(),
+                &[repo],
+                Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the guard is free"))
+        .expect("the probing step prepares");
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// D5a: a stopped step at its base takes its guard back with the tree exactly as the stop left
+    /// it — dirt included, nothing reset, nothing labelled — holds it until its own `capture`, and
+    /// a second `reacquire` of the same step does not wait on itself.
+    #[tokio::test]
+    async fn reacquire_at_base_holds_the_guard_until_capture_and_resets_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let rows = rows(&prepared);
+        std::fs::write(core_path.join("f"), "half-done\n").expect("the agent edits f");
+        // `settle_stop`'s release.
+        isolator.release(run).await.expect("release answers");
+        assert_free(&isolator, core, "after the stop").await;
+
+        isolator
+            .reacquire(run, step, &rows)
+            .await
+            .expect("a checkout at its base is reacquired");
+        assert_held(&isolator, core, "after reacquire").await;
+        tokio::time::timeout(Duration::from_secs(5), isolator.reacquire(run, step, &rows))
+            .await
+            .expect("a second reacquire does not wait on its own guard")
+            .expect("and is admitted");
+        assert_held(&isolator, core, "after the second reacquire").await;
+
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("f reads"),
+            "half-done\n",
+            "the stopped step's edit is still there"
+        );
+        assert!(
+            htui_refs(&core_path).is_empty(),
+            "no `htui/` ref was written"
+        );
+
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert_free(&isolator, core, "after capture").await;
+    }
+
+    /// D5a: the step's own commits, and its own `htui/<step>` label among them, are its own work:
+    /// reacquired, guard held, `HEAD` left where the step left it.
+    #[tokio::test]
+    async fn reacquire_admits_the_step_s_own_commits_and_its_own_label() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let rows = rows(&prepared);
+        commit_file(&core_path, "g", "one\n", "the agent's first commit");
+        let own = commit_file(&core_path, "h", "two\n", "the agent's second commit");
+        crate::isolate::git::create_branch(&core_path, &format!("htui/{step}"), &own)
+            .expect("the step's own label");
+        isolator.release(run).await.expect("release answers");
+
+        isolator
+            .reacquire(run, step, &rows)
+            .await
+            .expect("the step's own commits are reacquired");
+        assert_held(&isolator, core, "after reacquire").await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            own,
+            "never reset"
+        );
+
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert_free(&isolator, core, "after capture").await;
+    }
+
+    /// D5a: another step walked the shared checkout while this one was stopped, and its capture
+    /// labelled what it committed. `HEAD` still descends from the base, but the foreign label on
+    /// `base..HEAD` says the work is not this step's: refused with `moved_while_stopped`, every
+    /// guard the call took released, nothing reset.
+    #[tokio::test]
+    async fn reacquire_refuses_a_checkout_a_foreign_label_moved_and_releases() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, base) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let (run, stopped) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(
+                run,
+                stopped,
+                &[core, docs],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the step prepares");
+        let stopped_rows = rows(&prepared);
+        isolator.release(run).await.expect("release answers");
+
+        let other = StepId::new();
+        let walked = isolator
+            .prepare(
+                RunId::new(),
+                other,
+                &[core],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("another step prepares the free checkout");
+        let tip = commit_file(&core_path, "g", "theirs\n", "another step's commit");
+        isolator
+            .capture(other, &rows(&walked))
+            .await
+            .expect("the other step captures and labels its tip");
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{other}"))
+                .expect("the ref store reads"),
+            Some(tip.clone())
+        );
+
+        let err = isolator
+            .reacquire(run, stopped, &stopped_rows)
+            .await
+            .expect_err("a checkout another step moved is refused");
+        let expected = moved_while_stopped(&core_path, &tip, &base);
+        assert!(
+            matches!(&err, crate::isolate::IsolateError::Refused(reason) if *reason == expected),
+            "{err}"
+        );
+        assert_eq!(
+            expected,
+            format!(
+                "moved_while_stopped: {} at {tip}, base_ref {base}",
+                core_path.display()
+            )
+        );
+        assert_free(&isolator, core, "core after the refusal").await;
+        assert_free(&isolator, docs, "docs after the refusal").await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            tip,
+            "the other step's work is not reset"
+        );
+    }
+
+    /// D5a: a `HEAD` that no longer descends from the step's base (another walk reset the
+    /// checkout under it) is refused and released.
+    #[tokio::test]
+    async fn reacquire_refuses_a_head_off_the_base_and_releases() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, first) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let base = commit_file(&core_path, "g", "second\n", "two");
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        assert_eq!(prepared.trees[0].before_hash, base);
+        let rows = rows(&prepared);
+        isolator.release(run).await.expect("release answers");
+        {
+            let repository = gix::open(&core_path).expect("the repository opens");
+            let branch = repository
+                .head_name()
+                .expect("HEAD reads")
+                .expect("HEAD names a branch");
+            let target = gix::ObjectId::from_hex(first.as_bytes()).expect("a hash");
+            repository
+                .reference(
+                    branch,
+                    target,
+                    gix::refs::transaction::PreviousValue::Any,
+                    "test: moved back",
+                )
+                .expect("the branch moves back");
+        }
+
+        let err = isolator
+            .reacquire(run, step, &rows)
+            .await
+            .expect_err("a HEAD below the base is refused");
+        let expected = moved_while_stopped(&core_path, &first, &base);
+        assert!(
+            matches!(&err, crate::isolate::IsolateError::Refused(reason) if *reason == expected),
+            "{err}"
+        );
+        assert_free(&isolator, core, "after the refusal").await;
+    }
+
+    /// D5a: only `shared_serialized` holds a guard, so `local`, `worktree` and `copy` rows answer
+    /// `Ok` and take none — a moved `local` checkout included, and a `worktree`/`copy` path is
+    /// never read.
+    #[tokio::test]
+    async fn reacquire_of_local_worktree_and_copy_rows_takes_no_guard() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::Local, None)
+            .await
+            .expect("the local step prepares");
+        commit_file(&core_path, "g", "moved\n", "the local checkout moved");
+        let mut trees = rows(&prepared);
+        trees.extend([Isolation::Worktree, Isolation::Copy].map(|mode| {
+            RunStepTree {
+                run_step_id: step,
+                repo_id: RepoId::new(),
+                mode,
+                path: dir
+                    .path()
+                    .join("vanished")
+                    .join(format!("{mode:?}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                base_ref: "0".repeat(40),
+                dirty: false,
+            }
+        }));
+
+        isolator
+            .reacquire(run, step, &trees)
+            .await
+            .expect("no guarded row, nothing to refuse");
+        assert_free(&isolator, core, "after reacquire").await;
     }
 
     // ---------------------------------------------------------------------------------------------

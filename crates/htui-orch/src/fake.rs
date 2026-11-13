@@ -190,6 +190,12 @@ pub struct FakeIsolator {
     unmerged_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
     /// 1-based `reset` calls that never return (counted by `resets`), with their signal.
     reset_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+    /// MOD-125 M3 D5a: how many times [`reacquire`](Isolator::reacquire) has been called,
+    /// refusals included.
+    reacquires: Mutex<u32>,
+    /// MOD-125 M3 D5a: scripted [`reacquire`](Isolator::reacquire) refusals, FIFO, one consumed
+    /// per call.
+    reacquire_refusals: Mutex<VecDeque<String>>,
 }
 
 /// One scripted `premerge` answer (by part key, blueprint P-15: part step ids are minted at
@@ -231,6 +237,8 @@ pub enum IsolatorCall {
     Premerge(StepId),
     /// MOD-139 M3: `unmerged`, the post-check of the **integrate** step.
     Unmerged(StepId),
+    /// MOD-125 M3 D5a: `reacquire` of a stopped step's trees.
+    Reacquire(StepId),
 }
 
 /// Which of a step's two isolator windows is open (MOD-138 M3 T3).
@@ -508,6 +516,25 @@ impl FakeIsolator {
             .releases
             .lock()
             .expect("no panic holds the fake isolator's lock")
+    }
+
+    /// MOD-125 M3 D5a: how many times [`reacquire`](Isolator::reacquire) has been called,
+    /// refusals included.
+    #[must_use]
+    pub fn reacquires(&self) -> u32 {
+        *self
+            .reacquires
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+    }
+
+    /// MOD-125 M3 D5a: make the next [`reacquire`](Isolator::reacquire) refuse with `reason` —
+    /// the real isolator's `moved_while_stopped` — holding no guard afterwards.
+    pub fn refuse_reacquire(&self, reason: &str) {
+        self.reacquire_refusals
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(reason.to_owned());
     }
 
     /// Make the `n`-th [`reconcile`](Isolator::reconcile) call (1-based, counting every call this
@@ -1280,6 +1307,53 @@ impl Isolator for FakeIsolator {
             };
             // Dropped outside the `std` lock: dropping a guard wakes a waiter.
             drop(released);
+            Ok(())
+        })
+    }
+
+    /// MOD-125 M3 D5a: logged and counted; a scripted refusal answers with the step holding
+    /// nothing. Otherwise a `shared_serialized` row retakes [`serial`](FakeIsolator::serial) as
+    /// `prepare` does (its own guard dropped first, so a second call never waits on itself), held
+    /// to the step's `capture`, and the step's tree window reopens. Nothing is minted or reset.
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        Box::pin(async move {
+            self.log(IsolatorCall::Reacquire(step));
+            *self
+                .reacquires
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+            let refusal = self
+                .reacquire_refusals
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front();
+            if let Some(reason) = refusal {
+                drop(self.release_step(step));
+                return Err(IsolateError::Refused(reason));
+            }
+            if trees
+                .iter()
+                .any(|tree| tree.mode == Isolation::SharedSerialized)
+            {
+                drop(self.release_step(step));
+                let guard = Arc::clone(&self.serial).lock_owned().await;
+                self.held
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock")
+                    .insert((run, step), guard);
+            }
+            self.open_window(
+                step,
+                Window::Tree,
+                trees.iter().any(|tree| {
+                    matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized)
+                }),
+            );
             Ok(())
         })
     }
@@ -4008,6 +4082,155 @@ mod tests {
             ],
             "each stalled call was logged first"
         );
+    }
+
+    /// Whether a `shared_serialized` prepare of `run` is admitted within `wait` (and its guard
+    /// then given back).
+    async fn fake_isolator_admits(
+        isolator: &FakeIsolator,
+        run: htui_core::model::RunId,
+        wait_ms: u64,
+    ) -> bool {
+        let admitted = tokio::time::timeout(
+            std::time::Duration::from_millis(wait_ms),
+            isolator.prepare(
+                run,
+                StepId::new(),
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .is_ok();
+        isolator.release(run).await.expect("release answers");
+        admitted
+    }
+
+    /// MOD-125 M3 D5a: the fake's `reacquire` logs and counts itself, retakes the serial lock for
+    /// a `shared_serialized` row (without waiting on a guard the step still holds) and keeps it to
+    /// the step's `capture`; rows in no shared mode take nothing.
+    #[tokio::test]
+    async fn fake_isolate_reacquire_retakes_a_shared_guard_until_capture() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(
+                ids::RUN_1,
+                step,
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the step prepares");
+        let rows = prepared
+            .trees
+            .iter()
+            .map(|prepared| prepared.tree.clone())
+            .collect::<Vec<_>>();
+        isolator.release(ids::RUN_1).await.expect("release answers");
+        assert!(fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await);
+
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("the fake reacquires");
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("a second reacquire does not wait on its own guard");
+        assert_eq!(isolator.reacquires(), 2);
+        assert!(
+            !fake_isolator_admits(&isolator, ids::RUN_2, 50).await,
+            "the reacquired guard is held"
+        );
+        let log = isolator.call_log();
+        let reacquires = log
+            .iter()
+            .filter(|call| matches!(call, IsolatorCall::Reacquire(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(reacquires, vec![IsolatorCall::Reacquire(step); 2]);
+        let released = log
+            .iter()
+            .position(|call| *call == IsolatorCall::Release(ids::RUN_1))
+            .expect("the stop's release is logged");
+        let reacquired = log
+            .iter()
+            .position(|call| *call == IsolatorCall::Reacquire(step))
+            .expect("the reacquire is logged");
+        assert!(released < reacquired, "{log:?}");
+
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "capture released the reacquired guard"
+        );
+
+        let local = StepId::new();
+        let local_rows = rows
+            .iter()
+            .map(|row| htui_core::model::RunStepTree {
+                run_step_id: local,
+                mode: Isolation::Local,
+                ..row.clone()
+            })
+            .collect::<Vec<_>>();
+        isolator
+            .reacquire(ids::RUN_1, local, &local_rows)
+            .await
+            .expect("a local row reacquires");
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "a local row takes no guard"
+        );
+    }
+
+    /// MOD-125 M3 D5a: `refuse_reacquire` queues the next `reacquire`'s refusal, which is
+    /// answered verbatim with no guard held afterwards.
+    #[tokio::test]
+    async fn fake_isolate_refuse_reacquire_answers_the_reason_and_holds_nothing() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(
+                ids::RUN_1,
+                step,
+                &repos(),
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the step prepares");
+        let rows = prepared
+            .trees
+            .iter()
+            .map(|prepared| prepared.tree.clone())
+            .collect::<Vec<_>>();
+        let reason = "moved_while_stopped: /x at a, base_ref b";
+        isolator.refuse_reacquire(reason);
+
+        let err = isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect_err("the scripted refusal answers");
+        assert!(
+            matches!(&err, IsolateError::Refused(refused) if refused == reason),
+            "{err}"
+        );
+        assert_eq!(isolator.reacquires(), 1);
+        assert!(
+            fake_isolator_admits(&isolator, ids::RUN_2, 5_000).await,
+            "a refused reacquire holds nothing, the prepare's guard included"
+        );
+        isolator
+            .reacquire(ids::RUN_1, step, &rows)
+            .await
+            .expect("the queue held one refusal");
     }
 
     /// D99 over F-I's re-key: `release(run)` drops the guard a step of that run holds, and only
