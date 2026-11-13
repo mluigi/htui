@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 schemars   = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
+# MOD-152 D8: `command_output_read` matches a `pattern` per line.
+regex      = { workspace = true }
 chrono     = { workspace = true }
 # D3: the token is two `Uuid::new_v4()`. `v4` is declared here only (blueprint H-9); `v7`'s
 # `rng` already compiles the generator.

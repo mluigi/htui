@@ -1553,6 +1553,43 @@ impl From<NewCommandRun> for CommandRun {
     }
 }
 
+/// MOD-152 D2: the most a `command_log` text keeps, counted in bytes: the tail of a command's merged
+/// output, 32 times the row's own 64 KiB tail. A cut log opens with the executor's truncation line
+/// and starts on a line boundary.
+pub const COMMAND_LOG_CAP: usize = 2 * 1024 * 1024;
+
+/// MOD-152 D2: the most [`WriteStore::put_command_log`](crate::store::WriteStore::put_command_log)
+/// accepts, [`COMMAND_LOG_CAP`] plus room for the truncation marker; more is a `Constraint`.
+pub const COMMAND_LOG_STORE_MAX: usize = COMMAND_LOG_CAP + 4096;
+
+/// A row of `command_log` (MOD-152 D1): the scrubbed, size-capped merged output of one
+/// [`CommandRun`], written once by its runner before the row ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandLog {
+    /// `command_log.command_run_id`, the key: one log per row.
+    pub command_run_id: CommandRunId,
+    /// `command_log.text`, already scrubbed (R-ID-7, R-SEC-3) and at most
+    /// [`COMMAND_LOG_STORE_MAX`] bytes; the store neither redacts nor truncates it.
+    pub text: String,
+    /// `command_log.truncated`: the text is a tail, earlier output was dropped.
+    pub truncated: bool,
+    /// `command_log.total_bytes`: the size of the whole output before any cut.
+    pub total_bytes: u64,
+    /// `command_log.written_at`.
+    pub written_at: DateTime<Utc>,
+}
+
+/// What [`WriteStore::command_log_of_run`](crate::store::WriteStore::command_log_of_run) answers:
+/// the `command_run` row and its log, if the runner has written one (a reaped or crashed row has
+/// none, and neither has a row still running).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredCommandLog {
+    /// The row.
+    pub row: CommandRun,
+    /// Its log, if any.
+    pub log: Option<CommandLog>,
+}
+
 /// Step projection carried inside a [`RunSummary`]: what the Runs sub-tab lists per step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStepSummary {

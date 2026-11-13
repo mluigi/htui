@@ -7,7 +7,7 @@
 //! lease unregisters the session's token, so a call that arrives later answers `session ended`
 //! (I-6).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use htui_agent::driver::{
     McpServerSpec, PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule,
@@ -44,8 +44,56 @@ pub struct ToolScope {
     pub command_queue: bool,
     /// The session's working directory: `command_run`'s cwd root (OQ-7).
     pub cwd: PathBuf,
+    /// MOD-152 D11: the session's other trees (`SessionSpec.extra_dirs`): `command_run` and
+    /// `command_start` resolve their `repo` argument against it, by final path component.
+    pub extra_dirs: Vec<PathBuf>,
     /// B-18: the candidate's transport; `Cli` advertises `permission_prompt`.
     pub transport: Transport,
+}
+
+/// Why [`ToolScope::extra_dir`] named no directory (MOD-152 D11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtraDirRefusal {
+    /// No extra directory has this final path component; `available` lists the names there are.
+    Unknown {
+        /// The name asked for.
+        name: String,
+        /// The final path components of the session's `extra_dirs`, in order.
+        available: Vec<String>,
+    },
+    /// Two or more extra directories share this final path component.
+    Ambiguous {
+        /// The name asked for.
+        name: String,
+    },
+}
+
+impl ToolScope {
+    /// MOD-152 D11: the extra directory whose final path component is `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ExtraDirRefusal::Unknown`] when none has that name, [`ExtraDirRefusal::Ambiguous`] when
+    /// more than one does.
+    pub fn extra_dir(&self, name: &str) -> Result<&Path, ExtraDirRefusal> {
+        let named = |dir: &&PathBuf| dir.file_name().is_some_and(|last| last == name);
+        let mut found = self.extra_dirs.iter().filter(named);
+        match (found.next(), found.next()) {
+            (Some(dir), None) => Ok(dir.as_path()),
+            (Some(_), Some(_)) => Err(ExtraDirRefusal::Ambiguous {
+                name: name.to_owned(),
+            }),
+            (None, _) => Err(ExtraDirRefusal::Unknown {
+                name: name.to_owned(),
+                available: self
+                    .extra_dirs
+                    .iter()
+                    .filter_map(|dir| dir.file_name())
+                    .map(|last| last.to_string_lossy().into_owned())
+                    .collect(),
+            }),
+        }
+    }
 }
 
 /// The unregister a [`ToolLease`] runs when it drops.
@@ -89,7 +137,14 @@ impl ToolLease {
 
 /// MOD-11 R1 M2: htui's tools that are never pre-approved. `command_run` runs any command, so under
 /// the default `ask` a human sees it; `permission_prompt` is `claude-cli`'s own permission channel.
-pub const ASKING_TOOLS: [&str; 2] = ["command_run", "permission_prompt"];
+/// MOD-152 D9: `command_start` runs one too and `command_cancel` ends one, so both ask;
+/// `command_wait` and `command_output_read` run nothing and are pre-approved.
+pub const ASKING_TOOLS: [&str; 4] = [
+    "command_run",
+    "command_start",
+    "command_cancel",
+    "permission_prompt",
+];
 
 /// MOD-11 R1 M2: `tool` of the MCP server `server` as an agent calls it — and as both transports
 /// title the call a permission request names: `mcp__<server>__<tool>`.
@@ -184,7 +239,9 @@ mod tests {
     use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
     use htui_agent::permission::evaluate;
 
-    use super::{ToolLease, pre_approve};
+    use std::path::{Path, PathBuf};
+
+    use super::{ASKING_TOOLS, ExtraDirRefusal, ToolLease, ToolScope, pre_approve};
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -252,11 +309,11 @@ mod tests {
         .collect()
     }
 
-    /// MOD-11 R1 M2: one `allow_once` per advertised tool, named as both transports title it,
-    /// appended after every rule the policy already holds; `command_run` and `permission_prompt`
-    /// get none, and neither does a tool the scope does not advertise.
+    /// MOD-11 R1 M2, MOD-152 D9: one `allow_once` per advertised tool, named as both transports
+    /// title it, appended after every rule the policy already holds; the [`ASKING_TOOLS`] get
+    /// none, and neither does a tool the scope does not advertise.
     #[test]
-    fn pre_approve_appends_one_allow_per_advertised_tool_but_the_asking_two() {
+    fn pre_approve_appends_one_allow_per_advertised_tool_but_the_asking_ones() {
         let operator = PermissionRule {
             matcher: PermissionMatch {
                 tool_name: Some("Write".to_owned()),
@@ -273,6 +330,10 @@ mod tests {
             "box_profile",
             "document_write",
             "command_run",
+            "command_start",
+            "command_wait",
+            "command_cancel",
+            "command_output_read",
             "permission_prompt",
         ]);
         pre_approve(&mut policy, &lease);
@@ -297,6 +358,14 @@ mod tests {
                     Some("mcp__htui__document_write"),
                     PermissionOptionKind::AllowOnce
                 ),
+                (
+                    Some("mcp__htui__command_wait"),
+                    PermissionOptionKind::AllowOnce
+                ),
+                (
+                    Some("mcp__htui__command_output_read"),
+                    PermissionOptionKind::AllowOnce
+                ),
             ]
         );
         assert!(
@@ -313,7 +382,13 @@ mod tests {
             answer("mcp__htui__document_write").map(|answer| answer.kind),
             Some(PermissionOptionKind::AllowOnce)
         );
-        assert_eq!(answer("mcp__htui__command_run"), None, "command_run asks");
+        for asking in ASKING_TOOLS {
+            assert_eq!(
+                answer(&format!("mcp__htui__{asking}")),
+                None,
+                "{asking} asks"
+            );
+        }
         assert_eq!(
             answer("mcp__htui__note_add"),
             None,
@@ -323,6 +398,79 @@ mod tests {
             answer("mcp__other__document_write"),
             None,
             "another server's asks"
+        );
+    }
+
+    /// MOD-152 D9: the asking set is exactly the tools that run or stop a command and the CLI's
+    /// own permission channel; the two read-only command tools are pre-approved.
+    #[test]
+    fn the_asking_tools_are_the_command_runners_and_the_permission_channel() {
+        assert_eq!(
+            ASKING_TOOLS,
+            [
+                "command_run",
+                "command_start",
+                "command_cancel",
+                "permission_prompt"
+            ]
+        );
+    }
+
+    fn scope_with(extra_dirs: &[&str]) -> ToolScope {
+        use htui_core::fixtures::ids;
+        use htui_core::model::Transport;
+        use htui_core::prompt::render::HostnameLine;
+        use htui_core::store::StepFence;
+        ToolScope {
+            run_id: ids::RUN_2,
+            step_id: ids::STEP_R2_PRD,
+            project_id: ids::PROJECT_HTUI,
+            item_id: None,
+            box_id: ids::BOX,
+            user: ids::USER,
+            fence: StepFence::Unleased,
+            output_kind: None,
+            hostname: HostnameLine::Omitted,
+            command_queue: true,
+            cwd: PathBuf::from("/work/main"),
+            extra_dirs: extra_dirs.iter().map(PathBuf::from).collect(),
+            transport: Transport::Acp,
+        }
+    }
+
+    /// MOD-152 D11: a repo name is the directory's final path component.
+    #[test]
+    fn extra_dir_resolves_by_the_final_path_component() {
+        let scope = scope_with(&["/work/docs", "/srv/other/api"]);
+        assert_eq!(scope.extra_dir("api"), Ok(Path::new("/srv/other/api")));
+        assert_eq!(scope.extra_dir("docs"), Ok(Path::new("/work/docs")));
+    }
+
+    /// MOD-152 D11: an unknown name lists the names there are; two directories with one name are
+    /// refused rather than guessed.
+    #[test]
+    fn extra_dir_refuses_unknown_and_ambiguous_names() {
+        let scope = scope_with(&["/work/docs", "/srv/a/api", "/srv/b/api"]);
+        assert_eq!(
+            scope.extra_dir("nope"),
+            Err(ExtraDirRefusal::Unknown {
+                name: "nope".to_owned(),
+                available: vec!["docs".to_owned(), "api".to_owned(), "api".to_owned()],
+            })
+        );
+        assert_eq!(
+            scope.extra_dir("api"),
+            Err(ExtraDirRefusal::Ambiguous {
+                name: "api".to_owned()
+            })
+        );
+        assert_eq!(scope.extra_dir("docs"), Ok(Path::new("/work/docs")));
+        assert_eq!(
+            scope_with(&[]).extra_dir("docs"),
+            Err(ExtraDirRefusal::Unknown {
+                name: "docs".to_owned(),
+                available: Vec::new(),
+            })
         );
     }
 

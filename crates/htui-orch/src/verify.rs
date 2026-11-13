@@ -413,8 +413,8 @@ impl ShellVerifier {
         let stderr = child.child.stderr().take();
         let run = async {
             tokio::join!(
-                drain_counting(stdout, &captured, &printed),
-                drain_counting(stderr, &captured, &printed),
+                drain_counting(stdout, &captured, &printed, &|_| {}),
+                drain_counting(stderr, &captured, &printed, &|_| {}),
                 async { child.child.wait().await }
             )
             .2
@@ -560,6 +560,20 @@ pub async fn run_shell(
     budget: Duration,
     stop: impl Future<Output = ()> + Send,
 ) -> ShellRun {
+    run_shell_with(command, cwd, budget, stop, &|_| {}).await
+}
+
+/// [`run_shell`] with a streaming `sink` (MOD-152 D6): every chunk either pipe yields is handed
+/// to `sink`, in arrival order, after it is pushed to the tail buffer and outside its lock, so a
+/// caller sees all the output while [`ShellRun::output`] still holds only the last
+/// [`CAPTURE_TAIL`] bytes. The sink is synchronous and must not block: it runs on the drain.
+pub async fn run_shell_with(
+    command: &str,
+    cwd: &Path,
+    budget: Duration,
+    stop: impl Future<Output = ()> + Send,
+    sink: &(dyn Fn(&[u8]) + Send + Sync),
+) -> ShellRun {
     let shell = Path::new(SHELL.0);
     let build = || {
         let mut child = tokio::process::Command::new(shell);
@@ -606,8 +620,8 @@ pub async fn run_shell(
         let run = async {
             let mut drains = std::pin::pin!(async {
                 tokio::join!(
-                    drain_counting(stdout, &captured, &printed),
-                    drain_counting(stderr, &captured, &printed),
+                    drain_counting(stdout, &captured, &printed, sink),
+                    drain_counting(stderr, &captured, &printed, sink),
                 );
             });
             let mut drained = false;
@@ -700,6 +714,7 @@ async fn drain_counting(
     reader: Option<impl tokio::io::AsyncRead + Unpin>,
     captured: &Mutex<TailBuffer>,
     printed: &AtomicUsize,
+    sink: &(dyn Fn(&[u8]) + Send + Sync),
 ) {
     let Some(mut reader) = reader else {
         return;
@@ -714,6 +729,7 @@ async fn drain_counting(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(&chunk[..read]);
+                sink(&chunk[..read]);
             }
         }
     }
@@ -765,7 +781,7 @@ fn spawn_supervised(
 mod shell_tests {
     use std::time::Duration;
 
-    use super::{ShellEnd, run_shell};
+    use super::{ShellEnd, run_shell, run_shell_with};
     use crate::isolate::git::CAPTURE_TAIL;
 
     /// A `stop` that never fires.
@@ -857,6 +873,53 @@ mod shell_tests {
             ran.output
         );
         assert!(!ran.truncated);
+    }
+
+    /// MOD-152 D6: the sink sees every byte, past the tail cap, while `output` keeps the tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_with_streams_every_byte_to_the_sink() {
+        let seen = std::sync::Mutex::new(Vec::<u8>::new());
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell_with(
+            "head -c 100000 /dev/zero | tr '\\0' a; echo; echo the-end",
+            dir.path(),
+            Duration::from_secs(30),
+            never(),
+            &|chunk| seen.lock().expect("sink lock").extend_from_slice(chunk),
+        )
+        .await;
+        assert_eq!(ran.exit_code, Some(0));
+        let seen = seen.into_inner().expect("sink lock");
+        assert_eq!(seen.len(), 100_000 + "\nthe-end\n".len());
+        assert!(seen.len() > CAPTURE_TAIL);
+        assert!(seen.ends_with(b"the-end\n"));
+        assert_eq!(
+            ran.output.len(),
+            CAPTURE_TAIL,
+            "the row keeps only the tail"
+        );
+        assert!(ran.truncated);
+    }
+
+    /// MOD-152 D6: the sink is fed by stdout and by stderr.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_with_streams_stdout_and_stderr() {
+        let seen = std::sync::Mutex::new(Vec::<u8>::new());
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell_with(
+            "echo out; echo err >&2",
+            dir.path(),
+            Duration::from_secs(30),
+            never(),
+            &|chunk| seen.lock().expect("sink lock").extend_from_slice(chunk),
+        )
+        .await;
+        assert_eq!(ran.exit_code, Some(0));
+        let seen = String::from_utf8(seen.into_inner().expect("sink lock")).expect("utf-8");
+        assert!(seen.contains("out\n"), "{seen:?}");
+        assert!(seen.contains("err\n"), "{seen:?}");
     }
 
     /// MOD-11 OQ-7: the last 64 KiB are kept, and `truncated` says something was dropped.

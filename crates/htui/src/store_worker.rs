@@ -7194,6 +7194,7 @@ mod tests {
             hostname: htui_core::prompt::render::HostnameLine::Omitted,
             command_queue: false,
             cwd: std::env::temp_dir(),
+            extra_dirs: Vec::new(),
             transport: htui_core::model::Transport::Acp,
         }
     }

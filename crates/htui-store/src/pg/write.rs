@@ -50,6 +50,7 @@ use htui_core::model::{
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
     canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
+use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
 use htui_core::prompt::DEFAULT_TEMPLATES;
@@ -59,9 +60,9 @@ use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, batch_is_closed,
-    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
-    link_key, link_not_proposed_by_run, link_outside_reach, memory_entry_closed,
-    memory_subject_taken, note_needs_a_step, parent_cycle, parent_too_deep,
+    command_finish_status, command_log_too_large, command_not_claimable, command_not_queued,
+    document_needs_a_step, link_key, link_not_proposed_by_run, link_outside_reach,
+    memory_entry_closed, memory_subject_taken, note_needs_a_step, parent_cycle, parent_too_deep,
     project_settings_not_an_object, reaped_note, run_workspace_for, scope_row_run_workspace,
     second_canonical, second_parent, self_link, step_document_refusal, step_note_refusal,
     step_writes_own_item, workspace_prefix_taken,
@@ -10271,6 +10272,121 @@ impl WriteStore for PgStore {
                 id: id.to_string(),
             })?;
         Ok(false)
+    }
+
+    /// MOD-152 D5: the log upserted by its row id; the text is refused over
+    /// [`COMMAND_LOG_STORE_MAX`] before any write, and an unknown row is `NotFound` (the
+    /// `INSERT ... SELECT` from `command_run` writes no row for it).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound { entity: "command_run" }`; `Constraint(command_log_too_large)`.
+    async fn put_command_log(&self, log: CommandLog) -> Result<()> {
+        if log.text.len() > COMMAND_LOG_STORE_MAX {
+            return Err(StoreError::Constraint(command_log_too_large(
+                log.text.len(),
+            )));
+        }
+        let total_bytes = i64::try_from(log.total_bytes).unwrap_or(i64::MAX);
+        let done = sqlx::query!(
+            "INSERT INTO command_log (command_run_id, text, truncated, total_bytes, written_at) \
+             SELECT id, $2, $3, $4, $5 FROM command_run WHERE id = $1 \
+             ON CONFLICT (command_run_id) DO UPDATE \
+                SET text = EXCLUDED.text, truncated = EXCLUDED.truncated, \
+                    total_bytes = EXCLUDED.total_bytes, written_at = EXCLUDED.written_at",
+            log.command_run_id.as_uuid(),
+            log.text,
+            log.truncated,
+            total_bytes,
+            log.written_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if done.rows_affected() == 1 {
+            return Ok(());
+        }
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: log.command_run_id.to_string(),
+        })
+    }
+
+    /// MOD-152 D5: a row of `run` (through `run_step.run_id`) and its log. `id: None` is the latest
+    /// by `(queued_at, id)`, the order `command_runs` reads in.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT c.id          AS "id: CommandRunId",
+                   c.run_step_id AS "run_step_id: StepId",
+                   c.box_id      AS "box_id: BoxId",
+                   c.class,
+                   c.command,
+                   c.cwd,
+                   c.status      AS "status: CommandRunStatus",
+                   c.exit_code,
+                   c.output,
+                   c.queued_at,
+                   c.started_at,
+                   c.finished_at,
+                   l.text        AS "log_text?",
+                   l.truncated   AS "log_truncated?",
+                   l.total_bytes AS "log_total_bytes?",
+                   l.written_at  AS "log_written_at?"
+              FROM command_run c
+              JOIN run_step s ON s.id = c.run_step_id
+              LEFT JOIN command_log l ON l.command_run_id = c.id
+             WHERE s.run_id = $1 AND ($2::uuid IS NULL OR c.id = $2)
+             ORDER BY c.queued_at DESC, c.id DESC
+             LIMIT 1
+            "#,
+            run.as_uuid(),
+            id.map(CommandRunId::as_uuid),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|row| StoredCommandLog {
+            log: match (
+                row.log_text,
+                row.log_truncated,
+                row.log_total_bytes,
+                row.log_written_at,
+            ) {
+                (Some(text), Some(truncated), Some(total_bytes), Some(written_at)) => {
+                    Some(CommandLog {
+                        command_run_id: row.id,
+                        text,
+                        truncated,
+                        total_bytes: u64::try_from(total_bytes).unwrap_or(0),
+                        written_at,
+                    })
+                }
+                _ => None,
+            },
+            row: CommandRun {
+                id: row.id,
+                run_step_id: row.run_step_id,
+                box_id: row.box_id,
+                class: row.class,
+                command: row.command,
+                cwd: row.cwd,
+                status: row.status,
+                exit_code: row.exit_code,
+                output: row.output,
+                queued_at: row.queued_at,
+                started_at: row.started_at,
+                finished_at: row.finished_at,
+            },
+        }))
     }
 
     async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {

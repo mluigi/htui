@@ -59,15 +59,16 @@ use htui_store::testkit as common;
 /// and MOD-150 M1's seven link-kind cases (plan D2-D7) make it 284,
 /// and MOD-125 M2's three `pending_stops` cases (plan D1), its M-3 case (plan D9) and its L-3 case
 /// (plan D10) make it 289,
-/// and MOD-125 M2 R1's cancel-and-stop case (review M-1) makes it 290.
-const EXPECTED_CASES: usize = 290;
+/// and MOD-125 M2 R1's cancel-and-stop case (review M-1) makes it 290,
+/// and MOD-152 T1's three command-log cases (plan D1, D5) make it 293.
+const EXPECTED_CASES: usize = 293;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (290 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (293 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -80,7 +81,7 @@ fn case_list_matches_mem_store() {
          MOD-147 M2's seven key, reach, prefix, graph, run-workspace and upstream cases, and \
          MOD-139 M1's nine divided fan-out record cases and its F1 cross-run parent case, and \
          MOD-139 M2's nine admission, abandonment and part-input cases, and MOD-141 M2's \
-         three judge and deadline cases, and MOD-150 M1's seven link-kind cases, and MOD-125 M2's three `pending_stops` cases, its M-3 case and its L-3 case and its R1 cancel-and-stop case)"
+         three judge and deadline cases, and MOD-150 M1's seven link-kind cases, and MOD-125 M2's three `pending_stops` cases, its M-3 case and its L-3 case and its R1 cancel-and-stop case, and MOD-152 T1's three command-log cases)"
     );
 }
 

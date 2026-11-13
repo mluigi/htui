@@ -3164,6 +3164,7 @@ dependencies = [
  "htui-orch",
  "htui-store",
  "insta",
+ "regex",
  "schemars 1.2.2",
  "serde",
  "serde_json",

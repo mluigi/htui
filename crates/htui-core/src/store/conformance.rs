@@ -42,6 +42,7 @@ use crate::model::{
     WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
 use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     PredicateError, SkillBinding, Split, StepGraphEdge,
@@ -250,6 +251,9 @@ pub const CASES: &[&str] = &[
     "claim_command_admits_up_to_the_limit_in_queue_order",
     "beat_and_finish_need_the_claimant",
     "cancel_command_ends_a_queued_or_running_row",
+    "put_command_log_upserts_by_row",
+    "command_log_of_run_reads_the_callers_runs_rows",
+    "command_log_goes_with_its_step",
     "waiting_candidates_hold_every_park_and_nothing_else",
     "open_permissions_list_live_pending_item_requests",
     "a_follow_up_is_refused_in_the_documented_order",
@@ -844,6 +848,15 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "cancel_command_ends_a_queued_or_running_row" => {
             Box::pin(cancel_command_ends_a_queued_or_running_row(store)).await;
+        }
+        "put_command_log_upserts_by_row" => {
+            Box::pin(put_command_log_upserts_by_row(store)).await;
+        }
+        "command_log_of_run_reads_the_callers_runs_rows" => {
+            Box::pin(command_log_of_run_reads_the_callers_runs_rows(store)).await;
+        }
+        "command_log_goes_with_its_step" => {
+            Box::pin(command_log_goes_with_its_step(store)).await;
         }
         "waiting_candidates_hold_every_park_and_nothing_else" => {
             Box::pin(waiting_candidates_hold_every_park_and_nothing_else(store)).await;
@@ -22511,6 +22524,197 @@ async fn cancel_command_ends_a_queued_or_running_row<S: WriteStore>(store: &S) {
             id: unknown_id.to_string(),
         }),
         "{CASE}: an unknown row is NotFound"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-152 T1 (plan D1, D5): the command log. One scrubbed text per `command_run` row, written by
+// the runner before the row ends, read back by the owning run's later steps.
+// ------------------------------------------------------------------------------------------
+
+/// A [`CommandLog`] for `id` with `text`, written at `at`.
+fn command_log(id: CommandRunId, text: &str, at: DateTime<Utc>) -> CommandLog {
+    CommandLog {
+        command_run_id: id,
+        text: text.to_owned(),
+        truncated: false,
+        total_bytes: text.len() as u64,
+        written_at: at,
+    }
+}
+
+/// MOD-152 D5: [`WriteStore::put_command_log`] upserts by row id (the second write replaces the
+/// first, every column), accepts a text of exactly [`COMMAND_LOG_STORE_MAX`] bytes, refuses one
+/// byte more as `Constraint` and writes nothing, and names an unknown row `NotFound`.
+async fn put_command_log_upserts_by_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "put_command_log_upserts_by_row";
+    let t0 = seam_clock();
+    let row = queued_command("build", t0);
+    store.enqueue_command(row.clone()).await.expect(CASE);
+
+    let first = command_log(row.id, "first\n", t0);
+    store.put_command_log(first.clone()).await.expect(CASE);
+    let stored = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(stored.log, Some(first), "{CASE}: the log reads back");
+
+    let second = CommandLog {
+        command_run_id: row.id,
+        text: "second\n".to_owned(),
+        truncated: true,
+        total_bytes: 9_999_999_999,
+        written_at: t0 + TimeDelta::seconds(5),
+    };
+    store.put_command_log(second.clone()).await.expect(CASE);
+    let replaced = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        replaced.log,
+        Some(second.clone()),
+        "{CASE}: a second write replaces the first, every column"
+    );
+
+    let max = command_log(row.id, &"x".repeat(COMMAND_LOG_STORE_MAX), t0);
+    store.put_command_log(max.clone()).await.expect(CASE);
+    let over = command_log(row.id, &"x".repeat(COMMAND_LOG_STORE_MAX + 1), t0);
+    assert!(
+        matches!(
+            store.put_command_log(over).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: one byte over the store's maximum is a Constraint"
+    );
+    let kept = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(kept.log, Some(max), "{CASE}: and the refusal wrote nothing");
+
+    let unknown = CommandRunId::new();
+    assert_eq!(
+        store.put_command_log(command_log(unknown, "x", t0)).await,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
+    );
+}
+
+/// MOD-152 D5: [`WriteStore::command_log_of_run`] answers a row of the run with its log (or none
+/// yet); `id: None` is the run's latest row by `queued_at` across its steps; a row of another run,
+/// an unknown row and a run with no command row answer `None`.
+async fn command_log_of_run_reads_the_callers_runs_rows<S: WriteStore>(store: &S) {
+    const CASE: &str = "command_log_of_run_reads_the_callers_runs_rows";
+    let t0 = seam_clock();
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, None)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a run with no command row answers None"
+    );
+
+    let older = queued_command("build", t0);
+    let newer = queued_command("test", t0 + TimeDelta::seconds(10));
+    let foreign = NewCommandRun {
+        run_step_id: ids::STEP_R3_RESEARCH_A,
+        ..queued_command("build", t0 + TimeDelta::seconds(20))
+    };
+    for new in [&older, &newer, &foreign] {
+        store.enqueue_command((*new).clone()).await.expect(CASE);
+    }
+    let log = command_log(older.id, "older\n", t0);
+    store.put_command_log(log.clone()).await.expect(CASE);
+
+    let by_id = store
+        .command_log_of_run(ids::RUN_2, Some(older.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        (by_id.row.id, by_id.log),
+        (older.id, Some(log)),
+        "{CASE}: a row of the run reads with its log"
+    );
+    let latest = store
+        .command_log_of_run(ids::RUN_2, None)
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        (latest.row.id, latest.log),
+        (newer.id, None),
+        "{CASE}: id None is the latest row of the run by queued_at, and it has no log yet"
+    );
+    assert_eq!(
+        latest.row,
+        command_row(CASE, store, newer.id).await,
+        "{CASE}: the row is the stored row"
+    );
+
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(foreign.id))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a row of another run answers None"
+    );
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(CommandRunId::new()))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: an unknown row answers None"
+    );
+    let other = store
+        .command_log_of_run(ids::RUN_3, None)
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        other.row.id, foreign.id,
+        "{CASE}: the other run's latest row is its own"
+    );
+}
+
+/// MOD-152 D1: a log goes with its row (`ON DELETE CASCADE`): deleting the project that owns the
+/// step succeeds with a log in place, and the log is no longer readable.
+async fn command_log_goes_with_its_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "command_log_goes_with_its_step";
+    let t0 = seam_clock();
+    let row = queued_command("build", t0);
+    store.enqueue_command(row.clone()).await.expect(CASE);
+    store
+        .put_command_log(command_log(row.id, "gone\n", t0))
+        .await
+        .expect(CASE);
+    store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(row.id))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: the row and its log are gone"
+    );
+    let reborn = CommandRunId::new();
+    assert!(
+        matches!(
+            store.put_command_log(command_log(reborn, "x", t0)).await,
+            Err(StoreError::NotFound { .. })
+        ),
+        "{CASE}: nothing is left to write to"
     );
 }
 

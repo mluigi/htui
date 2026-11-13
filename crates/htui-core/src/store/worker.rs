@@ -32,15 +32,16 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::model::StoredCommandLog;
 use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
-    DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
-    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep, Note,
-    OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
-    PhaseId, PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch,
-    QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    CancelRequest, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus, Document,
+    DocumentHead, DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary,
+    MemoryEntry, MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep,
+    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus,
+    PhaseAgent, PhaseId, PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate,
+    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
     ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan,
     RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
     Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
@@ -517,6 +518,14 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::cancel_command`].
     fn cancel_command(&self, id: CommandRunId) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::put_command_log`].
+    fn put_command_log(&self, log: CommandLog) -> impl Future<Output = Result<()>> + Send;
+    /// [`WriteStore::command_log_of_run`].
+    fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> impl Future<Output = Result<Option<StoredCommandLog>>> + Send;
 
     /// MOD-12 M2 D5: the batch `run` was admitted under and that batch's spend
     /// (`MemStore::run_batch_spend`); `None` for a manual or chat run. A `WorkerStore` read because
@@ -1057,6 +1066,16 @@ impl WorkerStore for MemStore {
     }
     async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
+    }
+    async fn put_command_log(&self, log: CommandLog) -> Result<()> {
+        WriteStore::put_command_log(self, log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>> {
+        WriteStore::command_log_of_run(self, run, id).await
     }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         MemStore::run_batch_spend(self, run).await

@@ -54,6 +54,7 @@ use crate::model::{
     WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
     moved_order, overlaps, prompt_summary, scope_of,
 };
+use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
@@ -69,6 +70,7 @@ use crate::store::graph_rules::{
     graph_usable_by, phase_row_refusal,
 };
 use crate::store::traits::cancel_of_a_stopped_run;
+use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
@@ -328,6 +330,9 @@ struct State {
     /// filter-and-sort [`State::command_runs`] does is cheaper than a compound key that would have
     /// to be maintained. No fixture loads it — MOD-4 milestone 3 is its first writer anywhere.
     command_runs: BTreeMap<CommandRunId, CommandRun>,
+    /// `command_log` (MOD-152 D1), keyed by its row's id; it goes with the row, as
+    /// `ON DELETE CASCADE` takes it on Postgres.
+    command_logs: BTreeMap<CommandRunId, CommandLog>,
     /// The liveness of every `running` `command_run` row a claim admitted (MOD-11 D14, B-16), by
     /// row id; a row leaves the map when it finishes, is cancelled or is reaped.
     command_claims: HashMap<CommandRunId, CommandClaim>,
@@ -467,6 +472,7 @@ impl MemStore {
             step_trees: BTreeMap::new(),
             step_commits: BTreeMap::new(),
             command_runs: BTreeMap::new(),
+            command_logs: BTreeMap::new(),
             command_claims: HashMap::new(),
             lease_owners: HashMap::new(),
             openings: HashMap::new(),
@@ -5972,6 +5978,8 @@ impl State {
         self.command_runs
             .retain(|_, row| !gone.steps.contains(&row.run_step_id));
         let command_runs = &self.command_runs;
+        self.command_logs
+            .retain(|id, _| command_runs.contains_key(id));
         self.command_claims
             .retain(|id, _| command_runs.contains_key(id));
         self.steps.retain(|id, _| !gone.steps.contains(id));
@@ -7870,6 +7878,43 @@ impl State {
             row.finished_at = Some(now);
         }
         Ok(true)
+    }
+
+    /// MOD-152 D5: [`WriteStore::put_command_log`]'s act: upsert by row id, the row must exist.
+    fn put_command_log(&mut self, log: CommandLog) -> Result<()> {
+        if log.text.len() > COMMAND_LOG_STORE_MAX {
+            return Err(StoreError::Constraint(command_log_too_large(
+                log.text.len(),
+            )));
+        }
+        self.require_command_run(log.command_run_id)?;
+        self.command_logs.insert(log.command_run_id, log);
+        Ok(())
+    }
+
+    /// MOD-152 D5: [`WriteStore::command_log_of_run`]'s read: a row of any step of `run`.
+    fn command_log_of_run(&self, run: RunId, id: Option<CommandRunId>) -> Option<StoredCommandLog> {
+        let of_run = |row: &&CommandRun| {
+            self.steps
+                .get(&row.run_step_id)
+                .is_some_and(|step| step.run_id == run)
+        };
+        let row = match id {
+            Some(id) => self.command_runs.get(&id).filter(of_run),
+            None => self
+                .command_runs
+                .values()
+                .filter(of_run)
+                .max_by(|left, right| {
+                    left.queued_at
+                        .cmp(&right.queued_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                }),
+        }?;
+        Some(StoredCommandLog {
+            row: row.clone(),
+            log: self.command_logs.get(&row.id).cloned(),
+        })
     }
 
     /// A step's `command_run` rows in `(queued_at, id)` order; an unknown step reads empty.
@@ -11122,6 +11167,16 @@ impl WriteStore for MemStore {
     async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
         let now = self.now();
         self.write(|state| state.cancel_command(id, now))
+    }
+    async fn put_command_log(&self, log: CommandLog) -> Result<()> {
+        self.write(|state| state.put_command_log(log))
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>> {
+        Ok(self.read(|state| state.command_log_of_run(run, id)))
     }
 
     // ---- ANA-11 §5.1 (MOD-38): requirements and citations, one `write` closure each ----

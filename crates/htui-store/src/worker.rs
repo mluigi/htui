@@ -450,6 +450,16 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        WriteStore::put_command_log(self, log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        WriteStore::command_log_of_run(self, run, id).await
+    }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         PgStore::run_batch_spend(self, run).await
     }
@@ -872,6 +882,16 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
+    }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        WriteStore::put_command_log(self, log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        WriteStore::command_log_of_run(self, run, id).await
     }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         match self {

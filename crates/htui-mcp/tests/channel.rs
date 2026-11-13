@@ -41,6 +41,7 @@ fn scope(transport: Transport) -> ToolScope {
         hostname: HostnameLine::Omitted,
         command_queue: false,
         cwd: std::env::temp_dir(),
+        extra_dirs: Vec::new(),
         transport,
     }
 }

@@ -1501,6 +1501,22 @@ impl WriteStore for Writer {
             Self::Online(pg) => pg.cancel_command(id).await,
         }
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.put_command_log(log).await,
+            Self::Online(pg) => pg.put_command_log(log).await,
+        }
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        match self {
+            Self::Memory(store) => store.command_log_of_run(run, id).await,
+            Self::Online(pg) => pg.command_log_of_run(run, id).await,
+        }
+    }
 
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
 
