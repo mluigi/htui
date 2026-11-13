@@ -1081,7 +1081,7 @@ impl MemoryPane {
                     // A replace met another holder: the question names that one now.
                     Mode::Body(editor) | Mode::Clash { editor, .. } => {
                         self.mode = Mode::Clash {
-                            existing: Box::new(existing.clone()),
+                            existing: existing.clone(),
                             editor,
                         };
                         self.notice = None;

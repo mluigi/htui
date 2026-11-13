@@ -513,7 +513,7 @@ async fn a_stale_reply_keeps_the_text_and_moves_the_token() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head,
+            head: Box::new(head),
             entries: fresh,
         },
     );
@@ -581,7 +581,7 @@ async fn clashed() -> (SectionBench, HierarchySection) {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: live()[0].clone(),
+            existing: Box::new(live()[0].clone()),
         },
     );
     (bench, section)
@@ -666,7 +666,7 @@ async fn an_amend_clash_offers_only_edit() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: live()[0].clone(),
+            existing: Box::new(live()[0].clone()),
         },
     );
 
@@ -765,7 +765,7 @@ async fn a_reply_for_another_project_is_ignored() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: other,
-            existing: live()[1].clone(),
+            existing: Box::new(live()[1].clone()),
         },
     );
 
@@ -876,7 +876,7 @@ async fn a_clash_whose_holder_was_renamed_frees_the_subject() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head,
+            head: Box::new(head),
             entries: fresh,
         },
     );
@@ -915,7 +915,7 @@ async fn a_second_clash_names_the_new_holder() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: holder.clone(),
+            existing: Box::new(holder.clone()),
         },
     );
 
@@ -947,7 +947,7 @@ async fn a_stale_retire_follows_its_entry_to_its_new_row() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head: head.clone(),
+            head: Box::new(head.clone()),
             entries: fresh,
         },
     );
@@ -1190,7 +1190,7 @@ async fn a_stale_reply_whose_head_closed_returns_to_browse() {
             &mut section,
             &StoreReply::MemoryStale {
                 project: ids::PROJECT_VULKAN,
-                head,
+                head: Box::new(head),
                 entries: live()[1..].to_vec(),
             },
         );
