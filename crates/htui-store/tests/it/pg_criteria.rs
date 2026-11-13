@@ -12079,6 +12079,181 @@ async fn concurrent_identical_duplicates_all_land_one_row() {
     db.drop_db().await;
 }
 
+/// MOD-150 M2 D4: a close-out naming `x`'s canonical `b` races an agent's `x duplicates c`. Both
+/// take the per-item advisory lock, so exactly one canonical lands live and the loser answers
+/// `second_canonical` naming it, never 23505 from `uq_item_link_one_canonical` and never a
+/// deadlock between the close-out's item row lock and the proposal's foreign-key lock on it. A
+/// close-out that lost leaves `x` open. Fifty rounds, each on three fresh items and a cancelled
+/// run of `x` (its step still proposes under the unleased fence), the pair released together by
+/// a barrier. Started at once the close-out nearly always takes the lock first, so it starts up
+/// to 0.9 ms late, the lag cycling with the round, and the proposal wins rounds too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_out_naming_a_canonical_races_an_agent_proposal() {
+    use htui_core::model::link::ProposeLink;
+    use htui_core::model::{LinkKind, Resolution};
+    use htui_core::store::second_canonical;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+    let mut wins = [0_u32; 2];
+
+    for round in 0_u64..50 {
+        let mut minted = Vec::new();
+        for name in ["x", "b", "c"] {
+            minted.push(
+                db.store
+                    .mint_item(race_item(
+                        ids::KIND_HTUI_FEAT,
+                        &format!("round {round} {name}"),
+                    ))
+                    .await
+                    .expect("mint a race item")
+                    .id,
+            );
+        }
+        let [x, b, c] = minted[..] else {
+            unreachable!("three items")
+        };
+        let run = db
+            .store
+            .create_run(race_run(x))
+            .await
+            .expect("queue a graph run")
+            .id;
+        let step = db
+            .store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
+            })
+            .await
+            .expect("create the round's step")
+            .id;
+        db.store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("cancel the run, so it refuses no close-out");
+        let summary = htui_core::model::NewDocument {
+            id: htui_core::model::DocumentId::new(),
+            item_id: x,
+            kind: "summary".to_owned(),
+            title: format!("round {round} summary"),
+            body: String::new(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        };
+
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let lag = std::time::Duration::from_micros(round % 10 * 100);
+        let close = {
+            let (pool, start) = (pools[0].clone(), std::sync::Arc::clone(&start));
+            tokio::spawn(async move {
+                start.wait().await;
+                // A spin, not `tokio::time::sleep`: the timer's millisecond grain overshoots.
+                let until = std::time::Instant::now() + lag;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                pool.close_out(x, Resolution::Duplicate, Some(b), summary, &[])
+                    .await
+                    .map(|_| ())
+            })
+        };
+        let propose = {
+            let (pool, start) = (pools[1].clone(), std::sync::Arc::clone(&start));
+            tokio::spawn(async move {
+                start.wait().await;
+                pool.propose_link(
+                    StepFence::Unleased,
+                    ProposeLink {
+                        from: x,
+                        to: c,
+                        kind: LinkKind::Duplicates,
+                        step,
+                    },
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        let closed = close.await.expect("the close-out task completes");
+        let proposed = propose.await.expect("the proposal task completes");
+        let canonical = match (&closed, &proposed) {
+            (Ok(()), Err(htui_core::store::StoreError::Constraint(sentence))) => {
+                assert_eq!(
+                    *sentence,
+                    second_canonical(x, b),
+                    "round {round}: the proposal lost to the close-out's canonical"
+                );
+                wins[0] += 1;
+                b
+            }
+            (Err(htui_core::store::StoreError::Constraint(sentence)), Ok(())) => {
+                assert_eq!(
+                    *sentence,
+                    second_canonical(x, c),
+                    "round {round}: the close-out lost to the agent's canonical"
+                );
+                wins[1] += 1;
+                c
+            }
+            _ => panic!(
+                "round {round}: exactly one canonical wins, the loser `second_canonical`; got \
+                 close-out {closed:?}, proposal {proposed:?}"
+            ),
+        };
+        let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT to_item_id FROM item_link WHERE kind = 'duplicates' AND deleted_at IS NULL \
+             AND from_item_id = $1",
+        )
+        .bind(x.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("read the item's live canonical links");
+        assert_eq!(
+            live,
+            [canonical.as_uuid()],
+            "round {round}: one live canonical link, the winner's"
+        );
+        let status: String = sqlx::query_scalar("SELECT status::text FROM item WHERE id = $1")
+            .bind(x.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the item's status");
+        assert_eq!(
+            status,
+            if canonical == b { "closed" } else { "open" },
+            "round {round}: the item is closed exactly when the close-out won"
+        );
+    }
+    eprintln!("close-out won {} rounds, the proposal {}", wins[0], wins[1]);
+
+    for pool in pools {
+        pool.close().await;
+    }
+    db.drop_db().await;
+}
+
 /// MOD-150 D6 (blueprint deviation 3): the inherent `ready_items` and `queue_rows` read only
 /// `blocked_by`, so a `parent`, a `duplicates` and an `implements` link to a running or blocked
 /// item change neither, on Postgres (before and after a raw insert) or on `MemStore` (a store

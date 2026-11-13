@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM item_link\n                                   WHERE to_item_id = $1 AND kind = 'supersedes'\n                                     AND deleted_at IS NULL) AS \"live!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "af2fd2cc95cb33e3df6f1f86e3228d89c84bc79a12968c20f1e8eb66edd1d2b3"
+}

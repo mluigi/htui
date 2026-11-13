@@ -60,12 +60,12 @@ use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, batch_is_closed,
-    command_finish_status, command_log_too_large, command_not_claimable, command_not_queued,
-    document_needs_a_step, link_key, link_not_proposed_by_run, link_outside_reach,
-    memory_entry_closed, memory_subject_taken, note_needs_a_step, parent_cycle, parent_too_deep,
-    project_settings_not_an_object, reaped_note, run_workspace_for, scope_row_run_workspace,
-    second_canonical, second_parent, self_link, step_document_refusal, step_note_refusal,
-    step_writes_own_item, workspace_prefix_taken,
+    close_out_names_no_link, close_out_needs_a_link, command_finish_status, command_log_too_large,
+    command_not_claimable, command_not_queued, document_needs_a_step, link_key,
+    link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
+    note_needs_a_step, parent_cycle, parent_too_deep, project_settings_not_an_object, reaped_note,
+    run_workspace_for, scope_row_run_workspace, second_canonical, second_parent, self_link,
+    step_document_refusal, step_note_refusal, step_writes_own_item, workspace_prefix_taken,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
@@ -310,6 +310,183 @@ async fn step_fence(
     } else {
         Err(StoreError::Fenced { step })
     }
+}
+
+/// MOD-147 D3: whether `to` is reachable from an item of `project`: `to` is in `project`, or in
+/// the scope row or a member of a workspace holding `project` (its memberships, plus its owner
+/// workspace when `project` is itself a scope row). A snapshot read: membership racing the link
+/// is not locked, a link not being structural. [`StoreError::NotFound`] when `to` does not exist.
+/// `propose_link` measures from the step's project, `close_out` (MOD-150 M2 D2) from the closing
+/// item's. The SQL is the text `propose_link` held inline, indentation included, so its `.sqlx`
+/// entry is unchanged; so are [`live_other_link`]'s and [`upsert_link`]'s.
+async fn link_reaches(conn: &mut PgConnection, to: ItemId, project: ProjectId) -> Result<bool> {
+    sqlx::query_scalar!(
+        r#"
+            SELECT (i.project_id = $2
+                    OR EXISTS (
+                         SELECT 1 FROM workspace w
+                          WHERE (w.id IN (SELECT wp.workspace_id FROM workspace_project wp
+                                           WHERE wp.project_id = $2)
+                                 OR w.id = (SELECT p.owner_workspace_id FROM project p
+                                             WHERE p.id = $2))
+                            AND (w.id = (SELECT t.owner_workspace_id FROM project t
+                                          WHERE t.id = i.project_id)
+                                 OR EXISTS (SELECT 1 FROM workspace_project m
+                                             WHERE m.workspace_id = w.id
+                                               AND m.project_id = i.project_id))))
+                   AS "reachable!"
+              FROM item i
+             WHERE i.id = $1
+            "#,
+        to.as_uuid(),
+        project.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "item",
+        id: to.to_string(),
+    })
+}
+
+/// MOD-150 D3: the transaction-scoped advisory lock on `key`. This is `claim_command`'s statement
+/// text verbatim, so it reuses that query's `.sqlx` entry.
+async fn advisory_xact_lock(conn: &mut PgConnection, key: String) -> Result<()> {
+    sqlx::query!("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    Ok(())
+}
+
+/// MOD-150 D4: the `to` of `from`'s live `kind` link other than `to`, if any (the least, should
+/// a backstop-skipping writer have left two).
+async fn live_other_link(
+    conn: &mut PgConnection,
+    from: ItemId,
+    kind: LinkKind,
+    to: ItemId,
+) -> Result<Option<ItemId>> {
+    sqlx::query_scalar!(
+        r#"
+                SELECT to_item_id AS "to_item_id: ItemId"
+                  FROM item_link
+                 WHERE from_item_id = $1 AND kind = $2 AND to_item_id <> $3
+                   AND deleted_at IS NULL
+                 ORDER BY to_item_id
+                 LIMIT 1
+                "#,
+        from.as_uuid(),
+        kind.as_str(),
+        to.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// D13, B-6's upsert on the primary key `(from, to, kind)`: a new row is `proposer`'s, a live
+/// row keeps its proposer, a tombstone revives as `proposer`'s. `None` is a person (MOD-150 M2
+/// D3). `updated_at` is the `BEFORE UPDATE` trigger's.
+async fn upsert_link(
+    conn: &mut PgConnection,
+    from: ItemId,
+    to: ItemId,
+    kind: LinkKind,
+    proposer: Option<StepId>,
+) -> Result<ItemLink> {
+    sqlx::query_as!(
+        ItemLink,
+        r#"
+            INSERT INTO item_link (from_item_id, to_item_id, kind, proposed_by_step_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (from_item_id, to_item_id, kind) DO UPDATE
+               SET proposed_by_step_id = CASE WHEN item_link.deleted_at IS NULL
+                                              THEN item_link.proposed_by_step_id
+                                              ELSE EXCLUDED.proposed_by_step_id END,
+                   deleted_at          = NULL
+            RETURNING from_item_id        AS "from_item_id: ItemId",
+                      to_item_id          AS "to_item_id: ItemId",
+                      kind                AS "kind: LinkKind",
+                      proposed_by_step_id AS "proposed_by_step_id: StepId",
+                      created_at,
+                      updated_at,
+                      deleted_at
+            "#,
+        from.as_uuid(),
+        to.as_uuid(),
+        kind.as_str(),
+        proposer.map(StepId::as_uuid),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-150 M2 D2: close-out's link rule, decided before any write, in the closing item's
+/// transaction (its row locked, and for a named `duplicate` the item's `duplicates` advisory
+/// lock already held). Answers the link a named item makes (`item -duplicates-> named`,
+/// `named -supersedes-> item`), or `None` when no name was given and the live link the
+/// resolution needs is there.
+async fn close_out_link(
+    conn: &mut PgConnection,
+    item: ItemId,
+    project: ProjectId,
+    resolution: Resolution,
+    names: Option<ItemId>,
+) -> Result<Option<(ItemId, ItemId, LinkKind)>> {
+    let kind = match resolution {
+        Resolution::Duplicate => LinkKind::Duplicates,
+        Resolution::Superseded => LinkKind::Supersedes,
+        _ => {
+            return match names {
+                Some(_) => Err(StoreError::Constraint(close_out_names_no_link(resolution))),
+                None => Ok(None),
+            };
+        }
+    };
+    let Some(named) = names else {
+        let live = if kind == LinkKind::Duplicates {
+            // No link is a self link (`item_link`'s `CHECK (from_item_id <> to_item_id)`), so
+            // "other than `item`" is every live `duplicates` from it.
+            live_other_link(&mut *conn, item, kind, item)
+                .await?
+                .is_some()
+        } else {
+            sqlx::query_scalar!(
+                r#"SELECT EXISTS (SELECT 1 FROM item_link
+                                   WHERE to_item_id = $1 AND kind = 'supersedes'
+                                     AND deleted_at IS NULL) AS "live!""#,
+                item.as_uuid(),
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx)?
+        };
+        return if live {
+            Ok(None)
+        } else {
+            Err(StoreError::Constraint(close_out_needs_a_link(
+                item, resolution,
+            )))
+        };
+    };
+    if named == item {
+        return Err(StoreError::Constraint(self_link(item)));
+    }
+    if !link_reaches(&mut *conn, named, project).await? {
+        return Err(StoreError::Constraint(link_outside_reach(named)));
+    }
+    if kind == LinkKind::Supersedes {
+        // Multi-valued and backed by no partial unique: a live `supersedes` from another item
+        // refuses nothing, and a concurrent identical insert meets the primary-key upsert.
+        return Ok(Some((named, item, kind)));
+    }
+    if let Some(current) = live_other_link(&mut *conn, item, kind, named).await? {
+        return Err(StoreError::Constraint(second_canonical(item, current)));
+    }
+    Ok(Some((item, named, kind)))
 }
 
 /// MOD-11 F-21: what [`step_scope`] answers — the step's run, its item (`None` for a chat run)
@@ -9263,11 +9440,25 @@ impl WriteStore for PgStore {
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        let _ = names;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
-        let Some(status) = sqlx::query_scalar!(
-            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+        // MOD-150 M2 D4: a named `duplicate` takes `propose_link`'s per-item advisory lock, so a
+        // concurrent agent proposal of another canonical meets the second-canonical check rather
+        // than `uq_item_link_one_canonical` (23505). It is taken first, before the item row lock:
+        // the proposal takes the advisory lock and then, inserting, a `FOR KEY SHARE` lock on this
+        // item row; the other order would deadlock against it.
+        if resolution == Resolution::Duplicate && names.is_some() {
+            Box::pin(advisory_xact_lock(
+                &mut tx,
+                format!("item_link:duplicates:{item}"),
+            ))
+            .await?;
+        }
+
+        let Some(locked) = sqlx::query!(
+            r#"SELECT status     AS "status: Status",
+                      project_id AS "project_id: ProjectId"
+                 FROM item WHERE id = $1 FOR UPDATE"#,
             item.as_uuid(),
         )
         .fetch_optional(&mut *tx)
@@ -9279,6 +9470,7 @@ impl WriteStore for PgStore {
                 id: item.to_string(),
             });
         };
+        let status = locked.status;
 
         if let Some(live) = sqlx::query!(
             r#"
@@ -9337,6 +9529,16 @@ impl WriteStore for PgStore {
                 resolution,
             )));
         }
+        // MOD-150 M2 D2: the link a `duplicate` or `superseded` close-out names or needs. Boxed,
+        // as are the lock and the upsert, for `propose_link`'s stack reason.
+        let link = Box::pin(close_out_link(
+            &mut tx,
+            item,
+            locked.project_id,
+            resolution,
+            names,
+        ))
+        .await?;
 
         let mut probed: Vec<StepId> = Vec::new();
         for row in commits {
@@ -9363,6 +9565,10 @@ impl WriteStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+        }
+
+        if let Some((from, to, kind)) = link {
+            Box::pin(upsert_link(&mut tx, from, to, kind, None)).await?;
         }
 
         let closed = sqlx::query!(
@@ -10113,39 +10319,10 @@ impl WriteStore for PgStore {
                 link.step, link.from,
             )));
         }
-        // MOD-147 D3: `to` is reachable when it is in the step's project, or in the scope row or
-        // a member of a workspace holding that project (its memberships, plus its owner workspace
-        // when the step's project is itself a scope row). A snapshot read: membership racing the
-        // link is not locked, a link not being structural.
-        let reachable = sqlx::query_scalar!(
-            r#"
-            SELECT (i.project_id = $2
-                    OR EXISTS (
-                         SELECT 1 FROM workspace w
-                          WHERE (w.id IN (SELECT wp.workspace_id FROM workspace_project wp
-                                           WHERE wp.project_id = $2)
-                                 OR w.id = (SELECT p.owner_workspace_id FROM project p
-                                             WHERE p.id = $2))
-                            AND (w.id = (SELECT t.owner_workspace_id FROM project t
-                                          WHERE t.id = i.project_id)
-                                 OR EXISTS (SELECT 1 FROM workspace_project m
-                                             WHERE m.workspace_id = w.id
-                                               AND m.project_id = i.project_id))))
-                   AS "reachable!"
-              FROM item i
-             WHERE i.id = $1
-            "#,
-            link.to.as_uuid(),
-            scope.project.as_uuid(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "item",
-            id: link.to.to_string(),
-        })?;
-        if !reachable {
+        // MOD-147 D3: `to` is reachable from the step's project. The shared link queries are
+        // boxed here and in `close_out`: inline they grow both futures, and with them every
+        // conformance case's poll on the 2 MiB debug test stack (MOD-137).
+        if !Box::pin(link_reaches(&mut tx, link.to, scope.project)).await? {
             return Err(StoreError::Constraint(link_outside_reach(link.to)));
         }
         // MOD-150 D3: parent writes are serialised database-wide (one key: parent writes are rare
@@ -10162,34 +10339,13 @@ impl WriteStore for PgStore {
             _ => None,
         };
         if let Some(lock_key) = lock_key {
-            sqlx::query!(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                lock_key,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
+            Box::pin(advisory_xact_lock(&mut tx, lock_key)).await?;
         }
         // MOD-150 D4: one live parent, one live canonical. A live row with the same `to` is the
         // upsert below; a tombstone's revival is checked like an insert. uq_item_link_one_parent
         // and uq_item_link_one_canonical back both checks (D5).
         if matches!(link.kind, LinkKind::Parent | LinkKind::Duplicates) {
-            let current = sqlx::query_scalar!(
-                r#"
-                SELECT to_item_id AS "to_item_id: ItemId"
-                  FROM item_link
-                 WHERE from_item_id = $1 AND kind = $2 AND to_item_id <> $3
-                   AND deleted_at IS NULL
-                 ORDER BY to_item_id
-                 LIMIT 1
-                "#,
-                link.from.as_uuid(),
-                link.kind.as_str(),
-                link.to.as_uuid(),
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
+            let current = Box::pin(live_other_link(&mut tx, link.from, link.kind, link.to)).await?;
             if let Some(current) = current {
                 return Err(StoreError::Constraint(if link.kind == LinkKind::Parent {
                     second_parent(link.from, current)
@@ -10252,32 +10408,14 @@ impl WriteStore for PgStore {
             }
         }
 
-        let row = sqlx::query_as!(
-            ItemLink,
-            r#"
-            INSERT INTO item_link (from_item_id, to_item_id, kind, proposed_by_step_id)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (from_item_id, to_item_id, kind) DO UPDATE
-               SET proposed_by_step_id = CASE WHEN item_link.deleted_at IS NULL
-                                              THEN item_link.proposed_by_step_id
-                                              ELSE EXCLUDED.proposed_by_step_id END,
-                   deleted_at          = NULL
-            RETURNING from_item_id        AS "from_item_id: ItemId",
-                      to_item_id          AS "to_item_id: ItemId",
-                      kind                AS "kind: LinkKind",
-                      proposed_by_step_id AS "proposed_by_step_id: StepId",
-                      created_at,
-                      updated_at,
-                      deleted_at
-            "#,
-            link.from.as_uuid(),
-            link.to.as_uuid(),
-            link.kind.as_str(),
-            link.step.as_uuid(),
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
+        let row = Box::pin(upsert_link(
+            &mut tx,
+            link.from,
+            link.to,
+            link.kind,
+            Some(link.step),
+        ))
+        .await?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
