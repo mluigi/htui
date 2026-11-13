@@ -2767,7 +2767,8 @@ where
     /// resolution records a link and refuses everything else (R-ENT-9). A key no item holds is
     /// `Store(NotFound { entity: "item", id: <key> })`, with nothing written. A name on a
     /// resolution that records no link is the store's `close_out_names_no_link`, answered before
-    /// the lookup (review L5), so an unknown key does not turn it into `NotFound`.
+    /// the lookup (review L5) and after the close-out law's `resolution_not_closable`, as the store
+    /// orders them, so an unknown key does not turn it into `NotFound`.
     async fn close_out(
         &self,
         item: ItemId,
@@ -2775,9 +2776,21 @@ where
         names: Option<&str>,
     ) -> Result<CommandOutcome, EngineError> {
         let reads = self.close_out_reads(item).await?;
-        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let (_, finished) = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         if names.is_some() && !matches!(resolution, Resolution::Duplicate | Resolution::Superseded)
         {
+            // D2's store order: the close-out law refuses first, then the name on a linkless
+            // resolution (R1 verifier).
+            if !resolution.closes_from(reads.item.status, finished) {
+                let latest = htui_core::model::latest_graph_run(&reads.runs).map(|run| run.status);
+                return Err(EngineError::Store(StoreError::Constraint(
+                    htui_core::store::traits::resolution_not_closable(
+                        item,
+                        htui_core::model::ItemState::of(reads.item.status, latest),
+                        resolution,
+                    ),
+                )));
+            }
             return Err(EngineError::Store(StoreError::Constraint(
                 htui_core::store::traits::close_out_names_no_link(resolution),
             )));
@@ -20417,6 +20430,28 @@ mod tests {
                 "{key}: {refused}"
             );
         }
+        // The close-out law still answers first, as both stores order it (D2): an open,
+        // unfinished item does not close as `done`, named or not.
+        let refused = harness
+            .dispatch(Command::CloseOut {
+                item: ids::HTUI_ANA_2,
+                resolution: Resolution::Done,
+                names: Some("FEAT-99".to_owned()),
+            })
+            .await
+            .expect_err("an open item does not close as `done`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::Store(htui_core::store::StoreError::Constraint(why))
+                    if *why == htui_core::store::traits::resolution_not_closable(
+                        ids::HTUI_ANA_2,
+                        ItemState::Open,
+                        Resolution::Done,
+                    )
+            ),
+            "the law's sentence, not the name's: {refused}"
+        );
         let row = harness.orch.item(ids::HTUI_ANA_2).await;
         assert_eq!((row.status, row.resolution), (Status::Open, None));
     }
