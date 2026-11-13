@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gate.sh - the canonical htui gate (TOOL-9, ANA-29 D5). One sequence, so a green means the
 # same thing everywhere: fmt, clippy with and without --all-features, the whole workspace test
-# suite single-threaded without fail-fast, a scan of that output for aborts, the migration
+# suite at libtest's default threads without fail-fast (TOOL-16), a scan of that output for aborts, the migration
 # numbering, the workflow validator, and the htui-dev mod when it exists. Bash twin of gate.ps1
 # - keep the two in lockstep (same step names, same last.json shape).
 #
@@ -134,7 +134,9 @@ step_qdrant() {
 step_test() {
     mkdir -p "$GATE_DIR"
     # PIPESTATUS, not $?: tee would otherwise report success for a failed cargo.
-    cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 2>&1 | tee "$TEST_LOG"
+    # Default threads (TOOL-16): each crate's integration tests are one binary (TOOL-15), so what
+    # must not overlap takes a process-wide turn inside it (testkit::qdrant_turn, mock_keyring).
+    cargo test --workspace --all-features --no-fail-fast 2>&1 | tee "$TEST_LOG"
     return "${PIPESTATUS[0]}"
 }
 
@@ -381,7 +383,13 @@ fi
 if [[ $DETACH -eq 1 ]]; then
     mkdir -p "$GATE_DIR"
     args=(); [[ -n "$ONLY" ]] && args=(--only "$ONLY")
-    setsid bash "${BASH_SOURCE[0]}" "${args[@]}" > "$GATE_DIR/run.log" 2>&1 < /dev/null &
+    # `env --default-signal` (TOOL-16): a non-interactive shell starts a background job with SIGINT
+    # and SIGQUIT ignored, every process under it inherits that, and a shell that starts with a
+    # signal ignored cannot trap it. Two tests interrupt a `trap ... INT` child and failed in every
+    # detached gate; the orphaned children showed `SigIgn: 0x6`. Bare `--default-signal` (every
+    # signal) is the form GNU and uutils `env` agree on. Not `set -m`: a job-control job leads its
+    # process group, `setsid` then forks, and `$!` would name a parent that exits at once.
+    setsid env --default-signal bash "${BASH_SOURCE[0]}" "${args[@]}" > "$GATE_DIR/run.log" 2>&1 < /dev/null &
     echo "gate started, pid $! - log $GATE_DIR/run.log, result: bash scripts/gate.sh --status"
     exit 0
 fi

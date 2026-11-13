@@ -27,15 +27,19 @@ MOD-147 M1 and M2 (M3, M4 open), MOD-162 M1, MOD-122 M1, MOD-125 M1; each item's
 `command_run`, over the same queue rows and limits; every command row keeps a scrubbed log of its last 2 MiB
 (`command_log`, migration `0031`), read by tail, line range or regex with absolute line numbers; a `repo` argument
 picks one of the session's `extra_dirs`. `command_start`/`command_cancel` ask for approval, the reads do not.
-**MOD-141 is done** (`docs/decisions/mod/mod-141.md`; M3 on `hr/MOD-141`, to collect): one rataflow step-graph
-editor saves a graph of any scope through `ReplaceGraph`; `Settings > Kinds` opens it on project graphs, and
-`GraphEditorHost::open_by_id` is the entry point MOD-124 wires into the Toolbox. A workspace graph's label names its
-workspace (`flow · workspace Platform`), and a typed graph name that matches several graphs is refused, listing
-the qualified labels. **MOD-170 is done** (`docs/decisions/mod/mod-170.md`): the waiting list's key
-qualifier comes from one Postgres query a tick (`PgStore::waiting_keys`: the scope row and every scope project's
-slug and kind prefixes), where it was 2N+1 serial round trips; the mirror and memory still read per project, and
-the output is unchanged. MOD-143 waits on MOD-150 and MOD-133.
-Earlier completions, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
+**TOOL-16 is done** (`docs/decisions/tool/tool-16.md`; with TOOL-15 on branch `tool-16`, to merge): each crate's
+integration tests are modules of one `tests/it/main.rs` binary (TOOL-15; exempt `htui-agent/tests/extensibility.rs`
+and `htui/tests/panic_hook.rs`), so run one file as `cargo test -p <crate> --all-features --test it <name>::`, and a
+sandbox run on the old layout that adds a `tests/<name>.rs` moves it under `tests/it/` at collect. The gate runs at
+default threads and takes about 8 min (was 30), red only on the three base failures; Postgres tests copy a template
+database, live Qdrant tests hold `testkit::qdrant_turn()`, a test that writes and execs a script uses
+`tests/rust/write_executable.rs`, and `gate.sh --detach` no longer ignores SIGINT (the cancel/interrupt "load
+flakes" were that). Many Postgres cases failing `57P03` means the dev Postgres crashed: re-run. TOOL-17 is next.
+MOD-141 (`docs/decisions/mod/mod-141.md`): M3 is on `hr/MOD-141`, to collect. MOD-139
+(`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and Postgres gate; its migration is
+`0029_divided_fanout` (MOD-97 took `0028`).
+MOD-143 waits on MOD-150 and MOD-133.
+Earlier completions, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -1194,6 +1198,16 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
 
 ### Deferred backlog
 
+- [ ] **MOD-175 - Qdrant collection admin calls get a longer client deadline than searches** (from TOOL-16).
+  `R-STO-8`. `vector.rs::client_config` sets no timeout, so every call carries qdrant-client's default 5 s.
+  Creating a collection and its five payload indexes (`ensure_collection`, reached from
+  `QdrantIndex::connect`, `QdrantStore::connect` and htui-bench) takes about 0.13 s on an idle server but went
+  past 5 s while TOOL-16's parallel gate loaded the box ("create collection: … Timeout expired"); the sandbox
+  Qdrant took 7 s per create in 2026-09. A user's first index on a busy box fails the same way. Give the
+  admin calls (exists, create, create index, update, delete) a longer deadline (e.g. 30 s) and keep searches
+  and the probe on their short ones, so MOD-160's fail-open-cheaply search is unchanged. `ensure_collection`
+  is already idempotent, so a retried connect repairs a half-made collection. Tests: TOOL-16's
+  `testkit::qdrant_connect_to` retries the timeout today; it can go once this lands. Not blocked.
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-LATER-13`. **Deferred by the 2026-10-15 requirements review:** best-of-N fan-out is now the
@@ -1257,27 +1271,23 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
   CLEAN, NEXT, VAL as well as ANA and MOD), for open lines and write-ups alike. Backfill the write-ups
   that newly fall under it, or exempt items archived before 2026-10-15 if that list is long, and
   record which choice was made.
-- [ ] **TOOL-15 - One integration-test binary per crate** (from the 2026-11-13 hr build-cache trial).
-  Each of the 136 files under `crates/*/tests/` (68 in `crates/htui`) links its own executable against
-  the whole dependency tree. Measured on main `a05deeac`, cold
-  `cargo test --workspace --all-features --no-run` in the hr image at 4 cpus: 7m33s and a 29 GB target,
-  of which 19.8 GB is 148 executables (130-340 MB each), 7.1 GB incremental and 2.6 GB dependency
-  libraries. Merge each crate's files into modules of one test binary, so hr runs fit on the SSD and
-  link once per crate. Not on the table: turning incremental off or reducing debug info (maintainer,
-  2026-11-13). Decide in the plan: (a) process-wide state that a fresh process per file resets today
-  (keyring fake, environment variables, set-once globals): per-test reset guards, or `cargo-nextest`
-  with one process per test (gate runner change, doctests as a separate step, fixtures shared within
-  a file rebuilt per test); (b) the insta snapshot renames the new module paths cause; (c) one binary
-  per crate rather than one for the workspace, because `keys_file.rs`, `mcp_stdio.rs` and
-  `worker_pg.rs` need `CARGO_BIN_EXE_htui`, which cargo sets only for `htui`'s own tests; (d) the
-  `testkit` gating, so a merged binary cannot run 0 tests and report ok. Measure target size and
-  cold-build time before and after. Not blocked.
+- [ ] **TOOL-17 - cargo-nextest as the gate's test runner** (from TOOL-16). `cargo test` runs the test
+  binaries one after another (default threads, TOOL-16: htui unit 95 s, htui `it` 87 s, htui-store `it`
+  221 s, about 440 s summed); nextest runs every test of every binary in one pool, one process per test.
+  Gains: cross-binary overlap; the process-wide hazards (fake keyring, `panic_hook`, environment, the
+  `ETXTBSY` fork window) end; the live Qdrant cases become a one-thread test group in
+  `.config/nextest.toml` instead of `testkit::qdrant_turn`; `--retries` reports FLAKY rather than red or
+  green; per-test times. Costs: an install on the host and in the hr image; doctests as a separate
+  `cargo test --doc` step; both gate twins change; about 8,500 process spawns; per-process setup (the
+  `concepts_worker` model load, the template lookup) repeated per test. First a measured spike: prebuilt
+  binary, the Qdrant group, time `cargo nextest run --workspace --all-features` against TOOL-16's
+  default-thread run (532 s with the build). TOOL-15's plan D3 kept nextest as the fallback. Not blocked.
 
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 78 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 79 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
-| TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-15 one test binary per crate) |
+| TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-17 cargo-nextest) |

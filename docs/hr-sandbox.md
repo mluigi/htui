@@ -206,8 +206,11 @@ host): tests pass their Qdrant settings in.
 So the full suite runs as is:
 
 ```
-cargo test --workspace --all-features -- --test-threads=1
+cargo test --workspace --all-features
 ```
+
+At libtest's default threads, as the gate runs it (TOOL-16); an item run filters to its crate and
+module (`cargo test -p <crate> --all-features --test it <module>::`).
 
 There is no `docker` in a sandbox. Where a note says `docker exec htui-postgres psql …`, run `psql`
 directly:

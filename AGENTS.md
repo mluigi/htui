@@ -32,6 +32,26 @@ Overview: `.claude/skills/handoff-docs.md`.
 
 - Gate: `bash scripts/gate.sh` (Windows: `pwsh -NoProfile -File scripts/gate.ps1`). On Windows
   always run the `.ps1` twin of a script, never the `.sh`.
+- Integration tests: one binary per crate (TOOL-15). Each crate's `tests/<name>.rs` is the module
+  `tests/it/<name>.rs` of the `it` target, so run one file as
+  `cargo test -p <crate> --all-features --test it <name>::`, never `--test <name>`. The filter is a
+  libtest **substring** match: `settings::` also runs `box_settings::` and its kin, so read the
+  names that run. Snapshots live in `tests/it/snapshots/it__<name>__<test>.snap`. Without
+  `--all-features` (or `--features testkit` for `htui`, `test-support` for `htui-core` and
+  `htui-agent`) the `it` binary fails on a canary test instead of passing with 0 tests. A crash in
+  one test (stack overflow, SIGABRT) now ends its crate's whole `it` binary; `abort-grep` in the gate
+  names it. Two files stay outside `it`: `htui-agent/tests/extensibility.rs` (its path is hard-coded in
+  the `htui-dev` mod) and `htui/tests/panic_hook.rs` (it installs a process-wide panic hook that
+  would see every parallel test's panics). A new test that sets process-wide state (`set_hook`,
+  environment, cwd) gets its own top-level `tests/<name>.rs` target, or re-runs itself as a child.
+- Tests run in parallel (TOOL-16): the gate uses libtest's default threads, so a crate's tests share
+  one process and run side by side. A test of the live Qdrant holds `htui_store::testkit::qdrant_turn()`
+  for its whole body and creates its collection with `testkit::qdrant_connect_to` (retries the client's 5 s
+  deadline under load); a test that writes a script and executes it writes it with
+  `tests/rust/write_executable.rs` (included through `#[path]`), never `fs::write` plus `chmod`
+  (`ETXTBSY`). `testkit::fresh_db`/`demo_db` copy a template database, so `migrations_at_connect` is
+  `UpToDate`; a test about pending migrations starts from `bare_db`. Item runs:
+  `cargo test -p <crate> --all-features --test it <module>::` at default threads.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.

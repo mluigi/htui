@@ -1,0 +1,4515 @@
+//! `GixIsolator` and `ShellVerifier` under the real `Engine` (plan D41).
+//!
+//! The fake suite pins the walk's *decisions* over a double that touches no filesystem; this
+//! binary pins the three validation criteria that are about a filesystem — ANA-2 §12's 11, 12 and
+//! 13 (`docs/ANA-2.md:2115-2121`) — by assembling `EngineParts` over the production isolator and
+//! the production verifier and driving them through the same commands.
+//!
+//! Every git-backed case opens with [`skip_without_git`] and **passes** on a box without a `git`
+//! at or above 2.33.0 (plan D40): the sentence is printed and the case returns. Criterion 12 needs
+//! no `git` at all — `local` isolation reads a checkout and creates nothing — so it is not skipped
+//! anywhere.
+//!
+//! The oracle for what `git` believes is `git worktree list --porcelain`, run through the same
+//! binary that wrote the administrative entries (`isolate::git::testkit::worktree_list`). The
+//! `gix` side of the same question is asserted inside `isolate/real.rs`'s own tests, which can
+//! reach the crate-private readers this binary cannot.
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use htui_core::fixtures::ids;
+use htui_core::model::{
+    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePart, PremergeReport,
+    RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    SnapshotCandidate, SnapshotPhase, Split, StepGraphId, StepGraphPhase, StepId, StepRole,
+    StepStatus, VerifyOutcome,
+};
+use htui_core::prompt::DiffBlock;
+use htui_core::scrub::MinimalScrubber;
+use htui_core::store::{
+    CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
+};
+use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
+use htui_orch::conformance::until_stalled;
+use htui_orch::engine::{
+    Adopted, DeadWalks, Engine, EngineParts, FirstCandidate, Next, Resume, SessionKey, SessionSink,
+};
+use htui_orch::fake::{FakeOrchestrator, RESTART_GAP, ScriptedStep, TestClock};
+use htui_orch::isolate::Clock as _;
+use htui_orch::isolate::copy;
+use htui_orch::isolate::git::testkit::{
+    commit_file, repo_with_one_commit, usable_git, worktree_list,
+};
+use htui_orch::isolate::git::{Cli, IDENTITY_ENV, premerge_message};
+use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
+use htui_orch::isolate::{
+    ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
+    PartTip, Prepared, RepoCheckout, ResetReport,
+};
+use htui_orch::secrets::RunSecrets;
+use htui_orch::skip_without_git;
+use htui_orch::status::RunFailure;
+use htui_orch::verify::{ShellVerifier, VERIFY_CLASS};
+use serde_json::json;
+use tokio::sync::Notify;
+use uuid::Uuid;
+
+/// An `Engine` over `$fix`'s graphs, driver and verifier with `$store`, `$isolator`, `$clock`,
+/// `$owner` and `$sink` swapped in, bound to `$engine` while `$body` is evaluated.
+///
+/// `$store` is the process's own handle on the fixture's rows: `&fix.orch.store` for the
+/// fixture's process, the fourth item of [`Fixture::second_process`] for a second one, whose
+/// handle reads that process's clock (MOD-40 blueprint B23).
+///
+/// A macro because the parts it borrows — the graph source, the driver closure, the scrubber —
+/// are built here and must outlive the `Engine`, and the driver is a closure whose type no helper
+/// can name. [`Fixture::dispatch`] is this with the fixture's own process; blueprint §10's
+/// `engine_as` is this with a [`Fixture::second_process`]'s, or with a wrapping isolator.
+///
+/// Each engine gets an empty [`DeadWalks`] of its own (plan D140). No case here needs a dead walk
+/// to outlive the engine that saw it die.
+macro_rules! engine_as {
+    ($fix:expr, $store:expr, $isolator:expr, $clock:expr, $owner:expr, $sink:expr, |$engine:ident| $body:expr) => {{
+        let fix: &Fixture = $fix;
+        let graphs = fix.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| fix.orch.driver_for_key(key);
+        let scrubber = MinimalScrubber::new([]);
+        let secrets = RunSecrets::none();
+        let dead_walks = DeadWalks::new();
+        let app = fix
+            .orch
+            .store
+            .app_settings()
+            .await
+            .expect("MemStore never fails a read");
+        let box_profile = fix
+            .orch
+            .store
+            .box_profile(fix.orch.box_id())
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the demo fixture seeds this box");
+        let $engine = Engine::new(EngineParts {
+            store: $store,
+            graphs: &graphs,
+            isolator: $isolator,
+            verifier: &fix.verifier,
+            clock: $clock,
+            selector: &FirstCandidate,
+            sink: $sink,
+            driver: &driver,
+            policy: &htui_orch::ask_policy,
+            control: &htui_orch::never_cancelled,
+            scrubber: &scrubber,
+            secrets: &secrets,
+            app,
+            box_profile,
+            box_id: fix.orch.box_id(),
+            owner: $owner,
+            dead_walks: &dead_walks,
+            user: fix.orch.user(),
+            tails: htui_orch::Tails::Walk,
+            tools: None,
+        });
+        $body
+    }};
+}
+
+/// Everything one case drives: the store and the doubles a `FakeOrchestrator` already owns, plus
+/// the two production pieces this binary exists to exercise.
+struct Fixture {
+    orch: FakeOrchestrator,
+    /// Held for the case's lifetime: dropping it removes the repositories and the scratch root.
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    core: Checkout,
+    docs: Checkout,
+    /// The mode every phase this fixture repoints runs in.
+    isolation: Isolation,
+    isolator: GixIsolator,
+    /// What `isolator` was built from, so a second process can build its own over the same repos
+    /// (blueprint §10's `second_process`).
+    config: IsolatorConfig,
+    verifier: ShellVerifier,
+}
+
+/// One repository as both halves name it: the store's id and the isolator's path.
+struct Checkout {
+    id: RepoId,
+    path: PathBuf,
+    /// `HEAD` at the moment the fixture was built, which is every step's `before_hash`.
+    head: String,
+}
+
+impl Fixture {
+    /// Two repositories, `core` (primary) and `docs`, a scratch root beside them, and every phase
+    /// of `FEAT-3`'s graph pinned to `isolation` with `verify` as its `verify_command`.
+    ///
+    /// The isolation is set on the **phase** and not on the project: `ProjectPatch` has no
+    /// `settings` field (`crates/htui-core/src/model/kind.rs`), so the project rung is not
+    /// reachable through a writer, and `phase.isolation` is the rung above it anyway
+    /// (`graph.rs`'s `phase.isolation.unwrap_or(settings.default_isolation)`).
+    async fn new(isolation: Isolation, verify: Option<&str>) -> Self {
+        Self::with_copy_cap(isolation, verify, 1 << 30).await
+    }
+
+    /// [`new`](Self::new) with `copy_max_total_bytes` set to `cap` (plan D57).
+    async fn with_copy_cap(isolation: Isolation, verify: Option<&str>, cap: u64) -> Self {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let core = make_repo(&orch.store, dir.path(), "core", true).await;
+        let docs = make_repo(&orch.store, dir.path(), "docs", false).await;
+
+        let verify = verify.map(str::to_owned);
+        repoint(&orch.store, ids::HTUI_FEAT_3, |phase| {
+            phase.isolation = Some(isolation);
+            phase.verify_command = verify.clone();
+        })
+        .await;
+
+        let root = dir.path().join("trees");
+        let config = IsolatorConfig {
+            repos: BTreeMap::from([
+                (
+                    core.id,
+                    RepoCheckout {
+                        name: "core".to_owned(),
+                        local_path: core.path.clone(),
+                        is_primary: true,
+                    },
+                ),
+                (
+                    docs.id,
+                    RepoCheckout {
+                        name: "docs".to_owned(),
+                        local_path: docs.path.clone(),
+                        is_primary: false,
+                    },
+                ),
+            ]),
+            scratch_root: root.clone(),
+            copy_exclude: Vec::new(),
+            copy_max_total_bytes: cap,
+            box_id: orch.box_id(),
+        };
+        let isolator =
+            GixIsolator::new(config.clone()).expect("the scratch root is outside both checkouts");
+
+        let verifier = ShellVerifier::new(
+            &BTreeMap::from([(VERIFY_CLASS.to_owned(), 1)]),
+            Arc::new(MinimalScrubber::new([])),
+            Arc::new(htui_orch::isolate::SystemClock),
+        );
+
+        Self {
+            orch,
+            _dir: dir,
+            root,
+            core,
+            docs,
+            isolation,
+            isolator,
+            config,
+            verifier,
+        }
+    }
+
+    /// One command through an `Engine` built over the production isolator and verifier.
+    ///
+    /// `EngineParts`' fields are all public, which is what plan D41 relies on: a test assembles the
+    /// walk out of whichever halves it wants to be real, and nothing in `engine.rs` is generic over
+    /// a harness.
+    async fn dispatch<K: SessionSink>(
+        &self,
+        sink: &K,
+        command: Command,
+    ) -> Result<CommandOutcome, EngineError> {
+        engine_as!(
+            self,
+            &self.orch.store,
+            &self.isolator,
+            &self.orch.clock,
+            self.orch.owner(),
+            sink,
+            |engine| engine.dispatch(command).await
+        )
+    }
+
+    /// `StartRun` on `FEAT-3` over both repositories, in `core, docs` order.
+    async fn start<K: SessionSink>(&self, sink: &K) -> RunId {
+        self.start_item(sink, ids::HTUI_FEAT_3).await
+    }
+
+    /// `StartRun` on `item` over both repositories, in `core, docs` order.
+    async fn start_item<K: SessionSink>(&self, sink: &K, item: ItemId) -> RunId {
+        let outcome = self
+            .dispatch(
+                sink,
+                Command::StartRun {
+                    item,
+                    mode: RunMode::Manual,
+                    repo_scope: Some(vec![self.core.id, self.docs.id]),
+                    workspace: None,
+                },
+            )
+            .await
+            .expect("the graph resolves and the box has a slot");
+        let CommandOutcome::Started { run, .. } = outcome else {
+            panic!("`StartRun` answers `Started`, not {outcome:?}");
+        };
+        run
+    }
+
+    async fn steps(&self, run: RunId) -> Vec<RunStep> {
+        self.orch
+            .store
+            .run_steps(run)
+            .await
+            .expect("MemStore never fails a read")
+    }
+
+    /// The scratch root as `git` and `std::fs` both spell it, which is what a `starts_with`
+    /// against a porcelain path has to be compared to (blueprint H-11).
+    fn canonical_root(&self) -> PathBuf {
+        std::fs::canonicalize(&self.root).expect("`GixIsolator::new` created the scratch root")
+    }
+
+    /// The step the walk parked at, which every case asserts it reached.
+    async fn parked(&self, run: RunId) -> RunStep {
+        self.steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.status == StepStatus::AwaitingApproval)
+            .expect("the walk parked at a gate")
+    }
+}
+
+/// A repository with one commit, registered with the store as `name` on this box.
+async fn make_repo(store: &MemStore, dir: &Path, name: &str, is_primary: bool) -> Checkout {
+    let path = dir.join(name);
+    std::fs::create_dir_all(&path).expect("the repository directory is made");
+    let head = repo_with_one_commit(&path);
+
+    let id = RepoId::new();
+    store
+        .create_repo(NewRepo {
+            id,
+            project_id: ids::PROJECT_HTUI,
+            name: name.to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary,
+        })
+        .await
+        .expect("the demo project holds no repo of this name");
+    // Not read by the walk — the isolator is handed its paths (plan D34) — but this is the row
+    // milestone 6's worker builds `IsolatorConfig` out of, and writing it keeps the two halves of
+    // the fixture saying the same thing.
+    store
+        .upsert_repo_box_path(&RepoBoxPath {
+            repo_id: id,
+            box_id: ids::BOX,
+            local_path: path.to_string_lossy().into_owned(),
+            updated_at: htui_orch::engine::truncated(chrono::Utc::now()),
+        })
+        .await
+        .expect("both ids name rows");
+
+    Checkout {
+        id,
+        path: std::fs::canonicalize(&path).expect("the repository directory exists"),
+        head,
+    }
+}
+
+/// Repoints `item` at a clone of its graph whose phases `mutate` has edited.
+///
+/// The conformance suite's own helper, copied rather than shared because `conformance.rs`'s is
+/// written against its `Orchestrate` trait and this binary holds a store.
+async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphPhase)) {
+    let row = store
+        .item(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the fixture holds the item");
+    let graph = store
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph");
+    // The id is in the name so a case can repoint one item twice: a graph name is unique per
+    // project.
+    let id = StepGraphId::new();
+    let clone = store
+        .create_step_graph(NewStepGraph {
+            id,
+            scope: htui_core::model::GraphScope::Project(row.project_id),
+            name: format!("{}-isolated-{id}", row.key),
+            description: "a gix_isolator case's edit of the live graph".to_owned(),
+            is_override: false,
+        })
+        .await
+        .expect("the name is fresh");
+    for phase in &graph.phases {
+        let mut edited = StepGraphPhase {
+            id: PhaseId::new(),
+            graph_id: clone.id,
+            ..phase.phase.clone()
+        };
+        mutate(&mut edited);
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != Split::Divide {
+            edited.split = Split::for_fan_out(edited.fan_out);
+        }
+        store
+            .create_phase(&edited)
+            .await
+            .expect("the clone accepts its phases");
+    }
+    store
+        .update_item(
+            item,
+            row.version,
+            ItemPatch {
+                step_graph_id: Some(Some(clone.id)),
+                author_id: row.created_by,
+                reason: "a gix_isolator case's edit of the live graph".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the item's version is current");
+}
+
+/// `git status --porcelain` in `repo`, which is the only reading of "dirty" this binary can make:
+/// `isolate::git::is_dirty` is crate-private and `real.rs`'s own tests are where `gix`'s answer is
+/// asserted.
+async fn porcelain_status(git: &Cli, repo: &Path) -> String {
+    let exited = git
+        .run(
+            "status",
+            repo,
+            &[OsStr::new("status"), OsStr::new("--porcelain")],
+            &[],
+        )
+        .await
+        .expect("git status runs");
+    assert!(exited.ok(), "git status failed: {}", exited.stderr);
+    exited.stdout
+}
+
+/// `HEAD` of `repo`, read through `git` rather than through the crate's private `gix` half.
+async fn head_of(git: &Cli, repo: &Path) -> String {
+    let exited = git
+        .run(
+            "rev-parse",
+            repo,
+            &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
+            &[],
+        )
+        .await
+        .expect("git rev-parse runs");
+    assert!(exited.ok(), "git rev-parse failed: {}", exited.stderr);
+    exited.stdout.trim().to_owned()
+}
+
+/// A [`SessionSink`] that commits a file into the step's primary tree and then lets the fake
+/// orchestrator write the output document.
+///
+/// This is the only way a case can make a step produce a *commit*: the walk's agent is a
+/// `FakeDriver` and a fake agent edits nothing. Criterion 13 needs one, because a run whose steps
+/// committed nothing has nothing for `reconcile` to merge and nothing for cleanup to be
+/// interesting about.
+struct CommittingSink<'a> {
+    orch: &'a FakeOrchestrator,
+    /// The repository directory names to commit in; a tree not named here is left clean, which is
+    /// what D27 removes at `capture`.
+    repos: &'a [&'a str],
+    /// The phases that commit; empty means every phase. A phase not named here leaves its trees
+    /// clean, so a fan-out case can park on a later phase without that phase's tree in the way.
+    phases: &'a [&'a str],
+}
+
+impl CommittingSink<'_> {
+    /// The commit half of [`after_done`](SessionSink::after_done): one file into every named tree
+    /// of a committing phase, and no document.
+    async fn commit(
+        &self,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+    ) -> Result<(), StoreError> {
+        let commits = self.phases.is_empty() || self.phases.contains(&phase.name.as_str());
+        let trees = self.orch.store.step_trees(step.id).await?;
+        for tree in trees.iter().filter(|_| commits) {
+            if !self
+                .repos
+                .iter()
+                .any(|name| tree.path.ends_with(&format!("/{name}")))
+            {
+                continue;
+            }
+            commit_file(
+                Path::new(&tree.path),
+                // One file per candidate (plan T8): siblings of a group commit different trees,
+                // so a merge or a reset that picked the wrong one shows in the checkout.
+                &format!("agent-{}.txt", key.fanout_index),
+                &format!(
+                    "{} attempt {} candidate {}\n",
+                    phase.name, step.attempt, key.fanout_index
+                ),
+                &format!("htui test: {}", phase.name),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl SessionSink for CommittingSink<'_> {
+    async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+        _done: &htui_agent::event::DoneEvent,
+    ) -> Result<(), StoreError> {
+        self.commit(step, phase, key).await?;
+        // `after_done` answers the document it wrote; the seam wants a unit.
+        FakeOrchestrator::after_done(self.orch, item, step, phase, key).await?;
+        Ok(())
+    }
+}
+
+/// ANA-2 §12 criterion 11 (`docs/ANA-2.md:2115`): a `worktree` step over two repositories gets one
+/// tree per repository, both outside every managed checkout, both recorded.
+#[tokio::test]
+async fn criterion_11_a_worktree_step_on_two_repos() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    // Both trees are committed to, which is what keeps both alive past `capture`: D27 removes a
+    // `worktree` tree the step left clean and without a commit, and the criterion asks `git
+    // worktree list` to show them.
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core", "docs"],
+        phases: &[],
+    };
+    let run = fix.start(&sink).await;
+    let step = fix.parked(run).await;
+
+    let trees = fix
+        .orch
+        .store
+        .step_trees(step.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(trees.len(), 2, "one tree per repo in scope: {trees:?}");
+    for tree in &trees {
+        assert_eq!(tree.mode, Isolation::Worktree);
+        let path = PathBuf::from(&tree.path);
+        assert!(
+            path.starts_with(fix.canonical_root()),
+            "every tree is under the scratch root: {path:?}"
+        );
+        assert!(
+            !path.starts_with(&fix.core.path) && !path.starts_with(&fix.docs.path),
+            "and inside neither managed checkout (invariant 4): {path:?}"
+        );
+        assert!(path.join(".git").exists(), "the tree checked out: {path:?}");
+    }
+
+    let commits = fix
+        .orch
+        .store
+        .step_commits(step.id)
+        .await
+        .expect("MemStore never fails a read");
+    let mut bases: Vec<(RepoId, String)> = commits
+        .iter()
+        .map(|row| (row.repo_id, row.before_hash.clone()))
+        .collect();
+    bases.sort();
+    let mut expected = vec![
+        (fix.core.id, fix.core.head.clone()),
+        (fix.docs.id, fix.docs.head.clone()),
+    ];
+    expected.sort();
+    assert_eq!(
+        bases, expected,
+        "each `before_hash` is its repository's own `HEAD`"
+    );
+
+    // Plan D33: `upsert_step_tree` writes the primary's path to `run_step.isolation_path`.
+    let primary = trees
+        .iter()
+        .find(|tree| tree.repo_id == fix.core.id)
+        .expect("the primary has a tree");
+    assert_eq!(
+        fix.steps(run)
+            .await
+            .into_iter()
+            .find(|row| row.id == step.id)
+            .and_then(|row| row.isolation_path),
+        Some(primary.path.clone())
+    );
+
+    // The oracle: the binary that wrote the entries, asked what it believes.
+    for (checkout, repo_name) in [(&fix.core, "core"), (&fix.docs, "docs")] {
+        let listed = worktree_list(&git, &checkout.path).await;
+        // The main checkout's own directory is also named `core`/`docs`, so the entry is found by
+        // "under the scratch root" and not by its last component.
+        let entry = listed
+            .iter()
+            .find(|entry| {
+                entry.path.starts_with(fix.canonical_root()) && entry.path.ends_with(repo_name)
+            })
+            .unwrap_or_else(|| panic!("`git` lists the tree it made: {listed:?}"));
+        assert_eq!(
+            entry.branch.as_deref(),
+            Some(format!("refs/heads/htui/{}", step.id).as_str()),
+            "D23 branches the tree at `htui/<step_id>`"
+        );
+        assert_eq!(
+            entry.locked.as_deref(),
+            Some(format!("htui run {run}").as_str()),
+            "D23 locks it with the run in the reason"
+        );
+    }
+}
+
+/// ANA-2 §12 criterion 12 (`docs/ANA-2.md:2118`), its record half: a `local` step over a dirty
+/// checkout records `dirty = true` and the checkout's own `HEAD`.
+///
+/// **No `git` needed**: `local` reads the checkout and creates nothing, which is exactly what
+/// makes it the mode a box without `git` can still walk. The sweep that acts on `dirty = true` is
+/// milestone 5's and is not asserted here.
+#[tokio::test]
+async fn criterion_12_a_local_step_on_a_dirty_tree() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    std::fs::write(fix.core.path.join("f"), "edited by a human\n")
+        .expect("the tracked file is writable");
+
+    let run = fix.start(&fix.orch).await;
+    let step = fix.parked(run).await;
+
+    let trees = fix
+        .orch
+        .store
+        .step_trees(step.id)
+        .await
+        .expect("MemStore never fails a read");
+    let core = trees
+        .iter()
+        .find(|tree| tree.repo_id == fix.core.id)
+        .expect("the primary has a row");
+    assert_eq!(core.mode, Isolation::Local);
+    assert_eq!(
+        PathBuf::from(&core.path),
+        fix.core.path,
+        "`local` is the maintainer's own checkout, not a scratch tree"
+    );
+    assert!(
+        core.dirty,
+        "a modified tracked file is recorded, never reset"
+    );
+    assert_eq!(core.base_ref, fix.core.head);
+
+    let docs = trees
+        .iter()
+        .find(|tree| tree.repo_id == fix.docs.id)
+        .expect("the second repo has a row");
+    assert!(!docs.dirty, "nothing touched `docs`");
+
+    let commits = fix
+        .orch
+        .store
+        .step_commits(step.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        commits
+            .iter()
+            .find(|row| row.repo_id == fix.core.id)
+            .map(|row| row.before_hash.clone()),
+        Some(fix.core.head.clone())
+    );
+    assert!(
+        !fix.root.join(run.to_string()).exists(),
+        "`local` creates nothing under the scratch root"
+    );
+}
+
+/// ANA-2 §12 criterion 13 (`docs/ANA-2.md:2120`): cancelling a run removes every tree it made and
+/// leaves the managed checkouts exactly as it found them — merge included.
+#[tokio::test]
+async fn criterion_13_cancel_removes_every_tree() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    // Only the primary is committed to, so `docs`'s clean no-commit tree is removed at `capture`
+    // (D27) and its reconcile is the identity — the shape the criterion's "leaves the managed
+    // repo's own tree untouched" half is easiest to read on.
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &[],
+    };
+
+    let run = fix.start(&sink).await;
+    let prd = fix.parked(run).await;
+    assert_eq!(prd.position, 0);
+
+    // Approving `prd` runs plan D25's reconcile: the step's branch is merged `--no-ff` into the
+    // primary checkout, which is the one thing in this milestone that moves a managed repository.
+    fix.dispatch(
+        &sink,
+        Command::AnswerGate {
+            run,
+            step: prd.id,
+            answer: GateAnswer::Approved,
+        },
+    )
+    .await
+    .expect("`prd` produced its document");
+
+    let merged = head_of(&git, &fix.core.path).await;
+    assert_ne!(
+        merged, fix.core.head,
+        "the winner's commit reached the primary checkout (ANA-2 `:987-988`)"
+    );
+    assert_eq!(
+        head_of(&git, &fix.docs.path).await,
+        fix.docs.head,
+        "`docs` had no commit, so its reconcile was the identity"
+    );
+
+    let parked = fix.parked(run).await;
+    assert_eq!(parked.position, 1, "the walk advanced and parked at `plan`");
+
+    let outcome = fix
+        .dispatch(&sink, Command::CancelRun { run })
+        .await
+        .expect("a parked run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { .. }),
+        "{outcome:?}"
+    );
+
+    assert!(
+        !fix.root.join(run.to_string()).exists(),
+        "the run's whole scratch directory is gone (blueprint F-Q)"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        let listed = worktree_list(&git, &checkout.path).await;
+        for entry in &listed {
+            assert!(
+                !entry.path.starts_with(fix.canonical_root()),
+                "no entry under the scratch root survives: {entry:?}"
+            );
+            assert!(
+                entry
+                    .branch
+                    .as_deref()
+                    .is_none_or(|branch| !branch.starts_with("refs/heads/htui/")),
+                "and no `htui/` branch is left checked out anywhere: {entry:?}"
+            );
+        }
+    }
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        merged,
+        "cleanup moves no managed checkout"
+    );
+    assert_eq!(head_of(&git, &fix.docs.path).await, fix.docs.head);
+    assert_eq!(
+        porcelain_status(&git, &fix.core.path).await,
+        "",
+        "and leaves it clean"
+    );
+    assert_eq!(porcelain_status(&git, &fix.docs.path).await, "");
+}
+
+/// Plan D30 end to end: the phase's `verify_command` runs in the **primary repo's tree**, and the
+/// `command_run` row names that tree.
+#[tokio::test]
+async fn a_verify_command_runs_in_the_primary_tree() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    // `f` is `repo_with_one_commit`'s file and exists only inside a checkout, so a `pass` proves
+    // where the shell ran as well as that it ran.
+    let fix = Fixture::new(Isolation::Worktree, Some("test -f f")).await;
+    let run = fix.start(&fix.orch).await;
+    let step = fix.parked(run).await;
+
+    assert_eq!(step.verify_outcome, Some(VerifyOutcome::Pass));
+    assert_eq!(step.verify_exit_code, Some(0));
+
+    let rows = fix
+        .orch
+        .store
+        .command_runs(step.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(rows.len(), 1, "one verify, one row: {rows:?}");
+    let primary = fix
+        .orch
+        .store
+        .step_trees(step.id)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|tree| tree.repo_id == fix.core.id)
+        .expect("the primary has a tree");
+    assert_eq!(
+        (
+            rows[0].class.as_str(),
+            rows[0].cwd.as_str(),
+            rows[0].exit_code
+        ),
+        (VERIFY_CLASS, primary.path.as_str(), Some(0)),
+        "ANA-2 `:491-493`: the step's own tree for the project's primary repo"
+    );
+}
+
+// -- milestone 4: fan-out over real git (plan D54-D57, D72, D78) -------------------------------
+
+impl Fixture {
+    /// `ANA-2` on the `analysis` graph with `research` fanned out three ways under `gate`, running
+    /// `verify_command = "true"` through the real verifier, and `verdict` gated `always`: the walk
+    /// parks on `verdict` once the group is decided, with every tree the group left still in place
+    /// for the oracle. Both phases run in this fixture's isolation.
+    ///
+    /// `analysis` rather than `feature` because it is the smaller graph: `research` at 3 plans at
+    /// most five agents, judged or not. (Under ANA-2's original `max_agents_per_run = 6` a judged
+    /// 3-way phase on `feature` planned seven and was refused; the default is 8 now, which admits
+    /// it.)
+    async fn fan_research(&self, gate: Gate) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_ANA_2, |phase| {
+            phase.isolation = Some(isolation);
+            if phase.name == "research" {
+                phase.fan_out = 3;
+                phase.gate = gate;
+                phase.verify_command = Some("true".to_owned());
+            } else {
+                phase.gate = Gate::Always;
+            }
+        })
+        .await;
+    }
+
+    /// Plan D69: `agy` is the project's judge (the seeded agent with a model to run), and both of
+    /// its ordering calls at attempt 1 answer `winner`.
+    async fn judge_research(&self, winner: i32) {
+        let project = self
+            .orch
+            .store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds the item")
+            .project_id;
+        self.orch
+            .store
+            .set_project_settings(project, json!({ "judge_agent_id": ids::AGENT_AGY }));
+        for call in 0..2 {
+            self.orch.script_candidate(
+                "research:judge",
+                1,
+                -1,
+                call,
+                ScriptedStep::judge(winner, &[(winner, "the change the task asked for")]),
+            );
+        }
+    }
+
+    /// The candidates of `research`'s attempt 1, in `fanout_index` order.
+    async fn research_slot(&self, run: RunId) -> Vec<RunStep> {
+        self.research_attempt(run, 1).await
+    }
+
+    /// The candidates of `research`'s `attempt`, in `fanout_index` order.
+    async fn research_attempt(&self, run: RunId, attempt: i32) -> Vec<RunStep> {
+        let mut slot: Vec<RunStep> = self
+            .steps(run)
+            .await
+            .into_iter()
+            .filter(|step| step.position == 0 && step.attempt == attempt && step.fanout_index >= 0)
+            .collect();
+        slot.sort_by_key(|step| step.fanout_index);
+        assert_eq!(slot.len(), 3, "a 3-way group: {slot:?}");
+        slot
+    }
+
+    /// Every `item_note` body on `ANA-2`, oldest first.
+    async fn notes(&self) -> Vec<String> {
+        self.orch
+            .store
+            .notes(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect()
+    }
+
+    /// The one D50 park note the group wrote.
+    async fn selection_park(&self) -> String {
+        let parks: Vec<String> = self
+            .notes()
+            .await
+            .into_iter()
+            .filter(|body| body.starts_with("fan-out `research` attempt 1 awaits selection: "))
+            .collect();
+        assert_eq!(parks.len(), 1, "one park, one note: {parks:?}");
+        parks.into_iter().next().expect("checked above")
+    }
+}
+
+/// `git <args>` in `repo`, its stdout trimmed; a non-zero exit fails the case.
+async fn git_out(git: &Cli, repo: &Path, args: &[&str]) -> String {
+    let argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exited = git.run("oracle", repo, &argv, &[]).await.expect("git runs");
+    assert!(exited.ok(), "git {args:?} failed: {}", exited.stderr);
+    exited.stdout.trim().to_owned()
+}
+
+/// The commit `htui/<step>` names in `repo`.
+async fn label_of(git: &Cli, repo: &Path, step: &RunStep) -> String {
+    git_out(git, repo, &["rev-parse", &format!("htui/{}", step.id)]).await
+}
+
+/// Every `htui/` branch of `repo`, short names, sorted.
+async fn htui_branches(git: &Cli, repo: &Path) -> Vec<String> {
+    let listed = git_out(
+        git,
+        repo,
+        &["branch", "--list", "--format=%(refname:short)", "htui/*"],
+    )
+    .await;
+    let mut branches: Vec<String> = listed.lines().map(str::to_owned).collect();
+    branches.sort();
+    branches
+}
+
+/// The `htui/<step>` names of `steps`, sorted.
+fn labels(steps: &[RunStep]) -> Vec<String> {
+    let mut labels: Vec<String> = steps
+        .iter()
+        .map(|step| format!("htui/{}", step.id))
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// Plan D54, D55 and D57 end to end: three `worktree` candidates from one base, a judge that reads
+/// their real `git diff`s, and a reconcile that merges only the winner. `CancelRun` then removes
+/// every tree and leaves every label.
+#[tokio::test]
+async fn a_three_way_worktree_fan_out_merges_only_the_winner() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.fan_research(Gate::Never).await;
+    fix.judge_research(1).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let verdict = fix.parked(run).await;
+    assert_eq!(
+        verdict.position, 1,
+        "the group was decided and the walk went on"
+    );
+
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter()
+            .map(|step| (step.status, step.selected))
+            .collect::<Vec<_>>(),
+        [
+            (StepStatus::Superseded, Some(false)),
+            (StepStatus::Done, Some(true)),
+            (StepStatus::Superseded, Some(false)),
+        ],
+        "the judge picked candidate 1"
+    );
+    let steps = fix.steps(run).await;
+    let judge = steps
+        .iter()
+        .find(|step| step.fanout_index == -1)
+        .expect("two passing candidates, so the judge ran");
+    assert_eq!(judge.status, StepStatus::Done);
+
+    // D55 over real git: the judge's prompt carries each candidate's own patch.
+    let events = fix
+        .orch
+        .store
+        .step_events(judge.id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the judge recorded its session");
+    let prompt = events
+        .iter()
+        .find(|event| event.seq == 0)
+        .and_then(|event| event.payload["text"].as_str())
+        .expect("seq 0 is the judge's prompt");
+    for index in 0..3 {
+        assert!(
+            prompt.contains(&format!(
+                "diff --git a/agent-{index}.txt b/agent-{index}.txt"
+            )),
+            "candidate {index}'s patch reached the judge: {prompt}"
+        );
+    }
+
+    // D54(a): one base. Every label is one commit on top of the fixture's `HEAD`.
+    let mut tips = Vec::new();
+    for step in &slot {
+        let commits = fix
+            .orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read");
+        let core = commits
+            .iter()
+            .find(|row| row.repo_id == fix.core.id)
+            .expect("the candidate recorded the primary");
+        assert_eq!(
+            core.before_hash, fix.core.head,
+            "every candidate starts from the base"
+        );
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "candidate {}'s commit sits on the base",
+            step.fanout_index
+        );
+        tips.push(tip);
+    }
+    tips.dedup();
+    assert_eq!(tips.len(), 3, "three different commits: {tips:?}");
+
+    // `git` itself: three candidate trees under the scratch root, plus the primary.
+    let listed = worktree_list(&git, &fix.core.path).await;
+    assert_eq!(listed.len(), 4, "three trees plus the primary: {listed:?}");
+    let mut listed_branches: Vec<String> = listed
+        .iter()
+        .filter(|entry| entry.path.starts_with(fix.canonical_root()))
+        .filter_map(|entry| entry.branch.clone())
+        .collect();
+    listed_branches.sort();
+    assert_eq!(
+        listed_branches,
+        labels(&slot)
+            .iter()
+            .map(|label| format!("refs/heads/{label}"))
+            .collect::<Vec<_>>()
+    );
+
+    // D25 over a group: the primary gains one two-parent merge whose second parent is the winner.
+    let parents = git_out(
+        &git,
+        &fix.core.path,
+        &["rev-list", "--parents", "-n", "1", "HEAD"],
+    )
+    .await;
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(
+        parents[1..],
+        [fix.core.head.as_str(), tips[1].as_str()],
+        "a --no-ff merge of the winner's label onto the base"
+    );
+    assert!(fix.core.path.join("agent-1.txt").exists());
+    assert!(
+        !fix.core.path.join("agent-0.txt").exists() && !fix.core.path.join("agent-2.txt").exists(),
+        "no loser's change reached the primary"
+    );
+    assert_eq!(head_of(&git, &fix.docs.path).await, fix.docs.head);
+
+    let outcome = fix
+        .dispatch(&sink, Command::CancelRun { run })
+        .await
+        .expect("a parked run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { .. }),
+        "{outcome:?}"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        let listed = worktree_list(&git, &checkout.path).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the checkout itself is left: {listed:?}"
+        );
+    }
+    // `verdict`'s own clean tree was removed at its capture (D27) and its label stays too, so the
+    // candidates' labels are looked for rather than being the whole list.
+    let left = htui_branches(&git, &fix.core.path).await;
+    for label in labels(&slot) {
+        assert!(
+            left.contains(&label),
+            "cleanup removes trees, never labels: the losers stay reachable: {left:?}"
+        );
+    }
+}
+
+/// Plan D56 and the Risks row: `shared_serialized` siblings take the checkout one after another,
+/// each from the base; the park note says where the checkout was left and names every label; a
+/// human's pick moves the checked-out branch to the winner's label.
+#[tokio::test]
+async fn shared_serialized_siblings_run_in_turn_and_the_branch_ends_on_the_winner() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Done),
+        "{slot:?}"
+    );
+
+    // Siblings 1 and 2 found the checkout at the previous sibling's commit and reset it to the
+    // base first: every label is one commit on the base, and none contains another's file.
+    let mut tips = Vec::new();
+    for step in &slot {
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "sibling {} started from the base",
+            step.fanout_index
+        );
+        tips.push(tip);
+    }
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        tips[2],
+        "an undecided group leaves the checkout at the last sibling's commit"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+
+    let park = fix.selection_park().await;
+    assert!(
+        park.contains("; the shared checkout stays at the last sibling's commit (base "),
+        "{park}"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        assert!(
+            park.contains(&format!("{}@{}", checkout.id, checkout.head)),
+            "the base of every repo is named: {park}"
+        );
+    }
+    let named = slot
+        .iter()
+        .map(|step| format!("htui/{}", step.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(park.ends_with(&format!("; labels {named})")), "{park}");
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+
+    let outcome = fix
+        .dispatch(
+            &sink,
+            Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: 1,
+                winner: slot[1].id,
+            },
+        )
+        .await
+        .expect("a parked group takes a human's pick");
+    assert!(
+        matches!(outcome, CommandOutcome::Selected { .. }),
+        "{outcome:?}"
+    );
+
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        tips[1],
+        "D56: the checked-out branch moved to the winner's label"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert!(fix.core.path.join("agent-1.txt").exists());
+    assert!(!fix.core.path.join("agent-2.txt").exists());
+    let after = fix
+        .orch
+        .store
+        .step_commits(slot[1].id)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|row| row.repo_id == fix.core.id)
+        .and_then(|row| row.after_hash);
+    assert_eq!(after.as_deref(), Some(tips[1].as_str()));
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot),
+        "the losers' labels stay"
+    );
+    assert_eq!(fix.parked(run).await.position, 1, "and the walk went on");
+}
+
+/// Plan D72 (blueprint A-1): with a slot, a dirty shared checkout is refused for **every**
+/// sibling, including sibling 0 at `HEAD == base`. Nothing is reset and the dirt survives.
+#[tokio::test]
+async fn a_dirty_shared_checkout_fails_every_sibling_and_parks() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    std::fs::write(fix.core.path.join("f"), "edited by a human\n")
+        .expect("the tracked file is writable");
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Failed),
+        "{slot:?}"
+    );
+    let notes = fix.notes().await;
+    let refusal = dirty_tree_not_reset(&fix.core.path);
+    for index in 0..3 {
+        assert!(
+            notes.iter().any(|body| {
+                body.starts_with(&format!(
+                    "fan-out candidate {index} of `research` attempt 1: "
+                )) && body.contains(&refusal)
+            }),
+            "candidate {index} failed on the dirty checkout: {notes:?}"
+        );
+    }
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+    let park = fix.selection_park().await;
+    assert!(park.contains("0 failed"), "{park}");
+
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "no reset"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, " M f\n");
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the file is there"),
+        "edited by a human\n",
+        "the maintainer's work survives"
+    );
+    assert!(
+        htui_branches(&git, &fix.core.path).await.is_empty(),
+        "no sibling got as far as a label"
+    );
+    assert!(
+        park.ends_with("; no sibling moved the shared checkout"),
+        "the note names no label `git` does not have, and no commit the checkout is not at: {park}"
+    );
+}
+
+/// Plan D78 (blueprint A-7): sibling 0 fails after its `prepare` took the checkout; the
+/// best-effort capture on its failure path releases the guard, so siblings 1 and 2 still run
+/// instead of waiting on it inside `join_all` forever.
+#[tokio::test]
+async fn a_failed_shared_sibling_releases_the_checkout_for_the_next() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    fix.orch.script_candidate(
+        "research",
+        1,
+        0,
+        0,
+        ScriptedStep::refusing_to_start("no agent binary here"),
+    );
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        fix.start_item(&sink, ids::HTUI_ANA_2),
+    )
+    .await
+    .expect("a leaked guard would hang the group here");
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter().map(|step| step.status).collect::<Vec<_>>(),
+        [StepStatus::Failed, StepStatus::Done, StepStatus::Done]
+    );
+    let notes = fix.notes().await;
+    assert!(
+        notes.iter().any(|body| {
+            body.starts_with("fan-out candidate 0 of `research` attempt 1: ")
+                && body.contains("no agent binary here")
+        }),
+        "{notes:?}"
+    );
+    for step in &slot[1..] {
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "sibling {} ran from the base",
+            step.fanout_index
+        );
+    }
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        label_of(&git, &fix.core.path, &slot[2]).await
+    );
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot[1..]),
+        "sibling 0 moved nothing, so it has no label"
+    );
+    let park = fix.selection_park().await;
+    assert!(park.contains("0 failed"), "{park}");
+    assert!(
+        park.ends_with(&format!(
+            "; labels htui/{}, htui/{})",
+            slot[1].id, slot[2].id
+        )),
+        "only the labels `git` has are named: {park}"
+    );
+}
+
+/// The park note's `shared_serialized` sentence names the commit the checkout is at. When the
+/// last sibling fails after its `prepare` reset the checkout to the base, it commits nothing, so
+/// the checkout is at the base — not at the earlier siblings' labels, which the note still names.
+#[tokio::test]
+async fn a_failed_last_shared_sibling_leaves_the_checkout_at_the_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    fix.orch.script_candidate(
+        "research",
+        1,
+        2,
+        0,
+        ScriptedStep::refusing_to_start("no agent binary here"),
+    );
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        fix.start_item(&sink, ids::HTUI_ANA_2),
+    )
+    .await
+    .expect("the group settles");
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter().map(|step| step.status).collect::<Vec<_>>(),
+        [StepStatus::Done, StepStatus::Done, StepStatus::Failed]
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "sibling 2's prepare reset the checkout to the base and it committed nothing"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot[..2]),
+        "sibling 2 moved nothing, so it has no label"
+    );
+
+    let park = fix.selection_park().await;
+    assert!(park.contains("2 failed"), "{park}");
+    assert!(
+        !park.contains("the last sibling's commit"),
+        "the checkout is not at any sibling's commit: {park}"
+    );
+    assert!(
+        park.contains("; the shared checkout is back at the base (base "),
+        "{park}"
+    );
+    assert!(
+        park.contains(&format!("{}@{}", fix.core.id, fix.core.head)),
+        "{park}"
+    );
+    assert!(
+        park.ends_with(&format!(
+            "; labels htui/{}, htui/{})",
+            slot[0].id, slot[1].id
+        )),
+        "the labels `git` has are still named: {park}"
+    );
+}
+
+impl Fixture {
+    /// Every `research` candidate of `attempt` recorded both repositories at the fixture's `HEAD`
+    /// — the base the group of attempt 1 started from — and its label sits on it.
+    async fn assert_attempt_started_from_the_base(&self, git: &Cli, run: RunId, attempt: i32) {
+        for step in self.research_attempt(run, attempt).await {
+            let commits = self
+                .orch
+                .store
+                .step_commits(step.id)
+                .await
+                .expect("MemStore never fails a read");
+            let bases: BTreeMap<RepoId, String> = commits
+                .into_iter()
+                .map(|row| (row.repo_id, row.before_hash))
+                .collect();
+            assert_eq!(
+                bases,
+                BTreeMap::from([
+                    (self.core.id, self.core.head.clone()),
+                    (self.docs.id, self.docs.head.clone()),
+                ]),
+                "attempt {attempt} candidate {} starts from the retired attempt's base, not from \
+                 the commit a retired sibling left the checkout at",
+                step.fanout_index
+            );
+            let tip = label_of(git, &self.core.path, &step).await;
+            assert_eq!(
+                git_out(git, &self.core.path, &["rev-parse", &format!("{tip}^")]).await,
+                self.core.head,
+                "attempt {attempt} candidate {}'s commit sits on the base",
+                step.fanout_index
+            );
+        }
+    }
+}
+
+/// ANA-2 `:754-758` under plan D65's group retry: the retired slot's winner and losers are all
+/// superseded, so attempt 2 starts from the base attempt 1 started from — not from the last
+/// retired sibling's commit, which is where `shared_serialized` left the checkout.
+#[tokio::test]
+async fn a_group_retry_after_a_shared_fan_out_starts_from_the_original_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    repoint(&fix.orch.store, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.retry_limit = 1;
+        }
+    })
+    .await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    let last = label_of(&git, &fix.core.path, &slot[2]).await;
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        last,
+        "the parked group left the checkout at the last sibling's commit"
+    );
+    assert_ne!(last, fix.core.head);
+
+    let outcome = fix
+        .dispatch(
+            &sink,
+            Command::RetryStep {
+                run,
+                step: slot[0].id,
+            },
+        )
+        .await
+        .expect("a parked group retries as a whole");
+    assert!(
+        matches!(outcome, CommandOutcome::Retried { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        fix.research_attempt(run, 2)
+            .await
+            .iter()
+            .all(|step| step.status == StepStatus::Done),
+        "attempt 2's group ran"
+    );
+    fix.assert_attempt_started_from_the_base(&git, run, 2).await;
+}
+
+/// Plan D49(1)'s `never` × `failed` cell over `shared_serialized`: every sibling committed and
+/// failed its verification, the group is retired by the walk itself, and attempt 2 starts from
+/// the base attempt 1 started from.
+#[tokio::test]
+async fn a_failed_shared_group_retries_from_the_original_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Never).await;
+    repoint(&fix.orch.store, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.retry_limit = 1;
+            phase.verify_command = Some("false".to_owned());
+        }
+    })
+    .await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter()
+            .all(|step| step.verify_outcome == Some(VerifyOutcome::Fail)),
+        "{slot:?}"
+    );
+    assert_eq!(
+        fix.orch.run(run).await.status,
+        RunStatus::Failed,
+        "attempt 2 failed the same way and the budget is spent"
+    );
+    fix.assert_attempt_started_from_the_base(&git, run, 2).await;
+}
+
+/// Plan D57: `copy` measures once per candidate against the cap, so a tree that fits once is
+/// refused three times over, and the refusal names both figures.
+#[tokio::test]
+async fn copy_refuses_n_copies_above_the_cap() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    // A throwaway fixture only to learn the checkouts' sizes, which the real one's cap is set by.
+    let probe = Fixture::new(Isolation::Copy, None).await;
+    let need = |path: &Path| copy::measure(path, &copy::excludes(&[])).expect("the tree is walked");
+    let largest = need(&probe.core.path).max(need(&probe.docs.path));
+    drop(probe);
+
+    let cap = largest * 2;
+    let fix = Fixture::with_copy_cap(Isolation::Copy, None, cap).await;
+    fix.fan_research(Gate::Always).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Failed),
+        "{slot:?}"
+    );
+    let refusal = copy::copy_over_cap_copies(need(&fix.core.path), 3, cap);
+    let notes = fix.notes().await;
+    for index in 0..3 {
+        assert!(
+            notes.iter().any(|body| {
+                body.starts_with(&format!(
+                    "fan-out candidate {index} of `research` attempt 1: "
+                )) && body.contains(&refusal)
+            }),
+            "candidate {index} was refused with `{refusal}`: {notes:?}"
+        );
+    }
+    for step in &slot {
+        assert!(
+            !fix.root
+                .join(run.to_string())
+                .join(step.id.to_string())
+                .join("core")
+                .exists(),
+            "no copy was made"
+        );
+    }
+    fix.selection_park().await;
+}
+
+/// Plan D70: `git worktree add` is serialised per repository, so a 3-way `worktree` group
+/// prepares without a failure, round after round, on nothing but the lock.
+///
+/// The fact-check's probe saw ≈ 1 % of unserialised 3-way groups fail with `failed to read
+/// .git/worktrees/<id>/commondir`, which `with_retry` does not classify as retryable; fifty
+/// rounds would then fail about 40 % of the time. Each round is a fresh repository, so no round
+/// inherits an administrative entry from another, and every round is torn down through
+/// `cleanup` like a run's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_three_way_worktree_fan_out_is_deterministic_over_many_rounds() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    for round in 0..50 {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("core");
+        std::fs::create_dir_all(&path).expect("the repository directory is made");
+        let head = repo_with_one_commit(&path);
+        let path = std::fs::canonicalize(&path).expect("the repository directory exists");
+        let repo = RepoId::new();
+        let isolator = GixIsolator::new(IsolatorConfig {
+            repos: BTreeMap::from([(
+                repo,
+                RepoCheckout {
+                    name: "core".to_owned(),
+                    local_path: path.clone(),
+                    is_primary: true,
+                },
+            )]),
+            scratch_root: dir.path().join("trees"),
+            copy_exclude: Vec::new(),
+            copy_max_total_bytes: 1 << 30,
+            box_id: ids::BOX,
+        })
+        .expect("the scratch root is outside the checkout");
+
+        let scope = [repo];
+        let base = isolator.base(&scope).await.expect("the base is read");
+        assert_eq!(base, BTreeMap::from([(repo, head.clone())]));
+        let run = RunId::new();
+        let steps = [StepId::new(), StepId::new(), StepId::new()];
+        let prepared = futures::future::join_all(steps.iter().zip(0..).map(|(step, index)| {
+            isolator.prepare(
+                run,
+                *step,
+                &scope,
+                Isolation::Worktree,
+                Some(FanoutSlot {
+                    index,
+                    width: 3,
+                    base: &base,
+                }),
+            )
+        }))
+        .await;
+
+        let mut trees = Vec::new();
+        for (index, result) in prepared.into_iter().enumerate() {
+            let prepared = result
+                .unwrap_or_else(|err| panic!("round {round}: candidate {index} failed: {err}"));
+            for tree in prepared.trees {
+                assert_eq!(tree.before_hash, head, "round {round}: one base");
+                trees.push(tree.tree);
+            }
+        }
+        let listed = worktree_list(&git, &path).await;
+        assert_eq!(
+            listed.len(),
+            4,
+            "round {round}: three trees plus the primary: {listed:?}"
+        );
+        isolator
+            .cleanup(run, &trees)
+            .await
+            .unwrap_or_else(|err| panic!("round {round}: cleanup failed: {err}"));
+        assert_eq!(worktree_list(&git, &path).await.len(), 1, "round {round}");
+    }
+}
+
+impl Fixture {
+    /// Answers the gate the walk parked at.
+    async fn answer<K: SessionSink>(&self, sink: &K, run: RunId, answer: GateAnswer) -> RunStep {
+        let step = self.parked(run).await;
+        self.dispatch(
+            sink,
+            Command::AnswerGate {
+                run,
+                step: step.id,
+                answer,
+            },
+        )
+        .await
+        .expect("the parked step takes an answer");
+        step
+    }
+
+    /// `FEAT-3`'s `implement` given `retry_limit = 3`, so the budget alone would allow a third
+    /// attempt and only the no-progress predicate can stop the loop after two.
+    async fn three_implement_attempts(&self) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_FEAT_3, |phase| {
+            phase.isolation = Some(isolation);
+            if phase.name == "implement" {
+                phase.retry_limit = 3;
+            }
+        })
+        .await;
+    }
+
+    /// The primary repo's `run_step_commit` row of `step`.
+    async fn core_commit(&self, step: &RunStep) -> RunStepCommit {
+        self.orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == self.core.id)
+            .expect("the step recorded the primary")
+    }
+
+    /// The `docs` repo's `run_step_commit` row of `step`.
+    async fn docs_commit(&self, step: &RunStep) -> RunStepCommit {
+        self.orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == self.docs.id)
+            .expect("the step recorded `docs`")
+    }
+}
+
+/// A `review` rejection, as a human gives it.
+fn rejected(note: &str) -> GateAnswer {
+    GateAnswer::Rejected {
+        note: note.to_owned(),
+    }
+}
+
+/// ANA-2 §12 criterion 7 (`docs/ANA-2.md:2103`) over real git (plan D66, R-8): two `implement`
+/// attempts that commit nothing leave two `NULL` `after_hash`es, and the loop stops on
+/// `no_progress_hash` although `retry_limit = 3` would allow a third.
+#[tokio::test]
+async fn two_no_commit_implement_attempts_stop_the_loop_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.three_implement_attempts().await;
+    // `prd` and `plan` commit, so the primary moves before the loop starts; `implement` does not.
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["prd", "plan"],
+    };
+
+    let run = fix.start(&sink).await;
+    fix.answer(&sink, run, GateAnswer::Approved).await; // prd
+    fix.answer(&sink, run, GateAnswer::Approved).await; // plan
+    let implement_1 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    let merged = head_of(&git, &fix.core.path).await;
+    assert_ne!(merged, fix.core.head, "prd and plan reached the primary");
+    fix.answer(&sink, run, rejected("attempt 1 is no better"))
+        .await;
+    let implement_2 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    assert_eq!(
+        (implement_2.phase_name.as_str(), implement_2.attempt),
+        ("implement", 2)
+    );
+    fix.answer(&sink, run, rejected("attempt 2 is no better"))
+        .await;
+
+    for step in [&implement_1, &implement_2] {
+        let row = fix.core_commit(step).await;
+        assert_eq!(
+            (row.before_hash.as_str(), row.after_hash),
+            (merged.as_str(), None),
+            "attempt {} committed nothing on the primary",
+            step.attempt
+        );
+    }
+    let notes = fix
+        .orch
+        .store
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(
+        notes.iter().any(|note| {
+            note.body.contains("review loop exhausted after 2 attempts")
+                && note.body.contains("stop reason `no_progress_hash`")
+        }),
+        "the predicate stopped the loop, not the budget: {notes:?}"
+    );
+    assert!(
+        !fix.steps(run).await.iter().any(|step| step.attempt == 3),
+        "no third attempt"
+    );
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(head_of(&git, &fix.core.path).await, merged);
+}
+
+/// Plan D66's other half, which is what closes R-8: two `implement` attempts that **do** commit
+/// can never agree on `after_hash` in `worktree` mode, because attempt 2 branches from a primary
+/// that already holds attempt 1's merge. The loop goes on to a third attempt.
+///
+/// The two reviews say different things (CLEAN-4 plan D3). The fake's default output is one fixed
+/// string, so two default reviews would stop the loop on `no_progress_review` at attempt 2, and
+/// the third attempt would stop proving anything about the hash half.
+#[tokio::test]
+async fn two_committing_implement_attempts_never_look_identical_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.three_implement_attempts().await;
+    fix.orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    fix.orch.script(
+        "review",
+        2,
+        ScriptedStep::review("request-changes", "second"),
+    );
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["prd", "plan", "implement"],
+    };
+
+    let run = fix.start(&sink).await;
+    fix.answer(&sink, run, GateAnswer::Approved).await; // prd
+    fix.answer(&sink, run, GateAnswer::Approved).await; // plan
+    let implement_1 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    let merged_1 = head_of(&git, &fix.core.path).await;
+    fix.answer(&sink, run, rejected("attempt 1 is no better"))
+        .await;
+    let implement_2 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    fix.answer(&sink, run, rejected("attempt 2 is no better"))
+        .await;
+
+    let first = fix.core_commit(&implement_1).await;
+    let second = fix.core_commit(&implement_2).await;
+    assert_eq!(
+        second.before_hash, merged_1,
+        "attempt 2 starts from the primary that holds attempt 1's merge"
+    );
+    let (Some(first_after), Some(second_after)) = (&first.after_hash, &second.after_hash) else {
+        panic!("both attempts committed: {first:?} {second:?}");
+    };
+    assert_ne!(first_after, second_after);
+    git_out(
+        &git,
+        &fix.core.path,
+        &["merge-base", "--is-ancestor", first_after, second_after],
+    )
+    .await;
+
+    let parked = fix.parked(run).await;
+    assert_eq!(
+        (parked.phase_name.as_str(), parked.attempt),
+        ("implement", 3),
+        "the hash predicate did not fire, so the budget's third attempt ran"
+    );
+}
+
+/// Plan D135 (review K2) over real git: a `review` under a `never` gate that commits and then
+/// says `request-changes` is retired by the loop, and its commit never reaches the primary. The
+/// review's branch keeps its label at that commit; only the approving review is merged.
+#[tokio::test]
+async fn a_rejected_reviews_commits_never_reach_the_primary() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let isolation = fix.isolation;
+    repoint(&fix.orch.store, ids::HTUI_FEAT_3, |phase| {
+        phase.isolation = Some(isolation);
+        phase.gate = Gate::Never;
+    })
+    .await;
+    fix.orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "no tests"),
+    );
+    fix.orch
+        .script("review", 2, ScriptedStep::review("approve", "tests added"));
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["review"],
+    };
+
+    let run = fix.start(&sink).await;
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::Done);
+    let steps = fix.steps(run).await;
+    let review = |attempt: i32| {
+        steps
+            .iter()
+            .find(|step| step.phase_name == "review" && step.attempt == attempt)
+            .unwrap_or_else(|| panic!("review attempt {attempt} ran"))
+    };
+    assert_eq!(
+        review(1).status,
+        StepStatus::Cancelled,
+        "the loop retired it"
+    );
+    let rejected = fix
+        .core_commit(review(1))
+        .await
+        .after_hash
+        .expect("review attempt 1 committed on the primary's tree");
+    let head = head_of(&git, &fix.core.path).await;
+    let exited = git
+        .run(
+            "oracle",
+            &fix.core.path,
+            &[
+                OsStr::new("merge-base"),
+                OsStr::new("--is-ancestor"),
+                OsStr::new(&rejected),
+                OsStr::new(&head),
+            ],
+            &[],
+        )
+        .await
+        .expect("git runs");
+    assert!(
+        !exited.ok(),
+        "the rejected review's commit {rejected} reached the primary at {head}"
+    );
+    assert_eq!(
+        label_of(&git, &fix.core.path, review(1)).await,
+        rejected,
+        "the rejected review's branch stays labelled at its own commit"
+    );
+    assert_eq!(review(2).status, StepStatus::Done);
+    let approved = fix
+        .core_commit(review(2))
+        .await
+        .after_hash
+        .expect("review attempt 2 committed and was merged");
+    assert_eq!(
+        approved, head,
+        "the approving review is the primary's merge"
+    );
+}
+
+// -- milestone 5: the recovery sweep over real git (plan D89-D98, blueprint §10) --------------
+
+/// A [`CommittingSink`] whose session of `key` = `(phase, attempt)` commits as usual and then
+/// never returns (blueprint A-2, F-B): the document is written first only when `write_output`,
+/// then `stalled` is raised. Every other session is the inner sink's.
+///
+/// This is the crash: [`until_stalled`] drops the walk on the signal, so nothing the walk would
+/// have written after the session — `capture`'s `record_commits`, the settle, the gate — lands.
+/// `FakeOrchestrator::stall_after_done` cannot stand in for it: it would stall inside the
+/// fake's own `after_done`, after this sink's commit but with no say over the document.
+struct StallingSink<'a> {
+    inner: CommittingSink<'a>,
+    key: (String, i32),
+    write_output: bool,
+    stalled: Arc<Notify>,
+}
+
+impl<'a> StallingSink<'a> {
+    /// Commits into `repos` on every phase, and stalls `phase` attempt 1.
+    fn new(
+        orch: &'a FakeOrchestrator,
+        repos: &'a [&'a str],
+        phase: &str,
+        write_output: bool,
+    ) -> Self {
+        Self {
+            inner: CommittingSink {
+                orch,
+                repos,
+                phases: &[],
+            },
+            key: (phase.to_owned(), 1),
+            write_output,
+            stalled: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl SessionSink for StallingSink<'_> {
+    async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+        done: &htui_agent::event::DoneEvent,
+    ) -> Result<(), StoreError> {
+        if (phase.name.as_str(), step.attempt) != (self.key.0.as_str(), self.key.1) {
+            return self.inner.after_done(item, step, phase, key, done).await;
+        }
+        self.inner.commit(step, phase, key).await?;
+        if self.write_output {
+            FakeOrchestrator::after_done(self.inner.orch, item, step, phase, key).await?;
+        }
+        self.stalled.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// An [`Isolator`] that is [`GixIsolator`] in every verb except that its `nth` `reconcile` call
+/// (1-based) runs the real merge, raises `stalled` and never returns (blueprint F-A): "the merge
+/// happened, `record_commits` did not". With `nth = u32::MAX` it never stalls and only counts the
+/// `reconcile` calls, which is how a sweep is shown to reconcile a recovered winner exactly once
+/// (blueprint A-3): over real git a repeated reconcile writes no second merge, so the merges alone
+/// cannot tell one call from two.
+#[derive(Debug)]
+struct StallAfterReconcile<'g> {
+    inner: &'g GixIsolator,
+    nth: u32,
+    calls: Mutex<u32>,
+    stalled: Arc<Notify>,
+}
+
+impl<'g> StallAfterReconcile<'g> {
+    fn new(inner: &'g GixIsolator, nth: u32) -> Self {
+        Self {
+            inner,
+            nth,
+            calls: Mutex::new(0),
+            stalled: Arc::new(Notify::new()),
+        }
+    }
+
+    /// A delegate that never stalls and only counts `reconcile` calls.
+    fn counting(inner: &'g GixIsolator) -> Self {
+        Self::new(inner, u32::MAX)
+    }
+
+    /// How many `reconcile` calls reached [`GixIsolator`] so far.
+    fn reconciles(&self) -> u32 {
+        *self
+            .calls
+            .lock()
+            .expect("no panic holds the reconcile counter")
+    }
+}
+
+impl Isolator for StallAfterReconcile<'_> {
+    fn prepare<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        scope: &'a [RepoId],
+        isolation: Isolation,
+        slot: Option<FanoutSlot<'a>>,
+    ) -> IsolatorFuture<'a, Prepared> {
+        self.inner.prepare(run, step, scope, isolation, slot)
+    }
+
+    fn capture<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
+        self.inner.capture(step, trees)
+    }
+
+    fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        self.inner.base(scope)
+    }
+
+    fn diff<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Option<DiffBlock>> {
+        self.inner.diff(trees, commits)
+    }
+
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        self.inner.changed_paths(trees, commits)
+    }
+
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles> {
+        self.inner.env_files(cwd, extra_dirs)
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        winner: StepId,
+        trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
+    ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
+        Box::pin(async move {
+            let merged = self.inner.reconcile(winner, trees, siblings).await?;
+            let call = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .expect("no panic holds the reconcile counter");
+                *calls += 1;
+                *calls
+            };
+            if call == self.nth {
+                self.stalled.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(merged)
+        })
+    }
+
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        self.inner.premerge(step, trees, parts)
+    }
+
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        self.inner.unmerged(step, trees, heads, parts)
+    }
+
+    fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
+        self.inner.cleanup(run, trees)
+    }
+
+    fn reset<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ResetReport> {
+        self.inner.reset(step, trees)
+    }
+
+    fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
+        self.inner.release(run)
+    }
+
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        self.inner.reacquire(run, step, trees)
+    }
+}
+
+impl Fixture {
+    /// The process started after the one that crashed (plan D118's shape over real git): a new
+    /// [`GixIsolator`] over the same repositories — with its own D43 guard table, so nothing the
+    /// dead process held is waited on (blueprint H-12) — a new `owner`, which makes the dead
+    /// process's lease a stranger's, a clock [`RESTART_GAP`] later, past every TTL, and a store
+    /// handle that reads that clock.
+    fn second_process(&self) -> (GixIsolator, Uuid, TestClock, MemStore) {
+        let isolator =
+            GixIsolator::new(self.config.clone()).expect("the first process's config was accepted");
+        let clock = TestClock::at(self.orch.clock.now() + RESTART_GAP);
+        let store = self.orch.store.clone().with_clock(Arc::new(clock.clone()));
+        (isolator, Uuid::now_v7(), clock, store)
+    }
+
+    /// The crash (blueprint A-2): `dispatched` is driven until `stalled` fires and then dropped,
+    /// exactly as a killed process stops. Answers the `FEAT-3` run it left `running`.
+    async fn crash(&self, dispatched: impl Future, stalled: &Notify) -> RunId {
+        until_stalled(dispatched, stalled).await;
+        self.orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.status == RunStatus::Running)
+            .expect("the crash left the run `running`")
+            .id
+    }
+
+    /// `FEAT-3`'s row at `(position, attempt)`.
+    async fn step_at(&self, run: RunId, position: i32, attempt: i32) -> RunStep {
+        self.steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.position == position && step.attempt == attempt)
+            .unwrap_or_else(|| panic!("({position}, {attempt}) exists"))
+    }
+
+    /// Every `item_note` body on `FEAT-3`, oldest first.
+    async fn feat_notes(&self) -> Vec<String> {
+        self.orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect()
+    }
+
+    /// Blueprint §9.3's `{tree}, …` for `step`'s rows, with `labelled`'s `(repo, head)` appended
+    /// as ` labelled htui/<step> at <head>`.
+    async fn trees_text(&self, step: StepId, labelled: &[(RepoId, String)]) -> String {
+        self.orch
+            .store
+            .step_trees(step)
+            .await
+            .expect("MemStore never fails a read")
+            .iter()
+            .map(|tree| {
+                let label = labelled
+                    .iter()
+                    .find(|(repo, _)| *repo == tree.repo_id)
+                    .map_or_else(String::new, |(_, head)| {
+                        format!(" labelled htui/{step} at {head}")
+                    });
+                format!(
+                    "{} {} before_hash {}{label}",
+                    tree.repo_id, tree.path, tree.base_ref
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Repoints `FEAT-3`'s `prd` to `gate = never`, keeping the fixture's isolation.
+    async fn ungate_prd(&self) {
+        repoint(&self.orch.store, ids::HTUI_FEAT_3, |phase| {
+            if phase.name == "prd" {
+                phase.gate = Gate::Never;
+            }
+        })
+        .await;
+    }
+}
+
+/// Every merge commit on the primary's `HEAD`, as `[merge, parent, parent]`.
+async fn merges(git: &Cli, repo: &Path) -> Vec<Vec<String>> {
+    git_out(git, repo, &["log", "--merges", "--format=%H %P"])
+        .await
+        .lines()
+        .map(|line| line.split(' ').map(str::to_owned).collect())
+        .collect()
+}
+
+/// The `[Adopted]` of a sweep that parked `run` at `prd` because its tree was not reset.
+fn parked_not_reset(run: RunId) -> Vec<Adopted> {
+    vec![Adopted {
+        run,
+        next: Next::Parked(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(0),
+            failure: Some(RunFailure::Interrupted {
+                phase: "prd".to_owned(),
+                reset: false,
+            }),
+        }),
+    }]
+}
+
+/// ANA-2 §12 criterion 12, the sweep's half (`docs/ANA-2.md:2118-2119`, plan D93): a `local` step
+/// that started on a dirty checkout and never finished is **never reset**. The maintainer's edit
+/// is byte-identical after the sweep, `HEAD` did not move, no label was written, and the run is
+/// parked `interrupted, tree not reset` with a note naming the checkout and its `before_hash`.
+///
+/// Like its record half, this needs no `git` to walk and sweep — `local` creates nothing and the
+/// dirty path writes nothing — so it is not skipped; only the `git` oracle is.
+#[tokio::test]
+async fn criterion_12_the_sweep_parks_a_dirty_local_step_without_resetting() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    let edited = fix.core.path.join("f");
+    std::fs::write(&edited, "edited by a human\n").expect("the tracked file is writable");
+    // No repo named: the agent commits nothing, so `HEAD` is `before_hash` throughout.
+    let sink = StallingSink::new(&fix.orch, &[], "prd", false);
+    let run = fix.crash(fix.start(&sink), &sink.stalled).await;
+    let prd = fix.step_at(run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Running, "the crash left `prd` live");
+    let listed = fix.trees_text(prd.id, &[]).await;
+
+    let (isolator, owner, clock, store) = fix.second_process();
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
+    .expect("the sweep adopts");
+    assert_eq!(adopted, parked_not_reset(run));
+
+    assert_eq!(
+        std::fs::read_to_string(&edited).expect("the edited file is still there"),
+        "edited by a human\n",
+        "OQ-7: the maintainer's edit is byte-identical"
+    );
+    let prd = fix.step_at(run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_note.as_deref(), prd.gate_outcome),
+        (
+            StepStatus::Failed,
+            Some("interrupted, tree not reset"),
+            None
+        )
+    );
+    let n2 = format!(
+        "interrupted, tree not reset: step {} (`prd` attempt 1); trees: {listed}; reason: dirty \
+         at step start; the run is parked for a human",
+        prd.id
+    );
+    assert!(
+        fix.feat_notes().await.contains(&n2),
+        "{n2}\n{:?}",
+        fix.feat_notes().await
+    );
+    let core_path = fix.core.path.to_string_lossy();
+    assert!(
+        n2.contains(&format!("{core_path} before_hash {}", fix.core.head)),
+        "N2 names the checkout and its `before_hash`: {n2}"
+    );
+    assert_eq!(
+        fix.orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run exists")
+            .status,
+        RunStatus::AwaitingApproval
+    );
+
+    if let Ok(git) = usable_git() {
+        assert_eq!(
+            head_of(&git, &fix.core.path).await,
+            fix.core.head,
+            "nothing moved `HEAD`"
+        );
+        assert!(
+            htui_branches(&git, &fix.core.path).await.is_empty(),
+            "no `htui/` label on the never-reset path"
+        );
+    }
+}
+
+/// ANA-2 §12 criterion 18, second half (`docs/ANA-2.md:2136-2137`, plan D92, OQ-8) over real git:
+/// a `worktree` step that committed and then died before its document is failed `interrupted`
+/// and retried, and attempt 2 starts from **the same base** — which only real git can show
+/// (blueprint F-D): the primary never merged attempt 1, so its `HEAD` is still attempt 1's
+/// `before_hash`. Attempt 1's tree and label are left for a human to read, and `CancelRun`
+/// removes both attempts' trees (criterion 13's path).
+#[tokio::test]
+async fn criterion_18_an_unfinished_worktree_step_is_retried_from_the_same_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let sink = StallingSink::new(&fix.orch, &["core"], "prd", false);
+    let run = fix.crash(fix.start(&sink), &sink.stalled).await;
+    let first = fix.step_at(run, 0, 1).await;
+    let agent = label_of(&git, &fix.core.path, &first).await;
+    assert_ne!(
+        agent, fix.core.head,
+        "the dead agent committed on its branch"
+    );
+
+    let (isolator, owner, clock, store) = fix.second_process();
+    let committing = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &[],
+    };
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.sweep().await
+    )
+    .expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let first = fix.step_at(run, 0, 1).await;
+    assert_eq!(
+        (first.status, first.gate_note.as_deref()),
+        (StepStatus::Failed, Some("interrupted"))
+    );
+
+    let resumed = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.resume(run).await
+    )
+    .expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                ..
+            })
+        ),
+        "attempt 2 walked to `prd`'s `always` gate: {resumed:?}"
+    );
+    let second = fix.step_at(run, 0, 2).await;
+    assert_eq!(second.status, StepStatus::AwaitingApproval);
+    assert_eq!(fix.core_commit(&first).await.before_hash, fix.core.head);
+    assert_eq!(
+        fix.core_commit(&second).await.before_hash,
+        fix.core.head,
+        "attempt 2 starts where attempt 1 did (criterion 18, blueprint F-D)"
+    );
+    assert_eq!(
+        label_of(&git, &fix.core.path, &first).await,
+        agent,
+        "OQ-8: the interrupted attempt's label still names its commit"
+    );
+
+    let listed = worktree_list(&git, &fix.core.path).await;
+    for step in [&first, &second] {
+        let branch = format!("refs/heads/htui/{}", step.id);
+        assert!(
+            listed.iter().any(|entry| {
+                entry.path.starts_with(fix.canonical_root())
+                    && entry.branch.as_deref() == Some(branch.as_str())
+            }),
+            "`git` lists attempt {}'s tree: {listed:?}",
+            step.attempt
+        );
+    }
+
+    let outcome = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.dispatch(Command::CancelRun { run }).await
+    )
+    .expect("a parked run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { .. }),
+        "{outcome:?}"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        for entry in &worktree_list(&git, &checkout.path).await {
+            assert!(
+                !entry.path.starts_with(fix.canonical_root()),
+                "cancel removed both attempts' trees: {entry:?}"
+            );
+        }
+    }
+    assert!(!fix.root.join(run.to_string()).exists());
+    assert_eq!(head_of(&git, &fix.core.path).await, fix.core.head);
+}
+
+/// ANA-2 §12 criterion 18, first half (`docs/ANA-2.md:2135-2136`, plan D90, D91) over real git: a
+/// `worktree` step whose document and capture both landed before the crash — only its settle was
+/// lost — is adopted through its ungated gate, and its branch is merged into the primary exactly
+/// once (blueprint A-3), with the parents a `--no-ff` merge of it has.
+///
+/// Both repositories are committed to, because D90 reads "finished" as every repo of the run's
+/// scope having an `after_hash`: a repo the step left untouched captures as `None`, which the rows
+/// cannot tell from "never captured".
+#[tokio::test]
+async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.ungate_prd().await;
+    let sink = StallingSink::new(&fix.orch, &["core", "docs"], "prd", true);
+    let run = fix.crash(fix.start(&sink), &sink.stalled).await;
+    let prd = fix.step_at(run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Running, "the crash left `prd` live");
+
+    let (isolator, owner, clock, store) = fix.second_process();
+    // "Capture landed, settle lost": stage 5's first two writes, by hand.
+    let trees = fix
+        .orch
+        .store
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    let captured = isolator
+        .capture(prd.id, &trees)
+        .await
+        .expect("both trees are where the dead walk left them");
+    fix.orch
+        .store
+        .record_commits(StepFence::Lease(fix.orch.owner()), prd.id, &captured)
+        .await
+        .expect("MemStore records the capture");
+    let after = fix
+        .core_commit(&prd)
+        .await
+        .after_hash
+        .expect("the agent committed on `core`");
+    let docs_after = fix
+        .docs_commit(&prd)
+        .await
+        .after_hash
+        .expect("the agent committed on `docs`");
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+    assert!(merges(&git, &fix.docs.path).await.is_empty());
+
+    let counting = StallAfterReconcile::counting(&isolator);
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &counting,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
+    .expect("the sweep adopts");
+    assert_eq!(
+        counting.reconciles(),
+        1,
+        "blueprint A-3: the recovered winner is reconciled exactly once"
+    );
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    assert_eq!(
+        fix.step_at(run, 0, 1).await.status,
+        StepStatus::Done,
+        "D91: re-settled and passed its `never` gate"
+    );
+    let merged = merges(&git, &fix.core.path).await;
+    assert_eq!(merged.len(), 1, "merged exactly once: {merged:?}");
+    assert_eq!(
+        merged[0][1..],
+        [fix.core.head.clone(), after],
+        "a `--no-ff` merge of the step's branch into the base"
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, merged[0][0]);
+    assert_eq!(
+        fix.core_commit(&prd).await.after_hash.as_deref(),
+        Some(merged[0][0].as_str()),
+        "ANA-2 `:987-988`: the winner's `after_hash` is the merge"
+    );
+    let docs_merged = merges(&git, &fix.docs.path).await;
+    assert_eq!(
+        docs_merged.len(),
+        1,
+        "`docs` merged exactly once: {docs_merged:?}"
+    );
+    assert_eq!(
+        docs_merged[0][1..],
+        [fix.docs.head.clone(), docs_after],
+        "every repo of the scope is merged, not only the primary"
+    );
+    assert_eq!(head_of(&git, &fix.docs.path).await, docs_merged[0][0]);
+    assert_eq!(
+        fix.docs_commit(&prd).await.after_hash.as_deref(),
+        Some(docs_merged[0][0].as_str())
+    );
+}
+
+// -- MOD-139 M3 T5: divided runs over real git (blueprint §T5.1) -------------------------------
+
+/// Rewrites `item`'s live graph through `replace_graph`: `implement` divided (`split = divide`,
+/// `fan_out` 1) into one default part per key, each owning `src/<key>/**`. The conformance
+/// suite's `divided_feat_3` edit, over this binary's store.
+async fn divide_implement(store: &MemStore, item: ItemId, parts: &[&str]) {
+    let graph = store
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph")
+        .graph
+        .id;
+    let mut body = store
+        .graph_body(graph)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item's graph is there");
+    let node = body
+        .nodes
+        .iter_mut()
+        .find(|node| node.phase.name == "implement")
+        .expect("FEAT-3's graph has `implement`");
+    node.phase.split = Split::Divide;
+    node.phase.fan_out = 1;
+    let phase = node.phase.id;
+    node.parts = parts
+        .iter()
+        .enumerate()
+        .map(|(position, key)| PhasePart {
+            phase_id: phase,
+            position: i32::try_from(position).expect("a handful of parts"),
+            key: (*key).to_owned(),
+            title: format!("The {key}"),
+            brief: format!("Build the {key} part."),
+            owned_paths: vec![format!("src/{key}/**")],
+            acceptance: Some(format!("the {key} tests pass")),
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        })
+        .collect();
+    let outcome = store
+        .replace_graph(graph, body.graph.revision, body)
+        .await
+        .expect("the store takes the divided graph");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+}
+
+/// `git <args>` in `repo` under htui's merge identity, whatever it exits with: whether it
+/// succeeded, then its stdout.
+async fn git_as(git: &Cli, repo: &Path, args: &[&str]) -> (bool, String) {
+    let argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exited = git
+        .run("oracle", repo, &argv, &IDENTITY_ENV)
+        .await
+        .expect("git runs");
+    (exited.ok(), exited.stdout)
+}
+
+/// [`git_as`], failing the case on a non-zero exit.
+async fn git_ok(git: &Cli, repo: &Path, args: &[&str]) -> String {
+    let (ok, stdout) = git_as(git, repo, args).await;
+    assert!(ok, "git {args:?} failed in {repo:?}");
+    stdout
+}
+
+/// The agent of a divided run over real git (blueprint §T5.1).
+///
+/// A part session (`implement/<key>`) commits `src/<key>/lib.rs` into its `core` tree, and also
+/// `src/shared.rs` naming its key when `shared`, which is what makes two parts conflict. The
+/// integrate session finishes what its pre-merge could not: it reads its own `premerge` note, and
+/// for each part the note reports conflicted in `core` it runs `git merge --no-ff <tip>`, writes
+/// the union of both sides of every conflicted path, adds them and commits. Every session then
+/// lets the fake orchestrator write its output document.
+///
+/// `CommittingSink` cannot stand in for the parts: its `commit_file` writes one flat file named
+/// by the fan-out index, and the parts own paths under `src/<key>/`.
+struct MergingSink<'a> {
+    orch: &'a FakeOrchestrator,
+    git: &'a Cli,
+    /// The repository the parts commit to and the integrate session resolves in.
+    core: RepoId,
+    /// Whether every part also writes `src/shared.rs`.
+    shared: bool,
+}
+
+impl MergingSink<'_> {
+    /// `step`'s tree of the `core` repository.
+    async fn core_tree(&self, step: &RunStep) -> Result<PathBuf, StoreError> {
+        let trees = self.orch.store.step_trees(step.id).await?;
+        Ok(trees
+            .into_iter()
+            .find(|tree| tree.repo_id == self.core)
+            .map(|tree| PathBuf::from(tree.path))
+            .expect("the step holds a `core` tree"))
+    }
+
+    /// The part session's commit: its own file, and the shared one when `shared`.
+    async fn commit_part(&self, step: &RunStep) -> Result<(), StoreError> {
+        let key = step
+            .phase_name
+            .rsplit('/')
+            .next()
+            .expect("a part's phase is `<node>/<key>`");
+        let tree = self.core_tree(step).await?;
+        std::fs::create_dir_all(tree.join("src").join(key)).expect("the part's directory");
+        std::fs::write(
+            tree.join("src").join(key).join("lib.rs"),
+            format!("pub fn {key}() {{}}\n"),
+        )
+        .expect("the part's file is written");
+        if self.shared {
+            std::fs::write(tree.join("src/shared.rs"), format!("// written by {key}\n"))
+                .expect("the shared file is written");
+        }
+        git_ok(self.git, &tree, &["add", "-A"]).await;
+        git_ok(
+            self.git,
+            &tree,
+            &["commit", "-m", &format!("htui test: {}", step.phase_name)],
+        )
+        .await;
+        Ok(())
+    }
+
+    /// The integrate session's merge of every part its `premerge` note reports conflicted in
+    /// `core`, by tip.
+    async fn finish_merge(&self, item: ItemId, step: &RunStep) -> Result<(), StoreError> {
+        let notes = self.orch.store.notes(item).await?;
+        let Some(note) = notes
+            .iter()
+            .rev()
+            .find(|note| note.via_step_id == Some(step.id) && note.body.starts_with("premerge `"))
+        else {
+            return Ok(());
+        };
+        let mut repo = "";
+        let mut tips = Vec::new();
+        for line in note.body.lines() {
+            if let Some(header) = line.strip_prefix("repo `") {
+                repo = header.split('`').next().unwrap_or_default();
+            } else if repo == "core"
+                && let Some(rest) = line.strip_prefix("- part `")
+                && let Some(head) =
+                    rest.strip_suffix(": conflicted, merge aborted; conflicted paths:")
+                && let Some((_, tip)) = head.split_once("` ")
+            {
+                tips.push(tip.to_owned());
+            }
+        }
+        if tips.is_empty() {
+            return Ok(());
+        }
+        let tree = self.core_tree(step).await?;
+        for tip in &tips {
+            let (merged, _) =
+                git_as(self.git, &tree, &["merge", "--no-ff", "--no-edit", tip]).await;
+            assert!(
+                !merged,
+                "the note said {tip} conflicts, so the agent's merge stops too"
+            );
+            let conflicted =
+                git_ok(self.git, &tree, &["diff", "--name-only", "--diff-filter=U"]).await;
+            for path in conflicted.lines() {
+                let ours = git_ok(self.git, &tree, &["show", &format!(":2:{path}")]).await;
+                let theirs = git_ok(self.git, &tree, &["show", &format!(":3:{path}")]).await;
+                std::fs::write(tree.join(path), format!("{ours}{theirs}"))
+                    .expect("the union is written");
+                git_ok(self.git, &tree, &["add", path]).await;
+            }
+            git_ok(self.git, &tree, &["commit", "--no-edit"]).await;
+        }
+        Ok(())
+    }
+}
+
+impl SessionSink for MergingSink<'_> {
+    async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+        _done: &htui_agent::event::DoneEvent,
+    ) -> Result<(), StoreError> {
+        match step.role {
+            StepRole::Part => self.commit_part(step).await?,
+            StepRole::Integrate => self.finish_merge(item, step).await?,
+            _ => {}
+        }
+        FakeOrchestrator::after_done(self.orch, item, step, phase, key).await?;
+        Ok(())
+    }
+}
+
+impl Fixture {
+    /// `FEAT-3` ungated in the fixture's isolation with every phase's `input_kinds` cleared,
+    /// `review` attempt 1 approving, and `implement` divided into `parts`.
+    async fn divided(&self, parts: &[&str]) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_FEAT_3, |phase| {
+            phase.isolation = Some(isolation);
+            phase.gate = Gate::Never;
+            phase.input_kinds.clear();
+        })
+        .await;
+        divide_implement(&self.orch.store, ids::HTUI_FEAT_3, parts).await;
+        self.orch
+            .script("review", 1, ScriptedStep::review("approve", "fine"));
+    }
+
+    /// The divided run started through `StartRun` with `sink`, walked to `done`: its part rows
+    /// (plan order) and its one integrate row.
+    async fn divided_run<K: SessionSink>(&self, sink: &K) -> (RunId, Vec<RunStep>, RunStep) {
+        let run = self.start(sink).await;
+        let row = self.orch.run(run).await;
+        assert_eq!(
+            (row.status, row.failure.as_ref()),
+            (RunStatus::Done, None),
+            "the divided run lands"
+        );
+        let steps = self.steps(run).await;
+        let mut parts: Vec<RunStep> = steps
+            .iter()
+            .filter(|step| step.role == StepRole::Part)
+            .cloned()
+            .collect();
+        parts.sort_by_key(|step| (step.position, step.attempt));
+        let integrates: Vec<&RunStep> = steps
+            .iter()
+            .filter(|step| step.role == StepRole::Integrate)
+            .collect();
+        assert_eq!(integrates.len(), 1, "one integrate attempt: {integrates:?}");
+        (run, parts, integrates[0].clone())
+    }
+
+    /// Blueprint §T5.1's landing, on `core`: `HEAD` is the one `htui: reconcile <integrate>`
+    /// merge, its first parent the base and its second integrate's capture; every part tip is
+    /// in its second parent's history; no part was reconciled anywhere; integrate's history
+    /// holds one `htui: premerge <part>` merge per part. Answers the part tips, plan order.
+    async fn assert_one_landing(
+        &self,
+        git: &Cli,
+        parts: &[RunStep],
+        integrate: &RunStep,
+    ) -> Vec<String> {
+        let core = &self.core.path;
+        let head = head_of(git, core).await;
+        assert_eq!(
+            git_out(git, core, &["log", "-1", "--format=%s"]).await,
+            format!("htui: reconcile {}", integrate.id),
+            "the primary's `HEAD` is integrate's reconcile merge"
+        );
+        let parents: Vec<String> = git_out(git, core, &["log", "-1", "--format=%P"])
+            .await
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        let captured = self.core_commit(integrate).await;
+        assert_eq!(
+            captured.before_hash, self.core.head,
+            "integrate prepared from the plan's base"
+        );
+        assert_eq!(parents.len(), 2, "a `--no-ff` merge: {parents:?}");
+        assert_eq!(parents[0], self.core.head, "its first parent is the base");
+        assert_eq!(
+            captured.after_hash.as_deref(),
+            Some(head.as_str()),
+            "integrate's `after_hash` is the reconcile merge"
+        );
+        let mut tips = Vec::new();
+        for part in parts {
+            let tip = self
+                .core_commit(part)
+                .await
+                .after_hash
+                .unwrap_or_else(|| panic!("part `{}` committed on `core`", part.phase_name));
+            for descendant in [&head, &parents[1]] {
+                git_out(
+                    git,
+                    core,
+                    &["merge-base", "--is-ancestor", &tip, descendant],
+                )
+                .await;
+            }
+            tips.push(tip);
+        }
+        let subjects = git_out(git, core, &["log", "--all", "--format=%s"]).await;
+        for part in parts {
+            let reconciled = format!("htui: reconcile {}", part.id);
+            assert!(
+                !subjects.lines().any(|subject| subject == reconciled),
+                "a part is never reconciled: {subjects}"
+            );
+        }
+        let history = git_out(git, core, &["log", "--merges", "--format=%s", &parents[1]]).await;
+        for part in parts {
+            let premerge = premerge_message(part.id);
+            assert_eq!(
+                history
+                    .lines()
+                    .filter(|subject| *subject == premerge)
+                    .count(),
+                1,
+                "integrate's history holds `{premerge}` once: {history}"
+            );
+        }
+        assert_eq!(
+            merges(git, core).await.len(),
+            1 + parts.len(),
+            "the reconcile merge and one pre-merge per part, nothing else"
+        );
+        assert_eq!(
+            head_of(git, &self.docs.path).await,
+            self.docs.head,
+            "no part committed on `docs`, so nothing landed there"
+        );
+        tips
+    }
+}
+
+/// MOD-139 M3 D1-D3, D7 over real git, `worktree`: a divided run's two parts, on disjoint files,
+/// are pre-merged into integrate's tree and land on the primary as **one** reconcile merge, of
+/// integrate; no part is reconciled on its own.
+#[tokio::test]
+async fn a_divided_run_lands_one_integrate_merge_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: false,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    assert_eq!(
+        parts
+            .iter()
+            .map(|part| part.phase_name.as_str())
+            .collect::<Vec<_>>(),
+        ["implement/api", "implement/ui"]
+    );
+    fix.assert_one_landing(&git, &parts, &integrate).await;
+    assert_eq!(
+        git_out(
+            &git,
+            &fix.core.path,
+            &["ls-tree", "-r", "--name-only", "HEAD", "src"]
+        )
+        .await,
+        "src/api/lib.rs\nsrc/ui/lib.rs",
+        "both parts' files reached the primary"
+    );
+}
+
+/// MOD-139 M3 D2, D7 over real git, `copy`: the pre-merge copies each part's range into
+/// integrate's copy first, and reconcile's `copy_range` walks every parent, so the part commits
+/// reach the primary on the reconcile merge's second-parent side.
+#[tokio::test]
+async fn a_divided_run_lands_one_integrate_merge_in_copy_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: false,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    for part in &parts {
+        assert_eq!(fix.core_commit(part).await.before_hash, fix.core.head);
+    }
+    fix.assert_one_landing(&git, &parts, &integrate).await;
+    assert_eq!(
+        git_out(
+            &git,
+            &fix.core.path,
+            &["ls-tree", "-r", "--name-only", "HEAD", "src"]
+        )
+        .await,
+        "src/api/lib.rs\nsrc/ui/lib.rs",
+        "both parts' files reached the primary"
+    );
+}
+
+/// MOD-139 M3 D3-D6 over real git, `worktree`: both parts change `src/shared.rs`, so the
+/// pre-merge merges `api`, aborts `ui` and says so in its note; the integrate agent finishes the
+/// merge from the note's tip, and the post-check passes on attempt 1.
+#[tokio::test]
+async fn a_conflicting_premerge_is_resolved_by_the_agent() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: true,
+    };
+
+    let (_, parts, integrate) = fix.divided_run(&sink).await;
+    assert_eq!(
+        (integrate.attempt, integrate.status),
+        (1, StepStatus::Done),
+        "the post-check passed on the first attempt"
+    );
+    let core = &fix.core.path;
+    let head = head_of(&git, core).await;
+    let mut tips = Vec::new();
+    for part in &parts {
+        let tip = fix
+            .core_commit(part)
+            .await
+            .after_hash
+            .expect("the part committed on `core`");
+        git_out(&git, core, &["merge-base", "--is-ancestor", &tip, &head]).await;
+        tips.push(tip);
+    }
+    let [api, ui] = tips.as_slice() else {
+        panic!("two parts: {tips:?}");
+    };
+
+    let notes: Vec<String> = fix
+        .orch
+        .store
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .filter(|note| note.via_step_id == Some(integrate.id))
+        .map(|note| note.body)
+        .filter(|body| body.starts_with("premerge `implement` attempt 1:\n"))
+        .collect();
+    assert_eq!(notes.len(), 1, "one premerge note: {notes:?}");
+    let note = &notes[0];
+    assert!(
+        note.contains(&format!("\n- part `api` {api}: merged as ")),
+        "`api` merged first: {note}"
+    );
+    assert!(
+        note.contains(&format!(
+            "\n- part `ui` {ui}: conflicted, merge aborted; conflicted paths:\n  - src/shared.rs"
+        )),
+        "the note names `ui` conflicted on `src/shared.rs`: {note}"
+    );
+    assert_eq!(
+        git_out(&git, core, &["log", "-1", "--format=%s"]).await,
+        format!("htui: reconcile {}", integrate.id)
+    );
+    let subjects = git_out(&git, core, &["log", "--format=%s", &head]).await;
+    assert_eq!(
+        subjects
+            .lines()
+            .filter(|subject| subject.starts_with("htui: premerge "))
+            .collect::<Vec<_>>(),
+        [premerge_message(parts[0].id)],
+        "only `api` was pre-merged; the agent merged `ui`"
+    );
+    assert_eq!(
+        git_out(&git, core, &["show", "HEAD:src/shared.rs"]).await,
+        "// written by api\n// written by ui",
+        "the agent's union of both sides landed"
+    );
+}
+
+/// Plan D25, D92 over a `shared_serialized` checkout: the unfinished step's commit sits on the
+/// checkout itself, so the sweep labels it `htui/<step>` and `reset --hard`s the checkout to its
+/// `before_hash` before retrying — the work stays reachable, the retry starts clean from the
+/// base.
+///
+/// Blueprint A-6's leg: the same crash over a `local` checkout is **not** reset, because a
+/// `local` checkout is the maintainer's own branch. The step fails `interrupted, tree not reset`
+/// with `local_moved` as the reason, and nothing is labelled or moved.
+#[tokio::test]
+async fn a_clean_shared_checkout_is_labelled_then_reset_and_retried() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    for isolation in [Isolation::SharedSerialized, Isolation::Local] {
+        let fix = Fixture::new(isolation, None).await;
+        let sink = StallingSink::new(&fix.orch, &["core"], "prd", false);
+        let run = fix.crash(fix.start(&sink), &sink.stalled).await;
+        let first = fix.step_at(run, 0, 1).await;
+        let agent = head_of(&git, &fix.core.path).await;
+        assert_ne!(
+            agent, fix.core.head,
+            "the dead agent committed on the checkout"
+        );
+
+        let (isolator, owner, clock, store) = fix.second_process();
+        let adopted = engine_as!(
+            &fix,
+            &store,
+            &isolator,
+            &clock,
+            owner,
+            &fix.orch,
+            |engine| engine.sweep().await
+        )
+        .expect("the sweep adopts");
+        let first_now = fix.step_at(run, 0, 1).await;
+
+        if isolation == Isolation::Local {
+            assert_eq!(adopted, parked_not_reset(run), "blueprint A-6");
+            assert_eq!(
+                (first_now.status, first_now.gate_note.as_deref()),
+                (StepStatus::Failed, Some("interrupted, tree not reset"))
+            );
+            assert_eq!(
+                head_of(&git, &fix.core.path).await,
+                agent,
+                "the maintainer's branch is not moved backwards"
+            );
+            assert!(htui_branches(&git, &fix.core.path).await.is_empty());
+            let listed = fix.trees_text(first.id, &[]).await;
+            let reason = local_moved(&fix.core.path, &agent, &fix.core.head);
+            let n2 = format!(
+                "interrupted, tree not reset: step {} (`prd` attempt 1); trees: {listed}; \
+                 reason: {reason}; the run is parked for a human",
+                first.id
+            );
+            assert!(
+                fix.feat_notes().await.contains(&n2),
+                "{n2}\n{:?}",
+                fix.feat_notes().await
+            );
+            continue;
+        }
+
+        assert_eq!(
+            adopted,
+            [Adopted {
+                run,
+                next: Next::Walk
+            }]
+        );
+        assert_eq!(
+            (first_now.status, first_now.gate_note.as_deref()),
+            (StepStatus::Failed, Some("interrupted"))
+        );
+        assert_eq!(
+            label_of(&git, &fix.core.path, &first).await,
+            agent,
+            "D92: the label keeps the dead attempt's work reachable"
+        );
+        assert_eq!(
+            head_of(&git, &fix.core.path).await,
+            fix.core.head,
+            "and the checkout is back at `before_hash`"
+        );
+        assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+        let listed = fix
+            .trees_text(first.id, &[(fix.core.id, agent.clone())])
+            .await;
+        let n1 = format!(
+            "interrupted: step {} (`prd` attempt 1) did not finish; trees: {listed}; retrying as \
+             attempt 2",
+            first.id
+        );
+        assert!(
+            fix.feat_notes().await.contains(&n1),
+            "{n1}\n{:?}",
+            fix.feat_notes().await
+        );
+        assert_eq!(fix.step_at(run, 0, 2).await.status, StepStatus::Pending);
+
+        let resumed = engine_as!(
+            &fix,
+            &store,
+            &isolator,
+            &clock,
+            owner,
+            &fix.orch,
+            |engine| engine.resume(run).await
+        )
+        .expect("the adopter walks it");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "{resumed:?}"
+        );
+        let second = fix.step_at(run, 0, 2).await;
+        assert_eq!(second.status, StepStatus::AwaitingApproval);
+        assert_eq!(
+            fix.core_commit(&second).await.before_hash,
+            fix.core.head,
+            "attempt 2 is prepared from the base"
+        );
+    }
+}
+
+/// Plan D97 over real git (blueprint F-A): the first process's reconcile **merged** and died
+/// before `record_commits`, so the primary holds merge M while `prd`'s `after_hash` still names
+/// the branch tip. The adopter's frontier reconcile recognises M by its parents
+/// (`[before_hash, tip]`) instead of merging again, and records it.
+#[tokio::test]
+async fn a_lost_merge_is_recognised_not_repeated() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.ungate_prd().await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &[],
+    };
+    let stalling = StallAfterReconcile::new(&fix.isolator, 1);
+    let dispatched = async {
+        engine_as!(
+            &fix,
+            &fix.orch.store,
+            &stalling,
+            &fix.orch.clock,
+            fix.orch.owner(),
+            &sink,
+            |engine| engine
+                .dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode: RunMode::Manual,
+                    repo_scope: Some(vec![fix.core.id, fix.docs.id]),
+                    workspace: None,
+                })
+                .await
+        )
+    };
+    let run = fix.crash(dispatched, &stalling.stalled).await;
+    let prd = fix.step_at(run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Done, "stage 6 moved it `done`");
+    let tip = label_of(&git, &fix.core.path, &prd).await;
+    let merged = merges(&git, &fix.core.path).await;
+    assert_eq!(merged.len(), 1, "the dead process merged: {merged:?}");
+    assert_eq!(merged[0][1..], [fix.core.head.clone(), tip.clone()]);
+    let m = merged[0][0].clone();
+    assert_eq!(
+        fix.core_commit(&prd).await.after_hash.as_deref(),
+        Some(tip.as_str()),
+        "the merge was lost: `after_hash` is still capture's"
+    );
+
+    let (isolator, owner, clock, store) = fix.second_process();
+    let counting = StallAfterReconcile::counting(&isolator);
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &counting,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
+    .expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    assert_eq!(
+        counting.reconciles(),
+        1,
+        "blueprint A-3: the frontier reconcile runs once for the recovered winner"
+    );
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        merged,
+        "one merge: recognised, not repeated"
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, m);
+    assert_eq!(
+        fix.core_commit(&prd).await.after_hash.as_deref(),
+        Some(m.as_str()),
+        "and `record_commits` now names M"
+    );
+}
+
+/// Plan D136: one `worktree` step of a run of its own over `core`, prepared from wherever `core`
+/// is now, that commits `name` in its tree and is captured — what a run holds at reconcile. The
+/// answer is the step, its tip and its rows.
+async fn committed_worktree_step(
+    fix: &Fixture,
+    name: &str,
+    body: &str,
+) -> (StepId, String, Vec<RunStepTree>) {
+    committed_worktree_step_in(fix, RunId::new(), name, body).await
+}
+
+/// [`committed_worktree_step`] as one step of `run`, so two calls give two steps of one run
+/// (MOD-138 M3 D5): two nodes of one walk branched from one base.
+async fn committed_worktree_step_in(
+    fix: &Fixture,
+    run: RunId,
+    name: &str,
+    body: &str,
+) -> (StepId, String, Vec<RunStepTree>) {
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(run, step, &[fix.core.id], Isolation::Worktree, None)
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    let after = commit_file(Path::new(&rows[0].path), name, body, "the step commits");
+    fix.isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+    (step, after, rows)
+}
+
+/// Plan D136 (review H4): rule P admits two isolated runs on one repository when their paths are
+/// disjoint, so both start from the same base and the second to reconcile finds the primary
+/// already moved — by the first one's merge. The base is an ancestor of that `HEAD` and the
+/// primary is clean, so the second is merged on top: two merges on the primary, each run's file
+/// in its tree.
+#[tokio::test]
+async fn two_disjoint_isolated_runs_on_one_repo_both_reconcile() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, a_tip, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, b_tip, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    assert_eq!(a_rows[0].base_ref, fix.core.head);
+    assert_eq!(
+        b_rows[0].base_ref, fix.core.head,
+        "both runs start from one base"
+    );
+
+    let first = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    assert_eq!(first[0].after_hash.as_deref(), Some(m1.as_str()));
+    assert_eq!(second[0].after_hash.as_deref(), Some(m2.as_str()));
+    assert_eq!(
+        second[0].before_hash, fix.core.head,
+        "the row's base is unchanged"
+    );
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        vec![
+            vec![m2.clone(), m1.clone(), b_tip],
+            vec![m1, fix.core.head.clone(), a_tip],
+        ],
+        "two merges, the second on top of the first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("a.txt")).expect("run a's file"),
+        "run a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("b.txt")).expect("run b's file"),
+        "run b\n"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// Plan D141 (review M-A): the second run's merge sits on the first one's, so its row reads
+/// `(base, merge)` and `base..merge` holds both runs' files. The diff a retry reads as its
+/// `previous_diff` is this step's own: the merge against its first parent, naming `b.txt` only.
+#[tokio::test]
+async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    let diff = fix
+        .isolator
+        .diff(&b_rows, &second)
+        .await
+        .expect("the diff reads")
+        .expect("the second run committed");
+    assert_eq!(diff.range, format!("{m1}..{m2}"), "the merge's own range");
+    assert!(diff.stat.contains("b.txt"), "its own path: {}", diff.stat);
+    assert!(
+        !diff.stat.contains("a.txt") && !diff.diff.contains("a.txt"),
+        "never the other run's path: {}",
+        diff.diff
+    );
+}
+
+/// MOD-9 D119: a worktree step's committed paths, one row per file, keyed by the repo.
+#[tokio::test]
+async fn changed_paths_of_a_worktree_step_names_its_committed_paths() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(
+            RunId::new(),
+            step,
+            &[fix.core.id],
+            Isolation::Worktree,
+            None,
+        )
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    commit_file(
+        Path::new(&rows[0].path),
+        "a.txt",
+        "a\n",
+        "the step commits a",
+    );
+    commit_file(
+        Path::new(&rows[0].path),
+        "b.txt",
+        "b\n",
+        "the step commits b",
+    );
+    let commits = fix
+        .isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+
+    assert_eq!(
+        fix.isolator
+            .changed_paths(&rows, &commits)
+            .await
+            .expect("the changed paths read"),
+        ChangedPaths {
+            paths: vec![
+                (fix.core.id, "a.txt".to_owned()),
+                (fix.core.id, "b.txt".to_owned()),
+            ],
+            truncated: false,
+        }
+    );
+}
+
+/// MOD-9 D119 over plan D141: a reconcile merge onto a moved primary names only its own paths,
+/// read from the merge's first parent exactly as `diff` reads it.
+#[tokio::test]
+async fn changed_paths_of_a_reconcile_merge_uses_the_first_parent() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+
+    assert_eq!(
+        fix.isolator
+            .changed_paths(&b_rows, &second)
+            .await
+            .expect("the changed paths read"),
+        ChangedPaths {
+            paths: vec![(fix.core.id, "b.txt".to_owned())],
+            truncated: false,
+        },
+        "the merge's own path, never the other run's `a.txt`"
+    );
+}
+
+/// Plan D146 (review M2): a later run's merge moves `HEAD` past the middle one's, which is then
+/// neither `HEAD` nor its first parent. The middle run's diff is still its own merge against that
+/// merge's first parent, naming `b.txt` only, and so it stays on a detached `HEAD` as well.
+#[tokio::test]
+async fn a_merge_with_head_moved_past_it_diffs_only_its_own_paths() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    let (c, _, c_rows) = committed_worktree_step(&fix, "c.txt", "run c\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+    fix.isolator
+        .reconcile(c, &c_rows, &[])
+        .await
+        .expect("the third run reconciles on top of the second one's merge");
+    let m3 = head_of(&git, &fix.core.path).await;
+    assert_ne!(m3, m2, "HEAD moved past the second run's merge");
+
+    for head in ["on the branch", "detached"] {
+        if head == "detached" {
+            git_out(&git, &fix.core.path, &["checkout", "-q", "--detach"]).await;
+        }
+        let diff = fix
+            .isolator
+            .diff(&b_rows, &second)
+            .await
+            .expect("the diff reads")
+            .expect("the second run committed");
+        assert_eq!(
+            diff.range,
+            format!("{m1}..{m2}"),
+            "the merge's own range, HEAD {head}"
+        );
+        assert!(diff.stat.contains("b.txt"), "its own path: {}", diff.stat);
+        assert!(
+            !diff.stat.contains("a.txt") && !diff.diff.contains("a.txt"),
+            "never the earlier run's path, HEAD {head}: {}",
+            diff.diff
+        );
+        assert!(
+            !diff.stat.contains("c.txt") && !diff.diff.contains("c.txt"),
+            "never the later run's path, HEAD {head}: {}",
+            diff.diff
+        );
+    }
+}
+
+/// Plan D146 (R-33): an agent's branch that ends in a two-parent commit it made itself, with D25's
+/// `htui: reconcile <step>` message, is not htui's merge: it is not on the primary's first-parent
+/// line. Its row still diffs `before..after`, so the agent's earlier commit stays in the diff.
+#[tokio::test]
+async fn an_agent_branch_ending_in_a_spoofed_reconcile_merge_still_diffs_from_its_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(
+            RunId::new(),
+            step,
+            &[fix.core.id],
+            Isolation::Worktree,
+            None,
+        )
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    let tree = Path::new(&rows[0].path);
+    commit_file(tree, "agent.txt", "the agent's work\n", "the agent commits");
+    let message = format!("htui: reconcile {step}");
+    let spoof = git_out(
+        &git,
+        tree,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=agent@example.invalid",
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-p",
+            &fix.core.head,
+            "-m",
+            &message,
+        ],
+    )
+    .await;
+    git_out(&git, tree, &["update-ref", "HEAD", &spoof]).await;
+    let commits = fix
+        .isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+    assert_eq!(
+        commits[0].after_hash.as_deref(),
+        Some(spoof.as_str()),
+        "the branch ends in the spoofed merge"
+    );
+
+    let diff = fix
+        .isolator
+        .diff(&rows, &commits)
+        .await
+        .expect("the diff reads")
+        .expect("the step committed");
+    assert_eq!(
+        diff.range,
+        format!("{}..{spoof}", fix.core.head),
+        "the row's own range, not the spoof's first parent"
+    );
+    assert!(
+        diff.stat.contains("agent.txt"),
+        "the agent's earlier commit stays in the diff: {}",
+        diff.stat
+    );
+}
+
+/// Plan D146 (R-33, verifier round): under `local` and `shared_serialized` the agent commits
+/// onto the checkout itself, so a spoofed `htui: reconcile <step>` merge it makes *is* on the
+/// primary's first-parent line. Those modes never merge at reconcile, so no row of theirs is
+/// htui's merge and each still diffs `before..after`.
+#[tokio::test]
+async fn an_in_place_spoofed_reconcile_merge_still_diffs_from_its_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    for mode in [Isolation::Local, Isolation::SharedSerialized] {
+        let fix = Fixture::new(mode, None).await;
+        let step = StepId::new();
+        let prepared = fix
+            .isolator
+            .prepare(RunId::new(), step, &[fix.core.id], mode, None)
+            .await
+            .expect("the in-place mode prepares");
+        let rows: Vec<RunStepTree> = prepared
+            .trees
+            .iter()
+            .map(|tree| tree.tree.clone())
+            .collect();
+        let tree = Path::new(&rows[0].path);
+        commit_file(tree, "agent.txt", "the agent's work\n", "the agent commits");
+        let message = format!("htui: reconcile {step}");
+        let spoof = git_out(
+            &git,
+            tree,
+            &[
+                "-c",
+                "user.name=agent",
+                "-c",
+                "user.email=agent@example.invalid",
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-p",
+                &fix.core.head,
+                "-m",
+                &message,
+            ],
+        )
+        .await;
+        git_out(&git, tree, &["update-ref", "HEAD", &spoof]).await;
+        let commits = fix
+            .isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert_eq!(
+            commits[0].after_hash.as_deref(),
+            Some(spoof.as_str()),
+            "{mode:?}: the checkout ends in the spoofed merge"
+        );
+
+        let diff = fix
+            .isolator
+            .diff(&rows, &commits)
+            .await
+            .expect("the diff reads")
+            .expect("the step committed");
+        assert_eq!(
+            diff.range,
+            format!("{}..{spoof}", fix.core.head),
+            "{mode:?}: the row's own range, not the spoof's first parent"
+        );
+        assert!(
+            diff.stat.contains("agent.txt"),
+            "{mode:?}: the agent's earlier commit stays in the diff: {}",
+            diff.stat
+        );
+    }
+}
+
+/// Plan D147/D148 (R-33): a primary whose own config sets `merge.log=true` would have `git merge`
+/// append a shortlog body to D25's message. `merge_no_ff` turns it off, so the merge's message is
+/// exactly `htui: reconcile <step>`, and the second run's merge still diffs from its first parent.
+#[tokio::test]
+async fn a_primary_with_merge_log_still_diffs_a_moved_primary_merge_from_its_first_parent() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    git_out(&git, &fix.core.path, &["config", "merge.log", "true"]).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    let diff = fix
+        .isolator
+        .diff(&b_rows, &second)
+        .await
+        .expect("the diff reads")
+        .expect("the second run committed");
+    assert_eq!(diff.range, format!("{m1}..{m2}"), "the merge's own range");
+    assert!(
+        !diff.stat.contains("a.txt"),
+        "never the other run's path: {}",
+        diff.stat
+    );
+    assert_eq!(
+        git_out(&git, &fix.core.path, &["log", "-1", "--format=%B", &m2]).await,
+        format!("htui: reconcile {b}"),
+        "D25's message, with no shortlog body"
+    );
+}
+
+/// Plan D136's in-process race: rule P admits two isolated runs on one repository, and one
+/// process may reconcile both at once. Without D70's admin lock held from the `HEAD` read to the
+/// merge's post-condition, B can read `HEAD` at the base, A merge, and B's merge land on A's — B's
+/// `[HEAD read, after]` post-condition then fails and B parks although its merge is on the
+/// primary. Driven concurrently many times, both reconciles answer, and every round adds exactly
+/// two merges, one on top of the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_disjoint_isolated_runs_reconciled_concurrently_both_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    for round in 0..20 {
+        let base = head_of(&git, &fix.core.path).await;
+        let (a, a_tip, a_rows) =
+            committed_worktree_step(&fix, &format!("a{round}.txt"), "run a\n").await;
+        let (b, b_tip, b_rows) =
+            committed_worktree_step(&fix, &format!("b{round}.txt"), "run b\n").await;
+        let before = merges(&git, &fix.core.path).await;
+
+        let (first, second) = tokio::join!(
+            fix.isolator.reconcile(a, &a_rows, &[]),
+            fix.isolator.reconcile(b, &b_rows, &[]),
+        );
+        let first = first.unwrap_or_else(|err| panic!("round {round}: run a reconciles: {err}"));
+        let second = second.unwrap_or_else(|err| panic!("round {round}: run b reconciles: {err}"));
+
+        let merged = merges(&git, &fix.core.path).await;
+        assert_eq!(merged.len(), before.len() + 2, "round {round}: two merges");
+        assert_eq!(merged[2..], before[..], "round {round}: on top of the last");
+        let (top, under) = (&merged[0], &merged[1]);
+        assert_eq!(
+            top[1], under[0],
+            "round {round}: one merge on top of the other"
+        );
+        assert_eq!(under[1], base, "round {round}: the lower one on the base");
+        let mut tips = vec![top[2].clone(), under[2].clone()];
+        tips.sort();
+        let mut expected = vec![a_tip, b_tip];
+        expected.sort();
+        assert_eq!(tips, expected, "round {round}: one merge per run");
+        let mut answered = vec![
+            first[0].after_hash.clone().expect("run a merged"),
+            second[0].after_hash.clone().expect("run b merged"),
+        ];
+        answered.sort();
+        let mut made = vec![top[0].clone(), under[0].clone()];
+        made.sort();
+        assert_eq!(
+            answered, made,
+            "round {round}: each run answers its own merge"
+        );
+        assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    }
+}
+
+/// Plan D136 across processes, where D70's lock does not reach: a second process merged run A
+/// between this process's `HEAD` read and its merge of run B, so B's merge landed on A's and its
+/// post-condition failed — B parked with its merge on the primary. That landed merge is built
+/// here by hand (the interleaving has no deterministic seam across processes); B's later
+/// reconcile, in a process of its own as a sweep's would be, finds it through `merge_of` as
+/// `HEAD`'s merge of B's tip and answers it instead of merging again.
+#[tokio::test]
+async fn a_merge_that_landed_on_another_process_merge_is_recognised_later() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, b_tip, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the other process merges run a");
+    let m1 = head_of(&git, &fix.core.path).await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &[
+            "-c",
+            "user.name=htui",
+            "-c",
+            "user.email=htui@localhost",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-q",
+            "-m",
+            &format!("htui: reconcile {b}"),
+            &format!("htui/{b}"),
+        ],
+    )
+    .await;
+    let m2 = head_of(&git, &fix.core.path).await;
+    let merged = merges(&git, &fix.core.path).await;
+    assert_eq!(
+        merged[0],
+        [m2.clone(), m1, b_tip],
+        "run b's merge landed on a's"
+    );
+
+    let (isolator, _, _, _) = fix.second_process();
+    let again = isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the landed merge is recognised");
+    assert_eq!(again[0].after_hash.as_deref(), Some(m2.as_str()));
+    assert_eq!(again[0].before_hash, fix.core.head);
+    assert_eq!(merges(&git, &fix.core.path).await, merged, "no third merge");
+    assert_eq!(head_of(&git, &fix.core.path).await, m2, "HEAD did not move");
+}
+
+/// Plan D136, blueprint H-3 generalised: run A merged and crashed before `record_commits`, then
+/// run B merged on top. A's recovery reconciles again; its merge is no longer `HEAD`, but it is on
+/// `HEAD`'s first-parent history with A's tip as its second parent, so it is recognised and
+/// reported — never merged a second time.
+#[tokio::test]
+async fn a_lost_merge_beneath_a_later_merge_is_recognised_not_repeated() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    let first = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    fix.isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles");
+    let (head, merged) = (
+        head_of(&git, &fix.core.path).await,
+        merges(&git, &fix.core.path).await,
+    );
+
+    let again = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the lost merge is recognised");
+    assert_eq!(again, first, "A's merge is reported again, not a new one");
+    assert_eq!(merges(&git, &fix.core.path).await, merged, "no third merge");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "HEAD did not move"
+    );
+}
+
+/// Plan D136's boundary: a primary whose `HEAD` no longer has the step's base in its history
+/// (the branch was rewound and rebuilt) is not merged into; it still refuses `primary_moved`, and
+/// nothing is written.
+#[tokio::test]
+async fn a_primary_that_diverged_from_the_base_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let root = fix.core.head.clone();
+    // The step's base must have a parent to rewind to.
+    commit_file(&fix.core.path, "c.txt", "the base\n", "the base");
+    let (step, _, rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    assert_ne!(rows[0].base_ref, root);
+    git_out(&git, &fix.core.path, &["reset", "--hard", "-q", &root]).await;
+    let diverged = commit_file(
+        &fix.core.path,
+        "d.txt",
+        "elsewhere\n",
+        "a line without the base",
+    );
+
+    let err = fix
+        .isolator
+        .reconcile(step, &rows, &[])
+        .await
+        .expect_err("a diverged primary is refused");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {diverged}")
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        diverged,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+}
+
+/// Plan D136's other boundary (review finding D136-already-contained): the maintainer
+/// fast-forwarded the primary onto the step's branch, so `after` is already in `HEAD`'s history
+/// but no merge names it. `merge --no-ff` would answer "Already up to date." and make no commit;
+/// the reconcile refuses `primary_moved` as before D136 instead of failing a post-condition.
+#[tokio::test]
+async fn a_primary_fast_forwarded_onto_the_step_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (step, after, rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &["merge", "--ff-only", "-q", &format!("htui/{step}")],
+    )
+    .await;
+    assert_eq!(head_of(&git, &fix.core.path).await, after);
+
+    let err = fix
+        .isolator
+        .reconcile(step, &rows, &[])
+        .await
+        .expect_err("a primary that already holds the step is refused");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {after}")
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        after,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+}
+
+/// Plan D136: a second isolated run whose change collides with the first one's merge takes the
+/// existing merge-conflict path — refused with the conflicted paths, the half-merge aborted, the
+/// primary left at the first run's merge and clean.
+#[tokio::test]
+async fn a_second_isolated_run_that_conflicts_takes_the_merge_conflict_path() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "f", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "f", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+
+    let err = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect_err("the collision is refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "isolation refused: {}",
+            htui_orch::isolate::git::merge_conflict(&["f".to_owned()])
+        )
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, m1);
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// Plan D160 (R-26): a verb that changes the primary outlives the future that asked for it. A walk
+/// that is preempted or abandoned mid-merge drops that future; before D160 the drop reached the
+/// child's `kill_on_drop` handle and SIGKILLed `git` inside its `pre-merge-commit` hook, leaving
+/// the primary mid-merge. Now the merge finishes on its own task: it lands with D25's parents, and
+/// neither `index.lock` nor `MERGE_HEAD` is left in the user's tree.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
+    use std::time::Duration;
+
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let primary = dir.path().join("primary");
+    std::fs::create_dir(&primary).expect("the primary directory is made");
+    let before = repo_with_one_commit(&primary);
+    let step = StepId::new();
+    let tree = dir.path().join("tree");
+    git.add_worktree(&primary, &tree, step, RunId::new(), &before)
+        .await
+        .expect("the worktree is added");
+    let after = commit_file(&tree, "written", "by the agent\n", "the step's work");
+
+    // An absolute `sleep`: the hook must not depend on the `PATH` `git` hands it.
+    let sleep = which::which("sleep").expect("a box that can run a test suite has `sleep`");
+    let hooks = primary.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("the hooks directory is made");
+    let hook = hooks.join("pre-merge-commit");
+    crate::write_executable::write_executable(
+        &hook,
+        format!("#!/bin/sh\n'{}' 2\n", sleep.display()),
+    );
+
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        git.merge_no_ff(&primary, step, &before, &after),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the merge was still inside its hook when its future was dropped: {dropped:?}"
+    );
+    // The dropped `git merge` keeps running after its future is dropped, and the 2 s hook it is
+    // inside can outlast any fixed wait under load (CLEAN-5). Poll for the state the assertions
+    // below check rather than guessing a sleep, and carry the failure on a deadline so a real
+    // hang stays loud instead of being mistaken for a slow merge.
+    let dot_git = primary.join(".git");
+    let want_parents = format!("{before} {after}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let parents = git_out(&git, &primary, &["log", "-1", "--format=%P", "HEAD"]).await;
+        let index_lock = dot_git.join("index.lock").exists();
+        let merge_head = dot_git.join("MERGE_HEAD").exists();
+        if parents == want_parents && !index_lock && !merge_head {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped merge did not land within 30s: HEAD parents {parents:?}, want \
+             {want_parents:?}, index.lock {index_lock}, MERGE_HEAD {merge_head}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        !dot_git.join("index.lock").exists(),
+        "no index.lock is left behind"
+    );
+    assert!(
+        !dot_git.join("MERGE_HEAD").exists(),
+        "the primary is not left mid-merge"
+    );
+    assert_eq!(
+        git_out(&git, &primary, &["log", "-1", "--format=%P", "HEAD"]).await,
+        want_parents,
+        "the merge landed with D25's parents [before, after]"
+    );
+    assert_eq!(porcelain_status(&git, &primary).await, "", "and clean");
+}
+
+/// MOD-89: `core` ignores `.env` (a committed `.gitignore`) and holds one in its checkout — the
+/// shape every project with a local `.env` has, and the one `local` reads directly.
+fn ignore_env(fix: &Fixture) {
+    commit_file(&fix.core.path, ".gitignore", ".env\n", "ignore env");
+    std::fs::write(fix.core.path.join(".env"), "A=1\n").expect("the env file is written");
+}
+
+/// MOD-89: one step of a run of its own over `scope`, prepared directly under `isolation`, as
+/// [`committed_worktree_step`] does — the trees a session would start in.
+async fn prepared_step(fix: &Fixture, scope: &[RepoId], isolation: Isolation) -> Prepared {
+    fix.isolator
+        .prepare(RunId::new(), StepId::new(), scope, isolation, None)
+        .await
+        .expect("the mode prepares")
+}
+
+/// The env files [`GixIsolator::env_files`] finds in `prepared`'s trees, by path.
+async fn env_files_of(fix: &Fixture, prepared: &Prepared) -> Vec<String> {
+    fix.isolator
+        .env_files(&prepared.cwd, &prepared.extra_dirs)
+        .await
+        .expect("the scan fails open")
+        .paths
+}
+
+/// MOD-89 D2: a `local` step runs in the primary checkout itself, so a gitignored `.env` there is
+/// in its trees, named root-relative because the checkout is the session's `cwd`. No `git`
+/// needed: `local` reads the checkout and creates nothing.
+#[tokio::test]
+async fn a_local_step_s_trees_hold_a_gitignored_env_file() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id, fix.docs.id], Isolation::Local).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, [".env"]);
+}
+
+/// MOD-89 D7: the second repo of a `local` step is an `extra_dirs` root (plan D28), so its env
+/// file is named by that root's last component.
+#[tokio::test]
+async fn a_local_step_names_the_second_repo_s_env_file_by_its_name() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    std::fs::write(fix.docs.path.join(".env"), "A=1\n").expect("the env file is written");
+
+    let prepared = prepared_step(&fix, &[fix.core.id, fix.docs.id], Isolation::Local).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["docs/.env"]);
+}
+
+/// MOD-89: `copy` copies the checkout byte for byte and `.env` is in no exclude list, so the
+/// gitignored file rides along; the session's `cwd` is the step's directory and the copy is
+/// `core/` under it.
+#[tokio::test]
+async fn a_copy_step_carries_a_gitignored_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Copy).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["core/.env"]);
+}
+
+/// MOD-89: `worktree` checks out tracked files only, so a gitignored `.env` never reaches it.
+#[tokio::test]
+async fn a_worktree_step_omits_a_gitignored_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Worktree).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, Vec::<String>::new());
+}
+
+/// MOD-89: a committed `.env` is a tracked file, so `worktree` checks it out like any other.
+#[tokio::test]
+async fn a_worktree_step_holds_a_committed_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    commit_file(&fix.core.path, ".env", "A=1\n", "commit env");
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Worktree).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["core/.env"]);
+}
+
+/// MOD-89 T3, the real wiring end to end: a provider-less project's `local` run over a checkout
+/// holding a gitignored `.env` walks to its gate, and the item carries D7's warning once. No `git`
+/// needed under `local` (as [`criterion_12_a_local_step_on_a_dirty_tree`]).
+#[tokio::test]
+async fn a_local_run_over_a_gitignored_env_file_writes_the_warning() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    ignore_env(&fix);
+
+    let run = fix.start(&fix.orch).await;
+    fix.parked(run).await;
+
+    let warning = "env files in the session's trees: `.env`; the agent can read them";
+    let notes = fix.feat_notes().await;
+    assert_eq!(
+        notes.iter().filter(|body| *body == warning).count(),
+        1,
+        "{notes:?}"
+    );
+}
+
+/// MOD-138 M3: how long a case lets a call that must *not* finish run before it reads it as
+/// waiting, and how long it lets a call that must finish take before it reads it as stuck.
+const STILL_WAITING: std::time::Duration = std::time::Duration::from_millis(200);
+const NEVER_STUCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `call`, counted in `live` while it is in flight, with the most ever in flight at once kept in
+/// `most`: the isolator's boundary as two concurrent node futures meet it.
+async fn counted<T>(live: &AtomicU32, most: &AtomicU32, call: impl Future<Output = T>) -> T {
+    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+    most.fetch_max(now, Ordering::SeqCst);
+    let out = call.await;
+    live.fetch_sub(1, Ordering::SeqCst);
+    out
+}
+
+/// The rows a prepared step holds, as the engine writes them before its session.
+fn rows_of(prepared: &Prepared) -> Vec<RunStepTree> {
+    prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect()
+}
+
+/// MOD-138 M3 D5: the per-repository reconcile lock ANA-33 §7.3 and §9 ask for is the isolator's
+/// own. Two `worktree` nodes of **one run** (a diamond's two arms), branched from one base, land
+/// concurrently — `tokio::join!`, both calls in flight at once at the isolator's boundary — and
+/// both land: two merges, the second on top of the first, each step answering its own, the
+/// primary clean. That is D70's admin lock at work: without it the second merge's post-condition
+/// (`[HEAD read, after]`) fails and the node parks with its merge on the primary. Repeated, so a
+/// lucky interleaving cannot pass it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_worktree_nodes_of_one_run_landing_concurrently_both_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (live, most) = (AtomicU32::new(0), AtomicU32::new(0));
+    for round in 0..10 {
+        let base = head_of(&git, &fix.core.path).await;
+        let (a, a_tip, a_rows) =
+            committed_worktree_step_in(&fix, run, &format!("a{round}.txt"), "node a\n").await;
+        let (b, b_tip, b_rows) =
+            committed_worktree_step_in(&fix, run, &format!("b{round}.txt"), "node b\n").await;
+        assert_eq!(
+            (&a_rows[0].base_ref, &b_rows[0].base_ref),
+            (&base, &base),
+            "round {round}: both nodes branch from one base"
+        );
+        let before = merges(&git, &fix.core.path).await;
+        most.store(0, Ordering::SeqCst);
+
+        let (first, second) = tokio::join!(
+            counted(&live, &most, fix.isolator.reconcile(a, &a_rows, &[])),
+            counted(&live, &most, fix.isolator.reconcile(b, &b_rows, &[])),
+        );
+        let first = first.unwrap_or_else(|err| panic!("round {round}: node a lands: {err}"));
+        let second = second.unwrap_or_else(|err| panic!("round {round}: node b lands: {err}"));
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            2,
+            "round {round}: both landings were in flight at once"
+        );
+
+        let merged = merges(&git, &fix.core.path).await;
+        assert_eq!(merged.len(), before.len() + 2, "round {round}: two merges");
+        assert_eq!(merged[2..], before[..], "round {round}: on top of the last");
+        let (top, under) = (&merged[0], &merged[1]);
+        assert_eq!(
+            top[1], under[0],
+            "round {round}: the second merge on top of the first"
+        );
+        assert_eq!(under[1], base, "round {round}: the first one on the base");
+        let merge_of = |tip: &str| {
+            merged[..2]
+                .iter()
+                .find(|merge| merge[2] == tip)
+                .map(|merge| merge[0].clone())
+                .unwrap_or_else(|| panic!("round {round}: a merge of {tip}: {merged:?}"))
+        };
+        assert_eq!(
+            first[0].after_hash.as_deref(),
+            Some(merge_of(&a_tip).as_str()),
+            "round {round}: node a answers its own merge"
+        );
+        assert_eq!(
+            second[0].after_hash.as_deref(),
+            Some(merge_of(&b_tip).as_str()),
+            "round {round}: node b answers its own merge"
+        );
+        assert_eq!(
+            (&first[0].before_hash, &second[0].before_hash),
+            (&base, &base),
+            "round {round}: each row keeps its base"
+        );
+        for name in [format!("a{round}.txt"), format!("b{round}.txt")] {
+            assert!(
+                fix.core.path.join(&name).is_file(),
+                "round {round}: {name} reached the primary"
+            );
+        }
+        assert_eq!(
+            porcelain_status(&git, &fix.core.path).await,
+            "",
+            "round {round}: the primary is clean"
+        );
+    }
+}
+
+/// MOD-138 M3 D4's reason, probed: `shared_serialized`'s `(box, repo)` guard (D43) spans a step's
+/// `prepare` to its own `capture` (blueprint A-1) and **not** its reconcile. Node A prepares
+/// in place and B's `prepare` waits; A captures and B's `prepare` goes through at once, with A
+/// not yet landed. A then lands in place while B's agent has uncommitted work in that same
+/// checkout: the reconcile takes no guard, waits on nothing and refuses nothing. And once B has
+/// committed, A's landing (a re-land, as recovery would make) refuses `primary_moved`, while the
+/// last lander, B, still lands (D6's in-place rule). So the isolator does not keep two in-place
+/// nodes apart; the scheduler has to (D4, blueprint A3).
+#[tokio::test]
+async fn a_shared_serialized_guard_is_released_at_capture_not_held_over_the_landing() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    let run = RunId::new();
+    let scope = [fix.core.id];
+    let (a, b) = (StepId::new(), StepId::new());
+
+    let a_rows = rows_of(
+        &fix.isolator
+            .prepare(run, a, &scope, Isolation::SharedSerialized, None)
+            .await
+            .expect("node a prepares in place"),
+    );
+    let b_prepare = fix
+        .isolator
+        .prepare(run, b, &scope, Isolation::SharedSerialized, None);
+    tokio::pin!(b_prepare);
+    assert!(
+        tokio::time::timeout(STILL_WAITING, b_prepare.as_mut())
+            .await
+            .is_err(),
+        "node b's prepare waits on the guard node a took at its prepare"
+    );
+
+    let a_tip = commit_file(&fix.core.path, "a.txt", "node a\n", "node a commits");
+    fix.isolator
+        .capture(a, &a_rows)
+        .await
+        .expect("node a captures");
+    let b_rows = rows_of(
+        &tokio::time::timeout(NEVER_STUCK, b_prepare)
+            .await
+            .expect("node a's capture released the guard: node b prepares before a lands")
+            .expect("node b prepares in place"),
+    );
+    assert_eq!(b_rows[0].base_ref, a_tip, "node b starts on node a's work");
+
+    // Node b's agent at work in the checkout: an uncommitted edit of a tracked file.
+    std::fs::write(fix.core.path.join("f"), "node b, mid-session\n").expect("node b edits");
+    let landed = tokio::time::timeout(NEVER_STUCK, fix.isolator.reconcile(a, &a_rows, &[]))
+        .await
+        .expect("node a's landing never waits on node b's guard")
+        .expect("node a lands in place under node b's live session: nothing refuses it");
+    assert_eq!(landed[0].after_hash.as_deref(), Some(a_tip.as_str()));
+    assert_eq!(head_of(&git, &fix.core.path).await, a_tip);
+    assert_eq!(
+        porcelain_status(&git, &fix.core.path).await,
+        " M f\n",
+        "node b's uncommitted work is still in the checkout node a landed in"
+    );
+
+    let b_tip = commit_file(&fix.core.path, "f", "node b\n", "node b commits");
+    fix.isolator
+        .capture(b, &b_rows)
+        .await
+        .expect("node b captures");
+    let err = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect_err("an earlier in-place lander re-landed after a later one refuses");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {b_tip}")
+    );
+    let b_landed = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the last in-place lander lands");
+    assert_eq!(b_landed[0].after_hash.as_deref(), Some(b_tip.as_str()));
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// MOD-138 M3 blueprint A3's evidence: an in-place tree is the primary checkout, and a `worktree`
+/// node lands by merging **into** that checkout. With an in-place node's agent mid-session (an
+/// uncommitted edit of a tracked file), the `worktree` node's landing refuses
+/// `dirty_primary_tree` — a park — and writes nothing: `HEAD` and the agent's edit are untouched.
+/// Once the in-place node has committed and captured, the same landing goes through, merged on
+/// top of the in-place node's commit. So the scheduler keeps an in-place node exclusive against
+/// every tree-touching node, of any mode.
+#[tokio::test]
+async fn a_worktree_landing_beside_a_dirty_in_place_checkout_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (worktree, worktree_tip, worktree_rows) =
+        committed_worktree_step_in(&fix, run, "w.txt", "worktree node\n").await;
+    let in_place = StepId::new();
+    let in_place_rows = rows_of(
+        &fix.isolator
+            .prepare(
+                run,
+                in_place,
+                &[fix.core.id],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the in-place node prepares on the primary checkout"),
+    );
+    assert_eq!(in_place_rows[0].base_ref, fix.core.head);
+
+    std::fs::write(fix.core.path.join("f"), "in-place node, mid-session\n")
+        .expect("the in-place node edits");
+    let err = fix
+        .isolator
+        .reconcile(worktree, &worktree_rows, &[])
+        .await
+        .expect_err("a landing into a checkout an agent is editing refuses");
+    assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the edited file"),
+        "in-place node, mid-session\n",
+        "the agent's edit is untouched"
+    );
+
+    let in_place_tip = commit_file(&fix.core.path, "f", "in-place node\n", "in place");
+    fix.isolator
+        .capture(in_place, &in_place_rows)
+        .await
+        .expect("the in-place node captures");
+    let landed = fix
+        .isolator
+        .reconcile(worktree, &worktree_rows, &[])
+        .await
+        .expect("after the in-place node, the worktree node lands");
+    let merge = head_of(&git, &fix.core.path).await;
+    assert_eq!(landed[0].after_hash.as_deref(), Some(merge.as_str()));
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        vec![vec![merge, in_place_tip, worktree_tip]],
+        "merged on top of the in-place node's commit"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// MOD-138 M3 R1 (review finding 4): `recover::frontiers`' A8 rule re-lands an already landed
+/// winner when its successor is `pending` and unstarted (a crash between `create_step` and the
+/// start). That re-land is idempotent through `merge_of`, and it must stay so over a dirty primary
+/// (an in-place agent's edit, say): the landed merge is found and answered before the clean
+/// check, so the run does not park on `dirty_primary_tree`, and nothing is written. A step that
+/// never landed still refuses the dirty primary.
+#[tokio::test]
+async fn a_landed_step_re_lands_over_a_dirty_primary_and_a_fresh_one_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let run = RunId::new();
+    let (landed, _, landed_rows) = committed_worktree_step_in(&fix, run, "a.txt", "landed\n").await;
+    let (fresh, _, fresh_rows) = committed_worktree_step_in(&fix, run, "b.txt", "fresh\n").await;
+    let first = fix
+        .isolator
+        .reconcile(landed, &landed_rows, &[])
+        .await
+        .expect("the first landing merges");
+    let (head, merged) = (
+        head_of(&git, &fix.core.path).await,
+        merges(&git, &fix.core.path).await,
+    );
+
+    std::fs::write(fix.core.path.join("f"), "an edit in the primary\n")
+        .expect("the primary is dirtied");
+    let again = fix
+        .isolator
+        .reconcile(landed, &landed_rows, &[])
+        .await
+        .expect("the re-land finds its merge before the clean check");
+    assert_eq!(again, first, "the same merge commit, answered again");
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        merged,
+        "no second merge"
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "HEAD did not move"
+    );
+
+    let err = fix
+        .isolator
+        .reconcile(fresh, &fresh_rows, &[])
+        .await
+        .expect_err("a step that never landed refuses the dirty primary");
+    assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "nothing was merged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the edited file"),
+        "an edit in the primary\n",
+        "the edit is untouched"
+    );
+}

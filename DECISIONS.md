@@ -2,6 +2,8 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[TOOL-16](docs/decisions/tool/tool-16.md)** - A gate that fits in a session: template databases, parallel tests, shorter long poles (done, 2026-11-13)
+- **[TOOL-15](docs/decisions/tool/tool-15.md)** - One integration-test binary per crate (done, 2026-11-13)
 - **[MOD-152](docs/decisions/mod/mod-152.md)** - Async command queue and stored command logs (done, 2026-11-13)
 - **[MOD-164](docs/decisions/mod/mod-164.md)** - Automatic memory capture at run end (done, 2026-11-13)
 - **[MOD-141](docs/decisions/mod/mod-141.md)** - One step-graph editor for Settings and the Toolbox (done, 2026-11-12)

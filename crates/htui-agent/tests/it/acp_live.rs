@@ -1,0 +1,126 @@
+//! The one test that touches a real agent (`docs/ANA-4.md` §8 test strategy 5, §11 criterion 9).
+//!
+//! `#[ignore]` by default: it spawns whatever this box has installed, and a box without `node` or
+//! without the adapter is not a failing build. Run it by hand:
+//!
+//! ```text
+//! cargo test -p htui-agent --features test-support --test it acp_live:: -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! Run one `*_live` module at a time (`--test-threads=1`): the live modules share one test
+//! binary now, so their `ONE_AT_A_TIME` locks no longer exclude each other across modules.
+//!
+//! It **burns no model tokens**: `initialize` and `session/new` are protocol traffic, and the test
+//! sends no prompt. What it proves is the half of criterion 9 that milestone 3 owns — the seeded
+//! `claude` row resolves on this box to a launch that starts the adapter and completes a handshake
+//! at `protocolVersion 1` — plus the process-group half of criterion 11, by killing the tree and
+//! looking for survivors.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::InitializeRequest;
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use htui_agent::acp::client;
+use htui_agent::launch::AgentLaunch;
+use htui_core::model::Agent as AgentRow;
+use tokio::sync::oneshot;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+/// The seeded `claude` row, exactly as `PgStore::seed_if_empty_as` inserts it.
+fn claude_row() -> AgentRow {
+    htui_core::model::agent::seed_rows(chrono::Utc::now())
+        .into_iter()
+        .find(|agent| agent.name == "claude")
+        .expect("the seed rows carry `claude`")
+}
+
+#[tokio::test]
+#[ignore = "spawns the agent installed on this box"]
+async fn the_seeded_claude_row_reaches_a_v1_handshake() {
+    let row = claude_row();
+    let launch: AgentLaunch = serde_json::from_value(row.launch.clone()).expect("the seed parses");
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let tools = htui_agent::tools::resolve(launch.discovery.as_ref(), &cwd)
+        .await
+        .expect("the seeded row's tools resolve on this box");
+    println!("resolved tools: {tools:#?}");
+
+    let resolved = htui_agent::launch::resolve(&launch, &tools).expect("placeholders substitute");
+    println!("command: {} {:?}", resolved.command, resolved.args);
+
+    let mut spawned = htui_agent::launch::spawn(&resolved, &cwd)
+        .await
+        .expect("the adapter starts");
+    // Only the unix assertion below reads it, and an unconditional binding is an unused variable
+    // on Windows — which `cargo clippy --target x86_64-pc-windows-msvc` is what catches.
+    #[cfg(unix)]
+    let pid = spawned.pid().expect("the child reports a pid");
+    let writer = spawned.take_stdin().expect("stdin is piped");
+    let reader = spawned.take_stdout().expect("stdout is piped");
+
+    let (report, response) = oneshot::channel();
+    let transport = ByteStreams::new(
+        writer.into_inner().compat_write(),
+        reader.into_inner().compat(),
+    );
+    let handshake = Client.builder().name("htui-live-probe").connect_with(
+        transport,
+        async move |cx: ConnectionTo<Agent>| {
+            let init = cx
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(client::client_capabilities(
+                            &htui_agent::launch::ClientCapabilities {
+                                fs_read: true,
+                                fs_write: true,
+                                terminal: false,
+                                elicitation: false,
+                            },
+                        ))
+                        .client_info(client::client_info()),
+                )
+                .block_task()
+                .await?;
+            let _ = report.send(init);
+            Ok(())
+        },
+    );
+
+    let init = tokio::time::timeout(Duration::from_secs(60), async {
+        let (_, init) = tokio::join!(handshake, response);
+        init
+    })
+    .await
+    .expect("the handshake completes within a minute")
+    .expect("the agent answered `initialize`");
+
+    println!("agent: {:?}", init.agent_info);
+    assert_eq!(
+        init.protocol_version,
+        ProtocolVersion::V1,
+        "MOD-2 speaks wire protocol 1 (ANA-4 §3)"
+    );
+    let info = init.agent_info.expect("the adapter names itself");
+    assert!(!info.version.is_empty(), "the adapter reports a version");
+
+    spawned.kill_tree().await.expect("the process tree dies");
+    let _ = spawned.wait().await;
+
+    // Criterion 11, the process-group half: the wrapper (`node`) must not outlive the kill. The
+    // job-object half is Windows's and is not verified on this box (plan D31).
+    //
+    // Checked by **pid**, not by a `pgrep` pattern: `pgrep -f` matches any command line that
+    // contains the text, including the shell that launched the test, which makes a pattern check
+    // fail for reasons that have nothing to do with the code.
+    #[cfg(unix)]
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the agent process {pid} outlived the kill"
+        );
+    }
+}

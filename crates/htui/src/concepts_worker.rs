@@ -2445,13 +2445,14 @@ mod tests {
         assert!(nothing_cached(&index), "nothing is cached");
     }
 
-    /// `HTUI_TEST_QDRANT_URL` (never `HTUI_QDRANT_*`, blueprint P-13), or the skip line.
-    fn test_qdrant() -> Option<String> {
+    /// `HTUI_TEST_QDRANT_URL` (never `HTUI_QDRANT_*`, blueprint P-13) and this case's turn at it
+    /// (TOOL-16: the live cases of one binary run one at a time), or the skip line.
+    async fn test_qdrant() -> Option<(htui_store::testkit::QdrantTurn, String)> {
         let Ok(url) = std::env::var("HTUI_TEST_QDRANT_URL") else {
             eprintln!("skipped: HTUI_TEST_QDRANT_URL not set");
             return None;
         };
-        Some(url)
+        Some((htui_store::testkit::qdrant_turn().await, url))
     }
 
     /// A collection name no other test uses.
@@ -2463,7 +2464,7 @@ mod tests {
     /// nothing and loads no model.
     #[tokio::test]
     async fn a_tui_search_against_an_empty_qdrant_creates_no_collection_and_loads_nothing() {
-        let Some(url) = test_qdrant() else {
+        let Some((_turn, url)) = test_qdrant().await else {
             return;
         };
         let fresh = fresh_collection();
@@ -2488,11 +2489,11 @@ mod tests {
     /// MOD-160 D3 (live): a collection another embedder wrote is refused before the model loads.
     #[tokio::test]
     async fn a_tui_search_of_another_embedders_collection_is_refused_before_the_model() {
-        let Some(url) = test_qdrant() else {
+        let Some((_turn, url)) = test_qdrant().await else {
             return;
         };
         let fresh = fresh_collection();
-        let created = QdrantStore::connect_to(
+        let created = htui_store::testkit::qdrant_connect_to(
             &settings(&url, None),
             htui_store::embed::HashEmbedder::new(DENSE_DIM),
             &fresh,

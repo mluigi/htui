@@ -1,0 +1,1752 @@
+//! What a golden snapshot cannot hold: the assembler's invariants (ANA-5 §12 criteria 3, 5, 6, 8,
+//! 9, 10, 15, 17, 18).
+//!
+//! Deliberately snapshot-free (blueprint H-11). Every assertion here is a property — two runs agree,
+//! a projection equals its source, an arithmetic identity holds, a refusal fires before anything
+//! else happens — because an `insta` corpus can absorb a real change by being re-accepted, and
+//! these are the facts that must not be re-acceptable. `prompt_render.rs` holds the bytes; this
+//! file holds the rules.
+#![cfg(feature = "test-support")]
+
+use std::collections::BTreeSet;
+
+use htui_core::prompt::render::elision_marker;
+use htui_core::prompt::{
+    AssembleError, AssembledPrompt, PromptSpec, SectionName, TrimStrategy, assemble, fixtures,
+};
+use htui_core::scrub::{MinimalScrubber, Scrubber};
+
+/// The scrubber every test passes: no configured secrets, and still fail-closed on the prefix
+/// rules (`scrub.rs:114-120`), which is exactly what a production caller with no session secrets
+/// hands in.
+fn scrubber() -> MinimalScrubber {
+    MinimalScrubber::new([])
+}
+
+/// Assembles or panics with the error, which is what a failing criterion should print.
+fn ok(spec: &PromptSpec) -> AssembledPrompt {
+    assemble(spec, &scrubber()).unwrap_or_else(|e| panic!("the fixture must assemble: {e}"))
+}
+
+/// The record's strategy for one section name, or `None` when it has no entry at all.
+fn strategy_of(prompt: &AssembledPrompt, name: &SectionName) -> Option<TrimStrategy> {
+    prompt
+        .trim
+        .sections
+        .iter()
+        .find(|section| &section.name == name)
+        .map(|section| section.strategy)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 5 — purity and fan-out identity
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn same_spec_same_bytes_twice() {
+    // Two independently constructed specs, so a `HashMap` iteration order anywhere in the render
+    // path would show up as a digest difference rather than as a flake (blueprint H-3).
+    let first = ok(&fixtures::phase_implement_attempt2());
+    let second = ok(&fixtures::phase_implement_attempt2());
+    assert_eq!(first.text, second.text);
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(first.trim, second.trim);
+    assert_eq!(first.digest.len(), 64, "lowercase sha256 hex, all 64");
+}
+
+#[test]
+fn fan_out_siblings_get_identical_bytes() {
+    // Criterion 5. `PromptSpec` carries no `fanout_index`, no `RunId` and no `StepId`, so the three
+    // siblings are the same call three times — that *is* the design (§4.7 rule 8: the property is
+    // enforced by the type, not by the code). The greps are what make the claim checkable rather
+    // than tautological: they look for the values a caller could have leaked through a body.
+    //
+    // The **handoff** role is here too (review finding H-2). It is the one role built from a
+    // transcript, so it is the one role with a field a run id can reach: ACP hands `edit_proposal`
+    // an absolute path under `<config_dir>/trees/<run_id>/<step_id>/` and `handoff_basic`'s events
+    // carry exactly that. A Phase-only grep passed while the handoff prompt shipped all three.
+    for spec in [
+        fixtures::phase_implement_attempt2(),
+        fixtures::handoff_basic(),
+    ] {
+        let role = spec.role;
+        let siblings: Vec<AssembledPrompt> = (0..3).map(|_| ok(&spec)).collect();
+        assert_eq!(siblings[0].digest, siblings[1].digest);
+        assert_eq!(siblings[1].digest, siblings[2].digest);
+        assert_eq!(siblings[0].text, siblings[2].text);
+
+        let text = &siblings[0].text;
+        // The three values two siblings differ by, spelled the way a leak would spell them.
+        let run_id = "01a06490-eea0-7000-8000-0000000000aa";
+        let step_id = "01a06490-eea0-7000-8000-0000000000bb";
+        let tree_root = format!("/home/htui/.local/share/htui/trees/{run_id}/{step_id}");
+        for leak in [run_id, step_id, tree_root.as_str(), "fanout_index"] {
+            assert!(
+                !text.contains(leak),
+                "§4.7 rule 8: `{leak}` must not reach a {role:?} prompt:\n{text}"
+            );
+        }
+        // Absolute paths, POSIX and Windows, wherever they sit on a line.
+        for prefix in ["/home/", "/tmp/", "/var/", "/Users/", "\\\\?\\"] {
+            assert!(
+                !text.contains(prefix),
+                "§4.2 rule 5: no absolute path in a {role:?} prompt — found `{prefix}`"
+            );
+        }
+        for line in text.lines() {
+            let bytes = line.as_bytes();
+            let drive_letter = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+                && bytes.get(1) == Some(&b':')
+                && bytes.get(2) == Some(&b'\\');
+            assert!(!drive_letter, "a Windows absolute path on `{line}`");
+            assert!(!line.starts_with('/'), "a POSIX absolute path on `{line}`");
+        }
+    }
+}
+
+#[test]
+fn the_prompt_module_reads_no_clock() {
+    // §4.7 rule 7, as a source-level fact rather than a behavioural one: a clock read that only
+    // fires on one branch would pass every behavioural test and still break reproducibility.
+    const SOURCES: [(&str, &str); 9] = [
+        ("mod.rs", include_str!("../../src/prompt/mod.rs")),
+        ("template.rs", include_str!("../../src/prompt/template.rs")),
+        ("estimate.rs", include_str!("../../src/prompt/estimate.rs")),
+        ("render.rs", include_str!("../../src/prompt/render.rs")),
+        ("digest.rs", include_str!("../../src/prompt/digest.rs")),
+        ("trim.rs", include_str!("../../src/prompt/trim.rs")),
+        ("settings.rs", include_str!("../../src/prompt/settings.rs")),
+        ("excerpt.rs", include_str!("../../src/prompt/excerpt.rs")),
+        ("defaults.rs", include_str!("../../src/prompt/defaults.rs")),
+    ];
+    for (name, source) in SOURCES {
+        // A clock read is forbidden everywhere, tests included: there is no legitimate `now()` in
+        // a module whose output must be reproducible.
+        for forbidden in ["Utc::now", "Local::now", "SystemTime", "Instant::now"] {
+            assert!(
+                !source.contains(forbidden),
+                "`prompt/{name}` names `{forbidden}`: §4.7 rule 7 puts no wall-clock value in the \
+                 digested text"
+            );
+        }
+        // The rest bind the shipped path only. A `#[cfg(test)]` module may build a fixed
+        // `DateTime` to feed a renderer — that is a literal, not a clock — and the cut is made at
+        // the attribute rather than by exempting a file, so a new test module inherits the rule.
+        let shipped = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(shipped, _)| shipped);
+        for forbidden in ["use chrono", "std::env", "HashMap", "HashSet"] {
+            assert!(
+                !shipped.contains(forbidden),
+                "`prompt/{name}` names `{forbidden}`: invariant 2 says the assembler reads no \
+                 clock, no environment and no unordered map"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 6 — line endings
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn crlf_inputs_digest_identically() {
+    for spec in [
+        fixtures::phase_implement_attempt2(),
+        fixtures::judge_three_candidates(),
+        fixtures::handoff_basic(),
+    ] {
+        let lf = ok(&spec);
+        let crlf = ok(&fixtures::with_crlf(&spec));
+        assert_eq!(
+            lf.digest, crlf.digest,
+            "criterion 6: `{}` digests the same in either encoding",
+            spec.template.name
+        );
+        assert_eq!(lf.text, crlf.text);
+        assert!(
+            !crlf.text.contains('\r'),
+            "the text handed to `AgentDriver::start` carries no CR"
+        );
+        assert_eq!(
+            lf.trim.sections, crlf.trim.sections,
+            "and every token figure and elision count is over LF text (P-2)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 8 — one map, and only one
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn payload_sections_are_the_records_projection() {
+    for spec in [
+        fixtures::phase_implement_attempt2(),
+        fixtures::phase_all_empty(),
+        fixtures::phase_oversize(),
+        fixtures::judge_three_candidates(),
+        fixtures::handoff_basic(),
+    ] {
+        let prompt = ok(&spec);
+        let entries = prompt.payload_sections();
+        assert_eq!(
+            entries.len(),
+            prompt.trim.sections.len(),
+            "one entry per record row, for `{}`",
+            spec.template.name
+        );
+        for (entry, section) in entries.iter().zip(&prompt.trim.sections) {
+            assert_eq!(entry.name, section.name.render());
+            assert_eq!(entry.tokens, section.tokens_after);
+            assert_eq!(entry.trimmed, section.trimmed);
+        }
+        assert_eq!(
+            prompt.sections, prompt.trim.sections,
+            "`AssembledPrompt::sections` is the record's own vector, not a second copy"
+        );
+        // The payload form the recorder is handed is the same projection, serialised.
+        let value = prompt.payload_sections_value();
+        assert_eq!(
+            value,
+            serde_json::to_value(&entries).expect("plain data"),
+            "§5.2's array and `section_entries()` are one function's output"
+        );
+        assert_eq!(
+            prompt.trim.sections[0].name,
+            SectionName::Template,
+            "P-9: `template` is always the first entry"
+        );
+    }
+}
+
+#[test]
+fn the_only_section_entry_constructor_is_the_records_projection() {
+    // ANA-5 risk 12: the payload array and the record drift the moment a second place builds an
+    // entry. `trim.rs` is the one place, and this is the grep that keeps it so.
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/htui-core has a parent")
+        .to_path_buf();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![crates.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable crate directory") {
+            let path = entry.expect("a readable entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                if source.contains("SectionEntry {")
+                    && !path.ends_with("prompt/trim.rs")
+                    && !path.ends_with("tests/it/prompt_digest.rs")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`SectionEntry` is constructed outside `prompt/trim.rs`: {offenders:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 9 — the trim, its arithmetic and its markers
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_oversize_fixture_lands_at_or_under_target() {
+    let spec = fixtures::phase_oversize();
+    let prompt = ok(&spec);
+    let record = &prompt.trim;
+    let target = spec.budget.target();
+
+    let ratio = record.estimated_before as f64 / spec.budget.tokens as f64;
+    assert!(
+        (1.4..=1.6).contains(&ratio),
+        "the fixture is meant to be half again over budget, measured {ratio:.2}× \
+         ({} before, {} budget)",
+        record.estimated_before,
+        spec.budget.tokens
+    );
+    assert!(
+        record.estimated_after <= target,
+        "criterion 9: {} must land at or under {target}",
+        record.estimated_after
+    );
+    assert_eq!(record.target, target);
+    assert_eq!(record.budget, spec.budget.tokens);
+    assert_eq!(record.estimator, spec.estimator.id);
+
+    // §5.1's arithmetic invariant: the rows sum to the two totals.
+    let before: i64 = record.sections.iter().map(|s| s.tokens_before).sum();
+    let after: i64 = record.sections.iter().map(|s| s.tokens_after).sum();
+    assert_eq!(before, record.estimated_before);
+    assert_eq!(after, record.estimated_after);
+
+    // The protected set never loses a token, whatever the deficit (§4.4, invariant 4).
+    for name in [
+        SectionName::Template,
+        SectionName::Box,
+        SectionName::Skills,
+        SectionName::CommandQueue,
+    ] {
+        let section = record
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` has an entry"));
+        assert_eq!(
+            section.strategy,
+            TrimStrategy::None,
+            "`{name}` is protected"
+        );
+        assert!(!section.trimmed, "`{name}` is protected");
+        assert_eq!(section.tokens_before, section.tokens_after);
+    }
+
+    // The deficit is cleared in §4.4's order and stops the moment it reaches zero, so the sections
+    // at or before the clearing point are trimmed and the ones after it are untouched.
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Excerpts),
+        Some(TrimStrategy::Dropped),
+        "rank 1 goes first"
+    );
+    // §4.4 step 7: a section that reaches its floor without clearing the deficit moves to the drop,
+    // and the pass moves on only after it. The rungs each one passed through are still recorded —
+    // `upstream` kept its ladder counters — and the intermediate states are proved on their own,
+    // below, by clearing the deficit inside one ladder.
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Upstream),
+        Some(TrimStrategy::Dropped)
+    );
+    let upstream = record
+        .sections
+        .iter()
+        .find(|s| s.name == SectionName::Upstream)
+        .expect("an upstream entry");
+    assert_eq!(
+        upstream.stubbed,
+        Some(3),
+        "three summaries degraded on the way"
+    );
+    assert_eq!(upstream.dropped, Some(2), "and both depth-2 rows went");
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::PreviousDiff),
+        Some(TrimStrategy::Dropped)
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::VerifyFailure),
+        Some(TrimStrategy::Dropped),
+        "ten lines cannot reach a 200-line floor, so the ladder moves straight to the drop"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Documents("plan".to_owned())),
+        Some(TrimStrategy::HeadTail),
+        "the residual is taken from the first document"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Documents("review".to_owned())),
+        Some(TrimStrategy::None),
+        "and the deficit was cleared before the second one"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Item),
+        Some(TrimStrategy::None),
+        "`item` is trimmed last of all and is never reached here"
+    );
+
+    // A dropped section keeps an entry saying so, and contributes no bytes.
+    for name in [SectionName::Excerpts, SectionName::VerifyFailure] {
+        let section = record
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` has an entry"));
+        assert_eq!(section.tokens_after, 0);
+        assert!(section.trimmed);
+    }
+    assert!(
+        !prompt.text.contains("<section name=\"excerpts\">"),
+        "a dropped section leaves no wrapper behind"
+    );
+    assert!(!prompt.text.contains("<section name=\"verify_failure\""));
+}
+
+/// The oversize corpus against a chosen `target`, so a test can put the deficit's clearing point
+/// inside whichever ladder it means to exercise. `reserve_bp: 0` makes `target == tokens`, which
+/// keeps the arithmetic of each case readable.
+fn oversize_at(target: i64) -> PromptSpec {
+    let mut spec = fixtures::phase_oversize();
+    spec.budget = htui_core::prompt::Budget {
+        tokens: target,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+    spec
+}
+
+/// What the corpus estimates at before anything is trimmed.
+fn untrimmed_total() -> i64 {
+    ok(&oversize_at(i64::MAX / 4)).trim.estimated_before
+}
+
+#[test]
+fn the_upstream_ladder_degrades_before_it_drops() {
+    // §4.3's depth ladder, stopped mid-rung: the deficit clears while rows are still one-liners, so
+    // the section survives with its `stubbed` count — which is what `R-PRM-2`'s stubs look like
+    // under pressure.
+    let spec = oversize_at(untrimmed_total() - 13_000);
+    let prompt = ok(&spec);
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Excerpts),
+        Some(TrimStrategy::Dropped),
+        "the section ahead of it is exhausted first"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::Upstream),
+        Some(TrimStrategy::StubLadder)
+    );
+    let upstream = prompt
+        .trim
+        .sections
+        .iter()
+        .find(|s| s.name == SectionName::Upstream)
+        .expect("an upstream entry");
+    assert!(upstream.tokens_after > 0, "the section survived");
+    assert!(upstream.stubbed.unwrap_or(0) > 0, "and rows were degraded");
+    assert!(
+        prompt.text.contains("also upstream:"),
+        "the one-liners are what the ladder leaves"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::PreviousDiff),
+        Some(TrimStrategy::None),
+        "and the pass stopped before the next section"
+    );
+}
+
+#[test]
+fn the_drop_that_empties_the_upstream_section_is_counted() {
+    // **L-1.** The ladder assigned `stubbed` and `dropped` only *after* `render::upstream` returned
+    // a section. The drop that empties the section renders `None`, so the row that ended the
+    // section was the one row the record never counted — `dropped` was always one short of the
+    // truth on exactly the path a reader most needs it.
+    use htui_core::model::ids::ItemId;
+    use htui_core::model::item::Status;
+    use htui_core::model::link::UpstreamEntry;
+
+    let depth_two = |id: u128, key: &str| UpstreamEntry {
+        item_id: ItemId::from_uuid(uuid::Uuid::from_u128(id)),
+        qualified_key: key.to_owned(),
+        title: format!("{key} title"),
+        status: Status::Closed,
+        depth: 2,
+        in_scope: true,
+        summary: Some(format!("{key} summary\n")),
+        latest_run_status: None,
+    };
+    let mut spec = fixtures::phase_oversize();
+    // Every row at depth 2, so rung (b) drops them all and the last drop empties the section.
+    spec.upstream = vec![
+        depth_two(0x21, "htui:MOD-21"),
+        depth_two(0x22, "htui:MOD-22"),
+    ];
+    spec.budget = htui_core::prompt::Budget {
+        tokens: 3_000,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+
+    let prompt = ok(&spec);
+    let upstream = prompt
+        .trim
+        .sections
+        .iter()
+        .find(|section| section.name == SectionName::Upstream)
+        .expect("an upstream entry survives the drop");
+    assert_eq!(upstream.strategy, TrimStrategy::Dropped);
+    assert_eq!(
+        upstream.dropped,
+        Some(2),
+        "both rows went, and both are counted"
+    );
+    assert_eq!(
+        upstream.stubbed,
+        Some(2),
+        "and the rung they passed through on the way is still recorded"
+    );
+}
+
+#[test]
+fn a_diff_falls_to_its_stat_before_it_is_dropped() {
+    let spec = oversize_at(untrimmed_total() - 20_000);
+    let prompt = ok(&spec);
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::PreviousDiff),
+        Some(TrimStrategy::StatOnly)
+    );
+    assert!(
+        prompt
+            .text
+            .contains(" 2 files changed, 210 insertions(+), 8 deletions(-)"),
+        "the stat carries most of the signal at a fraction of the cost"
+    );
+    assert!(
+        !prompt
+            .text
+            .contains("+    self.rows.push(PendingRow::new(209));"),
+        "and the unified diff is what went"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::VerifyFailure),
+        Some(TrimStrategy::None)
+    );
+}
+
+#[test]
+fn verify_failure_keeps_its_tail() {
+    // Head-only truncation is the failure Codex had to patch: "TAIL IS COMPLETELY LOST - error
+    // messages invisible to model". A verification tail is exactly that case.
+    let mut spec = fixtures::phase_oversize();
+    spec.verify_failure = Some(htui_core::prompt::VerifyFailure {
+        exit_code: 101,
+        output: (0..400)
+            .map(|n| format!("test recorder::case_{n} ... ok\n"))
+            .collect(),
+    });
+    let before = {
+        let mut probe = spec.clone();
+        probe.budget = htui_core::prompt::Budget {
+            tokens: i64::MAX / 4,
+            source: htui_core::prompt::BudgetSource::Project,
+            reserve_bp: 0,
+        };
+        ok(&probe).trim.estimated_before
+    };
+    spec.budget = htui_core::prompt::Budget {
+        tokens: before - 24_000,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+
+    let prompt = ok(&spec);
+    let section = prompt
+        .trim
+        .sections
+        .iter()
+        .find(|s| s.name == SectionName::VerifyFailure)
+        .expect("a verify_failure entry");
+    assert_eq!(section.strategy, TrimStrategy::TailCut);
+    assert!(
+        prompt.text.contains("test recorder::case_399 ... ok"),
+        "the tail survives"
+    );
+    assert!(
+        !prompt.text.contains("test recorder::case_0 ... ok"),
+        "the head is what went"
+    );
+    assert!(
+        prompt.text.contains(&elision_marker(
+            section.elided_lines.expect("a marker"),
+            section.elided_bytes.expect("a marker"),
+        )),
+        "and the marker says how much"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// D100 under the trim ladder — review finding C-1
+// ---------------------------------------------------------------------------------------------
+
+/// The maskable secret the C-1 corpus plants in every trimmable input.
+const SECRET: &str = "hunter2";
+
+/// The oversize corpus with `SECRET` in every input a trim rung re-renders from.
+///
+/// One string in every field the ladder reaches: the excerpt bodies (whole-file drop), the upstream
+/// titles and summaries (stub ladder), the diff's stat and body (stat-only), the verification output
+/// (tail cut), both document bodies and the item body (head+tail). If any rung re-renders from
+/// [`PromptSpec`] rather than from the scrubbed inputs, the secret comes back.
+fn oversize_with_secrets() -> PromptSpec {
+    let mut spec = fixtures::phase_oversize();
+    spec.item_body = format!("the item body says {SECRET}\n{}", spec.item_body);
+    for doc in &mut spec.documents {
+        doc.body = format!("the {} body says {SECRET}\n{}", doc.kind, doc.body);
+    }
+    for entry in &mut spec.upstream {
+        entry.title = format!("{} {SECRET}", entry.title);
+        entry.summary = entry
+            .summary
+            .as_deref()
+            .map(|summary| format!("the summary says {SECRET}\n{summary}"));
+    }
+    for excerpt in &mut spec.excerpts.files {
+        excerpt.content = format!("// {SECRET}\n{}", excerpt.content);
+    }
+    if let Some(diff) = &mut spec.previous_diff {
+        diff.stat = format!("{} {SECRET}", diff.stat);
+        diff.diff = format!("+// {SECRET}\n{}", diff.diff);
+    }
+    // 400 lines, well over the 200-line floor, so the tail cut has something to reclaim and the
+    // rung re-renders `verify_failure` from its own input rather than cutting the section in place.
+    spec.verify_failure = Some(htui_core::prompt::VerifyFailure {
+        exit_code: 101,
+        output: (0..400)
+            .map(|n| format!("test recorder::case_{n} says {SECRET} ... ok\n"))
+            .collect(),
+    });
+    spec
+}
+
+/// `spec` at `target` tokens with no reserve, so the test's arithmetic is the target's.
+fn at_target(spec: &PromptSpec, target: i64) -> PromptSpec {
+    let mut out = spec.clone();
+    out.budget = htui_core::prompt::Budget {
+        tokens: target,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+    out
+}
+
+#[test]
+fn no_trim_rung_re_renders_an_unscrubbed_input() {
+    // **C-1.** `assemble()` scrubs the *rendered* sections (D100) and then hands them to the
+    // trimmer, whose rungs re-render from `PromptSpec` — so every masked byte the ladder touched
+    // reappeared in the prompt while `trim_record` went on describing the scrubbed text. The fix is
+    // to mask at the input layer, once, before anything renders: then the first render and every
+    // re-render are over the same masked data and there is no rung left to forget.
+    let base = oversize_with_secrets();
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let untrimmed = assemble(&at_target(&base, i64::MAX / 4), &scrubber)
+        .expect("the corpus assembles")
+        .trim
+        .estimated_before;
+
+    let mut strategies: BTreeSet<&'static str> = BTreeSet::new();
+    for cut in [
+        0, 4_000, 8_000, 12_000, 16_000, 20_000, 24_000, 28_000, 32_000,
+    ] {
+        let spec = at_target(&base, untrimmed - cut);
+        let prompt = assemble(&spec, &scrubber)
+            .unwrap_or_else(|error| panic!("the corpus assembles at -{cut}: {error}"));
+        assert!(
+            !prompt.text.contains(SECRET),
+            "the scrub survived neither the render nor the trim at -{cut}"
+        );
+        assert!(
+            prompt.text.contains("[REDACTED]"),
+            "and the mask is what took its place at -{cut}"
+        );
+        for section in &prompt.trim.sections {
+            strategies.insert(section.strategy.as_str());
+        }
+    }
+    // Every rung that re-renders is proved reached, or the sweep above proves nothing.
+    for strategy in [
+        TrimStrategy::HeadTail,
+        TrimStrategy::TailCut,
+        TrimStrategy::StatOnly,
+        TrimStrategy::StubLadder,
+        TrimStrategy::Dropped,
+    ] {
+        assert!(
+            strategies.contains(strategy.as_str()),
+            "the sweep never reached `{}`: {strategies:?}",
+            strategy.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_judge_candidate_rung_re_renders_scrubbed_too() {
+    // C-1's judge half: `trim_candidates` re-renders a candidate stat-only from
+    // `inputs.candidates[i]`, which is the caller's struct.
+    let mut spec = fixtures::judge_three_candidates();
+    let Some(judge) = &mut spec.judge else {
+        panic!("the judge fixture carries judge inputs");
+    };
+    for candidate in &mut judge.candidates {
+        if let Some(diff) = &mut candidate.diff {
+            diff.stat = format!("{} {SECRET}", diff.stat);
+            diff.diff = format!("+// {SECRET}\n{}", diff.diff);
+        }
+        if let Some(doc) = &mut candidate.document {
+            doc.body = format!("{SECRET}\n{}", doc.body);
+        }
+        candidate.verification_tail = candidate
+            .verification_tail
+            .as_deref()
+            .map(|tail| format!("{SECRET}\n{tail}"));
+    }
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let untrimmed = assemble(&at_target(&spec, i64::MAX / 4), &scrubber)
+        .expect("the judge corpus assembles")
+        .trim
+        .estimated_before;
+
+    let mut saw_stat_only = false;
+    for percent in [90, 75, 60, 50, 40] {
+        // Floored above the protected set, which is what a judge frame plus its box and skills
+        // cost: below it the call is a refusal rather than a trim and proves nothing.
+        let target = (untrimmed * percent / 100).max(400);
+        let prompt = assemble(&at_target(&spec, target), &scrubber)
+            .unwrap_or_else(|error| panic!("the judge corpus assembles at {target}: {error}"));
+        assert!(
+            !prompt.text.contains(SECRET),
+            "a candidate re-rendered stat-only from an unscrubbed input at {target}"
+        );
+        saw_stat_only |= prompt
+            .trim
+            .sections
+            .iter()
+            .any(|section| section.strategy == TrimStrategy::StatOnly);
+    }
+    assert!(saw_stat_only, "the isolate cap was never reached");
+}
+
+#[test]
+fn the_frame_literals_are_scrubbed_like_every_other_digested_byte() {
+    // **H-1.** Step 7 substituted `render::normalise_newlines(literal)` — the raw span — while only
+    // the *estimate* ran over a scrubbed copy, so a secret written into a `prompt_template.body`
+    // reached the model and the digest.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.body = format!("Use the key {SECRET}.\n\n{}", spec.body);
+    let prompt = assemble(&spec, &MinimalScrubber::new([SECRET.to_owned()]))
+        .expect("a maskable secret in the frame is masked, not refused");
+    assert!(
+        !prompt.text.contains(SECRET),
+        "§4.7 step 2: the frame's literals are digested bytes like any other"
+    );
+    assert!(prompt.text.contains("Use the key [REDACTED]."));
+
+    // And a secret the scrubber cannot mask refuses, naming the frame rather than the text.
+    let mut residue = fixtures::phase_implement_attempt2();
+    residue.body = format!(
+        "Use the key sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF.\n\n{}",
+        residue.body
+    );
+    let error = assemble(&residue, &scrubber()).expect_err("`R-SEC-3` fails closed on the frame");
+    let AssembleError::Unmasked { ref section, .. } = error else {
+        panic!("expected an unmasked refusal, got {error:?}");
+    };
+    assert_eq!(section, "template");
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
+    );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
+}
+
+#[test]
+fn an_attribute_is_masked_before_it_is_escaped_and_cut() {
+    // **M-2.** The scrub ran on values `render::attr` had already rewritten and `title_attr` had
+    // already cut at 120 bytes, so an exact-match mask missed a secret carrying `&` or `"` and a
+    // long secret shipped its first 120 bytes. Masking at the input layer puts the mask first.
+    let long_secret = format!("SEKRIT-{}-TAIL", "x".repeat(200));
+    let amp_secret = "MOD & 2";
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.item_title = format!("Ship it: {long_secret}");
+    spec.item_key = format!("htui:{amp_secret}");
+    let prompt = assemble(
+        &spec,
+        &MinimalScrubber::new([long_secret.clone(), amp_secret.to_owned()]),
+    )
+    .expect("both secrets are maskable");
+    assert!(
+        !prompt.text.contains("SEKRIT-xxxxxxxxxx"),
+        "the 120-byte `title` cut must not ship the head of a masked secret:\n{}",
+        prompt.text
+    );
+    assert!(
+        !prompt.text.contains("MOD &amp; 2"),
+        "a secret carrying `&` is masked before `attr` rewrites it:\n{}",
+        prompt.text
+    );
+}
+
+#[test]
+fn every_marker_matches_its_record() {
+    // Criterion 9's last clause, and blueprint rule 11: the prompt and the record never disagree.
+    let prompt = ok(&fixtures::phase_oversize());
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    for section in &prompt.trim.sections {
+        match (section.elided_lines, section.elided_bytes) {
+            (Some(lines), Some(bytes)) => {
+                let marker = elision_marker(lines, bytes);
+                assert!(
+                    prompt.text.contains(&marker),
+                    "`{}` records {lines} lines / {bytes} bytes and the prompt does not say so",
+                    section.name
+                );
+                assert!(section.trimmed, "a marker means the section lost content");
+                expected.insert(marker);
+            }
+            (None, None) => {}
+            _ => panic!(
+                "`{}` records one elision number and not the other",
+                section.name
+            ),
+        }
+    }
+    assert!(
+        !expected.is_empty(),
+        "the oversize fixture must produce at least one marker"
+    );
+    // And the converse: no marker in the text is missing from the record.
+    let found: BTreeSet<String> = prompt
+        .text
+        .lines()
+        .filter(|line| line.starts_with("[... htui elided "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(found, expected, "every marker in the text is in the record");
+}
+
+#[test]
+fn the_record_hashes_the_rendered_excerpt_block() {
+    // ANA-5 §4.5 `:1136-1137`: "`sha256` is over the excerpt's rendered content bytes, not the
+    // whole file, so a reader can prove which bytes the model saw without storing them."
+    //
+    // Plan F-39 recorded that T65 narrowed `files[]` from the ranker's own records instead,
+    // because `render::file_block` was private. This is that hole closed: the record is rebuilt
+    // from the surviving excerpts and hashed over the bytes the prompt actually carries.
+    let prompt = ok(&fixtures::phase_implement_attempt2());
+    let files = &prompt.trim.excerpts.files;
+    assert_eq!(files.len(), 2, "both fixture excerpts survived: {files:?}");
+    for file in files {
+        let open = format!("<file path=\"{}:{}\" ", file.repo, file.path);
+        let at = prompt
+            .text
+            .find(&open)
+            .unwrap_or_else(|| panic!("`{open}` is not in the prompt:\n{}", prompt.text));
+        let end = prompt.text[at..]
+            .find("</file>")
+            .expect("every block closes")
+            + "</file>".len();
+        let block = &prompt.text[at..at + end];
+        assert_eq!(
+            file.bytes,
+            block.len() as u64,
+            "`{}` records {} bytes and the rendered block is {}",
+            file.path,
+            file.bytes,
+            block.len()
+        );
+        assert_eq!(
+            file.sha256,
+            htui_core::prompt::digest::sha256_hex(block),
+            "`{}`'s recorded digest is not its rendered block's",
+            file.path
+        );
+        assert_eq!(file.sha256.len(), 64, "lowercase sha256 hex, all 64");
+        assert!(
+            block.contains(&format!(" lines=\"{}\"", file.lines)),
+            "the record's `lines` is the attribute's"
+        );
+    }
+    // The audit's own `selected` is the ranker's and is allowed to differ from `files`.
+    assert_eq!(prompt.trim.excerpts.selected, 2);
+}
+
+#[test]
+fn a_dropped_excerpt_leaves_its_record_behind_and_nothing_else() {
+    // §5.1 `:1536-1538`: `selected` is what the ranker paid for, `files` is what reached the
+    // model, and the trimmer is allowed to make the two disagree.
+    let prompt = ok(&fixtures::phase_oversize());
+    let excerpts = &prompt.trim.excerpts;
+    assert!(
+        excerpts.selected > 0,
+        "the oversize fixture selected excerpts"
+    );
+    assert!(
+        excerpts.files.len() < excerpts.selected as usize,
+        "the trim dropped at least one: {excerpts:?}"
+    );
+    for file in &excerpts.files {
+        assert!(
+            prompt
+                .text
+                .contains(&format!("<file path=\"{}:{}\" ", file.repo, file.path)),
+            "`{}` is recorded and is not in the prompt",
+            file.path
+        );
+    }
+}
+
+#[test]
+fn the_audit_lists_files_in_the_order_the_prompt_renders_them() {
+    // **L-4.** `render::excerpts` emits `<file>` blocks in `(repo, path)` byte order (§4.7 rule 5)
+    // while `surviving_audit` walked the *ranker's* order, so a reader lining the record up against
+    // the prompt read row 1 against block 2 the moment the two orders disagreed.
+    let mut spec = fixtures::phase_implement_attempt2();
+    // Rank 1 sits last in path order and rank 2 first, so the two orders are each other's reverse.
+    spec.excerpts.files[0].path = "crates/zz.rs".to_owned();
+    spec.excerpts.files[1].path = "crates/aa.rs".to_owned();
+    let prompt = ok(&spec);
+
+    let rendered: Vec<String> = prompt
+        .text
+        .lines()
+        .filter_map(|line| line.strip_prefix("<file path=\""))
+        .filter_map(|rest| rest.split_once('"'))
+        .map(|(path, _)| path.to_owned())
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "htui:crates/aa.rs".to_owned(),
+            "htui:crates/zz.rs".to_owned()
+        ],
+        "the prompt renders `(repo, path)` byte order, not rank order"
+    );
+    let recorded: Vec<String> = prompt
+        .trim
+        .excerpts
+        .files
+        .iter()
+        .map(|file| format!("{}:{}", file.repo, file.path))
+        .collect();
+    assert_eq!(recorded, rendered, "and `files[]` is that same order");
+}
+
+#[test]
+fn a_body_that_never_places_excerpts_records_none_as_reaching_the_model() {
+    // **M-1.** §5.1 `:1536-1538` defines `files[]` as what reached the model. A body with no
+    // `{{excerpts}}` slot renders no `<file>` block at all, and `finish()` fell back to "every
+    // selected file survived" whenever the section was absent — so the record claimed two files the
+    // prompt never carried. Absent is not untouched; it is zero.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.body = "{{item}}\n{{box}}\n".to_owned();
+    let prompt = ok(&spec);
+    assert!(
+        !prompt.text.contains("<file "),
+        "no `{{{{excerpts}}}}` slot renders no `<file>` block:\n{}",
+        prompt.text
+    );
+    assert!(
+        prompt.trim.excerpts.files.is_empty(),
+        "and nothing reached the model: {:?}",
+        prompt.trim.excerpts.files
+    );
+    assert_eq!(
+        prompt.trim.excerpts.selected, 2,
+        "`selected` is still what the ranker chose and paid for"
+    );
+}
+
+#[test]
+fn reserve_target_is_integer_arithmetic() {
+    let spec = fixtures::phase_implement_attempt2();
+    let record = ok(&spec).trim;
+    assert_eq!(record.budget, 120_000);
+    assert_eq!(record.target, 108_000, "§5.1's worked example");
+    assert!((record.reserve - 0.10).abs() < f64::EPSILON);
+    assert_eq!(
+        record.to_value(&scrubber()).expect("plain data")["budget_source"],
+        serde_json::json!("project")
+    );
+}
+
+#[test]
+fn to_value_is_byte_stable_and_carries_the_documented_keys() {
+    // Blueprint H-19 asks for sorted keys, on the plan's verified claim that "`serde_json::Map` is
+    // a `BTreeMap` here — no `preserve_order` feature anywhere". **That claim is false in a
+    // workspace build** (finding F-35): `agent-client-protocol` turns on
+    // `serde_json/preserve_order`, and Cargo unifies features across the workspace, so
+    // `htui-core`'s own `Map` is an `IndexMap` whenever `htui-agent` is in the same build and a
+    // `BTreeMap` when it is not. Key order is therefore sorted under `-p htui-core` and field
+    // declaration order under `--workspace`, from one unchanged `#[derive(Serialize)]`.
+    //
+    // What §5.1 actually needs survives that, which is why this test asserts it instead: the
+    // serialisation is **byte-stable** — deterministic under either map type — and the column is
+    // `JSONB`, which reorders keys on the way in regardless. Nothing in the assembler reads a key
+    // order, and `prompt_digest` is over the text and never over this record.
+    //
+    // Both serialisations go through `TrimRecord::to_value`, so what is compared here is the
+    // **scrubbed** form — the one the engine persists — and the key set checked below is read off
+    // the scrubbed object. With an empty scrubber the two are the same bytes, which is the point:
+    // the assertion is about the serialiser, not about the scrubbing.
+    let first = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
+    let second = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
+    assert_eq!(
+        serde_json::to_string(&first).expect("plain data"),
+        serde_json::to_string(&second).expect("plain data"),
+        "two assemblies of one spec serialise to the same bytes"
+    );
+
+    let keys: BTreeSet<&str> = first
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "v",
+            "template",
+            "budget",
+            "budget_source",
+            "reserve",
+            "target",
+            "estimator",
+            "estimated_before",
+            "estimated_after",
+            "sections",
+            "skill_choices",
+            "undigested",
+            "excerpts",
+            "notes",
+        ]),
+        "§5.1's twelve keys, MOD-9 D42's skill_choices and MOD-33 D270's undigested: fourteen, \
+         no more and no fewer (MOD-163 D17's memory is absent when the spec carried none)"
+    );
+    assert_eq!(
+        first["v"],
+        serde_json::json!(5),
+        "MOD-163 D17 bumped the record to v 5"
+    );
+    assert_eq!(
+        first["undigested"],
+        serde_json::json!(["box.hostname"]),
+        "MOD-33 D270: the implement body places `{{box}}` with the hostname on"
+    );
+    // `phase_implement_attempt2` carries one `Always` skill, placed by the implement body.
+    let choices = first["skill_choices"]
+        .as_array()
+        .expect("MOD-9 D55: `skill_choices` is always an array");
+    assert_eq!(choices.len(), 1, "one candidate, one choice");
+    assert_eq!(choices[0]["reason"], serde_json::json!("always"));
+    assert_eq!(choices[0]["active"], serde_json::json!(true));
+    assert_eq!(first["template"]["role"], serde_json::json!("phase"));
+    assert_eq!(first["template"]["version"], serde_json::json!(3));
+    assert_eq!(first["estimator"], serde_json::json!("chars-v2"));
+    // A section row omits the four optional counters rather than spelling them `null`.
+    let template_row = &first["sections"][0];
+    assert_eq!(template_row["name"], serde_json::json!("template"));
+    assert_eq!(template_row["strategy"], serde_json::json!("none"));
+    assert!(template_row.get("elided_lines").is_none());
+    assert!(template_row.get("stubbed").is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 10 — the two refusals, before anything happens
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_protected_set_over_target_refuses_before_anything() {
+    let spec = fixtures::phase_protected_too_big();
+    let error = assemble(&spec, &scrubber()).expect_err("the protected set alone is over target");
+    let AssembleError::BudgetTooSmall { needed, target } = error else {
+        panic!("expected a budget refusal, got {error:?}");
+    };
+    assert_eq!(target, spec.budget.target());
+    assert!(needed > target, "{needed} must exceed {target}");
+    assert_eq!(
+        AssembleError::BudgetTooSmall { needed, target }.to_string(),
+        format!(
+            "prompt budget too small: protected sections need {needed} tokens, target is {target}"
+        ),
+        "criterion 10's exact text, which becomes `run.failure`"
+    );
+}
+
+#[test]
+fn skills_over_the_cap_refuse() {
+    let spec = fixtures::phase_skills_over_cap();
+    let error = assemble(&spec, &scrubber()).expect_err("the skills exceed their cap");
+    let AssembleError::SkillsExceedCap { tokens, cap } = error else {
+        panic!("expected a skills refusal, got {error:?}");
+    };
+    assert_eq!(cap, spec.max_skill_tokens);
+    assert!(tokens > cap);
+    assert!(
+        error
+            .to_string()
+            .starts_with("skills exceed max_skill_tokens"),
+        "criterion 10's exact text"
+    );
+
+    // The skills cap is checked **before** the budget, because it is the sharper message: a step
+    // whose skills alone are over the cap is misconfigured in one place, not two (D.1 step 5).
+    let mut both = spec;
+    both.budget = htui_core::prompt::Budget {
+        tokens: 1_000,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 1_000,
+    };
+    assert!(
+        matches!(
+            assemble(&both, &scrubber()),
+            Err(AssembleError::SkillsExceedCap { .. })
+        ),
+        "the skills refusal wins when both would fire"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 3 — a row that bypassed MOD-9's validator
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_placeholder_refuses_with_the_stage_3_text() {
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.body = "You are running {{phase}} for {{item_key}}.\n\n{{foo}}\n".to_owned();
+    let error = assemble(&spec, &scrubber()).expect_err("`foo` is outside the closed set");
+    assert_eq!(
+        error.to_string(),
+        "unknown prompt placeholder: {{foo}}",
+        "criterion 3's exact text"
+    );
+
+    // A placeholder that exists but not in this role is the same failure to a caller: the template
+    // named something it may not use (blueprint B.1).
+    let mut wrong_role = fixtures::phase_implement_attempt2();
+    wrong_role.body = "{{item}}\n{{candidates}}\n".to_owned();
+    assert!(matches!(
+        assemble(&wrong_role, &scrubber()),
+        Err(AssembleError::UnknownPlaceholder { ref token }) if token == "candidates"
+    ));
+}
+
+#[test]
+fn scrub_residue_names_the_section_not_the_text() {
+    // D100: the scrub runs per section, before the digest, so `Unmasked.section` names the fact a
+    // maintainer can act on — and never the secret.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.item_body =
+        "The token is sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF and it must never be stored.\n"
+            .to_owned();
+    let error = assemble(&spec, &scrubber()).expect_err("`R-SEC-3` fails closed");
+    let AssembleError::Unmasked {
+        ref section,
+        rule,
+        ref path,
+    } = error
+    else {
+        panic!("expected an unmasked refusal, got {error:?}");
+    };
+    assert_eq!(section, "item");
+    assert_eq!(rule, "anthropic_api_key");
+    assert_eq!(path, "", "the whole wrapped string is the leaf");
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
+    );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
+
+    // A secret the scrubber *can* mask is masked, and assembly continues.
+    let mut masked = fixtures::phase_implement_attempt2();
+    masked.item_body = "The token is hunter2 and it must never be stored.\n".to_owned();
+    let prompt = assemble(&masked, &MinimalScrubber::new(["hunter2".to_owned()]))
+        .expect("a maskable secret is masked, not refused");
+    assert!(!prompt.text.contains("hunter2"));
+    assert!(prompt.text.contains("[REDACTED]"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// §4.7's ordering rules the assembler enforces itself
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn upstream_order_is_canonical_whatever_the_caller_sent() {
+    // Rule 2: the assembler re-sorts rather than trusting its caller, because three backends and
+    // two collations produce the rows.
+    let spec = fixtures::phase_implement_attempt2();
+    let mut shuffled = spec.clone();
+    shuffled.upstream.reverse();
+    assert_ne!(
+        shuffled.upstream, spec.upstream,
+        "the fixture must actually be reordered"
+    );
+    assert_eq!(ok(&spec).digest, ok(&shuffled).digest);
+}
+
+#[test]
+fn skill_order_is_unchanged_by_store_order() {
+    // Criterion 15's third clause. The first two (the phase override and the `position` tie-break)
+    // are `model::skill`'s own tests; this is the assembler half.
+    let mut spec = fixtures::phase_skills_over_cap();
+    spec.max_skill_tokens = 20_000;
+    let mut reversed = spec.clone();
+    reversed.skills.reverse();
+    assert_eq!(ok(&spec).digest, ok(&reversed).digest);
+
+    // And a skill bound twice appears once (`BoundSkill::collapse`'s dedup, applied here too).
+    let mut doubled = spec.clone();
+    doubled.skills.push(spec.skills[0].clone());
+    assert_eq!(ok(&spec).text, ok(&doubled).text);
+}
+
+#[test]
+fn a_reordered_body_reorders_sections_and_changes_the_digest() {
+    // Rule 1: section order is the parsed span order, which is a property of the pinned template
+    // version. A body that moves `{{upstream}}` above `{{documents}}` is a different prompt.
+    let spec = fixtures::phase_implement_attempt2();
+    let mut moved = spec.clone();
+    moved.body = spec.body.replace(
+        "{{documents}}\n{{verify_failure}}\n{{previous_diff}}\n{{upstream}}",
+        "{{upstream}}\n{{documents}}\n{{verify_failure}}\n{{previous_diff}}",
+    );
+    assert_ne!(moved.body, spec.body, "the replacement must actually apply");
+
+    let original = ok(&spec);
+    let reordered = ok(&moved);
+    assert_ne!(original.digest, reordered.digest);
+    let names = |prompt: &AssembledPrompt| -> Vec<String> {
+        prompt
+            .trim
+            .sections
+            .iter()
+            .map(|s| s.name.render())
+            .collect()
+    };
+    let before = names(&original);
+    let after = names(&reordered);
+    assert_ne!(before, after, "`sections[]` follows the body");
+    assert_eq!(
+        before.iter().collect::<BTreeSet<_>>(),
+        after.iter().collect::<BTreeSet<_>>(),
+        "the same sections, in a different order"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criteria 17 and 18 — the two roles whose callers are MOD-4's (D107)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_second_judge_call_differs_only_in_candidate_order() {
+    let spec = fixtures::judge_three_candidates();
+    let first = ok(&spec);
+    let mut second_call = spec.clone();
+    second_call
+        .judge
+        .as_mut()
+        .expect("the judge role carries judge inputs")
+        .reverse = true;
+    let second = ok(&second_call);
+
+    assert_ne!(
+        first.digest, second.digest,
+        "a different prompt with a different digest, by design (§4.7 rule 6)"
+    );
+    let candidates = |prompt: &AssembledPrompt| -> Vec<String> {
+        prompt
+            .trim
+            .sections
+            .iter()
+            .map(|s| s.name.render())
+            .filter(|name| name.starts_with("judge_candidate:"))
+            .collect()
+    };
+    assert_eq!(
+        candidates(&first),
+        vec![
+            "judge_candidate:0",
+            "judge_candidate:1",
+            "judge_candidate:2"
+        ]
+    );
+    let mut reversed = candidates(&first);
+    reversed.reverse();
+    assert_eq!(candidates(&second), reversed);
+    assert_eq!(
+        first.text.len(),
+        second.text.len(),
+        "only the order moved; not one byte was added or removed"
+    );
+}
+
+#[test]
+fn a_candidate_over_its_share_renders_stat_only() {
+    // Criterion 17's third clause: the isolate cap is per candidate, so one oversized diff does not
+    // cost the other two their content.
+    let mut spec = fixtures::judge_three_candidates();
+    spec.budget = htui_core::prompt::Budget {
+        tokens: 4_000,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 1_000,
+    };
+    let bloated = spec.judge.as_mut().expect("judge inputs").candidates[1]
+        .diff
+        .as_mut()
+        .expect("candidate 1 carries a diff");
+    bloated.diff = (0..800)
+        .map(|n| format!("+    self.rows.push(PendingRow::new({n}));\n"))
+        .collect();
+
+    let prompt = ok(&spec);
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::JudgeCandidate(1)),
+        Some(TrimStrategy::StatOnly)
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::JudgeCandidate(0)),
+        Some(TrimStrategy::None),
+        "a candidate inside its share keeps its diff"
+    );
+    assert!(
+        prompt
+            .text
+            .contains(" 1 file changed, 22 insertions(+), 1 deletion(-)"),
+        "the stat survives; it is the signal the diff carried"
+    );
+    assert!(
+        !prompt
+            .text
+            .contains("+    self.rows.push(PendingRow::new(799));"),
+        "and the unified diff does not"
+    );
+    assert!(prompt.trim.estimated_after <= prompt.trim.target);
+}
+
+#[test]
+fn a_handoff_summary_carries_only_the_windowed_tail() {
+    // Criterion 18's third clause, which is the half MOD-2 can own: no verbatim `assistant_text`
+    // beyond the windowed tail the caller put in `StepSummary` (`R-PRM-1`, D107).
+    let prompt = ok(&fixtures::handoff_basic());
+    assert!(
+        prompt
+            .text
+            .contains("Last assistant message (turn 3, tail):")
+    );
+    assert!(
+        prompt
+            .text
+            .contains("I cannot get the borrow checker past the trim loop.")
+    );
+    assert!(
+        prompt.text.contains("<section name=\"failure_reason\">"),
+        "the reason the prompt exists is protected and present"
+    );
+    assert_eq!(
+        strategy_of(&prompt, &SectionName::FailureReason),
+        Some(TrimStrategy::None)
+    );
+    // The handoff role's own closed set: no `{{item}}`, so no item section reaches the record.
+    assert!(
+        !prompt.text.contains("<section name=\"item\""),
+        "`item` is outside the handoff role's placeholder set"
+    );
+}
+
+#[test]
+fn a_role_without_its_inputs_refuses() {
+    let mut spec = fixtures::judge_three_candidates();
+    spec.judge = None;
+    assert!(matches!(
+        assemble(&spec, &scrubber()),
+        Err(AssembleError::RoleInputs { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// One vocabulary, two spellings (T67)
+// ---------------------------------------------------------------------------------------------
+
+/// `as_str` and `Serialize` must produce the same word for every variant of the three closed
+/// vocabularies `trim_record` carries.
+///
+/// The Prompt sub-tab renders `as_str` and a reader compares what it renders against the stored
+/// row, which is the `Serialize` form. Two tables would be two spellings, and this is what keeps
+/// them one.
+#[test]
+fn the_record_vocabularies_spell_themselves_once() {
+    use htui_core::prompt::excerpt::RootSource;
+    use htui_core::prompt::settings::BudgetSource;
+
+    fn serialised(value: &impl serde::Serialize) -> String {
+        match serde_json::to_value(value).expect("a unit variant serialises") {
+            serde_json::Value::String(text) => text,
+            other => panic!("a unit variant serialises as a string, not {other}"),
+        }
+    }
+
+    for strategy in [
+        TrimStrategy::None,
+        TrimStrategy::HeadTail,
+        TrimStrategy::TailCut,
+        TrimStrategy::StatOnly,
+        TrimStrategy::StubLadder,
+        TrimStrategy::Dropped,
+    ] {
+        assert_eq!(strategy.as_str(), serialised(&strategy), "{strategy:?}");
+    }
+    for source in [
+        BudgetSource::Phase,
+        BudgetSource::Project,
+        BudgetSource::AppSetting,
+        BudgetSource::AppSettingDefault,
+    ] {
+        assert_eq!(source.as_str(), serialised(&source), "{source:?}");
+    }
+    for source in [
+        RootSource::RunStepTree,
+        RootSource::RepoBoxPath,
+        RootSource::NoPath,
+    ] {
+        assert_eq!(source.as_str(), serialised(&source), "{source:?}");
+    }
+}
+
+#[test]
+fn a_known_secret_in_a_caller_note_is_masked_in_the_record() {
+    // MOD-32, T1 case 1. `PromptSpec.notes` is caller free text, copied verbatim into
+    // `trim_record.notes` at `prompt/mod.rs:1115-1119`, and no `mask` call in `scrubbed_inputs`
+    // reaches it — so nothing scrubbed the record's own strings on the way to the store.
+    //
+    // This case pins the **masking** half, not the scanning half, and the distinction is the
+    // point: a known secret is maskable, so a pass that only refused would fail a step over a
+    // value the scrubber can remove. Note what it does *not* claim — the run engine builds its
+    // scrubber with an empty secret list (`run_worker.rs:1253`), so on that path the masking half
+    // is inert and only the residue scan fires. This case pins the pass itself, with a populated
+    // scrubber, which is the configuration the chat path's recorder uses and the one a future fix
+    // to the run engine's scrubber would turn on. See `TrimRecord::to_value`'s doc.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET} on this box")];
+    let prompt = ok(&spec);
+
+    let value = prompt
+        .trim
+        .to_value(&MinimalScrubber::new([SECRET.to_owned()]))
+        .expect("a maskable secret in a caller note is masked, not refused");
+    assert_eq!(
+        value["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED] on this box"),
+        "the note is masked in the value that is persisted, at the note's own index"
+    );
+    assert!(
+        !value.to_string().contains(SECRET),
+        "no leaf of the persisted record may carry the secret: {value}"
+    );
+}
+
+#[test]
+fn a_credential_shaped_string_in_the_record_refuses_the_serialisation() {
+    // MOD-32, T1 case 2. The fail-closed half, on the persist path: `R-SEC-3` gates what is
+    // written, and a credential-shaped string the scrubber cannot mask must stop the write
+    // rather than reach `run_step.trim_record`.
+    //
+    // Case 1 proves the pass masks; this proves it also *refuses*, and a scan that only looked
+    // would let a case 1 style masking bug through in the other direction. Together they are the
+    // one call: mask, then fail closed on residue (`scrub.rs:228-233`).
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec!["the key is AKIAAAAAAAAAAAAAAAAA".to_owned()];
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("`R-SEC-3` is fail-closed on the persist path too");
+
+    assert_eq!(
+        error.rule, "aws_access_key_id",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        error.path, "/notes/0",
+        "the pointer locates the note, which is the fact a maintainer can act on"
+    );
+    // This error is logged and persisted in an `error` event, so its `Display` and `Debug` are
+    // the security contract (`scrub.rs:60-71`) and neither may repeat the text.
+    for rendered in [&error.to_string(), &format!("{error:?}")] {
+        assert!(!rendered.contains("AKIA"), "leaked: {rendered}");
+        assert!(
+            !rendered.contains("AAAAAAAAAAAAAAAAAA"),
+            "leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn the_template_name_is_reached_by_a_pass_that_enumerates_nothing() {
+    // MOD-32, T1 case 3 — the falsification guard, and the only case here that is about the
+    // *shape* of the fix rather than its behaviour.
+    //
+    // `spec.template.name` is a `prompt_template` row name that no `mask` call in
+    // `scrubbed_inputs` names, and the HANDOFF item did not predict it: the fields it named are
+    // already covered. So the defect was never "these three strings" — it was a guarantee
+    // expressed as an enumeration, which goes stale the day a field is added and nobody extends
+    // it. This case is what a future reversion to a field list fails on, and the mutation in the
+    // task report (mask `self.notes` only) is exactly that reversion.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.template.name = "sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF".to_owned();
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a field no mask call ever named is still reached by the whole-record pass");
+
+    assert_eq!(error.rule, "anthropic_api_key");
+    assert_eq!(error.path, "/template/name");
+    assert!(!error.to_string().contains("DEADBEEF"), "{}", error);
+}
+
+#[test]
+fn the_audit_root_and_provider_strings_are_reached_by_the_pass() {
+    // MOD-32, T1 case 3b — the pair the plan's **first** fact-check wrongly wrote off.
+    //
+    // `scrubbed_inputs` walks `spec.excerpts.files` and never `spec.excerpts.audit`, and
+    // `surviving_audit` clones the audit wholesale (`prompt/mod.rs:1084`), rebuilding only
+    // `files[]`. So `excerpts.roots[].repo` and `excerpts.provider_set[]` reach the record exactly
+    // as the reader produced them — the root strings are, in the HANDOFF item's own words, the
+    // part that leaks. They are the two fields a future reversion to a field list would most
+    // plausibly miss, because they sit in the same struct as the fields that are covered.
+    let mut roots_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !roots_spec.excerpts.audit.roots.is_empty(),
+        "the fixture carries a root record, which is what this case mutates"
+    );
+    roots_spec.excerpts.audit.roots[0].repo = "sk-ant-api03-ROOTSLUGROOTSLUGROOTSLUG".to_owned();
+    let root_error = ok(&roots_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("an audit root slug is a record string like any other");
+    assert_eq!(
+        root_error.rule, "anthropic_api_key",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        root_error.path, "/excerpts/roots/0/repo",
+        "and the pointer locates the root record, not the files array"
+    );
+    assert!(!root_error.to_string().contains("ROOTSLUG"), "{root_error}");
+
+    let mut provider_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !provider_spec.excerpts.audit.provider_set.is_empty(),
+        "the fixture carries a provider id, which is what this case mutates"
+    );
+    provider_spec.excerpts.audit.provider_set[0] = "AKIAAAAAAAAAAAAAAAAA@2".to_owned();
+    let provider_error = ok(&provider_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a provider id is a record string like any other");
+    assert_eq!(provider_error.rule, "aws_access_key_id");
+    assert_eq!(provider_error.path, "/excerpts/provider_set/0");
+    assert!(
+        !provider_error.to_string().contains("AKIA"),
+        "{provider_error}"
+    );
+}
+
+#[test]
+fn a_masked_record_survives_a_second_pass_unchanged() {
+    // MOD-32, T1 case 4, rewritten after the review gate.
+    //
+    // The first version of this case called `to_value` twice on the same **unmasked**
+    // `prompt.trim` and compared the two results, which asserts that a pure function is pure:
+    // both calls mask the same input the same way, so they agree however `mask` behaves, and a
+    // `mask` that re-masked the `[REDACTED]` marker would have passed. The property worth
+    // pinning is the one the comment claimed — *a record whose strings are already masked must
+    // serialise to the same bytes* — and it is only reachable by feeding an already-masked value
+    // back in. That is a live path, not a hypothetical one: `scrubbed_inputs` masks
+    // `excerpts.files[].repo`/`.path` and `skill_choices[].name` before `to_value` sees them, and
+    // with an empty secret list `mask` short-circuits at `scrub.rs:119-121` and cannot double-mask
+    // at all, so a populated scrubber is the only configuration where this can bite.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET}")];
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let prompt = assemble(&spec, &scrubber).expect("the fixture must assemble");
+
+    let once = prompt.trim.to_value(&scrubber).expect("maskable");
+    let rendered = once.to_string();
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the record must actually carry a mask, or this case is vacuous: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET), "and no secret: {rendered}");
+
+    let mut again = once.clone();
+    scrubber
+        .scrub(&mut again)
+        .expect("a record that is already masked is still clean");
+    assert_eq!(
+        once, again,
+        "masking is idempotent (`scrub.rs:52`): a second pass over a masked record changes nothing"
+    );
+    assert_eq!(
+        again["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED]"),
+        "and the second pass does not mask the marker again"
+    );
+}
+
+/// The one walk both `to_value` pins share: every `.rs` file under the workspace, symlinks
+/// skipped so the traversal cannot cycle, `target` and hidden directories pruned.
+///
+/// Bounded to the **workspace root** (`CARGO_MANIFEST_DIR/../..`) rather than `CARGO_MANIFEST_DIR/..`.
+/// The first version walked `crates/`, which in a packaged build holding only `htui-core` is a
+/// directory with nothing in it — the test then passed vacuously while claiming to have checked
+/// the tree.
+fn each_workspace_rust_file(mut visit: impl FnMut(&std::path::Path, &str)) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .expect("htui-core sits in a workspace with a crates/ directory")
+        .to_path_buf();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable workspace directory") {
+            let entry = entry.expect("a readable entry");
+            let kind = entry.file_type().expect("a readable file type");
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                visit(&path, &source);
+            }
+        }
+    }
+}
+
+/// True when this `serde_json::to_value(` call's argument text names a record.
+///
+/// **Why the argument and not a list of whole lines.** The first version of this pin matched
+/// literal strings like `"serde_json::to_value(&record)"`, which is an ordinary expression for any
+/// type: the first unrelated `fn f(record: &Foo)` in any crate would have failed the test with a
+/// message asserting a `TrimRecord` bypass. Reading the *argument* and asking whether it names a
+/// record is the rule the message was always about, and it catches the forms the code actually
+/// uses — `&prompt.trim`, `&prompts.forward.trim`, `trim`, `&record` — without a needle per
+/// spelling.
+///
+/// `self` is deliberately **not** in the rule, and that was measured rather than assumed. Adding
+/// it flagged two lines on the first run, both false: `payload_sections_value` at
+/// `prompt/mod.rs:345`, which serialises `self.payload_sections()` — a `Vec<SectionEntry>`, not a
+/// record — and a doc comment in `probe.rs` that *names* `serde_json::to_value` in prose. Outside
+/// `trim.rs` a record is never the receiver; it is `trim` or `record`. A `BTreeMap`-with-string-
+/// keys is likewise not a hazard, which is why the map pin below bans only the hashing maps.
+fn serialises_a_record(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    let Some(call) = line.split_once("serde_json::to_value(") else {
+        return false;
+    };
+    let argument = call.1.split(')').next().unwrap_or_default();
+    argument.contains("trim") || argument.contains("record")
+}
+
+#[test]
+fn a_trim_record_is_never_serialised_outside_to_value() {
+    // MOD-32, review finding. `TrimRecord` is `pub` and still derives `Serialize`, so
+    // `serde_json::to_value(&trim)` — the literal line this item deleted from the engine at all
+    // three sites — remains valid Rust and nothing in the build fails if it comes back. The
+    // signature change removed the *unscrubbed serialiser method*; it did not and cannot remove
+    // the unscrubbed *expression*, so the guarantee that a record is scrubbed before it is
+    // persisted is a convention, and this is the grep that keeps it one. Same idiom and the same
+    // reason as `the_only_section_entry_constructor_is_the_records_projection` above.
+    let mut offenders: Vec<String> = Vec::new();
+    each_workspace_rust_file(|path, source| {
+        let allowed = path.ends_with("prompt/trim.rs")
+            || path
+                .file_name()
+                .is_some_and(|name| name == "prompt_digest.rs");
+        if allowed {
+            return;
+        }
+        for (number, line) in source.lines().enumerate() {
+            if serialises_a_record(line) {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
+            }
+        }
+    });
+    assert!(
+        offenders.is_empty(),
+        "a `TrimRecord` is serialised outside `TrimRecord::to_value`, which is the bypass MOD-32 \
+         removed and the one that must not come back: {offenders:?}"
+    );
+}
+
+#[test]
+fn the_engine_scrubs_the_record_with_the_scrubber_it_holds() {
+    // MOD-32, review finding. The signature change forces *a* `&dyn Scrubber`, not *the* one the
+    // run holds. Swapping `self.parts.scrubber` for a locally built `MinimalScrubber::new([])` at
+    // any of the four sites (MOD-139 M2 added the part's, `part_live`) compiles, passes every behavioural case in this file, and silently
+    // disables the masking half on every path where the scrubber is populated — which is what
+    // happens the moment the run engine's empty secret list (`run_worker.rs:1253`) is fixed. So the
+    // argument is pinned here, not just the call.
+    let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/htui-orch/src/engine.rs");
+    let source = std::fs::read_to_string(&engine).expect("the engine is a readable source file");
+
+    assert_eq!(
+        source.matches("to_value(self.parts.scrubber").count(),
+        4,
+        "the four `set_step_prompt` sites pass the scrubber the run holds; one is added or removed \
+         here, and `set_step_prompt`'s production caller list has to stay in step with it"
+    );
+    for (number, line) in source.lines().enumerate() {
+        // The record's method call; `serde_json::to_value(` (MOD-139's `base_refs`) is no record.
+        if line.contains(".to_value(") && !line.contains(".to_value(self.parts.scrubber") {
+            panic!(
+                "engine.rs:{}: a `.to_value(` that does not pass `self.parts.scrubber`: {}",
+                number + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
+    // MOD-32, review finding. The engine's `Value::Null` argument leans on "no map in the record
+    // graph": `serde_json::to_value` fails on a map whose keys are not strings, and a `HashMap`
+    // field is the one way to introduce that. `the_prompt_module_reads_no_clock` bans the type for
+    // `crates/htui-core/src/prompt/`'s nine files, but the record graph reaches past them — into
+    // `model/skill.rs` for `SkillChoice`/`SkillLevel`/`Activation` and `model/ids.rs` for
+    // `SkillId` — so that guard was narrower than the claim it was cited for. This is the guard
+    // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
+    // clock" and "serialises to an object" are different invariants with different blast radii.
+    const GRAPH: [(&str, &str); 3] = [
+        ("prompt/trim.rs", include_str!("../../src/prompt/trim.rs")),
+        ("model/skill.rs", include_str!("../../src/model/skill.rs")),
+        ("model/ids.rs", include_str!("../../src/model/ids.rs")),
+    ];
+    for (name, source) in GRAPH {
+        // Comments excluded, and the shipped/test cut is deliberately **not** borrowed from the
+        // clock test. `trim.rs` names `BTreeMap` in prose — its own module doc explains that
+        // `serde_json::Map` is one — and a `BTreeMap<String, _>` is harmless, because a map only
+        // breaks the second failure mode when its keys are not strings. The hazard is the hashing
+        // maps, whose key type is chosen by whoever writes the field.
+        for forbidden in ["HashMap", "HashSet"] {
+            assert!(
+                !source.lines().any(|line| {
+                    !line.trim_start().starts_with("//") && line.contains(forbidden)
+                }),
+                "`{name}` names `{forbidden}`: an unordered map in the record graph is the one \
+                 thing that could make `serde_json::to_value` fail, which `to_value` would turn \
+                 into a `Null` `run_step.trim_record`"
+            );
+        }
+    }
+}

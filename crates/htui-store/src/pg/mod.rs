@@ -1095,7 +1095,10 @@ async fn tui_below_target(pool: &PgPool) -> Result<Option<String>> {
 ///
 /// A stored value that is not a version is replaced with this build's (B18): the TUI that has
 /// just migrated the database is the authority on what it now needs.
-async fn raise_target(pool: &PgPool) -> Result<Option<String>> {
+///
+/// `pub(crate)` for `testkit`'s template database (TOOL-16), which finishes the way
+/// [`PgStore::apply_migrations`] does.
+pub(crate) async fn raise_target(pool: &PgPool) -> Result<Option<String>> {
     let ours = this_version();
     let mut tx = pool.begin().await.map_err(map_sqlx)?;
     let inserted = sqlx::query!(

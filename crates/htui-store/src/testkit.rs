@@ -62,12 +62,18 @@ pub struct TestDb {
 
 static SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-/// A fresh database with the migrations **not** applied - or `None` when [`ENV_URL`] is unset.
-///
-/// The migration tests need a database in that state; every other test wants [`fresh_db`].
-pub async fn bare_db() -> Option<TestDb> {
-    let maint_url = match std::env::var(ENV_URL) {
-        Ok(url) if !url.trim().is_empty() => url,
+/// The template database of this process's migration set, built or found once (TOOL-16).
+static TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// The advisory-lock key every process takes while it looks for or builds a template, so two
+/// test binaries (or two worktrees) on one server never build the same one twice. Any constant
+/// does; this one is "htuitmpl" in ASCII.
+const TEMPLATE_LOCK: i64 = 0x6874_7569_746d_706c;
+
+/// The maintenance DSN, or `None` (after printing [`SKIP`]) when [`ENV_URL`] is unset.
+fn maint_url() -> Option<String> {
+    match std::env::var(ENV_URL) {
+        Ok(url) if !url.trim().is_empty() => Some(url),
         _ => {
             if std::env::var("CI").is_ok() {
                 panic!(
@@ -76,23 +82,35 @@ pub async fn bare_db() -> Option<TestDb> {
                 );
             }
             println!("{SKIP}");
-            return None;
+            None
         }
-    };
+    }
+}
 
+/// Once per process: drops what earlier runs left behind.
+///
+/// A test database or an unfinished template build older than an hour belongs to a run that
+/// died. A template of **another** migration set goes after a week: it belongs to a branch that
+/// moved on, and if that branch runs again its first test rebuilds it.
+async fn sweep(maint_url: &str) {
     SWEEP
         .get_or_init(|| async {
-            let Ok(mut sweep_conn) = PgConnection::connect(&maint_url).await else {
+            let Ok(mut sweep_conn) = PgConnection::connect(maint_url).await else {
                 return;
             };
             let stale: Vec<(String,)> = sqlx::query_as(
-                r#"
-                SELECT datname 
-                FROM pg_database 
-                WHERE datname LIKE 'htui_test_%' 
-                  AND (pg_stat_file('base/' || oid, true)).modification < now() - interval '1 hour'
-                "#,
+                r"
+                SELECT datname
+                FROM pg_database
+                WHERE ((datname LIKE 'htui\_test\_%' OR datname LIKE 'htui\_tmplbuild\_%')
+                       AND (pg_stat_file('base/' || oid, true)).modification
+                           < now() - interval '1 hour')
+                   OR (datname LIKE 'htui\_tmpl\_%' AND datname <> $1
+                       AND (pg_stat_file('base/' || oid, true)).modification
+                           < now() - interval '7 days')
+                ",
             )
+            .bind(template_name())
             .fetch_all(&mut sweep_conn)
             .await
             .unwrap_or_default();
@@ -107,15 +125,133 @@ pub async fn bare_db() -> Option<TestDb> {
             let _ = sweep_conn.close().await;
         })
         .await;
+}
 
-    // The *tail* of a UUIDv7 is the random half; its head is a millisecond timestamp, which two
-    // tests starting in the same millisecond share.
+/// `<prefix><12 hex>`. The *tail* of a UUIDv7 is the random half; its head is a millisecond
+/// timestamp, which two tests starting in the same millisecond share.
+fn unique_name(prefix: &str) -> String {
     let hex = Uuid::now_v7().simple().to_string();
-    let name = format!("htui_test_{}", &hex[hex.len() - 12..]);
+    format!("{prefix}{}", &hex[hex.len() - 12..])
+}
+
+/// `htui_tmpl_<16 hex>`: a hash of every embedded migration (version, description, checksum) and
+/// of [`crate::pg::HTUI_VERSION`], the target version the template carries. A migration edited in
+/// place changes its checksum and therefore the name, so a stale template is never copied.
+fn template_name() -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hash = Sha256::new();
+    for migration in crate::MIGRATOR.iter() {
+        hash.update(migration.version.to_le_bytes());
+        hash.update(migration.description.as_bytes());
+        hash.update(&migration.checksum[..]);
+    }
+    hash.update(crate::pg::HTUI_VERSION.as_bytes());
+    let digest = hash.finalize();
+    let mut name = String::from("htui_tmpl_");
+    for byte in &digest[..8] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// The name of a database [`fresh_db`] can copy: every migration applied and the target raised,
+/// exactly what [`PgStore::apply_migrations`] leaves **before** its bootstrap. Nothing is seeded
+/// and no box is registered, so each copy's own connect seeds and registers its test's identity
+/// as a first connect always has.
+///
+/// Built under a temporary name and renamed when complete, so a template that exists is a
+/// finished one; a build that died leaves only an `htui_tmplbuild_` database for [`sweep`].
+async fn template(maint_url: &str) -> &'static str {
+    TEMPLATE
+        .get_or_init(|| async {
+            let name = template_name();
+            let mut maint = PgConnection::connect(maint_url)
+                .await
+                .expect("connect to HTUI_TEST_DATABASE_URL");
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(TEMPLATE_LOCK)
+                .execute(&mut maint)
+                .await
+                .expect("take the template lock");
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+                    .bind(&name)
+                    .fetch_one(&mut maint)
+                    .await
+                    .expect("look the template up");
+            if !exists {
+                build_template(&mut maint, maint_url, &name).await;
+            }
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(TEMPLATE_LOCK)
+                .execute(&mut maint)
+                .await
+                .expect("release the template lock");
+            let _ = maint.close().await;
+            name
+        })
+        .await
+}
+
+/// Migrates a new database, raises its target and renames it to `name`.
+async fn build_template(maint: &mut PgConnection, maint_url: &str, name: &str) {
+    let build = unique_name("htui_tmplbuild_");
+    sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE \"{build}\"")))
+        .execute(&mut *maint)
+        .await
+        .expect("CREATE DATABASE for the template");
+
+    // The pool `PgStore::connect` opens, so the template is migrated under the session settings a
+    // test's own `apply_migrations` would have used. Over a pending schema the connect registers
+    // nothing, and the identity is never written anywhere.
+    let identity = Identity {
+        box_id: htui_core::model::BoxId::new(),
+        hostname: "htui-template".to_owned(),
+    };
+    let connected = PgStore::connect(&with_database(maint_url, &build), &identity)
+        .await
+        .expect("connect to the template build");
+    let pool = connected.store.pool().clone();
+    crate::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("apply the embedded migrations to the template");
+    crate::pg::raise_target(&pool)
+        .await
+        .expect("raise the template's target version");
+    pool.close().await;
+    drop(connected);
+
+    // A closed client's backend can take a moment to exit, and a rename refuses while any session
+    // is connected to the database.
+    let rename = format!("ALTER DATABASE \"{build}\" RENAME TO \"{name}\"");
+    for attempt in 0.. {
+        match sqlx::raw_sql(AssertSqlSafe(rename.clone()))
+            .execute(&mut *maint)
+            .await
+        {
+            Ok(_) => break,
+            Err(_) if attempt < 100 => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("rename the template build to {name}: {e}"),
+        }
+    }
+}
+
+/// Creates a database (a copy of `template` when given), mints a throwaway identity and connects.
+async fn create_db(maint_url: String, template: Option<&str>) -> TestDb {
+    let name = unique_name("htui_test_");
     let mut maint = PgConnection::connect(&maint_url)
         .await
         .expect("connect to HTUI_TEST_DATABASE_URL");
-    sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+    let create = match template {
+        Some(template) => format!("CREATE DATABASE \"{name}\" TEMPLATE \"{template}\""),
+        None => format!("CREATE DATABASE \"{name}\""),
+    };
+    sqlx::raw_sql(AssertSqlSafe(create))
         .execute(&mut maint)
         .await
         .expect("CREATE DATABASE");
@@ -134,7 +270,7 @@ pub async fn bare_db() -> Option<TestDb> {
         .expect("PgStore::connect");
     let pool = connected.store.pool().clone();
 
-    Some(TestDb {
+    TestDb {
         store: connected.store,
         pool,
         name,
@@ -144,16 +280,35 @@ pub async fn bare_db() -> Option<TestDb> {
         identity,
         migrations_at_connect: connected.migrations,
         dropped: false,
-    })
+    }
+}
+
+/// A fresh database with the migrations **not** applied - or `None` when [`ENV_URL`] is unset.
+///
+/// The migration tests need a database in that state; every other test wants [`fresh_db`].
+pub async fn bare_db() -> Option<TestDb> {
+    let maint_url = maint_url()?;
+    sweep(&maint_url).await;
+    Some(create_db(maint_url, None).await)
 }
 
 /// A fresh, migrated, empty database - or `None` when [`ENV_URL`] is unset.
+///
+/// A copy of the [`template`] database, so the migrations run once per process and migration set
+/// rather than once per test (TOOL-16). The connect over the copy seeds and registers, as
+/// [`PgStore::apply_migrations`]'s bootstrap would have, so the store and the rows are what
+/// migrating a bare database gives. The one visible difference: [`TestDb::migrations_at_connect`]
+/// is `UpToDate`, never `Pending`; a test about pending migrations starts from [`bare_db`].
 pub async fn fresh_db() -> Option<TestDb> {
-    let mut db = bare_db().await?;
-    db.store
-        .apply_migrations()
-        .await
-        .expect("apply the embedded migrations");
+    let maint_url = maint_url()?;
+    sweep(&maint_url).await;
+    let template = template(&maint_url).await;
+    let db = create_db(maint_url, Some(template)).await;
+    assert_eq!(
+        db.migrations_at_connect,
+        MigrationState::UpToDate,
+        "a copy of the template {template} is fully migrated"
+    );
     Some(db)
 }
 
@@ -301,6 +456,53 @@ pub fn with_database(dsn: &str, database: &str) -> String {
 #[must_use]
 pub fn parse_dsn(dsn: &str) -> PgConnectOptions {
     PgConnectOptions::from_str(dsn).expect("a parseable DSN")
+}
+
+/// Serialises the tests that talk to the test Qdrant (TOOL-16).
+static QDRANT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One test's turn at the test Qdrant: hold it for the whole test.
+pub type QdrantTurn = tokio::sync::MutexGuard<'static, ()>;
+
+/// Waits for this test's turn at the test Qdrant, so the live Qdrant cases of one test binary run
+/// one after another while the rest of the binary runs in parallel (TOOL-16).
+///
+/// Each case owns its collection, so nothing is shared but the server, and that is the point:
+/// a dozen collections created and indexed at once make Qdrant's collection and payload-index
+/// calls time out (`create collection: ... Timeout expired`), where one at a time they all pass.
+/// Before TOOL-15 every test file was its own process and the gate ran single-threaded, so the
+/// cases never overlapped.
+pub async fn qdrant_turn() -> QdrantTurn {
+    QDRANT.lock().await
+}
+
+/// [`QdrantStore::connect_to`](crate::vector::QdrantStore::connect_to), retried when the client's
+/// deadline expires (TOOL-16).
+///
+/// Creating a collection and its payload indexes takes about 0.1 s on an idle Qdrant, but past
+/// qdrant-client's default 5 s deadline while the parallel gate saturates the box ("create
+/// collection: … Timeout expired"), which a [`qdrant_turn`] cannot help: the load is every other
+/// test, not another Qdrant case. `connect_to` is idempotent (an existing collection is checked
+/// and its indexes re-asserted), so a retry after a create the server did finish is safe. Any
+/// other error, an embedder mismatch included, is returned at once.
+///
+/// # Errors
+/// What the last attempt answered.
+pub async fn qdrant_connect_to<E: crate::embed::DenseEmbedder + Clone>(
+    settings: &crate::qdrant_settings::QdrantSettings,
+    embedder: E,
+    collection: &str,
+) -> Result<crate::vector::QdrantStore<E>> {
+    let mut attempt = 1;
+    loop {
+        match crate::vector::QdrantStore::connect_to(settings, embedder.clone(), collection).await {
+            Err(e) if attempt < 3 && e.to_string().contains("Timeout expired") => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Serialises the tests that touch the fake keyring: it is one process-wide slot.

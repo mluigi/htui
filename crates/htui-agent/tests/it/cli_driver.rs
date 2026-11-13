@@ -1,0 +1,3109 @@
+//! The CLI supervisor: the invocation it assembles, and the session it runs over a child
+//! (plan T50, blueprint B.2 and F-T50).
+//!
+//! Two halves, and the split is the point. The first is **pure** — [`argv`] and [`usd`] are a list
+//! and a string, and every claim §4.4 makes about the command line is checked here without a
+//! process, which is what lets the cases be exhaustive about flag order and about the two
+//! combinations the CLI refuses. The second drives a real child, and the child is a `/bin/sh`
+//! script this file writes into a temporary directory (`acp_driver.rs`'s technique): the real
+//! `claude` binary lives in `tests/cli_live.rs` behind `#[ignore]`, because a supervisor test that
+//! needed a subscription login would be a test nobody runs and a CI nobody trusts.
+//!
+//! Blueprint H-7's fixture rule: no case here touches a seed row. Every row is synthetic and
+//! declares its command directly, so a case can say exactly what the kernel was asked to start.
+//! The one exception is `the_seeded_cli_row_never_asks_for_bare` (MOD-97 D6(a)), which pins the
+//! seed itself and builds its argv without a process.
+//! Nothing here is keyed on the row's **name** either (`R-AGT-5`) — the rows are called
+//! `scripted-cli` precisely so that a supervisor that had started reading names would fail.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+use chrono::Utc;
+#[cfg(unix)]
+use htui_agent::cli::{ClaudeStreamAdapter, CliDriver};
+use htui_agent::cli::{
+    ISOLATED_PERMISSION_MODE, ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd,
+};
+#[cfg(unix)]
+use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
+#[cfg(unix)]
+use htui_agent::driver::{AgentSession, DriverCaps, PermissionAnswer, PermissionRequestId};
+use htui_agent::driver::{
+    AgentSessionRef, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
+};
+#[cfg(unix)]
+use htui_agent::error::DriverError;
+use htui_agent::event::ToolKind;
+#[cfg(unix)]
+use htui_agent::event::{
+    DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent, Stamp, StopReason,
+    TerminalReason, ToolResultStatus,
+};
+use htui_agent::launch::{AgentLaunch, AgentSettings, CliSettings};
+#[cfg(unix)]
+use htui_agent::launch::{ChildIo, SESSION_VAR};
+use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
+#[cfg(unix)]
+use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
+#[cfg(unix)]
+use htui_agent::registry::DriverFactory;
+#[cfg(unix)]
+use htui_core::model::{Agent as AgentRow, Billing, Transport};
+use htui_core::model::{AgentId, StepId};
+#[cfg(unix)]
+use serde_json::json;
+
+/// A spec with nothing set: every case turns on exactly the fields it names.
+fn spec(cwd: PathBuf) -> SessionSpec {
+    SessionSpec {
+        agent_id: AgentId::new(),
+        step_id: StepId::new(),
+        cwd,
+        extra_dirs: Vec::new(),
+        env: BTreeMap::new(),
+        model: None,
+        tools: ToolExposure::default(),
+        mcp: Vec::new(),
+        permission: PermissionPolicy::default(),
+        retain_raw: false,
+        resume: None,
+        budget_micros: None,
+        prompt: None,
+    }
+}
+
+/// The `settings.cli` block a row declares (§5.2).
+fn cli_settings(permission_mode: &str, extra_args: &[&str]) -> CliSettings {
+    CliSettings {
+        stream: htui_agent::cli::STREAM.to_owned(),
+        permission_mode: permission_mode.to_owned(),
+        extra_args: extra_args.iter().map(|arg| (*arg).to_owned()).collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The invocation (§4.4), with no process in sight
+// ---------------------------------------------------------------------------------------------
+
+/// Every flag §4.4 verified, in the order blueprint B.2 fixes, with the row's own arguments in
+/// front and the operator's `extra_args` behind — so a repeated flag is settled by the operator's
+/// copy, which is the one the CLI keeps.
+#[test]
+fn argv_is_the_ana4_line_in_order() {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.model = Some("sonnet".to_owned());
+    spec.extra_dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+    spec.budget_micros = Some(300);
+
+    let args = argv(
+        &["--row-arg".to_owned()],
+        &cli_settings("acceptEdits", &["--x"]),
+        &spec,
+        "minted-id",
+        None,
+        false,
+    );
+
+    assert_eq!(
+        args,
+        [
+            &[
+                "--row-arg",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "acceptEdits",
+                "--session-id",
+                "minted-id",
+                "--model",
+                "sonnet",
+                "--add-dir",
+                "/a",
+                "--add-dir",
+                "/b",
+                "--max-budget-usd",
+                "0.000300",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--x"][..],
+        ]
+        .concat(),
+    );
+    assert!(
+        !args.contains(&"--bare".to_owned()),
+        "`--bare` is the seed's business and D92 dropped it there; the supervisor never adds one"
+    );
+}
+
+/// The prompt is not on the command line, and the case says why rather than only that.
+///
+/// `-p` takes a positional prompt and the temptation is to put it there. An argv is world-readable
+/// through `ps` on a shared box, so the prompt travels on stdin as the first user message instead
+/// (blueprint P-2). Nothing in [`argv`]'s signature can carry it, and this asserts that the flag
+/// that would have is bare.
+#[test]
+fn the_prompt_has_no_place_on_the_command_line() {
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec(PathBuf::from("/scratch")),
+        "minted-id",
+        None,
+        false,
+    );
+    let after_p = args
+        .iter()
+        .position(|arg| arg == "-p")
+        .map(|at| args[at + 1].clone())
+        .expect("`-p` is always passed");
+    assert_eq!(
+        after_p, "--output-format",
+        "`-p` is followed by the next flag, never by a prompt: {args:?}"
+    );
+}
+
+/// `--session-id` and `--resume` are exclusive: the CLI refuses the pair (blueprint H-18), so the
+/// spec's `resume` picks one and the minted id is simply unused.
+#[test]
+fn a_resuming_session_names_the_old_id_and_mints_nothing() {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.resume = Some(AgentSessionRef::new("older-session"));
+
+    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None, false);
+
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--resume", "older-session"]),
+        "{args:?}"
+    );
+    assert!(
+        !args.contains(&"--session-id".to_owned()) && !args.contains(&"minted-id".to_owned()),
+        "the two flags are exclusive, so the mint does not travel beside the resume: {args:?}"
+    );
+}
+
+/// Every value `args` passes `--permission-mode`, in order.
+fn permission_modes(args: &[String]) -> Vec<&str> {
+    args.windows(2)
+        .filter(|pair| pair[0] == "--permission-mode")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// MOD-96 D3: an isolated row that names no permission mode says [`ISOLATED_PERMISSION_MODE`]
+/// rather than leave the CLI to pick one: no settings file is read, and the CLI's own default was
+/// `auto` (probe F3). Rule 3's place, unchanged: right after the fixed flags, before the session id.
+#[test]
+fn isolated_session_with_no_mode_says_default() {
+    assert_eq!(ISOLATED_PERMISSION_MODE, "default");
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec(PathBuf::from("/scratch")),
+        "minted-id",
+        None,
+        false,
+    );
+    assert_eq!(
+        permission_modes(&args),
+        [ISOLATED_PERMISSION_MODE],
+        "{args:?}"
+    );
+    let at = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .expect("the flag is passed");
+    assert_eq!(args[at - 1], "--include-partial-messages", "{args:?}");
+    assert_eq!(args[at + 2], "--session-id", "{args:?}");
+}
+
+/// MOD-96 D3: a row that opts back in and names no mode passes no flag: its settings files are
+/// read, and their `defaultMode` is the operator's answer, not a mode `htui` picked.
+#[test]
+fn opted_in_session_with_no_mode_passes_none() {
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec(PathBuf::from("/scratch")),
+        "minted-id",
+        None,
+        true,
+    );
+    assert!(!args.contains(&"--permission-mode".to_owned()), "{args:?}");
+}
+
+/// MOD-55 review M1 survives MOD-96 D3: a tool-less session drops the mode, the substituted one
+/// included, because nothing is left for a mode to approve.
+#[test]
+fn tool_less_session_still_drops_the_mode() {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.tools = tool_less();
+    for mode in ["", "acceptEdits"] {
+        let args = argv(
+            &[],
+            &cli_settings(mode, &[]),
+            &spec,
+            "minted-id",
+            None,
+            false,
+        );
+        assert!(
+            !args.contains(&"--permission-mode".to_owned()),
+            "{mode:?}: {args:?}"
+        );
+    }
+}
+
+/// MOD-96 D3 fills only an empty mode: an operator's own passes as written, once, on an isolated
+/// session too.
+#[test]
+fn an_operators_mode_passes_unchanged() {
+    for mode in ["acceptEdits", "plan"] {
+        let args = argv(
+            &[],
+            &cli_settings(mode, &[]),
+            &spec(PathBuf::from("/scratch")),
+            "minted-id",
+            None,
+            false,
+        );
+        assert_eq!(permission_modes(&args), [mode], "{args:?}");
+        assert!(!args.contains(&"default".to_owned()), "{mode}: {args:?}");
+    }
+}
+
+/// **F-10, and the reason this case exists at all.** `--max-budget-usd 0` is refused *before* the
+/// CLI reads a byte of stdin — the recorded `claude_stream_json_budget_zero.jsonl` transcript is
+/// two lines long, exit 1, no stdout whatsoever. A supervisor that passed the flag for an absent
+/// cap would therefore turn "this project sets no per-run cap" into "this project cannot hold a
+/// turn", and would do it silently.
+#[test]
+fn a_budget_that_is_absent_or_zero_or_negative_passes_no_flag() {
+    for budget in [None, Some(0), Some(-1)] {
+        let mut spec = spec(PathBuf::from("/scratch"));
+        spec.budget_micros = budget;
+        let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None, false);
+        assert!(
+            !args.contains(&"--max-budget-usd".to_owned()),
+            "budget {budget:?} must not reach the command line: {args:?}"
+        );
+    }
+}
+
+/// Micros → the decimal the flag takes, by integer arithmetic: the recorder's client-side cap and
+/// the CLI's server-side one read one number, and a float round-trip is what would make them
+/// disagree in the sixth place (D83, D90).
+#[test]
+fn usd_is_six_places_of_integer_arithmetic() {
+    assert_eq!(usd(1_500_000), "1.500000");
+    assert_eq!(usd(300), "0.000300");
+    assert_eq!(usd(0), "0.000000");
+    assert_eq!(usd(1), "0.000001", "the smallest cap the flag can express");
+    assert_eq!(usd(1_000_000), "1.000000");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-26 D11: a persona's narrowing on the command line
+// ---------------------------------------------------------------------------------------------
+
+fn tool_names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+/// An exposure naming `allow`, `deny` and `deny_kinds`, `command_run` off.
+fn exposure(allow: &[&str], deny: &[&str], deny_kinds: &[ToolKind]) -> ToolExposure {
+    ToolExposure {
+        allow: tool_names(allow),
+        deny: tool_names(deny),
+        command_run: false,
+        deny_kinds: deny_kinds.to_vec(),
+        no_tools: false,
+    }
+}
+
+/// `args` up to the isolation levers, asserting that they end it: the cases whose subject is the
+/// flag an isolated session's levers follow (MOD-91 D2), over a row with no `extra_args`.
+fn without_levers(args: &[String]) -> &[String] {
+    assert!(
+        args.ends_with(&ISOLATION_ARGS.map(ToOwned::to_owned)),
+        "the levers end a row with no extra_args: {args:?}"
+    );
+    &args[..args.len() - ISOLATION_ARGS.len()]
+}
+
+/// [`argv`] over a bare spec carrying `tools`, with `extra_args`.
+fn narrowed_argv(tools: ToolExposure, extra_args: &[&str]) -> Vec<String> {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.tools = tools;
+    argv(
+        &[],
+        &cli_settings("", extra_args),
+        &spec,
+        "minted-id",
+        None,
+        false,
+    )
+}
+
+/// D11's position: both flags come right after the last pair and before the operator's
+/// `extra_args`, each as one `=`-joined argument, and `deny_kinds` is inverted onto the deny list
+/// after the names it already carries.
+#[test]
+fn persona_flags_follow_the_pairs_and_precede_extra_args() {
+    let args = narrowed_argv(
+        exposure(&["Read", "Grep"], &["mcp__x__y"], &[ToolKind::Execute]),
+        &["--foo"],
+    );
+    assert_eq!(
+        args,
+        [
+            &[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "default",
+                "--session-id",
+                "minted-id",
+                "--tools=Read,Grep",
+                "--disallowedTools=mcp__x__y,Bash,BashOutput,KillShell",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--foo"][..],
+        ]
+        .concat(),
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--session-id", "minted-id"]),
+        "the last pair is intact: {args:?}"
+    );
+}
+
+/// I-1: `--allowedTools` auto-approves (probed), so no exposure ever produces it.
+#[test]
+fn allowed_tools_is_never_emitted() {
+    let grid = [
+        ToolExposure::default(),
+        exposure(&["Read"], &[], &[]),
+        exposure(&[], &["Bash"], &[]),
+        exposure(&[], &[], &[ToolKind::Edit, ToolKind::Delete]),
+        exposure(&["Read", "Grep"], &["mcp__x__y"], ToolKind::ALL),
+    ];
+    for tools in grid {
+        let args = narrowed_argv(tools.clone(), &[]);
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--allowedTools")),
+            "{tools:?} → {args:?}"
+        );
+    }
+}
+
+/// D11: `--tools=""` would disable every tool, so an empty allow-list passes no `--tools` at all.
+#[test]
+fn tools_is_absent_when_allow_is_empty() {
+    let args = narrowed_argv(exposure(&[], &["Bash"], &[ToolKind::Read]), &[]);
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--tools")),
+        "{args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg.starts_with("--disallowedTools=")),
+        "the deny list still travels: {args:?}"
+    );
+}
+
+/// D11: `deny_kinds: [edit]` is the four claude names that edit a file.
+#[test]
+fn deny_kinds_edit_yields_the_four_claude_names() {
+    let args = narrowed_argv(exposure(&[], &[], &[ToolKind::Edit]), &[]);
+    assert_eq!(
+        without_levers(&args).last().map(String::as_str),
+        Some("--disallowedTools=Edit,Write,MultiEdit,NotebookEdit"),
+        "{args:?}"
+    );
+}
+
+/// MOD-11 D17: an exposed `command_run` denies every OQ-5 prefix as `Bash(<prefix>:*)`, after
+/// the names the exposure already denies, in the list's order.
+#[test]
+fn command_run_exposure_denies_the_heavy_bash_prefixes() {
+    let mut tools = exposure(&[], &["mcp__x__y", "Bash(make:*)"], &[]);
+    tools.command_run = true;
+    let args = narrowed_argv(tools, &[]);
+    let mut expected = vec!["mcp__x__y".to_owned(), "Bash(make:*)".to_owned()];
+    for prefix in htui_core::model::kind::HEAVY_COMMAND_PREFIXES {
+        let name = format!("Bash({prefix}:*)");
+        if !expected.contains(&name) {
+            expected.push(name);
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        2 + 14,
+        "`make` was already denied: kept once"
+    );
+    assert_eq!(
+        without_levers(&args).last().cloned(),
+        Some(format!("--disallowedTools={}", expected.join(","))),
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("Bash(cargo build:*)") && arg.contains("Bash(go test:*)")),
+        "{args:?}"
+    );
+}
+
+/// MOD-11 D17: no exposure, no Bash denial — a persona's deny list travels as it was.
+#[test]
+fn no_exposure_no_bash_denials() {
+    let args = narrowed_argv(exposure(&[], &["mcp__x__y"], &[]), &[]);
+    assert_eq!(
+        without_levers(&args).last().map(String::as_str),
+        Some("--disallowedTools=mcp__x__y"),
+        "{args:?}"
+    );
+    let args = narrowed_argv(ToolExposure::default(), &[]);
+    assert!(!args.iter().any(|arg| arg.contains("Bash(")), "{args:?}");
+}
+
+/// I-7: a step with no persona gets exactly today's command line.
+#[test]
+fn a_default_exposure_adds_no_flag() {
+    let args = narrowed_argv(ToolExposure::default(), &[]);
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--tools") || arg.starts_with("--disallowedTools")),
+        "{args:?}"
+    );
+    assert_eq!(
+        without_levers(&args).last().map(String::as_str),
+        Some("minted-id"),
+        "{args:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D8: `htui`'s MCP server on the command line
+// ---------------------------------------------------------------------------------------------
+
+/// The server `htui` registers for a session: the binary, `mcp`, the address and the token.
+/// MOD-79: a stand-in for the path [`McpConfigFile`] writes, for the pure `argv` cases.
+const CONFIG_PATH: &str = "/run/htui-cli-1-abcd/mcp.json";
+
+fn htui_server() -> McpServerSpec {
+    McpServerSpec {
+        name: "htui".to_owned(),
+        command: "/abs/htui".to_owned(),
+        args: vec!["mcp".to_owned()],
+        env: BTreeMap::from([
+            ("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned()),
+            (
+                "HTUI_MCP_ADDR".to_owned(),
+                "/run/htui-mcp-1-abcd/s".to_owned(),
+            ),
+        ]),
+    }
+}
+
+/// A spec that sets every field `argv` reads: model, directories, budget and a narrowing.
+fn full_spec() -> SessionSpec {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.model = Some("sonnet".to_owned());
+    spec.extra_dirs = vec![PathBuf::from("/a")];
+    spec.budget_micros = Some(300);
+    spec.tools = exposure(&["Read", "Grep"], &["mcp__x__y"], &[]);
+    spec
+}
+
+/// The `--mcp-config=` arguments of `args`.
+fn mcp_configs(args: &[String]) -> Vec<&String> {
+    args.iter()
+        .filter(|arg| arg.starts_with("--mcp-config"))
+        .collect()
+}
+
+/// I-7: a spec with no server gets exactly the pre-MOD-11 command line, flag for flag, plus the
+/// isolation levers every session has carried since MOD-91.
+#[test]
+fn argv_without_mcp_is_unchanged() {
+    let args = argv(
+        &["--row-arg".to_owned()],
+        &cli_settings("acceptEdits", &["--x"]),
+        &full_spec(),
+        "minted-id",
+        None,
+        false,
+    );
+    assert_eq!(
+        args,
+        [
+            &[
+                "--row-arg",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "acceptEdits",
+                "--session-id",
+                "minted-id",
+                "--model",
+                "sonnet",
+                "--add-dir",
+                "/a",
+                "--max-budget-usd",
+                "0.000300",
+                "--tools=Read,Grep",
+                "--disallowedTools=mcp__x__y",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--x"][..],
+        ]
+        .concat(),
+    );
+    assert!(mcp_configs(&args).is_empty(), "{args:?}");
+    assert_eq!(htui_agent::cli::mcp_config(&[]), None);
+}
+
+/// D8: one `=`-joined `--mcp-config` argument (the CLI's variadic parse cannot swallow the next
+/// token), after the last pair and before `--tools`, which is left as it was.
+#[test]
+fn argv_with_mcp_has_one_joined_config_before_tools() {
+    let mut with = full_spec();
+    with.mcp = vec![htui_server()];
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    let without = argv(
+        &[],
+        &cli_settings("", &[]),
+        &full_spec(),
+        "minted-id",
+        None,
+        false,
+    );
+
+    let configs = mcp_configs(&args);
+    assert_eq!(configs.len(), 1, "{args:?}");
+    assert!(configs[0].starts_with("--mcp-config="), "{args:?}");
+    assert_eq!(
+        configs[0],
+        &format!("--mcp-config={CONFIG_PATH}"),
+        "the path, joined"
+    );
+    let config_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--mcp-config="))
+        .expect("the config is there");
+    let tools_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--tools="))
+        .expect("the allow-list is there");
+    assert!(config_at < tools_at, "{args:?}");
+    assert_eq!(
+        args[config_at - 2..config_at],
+        ["--max-budget-usd", "0.000300"],
+        "right after the last pair: {args:?}"
+    );
+    assert_eq!(args[tools_at], "--tools=Read,Grep", "--tools is untouched");
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|arg| !arg.starts_with("--mcp-config"))
+        .collect();
+    assert_eq!(
+        rest,
+        without.iter().collect::<Vec<_>>(),
+        "the config is the only addition"
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--strict-mcp-config")),
+        "the operator's own servers stay: {args:?}"
+    );
+}
+
+/// D8: the JSON is the CLI's own `mcpServers` shape — keyed by name, `type: "stdio"`, `env` an
+/// object — and serialises compactly in key order, and the argv carries only the file's path
+/// (MOD-79): the JSON's `env` holds the session's `HTUI_MCP_TOKEN`.
+#[test]
+fn the_mcp_config_is_the_clis_stdio_shape() {
+    let config = htui_agent::cli::mcp_config(&[htui_server()]).expect("one server, one config");
+    let parsed: serde_json::Value = serde_json::from_str(&config).expect("the config is JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "mcpServers": {
+                "htui": {
+                    "type": "stdio",
+                    "command": "/abs/htui",
+                    "args": ["mcp"],
+                    "env": {
+                        "HTUI_MCP_ADDR": "/run/htui-mcp-1-abcd/s",
+                        "HTUI_MCP_TOKEN": "token-value",
+                    },
+                },
+            },
+        }),
+    );
+    assert!(
+        !config.contains('\n') && !config.contains(": "),
+        "compact: {config}"
+    );
+    assert!(
+        config.find("HTUI_MCP_ADDR") < config.find("HTUI_MCP_TOKEN"),
+        "env in key order: {config}"
+    );
+
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.mcp = vec![htui_server()];
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    assert_eq!(
+        mcp_configs(&args),
+        [&format!("--mcp-config={CONFIG_PATH}")],
+        "argv carries the file's path, never that JSON (MOD-79)"
+    );
+    for secret in ["token-value", "/run/htui-mcp-1-abcd/s", "mcpServers"] {
+        assert!(
+            !args.iter().any(|arg| arg.contains(secret)),
+            "{secret} stays off the argv: {args:?}"
+        );
+    }
+}
+
+/// D8: the operator's `extra_args` still come last, so a repeated flag is theirs.
+#[test]
+fn extra_args_stay_last_with_mcp() {
+    let mut spec = full_spec();
+    spec.mcp = vec![htui_server()];
+    let args = argv(
+        &[],
+        &cli_settings("", &["--mcp-config=operator.json", "--y"]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    assert_eq!(
+        args[args.len() - 2..],
+        ["--mcp-config=operator.json", "--y"],
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .position(|arg| arg.starts_with("--disallowedTools="))
+            .expect("the deny list travels")
+            < args.len() - 2,
+        "{args:?}"
+    );
+}
+
+/// MOD-11 D18: a spec with a prompt port names `htui`'s prompt tool as one flag pair right after
+/// the `--mcp-config=` argument; a spec without one passes no such flag at all.
+#[test]
+fn argv_names_the_prompt_tool_only_with_a_port() {
+    let mut with = full_spec();
+    with.mcp = vec![htui_server()];
+    let without = argv(
+        &[],
+        &cli_settings("", &["--y"]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    assert!(
+        !without.contains(&"--permission-prompt-tool".to_owned()),
+        "no port, no prompt tool: {without:?}"
+    );
+
+    let (port, _ask) = bridge();
+    with.prompt = Some(port);
+    let args = argv(
+        &[],
+        &cli_settings("", &["--y"]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    let config_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--mcp-config="))
+        .expect("the config is there");
+    assert_eq!(
+        args[config_at + 1..config_at + 3],
+        ["--permission-prompt-tool", "mcp__htui__permission_prompt"],
+        "the pair follows the config: {args:?}"
+    );
+    assert_eq!(PROMPT_TOOL, "mcp__htui__permission_prompt");
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|arg| *arg != "--permission-prompt-tool" && *arg != PROMPT_TOOL)
+        .collect();
+    assert_eq!(
+        rest,
+        without.iter().collect::<Vec<_>>(),
+        "the pair is the only addition"
+    );
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("--y"),
+        "extra_args last"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-55 review M1: a session with no tool at all
+// ---------------------------------------------------------------------------------------------
+
+/// A `no_tools` exposure, every kind denied besides: what a help turn hands the driver.
+fn tool_less() -> ToolExposure {
+    ToolExposure {
+        deny_kinds: ToolKind::ALL.to_vec(),
+        no_tools: true,
+        ..ToolExposure::default()
+    }
+}
+
+/// `no_tools` disables every built-in tool (`--tools=`, the empty list), loads no MCP server at
+/// all (`--strict-mcp-config` with no `--mcp-config`, so the operator's own servers go too), and
+/// drops the row's `--permission-mode` and the prompt-tool pair: with nothing to call there is
+/// nothing a mode or a prompt could approve.
+#[test]
+fn no_tools_disables_every_tool_and_every_mcp_server() {
+    let mut spec = full_spec();
+    spec.tools = tool_less();
+    spec.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    spec.prompt = Some(port);
+
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--x"]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+
+    assert_eq!(
+        args.iter()
+            .filter(|arg| arg.starts_with("--tools"))
+            .collect::<Vec<_>>(),
+        ["--tools="],
+        "one empty tool list, the allow-list ignored: {args:?}"
+    );
+    assert!(args.contains(&"--strict-mcp-config".to_owned()), "{args:?}");
+    assert!(mcp_configs(&args).is_empty(), "no server: {args:?}");
+    assert!(
+        !args.contains(&"--permission-mode".to_owned()),
+        "the row's mode is dropped: {args:?}"
+    );
+    assert!(
+        !args.contains(&"--permission-prompt-tool".to_owned()),
+        "no prompt tool: {args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg.starts_with("--disallowedTools=")),
+        "the deny list still travels: {args:?}"
+    );
+    assert_eq!(args.last().map(String::as_str), Some("--x"), "{args:?}");
+}
+
+/// With `no_tools` off nothing above appears, whatever else the exposure says: the flag-off argv
+/// is pinned flag for flag by `argv_is_the_ana4_line_in_order` and `argv_without_mcp_is_unchanged`.
+#[test]
+fn no_tools_off_adds_neither_flag() {
+    let grid = [
+        ToolExposure::default(),
+        exposure(&["Read"], &[], &[]),
+        exposure(&["Read", "Grep"], &["mcp__x__y"], ToolKind::ALL),
+    ];
+    for tools in grid {
+        let mut spec = full_spec();
+        spec.tools = tools.clone();
+        spec.mcp = vec![htui_server()];
+        let args = argv(
+            &[],
+            &cli_settings("acceptEdits", &[]),
+            &spec,
+            "minted-id",
+            Some(Path::new(CONFIG_PATH)),
+            false,
+        );
+        assert!(
+            !args.contains(&"--strict-mcp-config".to_owned()),
+            "{tools:?} → {args:?}"
+        );
+        assert!(
+            !args.contains(&"--tools=".to_owned()),
+            "{tools:?} → {args:?}"
+        );
+        assert_eq!(mcp_configs(&args).len(), 1, "{tools:?} → {args:?}");
+    }
+}
+
+/// A row whose `extra_args` would widen a tool-less session back is refused, naming the flag:
+/// they come last on the argv, so the CLI would keep them over `--tools=`.
+#[test]
+fn no_tools_refuses_extra_args_that_widen() {
+    for extra in [
+        &["--allowedTools", "Bash"][..],
+        &["--allowedTools=Bash"],
+        &["--allowed-tools", "Bash"],
+        &["--dangerously-skip-permissions"],
+        &["--allow-dangerously-skip-permissions"],
+        &["--permission-mode", "bypassPermissions"],
+        &["--permission-mode=acceptEdits"],
+        &["--tools", "Bash"],
+        &["--tools=Bash"],
+        &["--mcp-config", "operator.json"],
+        &["--mcp-config=operator.json"],
+    ] {
+        let cli = cli_settings("", extra);
+        let refused =
+            refuse_widening(&cli, &tool_less()).expect_err(&format!("{extra:?} must be refused"));
+        assert!(
+            refused.to_string().starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        let flag = extra[0].split('=').next().expect("a flag");
+        assert!(
+            refused.to_string().contains(flag),
+            "{extra:?}: the refusal names the flag: {refused}"
+        );
+    }
+}
+
+/// What does not widen passes, and with `no_tools` off nothing is checked at all.
+#[test]
+fn no_tools_passes_extra_args_that_do_not_widen() {
+    for extra in [
+        &[][..],
+        &["--x"],
+        &["--permission-mode", "plan"],
+        &["--disallowedTools=Bash"],
+    ] {
+        refuse_widening(&cli_settings("acceptEdits", extra), &tool_less())
+            .unwrap_or_else(|err| panic!("{extra:?} widens nothing: {err}"));
+    }
+    refuse_widening(
+        &cli_settings("bypassPermissions", &["--dangerously-skip-permissions"]),
+        &ToolExposure::default(),
+    )
+    .expect("a session with tools is not this check's business");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-91: the user's own Claude Code extensions stay out of the session
+// ---------------------------------------------------------------------------------------------
+
+/// The one literal pin of the levers (blueprint B1): what T1 case 1 probed against `claude`
+/// 2.1.294. Every other case composes its argv from [`ISOLATION_ARGS`].
+#[test]
+fn isolation_args_are_the_probed_levers() {
+    assert_eq!(
+        ISOLATION_ARGS[..],
+        [
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--disable-slash-commands",
+            "--setting-sources",
+            "",
+        ],
+    );
+}
+
+/// Where [`ISOLATION_ARGS`] start in `args`, asserting that they appear once, as one contiguous
+/// window, and that neither lever appears anywhere else.
+fn levers_at(args: &[String]) -> usize {
+    let at: Vec<usize> = args
+        .windows(ISOLATION_ARGS.len())
+        .enumerate()
+        .filter(|(_, window)| *window == ISOLATION_ARGS)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(at.len(), 1, "one window of levers: {args:?}");
+    for lever in ISOLATION_ARGS {
+        assert_eq!(
+            args.iter().filter(|arg| *arg == lever).count(),
+            1,
+            "{lever} once: {args:?}"
+        );
+    }
+    at[0]
+}
+
+/// The sessions D2 names, each with the MCP config path `io_in` would pass: a fresh one, a
+/// resume, a tool-less help turn, and one with every field set, a server and a prompt port.
+fn lever_grid() -> Vec<(&'static str, SessionSpec, Option<&'static Path>)> {
+    let fresh = spec(PathBuf::from("/scratch"));
+    let mut resuming = spec(PathBuf::from("/scratch"));
+    resuming.resume = Some(AgentSessionRef::new("older-session"));
+    let mut tool_less_spec = full_spec();
+    tool_less_spec.tools = tool_less();
+    let mut full = full_spec();
+    full.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    full.prompt = Some(port);
+    vec![
+        ("fresh", fresh, None),
+        ("resuming", resuming, None),
+        ("tool-less", tool_less_spec, None),
+        ("full", full, Some(Path::new(CONFIG_PATH))),
+    ]
+}
+
+/// MOD-91 D1, D2: a row that has not opted back in carries the levers on every session, tool-less
+/// help turns and resumes included.
+#[test]
+fn argv_isolates_by_default() {
+    for (name, spec, config) in lever_grid() {
+        let args = argv(
+            &[],
+            &cli_settings("acceptEdits", &[]),
+            &spec,
+            "minted-id",
+            config,
+            false,
+        );
+        assert_eq!(
+            levers_at(&args) + ISOLATION_ARGS.len(),
+            args.len(),
+            "{name}: with no extra_args, the levers end the argv"
+        );
+    }
+}
+
+/// MOD-91 D3: a row that opts back in (`settings.user_extensions`) gets the same argv minus the
+/// levers, and nothing else changes.
+#[test]
+fn argv_opt_in_drops_the_levers() {
+    for (name, spec, config) in lever_grid() {
+        let cli = cli_settings("acceptEdits", &["--x"]);
+        let opted = argv(&[], &cli, &spec, "minted-id", config, true);
+        let isolated = argv(&[], &cli, &spec, "minted-id", config, false);
+
+        for lever in ISOLATION_ARGS.iter().filter(|arg| arg.starts_with("--")) {
+            assert!(!opted.iter().any(|arg| arg == lever), "{name}: {opted:?}");
+        }
+        let at = levers_at(&isolated);
+        assert_eq!(
+            [&isolated[..at], &isolated[at + ISOLATION_ARGS.len()..]].concat(),
+            opted,
+            "{name}: the levers are the only difference"
+        );
+    }
+}
+
+/// MOD-91 D2: the levers come after the narrowing and before the operator's `extra_args`, so a
+/// repeated flag there is still the operator's (7).
+#[test]
+fn the_levers_precede_extra_args() {
+    let mut spec = full_spec();
+    spec.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    spec.prompt = Some(port);
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--y"]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+
+    let at = levers_at(&args);
+    assert!(
+        args[at - 1].starts_with("--disallowedTools="),
+        "right after the narrowing: {args:?}"
+    );
+    assert_eq!(
+        args[at + ISOLATION_ARGS.len()..],
+        ["--y"],
+        "right before extra_args, which stay last: {args:?}"
+    );
+}
+
+/// MOD-91 D2: a tool-less help turn is isolated too: the levers follow `--strict-mcp-config` and
+/// the deny list, and precede `extra_args`.
+#[test]
+fn a_tool_less_session_is_isolated_too() {
+    let mut spec = full_spec();
+    spec.tools = tool_less();
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--x"]),
+        &spec,
+        "minted-id",
+        None,
+        false,
+    );
+
+    let at = levers_at(&args);
+    assert_eq!(args[at - 2], "--strict-mcp-config", "{args:?}");
+    assert!(args[at - 1].starts_with("--disallowedTools="), "{args:?}");
+    assert_eq!(args[at + ISOLATION_ARGS.len()..], ["--x"], "{args:?}");
+}
+
+/// MOD-91 D8: a later `--settings` replaces `htui`'s own whole (T1 case 1a), so an isolated row
+/// refuses one in `extra_args` unless its value is inline JSON setting `"disableAllHooks": true`.
+/// Spaced or joined, a path (`htui` does not read the operator's file), `false`, the string
+/// `"true"`, a key nested one level down, a non-object or JSON scalar, an empty value, a dangling
+/// flag, one behind an unrelated flag, and a bad value whatever follows it are all refused. The
+/// refusal names the flag and both fixes, and never the value: a settings value can carry an `env`
+/// block (`R-SEC-2`).
+#[test]
+fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
+    for extra in [
+        &["--settings", r#"{"env":{"TOKEN":"s3cret"}}"#][..],
+        &[r#"--settings={"env":{"TOKEN":"s3cret"}}"#],
+        &["--settings", "/op/settings.json"],
+        &["--settings=/op/settings.json"],
+        &["--settings", r#"{"disableAllHooks":false}"#],
+        &["--settings", "[1]"],
+        &["--settings", r#"{"x":{"disableAllHooks":true}}"#],
+        &["--settings", r#"{"disableAllHooks":"true"}"#],
+        &["--settings="],
+        &["--settings", "true"],
+        &["--settings", "null"],
+        &["--settings"],
+        &["--x", "--settings", "/op/settings.json"],
+        &[
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--settings",
+            "/op/settings.json",
+        ],
+        &[
+            "--settings",
+            "/op/settings.json",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+        ],
+    ] {
+        let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .expect_err(&format!("{extra:?} must be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        for named in [
+            "--settings",
+            "disableAllHooks",
+            "set `mods (y/n)` to `y` in Settings > Agents",
+        ] {
+            assert!(
+                message.contains(named),
+                "{extra:?}: names {named}: {message}"
+            );
+        }
+        for secret in ["s3cret", "/op/settings.json", "TOKEN"] {
+            assert!(
+                !message.contains(secret),
+                "{extra:?}: never quotes the value: {message}"
+            );
+        }
+    }
+}
+
+/// MOD-91 D8: a `--settings` that keeps the hooks lever passes, spaced, joined or whitespace-laden,
+/// whatever else it sets; so does a row with no `--settings`, and a flag that only shares a prefix
+/// with MOD-96 D2's (the match is exact).
+#[test]
+fn a_settings_that_keeps_the_hooks_lever_passes() {
+    for extra in [
+        &["--settings", r#"{"disableAllHooks":true}"#][..],
+        &[r#"--settings={"disableAllHooks":true,"env":{"A":"b"}}"#],
+        &[
+            "--settings",
+            r#"{ "disableAllHooks" : true, "env": { "A": "b" } }"#,
+        ],
+        &[],
+        &["--x"],
+        &["--setting-source", "user"],
+    ] {
+        refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .unwrap_or_else(|err| panic!("{extra:?} keeps the session isolated: {err}"));
+    }
+}
+
+/// MOD-91 D8: a row that opts back in has nothing to keep, so its `extra_args` are not read.
+#[test]
+fn an_opted_in_row_is_never_checked_for_settings() {
+    refuse_settings_override(
+        &cli_settings("acceptEdits", &["--settings", "/op/settings.json"]),
+        true,
+    )
+    .expect("an opted-in row is not this check's business");
+}
+
+/// MOD-96 D2: the CLI keeps the last `--setting-sources` (probe E1), so any one in an isolated
+/// row's `extra_args` would read the settings files again, and their permission rules would answer
+/// before `htui` is asked. Spaced or joined, with any value, `""` included, none, or behind another
+/// flag, it is refused before its value is read. The refusal names the flag and the fix, and never
+/// the value, nor any source name it could have carried.
+#[test]
+fn an_isolated_row_refuses_a_setting_sources_override() {
+    for extra in [
+        &["--setting-sources", "user"][..],
+        &["--setting-sources=user,project,local"],
+        &["--setting-sources", ""],
+        &["--setting-sources="],
+        &["--setting-sources"],
+        &["--x", "--setting-sources", "project"],
+        &[
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--setting-sources",
+            "s3cret-source",
+        ],
+        &["--setting-sources", "s3cret-source"],
+    ] {
+        let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .expect_err(&format!("{extra:?} must be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        for named in [
+            "--setting-sources",
+            "set `mods (y/n)` to `y` in Settings > Agents",
+        ] {
+            assert!(
+                message.contains(named),
+                "{extra:?}: names {named}: {message}"
+            );
+        }
+        for value in ["s3cret", "user", "project", "local"] {
+            assert!(
+                !message.contains(value),
+                "{extra:?}: never quotes the value: {message}"
+            );
+        }
+    }
+}
+
+/// MOD-96 D2: a row that opts back in reads its settings files anyway, so its `--setting-sources`
+/// is not read either.
+#[test]
+fn an_opted_in_row_is_never_checked_for_setting_sources() {
+    refuse_settings_override(
+        &cli_settings("acceptEdits", &["--setting-sources", "user,project,local"]),
+        true,
+    )
+    .expect("an opted-in row is not this check's business");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A session over a scripted agent
+// ---------------------------------------------------------------------------------------------
+
+/// How long a signalled process is given to stop being one.
+///
+/// `acp_driver.rs`'s window and its reasoning: a kill takes single-digit milliseconds on this box,
+/// and a bound three orders of magnitude larger turns a regression into a named failure in two
+/// seconds rather than a hung suite.
+#[cfg(unix)]
+const KILL_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a case waits for an event before calling the supervisor stuck.
+///
+/// Every script here answers in milliseconds; this exists so a supervisor that stopped forwarding
+/// fails with the name of the event it never produced instead of hanging the suite.
+#[cfg(unix)]
+const EVENT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Fails unless `pid` has been **reaped** within [`KILL_WINDOW`]: no `/proc/{pid}` at all, which a
+/// zombie still has.
+///
+/// The strong form, and every case here is entitled to it: the cancel path awaits
+/// `ChildGuard::kill_and_reap` before it acknowledges, and the handle joins the task before
+/// `cancel` returns. `acp_driver.rs` carries the same helper for the same reason it is copied
+/// rather than shared — a case's own assertion in its own file is what lets one change without
+/// the others being re-read.
+#[cfg(unix)]
+async fn assert_reaped(pid: u32, what: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + KILL_WINDOW;
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: pid {pid} was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, what);
+    }
+}
+
+/// Fails unless `pid` is gone **or** reaped-pending within [`KILL_WINDOW`].
+///
+/// The weaker form, for the one exit that runs no code of ours: an aborted task's `ChildGuard`
+/// `Drop` can only *signal*, so a zombie is the honest expectation there.
+#[cfg(unix)]
+async fn assert_not_running(pid: u32, what: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + KILL_WINDOW;
+        loop {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return;
+            };
+            // `pid (comm) state …`, and `comm` may hold spaces and parens: the state is the first
+            // field after the **last** `)`.
+            let after = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
+            let state = after.trim().chars().next().unwrap_or('Z');
+            if state == 'Z' || state == 'X' {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: pid {pid} is still running (state {state})"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, what);
+    }
+}
+
+/// Writes `contents` as an executable file, creating its directory, without opening the
+/// `ETXTBSY` window (`crate::write_executable`).
+#[cfg(unix)]
+fn executable(path: &Path, contents: &str) {
+    crate::write_executable::write_executable(path, contents);
+}
+
+/// A synthetic `cli` row naming `command` directly.
+///
+/// Directly, and not through a `${tool}` placeholder: this file is about the supervisor, and a
+/// discovery document would put `tools::resolve` between the case and the thing it is asserting.
+/// The name is **not** an agent's brand on purpose (`R-AGT-5`): everything that selects this
+/// transport comes out of `transport` and `settings.cli.stream`, and a supervisor that had started
+/// reading `agent.name` would still pass if the row were called what the dialect is called.
+#[cfg(unix)]
+fn scripted_row(command: &Path, env: serde_json::Map<String, serde_json::Value>) -> AgentRow {
+    let now = Utc::now();
+    AgentRow {
+        id: AgentId::new(),
+        name: "scripted-cli".to_owned(),
+        transport: Transport::Cli,
+        launch: json!({
+            "command": command.to_string_lossy(),
+            "args": [],
+            "env": env,
+            "discovery": { "handshake": false, "tools": {} },
+        }),
+        models: vec!["row-model".to_owned()],
+        default_model: None,
+        billing: Billing::Subscription,
+        enabled: true,
+        settings: json!({
+            "cli": {
+                "stream": htui_agent::cli::STREAM,
+                "permission_mode": "acceptEdits",
+                "extra_args": [],
+            },
+            "usage": { "scope": "model_usage" },
+        }),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// A session over `row`, through the factory — so the registry's own `cli/<stream>` derivation and
+/// the capability profile it computes are part of every case rather than bypassed by them.
+#[cfg(unix)]
+async fn start(row: &AgentRow, cwd: &Path) -> Box<dyn AgentSession> {
+    start_with(row, spec(cwd.to_path_buf())).await
+}
+
+/// [`start`] with a spec the case built (MOD-11 D18: one carrying a prompt port).
+#[cfg(unix)]
+async fn start_with(row: &AgentRow, spec: SessionSpec) -> Box<dyn AgentSession> {
+    driver(row)
+        .start(spec, "hello".to_owned())
+        .await
+        .expect("the scripted agent sends its `system/init`")
+}
+
+/// The driver for `row`, through the factory, with §4.3's capability triple checked: what
+/// [`start_with`] starts from, and what a case that expects `start` to **fail** calls directly.
+#[cfg(unix)]
+fn driver(row: &AgentRow) -> Box<dyn htui_agent::driver::AgentDriver> {
+    let mut factory = DriverFactory::new();
+    factory.register(
+        htui_agent::cli::ADAPTER_ID,
+        Box::new(ClaudeStreamAdapter) as Box<dyn htui_agent::registry::TransportBuilder>,
+    );
+    let driver = factory
+        .driver_for(row, None)
+        .expect("the `cli/claude_stream_json` adapter builds this row");
+    assert!(
+        !driver.caps().permission_requests && !driver.caps().edit_proposals && !driver.caps().plans,
+        "§4.3's triple is what the chat tab draws its banner from: {:?}",
+        driver.caps()
+    );
+    driver
+}
+
+/// The next event, or a named failure rather than a hung suite.
+#[cfg(unix)]
+async fn next(session: &mut Box<dyn AgentSession>, what: &str) -> DriverEvent {
+    match tokio::time::timeout(EVENT_WINDOW, session.next_event()).await {
+        Ok(Ok(Some(envelope))) => envelope.event,
+        Ok(Ok(None)) => panic!("the session ended while waiting for {what}"),
+        Ok(Err(err)) => panic!("waiting for {what}: {err}"),
+        Err(_) => panic!("nothing arrived within the window while waiting for {what}"),
+    }
+}
+
+/// Every remaining event until the session ends.
+#[cfg(unix)]
+async fn drain(session: &mut Box<dyn AgentSession>) -> Vec<DriverEvent> {
+    let mut events = Vec::new();
+    loop {
+        match tokio::time::timeout(EVENT_WINDOW, session.next_event()).await {
+            Ok(Ok(Some(envelope))) => events.push(envelope.event),
+            Ok(Ok(None)) => return events,
+            Ok(Err(err)) => panic!("draining the session: {err}"),
+            Err(_) => panic!("the session never ended; drained {events:?}"),
+        }
+    }
+}
+
+/// The banner's body, or a failure naming what arrived instead.
+#[cfg(unix)]
+fn banner_body(event: &DriverEvent) -> &serde_json::Value {
+    match event {
+        DriverEvent::Other(other) if other.update == "session_started" => &other.body,
+        other => panic!("the session banner is the step's first row, got {other:?}"),
+    }
+}
+
+/// The `system/init` line, with the keys the recorded transcripts carry — `claude_code_version`
+/// and no `version`, which is the sort of thing only a fixture can settle.
+#[cfg(unix)]
+const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"the-cli-picked-this","claude_code_version":"9.9.9","model":"scripted-model"}"#;
+
+/// A terminal `result`, successful, with a cost and one model's tokens.
+#[cfg(unix)]
+const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","total_cost_usd":0.000002,"modelUsage":{"m":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#;
+
+/// One assistant message carrying the word `ok`.
+#[cfg(unix)]
+const REPLY: &str =
+    r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}}"#;
+
+/// The tool-use id of the recorded probe's gated call (blueprint §2.7).
+#[cfg(unix)]
+const TOOL_USE_ID: &str = "toolu_01HuMymhasmoPmGaLNFxJ4GV";
+
+/// The assistant line announcing that call, as the CLI streams it before it asks.
+#[cfg(unix)]
+const TOOL_USE: &str = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_01HuMymhasmoPmGaLNFxJ4GV","name":"mcp__htui__hello","input":{}}]}}"#;
+
+/// [`RESULT`] carrying the probe's `permission_denials[]` entry for that call (blueprint §2.7):
+/// what the CLI repeats at the end of a turn whose prompt was answered `deny`.
+#[cfg(unix)]
+const DENIED_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","total_cost_usd":0.000002,"modelUsage":{"m":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}},"permission_denials":[{"tool_name":"mcp__htui__hello","tool_use_id":"toolu_01HuMymhasmoPmGaLNFxJ4GV","tool_input":{}}]}"#;
+
+/// What every script records about itself before it says a word: its argv, and its own pid.
+///
+/// The pid is the group leader's, and it is the one identifier a kill can be checked against that
+/// nothing else can accidentally answer to — a `pgrep` pattern matches any command line that
+/// merely contains the text, including the shell that ran the check (`launch.rs`'s `pid()` doc).
+#[cfg(unix)]
+const RECORD: &str = concat!(
+    "printf '%s\n' \"$@\" > \"$HTUI_ARGV_FILE\"\n",
+    "echo $$ > \"$HTUI_PID_FILE\"\n",
+);
+
+/// A template with its placeholders filled in.
+///
+/// The envelopes and the self-recording preamble live in one place so a case reads as a *script* —
+/// what the agent does, in order — rather than as three hundred columns of JSON with a `while` loop
+/// hidden in the middle.
+#[cfg(unix)]
+fn script(template: &str) -> String {
+    template
+        .replace("<RECORD>", RECORD)
+        .replace("<COPY_CONFIG>", COPY_CONFIG)
+        .replace("<INIT>", INIT)
+        .replace("<RESULT>", RESULT)
+        .replace("<REPLY>", REPLY)
+        .replace("<TOOL_USE>", TOOL_USE)
+        .replace("<DENIED_RESULT>", DENIED_RESULT)
+        .replace("<LATE_TOOL_USE>", LATE_TOOL_USE)
+        .replace("<FLOOD>", &FLOOD.to_string())
+}
+
+/// Answers every stdin line with a whole turn, and exits when stdin closes.
+///
+/// It records its own argv first, so one case can assert what the kernel was asked to start
+/// without a second fixture. The hook envelope precedes `system/init` because that is what the
+/// real CLI does without `--bare` (plan F-9), and the supervisor's pre-`init` buffer is what has to
+/// put it *behind* the banner.
+#[cfg(unix)]
+const TURN_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '{"type":"system","subtype":"hook_started","hook_name":"SessionStart"}'
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// Announces a tool call and then **dies mid-turn**, which is the milestone-3 defect class.
+#[cfg(unix)]
+const EOF_MID_TURN_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}'
+exit 0
+"#;
+
+/// Finishes its turn and *then* exits: the stream ends with nothing open (plan F-1).
+#[cfg(unix)]
+const EOF_BETWEEN_TURNS_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<REPLY>'
+printf '%s\n' '<RESULT>'
+exit 0
+"#;
+
+/// Runs forever until it is interrupted, and answers the interrupt with a **late** terminal
+/// `result` — the shape plan F-2 measured, minus the error dress, so a drained `done` is
+/// distinguishable from a synthesized one by its stop reason alone.
+#[cfg(unix)]
+const SLOW_CANCEL_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+on_int() {
+  sleep 0.2
+  printf '%s\n' '<RESULT>'
+  exit 0
+}
+trap on_int INT
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<REPLY>'
+while true; do sleep 0.1; done
+"#;
+
+/// Writes a line that is not JSON and a line that ends CRLF, and then finishes its turn
+/// normally: neither may end the stream (blueprint H-23).
+#[cfg(unix)]
+const NOISY_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' 'npm warn: this is not an envelope'
+printf '%s\r\n' '<REPLY>'
+printf '%s\n' '<RESULT>'
+exit 0
+"#;
+
+/// MOD-11 D18: announces [`TOOL_USE`] and then waits — as the CLI waits on its
+/// `--permission-prompt-tool` — until the case creates `$HTUI_GO_FILE`; then ends the turn with
+/// [`DENIED_RESULT`] and exits.
+#[cfg(unix)]
+const PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+printf '%s\n' '<DENIED_RESULT>'
+exit 0
+"#;
+
+/// [`PROMPT_SCRIPT`] answering the interrupt with [`DENIED_RESULT`] — F-2's real `result`, carrying
+/// the `permission_denials[]` entry for the call the cancel denied.
+#[cfg(unix)]
+const PROMPT_CANCEL_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+on_int() {
+  printf '%s\n' '<DENIED_RESULT>'
+  exit 0
+}
+trap on_int INT
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while true; do sleep 0.05; done
+"#;
+
+/// How many assistant lines [`FLOOD_PROMPT_SCRIPT`] streams while its prompt is parked: well past
+/// [`htui_agent::cli::EVENTS_CAPACITY`], so the session task blocks on a full event channel.
+#[cfg(unix)]
+const FLOOD: usize = 1000;
+
+/// [`PROMPT_SCRIPT`], except that once `$HTUI_GO_FILE` exists it streams [`FLOOD`] replies — as a
+/// CLI keeps streaming parallel work while one gated call waits — and only ends its turn once
+/// `$HTUI_GO_FILE.end` exists too.
+#[cfg(unix)]
+const FLOOD_PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+i=0
+while [ "$i" -lt <FLOOD> ]; do printf '%s\n' '<REPLY>'; i=$((i+1)); done
+while [ ! -f "$HTUI_GO_FILE.end" ]; do sleep 0.05; done
+printf '%s\n' '<RESULT>'
+exit 0
+"#;
+
+/// The assistant line announcing a gated `Write`, for [`LATE_CALL_PROMPT_SCRIPT`].
+#[cfg(unix)]
+const LATE_TOOL_USE: &str = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"toolu_late","name":"Write","input":{"file_path":"/tmp/late.txt","content":"x"}}]}}"#;
+
+/// Streams [`FLOOD`] replies and *then* the `tool_use` line of [`LATE_TOOL_USE`], touches
+/// `$HTUI_GO_FILE.sent`, and waits for `$HTUI_GO_FILE` before ending its turn: a session task that
+/// has fallen behind stdout when the CLI asks about the call.
+#[cfg(unix)]
+const LATE_CALL_PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+i=0
+while [ "$i" -lt <FLOOD> ]; do printf '%s\n' '<REPLY>'; i=$((i+1)); done
+printf '%s\n' '<LATE_TOOL_USE>'
+: > "$HTUI_GO_FILE.sent"
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+printf '%s\n' '<RESULT>'
+exit 0
+"#;
+
+/// A row over a script written into `dir`, plus the two files it records about itself.
+#[cfg(unix)]
+struct Scripted {
+    row: AgentRow,
+    /// Where the script writes its own argv, one argument per line.
+    argv: PathBuf,
+    /// Where the script writes its own pid.
+    pid: PathBuf,
+}
+
+#[cfg(unix)]
+fn scripted(dir: &Path, body: &str) -> Scripted {
+    let command = dir.join("bin/scripted-agent");
+    let argv = dir.join("argv");
+    let pid = dir.join("pid");
+    executable(&command, &script(body));
+    let env = serde_json::Map::from_iter([
+        ("HTUI_ARGV_FILE".to_owned(), json!(argv.to_string_lossy())),
+        ("HTUI_PID_FILE".to_owned(), json!(pid.to_string_lossy())),
+        (
+            "HTUI_GO_FILE".to_owned(),
+            json!(dir.join("go").to_string_lossy()),
+        ),
+    ]);
+    Scripted {
+        row: scripted_row(&command, env),
+        argv,
+        pid,
+    }
+}
+
+/// The pid the script recorded for itself, once it has got that far.
+#[cfg(unix)]
+fn recorded_pid(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .expect("the script recorded its pid")
+        .trim()
+        .parse()
+        .expect("a pid is a number")
+}
+
+/// A turn, start to finish, in the order §4.4 and §6.2 fix: the banner first, then whatever came
+/// before it, then the reply, then the turn's one `usage`, then exactly one `done`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_session_over_a_scripted_agent_streams_a_turn_and_then_a_follow_up() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), TURN_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let banner = next(&mut session, "the banner").await;
+    let body = banner_body(&banner);
+    assert_eq!(
+        body["session_id"],
+        json!(
+            session
+                .session_ref()
+                .expect("a CLI session has an id")
+                .as_str()
+        ),
+        "the id is `htui`'s mint, not the one the script reported (D84, blueprint H-17): {body}"
+    );
+    assert_eq!(
+        body["protocol_version"],
+        json!(null),
+        "the stream negotiates nothing, and a `1` copied from ACP would claim a handshake that \
+         never happened: {body}"
+    );
+    assert_eq!(body["agent_name"], json!("scripted-cli"), "{body}");
+    assert_eq!(
+        body["agent_version"],
+        json!("9.9.9"),
+        "`system/init.claude_code_version`, which is the key the wire actually carries: {body}"
+    );
+    assert_eq!(
+        body["models"],
+        json!(["scripted-model"]),
+        "the stream says which model it selected, and that beats the row's list: {body}"
+    );
+
+    assert!(
+        matches!(
+            next(&mut session, "the buffered hook line").await,
+            DriverEvent::Other(other) if other.update == "system/hook_started"
+        ),
+        "F-9: a hook envelope that arrived before `init` is released *behind* the banner, so the \
+         banner is still the step's first `other` row"
+    );
+
+    let follow_up_too_early = session.send_follow_up("again".to_owned()).await;
+    assert!(
+        matches!(
+            follow_up_too_early,
+            Err(DriverError::Transport(ref message))
+                if message.contains("would interleave two turns")
+        ),
+        "a follow-up before the turn's `done` is refused: {follow_up_too_early:?}"
+    );
+
+    assert!(matches!(
+        next(&mut session, "the reply").await,
+        DriverEvent::AssistantChunk(chunk) if chunk.text == "ok"
+    ));
+    let usage = next(&mut session, "the turn's usage").await;
+    assert!(
+        matches!(&usage, DriverEvent::Usage(usage) if usage.cost_micros == Some(2)),
+        "the turn's one `usage` row, cost as micros: {usage:?}"
+    );
+    assert!(matches!(
+        next(&mut session, "the turn's done").await,
+        DriverEvent::Done(done) if done.stop_reason == StopReason::EndTurn
+    ));
+
+    session
+        .send_follow_up("again".to_owned())
+        .await
+        .expect("after the `done` a follow-up opens the next turn");
+    assert!(matches!(
+        next(&mut session, "the second turn's reply").await,
+        DriverEvent::AssistantChunk(_)
+    ));
+    let _usage = next(&mut session, "the second turn's usage").await;
+    assert!(matches!(
+        next(&mut session, "the second turn's done").await,
+        DriverEvent::Done(_)
+    ));
+
+    let argv = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+    let seen: Vec<&str> = argv.lines().collect();
+    assert!(
+        seen.windows(2)
+            .any(|pair| pair == ["--output-format", "stream-json"]),
+        "the argv the kernel saw is §4.4's line: {argv}"
+    );
+    let minted = session
+        .session_ref()
+        .expect("a CLI session has an id")
+        .as_str()
+        .to_owned();
+    assert!(
+        seen.windows(2)
+            .any(|pair| pair == ["--session-id", minted.as_str()]),
+        "D84 end to end: the id `session_ref` hands a later step's `--resume` is the one this \
+         process was started with, not one the agent reported back: {argv}"
+    );
+    assert!(
+        !argv.contains("hello"),
+        "and the prompt is not on it — it went out on stdin (blueprint P-2): {argv}"
+    );
+
+    // Between turns, so there is no turn to cancel: this ends the session.
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    assert!(
+        matches!(
+            tokio::time::timeout(EVENT_WINDOW, session.next_event()).await,
+            Ok(Ok(None))
+        ),
+        "a cancel between turns ends the session rather than synthesizing a turn's `done`"
+    );
+}
+
+/// Once the session has ended, every operation but a pull answers `Closed` — including the one this
+/// transport does not have at all.
+#[tokio::test]
+#[cfg(unix)]
+async fn answer_permission_is_unsupported_and_closed_first_once_the_session_has_ended() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), TURN_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let refused = session
+        .answer_permission(
+            PermissionRequestId::new("whatever"),
+            PermissionAnswer::Cancelled,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DriverError::Unsupported("answer_permission"))),
+        "this transport has no permission channel at all, which is a statement about the \
+         *operation* rather than about the id (§4.3): {refused:?}"
+    );
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    while let Ok(Ok(Some(_))) = tokio::time::timeout(EVENT_WINDOW, session.next_event()).await {}
+
+    let closed = session
+        .answer_permission(
+            PermissionRequestId::new("whatever"),
+            PermissionAnswer::Cancelled,
+        )
+        .await;
+    assert!(
+        matches!(closed, Err(DriverError::Closed)),
+        "a session that is over should not be arguing about an operation it never had the chance \
+         to refuse: {closed:?}"
+    );
+}
+
+/// **The milestone-3 defect class, closed** (`682a423`: "a stream ending before its `done` was
+/// recorded as a finished turn"). A child that dies with a turn open owes three things, in this
+/// order: an `error` naming the transport, a synthesized `failed` result for every call still
+/// open, and exactly one `done { cancelled }`.
+///
+/// The order is the assertion. A `done` before the `error` would let a replay read the turn as
+/// having ended cleanly and then met some unrelated trouble; a missing `tool_result` leaves the
+/// call spinning in the transcript forever; a second `done` breaks "exactly one per turn", which
+/// is what `send_follow_up` gates on.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_eof_mid_turn_is_an_error_a_closed_call_and_one_cancelled_done() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), EOF_MID_TURN_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let _banner = next(&mut session, "the banner").await;
+    assert!(matches!(
+        next(&mut session, "the tool call").await,
+        DriverEvent::ToolCall(call) if call.tool_call_id == "call-1"
+    ));
+
+    let rest = drain(&mut session).await;
+    let kinds: Vec<&str> = rest
+        .iter()
+        .map(|event| match event {
+            DriverEvent::Error(_) => "error",
+            DriverEvent::ToolResult(_) => "tool_result",
+            DriverEvent::Done(_) => "done",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["error", "tool_result", "done"],
+        "an EOF mid-turn is an error, then the open call closed, then one `done`: {rest:?}"
+    );
+    assert!(matches!(
+        &rest[0],
+        DriverEvent::Error(error) if error.code == "transport_closed"
+    ));
+    assert!(matches!(
+        &rest[1],
+        DriverEvent::ToolResult(result)
+            if result.tool_call_id == "call-1"
+                && result.status == ToolResultStatus::Failed
+                && result.terminal_reason == Some(TerminalReason::Cancelled)
+    ));
+    assert!(matches!(
+        &rest[2],
+        DriverEvent::Done(done) if done.stop_reason == StopReason::Cancelled
+    ));
+}
+
+/// The other half of F-1: a stream that stops when **nothing is open** is a session that finished,
+/// not a turn that broke. The CLI runs its open turn to completion and exits 0 once its stdin
+/// closes, so an EOF here owes no `error` and no second `done` — only `Ok(None)`.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_eof_between_turns_ends_the_session_and_says_nothing_else() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), EOF_BETWEEN_TURNS_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let _banner = next(&mut session, "the banner").await;
+    let rest = drain(&mut session).await;
+
+    assert_eq!(
+        rest.iter()
+            .filter(|event| matches!(event, DriverEvent::Done(_)))
+            .count(),
+        1,
+        "one turn, one `done`: {rest:?}"
+    );
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Error(_))),
+        "a clean exit between turns is not a transport failure: {rest:?}"
+    );
+}
+
+/// **D-2's ordering, and the reason the drain comes before anything is synthesized.**
+///
+/// The cancel closes stdin, interrupts the group and then *reads* for the grace window. A `result`
+/// that arrives in that window is the turn's real ending and is reported as such — here the script
+/// answers its interrupt 200 ms late with a `completed` result, so the `done` the caller sees
+/// carries **the script's** stop reason and could not have been invented on this side. And there is
+/// exactly one: `close_turn` is a no-op on a turn the drain already closed.
+///
+/// The pid assertion is §11 criterion 11's CLI half: `cancel` returning means the tree is gone,
+/// not that a kill is on its way.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancel_drains_a_late_result_and_reports_its_done_rather_than_a_second_one() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), SLOW_CANCEL_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let _banner = next(&mut session, "the banner").await;
+    assert!(matches!(
+        next(&mut session, "the first chunk").await,
+        DriverEvent::AssistantChunk(_)
+    ));
+    let pid = recorded_pid(&scripted.pid);
+
+    session
+        .cancel(Duration::from_secs(5))
+        .await
+        .expect("cancel");
+    assert_reaped(pid, "the cancelled session's child").await;
+
+    let rest = drain(&mut session).await;
+    let dones: Vec<StopReason> = rest
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::Done(done) => Some(done.stop_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dones,
+        vec![StopReason::EndTurn],
+        "the drained `result` is the turn's real end, and nothing synthesized a second one: \
+         {rest:?}"
+    );
+    assert!(
+        rest.iter()
+            .any(|event| matches!(event, DriverEvent::Usage(_))),
+        "and its usage came with it: {rest:?}"
+    );
+}
+
+/// The same cancel with **no** grace: there is nothing to drain, so the turn ends the only way it
+/// can — one synthesized `done { cancelled }` — and the script's later `result` never lands,
+/// because the kill took the choice away.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancel_with_no_grace_synthesizes_exactly_one_cancelled_done() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), SLOW_CANCEL_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let _banner = next(&mut session, "the banner").await;
+    assert!(matches!(
+        next(&mut session, "the first chunk").await,
+        DriverEvent::AssistantChunk(_)
+    ));
+    let pid = recorded_pid(&scripted.pid);
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    assert_reaped(pid, "the cancelled session's child").await;
+
+    let rest = drain(&mut session).await;
+    let dones: Vec<StopReason> = rest
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::Done(done) => Some(done.stop_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dones, vec![StopReason::Cancelled], "{rest:?}");
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Usage(_))),
+        "the script's late `result` never arrived, so nothing invented its cost: {rest:?}"
+    );
+}
+
+/// **H-23.** A line that is not JSON is an event, not an ending, and a line that arrives CRLF is
+/// the same line.
+///
+/// `lines()` would have ended this stream twice over — once on the unparseable line if the reader
+/// had insisted on JSON, and once on the first non-UTF-8 byte it answers `InvalidData` for. Either
+/// would have been recorded as a transport that closed mid-turn, which is the one failure this
+/// transport must never invent.
+#[tokio::test]
+#[cfg(unix)]
+async fn noise_and_a_carriage_return_do_not_end_the_stream() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), NOISY_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+
+    let _banner = next(&mut session, "the banner").await;
+    let rest = drain(&mut session).await;
+
+    assert!(
+        rest.iter().any(|event| matches!(
+            event,
+            DriverEvent::Other(other)
+                if other.update == "<unparsed>"
+                    && other.body["line"] == json!("npm warn: this is not an envelope")
+        )),
+        "the unparseable line is kept whole, which is the shape most worth keeping: {rest:?}"
+    );
+    assert!(
+        rest.iter().any(|event| matches!(
+            event,
+            DriverEvent::AssistantChunk(chunk) if chunk.text == "ok"
+        )),
+        "the CRLF line parsed, so the `\\r` was stripped rather than handed to the decoder: \
+         {rest:?}"
+    );
+    assert!(
+        rest.iter()
+            .any(|event| matches!(event, DriverEvent::Done(_))),
+        "and the turn still ended: {rest:?}"
+    );
+}
+
+/// Options for a session whose agent never says `system/init`.
+#[cfg(unix)]
+fn short_init_options() -> SessionOptions {
+    SessionOptions {
+        agent_name: "scripted-cli".to_owned(),
+        models: Vec::new(),
+        settings: AgentSettings::default(),
+        stamp: Stamp::Wall,
+        // Short enough that this is a test rather than a coffee break: the production minute is
+        // what `SessionOptions` carries the window as a *field* for.
+        init_timeout: Duration::from_millis(300),
+        box_version: None,
+        session_id: "minted-id".to_owned(),
+    }
+}
+
+/// An agent that opens its streams and never says `system/init` must not hold the tab that asked
+/// for the chat — and must not be left running when the wait gives up.
+///
+/// The child is `sleep` and the streams are an in-process duplex nobody writes to: a session's
+/// child and a session's byte streams are separable in [`ChildIo`], and separating them is what
+/// makes this assertion about the child alone. `assert_not_running` and not `assert_reaped`,
+/// because this is the one exit that runs no code of ours — the abort drops the `ChildGuard`, whose
+/// `Drop` can only signal.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_stream_with_no_init_times_out_and_kills_its_child() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let child = htui_agent::launch::spawn(
+        &htui_agent::launch::ResolvedLaunch {
+            command: "sleep".to_owned(),
+            args: vec!["1000".to_owned()],
+            env: BTreeMap::new(),
+            env_remove: Vec::new(),
+        },
+        tmp.path(),
+    )
+    .await
+    .expect("`sleep` is on this box");
+    let pid = child.pid().expect("a freshly spawned child has a pid");
+
+    // Held for the test's life on purpose: dropping the agent end is an EOF, and an EOF is the
+    // *other* failing exit, not this one.
+    let (client_end, _agent_end) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(client_end);
+    let io = ChildIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child: Some(child),
+    };
+
+    let opened = open_session(
+        io,
+        spec(tmp.path().to_path_buf()),
+        "hi".to_owned(),
+        short_init_options(),
+        None,
+    )
+    .await;
+
+    match &opened {
+        Err(DriverError::Transport(message)) => assert!(
+            message.contains("system/init"),
+            "the error names what never arrived: {message}"
+        ),
+        Err(other) => panic!("expected a transport error, got {other:?}"),
+        Ok(_) => panic!("a silent agent does not open a session"),
+    }
+    assert_not_running(pid, "the session's child").await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D18: the permission bridge
+// ---------------------------------------------------------------------------------------------
+
+/// The probe's prompt call for [`TOOL_USE_ID`], or one with no id when `id` is `None`.
+#[cfg(unix)]
+fn prompt_call(id: Option<&str>) -> PromptCall {
+    PromptCall {
+        tool_name: "mcp__htui__hello".to_owned(),
+        input: json!({}),
+        tool_use_id: id.map(str::to_owned),
+    }
+}
+
+/// The request the session announces for a prompt whose id is `request_id`.
+#[cfg(unix)]
+fn prompt_request(request_id: &str, tool_call_id: Option<&str>) -> DriverEvent {
+    DriverEvent::PermissionRequest(PermissionRequestEvent {
+        request_id: PermissionRequestId::new(request_id),
+        tool_call_id: tool_call_id.map(str::to_owned),
+        options: vec![
+            PermissionOption {
+                id: "allow".to_owned(),
+                label: "Allow".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            },
+            PermissionOption {
+                id: "reject".to_owned(),
+                label: "Reject".to_owned(),
+                kind: PermissionOptionKind::RejectOnce,
+            },
+        ],
+    })
+}
+
+/// A session over [`PROMPT_SCRIPT`] with a prompt port, pulled up to its announced tool call; the
+/// tool end of the bridge and the script's go-file come back with it.
+#[cfg(unix)]
+async fn prompting(dir: &Path) -> (Box<dyn AgentSession>, PromptAsk, PathBuf) {
+    prompting_over(dir, PROMPT_SCRIPT).await
+}
+
+/// [`prompting`] over `body` rather than [`PROMPT_SCRIPT`].
+#[cfg(unix)]
+async fn prompting_over(dir: &Path, body: &str) -> (Box<dyn AgentSession>, PromptAsk, PathBuf) {
+    let scripted = scripted(dir, body);
+    let (port, ask) = bridge();
+    let mut spec = spec(dir.to_path_buf());
+    spec.prompt = Some(port.clone());
+    let mut session = start_with(&scripted.row, spec).await;
+    assert!(
+        port.take().is_none(),
+        "H-17: the transport took the receiver; a clone gets no second stream"
+    );
+    let _banner = next(&mut session, "the banner").await;
+    let call = next(&mut session, "the gated call").await;
+    assert!(
+        matches!(&call, DriverEvent::ToolCall(call) if call.tool_call_id == TOOL_USE_ID),
+        "{call:?}"
+    );
+    (session, ask, dir.join("go"))
+}
+
+/// Asks `call` on its own task, as the MCP tool does while the session runs.
+#[cfg(unix)]
+fn asking(
+    ask: &PromptAsk,
+    call: PromptCall,
+) -> tokio::task::JoinHandle<Result<PromptVerdict, PromptClosed>> {
+    let ask = ask.clone();
+    htui_agent::contained::spawn(async move { ask.ask(call).await })
+}
+
+/// The verdict an asking task got, within the window.
+#[cfg(unix)]
+async fn verdict(
+    task: tokio::task::JoinHandle<Result<PromptVerdict, PromptClosed>>,
+) -> Result<PromptVerdict, PromptClosed> {
+    tokio::time::timeout(EVENT_WINDOW, task)
+        .await
+        .expect("the ask resolved within the window")
+        .expect("the asking task did not panic")
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_request_becomes_a_permission_request_event() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let first = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    assert_eq!(
+        next(&mut session, "the first prompt").await,
+        prompt_request(TOOL_USE_ID, Some(TOOL_USE_ID)),
+        "the CLI's tool-use id is the request id, and the call it gates"
+    );
+
+    let second = asking(&ask, prompt_call(None));
+    let minted = next(&mut session, "the second prompt").await;
+    let DriverEvent::PermissionRequest(request) = &minted else {
+        panic!("a prompt is a permission request: {minted:?}")
+    };
+    assert!(
+        request.request_id.as_str().starts_with("prompt-"),
+        "no tool-use id, a minted request id: {minted:?}"
+    );
+    assert_eq!(
+        minted,
+        prompt_request(request.request_id.as_str(), None),
+        "the same two options, no call named"
+    );
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both asks wait for an answer"
+    );
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    for task in [first, second] {
+        assert!(matches!(
+            verdict(task).await,
+            Ok(PromptVerdict::Deny { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn answering_allow_completes_the_prompt_with_allow() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting(tmp.path()).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    let again = session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(&again, Err(DriverError::Transport(why)) if why.contains("no parked")),
+        "an answered prompt is no longer parked: {again:?}"
+    );
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{rest:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn answering_reject_completes_it_with_deny() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let rejected = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the first prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("reject".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(
+        verdict(rejected).await,
+        Ok(PromptVerdict::Deny {
+            message: "denied in htui".to_owned()
+        })
+    );
+
+    let cancelled = asking(&ask, prompt_call(Some("toolu_second")));
+    let _request = next(&mut session, "the second prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new("toolu_second"),
+            PermissionAnswer::Cancelled,
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(
+        verdict(cancelled).await,
+        Ok(PromptVerdict::Deny {
+            message: "the session was cancelled".to_owned()
+        })
+    );
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancel_denies_every_pending_prompt() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let first = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the first prompt").await;
+    let second = asking(&ask, prompt_call(None));
+    let _request = next(&mut session, "the second prompt").await;
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    for task in [first, second] {
+        assert_eq!(
+            verdict(task).await,
+            Ok(PromptVerdict::Deny {
+                message: "the session was cancelled".to_owned()
+            })
+        );
+    }
+    assert_eq!(
+        ask.ask(prompt_call(None)).await,
+        Err(PromptClosed),
+        "nobody is left to ask"
+    );
+}
+
+/// D18 dedup: the terminal `result` repeats a prompt-denied call in `permission_denials[]`; the
+/// prompt's own answer already settled it, so the replay adds no `permission_answer`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_denial_is_reported_once() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting(tmp.path()).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("reject".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert!(matches!(
+        verdict(task).await,
+        Ok(PromptVerdict::Deny { .. })
+    ));
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::PermissionAnswer(_))),
+        "the answered prompt is not reported again: {rest:?}"
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(_))),
+        "{rest:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn without_a_port_answer_permission_stays_unsupported() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), TURN_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+    let refused = session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DriverError::Unsupported("answer_permission"))),
+        "{refused:?}"
+    );
+    let argv = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+    assert!(!argv.contains("--permission-prompt-tool"), "{argv}");
+    session.cancel(Duration::ZERO).await.expect("cancel");
+}
+
+/// Adversarial review T9-ADV-1: an answer must not depend on the caller pulling events. A CLI that
+/// keeps streaming while one call waits fills the event channel; the session task then sits in
+/// `emit`, and a handle that only awaited the task's reply would wait on a task waiting on it.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_answer_lands_while_the_event_channel_is_full() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting_over(tmp.path(), FLOOD_PROMPT_SCRIPT).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    assert_eq!(
+        next(&mut session, "the prompt").await,
+        prompt_request(TOOL_USE_ID, Some(TOOL_USE_ID))
+    );
+    std::fs::write(&go, b"").expect("go");
+    // Long enough for the flood to fill the channel behind the parked prompt.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let answered = tokio::time::timeout(
+        EVENT_WINDOW,
+        session.answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(answered, Ok(Ok(()))),
+        "the answer lands with nobody pulling: {answered:?}"
+    );
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    std::fs::write(go.with_extension("end"), b"").expect("end");
+    let rest = drain(&mut session).await;
+    assert!(
+        rest.len() >= FLOOD,
+        "nothing the answer drained is lost: {} events",
+        rest.len()
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{:?}",
+        rest.last()
+    );
+}
+
+/// Adversarial review T9-ADV-2: a cancel denies the parked prompt, and the caller records that
+/// request's `cancelled` answer itself (the relay's `answer_cancelled`, chat's `Cancel` arm). The
+/// `result` the interrupt buys repeats the denied call in `permission_denials[]`; it is the same
+/// refusal and adds no second `permission_answer`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancelled_prompt_is_not_reported_again() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting_over(tmp.path(), PROMPT_CANCEL_SCRIPT).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+
+    session.cancel(EVENT_WINDOW).await.expect("cancel");
+    assert_eq!(
+        verdict(task).await,
+        Ok(PromptVerdict::Deny {
+            message: "the session was cancelled".to_owned()
+        })
+    );
+    let rest = drain(&mut session).await;
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(_))),
+        "the interrupt's `result` was drained: {rest:?}"
+    );
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::PermissionAnswer(_))),
+        "the cancelled prompt is not reported again: {rest:?}"
+    );
+}
+
+/// Adversarial review T9-ADV-ORDER-1: a prompt can overtake the `tool_use` line it gates when the
+/// session task is behind stdout. The call is announced from the prompt itself, ahead of the
+/// request, so a policy matcher and the relay's summary see it; the stream's later line adds no
+/// second `tool_call`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_ahead_of_its_tool_use_line_still_follows_its_call() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), LATE_CALL_PROMPT_SCRIPT);
+    let (port, ask) = bridge();
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.prompt = Some(port);
+    let mut session = start_with(&scripted.row, spec).await;
+    let _banner = next(&mut session, "the banner").await;
+
+    let go = tmp.path().join("go");
+    let sent = go.with_extension("sent");
+    let deadline = tokio::time::Instant::now() + EVENT_WINDOW;
+    while !sent.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the script never streamed its call"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let input = json!({"file_path": "/tmp/late.txt", "content": "x"});
+    let task = asking(
+        &ask,
+        PromptCall {
+            tool_name: "Write".to_owned(),
+            input,
+            tool_use_id: Some("toolu_late".to_owned()),
+        },
+    );
+    let expected = htui_agent::cli::claude::Mapper::new(htui_agent::launch::UsageScope::ModelUsage)
+        .map(&serde_json::from_str(LATE_TOOL_USE).expect("the fixture is JSON"));
+
+    let mut before = Vec::new();
+    loop {
+        let event = next(&mut session, "the prompt").await;
+        if matches!(event, DriverEvent::PermissionRequest(_)) {
+            assert_eq!(event, prompt_request("toolu_late", Some("toolu_late")));
+            break;
+        }
+        before.push(event);
+    }
+    let calls: Vec<_> = before
+        .iter()
+        .filter(|event| matches!(event, DriverEvent::ToolCall(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        calls, expected,
+        "the gated call is announced, as the stream would, before its request"
+    );
+
+    session
+        .answer_permission(
+            PermissionRequestId::new("toolu_late"),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::ToolCall(_))),
+        "the stream's own line for the call adds no second `tool_call`: {:?}",
+        rest.iter()
+            .filter(|event| matches!(event, DriverEvent::ToolCall(_)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{:?}",
+        rest.last()
+    );
+}
+
+/// MOD-55 review M1: the refusal comes before the spawn. The row names a command that does not
+/// exist, so a driver that spawned first would answer `Spawn` instead of naming the flag.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tool_less_start_with_widening_extra_args_is_refused_before_the_spawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut row = scripted_row(&dir.path().join("absent"), serde_json::Map::new());
+    row.settings["cli"]["extra_args"] = json!(["--dangerously-skip-permissions"]);
+    let mut factory = DriverFactory::new();
+    factory.register(
+        htui_agent::cli::ADAPTER_ID,
+        Box::new(ClaudeStreamAdapter) as Box<dyn htui_agent::registry::TransportBuilder>,
+    );
+    let driver = factory.driver_for(&row, None).expect("the row builds");
+    let mut with = spec(dir.path().to_path_buf());
+    with.tools = tool_less();
+
+    let refused = driver
+        .start(with, "hello".to_owned())
+        .await
+        .expect_err("a tool-less session refuses the row");
+
+    assert!(
+        matches!(&refused, DriverError::Transport(message)
+            if message.contains("--dangerously-skip-permissions")),
+        "{refused:?}"
+    );
+}
+
+/// MOD-91 D8: the refusal comes before the spawn, as the widening one does. The row names a
+/// command that does not exist, so a driver that spawned first would answer `Spawn` instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_isolated_start_with_an_overriding_settings_is_refused_before_the_spawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut row = scripted_row(&dir.path().join("absent"), serde_json::Map::new());
+    row.settings["cli"]["extra_args"] = json!(["--settings", "/op/settings.json"]);
+
+    let Err(refused) = driver(&row)
+        .start(spec(dir.path().to_path_buf()), "hello".to_owned())
+        .await
+    else {
+        panic!("an isolated session refuses the row");
+    };
+
+    assert!(
+        matches!(&refused, DriverError::Transport(message)
+            if message.contains("--settings") && !message.contains("/op/settings.json")),
+        "{refused:?}"
+    );
+}
+
+/// MOD-91 D4: what a session would spawn carries `HTUI_SESSION=1` whether or not the row opts back
+/// in, and neither the row's `launch.env` nor the spec's `env` can set it to anything else: it is
+/// inserted after both.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_marks_the_session_whatever_the_setting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for user_extensions in [false, true] {
+        for (row_env, spec_env) in [(None, None), (Some("0"), None), (None, Some("0"))] {
+            let env = row_env
+                .map(|value| serde_json::Map::from_iter([(SESSION_VAR.to_owned(), json!(value))]))
+                .unwrap_or_default();
+            let mut row = scripted_row(&dir.path().join("absent"), env);
+            row.settings["user_extensions"] = json!(user_extensions);
+            let driver = CliDriver::from_row(&row, DriverCaps::default()).expect("the row builds");
+            let mut with = spec(dir.path().to_path_buf());
+            if let Some(value) = spec_env {
+                with.env.insert(SESSION_VAR.to_owned(), value.to_owned());
+            }
+
+            let resolved = driver.launch_for(&with).await.expect("the row resolves");
+
+            assert_eq!(
+                resolved.env.get(SESSION_VAR).map(String::as_str),
+                Some("1"),
+                "user_extensions {user_extensions}, row {row_env:?}, spec {spec_env:?}"
+            );
+        }
+    }
+    assert_eq!(SESSION_VAR, "HTUI_SESSION");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-97 D5: a subscription-billed row's API-billing variables never reach the session
+// ---------------------------------------------------------------------------------------------
+
+/// The two neutral names the MOD-97 cases list. Not a vendor's: the list is row data (`R-AGT-5`).
+#[cfg(unix)]
+const BILLING_ENV: [&str; 2] = ["HTUI_TEST_VENDOR_KEY", "HTUI_TEST_VENDOR_TOKEN"];
+
+/// What [`CliDriver::launch_for`] resolves for a row whose `launch.env` carries the first billing
+/// name, whose settings list `billing_env` (or nothing, on `None`), and whose session's `spec.env`
+/// carries the second name (the project-secret route) plus a plain `OTHER`.
+#[cfg(unix)]
+async fn cli_launch_with(
+    billing: Billing,
+    billing_env: Option<serde_json::Value>,
+) -> htui_agent::launch::ResolvedLaunch {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let env = serde_json::Map::from_iter([(BILLING_ENV[0].to_owned(), json!("row-value"))]);
+    let mut row = scripted_row(&dir.path().join("absent"), env);
+    row.billing = billing;
+    if let Some(list) = billing_env {
+        row.settings["api_billing_env"] = list;
+    }
+    cli_launch_for(&row, dir.path()).await
+}
+
+/// [`CliDriver::launch_for`] over `row`, with [`BILLING_ENV`]'s second name and `OTHER` in the
+/// session's environment.
+#[cfg(unix)]
+async fn cli_launch_for(row: &AgentRow, cwd: &Path) -> htui_agent::launch::ResolvedLaunch {
+    let driver = CliDriver::from_row(row, DriverCaps::default()).expect("the row builds");
+    let mut with = spec(cwd.to_path_buf());
+    with.env
+        .insert(BILLING_ENV[1].to_owned(), "secret-value".to_owned());
+    with.env.insert("OTHER".to_owned(), "kept".to_owned());
+    driver.launch_for(&with).await.expect("the row resolves")
+}
+
+/// MOD-97 D1, D5: on a `subscription` row every listed name leaves the resolved environment,
+/// whether the row's `launch.env` or the session's `spec.env` (a project secret) put it there, and
+/// `env_remove` carries the whole list in order, so `spawn` removes an inherited copy too.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_strips_the_billing_env_on_a_subscription_row() {
+    let resolved = cli_launch_with(Billing::Subscription, Some(json!(BILLING_ENV))).await;
+
+    for name in BILLING_ENV {
+        assert!(!resolved.env.contains_key(name), "{name}: {resolved:?}");
+    }
+    assert_eq!(resolved.env.get("OTHER").map(String::as_str), Some("kept"));
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, BILLING_ENV);
+}
+
+/// MOD-97 D2: a `per_token` row carrying the same list keeps every variable, so a copy of a
+/// subscription row flipped to `per_token` bills the API without editing the list.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_keeps_the_billing_env_on_a_per_token_row() {
+    let resolved = cli_launch_with(Billing::PerToken, Some(json!(BILLING_ENV))).await;
+
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+        Some("row-value")
+    );
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+        Some("secret-value")
+    );
+    assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+}
+
+/// MOD-97 D2: a row without the list strips nothing, and neither does one whose settings document
+/// is unreadable (it falls back to `AgentSettings::default()`, as every other setting does).
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_strips_nothing_without_the_list() {
+    let without = cli_launch_with(Billing::Subscription, None).await;
+    let empty = cli_launch_with(Billing::Subscription, Some(json!([]))).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let env = serde_json::Map::from_iter([(BILLING_ENV[0].to_owned(), json!("row-value"))]);
+    let mut unreadable = scripted_row(&dir.path().join("absent"), env);
+    unreadable.settings = json!("x");
+    let unreadable = cli_launch_for(&unreadable, dir.path()).await;
+
+    for resolved in [without, empty, unreadable] {
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[0]).map(String::as_str),
+            Some("row-value"),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+            Some("secret-value"),
+            "{resolved:?}"
+        );
+        assert!(resolved.env_remove.is_empty(), "{resolved:?}");
+    }
+}
+
+/// MOD-97 (MOD-91 D4): a list naming `HTUI_SESSION` cannot unset the session marker; the name is
+/// dropped from the list, so `spawn` never removes it either.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_billing_list_cannot_strip_the_session_marker() {
+    let resolved = cli_launch_with(
+        Billing::Subscription,
+        Some(json!([SESSION_VAR, BILLING_ENV[0]])),
+    )
+    .await;
+
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+    assert!(!resolved.env.contains_key(BILLING_ENV[0]));
+}
+
+/// MOD-97 R1 L1: the marker is dropped from the list whatever its case, because Windows removes
+/// environment names case-insensitively, so `htui_session` there would unset `HTUI_SESSION`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_billing_list_cannot_strip_the_session_marker_in_another_case() {
+    let lower = SESSION_VAR.to_ascii_lowercase();
+    let resolved = cli_launch_with(
+        Billing::Subscription,
+        Some(json!([lower, "Htui_Session", BILLING_ENV[0]])),
+    )
+    .await;
+
+    assert_eq!(resolved.env.get(SESSION_VAR).map(String::as_str), Some("1"));
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+}
+
+/// MOD-97 R1 M1: a hand-written bare string is a one-name list, and a subscription row strips it,
+/// rather than failing the settings document and stripping nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_string_list_is_stripped_on_a_subscription_row() {
+    let resolved = cli_launch_with(Billing::Subscription, Some(json!(BILLING_ENV[0]))).await;
+
+    assert!(!resolved.env.contains_key(BILLING_ENV[0]), "{resolved:?}");
+    assert_eq!(resolved.env_remove, [BILLING_ENV[0]]);
+    assert_eq!(
+        resolved.env.get(BILLING_ENV[1]).map(String::as_str),
+        Some("secret-value"),
+        "an unlisted name is kept"
+    );
+}
+
+/// [`TURN_SCRIPT`], after copying the two [`BILLING_ENV`] variables it was started with (or `unset`)
+/// to `$HTUI_GO_FILE.billing`, one per line.
+#[cfg(unix)]
+const BILLING_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n%s\n' "${HTUI_TEST_VENDOR_KEY-unset}" "${HTUI_TEST_VENDOR_TOKEN-unset}" > "$HTUI_GO_FILE.billing"
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// MOD-97 D5 composed, through the factory and a real child: the row's `launch.env` carries the
+/// first listed variable and the session's `spec.env` (a project secret) the second. A
+/// `subscription` row's child sees neither; a `per_token` row's sees both.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_session_never_sees_the_billing_env_on_a_subscription_row() {
+    for (billing, expected) in [
+        (Billing::Subscription, "unset\nunset\n"),
+        (Billing::PerToken, "row-value\nsecret-value\n"),
+    ] {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut scripted = scripted(tmp.path(), BILLING_SCRIPT);
+        scripted.row.billing = billing;
+        scripted.row.launch["env"][BILLING_ENV[0]] = json!("row-value");
+        scripted.row.settings["api_billing_env"] = json!(BILLING_ENV);
+        let mut with = spec(tmp.path().to_path_buf());
+        with.env
+            .insert(BILLING_ENV[1].to_owned(), "secret-value".to_owned());
+        let mut session = start_with(&scripted.row, with).await;
+        // The script records before it prints `init`, so the file exists by now.
+        let _ = next(&mut session, "the banner").await;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("go.billing"))
+                .expect("the script recorded its billing variables"),
+            expected,
+            "{billing:?}"
+        );
+
+        session.cancel(Duration::ZERO).await.expect("cancel");
+    }
+}
+
+/// MOD-97 D6(a), the one case here that reads a seed row (H-7's exception): the seeded
+/// `claude-cli` row never asks for `--bare`. Claude Code has no `--no-bare`, and `--bare` sets
+/// `CLAUDE_CODE_SIMPLE=1` and makes authentication strictly an API key or an `apiKeyHelper`, so a
+/// seed that asked for it would bill a subscription row to the key [`launch_for`] strips. The argv
+/// is built straight from the row, without `launch_for`, which would resolve `${claude}` on the
+/// `PATH`.
+///
+/// [`launch_for`]: CliDriver::launch_for
+#[test]
+fn the_seeded_cli_row_never_asks_for_bare() {
+    let rows = htui_core::model::agent::seed_rows(
+        chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.name == "claude-cli")
+        .expect("the seed rows carry `claude-cli`");
+    let launch: AgentLaunch =
+        serde_json::from_value(row.launch.clone()).expect("the seeded launch parses");
+    let settings: AgentSettings =
+        serde_json::from_value(row.settings.clone()).expect("the seeded settings parse");
+    let cli = settings
+        .cli
+        .expect("the seeded CLI row carries a cli block");
+
+    let args = argv(
+        &launch.args,
+        &cli,
+        &spec(PathBuf::from("/scratch")),
+        "sid",
+        None,
+        settings.user_extensions,
+    );
+
+    assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
+    assert!(
+        !cli.extra_args.contains(&"--bare".to_owned()),
+        "{:?}",
+        cli.extra_args
+    );
+    assert!(
+        !launch.env.contains_key("CLAUDE_CODE_SIMPLE"),
+        "the seed sets no `CLAUDE_CODE_SIMPLE`"
+    );
+}
+
+/// [`TURN_SCRIPT`], after copying its own `HTUI_SESSION` (or `unset`) to `$HTUI_GO_FILE.session`.
+#[cfg(unix)]
+const SESSION_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s' "${HTUI_SESSION-unset}" > "$HTUI_GO_FILE.session"
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// MOD-91 D1–D4 through a real child: an isolated row's process is started with the levers, an
+/// opted-in row's without them, and both see `HTUI_SESSION=1`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_session_spawns_the_levers_and_marks_its_environment() {
+    for user_extensions in [false, true] {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut scripted = scripted(tmp.path(), SESSION_SCRIPT);
+        scripted.row.settings["user_extensions"] = json!(user_extensions);
+        let mut session = start(&scripted.row, tmp.path()).await;
+        // The script records before it prints `init`, so both files exist by now.
+        let _ = next(&mut session, "the banner").await;
+
+        let text = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+        let args: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            args.windows(ISOLATION_ARGS.len())
+                .any(|window| window == ISOLATION_ARGS),
+            !user_extensions,
+            "user_extensions {user_extensions}: {args:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("go.session"))
+                .expect("the script recorded its HTUI_SESSION"),
+            "1",
+            "user_extensions {user_extensions}"
+        );
+
+        session.cancel(Duration::ZERO).await.expect("cancel");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-79: the MCP config travels as a file
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-79: copies the file `--mcp-config=` names to `$HTUI_GO_FILE.config`, proving the CLI can
+/// read it while it runs.
+#[cfg(unix)]
+const COPY_CONFIG: &str = concat!(
+    "for arg in \"$@\"; do\n",
+    "  case \"$arg\" in\n",
+    "    --mcp-config=*) cat \"${arg#--mcp-config=}\" > \"$HTUI_GO_FILE.config\" ;;\n",
+    "  esac\n",
+    "done\n",
+);
+
+/// [`TURN_SCRIPT`], after copying its MCP config.
+#[cfg(unix)]
+const CONFIG_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+<COPY_CONFIG>
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// Copies its MCP config, then exits before `system/init`, as an unauthenticated CLI does.
+#[cfg(unix)]
+const CONFIG_THEN_EXIT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+<COPY_CONFIG>
+printf '%s\n' 'not logged in' >&2
+exit 1
+"#;
+
+/// The one `--mcp-config=` path a script recorded, and the whole argv text it recorded it in.
+///
+/// One argument per line (`RECORD`), and a config path holds no newline, so the split is exact
+/// (blueprint H-17).
+#[cfg(unix)]
+fn recorded_config(argv: &Path) -> (PathBuf, String) {
+    let text = std::fs::read_to_string(argv).expect("the script recorded its argv");
+    let configs: Vec<&str> = text
+        .lines()
+        .filter(|arg| arg.starts_with("--mcp-config"))
+        .collect();
+    assert_eq!(configs.len(), 1, "one config argument: {text}");
+    let path = configs[0]
+        .strip_prefix("--mcp-config=")
+        .expect("the `=`-joined form");
+    (PathBuf::from(path), text)
+}
+
+/// The directory around a config file.
+#[cfg(unix)]
+fn config_dir(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .expect("the config file has a directory")
+        .to_path_buf()
+}
+
+/// The CLI gets a path and can read the token through it; the argv shows neither the token nor any
+/// other `env` value. The file lives while the session does and is gone once `cancel` has joined
+/// the task (blueprint H-18: a natural end would race the drop).
+#[tokio::test]
+#[cfg(unix)]
+async fn the_cli_reads_its_mcp_config_from_a_private_file_and_never_from_its_argv() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), CONFIG_SCRIPT);
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.mcp = vec![htui_server()];
+    let mut session = start_with(&scripted.row, spec).await;
+    // The script records and copies before it prints `init`, so both files exist by now.
+    let _ = next(&mut session, "the banner").await;
+
+    let (config, text) = recorded_config(&scripted.argv);
+    for value in htui_server().env.values() {
+        assert!(
+            !text.contains(value.as_str()),
+            "{value} stays off the argv: {text}"
+        );
+    }
+    assert!(!text.contains("mcpServers"), "no JSON on the argv: {text}");
+    assert_eq!(config.file_name(), Some("mcp.json".as_ref()), "{config:?}");
+    let dir = config_dir(&config);
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 directory name");
+    assert!(
+        name.starts_with(&format!("htui-cli-{}-", std::process::id())),
+        "{name}"
+    );
+    assert!(dir.is_dir(), "the file outlives `system/init` (D3)");
+
+    let copied = std::fs::read_to_string(tmp.path().join("go.config"))
+        .expect("the script copied its config");
+    assert_eq!(
+        Some(copied.as_str()),
+        htui_agent::cli::mcp_config(&[htui_server()]).as_deref(),
+        "the file is `mcp_config`'s JSON, byte for byte"
+    );
+    assert!(copied.contains("token-value"), "the CLI can read the token");
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    assert!(!config.exists(), "{config:?}");
+    assert!(!dir.exists(), "{dir:?}");
+}
+
+/// `open_session`'s exit (2): a CLI that read its config and then exited before `system/init`
+/// fails `start`, and the awaited task has dropped the file by the time it does.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cli_that_exits_before_init_leaves_no_mcp_config_behind() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), CONFIG_THEN_EXIT_SCRIPT);
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.mcp = vec![htui_server()];
+    // `let … else`, not `expect_err`: `Box<dyn AgentSession>` has no `Debug`.
+    let Err(err) = driver(&scripted.row).start(spec, "hello".to_owned()).await else {
+        panic!("a CLI that exits before `system/init` opens no session");
+    };
+    match &err {
+        DriverError::Transport(message) => assert!(
+            message.contains("system/init"),
+            "the error names what never arrived: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+
+    let copied = std::fs::read_to_string(tmp.path().join("go.config"))
+        .expect("the script copied its config");
+    assert!(
+        copied.contains("token-value"),
+        "the file existed while the CLI ran"
+    );
+    let (config, _) = recorded_config(&scripted.argv);
+    assert!(!config.exists(), "{config:?}");
+    assert!(!config_dir(&config).exists(), "{config:?}");
+}
+
+/// `open_session`'s exit (1), the abort: the config moved into the task is dropped with the
+/// aborted future. No child is needed to show that, so the streams are a duplex nobody writes to,
+/// as in [`a_stream_with_no_init_times_out_and_kills_its_child`]; the production minute cannot be
+/// reached through `start`, which is why this builds the guard itself.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_open_session_that_times_out_drops_its_mcp_config() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let config = McpConfigFile::write(&[htui_server()])
+        .expect("the config is written")
+        .expect("one server writes a file");
+    let dir = config_dir(config.path());
+    assert!(dir.is_dir());
+
+    // Held for the test's life: dropping the agent end is an EOF, which is exit (2), not this one.
+    let (client_end, _agent_end) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(client_end);
+    let io = ChildIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child: None,
+    };
+    let opened = open_session(
+        io,
+        spec(tmp.path().to_path_buf()),
+        "hi".to_owned(),
+        short_init_options(),
+        Some(config),
+    )
+    .await;
+
+    match &opened {
+        Err(DriverError::Transport(message)) => assert!(
+            message.contains("system/init"),
+            "the error names what never arrived: {message}"
+        ),
+        Err(other) => panic!("expected a transport error, got {other:?}"),
+        Ok(_) => panic!("a silent agent does not open a session"),
+    }
+    assert!(!dir.exists(), "{dir:?}");
+}
