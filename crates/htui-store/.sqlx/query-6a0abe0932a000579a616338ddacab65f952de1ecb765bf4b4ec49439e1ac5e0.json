@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS \"one!\" FROM item_link\n                    WHERE from_item_id = $1 AND kind = 'duplicates' AND deleted_at IS NULL\n                    LIMIT 1\n                      FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6a0abe0932a000579a616338ddacab65f952de1ecb765bf4b4ec49439e1ac5e0"
+}

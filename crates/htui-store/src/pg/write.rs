@@ -350,6 +350,21 @@ async fn link_reaches(conn: &mut PgConnection, to: ItemId, project: ProjectId) -
     })
 }
 
+/// MOD-150 M2 review L1: `FOR KEY SHARE` on the item `id` names, the lock its link insert's
+/// foreign key takes anyway, taken early so `close_out` holds its two item rows in id order. A
+/// missing row locks nothing and answers nothing here: `close_out_link` refuses it at its place
+/// in D2's order.
+async fn key_share_item(conn: &mut PgConnection, id: ItemId) -> Result<()> {
+    sqlx::query_scalar!(
+        r#"SELECT 1 AS "one!" FROM item WHERE id = $1 FOR KEY SHARE"#,
+        id.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
+}
+
 /// MOD-150 D3: the transaction-scoped advisory lock on `key`. This is `claim_command`'s statement
 /// text verbatim, so it reuses that query's `.sqlx` entry.
 async fn advisory_xact_lock(conn: &mut PgConnection, key: String) -> Result<()> {
@@ -428,7 +443,11 @@ async fn upsert_link(
 /// transaction (its row locked, and for a named `duplicate` the item's `duplicates` advisory
 /// lock already held). Answers the link a named item makes (`item -duplicates-> named`,
 /// `named -supersedes-> item`), or `None` when no name was given and the live link the
-/// resolution needs is there.
+/// resolution needs is there. That link's row is then held `FOR SHARE` to the commit (review
+/// M1): a step of a finished run can still withdraw it (the unleased fence), and its `UPDATE`
+/// now waits for the close-out to commit, so the item never closes on a link withdrawn under
+/// it. One live row is enough to hold (`LIMIT 1`): the rule needs one. Under READ COMMITTED a
+/// row whose withdrawal commits while the lock waits is skipped and the next one locked.
 async fn close_out_link(
     conn: &mut PgConnection,
     item: ItemId,
@@ -448,23 +467,29 @@ async fn close_out_link(
     };
     let Some(named) = names else {
         let live = if kind == LinkKind::Duplicates {
-            // No link is a self link (`item_link`'s `CHECK (from_item_id <> to_item_id)`), so
-            // "other than `item`" is every live `duplicates` from it.
-            live_other_link(&mut *conn, item, kind, item)
-                .await?
-                .is_some()
-        } else {
             sqlx::query_scalar!(
-                r#"SELECT EXISTS (SELECT 1 FROM item_link
-                                   WHERE to_item_id = $1 AND kind = 'supersedes'
-                                     AND deleted_at IS NULL) AS "live!""#,
+                r#"SELECT 1 AS "one!" FROM item_link
+                    WHERE from_item_id = $1 AND kind = 'duplicates' AND deleted_at IS NULL
+                    LIMIT 1
+                      FOR SHARE"#,
                 item.as_uuid(),
             )
-            .fetch_one(&mut *conn)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx)?
+        } else {
+            sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM item_link
+                    WHERE to_item_id = $1 AND kind = 'supersedes' AND deleted_at IS NULL
+                    LIMIT 1
+                      FOR SHARE"#,
+                item.as_uuid(),
+            )
+            .fetch_optional(&mut *conn)
             .await
             .map_err(map_sqlx)?
         };
-        return if live {
+        return if live.is_some() {
             Ok(None)
         } else {
             Err(StoreError::Constraint(close_out_needs_a_link(
@@ -9399,7 +9424,9 @@ impl WriteStore for PgStore {
     /// `R-TUI-9`'s close-out: the summary, the commits and the item's move to `closed`, one
     /// transaction (plan D6), refused while any run of the item is still active.
     ///
-    /// The item's row is taken `FOR UPDATE` first and held to the commit, which is what makes the
+    /// The item's row is taken `FOR UPDATE` before any read the close-out decides on (after the
+    /// named `duplicate`'s advisory lock and, in id order, the named item's `FOR KEY SHARE`:
+    /// MOD-150 M2 D4, review L1) and held to the commit, which is what makes the
     /// three effects one act rather than three: it is the lock
     /// [`write_document`](WriteStore::write_document) needs to allocate the summary's version, and
     /// it is also what stops a [`create_run`](WriteStore::create_run) from starting a run of this
@@ -9455,6 +9482,14 @@ impl WriteStore for PgStore {
             .await?;
         }
 
+        // Review L1: with a name, the two item rows are locked in id order, the closing one
+        // `FOR UPDATE` and the named one `FOR KEY SHARE` (its link insert's foreign-key lock,
+        // taken early). Two close-outs naming each other would otherwise each hold their own row
+        // and wait on the other's (`40P01`).
+        let named = names.filter(|named| *named != item);
+        if let Some(named) = named.filter(|named| named.as_uuid() < item.as_uuid()) {
+            Box::pin(key_share_item(&mut tx, named)).await?;
+        }
         let Some(locked) = sqlx::query!(
             r#"SELECT status     AS "status: Status",
                       project_id AS "project_id: ProjectId"
@@ -9471,6 +9506,9 @@ impl WriteStore for PgStore {
             });
         };
         let status = locked.status;
+        if let Some(named) = named.filter(|named| named.as_uuid() > item.as_uuid()) {
+            Box::pin(key_share_item(&mut tx, named)).await?;
+        }
 
         if let Some(live) = sqlx::query!(
             r#"
@@ -9584,8 +9622,8 @@ impl WriteStore for PgStore {
         .rows_affected();
 
         if closed != 1 {
-            // Impossible: the item has been locked `FOR UPDATE` since this transaction's first
-            // statement, so the status the close-out was decided against is still the row's.
+            // Impossible: the item was locked `FOR UPDATE` before any read the close-out was
+            // decided on, so the status it was decided against is still the row's.
             return Err(StoreError::Backend(format!(
                 "item `{item}` did not move `{status}` -> `closed` under the row lock this \
                  transaction holds: no rule of ANA-2 §4.3 can produce this"
