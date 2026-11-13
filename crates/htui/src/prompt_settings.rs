@@ -131,9 +131,9 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
 /// `agents` is a parameter rather than a read here because the registry is an inherent
 /// `Backend`/`PgStore` read that the [`Writer`] this runs over does not carry (MOD-164 D7).
 ///
-/// N+1 reads on purpose (D3, M3 D5's trade, same words): thirteen `setting(App, _)` plus, per project,
-/// one `project()` and one `setting(Project(id), _)` per project key. They happen per event —
-/// activation, a scope change, after a write — never per keystroke.
+/// N+1 reads on purpose (D3, M3 D5's trade, same words): thirteen `setting(App, _)` plus, per
+/// project, one `project()` and one `setting(Project(id), _)` per project key. They happen per
+/// event — activation, a scope change, after a write — never per keystroke.
 ///
 /// A project that vanishes between its `project()` and its `setting()` calls yields `value: None`
 /// rather than an error: a torn read is not a state to render, and the write that follows answers

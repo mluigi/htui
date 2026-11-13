@@ -244,8 +244,9 @@ impl SettingKey {
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
     /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded
-    /// `compete_fan_out` and MOD-164's unseeded `light_model`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
-    /// and the `app` group of `Settings > Prompt` iterate this, never `ALL`.
+    /// `compete_fan_out` and MOD-164's unseeded `light_model`, and no project-only key (MOD-33
+    /// D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate this, never
+    /// `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
             .into_iter()
@@ -910,7 +911,7 @@ pub fn resolve_compete_fan_out(app: &BTreeMap<String, Value>) -> bool {
 pub struct LightModel {
     /// `agent.id` of the agent to run the capture turn on.
     pub agent_id: AgentId,
-    /// The model to ask that agent for, 1..=200 characters.
+    /// The model to ask that agent for, 1..=200 characters once trimmed, no NUL.
     pub model: String,
 }
 
@@ -931,16 +932,17 @@ struct LightModelValue {
 }
 
 /// `value` as a [`LightModel`] when it has exactly the two fields, a UUID and a model of
-/// 1..=[`LIGHT_MODEL_MAX_CHARS`] characters; `None` for anything else, `null` included.
+/// 1..=[`LIGHT_MODEL_MAX_CHARS`] characters once trimmed (an all-space model has none) holding no
+/// NUL (review L8); `None` for anything else, `null` included.
 fn light_model_of(value: &Value) -> Option<LightModel> {
     let parsed = LightModelValue::deserialize(value).ok()?;
-    let chars = parsed.model.chars().count();
-    (1..=LIGHT_MODEL_MAX_CHARS)
-        .contains(&chars)
-        .then_some(LightModel {
+    let chars = parsed.model.trim().chars().count();
+    ((1..=LIGHT_MODEL_MAX_CHARS).contains(&chars) && !parsed.model.contains('\0')).then_some(
+        LightModel {
             agent_id: parsed.agent_id,
             model: parsed.model,
-        })
+        },
+    )
 }
 
 /// `light_model` (MOD-164 D7): the `app_setting` row's agent and model, or `None` when it is
@@ -1435,8 +1437,8 @@ mod tests {
     }
 
     /// MOD-164 D7: `validate` checks the shape only — exactly two fields, a UUID and a model of
-    /// 1..=200 characters. Agent membership is not checked (ACP agents list no models until
-    /// their first handshake).
+    /// 1..=200 characters once trimmed, holding no NUL (review L8). Agent membership is not checked
+    /// (ACP agents list no models until their first handshake).
     #[test]
     fn light_model_refuses_extra_fields_a_bad_uuid_and_an_empty_model() {
         let key = SettingKey::LightModel;
@@ -1448,6 +1450,8 @@ mod tests {
             ),
             ("a bad uuid", light("not-a-uuid", "opus")),
             ("an empty model", light(AGENT, "")),
+            ("an all-space model", light(AGENT, " \t ")),
+            ("a model holding a NUL", light(AGENT, "op\0us")),
             ("a model of 201 characters", light(AGENT, &too_wide)),
             ("no model", json!({ "agent_id": AGENT })),
             ("no agent", json!({ "model": "opus" })),
@@ -1479,6 +1483,8 @@ mod tests {
             json!("opus"),
             light("not-a-uuid", "opus"),
             light(AGENT, ""),
+            light(AGENT, "   "),
+            light(AGENT, "haiku\0"),
             json!({ "agent_id": AGENT, "model": "opus", "extra": 1 }),
         ] {
             assert_eq!(
