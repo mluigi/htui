@@ -2047,7 +2047,14 @@ pub(crate) mod tests {
             Some(format!("agent spawn failed: {sentence}")),
             "the run fails with the switch's sentence"
         );
-        let steps = fixture.steps(run).await;
+        // MOD-164 D11: the failing run ends with its capture row (a stage row, skipped with no
+        // light model), which is not an admission.
+        let steps: Vec<_> = fixture
+            .steps(run)
+            .await
+            .into_iter()
+            .filter(|step| step.role != StepRole::Stage)
+            .collect();
         assert_eq!(steps.len(), 1, "nothing else was admitted: {steps:?}");
         assert_eq!(steps[0].id, step.id);
         assert_eq!(
