@@ -296,10 +296,15 @@ impl BacklogTab {
     }
 
     /// MOD-147 M3 D3: the list's groups, in order: the workspace's scope row when the last
-    /// `Items` reply named one, then `ctx.projects`. The one source every group site reads (the
-    /// rows, the drawn list, fold retention), so a scope-row item is never selected undrawn.
-    pub(super) fn group_projects(&self, ctx: &Ctx<'_>) -> Vec<ProjectRef> {
-        self.scope_row.iter().chain(ctx.projects).cloned().collect()
+    /// `Items` reply named one, then `ctx.projects`. Every group site (the rows through this, the
+    /// drawn list through [`ListView::groups`], fold retention) reads [`list::group_projects`],
+    /// so a scope-row item is never selected undrawn. Borrowed: read on every key and frame, it
+    /// clones no row.
+    pub(super) fn group_projects<'s>(
+        &'s self,
+        ctx: &'s Ctx<'_>,
+    ) -> impl Iterator<Item = &'s ProjectRef> + Clone {
+        list::group_projects(self.scope_row.as_ref(), ctx.projects)
     }
 
     /// Id of the selected item, or `None` while a project header is selected.
@@ -565,9 +570,11 @@ impl Tab for BacklogTab {
             // MOD-13 review L5: a fold is the scope's project's, not the reply's, so a filter
             // that hides a project's items keeps its fold. A scope change clears it (D6).
             // MOD-147 M3 D3: the workspace's own group is one of them.
-            let groups = self.group_projects(ctx);
-            self.folded
-                .retain(|project| groups.iter().any(|scoped| scoped.project_id == *project));
+            // `group_projects`' parts, borrowed field by field beside the `folded` it trims.
+            let (scope_row, members) = (self.scope_row.as_ref(), ctx.projects);
+            self.folded.retain(|project| {
+                list::group_projects(scope_row, members).any(|scoped| scoped.project_id == *project)
+            });
             // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
             if let Some(PendingReveal { id, key, focus }) = self.pending_reveal.take() {
                 match self.items.iter().find(|item| item.id == id) {
@@ -672,10 +679,10 @@ impl Tab for BacklogTab {
             keys.label(stack, Act::BacklogNewItem),
             keys.label(stack, Act::BacklogClearFilter),
         );
-        let groups = self.group_projects(ctx);
         let view = ListView {
             items: &self.items,
-            projects: &groups,
+            scope_row: self.scope_row.as_ref(),
+            projects: ctx.projects,
             folded: &self.folded,
             selected: self.selected,
             filter: summary.as_deref(),

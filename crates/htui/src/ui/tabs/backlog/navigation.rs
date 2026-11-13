@@ -73,7 +73,7 @@ impl BacklogTab {
         let filtered = self.shown.summary(ctx.projects).is_some();
         list::visible(
             &self.items,
-            &self.group_projects(ctx),
+            self.group_projects(ctx),
             &self.folded,
             filtered,
         )

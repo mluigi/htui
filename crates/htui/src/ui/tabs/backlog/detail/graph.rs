@@ -191,8 +191,12 @@ impl GraphTab {
     /// The Backlog's groups (MOD-147 M3 D3): the scope row its last `Items` reply named, then
     /// `ctx.projects`. What `in_workspace` reads, so a workspace item's node is neither dimmed
     /// nor refused on `Enter`.
-    fn workspace_projects(&self, ctx: &Ctx<'_>) -> Vec<ProjectRef> {
-        self.scope_row.iter().chain(ctx.projects).cloned().collect()
+    /// Borrowed, never collected: it is read on every `Enter` and every frame.
+    fn workspace_projects<'s>(
+        &'s self,
+        ctx: &'s Ctx<'_>,
+    ) -> impl Iterator<Item = &'s ProjectRef> + Clone {
+        self.scope_row.iter().chain(ctx.projects)
     }
 
     /// Rebuilds `rows` from `graph` at `depth`: the one place the tree is built.
@@ -254,7 +258,7 @@ impl GraphTab {
             return;
         }
         let node = row.node;
-        if in_workspace(node, &self.workspace_projects(ctx)) {
+        if in_workspace(node, self.workspace_projects(ctx)) {
             ctx.emit(Action::Reveal(RevealTarget::Item {
                 id: node.item_id,
                 key: node.key.clone(),
@@ -492,9 +496,9 @@ fn walk(
 }
 
 /// Whether `node`'s project is one of the workspace's (D7).
-fn in_workspace(node: &LinkNode, projects: &[ProjectRef]) -> bool {
+fn in_workspace<'p>(node: &LinkNode, projects: impl IntoIterator<Item = &'p ProjectRef>) -> bool {
     projects
-        .iter()
+        .into_iter()
         .any(|project| project.project_id == node.project_id)
 }
 
@@ -521,9 +525,9 @@ fn status_text(state: ItemState) -> String {
 ///
 /// The kind column is padded to [`kind_width`] for every row or for none (L6): padded when every
 /// row still fits with it, so a narrow pane drops the padding uniformly rather than row by row.
-fn lines(
+fn lines<'p>(
     rows: &[GraphRow<'_>],
-    projects: &[ProjectRef],
+    projects: impl IntoIterator<Item = &'p ProjectRef> + Clone,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -544,7 +548,7 @@ fn lines(
             line(
                 row,
                 root_project,
-                in_workspace(row.node, projects),
+                in_workspace(row.node, projects.clone()),
                 pad_kind.then_some(kind_width),
                 width,
                 theme,
@@ -828,7 +832,7 @@ impl DetailTab for GraphTab {
         // The gutter takes the tree's first cell; the rows are fitted to the rest.
         let width = usize::from(tree.width.saturating_sub(1));
         let projects = self.workspace_projects(ctx);
-        let rows: Vec<Row<'static>> = lines(&rows, &projects, width, ctx.theme)
+        let rows: Vec<Row<'static>> = lines(&rows, projects, width, ctx.theme)
             .into_iter()
             .map(|line| Row {
                 line,

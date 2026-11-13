@@ -64,8 +64,11 @@ pub type Group<'a> = (&'a ProjectRef, Vec<&'a ItemSummary>);
 pub struct ListView<'a> {
     /// The scope's items, as the `Items` reply delivered them.
     pub items: &'a [ItemSummary],
-    /// The groups: the workspace's scope row when the `Items` reply named one (MOD-147 M3 D3),
-    /// then the scope's projects in `workspace_project.position` order.
+    /// The workspace's scope row when the `Items` reply named one: the first group (MOD-147 M3
+    /// D3).
+    pub scope_row: Option<&'a ProjectRef>,
+    /// The scope's projects in `workspace_project.position` order: the groups after
+    /// `scope_row` ([`ListView::groups`]).
     pub projects: &'a [ProjectRef],
     /// Projects whose group is currently folded.
     pub folded: &'a [ProjectId],
@@ -79,6 +82,22 @@ pub struct ListView<'a> {
     pub clear_key: Option<&'a str>,
 }
 
+impl<'a> ListView<'a> {
+    /// The groups, in order: [`group_projects`] over `scope_row` and `projects`.
+    pub fn groups(&self) -> impl Iterator<Item = &'a ProjectRef> + Clone + use<'a> {
+        group_projects(self.scope_row, self.projects)
+    }
+}
+
+/// MOD-147 M3 D3: the list's groups, in order: the workspace's scope row when there is one, then
+/// `members`. Borrowed, never collected: the Backlog reads it on every key and every frame.
+pub fn group_projects<'a>(
+    scope_row: Option<&'a ProjectRef>,
+    members: &'a [ProjectRef],
+) -> impl Iterator<Item = &'a ProjectRef> + Clone {
+    scope_row.into_iter().chain(members)
+}
+
 /// Groups the items by project.
 ///
 /// Project order is `projects`' (the Backlog's `group_projects`: the workspace's scope row, then
@@ -86,9 +105,12 @@ pub struct ListView<'a> {
 /// ordered by `key_prefix` then `key_number`, so `ANA-2` follows `ANA-1` rather than `FEAT-2`
 /// (several key prefixes share one project, so `key_number` alone does not order them).
 #[must_use]
-pub fn groups<'a>(items: &'a [ItemSummary], projects: &'a [ProjectRef]) -> Vec<Group<'a>> {
+pub fn groups<'a>(
+    items: &'a [ItemSummary],
+    projects: impl IntoIterator<Item = &'a ProjectRef>,
+) -> Vec<Group<'a>> {
     projects
-        .iter()
+        .into_iter()
         .map(|project| {
             let mut rows: Vec<&ItemSummary> = items
                 .iter()
@@ -107,9 +129,9 @@ pub fn groups<'a>(items: &'a [ItemSummary], projects: &'a [ProjectRef]) -> Vec<G
 /// The visible rows, top to bottom: every project header, each followed by its items unless the
 /// group is folded.
 #[must_use]
-pub fn rows(
-    items: &[ItemSummary],
-    projects: &[ProjectRef],
+pub fn rows<'a>(
+    items: &'a [ItemSummary],
+    projects: impl IntoIterator<Item = &'a ProjectRef>,
     folded: &[ProjectId],
 ) -> Vec<Selection> {
     let mut out = Vec::new();
@@ -126,9 +148,9 @@ pub fn rows(
 /// nothing matches has none. Its project headers would still be rows, so the cursor would sit on,
 /// fold and step over headers the pane does not draw.
 #[must_use]
-pub fn visible(
-    items: &[ItemSummary],
-    projects: &[ProjectRef],
+pub fn visible<'a>(
+    items: &'a [ItemSummary],
+    projects: impl IntoIterator<Item = &'a ProjectRef>,
     folded: &[ProjectId],
     filtered: bool,
 ) -> Vec<Selection> {
@@ -186,7 +208,7 @@ pub fn render(
     // Unfiltered, it is the pre-MOD-13 check: no project, no row.
     let visible = visible(
         view.items,
-        view.projects,
+        view.groups(),
         view.folded,
         view.filter.is_some(),
     );
@@ -216,7 +238,7 @@ fn empty_state(view: &ListView<'_>) -> (&'static str, String) {
             |key| format!("{key} clears the filter"),
         );
         (NO_MATCH, next)
-    } else if view.projects.is_empty() {
+    } else if view.groups().next().is_none() {
         (NO_ITEMS, NO_PROJECT_NEXT.to_owned())
     } else {
         let next = view
@@ -251,7 +273,7 @@ fn list_rows(view: &ListView<'_>, theme: &Theme) -> Vec<Row<'static>> {
         .unwrap_or(0);
 
     let mut out = Vec::new();
-    for (project, group) in groups(view.items, view.projects) {
+    for (project, group) in groups(view.items, view.groups()) {
         let folded = view.folded.contains(&project.project_id);
         out.push(group_row(&project.name, group.len(), folded, theme));
         if folded {
@@ -348,6 +370,7 @@ mod tests {
     ) -> ListView<'a> {
         ListView {
             items,
+            scope_row: None,
             projects,
             folded: &[],
             selected,
