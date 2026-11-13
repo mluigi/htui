@@ -72,7 +72,6 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
-use crate::store::traits::MEMORY_NEEDS_A_CAPTURE_STEP;
 use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -94,6 +93,9 @@ use crate::store::traits::{
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -9444,6 +9446,16 @@ impl State {
             ));
         }
         let (agent_id, model) = (row.agent_id, row.model.clone());
+        let cites_the_run = |cited: &crate::model::MemoryCitation| {
+            self.steps
+                .get(&cited.step_id)
+                .is_some_and(|cited| cited.run_id == run)
+        };
+        if new.evidence.citations.is_empty() || !new.evidence.citations.iter().all(cites_the_run) {
+            return Err(StoreError::Constraint(
+                MEMORY_EVIDENCE_OUTSIDE_THE_RUN.to_owned(),
+            ));
+        }
         let written = self
             .memory_entries
             .values()
@@ -9467,8 +9479,13 @@ impl State {
                     && memory_subject_key(&entry.subject) == key
             })
             .min_by_key(|entry| entry.id)
-            .map(|entry| (entry.id, entry.source));
-        if let Some((existing, MemorySource::Person)) = holder {
+            .map(|entry| {
+                (
+                    entry.id,
+                    run_memory_held_by_a_person(entry.source, entry.version),
+                )
+            });
+        if let Some((existing, true)) = holder {
             return Ok(RunMemoryWrite::PersonHolds { existing });
         }
         if self.memory_entries.contains_key(&new.id) {

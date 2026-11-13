@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT cardinality($2::uuid[]) > 0\n               AND NOT EXISTS (\n                   SELECT 1 FROM unnest($2::uuid[]) AS c(id)\n                    WHERE NOT EXISTS (\n                          SELECT 1 FROM run_step s WHERE s.id = c.id AND s.run_id = $1))\n                AS \"inside!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inside!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "50794ee192196642d6652f2e9f269f17a2e867371e443a659e96d806ac06fb23"
+}

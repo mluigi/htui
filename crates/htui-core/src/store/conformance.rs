@@ -62,15 +62,16 @@ use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
-    MEMORY_NEEDS_A_CAPTURE_STEP, ParkOutcome, QueueStored, QueueTarget, QueueToken,
-    RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, command_finish_status,
-    command_not_claimable, command_not_queued, document_needs_a_step, has_nul, illegal_move,
-    invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
-    link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
-    not_a_tool_name, note_needs_a_step, queue_target_refusal, queue_token_refusal,
-    references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
-    self_link, step_writes_own_item, withdrawn_requirement_cited,
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, ParkOutcome, QueueStored,
+    QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
+    citation_key, command_finish_status, command_not_claimable, command_not_queued,
+    document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
+    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_reach,
+    memory_entry_closed, memory_subject_taken, not_a_tool_name, note_needs_a_step,
+    queue_target_refusal, queue_token_refusal, references_no_row, requirement_withdrawn,
+    resolution_not_closable, rule_kind_unknown, self_link, step_writes_own_item,
+    withdrawn_requirement_cited,
 };
 use crate::store::traits::{
     MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
@@ -341,9 +342,11 @@ pub const CASES: &[&str] = &[
     "run_memory_creates_a_run_entry_with_stamped_provenance",
     "run_memory_supersedes_a_live_run_entry_on_the_folded_subject",
     "run_memory_never_replaces_a_person_entry",
+    "run_memory_keeps_a_run_entry_a_person_amended",
     "run_memory_stops_at_the_write_cap",
     "run_memory_refuses_a_step_that_is_not_capture",
     "run_memory_refuses_a_lost_fence",
+    "run_memory_refuses_evidence_outside_the_run",
     "finish_run_counts_memory_usage_once",
     "finish_run_skips_deleted_or_unlisted_entries",
     // MOD-144: the item status reduction (ANA-35 §7.1, plan "The rules")
@@ -1123,6 +1126,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "run_memory_never_replaces_a_person_entry" => {
             Box::pin(run_memory_never_replaces_a_person_entry(store)).await
         }
+        "run_memory_keeps_a_run_entry_a_person_amended" => {
+            Box::pin(run_memory_keeps_a_run_entry_a_person_amended(store)).await
+        }
         "run_memory_stops_at_the_write_cap" => {
             Box::pin(run_memory_stops_at_the_write_cap(store)).await
         }
@@ -1130,6 +1136,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             Box::pin(run_memory_refuses_a_step_that_is_not_capture(store)).await
         }
         "run_memory_refuses_a_lost_fence" => Box::pin(run_memory_refuses_a_lost_fence(store)).await,
+        "run_memory_refuses_evidence_outside_the_run" => {
+            Box::pin(run_memory_refuses_evidence_outside_the_run(store)).await
+        }
         "finish_run_counts_memory_usage_once" => {
             Box::pin(finish_run_counts_memory_usage_once(store)).await
         }
@@ -28345,6 +28354,70 @@ async fn run_memory_never_replaces_a_person_entry<S: WriteStore>(store: &S) {
     );
 }
 
+/// MOD-164 D4 (review M1): a run entry a person amended is the person's. Runs create entries at
+/// version 1 and only move them to `superseded`, so a live run entry past version 1 was edited by
+/// a person: a later capture write on its folded subject answers `PersonHolds` naming it, writes
+/// nothing, and the person's text stays.
+async fn run_memory_keeps_a_run_entry_a_person_amended<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_keeps_a_run_entry_a_person_amended";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let written = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+    let amended = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(
+                written.id,
+                1,
+                memory_patch(CASE, None, Some("Install the mingw toolchain.")),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (amended.source, amended.version),
+        (MemorySource::Run, 2),
+        "{CASE}: the amend keeps the run's source and moves the version"
+    );
+
+    let retry = store.create_step(capture_row(run, 2)).await.expect(CASE).id;
+    assert_eq!(
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                retry,
+                run_memory_new(CASE, retry, " LINKER", "Install cc again."),
+            )
+            .await
+            .expect(CASE),
+        RunMemoryWrite::PersonHolds {
+            existing: written.id
+        },
+        "{CASE}: the amended entry holds the subject as a person's does"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![amended.clone()],
+        "{CASE}: nothing was written, and the person's text is kept"
+    );
+    assert_eq!(
+        memory_history(CASE, store, written.id).await.len(),
+        2,
+        "{CASE}: the amended entry gained no revision"
+    );
+}
+
 /// MOD-164 D4: a capture step writes at most [`MEMORY_RUN_WRITE_CAP`] entries, counted over every
 /// entry naming the step (a superseded one included). Past it the write answers `CapReached` and
 /// writes nothing, before the subject is looked at; another capture step has a cap of its own.
@@ -28517,6 +28590,85 @@ async fn run_memory_refuses_a_lost_fence<S: WriteStore>(store: &S) {
             )
             .await
             .expect(CASE),
+    );
+}
+
+/// MOD-164 D4 (review L4): a capture write rests on quotes of its own run. No citation, or a
+/// citation naming a step of another run or no step, is refused with
+/// [`MEMORY_EVIDENCE_OUTSIDE_THE_RUN`] and nothing is written. The check comes after the
+/// capture-step check and before the cap.
+async fn run_memory_refuses_evidence_outside_the_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_evidence_outside_the_run";
+    let a = Uuid::now_v7();
+    let (_, ordinary, step) = capture_step(CASE, store, a).await;
+    let other = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let stranger = store
+        .create_step(new_run_step(other, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let citing = |cited: Vec<StepId>| {
+        let mut new = run_memory_new(CASE, step, "Linker", "Install cc.");
+        new.evidence.citations = cited
+            .into_iter()
+            .map(|step_id| MemoryCitation {
+                step_id,
+                quote: "error: linker `cc` not found".to_owned(),
+            })
+            .collect();
+        new
+    };
+    let outside = |refused: &Result<RunMemoryWrite, StoreError>| matches!(refused, Err(StoreError::Constraint(code)) if code == MEMORY_EVIDENCE_OUTSIDE_THE_RUN);
+
+    let not_capture = store
+        .write_run_memory(StepFence::Lease(a), ordinary, citing(Vec::new()))
+        .await;
+    assert!(
+        matches!(&not_capture, Err(StoreError::Constraint(code)) if code == MEMORY_NEEDS_A_CAPTURE_STEP),
+        "{CASE}: the capture-step check comes first, got {not_capture:?}"
+    );
+    for (cited, what) in [
+        (Vec::new(), "no citation"),
+        (vec![step, stranger], "a step of another run"),
+        (vec![StepId::new(), ordinary], "no step"),
+    ] {
+        let refused = store
+            .write_run_memory(StepFence::Lease(a), step, citing(cited))
+            .await;
+        assert!(
+            outside(&refused),
+            "{CASE}: {what} is refused with the code word, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: no refusal wrote an entry"
+    );
+
+    for subject in ["One", "Two", "Three"] {
+        run_memory_created(
+            CASE,
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, ordinary, subject, "Cited from the run's own step."),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let past_cap = store
+        .write_run_memory(StepFence::Lease(a), step, citing(vec![stranger]))
+        .await;
+    assert!(
+        outside(&past_cap),
+        "{CASE}: the evidence is judged before the cap, got {past_cap:?}"
     );
 }
 

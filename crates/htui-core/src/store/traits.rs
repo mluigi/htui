@@ -61,23 +61,23 @@ use crate::model::{
     CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
     FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
-    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope,
+    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
@@ -2700,13 +2700,21 @@ pub trait WriteStore: ReadStore {
     ///    then `Fenced { step }`: `write_step_document`'s order);
     /// 2. the step is a `stage` row keyed `capture`, else
     ///    `Constraint(`[`MEMORY_NEEDS_A_CAPTURE_STEP`]`)`;
-    /// 3. [`MEMORY_RUN_WRITE_CAP`](crate::model::MEMORY_RUN_WRITE_CAP) entries already name
+    /// 3. `new.evidence` cites at least one step, and every cited step is a step of `step`'s run,
+    ///    else `Constraint(`[`MEMORY_EVIDENCE_OUTSIDE_THE_RUN`]`)`;
+    /// 4. [`MEMORY_RUN_WRITE_CAP`](crate::model::MEMORY_RUN_WRITE_CAP) entries already name
     ///    `step` (every state): [`RunMemoryWrite::CapReached`], nothing written;
-    /// 4. the live entry of the run's project whose subject folds to `new.subject`'s:
+    /// 5. the live entry of the run's project whose subject folds to `new.subject`'s:
     ///    none - the entry is created ([`RunMemoryWrite::Created`]); a person's - nothing is
     ///    written ([`RunMemoryWrite::PersonHolds`]); a run's - it is superseded as
     ///    [`supersede_memory_entry`](WriteStore::supersede_memory_entry) supersedes one
-    ///    ([`RunMemoryWrite::Superseded`]).
+    ///    ([`RunMemoryWrite::Superseded`]). A person's is a `person` entry, or a `run` entry a
+    ///    person amended: one past version 1, since a run only creates entries and only moves
+    ///    them to `superseded` ([`run_memory_held_by_a_person`]).
+    ///
+    /// Two writes on one step are serialized: Postgres locks the step row `FOR NO KEY UPDATE`
+    /// before step 1, so the cap's count in step 4 is never read by two writers at once; the
+    /// in-memory store holds its one lock throughout.
     ///
     /// The new entry is `source = run`, stamped from the rows, never from `new`: `run_id`,
     /// `step_id`, `item_id`, `agent_id` and `model` from the step and its run, `created_by` (and
@@ -2715,8 +2723,8 @@ pub trait WriteStore: ReadStore {
     /// entry's is `superseded`.
     ///
     /// # Errors
-    /// The four above, then `Constraint(`[`already_exists`]`)` for a duplicate `new.id`, and the
-    /// backend's own failures.
+    /// The refusals of steps 1 to 3 above, then `Constraint(`[`already_exists`]`)` for a
+    /// duplicate `new.id`, and the backend's own failures.
     async fn write_run_memory(
         &self,
         fence: StepFence,
@@ -2923,12 +2931,12 @@ pub fn phase_name_refusal(name: &str) -> Option<String> {
 }
 
 /// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` of `0029_divided_fanout.sql` and
-/// `chk_run_step_stage` as `0031_memory_capture.sql` restated it, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
-/// both stores give; `None` when the row may be written. Judged before any read. In order: a part
-/// names its parent step and its node key; a step is not its own parent (the self-parent CHECK,
-/// MOD-139 M1 R1); a stage sits at -4..-1 (MOD-164 D3 added -4); a negative position is a stage's
-/// only; a stage's key is one of [`STAGE_KEYS`]; then the NUL. As in the CHECK, nothing binds a
-/// key to its position.
+/// `chk_run_step_stage` as `0031_memory_capture.sql` restated it, plus a `node_key` NUL Postgres
+/// `text` cannot hold, in the one sentence both stores give; `None` when the row may be written.
+/// Judged before any read. In order: a part names its parent step and its node key; a step is not
+/// its own parent (the self-parent CHECK, MOD-139 M1 R1); a stage sits at -4..-1 (MOD-164 D3 added
+/// -4); a negative position is a stage's only; a stage's key is one of [`STAGE_KEYS`]; then the
+/// NUL. As in the CHECK, nothing binds a key to its position.
 #[must_use]
 pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     let stage = new.role == StepRole::Stage;
@@ -3900,6 +3908,22 @@ pub fn memory_entry_closed(id: MemoryEntryId, state: MemoryState) -> String {
 /// MOD-164 D4: [`WriteStore::write_run_memory`] writes for a run's capture stage only (`role =
 /// stage`, `node_key = capture`). A stable code word, so the engine can tell it apart.
 pub const MEMORY_NEEDS_A_CAPTURE_STEP: &str = "memory_needs_a_capture_step";
+
+/// MOD-164 D4 (review L4): a run's entry rests on quotes of its own run.
+/// [`WriteStore::write_run_memory`] refuses an empty `evidence.citations` and a citation whose
+/// `step_id` is not a step of the capture step's run. A stable code word, as
+/// [`MEMORY_NEEDS_A_CAPTURE_STEP`].
+pub const MEMORY_EVIDENCE_OUTSIDE_THE_RUN: &str = "memory_evidence_outside_the_run";
+
+/// MOD-164 D4 (review M1): whether a live entry holding a capture write's subject is a person's,
+/// so the run leaves it alone ([`RunMemoryWrite::PersonHolds`]). A `person` entry is; so is a
+/// `run` entry past version 1, since a run only creates entries (version 1) and only moves them
+/// to `superseded` (out of the live set): a live run entry at version 2 or later was amended by a
+/// person, and the text is theirs now. Shared so the two stores cannot disagree.
+#[must_use]
+pub fn run_memory_held_by_a_person(source: MemorySource, version: i32) -> bool {
+    source == MemorySource::Person || version > 1
+}
 
 // ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
 

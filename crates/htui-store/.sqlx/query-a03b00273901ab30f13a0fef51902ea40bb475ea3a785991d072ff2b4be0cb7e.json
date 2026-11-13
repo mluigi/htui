@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT s.role,\n               s.node_key,\n               s.agent_id     AS \"agent_id: AgentId\",\n               s.model,\n               r.started_by   AS \"started_by: UserId\",\n               r.lease_box_id AS \"lease_box_id: BoxId\",\n               (SELECT count(*) FROM memory_entry m WHERE m.step_id = s.id) AS \"written!\"\n          FROM run_step s JOIN run r ON r.id = s.run_id\n         WHERE s.id = $1\n        ",
+  "query": "\n        SELECT s.role         AS \"role: StepRole\",\n               s.node_key,\n               s.agent_id     AS \"agent_id: AgentId\",\n               s.model,\n               r.started_by   AS \"started_by: UserId\",\n               r.lease_box_id AS \"lease_box_id: BoxId\",\n               (SELECT count(*) FROM memory_entry m WHERE m.step_id = s.id) AS \"written!\"\n          FROM run_step s JOIN run r ON r.id = s.run_id\n         WHERE s.id = $1\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "role",
+        "name": "role: StepRole",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -91,5 +91,5 @@
       null
     ]
   },
-  "hash": "4992b5fbbc9fc130075bd43a1104a232d2970cae6306252af6164e1ff4d9212c"
+  "hash": "a03b00273901ab30f13a0fef51902ea40bb475ea3a785991d072ff2b4be0cb7e"
 }

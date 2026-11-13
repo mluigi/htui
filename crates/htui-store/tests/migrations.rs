@@ -7043,8 +7043,11 @@ async fn insert_sourced_memory_entry(
 /// MOD-164 plan D1: `0031_memory_capture.sql`'s rules. A person's entry naming a run is refused by
 /// `chk_memory_entry_person_has_no_run`, a source outside person and run by the source CHECK; a
 /// run's entry with its run, and a person's with none, are admitted, and a person's reads back with
-/// zeroed counters. `chk_run_step_stage` now takes -4: `capture` there is admitted, and so is
-/// `pick` (nothing binds a key to its position), while -5 is refused.
+/// zeroed counters. The recreated `trg_memory_entry_updated_at` moves `updated_at` on an UPDATE that
+/// moves the counters and `body` together, and on a no-op `SET body = body` (review L6: only a
+/// counters-only UPDATE leaves it). `chk_run_step_stage` now takes -4: `capture` there is admitted,
+/// and so is `pick` (nothing binds a key to its position), while -5 is refused. `run_id` and
+/// `item_id` each have a partial index behind their `ON DELETE SET NULL` (review L5).
 #[cfg(feature = "demo")]
 #[tokio::test]
 async fn the_0031_checks_refuse_what_they_name() {
@@ -7095,6 +7098,57 @@ async fn the_0031_checks_refuse_what_they_name() {
         "chk_memory_entry_shown_done",
         "a negative shown_done",
     );
+
+    let updated_at = |id: uuid::Uuid| async move {
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT updated_at FROM memory_entry WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read updated_at")
+    };
+    for (statement, what) in [
+        (
+            "UPDATE memory_entry SET shown_steps = shown_steps + 1, body = 'body, amended' \
+             WHERE id = $1",
+            "an UPDATE moving the counters and the body",
+        ),
+        (
+            "UPDATE memory_entry SET body = body WHERE id = $1",
+            "a no-op UPDATE of the body",
+        ),
+    ] {
+        let before = updated_at(person).await;
+        sqlx::query(statement)
+            .bind(person)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("{what}: {err}"));
+        assert!(updated_at(person).await > before, "{what} moves updated_at");
+    }
+
+    for (name, definition) in [
+        (
+            "idx_memory_entry_run",
+            "CREATE INDEX idx_memory_entry_run ON public.memory_entry USING btree (run_id) \
+             WHERE (run_id IS NOT NULL)",
+        ),
+        (
+            "idx_memory_entry_item",
+            "CREATE INDEX idx_memory_entry_item ON public.memory_entry USING btree (item_id) \
+             WHERE (item_id IS NOT NULL)",
+        ),
+    ] {
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read `{name}`'s definition: {err}"));
+        assert_eq!(actual.as_deref(), Some(definition), "0031's `{name}`");
+    }
 
     insert_role_step(pool, run, -4, "stage", None, Some("capture"))
         .await
