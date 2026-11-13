@@ -33,8 +33,8 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
-    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove, QueueOverview,
-    QueueSetting, WorkerLogLine,
+    LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove,
+    QueueOverview, QueueSetting, WorkerLogLine,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -318,6 +318,16 @@ pub enum StoreRequest {
         /// The `updated_at` of the row the editor opened on (`SpecView.stored`); `None` expects
         /// no row.
         expected: Option<DateTime<Utc>>,
+    },
+    /// Set one box's worker log level, `box.settings.log_level` (MOD-122 M2 D7, D11): last write
+    /// wins, no token, `edit_version` untouched. Served by [`box_settings::serve`] over the
+    /// `Writer` (F9); answered with [`StoreReply::Boxes`] when it applied and
+    /// [`StoreReply::BoxesStale`] when the box is gone.
+    SetBoxLogLevel {
+        /// The box, as a snapshot listed it.
+        box_id: BoxId,
+        /// The level to store.
+        level: LogShipLevel,
     },
     /// Create one `agent` row from the Settings form (MOD-23 D239). The worker mints the id and
     /// the clock, builds `launch` as `{command, args, env: {}}`, and copies `settings` from
@@ -1365,11 +1375,12 @@ impl StoreRequest {
             Self::EditHelp { .. } => EDIT_HELP,
             Self::ProbeAgents => "probe_agents",
             Self::ProbeBox => "probe_box",
-            // The three of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
-            // MOD-51 D4).
+            // The four of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
+            // MOD-51 D4; MOD-122 M2 F9).
             Self::Boxes => "boxes",
             Self::EditBox { .. } => "edit_box",
             Self::SetProbeSpec { .. } => "set_probe_spec",
+            Self::SetBoxLogLevel { .. } => "set_box_log_level",
             // The three of `agent_settings::REQUEST_NAMES`, in that order (MOD-23 D241).
             Self::CreateAgent { .. } => "create_agent",
             Self::EditAgent { .. } => "edit_agent",
@@ -2557,12 +2568,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The three box requests, or-ed for the same reason the thirty-two above are: a guard
+        // The four box requests, or-ed for the same reason the thirty-two above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4).
-        StoreRequest::Boxes | StoreRequest::EditBox { .. } | StoreRequest::SetProbeSpec { .. } => {
-            box_settings::serve(backend, request).await?
-        }
+        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4, MOD-122 M2 F9).
+        StoreRequest::Boxes
+        | StoreRequest::EditBox { .. }
+        | StoreRequest::SetProbeSpec { .. }
+        | StoreRequest::SetBoxLogLevel { .. } => box_settings::serve(backend, request).await?,
         // The three agent registry writes, or-ed for the reason the arms above are: a guard does
         // not count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-23
         // D241). Served here, in the loop: one statement and one read each (`R-NF-3`).
@@ -6159,9 +6171,9 @@ mod tests {
         );
     }
 
-    /// The three box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so
+    /// The four box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so
     /// the section's `Failed` match and the worker cannot drift apart (MOD-7 milestone 2, D46;
-    /// MOD-51 D4).
+    /// MOD-51 D4; MOD-122 M2 F9).
     #[test]
     fn box_requests_are_named_as_box_settings_lists_them() {
         assert_eq!(
@@ -6176,6 +6188,11 @@ mod tests {
                 StoreRequest::SetProbeSpec {
                     overlay: None,
                     expected: None,
+                }
+                .name(),
+                StoreRequest::SetBoxLogLevel {
+                    box_id: BoxId::new(),
+                    level: LogShipLevel::Debug,
                 }
                 .name(),
             ],

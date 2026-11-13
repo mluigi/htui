@@ -2,7 +2,8 @@
 //! profile, tools, probed and declared tags, quirks, executor and last probe; declared tags,
 //! quirks and the executor (MOD-41 plan D10) edited as a compare-and-set a reconnect cannot
 //! stale; the probe on this box only. `s` edits the app-wide probe spec overlay (MOD-51 D6) in
-//! the body, box or no box.
+//! the body, box or no box. `v` cycles the box's worker log level and saves it at once, last
+//! write wins, no token (MOD-122 M2 D11).
 //!
 //! Holds no store handle and mints no id (`R-NF-3`): every `BoxId` it sends came out of a
 //! [`BoxesSnapshot`].
@@ -29,7 +30,8 @@
 //! spec token; nothing is written wrongly either (MOD-51 LOW-5).
 
 use htui_core::model::{
-    BoxId, BoxRecord, Executor, Scope, canonical_declared_tags, declared_tags_from_text,
+    BoxId, BoxRecord, Executor, LogShipLevel, Scope, canonical_declared_tags,
+    declared_tags_from_text,
 };
 
 use std::cell::Cell;
@@ -95,7 +97,8 @@ const NO_BOXES_NEXT: &str = "a box is listed once htui connects from it";
 
 /// The Browse keys (MOD-51 D6: `s` opens the probe spec editor; `p probe this box` became
 /// `p probe` so the line fits an 80-column terminal, blueprint F-10, and [`THIS_BOX_ONLY`] still
-/// explains `p` on another box).
+/// explains `p` on another box). The worker log level (MOD-122 M2 D11) comes last: at 80 columns
+/// it is the one the line's ellipsis takes, and its row's help still names the key.
 const HINT_BROWSE: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::BoxesEditTags, "tags"),
@@ -104,6 +107,7 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::BoxesProbe, "probe"),
     Hint::One(Act::BoxesEditSpec, "spec"),
     Hint::One(Act::Reload, "reload"),
+    Hint::One(Act::BoxesLogLevel, "log level"),
 ];
 
 /// The Browse keys over a read list with no box in it: the spec is app-wide, so `s` still works
@@ -196,6 +200,7 @@ fn doing(busy: &str) -> &'static str {
         "boxes" => "reading the boxes",
         "edit_box" => "saving the box",
         "set_probe_spec" => "saving the probe spec",
+        "set_box_log_level" => "saving the worker log level",
         _ => "writing",
     }
 }
@@ -221,6 +226,31 @@ const EDIT_NAME: &str = REQUEST_NAMES[1];
 
 /// The name `busy` carries while a `SetProbeSpec` is in flight (MOD-51 D6).
 const SPEC_NAME: &str = REQUEST_NAMES[2];
+/// The name `busy` carries while a `SetBoxLogLevel` is in flight (MOD-122 M2 D11).
+const LEVEL_NAME: &str = REQUEST_NAMES[3];
+
+/// The worker log level row's help on a box that is not a headless worker (MOD-122 M2 D11): the
+/// level is stored, but only `htui worker` reads it.
+const LEVEL_ELSEWHERE: &str = "applies to `htui worker` on this box";
+
+/// The worker log level row's help (MOD-122 M2 D11): where the level applies on a box that is not
+/// a headless worker, and the key that cycles it, `settings.boxes.log_level` through the browse
+/// stack; unbound, the key clause goes, and a worker box with no key has no help.
+fn level_help(worker: bool, cycle: Option<&str>) -> Option<String> {
+    let cycles = cycle.map(|key| format!("{key} cycles"));
+    match (worker, cycles) {
+        (true, cycles) => cycles,
+        (false, Some(cycles)) => Some(format!("{LEVEL_ELSEWHERE} \u{b7} {cycles}")),
+        (false, None) => Some(LEVEL_ELSEWHERE.to_owned()),
+    }
+}
+
+/// The level after `level` in `off → error → warn → info → debug → off` (MOD-122 M2 F8).
+fn next_level(level: LogShipLevel) -> LogShipLevel {
+    let all = LogShipLevel::ALL;
+    let at = all.iter().position(|each| *each == level).unwrap_or(0);
+    all[(at + 1) % all.len()]
+}
 
 /// The section.
 #[derive(Debug, Default)]
@@ -234,7 +264,8 @@ pub struct BoxesSection {
     /// Browse, or one editor.
     mode: Mode,
     /// The write in flight (D56): `Some("edit_box")` between an `EditBox` and its reply,
-    /// `Some("set_probe_spec")` between a `SetProbeSpec` and its reply (MOD-51 D6).
+    /// `Some("set_probe_spec")` between a `SetProbeSpec` and its reply (MOD-51 D6),
+    /// `Some("set_box_log_level")` between a `SetBoxLogLevel` and its reply (MOD-122 M2 D11).
     busy: Option<&'static str>,
     /// A `ProbeBox` is in flight: the hint says so. Cleared by `BoxProbed` or its `Failed`.
     probing: bool,
@@ -429,7 +460,7 @@ impl BoxesSection {
     fn on_stale(&mut self, snapshot: &BoxesSnapshot, keys: &Keys) {
         let save = keys.label(views::BOXES_EDITOR, Act::FormSave);
         let submit = keys.label(views::CAPTURE, Act::FieldSubmit);
-        self.busy = None;
+        let was = self.busy.take();
         self.replace(snapshot);
         // MOD-51 F-6(a): the probe spec editor is over no box, so it is settled before
         // `editor_box` would take it for no editor at all. Its token is the overlay row's, `None`
@@ -440,8 +471,14 @@ impl BoxesSection {
             return;
         }
         let Some(box_id) = self.editor_box() else {
-            // Nothing is open to retry from, so the sentence has to say the write did not apply.
-            self.notice = Some(CHANGED_ELSEWHERE_CLOSED.to_owned());
+            // A level write has no token to spend, so its only miss is a box gone (MOD-122 M2
+            // F9). Otherwise nothing is open to retry from, so the sentence has to say the write
+            // did not apply.
+            self.notice = Some(if was == Some(LEVEL_NAME) {
+                DELETED_ELSEWHERE.to_owned()
+            } else {
+                CHANGED_ELSEWHERE_CLOSED.to_owned()
+            });
             return;
         };
         let now = snapshot
@@ -544,6 +581,25 @@ impl BoxesSection {
         };
         self.mode = Mode::Executor(ExecutorFlip::over(record));
         self.notice = None;
+    }
+
+    /// `v` (MOD-122 M2 D11, F8): the selected box's worker log level moves one step along
+    /// `off → error → warn → info → debug → off` and is saved at once; no editor opens. The level
+    /// on screen is the snapshot's until the reply's read shows the new one.
+    fn cycle_level(&mut self, ctx: &Ctx<'_>) {
+        if self.blocked() {
+            return;
+        }
+        let Some(record) = self.selected_record() else {
+            return;
+        };
+        let request = StoreRequest::SetBoxLogLevel {
+            box_id: record.row.id,
+            level: next_level(LogShipLevel::of(&record.row.settings)),
+        };
+        self.busy = Some(LEVEL_NAME);
+        self.notice = None;
+        ctx.request(request);
     }
 
     /// `s` (MOD-51 D6): the probe spec editor over the stored overlay, with or without a listed
@@ -815,6 +871,12 @@ impl SettingsSection for BoxesSection {
                 {
                     self.open_executor();
                 }
+                // MOD-122 M2 D11: like `executor`, only over a listed box.
+                Act::BoxesLogLevel
+                    if self.unavailable.is_none() && self.selected_record().is_some() =>
+                {
+                    self.cycle_level(ctx);
+                }
                 // MOD-51 D6: the probe spec is app-wide, so `s` needs no listed box.
                 Act::BoxesEditSpec => self.open_spec(),
                 Act::BoxesProbe => self.probe(ctx),
@@ -850,9 +912,10 @@ impl SettingsSection for BoxesSection {
             }
             // A refused write: the editor stays open over its text, and a second save retries.
             // For a probe spec save (MOD-51 D6) the sentence is the probe's own when the overlay
-            // was refused (D3), the store's when the write was.
+            // was refused (D3), the store's when the write was. A refused level write (MOD-122 M2
+            // D11) leaves the snapshot's level on screen, and a second `v` retries.
             StoreReply::Failed { request, message }
-                if *request == EDIT_NAME || *request == SPEC_NAME =>
+                if *request == EDIT_NAME || *request == SPEC_NAME || *request == LEVEL_NAME =>
             {
                 self.busy = None;
                 self.notice = Some(message.clone());
@@ -1137,6 +1200,24 @@ impl BoxesSection {
             }
             _ => fields.push(read("executor", Executor::of(&row.settings).to_string())),
         }
+
+        // MOD-122 M2 D7, D11: read through `LogShipLevel::of`, so a bad sibling key cannot move
+        // it; `v` cycles it from browse. The form shows help only under a focused row, and this
+        // one is never focused, so its help is dim lines of the value, as the quirks are lines.
+        let worker = Executor::of(&row.settings) == Executor::Worker;
+        let cycle = ctx.keys().label(views::BOXES_BROWSE, Act::BoxesLogLevel);
+        let mut level = vec![Line::styled(
+            LogShipLevel::of(&row.settings).to_string(),
+            theme.base,
+        )];
+        if let Some(help) = level_help(worker, cycle.as_deref()) {
+            level.extend(
+                wrapped(&help, usize::from(value_width))
+                    .into_iter()
+                    .map(|line| Line::styled(line, theme.dim)),
+            );
+        }
+        fields.push(form::Field::new("log level", form::Value::Lines(level)));
 
         let tools: Vec<String> = record
             .tools

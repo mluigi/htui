@@ -445,7 +445,7 @@ while it is in front; scrolling up pauses following, so the lines you are readin
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
 | **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
-| **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), and a fresh check of its tools (`p`). |
+| **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), how much of its log that worker sends to the database (`v` cycles `off`, `error`, `warn`, `info`, `debug`; default `warn`), and a fresh check of its tools (`p`). |
 | **Personas** | Agent personas: create (`n`), edit the fields (`e`), the body (`b`) and the permission rules (`r`), delete (`d`), and import `.md` persona files (`I`). See [`docs/personas.md`](docs/personas.md). |
 | **Logging** | Which lines `htui` keeps (the filter, an `EnvFilter` directive such as `info` or `htui=debug`) and a file to append its log to (`e` edits; `~/` is your home directory, and a path that is not a regular file, such as a pipe, is refused). Both apply at once and are kept in `ui-state.toml`; a field set by `--log` or `HTUI_LOG_FILTER` says so and cannot be changed here for that session. |
 
