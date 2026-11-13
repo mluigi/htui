@@ -97,6 +97,11 @@
 //!     seeded `claude-cli` row, spawned by its driver while a bogus API key is exported, still
 //!     authenticates on the subscription login (`system/init.apiKeySource == "none"`). It is also
 //!     the canary for a CLI that makes `--bare` (strictly key or `apiKeyHelper`) the `-p` default.
+//! 12. [`case_12_a_sigint_interrupted_turn_resumes`] and [`case_13_a_killed_turn_resumes`] —
+//!     **MOD-125 M3 D10**. A turn stopped mid-generation (D81's stdin close and SIGINT, or the
+//!     group killed), then `--resume` in a second process with the redo text: does the saved
+//!     session open, and does it keep the first turn? Both run under a scratch `CLAUDE_CONFIG_DIR`
+//!     ([`scratch_config`]), because they read the saved session back.
 //!
 //! # The file's own rule
 //!
@@ -2176,5 +2181,337 @@ async fn case_11_a_subscription_row_ignores_an_inherited_api_key() {
     assert!(
         is_success(&result),
         "the turn succeeded on the subscription login: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cases 12 and 13 — MOD-125 M3 D10: a stopped turn's saved session reopens
+// ---------------------------------------------------------------------------------------------
+
+/// A SIGINT-interrupted turn (D81's graceful stop: stdin close, then SIGINT to the group), then a
+/// second process on `--resume` with the redo text. See [`stopped_turn_resumes`].
+#[tokio::test]
+#[ignore = "spends model tokens against the subscription login this box holds"]
+async fn case_12_a_sigint_interrupted_turn_resumes() {
+    stopped_turn_resumes(Stop::Interrupted).await;
+}
+
+/// A killed turn (the forced drop: the group killed mid-generation, nothing asked first), then a
+/// second process on `--resume` with the redo text. See [`stopped_turn_resumes`].
+#[tokio::test]
+#[ignore = "spends model tokens against the subscription login this box holds"]
+async fn case_13_a_killed_turn_resumes() {
+    stopped_turn_resumes(Stop::Killed).await;
+}
+
+/// How the first turn of [`stopped_turn_resumes`] is stopped.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    /// D81's graceful stop, as case 3 (b) measures it: stdin closed, then SIGINT to the group,
+    /// then [`CANCEL_WINDOW`] to reach EOF.
+    Interrupted,
+    /// The forced drop: the group killed ([`Spawned::kill_tree`]) while the model is generating.
+    Killed,
+}
+
+impl Stop {
+    /// The fixture name stem and the label the printout uses.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Interrupted => "stopped_sigint",
+            Self::Killed => "stopped_killed",
+        }
+    }
+}
+
+/// The first turn: a fact only this turn states, then work long enough to be stopped mid-way.
+///
+/// The code word is what "keeps the first turn" is measured by: it is written nowhere but this
+/// prompt, so finding it in the resumed session's saved transcript is evidence the resume reopened
+/// *this* conversation rather than a fresh one under the same id.
+const STOPPED_PROMPT: &str = "The code word for this session is heliotrope; do not repeat it \
+                              unless asked. Now count slowly from 1 to 200, one number per line, \
+                              nothing else.";
+
+/// The code word [`STOPPED_PROMPT`] plants.
+const CODE_WORD: &str = "heliotrope";
+
+/// The redo text a resumed step is sent (plan D7): `htui_orch::promote::STOP_RESUME_OPENING`,
+/// copied because `htui-agent` does not depend on `htui-orch`. If the two drift the probe still
+/// measures the same thing — a resumed session taking a follow-up — but keep them equal.
+const STOP_RESUME_OPENING: &str = "this step was stopped and has been resumed; your last turn may \
+                                   have been cut off; continue the task, redoing any unfinished \
+                                   part of it";
+
+/// A substring of [`STOP_RESUME_OPENING`] with nothing JSON would escape, for the transcript search.
+const RESUME_MARK: &str = "has been resumed";
+
+/// Whether the child must not inherit `name`: a parent Claude Code session's `CLAUDE*` markers and
+/// every `ANTHROPIC_*`, so the scratch configuration's subscription login is the credential in use
+/// (as `tests/isolation_live.rs` scrubs them). `CLAUDE_CONFIG_DIR` is set, not inherited.
+fn scrubbed(name: &str) -> bool {
+    (name.starts_with("CLAUDE") && name != "CLAUDE_CONFIG_DIR") || name.starts_with("ANTHROPIC_")
+}
+
+/// A scratch Claude Code configuration under `cwd`, returned as the `CLAUDE_CONFIG_DIR` to use.
+///
+/// Cases 1-11 run on whatever configuration the shell exports. These two read back the session the
+/// CLI saved, so they must not write it into the maintainer's `~/.claude` (from the hr sandbox that
+/// directory is shared read-write with the host). The directory holds `.credentials.json` with the
+/// box's `claudeAiOauth` object **without** its `refreshToken`, so a refresh can never rotate the
+/// host's token (an expired access token fails the turn; it is never refreshed from here), and a
+/// `.claude.json` with onboarding done and `cwd` trusted. It lives **inside** `cwd` so the
+/// redaction rule's `cwd → /scratch` also covers the config paths `system/init` reports.
+fn scratch_config(cwd: &Path) -> PathBuf {
+    let cfg = cwd.join("claude-config");
+    std::fs::create_dir_all(&cfg).expect("the scratch config directory");
+    let home = dirs::home_dir().expect("a home directory");
+    let real = home.join(".claude/.credentials.json");
+    let text = std::fs::read_to_string(&real).unwrap_or_else(|err| {
+        panic!(
+            "precondition: {} is unreadable ({err}); these cases need the box's subscription login",
+            real.display()
+        )
+    });
+    let creds: Value = serde_json::from_str(&text).expect("the credentials parse");
+    let mut oauth = creds
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("precondition: the box holds a subscription OAuth credential");
+    oauth.remove("refreshToken");
+    write_private(
+        &cfg.join(".credentials.json"),
+        &json!({ "claudeAiOauth": oauth }).to_string(),
+    );
+    let claude_json = json!({
+        "hasCompletedOnboarding": true,
+        "projects": { cwd.to_string_lossy(): { "hasTrustDialogAccepted": true } },
+    });
+    std::fs::write(cfg.join(".claude.json"), claude_json.to_string()).expect(".claude.json");
+    cfg
+}
+
+/// Writes `text` to a new file only its owner can read.
+#[cfg(unix)]
+fn write_private(path: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .expect("create the scratch credentials 0600");
+    file.write_all(text.as_bytes())
+        .expect("write the scratch credentials");
+}
+
+/// Writes `text` to a new file only its owner can read.
+#[cfg(not(unix))]
+fn write_private(path: &Path, text: &str) {
+    std::fs::write(path, text).expect("write the scratch credentials");
+}
+
+/// Every `*.jsonl` under `cfg/projects` whose text holds all of `needles`: the saved sessions.
+fn saved_sessions_with(cfg: &Path, needles: &[&str]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&cfg.join("projects"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|text| needles.iter().all(|needle| text.contains(needle)))
+        })
+        .collect()
+}
+
+impl Run {
+    /// [`Run::start`] under the scratch configuration `cfg`: `CLAUDE_CONFIG_DIR` set and every
+    /// [`scrubbed`] variable removed from the child's environment.
+    async fn start_scratch(cwd: &Path, args: &[String], cfg: &Path) -> Self {
+        let launch = claude_launch(args);
+        let tools = htui_agent::tools::resolve(launch.discovery.as_ref(), cwd)
+            .await
+            .expect(
+                "precondition: `claude` did not resolve on this box. It is a `path` probe on the \
+                 seed row; put the binary on PATH or set HTUI_TOOL_CLAUDE.",
+            );
+        let mut resolved =
+            htui_agent::launch::resolve(&launch, &tools).expect("`${claude}` substitutes");
+        resolved.env.insert(
+            "CLAUDE_CONFIG_DIR".to_owned(),
+            cfg.to_string_lossy().into_owned(),
+        );
+        let mut removed: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| scrubbed(name))
+            .collect();
+        removed.sort();
+        resolved.env_remove.extend(removed);
+        Self::spawn(&resolved, cwd).await
+    }
+
+    /// Kills the group with no warning, through the production method ([`Spawned::kill_tree`]).
+    async fn kill(&mut self) {
+        println!(
+            "  [{:>6.2}s] -- kill the group",
+            self.started.elapsed().as_secs_f64()
+        );
+        if let Err(error) = self.spawned.kill_tree().await {
+            println!("        the kill was refused: {error}");
+        }
+    }
+}
+
+/// D10 (MOD-125 M3): a turn stopped by `stop`, then a **second process** on `--resume` with the
+/// redo text, in the same working directory and configuration, as a resumed step runs (D5).
+///
+/// The first process carries a minted `--session-id` (D84) and [`STOPPED_PROMPT`]; on the first
+/// text the model produces (case 3's trigger) it is stopped by `stop`. The second spawn is
+/// `--resume <minted>` and sends [`STOP_RESUME_OPENING`].
+///
+/// Asserted, as the brief asks: the first turn produced text to stop (a precondition); both
+/// processes died (by pid, [`Run::finish`]); the resumed process **opens** the saved session — its
+/// stream carries the minted id and its turn ends in a successful `result`; and the session it
+/// saved **keeps the first turn** — one transcript under the scratch `projects/` holds both the
+/// code word (written only by turn 1) and the redo text. What the model wrote back is printed and
+/// never asserted: whether it picks the count up where it stopped or starts over is the vendor's
+/// wording, and the reply is the evidence. A failure here is a finding for M3, whose fallback
+/// (a fresh session with the handoff text, D7) covers a session that does not open.
+async fn stopped_turn_resumes(stop: Stop) {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    let name = stop.name();
+    let minted = StepId::new().to_string();
+    println!("\n=== {name} / first turn, --session-id {minted} ===");
+
+    let cwd = scratch();
+    let root = cwd.path().canonicalize().expect("a canonical scratch path");
+    let cfg = scratch_config(&root);
+
+    let mut run = Run::start_scratch(
+        &root,
+        &args_with(&["--session-id", &minted, "--include-partial-messages"]),
+        &cfg,
+    )
+    .await;
+    run.send(STOPPED_PROMPT).await;
+    let trigger = run
+        .read_until(TURN_WINDOW, |line| {
+            line.json().is_some_and(|value| {
+                (value["type"] == json!("stream_event")
+                    && value["event"]["delta"]["type"] == json!("text_delta"))
+                    || value["type"] == json!("assistant")
+            })
+        })
+        .await;
+    println!("  triggered on: {:?}", trigger.as_ref().map(Line::kind));
+    assert!(
+        trigger.is_some(),
+        "{name}: the first turn produced no text to stop, so there is nothing to resume. This is \
+         a precondition (auth, the scratch login), not a finding."
+    );
+
+    let acted = Instant::now();
+    let status = match stop {
+        Stop::Interrupted => {
+            run.close_stdin();
+            run.signal(StopSignal::Interrupt);
+            let to_eof = run.drain(CANCEL_WINDOW).await;
+            println!(
+                "  EOF {} {:.2}s after the interrupt",
+                if to_eof.is_some() {
+                    "reached"
+                } else {
+                    "NOT reached"
+                },
+                acted.elapsed().as_secs_f64()
+            );
+            run.wait(EOF_WINDOW).await
+        }
+        Stop::Killed => {
+            run.kill().await;
+            let _ = run.drain(EOF_WINDOW).await;
+            run.wait(EOF_WINDOW).await
+        }
+    };
+    let first_result = run
+        .json_lines()
+        .iter()
+        .rev()
+        .find(|line| line["type"] == json!("result"))
+        .map(|line| usage_line(line));
+    println!("  first turn's terminal envelope: {first_result:?}");
+    run.finish(name, status).await;
+    let saved_before = saved_sessions_with(&cfg, &[CODE_WORD]);
+    println!("  saved sessions holding the code word after the stop: {saved_before:?}");
+
+    println!("\n=== {name} / --resume {minted} ===");
+    let mut run = Run::start_scratch(&root, &args_with(&["--resume", &minted]), &cfg).await;
+    run.send(STOP_RESUME_OPENING).await;
+    let resumed = run.read_result(LONG_TURN_WINDOW).await;
+    run.close_stdin();
+    let _ = run.drain(EOF_WINDOW).await;
+    let status = run.wait(EOF_WINDOW).await;
+
+    let resumed_ids: BTreeSet<String> = run
+        .json_lines()
+        .iter()
+        .filter_map(|line| line["session_id"].as_str())
+        .map(ToOwned::to_owned)
+        .collect();
+    let reply: String = run
+        .json_lines()
+        .iter()
+        .filter(|line| line["type"] == json!("assistant"))
+        .filter_map(|line| line["message"]["content"][0]["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    println!("  session ids on the resumed stream: {resumed_ids:?}");
+    println!(
+        "  the resumed reply (first 400 chars): {:?}",
+        reply.chars().take(400).collect::<String>()
+    );
+    match &resumed {
+        Some(result) => println!("  result: {}", usage_line(result)),
+        None => println!("  result: none arrived"),
+    }
+    run.finish(&format!("{name}_resumed"), status).await;
+    let kept = saved_sessions_with(&cfg, &[CODE_WORD, RESUME_MARK]);
+    println!("  saved sessions holding turn 1 and the redo text: {kept:?}");
+    drop(cwd);
+
+    assert!(
+        resumed_ids.contains(&minted),
+        "{name}: `--resume {minted}` did not open the stopped session; its stream carried \
+         {resumed_ids:?}. A refusal (\"no conversation found\") means a stopped step cannot be \
+         reopened this way and M3's fallback is what runs."
+    );
+    let resumed = resumed.unwrap_or_else(|| {
+        panic!("{name}: the resumed session produced no `result` within {LONG_TURN_WINDOW:?}")
+    });
+    assert!(
+        is_success(&resumed),
+        "{name}: the resumed session's turn failed: {resumed}"
+    );
+    assert!(
+        !kept.is_empty(),
+        "{name}: no saved session holds both turn 1's code word and the redo text, so the resume \
+         did not keep the first turn (sessions with the code word after the stop: \
+         {saved_before:?})"
     );
 }

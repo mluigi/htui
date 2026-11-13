@@ -23,7 +23,10 @@
 //!   line JSON-RPC to it from a small client here. `session/new` carries
 //!   `acp::session_meta(&settings)` with one key merged in: `extraArgs["debug-file"]`, the one thing
 //!   the driver path cannot inject. One case resumes a session in a second adapter process with the
-//!   same `_meta`, over `session/resume` (or `session/load` where only that is advertised). The
+//!   same `_meta`, over `session/resume` (or `session/load` where only that is advertised). Two
+//!   more (MOD-125 M3 D10, the twins of `tests/cli_live.rs` cases 12 and 13) stop a turn
+//!   mid-generation, by `session/cancel` or by killing the adapter, and reopen the session in a
+//!   second process over `session/load` (`session/resume` where load is not advertised). The
 //!   driver's own `_meta` plumbing on new, resume and load is pinned by `tests/acp_driver.rs`.
 //!
 //!   Node and the adapter resolve exactly as a chat's do, through the `HTUI_TOOL_*` overrides or
@@ -1003,28 +1006,58 @@ impl AcpClient {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.begin(method, params).await;
+        self.response(id, TURN_WINDOW)
+            .await
+            .unwrap_or_else(|| panic!("`{method}` is answered within the window"))
+    }
+
+    /// Sends a request and returns its id without waiting for the answer ([`Self::response`]).
+    async fn begin(&mut self, method: &str, params: Value) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.send(&request).await;
-        let wait = async {
-            loop {
-                let message = self
-                    .inbox
-                    .recv()
-                    .await
-                    .expect("the adapter's stdout stays open");
-                if message.get("id").and_then(Value::as_u64) == Some(id)
-                    && message.get("method").is_none()
-                {
-                    return message;
-                }
-                self.handle(message).await;
+        id
+    }
+
+    /// Sends a notification: no id, no answer.
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await;
+    }
+
+    /// The answer to request `id`, handling everything else that arrives first; `None` when the
+    /// window passes or the adapter's stdout closes before it.
+    async fn response(&mut self, id: u64, window: Duration) -> Option<Value> {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let message = tokio::time::timeout_at(deadline, self.inbox.recv())
+                .await
+                .ok()??;
+            if message.get("id").and_then(Value::as_u64) == Some(id)
+                && message.get("method").is_none()
+            {
+                return Some(message);
             }
-        };
-        tokio::time::timeout(TURN_WINDOW, wait)
-            .await
-            .unwrap_or_else(|_| panic!("`{method}` is answered within the window"))
+            self.handle(message).await;
+        }
+    }
+
+    /// Handles what arrives until a `session/update` satisfies `wanted`; `false` when the window
+    /// passes or the adapter's stdout closes first.
+    async fn until(&mut self, window: Duration, wanted: impl Fn(&Value) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + window;
+        let from = self.updates.len();
+        loop {
+            if self.updates[from..].iter().any(&wanted) {
+                return true;
+            }
+            match tokio::time::timeout_at(deadline, self.inbox.recv()).await {
+                Ok(Some(message)) => self.handle(message).await,
+                Ok(None) | Err(_) => return false,
+            }
+        }
     }
 
     /// Takes whatever arrives within `window`.
@@ -1038,6 +1071,15 @@ impl AcpClient {
     async fn close(mut self) {
         let _ = self.writer.shutdown().await;
         let _ = self.child.kill_tree().await;
+        let _ = self.child.wait().await;
+    }
+
+    /// Kills the adapter's group with no warning: stdin is not closed first, so nothing tells the
+    /// adapter a stop is coming.
+    async fn kill(mut self) {
+        if let Err(error) = self.child.kill_tree().await {
+            println!("  the kill was refused: {error}");
+        }
         let _ = self.child.wait().await;
     }
 }
@@ -1391,6 +1433,237 @@ async fn acp_isolated_on_resume() {
         "the settings hook fires in neither process"
     );
     assert_eq!(turn.commands, Vec::<String>::new(), "no command is listed");
+}
+
+/// D10's ACP twin of `tests/cli_live.rs` case 12: a turn cancelled mid-generation the way the
+/// driver cancels one (`session/cancel`, then the adapter closed), then the session reopened in a
+/// second adapter process. See [`acp_stopped_turn_reopens`].
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn acp_a_cancelled_turn_reopens() {
+    acp_stopped_turn_reopens(AcpStop::Cancelled).await;
+}
+
+/// D10's ACP twin of `tests/cli_live.rs` case 13: the adapter's group killed mid-generation, then
+/// the session reopened in a second adapter process. See [`acp_stopped_turn_reopens`].
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn acp_a_killed_turn_reopens() {
+    acp_stopped_turn_reopens(AcpStop::Killed).await;
+}
+
+/// How the first turn of [`acp_stopped_turn_reopens`] is stopped.
+#[derive(Debug, Clone, Copy)]
+enum AcpStop {
+    /// The driver's graceful cancel (`AcpDriver`'s `cancel_session`): `session/cancel`, the turn's
+    /// answer awaited for [`CANCEL_WINDOW`], then the adapter closed.
+    Cancelled,
+    /// The forced drop: the adapter's group killed while the model is generating.
+    Killed,
+}
+
+/// How long a cancelled ACP turn is given to answer its `session/prompt` (`tests/cli_live.rs`'s
+/// cancel window).
+const CANCEL_WINDOW: Duration = Duration::from_secs(90);
+
+/// The first turn: a fact only this turn states, then work long enough to be stopped mid-way
+/// (`tests/cli_live.rs`'s `STOPPED_PROMPT`).
+const STOPPED_PROMPT: &str = "The code word for this session is heliotrope; do not repeat it \
+                              unless asked. Now count slowly from 1 to 200, one number per line, \
+                              nothing else.";
+
+/// The code word [`STOPPED_PROMPT`] plants: written nowhere else, so finding it after the reopen
+/// is evidence the reopened session is this conversation.
+const CODE_WORD: &str = "heliotrope";
+
+/// The redo text a resumed step is sent (plan D7): `htui_orch::promote::STOP_RESUME_OPENING`,
+/// copied because `htui-agent` does not depend on `htui-orch`. Keep the two equal.
+const STOP_RESUME_OPENING: &str = "this step was stopped and has been resumed; your last turn may \
+                                   have been cut off; continue the task, redoing any unfinished \
+                                   part of it";
+
+/// A substring of [`STOP_RESUME_OPENING`] with nothing JSON would escape, for the transcript search.
+const RESUME_MARK: &str = "has been resumed";
+
+/// Every `*.jsonl` under `cfg/projects` whose text holds all of `needles`: the saved sessions.
+/// Copied from `tests/cli_live.rs`, as this repo copies its test helpers per file.
+fn saved_sessions_with(cfg: &Path, needles: &[&str]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&cfg.join("projects"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|text| needles.iter().all(|needle| text.contains(needle)))
+        })
+        .collect()
+}
+
+/// The `text` of every update of kind `kind` among `updates`, in order.
+fn texts_of(updates: &[Value], kind: &str) -> Vec<String> {
+    updates
+        .iter()
+        .filter(|update| update.get("sessionUpdate").and_then(Value::as_str) == Some(kind))
+        .filter_map(|update| update.pointer("/content/text").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// D10's ACP twin (MOD-125 M3): a turn stopped by `stop` in one adapter process, then the session
+/// reopened in a second with the same `_meta`, and the redo text sent, as a resumed step does (D5).
+///
+/// The route is **`session/load`** when the adapter advertises `loadSession`, `session/resume`
+/// otherwise. That is the reverse of the driver's preference (`acp::restore_session` takes resume
+/// first) on purpose: [`acp_isolated_on_resume`] already exercises resume, and a load **replays**
+/// the history, so "keeps the first turn" can be read off the wire as well as off the saved file.
+///
+/// Asserted: the first turn produced text to stop (a precondition); the reopen answers a result;
+/// the reopened session takes the redo turn to `end_turn`; on a load, the replay carries turn 1's
+/// code word in a `user_message_chunk`; and one saved transcript under the scratch
+/// `CLAUDE_CONFIG_DIR` holds both the code word and the redo text. The model's reply is printed,
+/// never asserted.
+async fn acp_stopped_turn_reopens(stop: AcpStop) {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let claude = claude_on_path();
+    let scratch = Scratch::new(&claude);
+    let row = acp_row(&scratch, false);
+    let label = match stop {
+        AcpStop::Cancelled => "acp cancelled",
+        AcpStop::Killed => "acp killed",
+    };
+
+    let Some((mut first, _)) = acp_start(&scratch, &row).await else {
+        return;
+    };
+    let session_id = acp_new(&mut first, &scratch, &row, &scratch.debug).await;
+    let prompt_id = first
+        .begin(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": STOPPED_PROMPT }],
+            }),
+        )
+        .await;
+    let triggered = first
+        .until(TURN_WINDOW, |update| {
+            update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk")
+        })
+        .await;
+    if !triggered {
+        first.kill().await;
+        panic!(
+            "{label}: the first turn produced no text to stop, so there is nothing to reopen. \
+             This is a precondition (auth, the scratch login), not a finding."
+        );
+    }
+    let first_stop = match stop {
+        AcpStop::Cancelled => {
+            first
+                .notify("session/cancel", json!({ "sessionId": session_id }))
+                .await;
+            let answer = first.response(prompt_id, CANCEL_WINDOW).await;
+            first.close().await;
+            Some(answer.map_or_else(
+                || "no answer within the window".to_owned(),
+                |answer| answer.to_string(),
+            ))
+        }
+        AcpStop::Killed => {
+            first.kill().await;
+            None
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let saved_before = saved_sessions_with(&scratch.cfg, &[CODE_WORD]);
+
+    let reopened_debug = scratch.debug.with_file_name("debug-reopened.log");
+    let Some((mut second, init)) = acp_start(&scratch, &row).await else {
+        return;
+    };
+    let caps = init
+        .pointer("/result/agentCapabilities")
+        .cloned()
+        .unwrap_or_default();
+    let method = if caps.get("loadSession").and_then(Value::as_bool) == Some(true) {
+        "session/load"
+    } else if caps.pointer("/sessionCapabilities/resume").is_some() {
+        "session/resume"
+    } else {
+        panic!("the adapter advertises neither load nor resume: {caps}")
+    };
+    let reopened = second
+        .request(
+            method,
+            json!({
+                "sessionId": session_id,
+                "cwd": scratch.checkout,
+                "mcpServers": acp_servers(&scratch),
+                "_meta": acp_meta(&row, &reopened_debug),
+            }),
+        )
+        .await;
+    second.drain(Duration::from_secs(2)).await;
+    let replayed = texts_of(&second.updates, "user_message_chunk");
+    let replay_keeps_turn_1 = replayed.iter().any(|text| text.contains(CODE_WORD));
+    let from = second.updates.len();
+    let redo_stop = acp_prompt(&mut second, &session_id, STOP_RESUME_OPENING).await;
+    let reply = texts_of(&second.updates[from..], "agent_message_chunk").join("");
+    second.close().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let kept = saved_sessions_with(&scratch.cfg, &[CODE_WORD, RESUME_MARK]);
+
+    println!("== {label}, reopened in a second process over {method}");
+    println!("  first turn's answer to the cancel: {first_stop:?}");
+    println!("  saved sessions holding the code word after the stop: {saved_before:?}");
+    println!("  {method} answered: {reopened}");
+    println!(
+        "  replayed user text ({} chunks), code word present: {replay_keeps_turn_1}",
+        replayed.len()
+    );
+    println!("  redo turn: stop {redo_stop:?}");
+    println!(
+        "  the redo reply (first 400 chars): {:?}",
+        reply.chars().take(400).collect::<String>()
+    );
+    println!("  saved sessions holding turn 1 and the redo text: {kept:?}");
+
+    assert!(
+        reopened.get("result").is_some(),
+        "{label}: `{method}` did not reopen the stopped session: {reopened}. A refusal means a \
+         stopped ACP step cannot be reopened this way and M3's fallback is what runs."
+    );
+    assert_eq!(
+        redo_stop.as_deref(),
+        Some("end_turn"),
+        "{label}: the reopened session takes the redo turn"
+    );
+    if method == "session/load" {
+        assert!(
+            replay_keeps_turn_1,
+            "{label}: the load's replay does not carry turn 1's prompt: {replayed:?}"
+        );
+    }
+    assert!(
+        !kept.is_empty(),
+        "{label}: no saved session holds both turn 1's code word and the redo text, so the reopen \
+         did not keep the first turn (sessions with the code word after the stop: \
+         {saved_before:?})"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
