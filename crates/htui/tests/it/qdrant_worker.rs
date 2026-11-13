@@ -35,7 +35,7 @@ async fn throwaway() -> Option<(testkit::QdrantTurn, QdrantStore<HashEmbedder>)>
     let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
     Some((
         turn,
-        QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
+        testkit::qdrant_connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
             .await
             .expect("Qdrant answers"),
     ))
@@ -157,7 +157,7 @@ async fn the_worker_job_follows_the_url_row() {
             urls.lock()
                 .expect("not poisoned")
                 .push(settings.url.to_string());
-            let store = QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
+            let store = testkit::qdrant_connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
                 .await
                 .map(Arc::new)
                 .map_err(|err| err.to_string());

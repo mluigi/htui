@@ -476,6 +476,35 @@ pub async fn qdrant_turn() -> QdrantTurn {
     QDRANT.lock().await
 }
 
+/// [`QdrantStore::connect_to`](crate::vector::QdrantStore::connect_to), retried when the client's
+/// deadline expires (TOOL-16).
+///
+/// Creating a collection and its payload indexes takes about 0.1 s on an idle Qdrant, but past
+/// qdrant-client's default 5 s deadline while the parallel gate saturates the box ("create
+/// collection: … Timeout expired"), which a [`qdrant_turn`] cannot help: the load is every other
+/// test, not another Qdrant case. `connect_to` is idempotent (an existing collection is checked
+/// and its indexes re-asserted), so a retry after a create the server did finish is safe. Any
+/// other error, an embedder mismatch included, is returned at once.
+///
+/// # Errors
+/// What the last attempt answered.
+pub async fn qdrant_connect_to<E: crate::embed::DenseEmbedder + Clone>(
+    settings: &crate::qdrant_settings::QdrantSettings,
+    embedder: E,
+    collection: &str,
+) -> Result<crate::vector::QdrantStore<E>> {
+    let mut attempt = 1;
+    loop {
+        match crate::vector::QdrantStore::connect_to(settings, embedder.clone(), collection).await {
+            Err(e) if attempt < 3 && e.to_string().contains("Timeout expired") => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Serialises the tests that touch the fake keyring: it is one process-wide slot.
 static KEYRING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

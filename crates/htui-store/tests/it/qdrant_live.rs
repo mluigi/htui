@@ -45,7 +45,7 @@ fn fresh_name() -> String {
     format!("htui_test_{}", uuid::Uuid::now_v7().simple())
 }
 
-async fn connect<E: DenseEmbedder>(
+async fn connect<E: DenseEmbedder + Clone>(
     url: &str,
     embedder: E,
     name: &str,
@@ -54,7 +54,7 @@ async fn connect<E: DenseEmbedder>(
         htui_core::qdrant::QdrantUrl::parse(url).expect("valid URL"),
         None,
     );
-    QdrantStore::connect_to(&settings, embedder, name).await
+    htui_store::testkit::qdrant_connect_to(&settings, embedder, name).await
 }
 
 async fn throwaway() -> Option<(QdrantTurn, QdrantStore<HashEmbedder>)> {

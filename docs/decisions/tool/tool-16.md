@@ -51,6 +51,13 @@ as the base log).
    and `gix_isolator`; `install` also stopped opening the cmd for writing to set its mtime. `probe`, `auth` and
    `acp_driver` keep their retries.
 6. **`gate.sh --detach` keeps SIGINT** (`1dd0d52f`, `0629cc71`). See below.
+7. **Qdrant creates retried in tests** (after the merge with main). A collection create takes about 0.13 s on an
+   idle Qdrant but went past qdrant-client's default 5 s deadline under the parallel gate, so
+   `concepts_worker::tests::a_tui_search_of_another_embedders_collection_is_refused_before_the_model` failed in 2
+   of 4 parallel runs; the load is every other test, so `qdrant_turn` cannot help. `testkit::qdrant_connect_to`
+   retries `QdrantStore::connect_to` (idempotent) on `Timeout expired`, up to three tries; used by `qdrant_live`,
+   `qdrant_worker`, `state_cli_pg` and that test. The product side, a longer deadline for collection admin calls
+   only, is MOD-175 (maintainer: both).
 
 `AGENTS.md` "Verify" states the conventions: parallel tests, `qdrant_turn`, `write_executable`, `bare_db` for
 pending-migration tests.
@@ -84,7 +91,10 @@ and the memory note are corrected.
 
 - **The dev Postgres's load-related crash** hit the first default-thread gate: a backend `exited with exit code
   2`, the postmaster reinitialised, and 97 Postgres cases failed `57P03` while it recovered (disk at 65%). It did
-  not recur in the next two gates and predates TOOL-16 (seen 2026-09-16). The gate now drives more concurrent
+  not recur in the next two gates and predates TOOL-16 (seen 2026-09-16); it struck again during a 20-test run of
+  `state_cli_pg::`/`qdrant_worker::`, so it is not load alone. No cause found: the backend logs nothing before
+  `exited with exit code 2` (Postgres's SIGQUIT exit), `htui-postgres` runs as uid 999 so the tests cannot signal
+  it, and the server has `log_connections = off`, `log_min_messages = warning`. The gate now drives more concurrent
   create/drop-database work, so a recurrence is more likely than it was; the tell is `57P03` across many cases and
   `exited with exit code` in `docker logs htui-postgres`. Re-run before suspecting the change.
 - `gate.ps1` was not run (no Windows here); its change is the same one-line flag removal, and Windows has no

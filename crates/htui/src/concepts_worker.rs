@@ -2493,7 +2493,7 @@ mod tests {
             return;
         };
         let fresh = fresh_collection();
-        let created = QdrantStore::connect_to(
+        let created = htui_store::testkit::qdrant_connect_to(
             &settings(&url, None),
             htui_store::embed::HashEmbedder::new(DENSE_DIM),
             &fresh,

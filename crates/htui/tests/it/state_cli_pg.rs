@@ -1017,7 +1017,7 @@ async fn a_search_over_an_index_answers_in_scope() {
         return;
     };
     let name = fresh_collection();
-    let index = QdrantStore::connect_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
+    let index = testkit::qdrant_connect_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
         .await
         .expect("Qdrant answers");
     concepts::index_cycle(&db.store, &index).await;
