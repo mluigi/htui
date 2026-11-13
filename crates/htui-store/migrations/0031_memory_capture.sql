@@ -9,7 +9,9 @@
 -- the model); and the evidence JSONB, {citations: [{step_id, quote}]}. A person's entry carries
 -- none of those (chk_memory_entry_person_has_no_run); item_id is outside that CHECK, kept free
 -- for a later person-side link. Three usage counters, written once per run by finish_run (D5),
--- start at 0. idx_memory_entry_step backs the per-step write cap's count and step_id's SET NULL.
+-- start at 0. idx_memory_entry_step backs the per-step write cap's count and step_id's SET NULL;
+-- idx_memory_entry_run and idx_memory_entry_item back run_id's and item_id's, so deleting a run or
+-- an item does not scan memory_entry for the rows to clear.
 --
 -- run_step: chk_run_step_stage reserves -4..-1 and takes 'capture' as a fourth stage key, the
 -- capture stage's row at -4. As in 0029 the CHECK does not bind a key to its position. Every
@@ -51,6 +53,10 @@ ALTER TABLE memory_entry
 
 -- The write cap's count of a capture step's entries, and step_id's ON DELETE SET NULL lookup.
 CREATE INDEX idx_memory_entry_step ON memory_entry(step_id) WHERE step_id IS NOT NULL;
+
+-- run_id's and item_id's ON DELETE SET NULL lookups, when a run or an item is deleted.
+CREATE INDEX idx_memory_entry_run ON memory_entry(run_id) WHERE run_id IS NOT NULL;
+CREATE INDEX idx_memory_entry_item ON memory_entry(item_id) WHERE item_id IS NOT NULL;
 
 -- --------------------------------------------------------------------------------------------
 -- 2. run_step: the capture stage at -4

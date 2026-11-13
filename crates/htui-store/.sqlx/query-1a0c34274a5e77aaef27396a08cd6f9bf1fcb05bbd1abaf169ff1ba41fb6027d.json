@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id      AS \"id: MemoryEntryId\",\n                   source  AS \"source: MemorySource\",\n                   version\n              FROM memory_entry\n             WHERE project_id = $1 AND state IN ('active','suspect')\n               AND lower(btrim(subject)) = lower(btrim($2::text))\n             ORDER BY id LIMIT 1\n               FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "source: MemorySource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1a0c34274a5e77aaef27396a08cd6f9bf1fcb05bbd1abaf169ff1ba41fb6027d"
+}

@@ -108,7 +108,9 @@ use crate::pg::rows::{MemoryEntryRow, PersonaRow};
 use htui_core::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemoryEvidence, MemorySource, NewRunMemory, RunMemoryWrite,
 };
-use htui_core::store::traits::MEMORY_NEEDS_A_CAPTURE_STEP;
+use htui_core::store::traits::{
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
+};
 
 /// The refusal text for a kind that is unknown or belongs to another project.
 ///
@@ -1031,7 +1033,7 @@ async fn memory_write_refused(
 /// The rows a capture write stamps its entry from (MOD-164 D4): the step's role, key, agent and
 /// model, the run's starter and lease box, and how many entries already name the step.
 struct CaptureFacts {
-    role: String,
+    role: StepRole,
     node_key: Option<String>,
     agent_id: Option<AgentId>,
     model: Option<String>,
@@ -1046,7 +1048,7 @@ async fn capture_facts(conn: &mut PgConnection, step: StepId) -> Result<CaptureF
     sqlx::query_as!(
         CaptureFacts,
         r#"
-        SELECT s.role,
+        SELECT s.role         AS "role: StepRole",
                s.node_key,
                s.agent_id     AS "agent_id: AgentId",
                s.model,
@@ -10624,11 +10626,16 @@ impl WriteStore for PgStore {
         })
     }
 
-    /// One transaction (MOD-164 D4): [`step_scope`] (`FOR SHARE` on the step and its run), the
-    /// capture-stage check, the cap, then the folded subject's live holder `FOR UPDATE`. A
-    /// person's holder answers `PersonHolds`; a run's is superseded by [`apply_memory_edit`]
-    /// before the new entry is inserted (`superseded_by`'s FK is deferred to `COMMIT`). Any
-    /// refusal rolls back, then [`memory_write_refused`] names it.
+    /// One transaction (MOD-164 D4): the step `FOR NO KEY UPDATE`, then [`step_scope`] (`FOR
+    /// SHARE` on the step and its run), the capture-stage check, the evidence check, the cap, then
+    /// the folded subject's live holder `FOR UPDATE`. The first lock serializes two writes on one
+    /// step, so the cap's count cannot be read twice before either inserts (review L2); it is taken
+    /// before `step_scope`, never as an upgrade after it: two transactions both holding `FOR
+    /// SHARE` would deadlock upgrading. `FOR NO KEY UPDATE` leaves the step's `FOR KEY SHARE`
+    /// (the foreign keys' lock) free. A holder [`run_memory_held_by_a_person`] answers
+    /// `PersonHolds`; any other is superseded by [`apply_memory_edit`] before the new entry is
+    /// inserted (`superseded_by`'s FK is deferred to `COMMIT`). Any refusal rolls back, then
+    /// [`memory_write_refused`] names it.
     async fn write_run_memory(
         &self,
         fence: StepFence,
@@ -10638,13 +10645,45 @@ impl WriteStore for PgStore {
         let evidence = serde_json::to_value(&new.evidence).map_err(|err| {
             StoreError::Backend(format!("memory evidence did not serialise: {err}"))
         })?;
+        let cited: Vec<Uuid> = new
+            .evidence
+            .citations
+            .iter()
+            .map(|citation| citation.step_id.as_uuid())
+            .collect();
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query!(
+            "SELECT 1 AS one FROM run_step WHERE id = $1 FOR NO KEY UPDATE",
+            step.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
         let scope = step_scope(&mut tx, step, fence).await?;
         let facts = capture_facts(&mut tx, step).await?;
-        if facts.role != StepRole::Stage.as_str() || facts.node_key.as_deref() != Some(CAPTURE_KEY)
-        {
+        if facts.role != StepRole::Stage || facts.node_key.as_deref() != Some(CAPTURE_KEY) {
             return Err(StoreError::Constraint(
                 MEMORY_NEEDS_A_CAPTURE_STEP.to_owned(),
+            ));
+        }
+        let inside = sqlx::query_scalar!(
+            r#"
+            SELECT cardinality($2::uuid[]) > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM unnest($2::uuid[]) AS c(id)
+                    WHERE NOT EXISTS (
+                          SELECT 1 FROM run_step s WHERE s.id = c.id AND s.run_id = $1))
+                AS "inside!"
+            "#,
+            scope.run.as_uuid(),
+            &cited,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if !inside {
+            return Err(StoreError::Constraint(
+                MEMORY_EVIDENCE_OUTSIDE_THE_RUN.to_owned(),
             ));
         }
         if facts.written >= i64::from(MEMORY_RUN_WRITE_CAP) {
@@ -10654,8 +10693,9 @@ impl WriteStore for PgStore {
         }
         let holder = sqlx::query!(
             r#"
-            SELECT id     AS "id: MemoryEntryId",
-                   source AS "source: MemorySource"
+            SELECT id      AS "id: MemoryEntryId",
+                   source  AS "source: MemorySource",
+                   version
               FROM memory_entry
              WHERE project_id = $1 AND state IN ('active','suspect')
                AND lower(btrim(subject)) = lower(btrim($2::text))
@@ -10670,7 +10710,7 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
 
         let old = match holder {
-            Some(holder) if holder.source == MemorySource::Person => {
+            Some(holder) if run_memory_held_by_a_person(holder.source, holder.version) => {
                 return Ok(RunMemoryWrite::PersonHolds {
                     existing: holder.id,
                 });
