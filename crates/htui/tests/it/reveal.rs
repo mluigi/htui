@@ -121,7 +121,9 @@ async fn revealing_a_loaded_item_focuses_the_backlog_and_selects_it() {
 #[tokio::test]
 async fn revealing_an_item_under_a_folded_project_unfolds_it() {
     let mut harness = platform().await;
+    // `g` is the workspace's own (empty) header since MOD-147 M3; `j` is htui's.
     harness.key("g");
+    harness.key("j");
     harness.drive_to_end().await;
     harness.key("enter");
     harness.drive_to_end().await;

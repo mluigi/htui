@@ -249,8 +249,10 @@ async fn enter_on_a_pane_that_cannot_replay_says_where_to_press_it() {
 #[tokio::test]
 async fn enter_on_a_project_header_still_folds() {
     let mut harness = registered().await;
-    // `g` lands on the first project header; the detail pane never sees that `Enter`.
+    // `g` lands on the first group header, the workspace's own (empty, MOD-147 M3), and `j` on
+    // htui's; the detail pane never sees that `Enter`.
     harness.key("g");
+    harness.key("j");
     harness.settle().await;
     harness.key("enter");
     harness.settle().await;

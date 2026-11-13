@@ -185,6 +185,28 @@ async fn a_rebound_field_key_is_the_one_the_form_pane_names() {
     assert!(focused(&harness.render(), "priority"), "F3 moves on");
 }
 
+/// MOD-147 M3 D5: `N` on the workspace's own header opens a `WS` form on the scope row, its
+/// project picker holding that row alone.
+#[tokio::test]
+async fn n_on_the_workspace_header_opens_a_ws_form() {
+    let mut harness = backlog(MemStore::demo(), 100, 30, None).await;
+    // The cursor arrives on htui's ANA-1; two rows up is the empty `Platform` header.
+    keys(&mut harness, &["k", "k", "N"]).await;
+    let frame = harness.render();
+    for wanted in [
+        " New item \u{b7} @platform ",
+        "\u{2039} @platform \u{203a}",
+        "\u{2039} WS ",
+    ] {
+        assert!(frame.contains(wanted), "{wanted:?} in\n{frame}");
+    }
+    keys(&mut harness, &["backtab", "backtab", "l"]).await;
+    let frame = harness.render();
+    assert!(focused(&frame, "project"), "{frame}");
+    assert!(frame.contains("\u{2039} @platform \u{203a}"), "{frame}");
+    assert_eq!(harness.app().status, None);
+}
+
 /// MOD-81: the new item form at 80 columns: every row, the pickers' words and the pane's keys.
 #[tokio::test]
 async fn the_item_form_at_80_columns() {

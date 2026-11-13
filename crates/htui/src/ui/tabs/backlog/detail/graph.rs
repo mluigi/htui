@@ -161,6 +161,9 @@ pub struct GraphTab {
     /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
     /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
     told: Told,
+    /// MOD-147 M3 D3: the workspace's scope row the Backlog's last `Items` reply named, so a
+    /// workspace item's node is in the workspace ([`workspace_projects`](Self::workspace_projects)).
+    scope_row: Option<ProjectRef>,
 }
 
 impl GraphTab {
@@ -181,7 +184,15 @@ impl GraphTab {
             cursor: 0,
             depth: DEFAULT_DEPTH,
             told: Told::new(),
+            scope_row: None,
         }
+    }
+
+    /// The Backlog's groups (MOD-147 M3 D3): the scope row its last `Items` reply named, then
+    /// `ctx.projects`. What `in_workspace` reads, so a workspace item's node is neither dimmed
+    /// nor refused on `Enter`.
+    fn workspace_projects(&self, ctx: &Ctx<'_>) -> Vec<ProjectRef> {
+        self.scope_row.iter().chain(ctx.projects).cloned().collect()
     }
 
     /// Rebuilds `rows` from `graph` at `depth`: the one place the tree is built.
@@ -243,7 +254,7 @@ impl GraphTab {
             return;
         }
         let node = row.node;
-        if in_workspace(node, ctx.projects) {
+        if in_workspace(node, &self.workspace_projects(ctx)) {
             ctx.emit(Action::Reveal(RevealTarget::Item {
                 id: node.item_id,
                 key: node.key.clone(),
@@ -768,6 +779,8 @@ impl DetailTab for GraphTab {
                 self.failed = Some(message.clone());
                 self.cursor = 0;
             }
+            // MOD-147 M3 D3: the Backlog hands its `Items` reply on for the scope row it names.
+            StoreReply::Items { scope_row, .. } => self.scope_row.clone_from(scope_row),
             _ => {}
         }
     }
@@ -814,7 +827,8 @@ impl DetailTab for GraphTab {
         let cursor = self.cursor.min(rows.len() - 1);
         // The gutter takes the tree's first cell; the rows are fitted to the rest.
         let width = usize::from(tree.width.saturating_sub(1));
-        let rows: Vec<Row<'static>> = lines(&rows, ctx.projects, width, ctx.theme)
+        let projects = self.workspace_projects(ctx);
+        let rows: Vec<Row<'static>> = lines(&rows, &projects, width, ctx.theme)
             .into_iter()
             .map(|line| Row {
                 line,
@@ -1955,6 +1969,87 @@ mod tests {
             .find(|span| span.content.contains("FEAT-1"))
             .expect("the label span");
         assert_eq!(label.style, shell.theme.dim);
+    }
+
+    /// FEAT-1's demo graph with its first neighbour (ANA-1) moved onto Platform's scope row as
+    /// `WS-1`, and the scope row as the Backlog's `Items` reply names it (MOD-147 M3 D2).
+    async fn with_a_workspace_node() -> (LinkGraph, StoreReply) {
+        let mut graph = demo(ids::HTUI_FEAT_1).await;
+        let node = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.item_id == ids::HTUI_ANA_1)
+            .expect("ANA-1 is one hop from FEAT-1");
+        node.project_id = ids::PROJECT_SCOPE_PLATFORM;
+        "@platform".clone_into(&mut node.project_slug);
+        "WS-1".clone_into(&mut node.key);
+        let reply = StoreReply::Items {
+            items: Vec::new(),
+            scope_row: Some(ProjectRef {
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                slug: "@platform".to_owned(),
+                name: "Platform".to_owned(),
+                position: 0,
+            }),
+        };
+        (graph, reply)
+    }
+
+    /// MOD-147 M3 D3: once the Backlog's `Items` reply names the scope row, a workspace item's
+    /// node is in the workspace: drawn undimmed and re-rooted onto by `Enter`, not refused. Before
+    /// it, the node reads as any other outside the members.
+    #[tokio::test]
+    async fn a_workspace_node_is_neither_dim_nor_refused() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let (graph, reply) = with_a_workspace_node().await;
+        let mut tab = pane(graph);
+        let label_style = |tab: &GraphTab| {
+            let buffer = buffer(tab, &shell, 43, 10);
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    let x = row.find("@platform:WS-1")?;
+                    let x = u16::try_from(row[..x].chars().count()).expect("narrow");
+                    let cell = &buffer[(x, y)];
+                    Some((cell.fg, cell.modifier))
+                })
+                .expect("the WS-1 row is drawn")
+        };
+        let dim = (
+            ratatui::style::Color::Indexed(244),
+            ratatui::style::Modifier::empty(),
+        );
+        assert_eq!(label_style(&tab), dim, "members only: dim");
+        tab.cursor = tab
+            .visible()
+            .iter()
+            .position(|row| row.link.is_some() && row.node.item_id == ids::HTUI_ANA_1)
+            .expect("WS-1 has a row of its own");
+        tab.on_key(key(KeyCode::Enter), &mut ctx);
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Error(text)] if text == "@platform:WS-1 is outside this workspace"
+            ),
+            "members only: refused"
+        );
+
+        tab.on_reply(&reply, &mut ctx);
+        assert_ne!(label_style(&tab), dim, "the scope row's: undimmed");
+        assert!(
+            label_style(&tab).1.contains(ratatui::style::Modifier::BOLD),
+            "drawn as a key"
+        );
+        assert_eq!(tab.on_key(key(KeyCode::Enter), &mut ctx), Handled::Consumed);
+        match shell.emit.take().as_slice() {
+            [Action::Reveal(RevealTarget::Item { id, key })] => {
+                assert_eq!((*id, key.as_str()), (ids::HTUI_ANA_1, "WS-1"));
+            }
+            other => panic!("a reveal: {other:?}"),
+        }
     }
 
     /// The pane drawn into a `width` x `height` test terminal, its buffer.

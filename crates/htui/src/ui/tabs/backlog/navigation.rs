@@ -67,10 +67,16 @@ impl BacklogTab {
 
     /// The rows the list pane draws, which are the only rows the cursor may reach: the one rule
     /// [`list::visible`] gives both (MOD-13 review M2). "Filtered" is the title's own test, a
-    /// summary to show.
+    /// summary to show. The groups are [`BacklogTab::group_projects`] (MOD-147 M3 D3), the
+    /// summary's facets the members alone (D4).
     pub(super) fn rows(&self, ctx: &Ctx<'_>) -> Vec<Selection> {
         let filtered = self.shown.summary(ctx.projects).is_some();
-        list::visible(&self.items, ctx.projects, &self.folded, filtered)
+        list::visible(
+            &self.items,
+            &self.group_projects(ctx),
+            &self.folded,
+            filtered,
+        )
     }
 
     /// Moves the cursor `delta` rows, clamped to the ends of the list.

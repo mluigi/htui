@@ -42,7 +42,9 @@ mod writes;
 
 use std::cell::Cell;
 
-use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, StepId};
+use htui_core::model::{
+    ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, RunId, Scope, StepId,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -144,6 +146,10 @@ struct PendingReveal {
 pub struct BacklogTab {
     /// The scope's items, as the `Items` reply delivered them.
     items: Vec<ItemSummary>,
+    /// MOD-147 M3 D3: the workspace's scope row the last `Items` reply named, drawn as the first
+    /// group ([`group_projects`](Self::group_projects)); `None` before it and after a scope
+    /// change. `ctx.projects` stays the members alone (M1 D1).
+    scope_row: Option<ProjectRef>,
     /// Projects whose group is folded.
     folded: Vec<ProjectId>,
     /// The cursor, or `None` before the first reply.
@@ -264,6 +270,7 @@ impl BacklogTab {
         detail.register(Box::new(ReqsTab::new()));
         Self {
             items: Vec::new(),
+            scope_row: None,
             folded: Vec::new(),
             selected: None,
             detail,
@@ -286,6 +293,13 @@ impl BacklogTab {
             Selection::Item(id) => self.items.iter().find(|item| item.id == id),
             Selection::Project(_) => None,
         }
+    }
+
+    /// MOD-147 M3 D3: the list's groups, in order: the workspace's scope row when the last
+    /// `Items` reply named one, then `ctx.projects`. The one source every group site reads (the
+    /// rows, the drawn list, fold retention), so a scope-row item is never selected undrawn.
+    pub(super) fn group_projects(&self, ctx: &Ctx<'_>) -> Vec<ProjectRef> {
+        self.scope_row.iter().chain(ctx.projects).cloned().collect()
     }
 
     /// Id of the selected item, or `None` while a project header is selected.
@@ -317,6 +331,7 @@ impl Tab for BacklogTab {
     /// scope's.
     fn on_scope_change(&mut self, scope: &Scope) {
         self.items.clear();
+        self.scope_row = None;
         self.folded.clear();
         self.selected = None;
         self.detail.on_item_change(None);
@@ -539,18 +554,20 @@ impl Tab for BacklogTab {
             }
             _ => {}
         }
-        if let StoreReply::Items(items) = reply {
+        if let StoreReply::Items { items, scope_row } = reply {
             self.items.clone_from(items);
+            self.scope_row.clone_from(scope_row);
+            // MOD-147 M3 D3: the Graph sub-tab reads the same groups (`in_workspace`).
+            self.detail.on_reply(reply, ctx);
             // MOD-13 review M1: the newest read is the only one delivered, and it went out under
             // `filter`.
             self.shown.clone_from(&self.filter);
             // MOD-13 review L5: a fold is the scope's project's, not the reply's, so a filter
             // that hides a project's items keeps its fold. A scope change clears it (D6).
-            self.folded.retain(|project| {
-                ctx.projects
-                    .iter()
-                    .any(|scoped| scoped.project_id == *project)
-            });
+            // MOD-147 M3 D3: the workspace's own group is one of them.
+            let groups = self.group_projects(ctx);
+            self.folded
+                .retain(|project| groups.iter().any(|scoped| scoped.project_id == *project));
             // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
             if let Some(PendingReveal { id, key, focus }) = self.pending_reveal.take() {
                 match self.items.iter().find(|item| item.id == id) {
@@ -655,9 +672,10 @@ impl Tab for BacklogTab {
             keys.label(stack, Act::BacklogNewItem),
             keys.label(stack, Act::BacklogClearFilter),
         );
+        let groups = self.group_projects(ctx);
         let view = ListView {
             items: &self.items,
-            projects: ctx.projects,
+            projects: &groups,
             folded: &self.folded,
             selected: self.selected,
             filter: summary.as_deref(),

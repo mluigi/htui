@@ -167,7 +167,8 @@ async fn the_no_item_step_works_with_the_detail_focused() {
         frame.contains("j/k chooses one"),
         "the list again:\n{frame}"
     );
-    down(&mut harness, 1).await;
+    // MOD-147 M3: from the workspace's own (empty) header, past the htui header to ANA-1.
+    down(&mut harness, 2).await;
     let frame = harness.render();
     assert!(
         !frame.contains("No item selected."),

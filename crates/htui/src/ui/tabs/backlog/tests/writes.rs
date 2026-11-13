@@ -288,7 +288,7 @@ async fn an_applied_edit_after_the_selection_moved_reads_only_the_list() {
         .filter(|item| item.id != first)
         .cloned()
         .collect();
-    tab.on_reply(&StoreReply::Items(others), &mut bench.ctx());
+    tab.on_reply(&items_reply(others), &mut bench.ctx());
     assert_ne!(tab.selected, Some(bench.first), "the list moved the cursor");
     let _ = sent(&bench);
 

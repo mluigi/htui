@@ -147,12 +147,16 @@ impl BacklogTab {
         if !answers || moved || self.form.is_some() || self.detail.captures_input() {
             return;
         }
+        // MOD-147 M3 D5: a form on the workspace's scope row picks from that row alone, so its
+        // picker cannot cycle to a member and its title names `@<ws>`; its kinds are the row's
+        // (`WS`), served for its id unchanged.
+        let scope_row = self
+            .scope_row
+            .as_ref()
+            .filter(|row| row.project_id == opening.project);
+        let projects = scope_row.map_or(ctx.projects, std::slice::from_ref);
         self.item_form = match opening.item {
-            None => Some(ItemForm::open_new(
-                context.clone(),
-                ctx.projects,
-                opening.kind,
-            )),
+            None => Some(ItemForm::open_new(context.clone(), projects, opening.kind)),
             Some(_) => ItemForm::open_edit(context.clone()),
         };
     }

@@ -436,8 +436,8 @@ async fn the_list_over_platform_holds_a_gate_a_permission_and_a_reopen() {
 }
 
 /// MOD-147 D10: a workspace's own item parked at its gate waits on a person too, listed first and
-/// counted; `WS` is the scope row's alone, so its key prints bare. `Enter` on it says where it
-/// will open (the Backlog lists workspace items from M3) and leaves the list open.
+/// counted; `WS` is the scope row's alone, so its key prints bare. M3 D6: `Enter` on it closes the
+/// list and reveals it in the Backlog's workspace group, on its parked step.
 #[tokio::test]
 async fn a_workspace_items_gate_is_listed_first() {
     let store = MemStore::demo();
@@ -454,10 +454,12 @@ async fn a_workspace_items_gate_is_listed_first() {
 
     harness.key("enter");
     harness.drive_to_end().await;
-    assert!(list_is_open(&mut harness), "the list stays open");
-    let status = format!("{:?}", harness.app().status);
-    assert!(
-        status.contains("workspace items open in the Backlog from MOD-147 M3"),
-        "{status}"
-    );
+    assert!(harness.app().overlays.is_empty(), "the list closed");
+    assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
+    let frame = harness.render();
+    assert!(on_item(&frame, "WS-1"), "{frame}");
+    assert!(frame.contains("\u{25be} Platform (1)"), "{frame}");
+    let line = cursor_line(&frame);
+    assert!(line.contains("prd"), "the parked step: {line}\n{frame}");
+    assert_eq!(harness.app().status, None);
 }

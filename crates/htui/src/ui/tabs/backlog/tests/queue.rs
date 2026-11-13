@@ -206,7 +206,7 @@ async fn a_queue_write_names_its_item_after_the_list_dropped_it() {
             format!("queue_item {ana_2} in {}", bench.scope.workspace_id)
         ]
     );
-    tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+    tab.on_reply(&items_reply(Vec::new()), &mut bench.ctx());
     let _ = bench.actions();
     tab.on_reply(
         &StoreReply::QueueWritten {

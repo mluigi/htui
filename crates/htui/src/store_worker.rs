@@ -26,9 +26,9 @@ use htui_core::model::{
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
     FollowUpText, GraphBody, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec,
     ItemSummary, KeyQualifier, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona,
-    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectType,
-    RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId, RunStatus,
-    RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
+    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectRef,
+    ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId,
+    RunStatus, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
     StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
@@ -1551,8 +1551,16 @@ pub enum StoreReply {
         /// The list and the two counts.
         view: WaitingView,
     },
-    /// Answer to [`StoreRequest::Items`].
-    Items(Vec<ItemSummary>),
+    /// Answer to [`StoreRequest::Items`]: the rows, read over the asked scope widened with the
+    /// workspace's scope row (MOD-147 M3 D1), and that row, so the Backlog draws the workspace's
+    /// own group even while it holds no item (D2). `None` for a workspace with no scope row (or
+    /// none mirrored yet) and for the nil startup scope.
+    Items {
+        /// The rows, the scope row's first.
+        items: Vec<ItemSummary>,
+        /// The scope row as a group: slug `@<ws>`, the workspace's name, position 0.
+        scope_row: Option<ProjectRef>,
+    },
     /// Answer to [`StoreRequest::Item`]; boxed because `Item` dwarfs every other variant.
     Item(Box<Option<Item>>),
     /// Answer to [`StoreRequest::Links`].
@@ -2450,7 +2458,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             scope,
             filter,
             ready_here,
-        } => StoreReply::Items(read_items(backend, scope, filter, *ready_here).await?),
+        } => serve_items(backend, scope, filter, *ready_here).await?,
         StoreRequest::Item(id) => StoreReply::Item(Box::new(backend.item(*id).await?)),
         StoreRequest::Links { id, hops } => StoreReply::Links(backend.links(*id, *hops).await?),
         StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
@@ -2913,6 +2921,47 @@ async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> 
         open_batch: backend.open_batch_of(box_id).await?.map(|batch| batch.id),
         demo: matches!(backend, Backend::Memory(_)),
     })
+}
+
+/// MOD-147 M3 D1, D2: `Items` over the asked scope with the workspace's scope row first, for this
+/// read only (the `waiting_reads` shape), and the row itself. Two reads per request, uncached:
+/// the loop's `scope_rows` memo is out of `serve`'s reach. A project facet needs no guard: every
+/// backend intersects `filter.project_ids` with the scope, so it leaves the scope row's items out.
+async fn serve_items(
+    backend: &Backend,
+    scope: &Scope,
+    filter: &ItemFilter,
+    ready_here: bool,
+) -> StoreResult<StoreReply> {
+    let scope_row = scope_row_ref(backend, scope.workspace_id).await?;
+    let read = scope_row
+        .as_ref()
+        .map_or_else(|| scope.clone(), |row| scope.with_scope_row(row.project_id));
+    Ok(StoreReply::Items {
+        items: read_items(backend, &read, filter, ready_here).await?,
+        scope_row,
+    })
+}
+
+/// MOD-147 M3 D2: `workspace`'s scope row as a Backlog group, position 0; `None` for the nil
+/// startup scope (no lookup, as `refresher_projects`), a workspace with no scope row, or a row the
+/// store no longer holds.
+async fn scope_row_ref(
+    backend: &Backend,
+    workspace: WorkspaceId,
+) -> StoreResult<Option<ProjectRef>> {
+    if workspace.as_uuid().is_nil() {
+        return Ok(None);
+    }
+    let Some(row) = backend.scope_project(workspace).await? else {
+        return Ok(None);
+    };
+    Ok(backend.project(row).await?.map(|project| ProjectRef {
+        project_id: project.id,
+        slug: project.slug,
+        name: project.name,
+        position: 0,
+    }))
 }
 
 /// MOD-13 D2: `Items`, with this box's readiness composed in. Not `Backend::ready_items`, which
@@ -4706,7 +4755,7 @@ mod tests {
     async fn serve_items_returns_the_scope_in_store_order() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
-        let StoreReply::Items(items) = serve(
+        let StoreReply::Items { items, scope_row } = serve(
             &backend,
             &StoreRequest::Items {
                 scope,
@@ -4718,8 +4767,123 @@ mod tests {
         else {
             panic!("wrong reply variant")
         };
-        assert_eq!(items.len(), 11, "eight htui items plus three agy items");
+        assert_eq!(
+            items.len(),
+            11,
+            "eight htui items plus three agy items; the demo seeds no scope-row item"
+        );
         assert_eq!(items[0].key, "ANA-1");
+        assert_eq!(
+            scope_row.map(|row| row.project_id),
+            Some(ids::PROJECT_SCOPE_PLATFORM)
+        );
+    }
+
+    /// The scope row as the Backlog's group: `@platform`, the workspace's name, position 0.
+    fn platform_row() -> ProjectRef {
+        ProjectRef {
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            slug: "@platform".to_owned(),
+            name: "Platform".to_owned(),
+            position: 0,
+        }
+    }
+
+    /// One `Items` read through `serve`, unwrapped with its scope row.
+    async fn items_and_row(
+        backend: &Backend,
+        scope: Scope,
+        filter: ItemFilter,
+    ) -> (Vec<ItemSummary>, Option<ProjectRef>) {
+        let reply = serve(
+            backend,
+            &StoreRequest::Items {
+                scope,
+                filter,
+                ready_here: false,
+            },
+        )
+        .await;
+        let StoreReply::Items { items, scope_row } = reply else {
+            panic!("wrong reply variant: {reply:?}")
+        };
+        (items, scope_row)
+    }
+
+    /// MOD-147 M3 D1, D2: the read covers the workspace's scope row, its items listed first, and
+    /// the reply names the row, while the asked scope never holds it.
+    #[tokio::test]
+    async fn items_cover_the_scope_row_first_and_name_it() {
+        let store = MemStore::demo();
+        let (ws_1, _) = park_a_workspace_gate(&store).await;
+        let backend = Backend::memory(store);
+        let scope = platform_scope(&backend).await;
+        assert!(!scope.contains(ids::PROJECT_SCOPE_PLATFORM));
+        let (items, scope_row) = items_and_row(&backend, scope, ItemFilter::default()).await;
+        assert_eq!(items.len(), 12, "the eleven members' items and WS-1");
+        assert_eq!((items[0].id, items[0].key.as_str()), (ws_1, "WS-1"));
+        assert_eq!(scope_row, Some(platform_row()));
+    }
+
+    /// D1: a project facet without the scope row leaves its items out (every backend intersects
+    /// the facet with the scope); the reply still names the row, so the group is drawn.
+    #[tokio::test]
+    async fn a_project_facet_leaves_the_scope_rows_items_out() {
+        let store = MemStore::demo();
+        park_a_workspace_gate(&store).await;
+        let backend = Backend::memory(store);
+        let scope = platform_scope(&backend).await;
+        let (items, scope_row) = items_and_row(
+            &backend,
+            scope,
+            ItemFilter {
+                project_ids: Some(vec![ids::PROJECT_HTUI]),
+                ..ItemFilter::default()
+            },
+        )
+        .await;
+        assert!(!items.is_empty());
+        assert!(
+            items
+                .iter()
+                .all(|item| item.project_id == ids::PROJECT_HTUI),
+            "{items:?}"
+        );
+        assert_eq!(scope_row, Some(platform_row()));
+    }
+
+    /// D1: the nil startup scope asks for no scope row and answers none.
+    #[tokio::test]
+    async fn a_nil_workspace_answers_no_scope_row() {
+        let backend = demo();
+        let nil = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let (items, scope_row) = items_and_row(&backend, nil, ItemFilter::default()).await;
+        assert!(!items.is_empty());
+        assert_eq!(scope_row, None);
+    }
+
+    /// D1, D2 offline: the mirror answers the same scope row (`seed_mirror` writes `project` with
+    /// its `owner_workspace_id`, no item), so the empty workspace group is still drawn.
+    #[tokio::test]
+    async fn offline_items_name_the_mirrored_scope_row() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "items-scope-row-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        htui_store::testkit::seed_mirror(&cache, &demo_data())
+            .await
+            .expect("the mirror is seeded");
+        let backend = Backend::Offline { cache, since: None };
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        let (items, scope_row) = items_and_row(&backend, scope, ItemFilter::default()).await;
+        assert!(items.is_empty(), "the mirror holds no item");
+        assert_eq!(scope_row, Some(platform_row()));
     }
 
     /// The demo plus one open htui item needing `cuda`, a tag the demo box has neither probed nor
@@ -4763,7 +4927,7 @@ mod tests {
             },
         )
         .await;
-        let StoreReply::Items(items) = reply else {
+        let StoreReply::Items { items, .. } = reply else {
             panic!("wrong reply variant: {reply:?}")
         };
         items
@@ -4947,7 +5111,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&reply, StoreReply::Items(rows) if rows.is_empty()),
+            matches!(&reply, StoreReply::Items { items, .. } if items.is_empty()),
             "answered from the mirror: {reply:?}"
         );
     }
@@ -5405,7 +5569,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(reply, StoreReply::Items(_)));
+        assert!(matches!(reply, StoreReply::Items { .. }));
         assert_eq!(
             *scope_rx.borrow(),
             vec![
@@ -5433,7 +5597,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(reply, StoreReply::Items(_)));
+        assert!(matches!(reply, StoreReply::Items { .. }));
         assert_eq!(*scope_rx.borrow(), rowless.project_ids);
 
         drop(req_tx);

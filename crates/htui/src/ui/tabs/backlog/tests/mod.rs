@@ -71,12 +71,7 @@ impl DetailTab for CapturingProbe {
 }
 
 /// The Platform scope, its projects and its items, and the first item row (MOD-14 cases).
-async fn platform() -> (
-    Scope,
-    Vec<htui_core::model::ProjectRef>,
-    Vec<ItemSummary>,
-    Selection,
-) {
+async fn platform() -> (Scope, Vec<ProjectRef>, Vec<ItemSummary>, Selection) {
     let store = MemStore::demo();
     let workspace = store
         .workspaces()
@@ -101,7 +96,7 @@ async fn platform() -> (
 /// The Platform fixture a `Ctx` borrows from, for the filter cases.
 struct Bench {
     scope: Scope,
-    projects: Vec<htui_core::model::ProjectRef>,
+    projects: Vec<ProjectRef>,
     items: Vec<ItemSummary>,
     first: Selection,
     top_bar: TopBarState,
@@ -614,10 +609,19 @@ fn first_project(bench: &Bench) -> ProjectId {
         .expect("the first row is an item")
 }
 
+/// An `Items` reply of `items` naming no scope row: the members' groups alone (MOD-147 M3 D2).
+fn items_reply(items: Vec<ItemSummary>) -> StoreReply {
+    StoreReply::Items {
+        items,
+        scope_row: None,
+    }
+}
+
 mod filter;
 mod hints;
 mod input;
 mod navigation;
 mod queue;
 mod render;
+mod workspace;
 mod writes;

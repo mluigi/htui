@@ -178,7 +178,7 @@ async fn applying_a_filter_disarms_a_pending_reveal() {
     assert!(tab.pending_reveal.is_none(), "the filter disarmed it");
     let _ = bench.actions();
 
-    tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+    tab.on_reply(&items_reply(Vec::new()), &mut bench.ctx());
     assert!(
         !bench
             .actions()
@@ -203,7 +203,7 @@ async fn applying_no_filter_keeps_a_pending_reveal() {
     press(&mut tab, &bench, KeyCode::Enter);
     assert!(tab.pending_reveal.is_some(), "still armed");
 
-    tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+    tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     assert_eq!(
         tab.selected,
         Some(Selection::Item(htui_core::fixtures::ids::HTUI_ANA_2)),
@@ -286,7 +286,7 @@ async fn a_filtered_reply_names_its_filter_in_the_title() {
     let mut tab = bench.tab();
     tab.apply(done_only(), &bench.ctx());
     tab.on_reply(
-        &StoreReply::Items(with_state(&bench, ItemState::Done)),
+        &items_reply(with_state(&bench, ItemState::Done)),
         &mut bench.ctx(),
     );
     assert_eq!(tab.shown, done_only());

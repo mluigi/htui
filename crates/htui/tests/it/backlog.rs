@@ -199,6 +199,117 @@ async fn enter_folds_and_unfolds_a_project_group() {
     );
 }
 
+/// `WS-1` minted on Platform's scope row in `store` (MOD-147 M3).
+async fn mint_ws_1(store: &MemStore) -> ItemId {
+    let item = store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+            title: "Spans the workspace".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("mint WS-1 on the scope row");
+    assert_eq!(item.key, "WS-1");
+    item.id
+}
+
+/// The index of the one list-pane line holding `text` (left of the `││` between the panes).
+fn line_of(frame: &str, text: &str) -> usize {
+    let at: Vec<usize> = frame
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split_once("\u{2502}\u{2502}")
+                .is_some_and(|(list, _)| list.contains(text))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match at.as_slice() {
+        [index] => *index,
+        _ => panic!("expected one line holding {text:?}, got {at:?}:\n{frame}"),
+    }
+}
+
+/// MOD-147 M3 D1, D3: the workspace's own items list first, under a group titled with the
+/// workspace's name; the cursor arrives on `WS-1`. The header folds and unfolds, and the fold
+/// survives a refresh's `Items` reply.
+#[tokio::test]
+async fn the_workspace_group_lists_first_and_folds() {
+    let store = MemStore::demo();
+    mint_ws_1(&store).await;
+    let mut harness = backlog_over(store.clone()).await;
+    let frame = harness.render();
+    let header = line_of(&frame, "\u{25be} Platform (1)");
+    let item = line_of(&frame, "Spans the workspace");
+    assert!(
+        header < item && item < line_of(&frame, "\u{25be} htui (8)"),
+        "{frame}"
+    );
+    assert!(on_item(&frame, "WS-1"), "{frame}");
+
+    harness.key("k");
+    harness.key("enter");
+    harness.drive_to_end().await;
+    for _ in 0..4 {
+        harness.app().update(Action::Tick);
+    }
+    harness.drive_to_end().await;
+    let folded = harness.render();
+    assert!(folded.contains("\u{25b8} Platform (1)"), "{folded}");
+    assert!(!folded.contains("Spans the workspace"), "{folded}");
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert!(harness.render().contains("Spans the workspace"));
+}
+
+/// MOD-147 M3 D3: a workspace with no item of its own draws its group empty, above the members.
+#[tokio::test]
+async fn an_empty_workspace_group_is_drawn_above_the_members() {
+    let mut harness = backlog().await;
+    let frame = harness.render();
+    assert!(
+        line_of(&frame, "\u{25be} Platform (0)") < line_of(&frame, "\u{25be} htui (8)"),
+        "{frame}"
+    );
+    assert!(
+        on_item(&frame, "ANA-1"),
+        "the cursor still arrives on the first item"
+    );
+}
+
+/// MOD-147 M3 D3: a reveal of a workspace item, its group folded, unfolds it and lands on it.
+#[tokio::test]
+async fn a_reveal_lands_on_a_workspace_item() {
+    let store = MemStore::demo();
+    let ws_1 = mint_ws_1(&store).await;
+    let mut harness = backlog_over(store.clone()).await;
+    harness.app().reveal_tabs = vec![(RevealKind::Item, BacklogTab::ID)];
+    harness.key("k");
+    harness.key("enter");
+    down(&mut harness, TO_FEAT_1).await;
+    assert!(!harness.render().contains("Spans the workspace"));
+    harness
+        .app()
+        .update(Action::Reveal(htui::app::RevealTarget::Item {
+            id: ws_1,
+            key: "WS-1".to_owned(),
+        }));
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(on_item(&frame, "WS-1"), "{frame}");
+    assert!(frame.contains("Spans the workspace"), "{frame}");
+    assert_eq!(harness.app().status, None);
+}
+
 #[tokio::test]
 async fn j_k_g_and_shift_g_move_the_selection() {
     let mut harness = backlog().await;
@@ -1409,8 +1520,9 @@ async fn enter_reveals_a_node_of_the_other_project_and_unfolds_its_group() {
 
     harness.key("g");
     harness.drive_to_end().await;
-    // From the htui header: one row to the arrival row, then on to FEAT-2.
-    down(&mut harness, 1 + TO_FEAT_2).await;
+    // From the workspace's own (empty) header, MOD-147 M3: past the htui header to the arrival
+    // row, then on to FEAT-2.
+    down(&mut harness, 2 + TO_FEAT_2).await;
     assert!(on_item(&harness.render(), "FEAT-2"));
     sub_tab(&mut harness, TO_GRAPH);
     // One `J` from FEAT-2's root row is agy FEAT-1: `agy` < `htui` breaks the key tie.

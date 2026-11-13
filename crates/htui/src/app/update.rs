@@ -761,7 +761,7 @@ mod tests {
             Handled::Pass
         }
         fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-            if let StoreReply::Items(items) = reply {
+            if let StoreReply::Items { items, .. } = reply {
                 self.seen.borrow_mut().push(items.len());
             }
         }
@@ -822,7 +822,10 @@ mod tests {
         ReplyEnvelope {
             seq,
             origin: Origin::Tab(Recorder::ID),
-            reply: StoreReply::Items(vec![row; count]),
+            reply: StoreReply::Items {
+                items: vec![row; count],
+                scope_row: None,
+            },
         }
     }
 

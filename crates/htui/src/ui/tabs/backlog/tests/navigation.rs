@@ -59,7 +59,7 @@ async fn a_refused_items_read_disarms_a_pending_reveal() {
     );
     assert!(tab.pending_reveal.is_none(), "the refusal disarms it");
 
-    tab.on_reply(&StoreReply::Items(Vec::new()), &mut ctx);
+    tab.on_reply(&items_reply(Vec::new()), &mut ctx);
     let errors: Vec<Action> = emit
         .take()
         .into_iter()
@@ -115,7 +115,7 @@ async fn a_reveal_of_a_hidden_item_clears_the_filter() {
     let actions = bench.actions();
     assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
 
-    tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+    tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     assert_eq!(
         tab.selected,
         Some(Selection::Item(htui_core::fixtures::ids::HTUI_ANA_2))
@@ -228,7 +228,7 @@ async fn revealing_a_step_of_an_unloaded_item_carries_the_focus_to_the_items_rep
     assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
     assert!(runs_reads(&actions).is_empty(), "{actions:?}");
 
-    tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+    tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     assert_eq!(tab.selected, Some(Selection::Item(ids::HTUI_FEAT_1)));
     assert_eq!(tab.detail.active_id(), Some(RunsTab::ID));
     assert_eq!(tab.pending_reveal, None);
@@ -308,7 +308,7 @@ async fn a_filtered_reply_moves_the_cursor_to_its_first_item() {
         .into_iter()
         .find(|row| matches!(row, Selection::Item(_)))
         .expect("another item");
-    tab.on_reply(&StoreReply::Items(others), &mut bench.ctx());
+    tab.on_reply(&items_reply(others), &mut bench.ctx());
     assert_eq!(tab.selected, Some(expected));
     let Selection::Item(id) = expected else {
         unreachable!()
@@ -333,7 +333,7 @@ async fn a_filter_nothing_matches_leaves_no_row_to_move_or_fold() {
         ..BacklogFilter::default()
     };
     tab.apply(cuda, &bench.ctx());
-    tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+    tab.on_reply(&items_reply(Vec::new()), &mut bench.ctx());
     assert_eq!(tab.selected, None, "no row, no cursor");
     assert!(drawn(&tab, &bench).contains(list::NO_MATCH));
     let _ = bench.actions();
@@ -360,7 +360,7 @@ async fn a_filter_nothing_matches_leaves_no_row_to_move_or_fold() {
     );
 
     press(&mut tab, &bench, KeyCode::Char('F'));
-    tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+    tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     assert!(tab.folded.is_empty(), "no project comes back folded");
     assert_eq!(tab.selected, Some(bench.first));
 }
@@ -386,11 +386,11 @@ async fn a_fold_survives_a_filter_that_hides_its_project() {
         .filter(|item| item.project_id == PROJECT_HTUI)
         .cloned()
         .collect();
-    tab.on_reply(&StoreReply::Items(htui), &mut bench.ctx());
+    tab.on_reply(&items_reply(htui), &mut bench.ctx());
     assert_eq!(tab.folded, [PROJECT_AGY]);
 
     press(&mut tab, &bench, KeyCode::Char('F'));
-    tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+    tab.on_reply(&items_reply(bench.items.clone()), &mut bench.ctx());
     assert_eq!(tab.folded, [PROJECT_AGY], "still folded after `F`");
 }
 

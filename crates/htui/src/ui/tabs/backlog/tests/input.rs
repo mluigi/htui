@@ -36,6 +36,7 @@ async fn a_capturing_sub_tab_gets_the_navigation_keys() {
     }));
     let mut tab = BacklogTab {
         items,
+        scope_row: None,
         folded: Vec::new(),
         selected: Some(first),
         detail,
@@ -110,6 +111,7 @@ async fn m_on_the_list_opens_the_graph() {
     let (scope, projects, items, first) = platform().await;
     let mut tab = BacklogTab {
         items,
+        scope_row: None,
         folded: Vec::new(),
         selected: Some(first),
         detail: BacklogTab::new().detail,
@@ -163,6 +165,7 @@ async fn m_while_a_sub_tab_captures_is_the_sub_tab_s() {
     detail.register(Box::new(GraphTab::new()));
     let mut tab = BacklogTab {
         items,
+        scope_row: None,
         folded: Vec::new(),
         selected: Some(first),
         detail,

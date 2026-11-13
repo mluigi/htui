@@ -64,7 +64,8 @@ pub type Group<'a> = (&'a ProjectRef, Vec<&'a ItemSummary>);
 pub struct ListView<'a> {
     /// The scope's items, as the `Items` reply delivered them.
     pub items: &'a [ItemSummary],
-    /// The scope's projects, in `workspace_project.position` order.
+    /// The groups: the workspace's scope row when the `Items` reply named one (MOD-147 M3 D3),
+    /// then the scope's projects in `workspace_project.position` order.
     pub projects: &'a [ProjectRef],
     /// Projects whose group is currently folded.
     pub folded: &'a [ProjectId],
@@ -80,7 +81,8 @@ pub struct ListView<'a> {
 
 /// Groups the items by project.
 ///
-/// Project order is `ctx.projects`, i.e. `workspace_project.position`; inside a group the rows are
+/// Project order is `projects`' (the Backlog's `group_projects`: the workspace's scope row, then
+/// `ctx.projects` in `workspace_project.position` order); inside a group the rows are
 /// ordered by `key_prefix` then `key_number`, so `ANA-2` follows `ANA-1` rather than `FEAT-2`
 /// (several key prefixes share one project, so `key_number` alone does not order them).
 #[must_use]
