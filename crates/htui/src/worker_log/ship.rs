@@ -6,7 +6,7 @@
 //! `concepts::spawn_index_job` is.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
+use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -14,6 +14,8 @@ use htui_core::model::{BoxId, LogShipLevel};
 use htui_core::store::{StoreError, WorkerLogStore};
 use htui_store::PgStore;
 use serde_json::Value;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use super::{BACKOFF_MAX, FLUSH_EVERY, ShipHandle};
 
@@ -25,6 +27,10 @@ pub const DEFAULT_RETENTION_DAYS: u64 = 14;
 pub const PER_BOX_CAP: u32 = 100_000;
 /// Plan D4: how often the sweep runs after the one at start.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
+/// R1 M4: how long after a failed sweep the next one is tried (thirty flush intervals).
+pub const SWEEP_RETRY: Duration = Duration::from_secs(60);
+/// R1 M2: the longest shutdown waits for the flusher's final flush before aborting it.
+pub const FINAL_FLUSH_MAX: Duration = Duration::from_secs(2);
 
 /// What the flusher reads and writes: the worker log store, plus the worker's own box and two
 /// reads that are inherent on [`PgStore`], not on a trait (blueprint F7f).
@@ -103,22 +109,22 @@ impl<S: ShipSource> Flusher<S> {
     }
 
     /// Plan D4: rows older than the retention, then beyond [`PER_BOX_CAP`] per box. Quiet: a
-    /// failure leaves the sweep due, so the next cycle tries again.
+    /// failure makes the next sweep due after [`SWEEP_RETRY`] (R1 M4), not every cycle.
     async fn sweep(&mut self, now: DateTime<Utc>) {
-        let Ok(app) = self.store.ship_app_settings().await else {
-            return;
+        let swept = match self.store.ship_app_settings().await {
+            Ok(app) => {
+                // At most 365, so the conversion never falls back.
+                let days = i64::try_from(retention_days(&app)).unwrap_or(365);
+                let older_than = now - TimeDelta::days(days);
+                self.store
+                    .prune_worker_logs(older_than, PER_BOX_CAP)
+                    .await
+                    .is_ok()
+            }
+            Err(_) => false,
         };
-        // At most 365, so the conversion never falls back.
-        let days = i64::try_from(retention_days(&app)).unwrap_or(365);
-        let older_than = now - TimeDelta::days(days);
-        if self
-            .store
-            .prune_worker_logs(older_than, PER_BOX_CAP)
-            .await
-            .is_ok()
-        {
-            self.next_sweep = Some(now + TimeDelta::from_std(SWEEP_EVERY).unwrap_or_default());
-        }
+        let next = if swept { SWEEP_EVERY } else { SWEEP_RETRY };
+        self.next_sweep = Some(now + TimeDelta::from_std(next).unwrap_or_default());
     }
 
     /// Ships everything buffered in one call; a failure keeps the lines for the next cycle. Logs
@@ -167,27 +173,75 @@ fn pause_after(failures: u32) -> Duration {
         .map_or(BACKOFF_MAX, |pause| pause.min(BACKOFF_MAX))
 }
 
-/// The flusher over `store` until aborted: a cycle every [`FLUSH_EVERY`] (or back-off), and a
-/// flush in between whenever [`BATCH_LINES`](super::BATCH_LINES) lines wait while shipping works.
-pub async fn run_flusher<S: ShipSource>(store: S, handle: ShipHandle) -> Infallible {
+/// The flusher over `store` until `stop` resolves (or it is aborted): a cycle every
+/// [`FLUSH_EVERY`] (or back-off), and a flush in between whenever
+/// [`BATCH_LINES`](super::BATCH_LINES) lines wait while shipping works. On `stop`, one final flush
+/// (R1 M2), unbounded here: [`FlusherTask::shutdown`] bounds it. `stop` is seen between cycles
+/// and flushes, never inside one, so a flush in progress is never cut with its lines taken.
+pub async fn run_flusher<S: ShipSource>(store: S, handle: ShipHandle, stop: impl Future) {
     let mut flusher = Flusher::new(store, handle.clone());
-    loop {
+    let mut stop = std::pin::pin!(stop);
+    'cycles: loop {
         let pause = flusher.cycle(Utc::now()).await;
         let deadline = tokio::time::Instant::now() + pause;
         loop {
             tokio::select! {
+                biased;
+                _ = &mut stop => break 'cycles,
                 () = tokio::time::sleep_until(deadline) => break,
                 () = handle.filled(), if flusher.healthy() => flusher.flush().await,
             }
         }
     }
+    flusher.flush().await;
 }
 
-/// The worker's flusher over `pg` (plan D2): spawned beside the index job, sharing the pool,
-/// aborted at shutdown.
+/// A running flusher (R1 M2, L7). [`shutdown`](Self::shutdown) stops it after one final flush,
+/// waiting at most [`FINAL_FLUSH_MAX`]; dropped without it (an early return), it is aborted, so
+/// nothing outlives the worker's startup.
+#[derive(Debug)]
+pub struct FlusherTask {
+    stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl FlusherTask {
+    /// Spawns `run`, handing it the future that resolves when [`shutdown`](Self::shutdown) is
+    /// called (or this is dropped).
+    pub(crate) fn start<F>(run: impl FnOnce(oneshot::Receiver<()>) -> F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (stop, stopped) = oneshot::channel();
+        Self {
+            stop: Some(stop),
+            task: tokio::spawn(run(stopped)),
+        }
+    }
+
+    /// Asks the flusher to stop and waits for its final flush, at most [`FINAL_FLUSH_MAX`]; a
+    /// store that does not answer in time is abandoned, with its lines.
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            // A flusher already gone has nothing left to flush.
+            stop.send(()).ok();
+        }
+        // Timed out: `Drop` aborts it.
+        drop(tokio::time::timeout(FINAL_FLUSH_MAX, &mut self.task).await);
+    }
+}
+
+impl Drop for FlusherTask {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The worker's flusher over `pg` (plan D2): spawned beside the index job, sharing the pool, and
+/// stopped at shutdown with a final flush.
 #[must_use]
-pub fn spawn_flusher(pg: PgStore, handle: ShipHandle) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { match run_flusher(pg, handle).await {} })
+pub fn spawn_flusher(pg: PgStore, handle: ShipHandle) -> FlusherTask {
+    FlusherTask::start(|stop| run_flusher(pg, handle, stop))
 }
 
 #[cfg(test)]
@@ -206,6 +260,10 @@ mod tests {
     #[derive(Default)]
     struct State {
         failing: bool,
+        /// Only the sweep's prune fails.
+        prune_failing: bool,
+        /// An append never answers.
+        hanging: bool,
         written: Vec<NewWorkerLog>,
         appends: usize,
         settings: Option<Value>,
@@ -236,6 +294,10 @@ mod tests {
 
     impl WorkerLogStore for Fake {
         async fn append_worker_logs(&self, _: BoxId, lines: &[NewWorkerLog]) -> Result<u64> {
+            let hanging = self.state().hanging;
+            if hanging {
+                std::future::pending::<()>().await;
+            }
             let mut state = self.state();
             state.appends += 1;
             if state.failing {
@@ -251,7 +313,7 @@ mod tests {
 
         async fn prune_worker_logs(&self, older_than: DateTime<Utc>, cap: u32) -> Result<u64> {
             let mut state = self.state();
-            if state.failing {
+            if state.failing || state.prune_failing {
                 return Err(down());
             }
             state.sweeps.push((older_than, cap));
@@ -294,6 +356,12 @@ mod tests {
         }
     }
 
+    /// A handle at `info`, so [`line`]'s lines ship.
+    fn at_info(handle: ShipHandle) -> ShipHandle {
+        handle.set_level(LogShipLevel::Info);
+        handle
+    }
+
     fn t0() -> DateTime<Utc> {
         DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp")
     }
@@ -329,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn worker_log_a_failed_flush_backs_off_and_the_recovery_ships_the_backlog_in_order() {
         let fake = Fake::default();
-        let handle = ShipHandle::new();
+        let handle = at_info(ShipHandle::new());
         let mut flusher = Flusher::new(fake.clone(), handle.clone());
         handle.push(line("a"));
         assert_eq!(flusher.cycle(t0()).await, FLUSH_EVERY);
@@ -361,7 +429,7 @@ mod tests {
     async fn worker_log_drops_ship_as_one_warn_line_on_the_next_flush() {
         let fake = Fake::default();
         fake.state().failing = true;
-        let handle = ShipHandle::with_cap(2);
+        let handle = at_info(ShipHandle::with_cap(2));
         let mut flusher = Flusher::new(fake.clone(), handle.clone());
         for text in ["a", "b", "c", "d"] {
             handle.push(line(text));
@@ -380,7 +448,7 @@ mod tests {
             [
                 (
                     WorkerLogLevel::Warn,
-                    "2 log lines dropped while database unreachable"
+                    "2 log lines were dropped while the database was unreachable"
                 ),
                 (WorkerLogLevel::Info, "c"),
                 (WorkerLogLevel::Info, "d"),
@@ -416,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn worker_log_the_shipper_logs_only_on_transitions() {
         let fake = Fake::default();
-        let handle = ShipHandle::new();
+        let handle = at_info(ShipHandle::new());
         let mut flusher = Flusher::new(fake.clone(), handle.clone());
         let said = Said::default();
         let _guard =
@@ -462,15 +530,107 @@ mod tests {
         );
     }
 
+    /// R1 M4: a failed sweep is retried after [`SWEEP_RETRY`], not every cycle.
     #[tokio::test]
-    async fn worker_log_a_failed_sweep_is_retried_next_cycle() {
+    async fn worker_log_a_failed_sweep_is_retried_a_minute_later() {
+        for read_fails in [false, true] {
+            let fake = Fake::default();
+            if read_fails {
+                fake.state().failing = true;
+            } else {
+                fake.state().prune_failing = true;
+            }
+            let mut flusher = Flusher::new(fake.clone(), ShipHandle::new());
+            flusher.cycle(t0()).await;
+            fake.state().failing = false;
+            fake.state().prune_failing = false;
+            flusher.cycle(t0() + TimeDelta::seconds(2)).await;
+            flusher.cycle(t0() + TimeDelta::seconds(58)).await;
+            assert!(fake.state().sweeps.is_empty(), "read_fails={read_fails}");
+            flusher.cycle(t0() + TimeDelta::seconds(60)).await;
+            assert_eq!(fake.state().sweeps.len(), 1, "read_fails={read_fails}");
+        }
+    }
+
+    /// R1 M1: lines buffered before the box row said `off`, or at a level since raised past them,
+    /// never reach the store.
+    #[tokio::test]
+    async fn worker_log_a_lowered_level_reaches_lines_already_buffered() {
         let fake = Fake::default();
-        fake.state().failing = true;
-        let mut flusher = Flusher::new(fake.clone(), ShipHandle::new());
+        let handle = ShipHandle::new();
+        let mut flusher = Flusher::new(fake.clone(), handle.clone());
+        let mut warn = line("startup warn");
+        warn.level = WorkerLogLevel::Warn;
+        handle.push(warn);
+        fake.state().settings = Some(json!({ "log_level": "off" }));
         flusher.cycle(t0()).await;
-        fake.state().failing = false;
-        flusher.cycle(t0() + TimeDelta::seconds(2)).await;
-        assert_eq!(fake.state().sweeps.len(), 1);
+        assert_eq!(fake.state().appends, 0);
+        assert!(fake.written().is_empty());
+
+        handle.set_level(LogShipLevel::Info);
+        handle.push(line("info"));
+        fake.state().settings = Some(json!({ "log_level": "error" }));
+        flusher.cycle(t0()).await;
+        assert!(fake.written().is_empty());
+    }
+
+    /// R1 M2: a line pushed just before shutdown is shipped by the final flush.
+    #[tokio::test(start_paused = true)]
+    async fn worker_log_shutdown_ships_the_last_lines() {
+        let fake = Fake::default();
+        let handle = at_info(ShipHandle::new());
+        fake.state().settings = Some(json!({ "log_level": "info" }));
+        let task = FlusherTask::start(|stop| run_flusher(fake.clone(), handle.clone(), stop));
+        // Past the first cycle, into the wait.
+        tokio::time::sleep(FLUSH_EVERY / 2).await;
+        handle.push(line("the last line"));
+        let started = tokio::time::Instant::now();
+        task.shutdown().await;
+        assert!(
+            started.elapsed() < FLUSH_EVERY / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fake.written(), ["the last line"]);
+    }
+
+    /// R1 M2: a store that never answers holds shutdown no longer than [`FINAL_FLUSH_MAX`].
+    #[tokio::test(start_paused = true)]
+    async fn worker_log_a_hanging_store_does_not_hold_shutdown() {
+        let fake = Fake::default();
+        fake.state().hanging = true;
+        let handle = at_info(ShipHandle::new());
+        handle.push(line("never answered"));
+        let task = FlusherTask::start(|stop| run_flusher(fake.clone(), handle.clone(), stop));
+        tokio::time::sleep(FLUSH_EVERY / 2).await;
+        let started = tokio::time::Instant::now();
+        task.shutdown().await;
+        let took = started.elapsed();
+        assert!(took >= FINAL_FLUSH_MAX, "{took:?}");
+        assert!(took < FINAL_FLUSH_MAX + FLUSH_EVERY / 4, "{took:?}");
+    }
+
+    /// R1 L7: a flusher dropped without `shutdown` (an early return) is aborted, not leaked.
+    #[tokio::test]
+    async fn worker_log_a_dropped_flusher_is_aborted() {
+        struct Gone(Arc<Mutex<bool>>);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            }
+        }
+        let gone = Arc::new(Mutex::new(false));
+        let sentinel = Gone(Arc::clone(&gone));
+        let task = FlusherTask::start(|_stop| async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        drop(task);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(*gone.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     #[test]

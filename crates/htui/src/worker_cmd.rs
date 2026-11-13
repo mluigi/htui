@@ -128,7 +128,8 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
     // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
     // the pool, never the runtime.
     let index_job = concepts::spawn_index_job(pg.clone());
-    // MOD-122 M2 plan D2, D4: this box's log lines to `worker_log`, and the retention sweep.
+    // MOD-122 M2 plan D2, D4: this box's log lines to `worker_log`, and the retention sweep. Dropped
+    // on an early return below, it is aborted (R1 L7).
     let log_flusher = worker_log::spawn_flusher(pg.clone(), ship);
     // MOD-160 D9: one model-free look at Qdrant, said once; never awaited, so a Qdrant that does
     // not answer never delays "htui worker ready".
@@ -151,8 +152,9 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     index_job.abort();
-    log_flusher.abort();
     start_check_task.abort();
+    // R1 M2: the last lines ship, waiting at most `worker_log::FINAL_FLUSH_MAX`.
+    log_flusher.shutdown().await;
     tracing::info!("htui worker stopped");
     Ok(())
 }

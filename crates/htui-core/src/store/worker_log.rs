@@ -23,6 +23,10 @@ pub trait WorkerLogStore: Send + Sync {
     /// user and the box's hostname (`box_name`), and its text goes through
     /// [`NewWorkerLog::stored_text`]. The batch is written whole or not at all.
     ///
+    /// Not idempotent (MOD-122 M2 R1 L3): a caller that cannot tell whether the commit landed (the
+    /// connection dropped as it committed) re-sends the batch, so a reader may see a line twice;
+    /// a row is never lost.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) (`entity: "box"`) for an

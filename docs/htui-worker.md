@@ -509,11 +509,18 @@ another box can read them (the Logs tab lists one source per worker box):
 - **While the database is unreachable** the worker keeps up to 20 000 lines and retries, waiting
   2 s, then 4, 8, 16 and at most 30 s between tries. Past 20 000 the oldest line below `error` goes
   first, an `error` line only when nothing else is held, and the next successful send starts with
-  one `warn` line saying `N log lines dropped while database unreachable`. The worker logs one
-  `warn` when sending starts failing and one `info` when it recovers, never one per try.
+  one `warn` line saying `N log lines were dropped while the database was unreachable` (`1 log
+  line was dropped …` for one). The worker logs one `warn` when sending starts failing and one
+  `info` when it recovers, never one per try. A database row that may or may not have been written
+  (the connection dropped as it committed) is sent again, so a line can appear twice; none is lost.
+- **Level changes reach waiting lines.** Lowering the level, or setting `off`, also holds back
+  lines kept before the change and not yet sent.
+- **At shutdown** the worker sends what it still holds, waiting at most 2 s for the database.
 - **Secrets.** Every line goes through the same credential scrubber as run output before it is
   kept. A line the scrubber refuses is sent with its level and target and the text
-  `[line withheld: matched credential rule]`; its text is never stored.
+  `[line withheld: it matched a credential rule]`; its text is never stored. A target the scrubber
+  refuses is sent as `withheld`. A line longer than 8 KiB is cut to 8 KiB, ending in `…`, after
+  the scrub.
 - **How long they stay.** At start and then hourly the worker deletes lines older than
   `log_retention_days` days (an app setting, a whole number from 1 to 365, default 14), and every
   box's lines beyond the newest 100 000. Two workers sweeping at once is harmless. When a box row is

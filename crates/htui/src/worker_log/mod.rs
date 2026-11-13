@@ -7,13 +7,15 @@
 //! level from the worker's own box row each cycle, and sweeps old rows at start and hourly.
 //!
 //! Nothing here formats a DSN, a key, a token or an environment value; a line the scrubber refuses
-//! keeps its level and target and ships as [`WITHHELD`].
+//! keeps its level and target and ships as [`WITHHELD`], and a refused target ships as
+//! [`WITHHELD_TARGET`]. A kept text is cut to [`WORKER_LOG_TEXT_MAX`] after the scrub. At
+//! shutdown, [`FlusherTask::shutdown`] ships what is left, within [`FINAL_FLUSH_MAX`].
 
 pub mod ship;
 
 pub use ship::{
-    DEFAULT_RETENTION_DAYS, PER_BOX_CAP, SWEEP_EVERY, ShipSource, retention_days, run_flusher,
-    spawn_flusher,
+    DEFAULT_RETENTION_DAYS, FINAL_FLUSH_MAX, FlusherTask, PER_BOX_CAP, SWEEP_EVERY, ShipSource,
+    retention_days, run_flusher, spawn_flusher,
 };
 
 use std::collections::VecDeque;
@@ -23,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use chrono::Utc;
-use htui_core::model::{LogShipLevel, NewWorkerLog, WorkerLogLevel};
+use htui_core::model::{LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel};
 use htui_core::scrub::{MinimalScrubber, Scrubber as _};
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -45,7 +47,9 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// at 20 000 (about 3 MiB of short lines) nothing dropped, flush p95 4.3 ms, max 0.44 s.
 pub const BUFFER_CAP: usize = 20_000;
 /// Plan D9: the text of a line the scrubber refused.
-pub const WITHHELD: &str = "[line withheld: matched credential rule]";
+pub const WITHHELD: &str = "[line withheld: it matched a credential rule]";
+/// The target of a line whose target the scrubber refused (R1 L5): the line ships under it.
+pub const WITHHELD_TARGET: &str = "withheld";
 
 /// The ship filter's predicate: the level read live, and the `sqlx` rule.
 type ShipAdmit = Box<dyn Fn(&Metadata<'_>) -> bool + Send + Sync>;
@@ -147,8 +151,9 @@ impl ShipHandle {
         self.0.filled.notified().await;
     }
 
-    /// Keeps `line`; at the cap drops the oldest line below `error`, or an error line when nothing
-    /// else is held (plan D3), and counts the drop.
+    /// Keeps `line`; at the cap drops the oldest line below `error`, or the oldest error line when
+    /// only errors are held, or the newcomer when it is below `error` or nothing is held (every
+    /// line in flight), and counts the drop (plan D3).
     pub(crate) fn push(&self, line: NewWorkerLog) {
         let waiting = {
             let mut pending = self.pending();
@@ -160,8 +165,9 @@ impl ShipHandle {
                     .position(|held| held.level != WorkerLogLevel::Error)
                 {
                     pending.lines.remove(at);
-                } else if line.level != WorkerLogLevel::Error {
-                    // Everything held is an error: the newcomer is the oldest line below one.
+                } else if line.level != WorkerLogLevel::Error || pending.lines.is_empty() {
+                    // Everything held is an error, so the newcomer is the oldest line below one;
+                    // or nothing is held, so there is no older line to make room.
                     return;
                 } else {
                     pending.lines.pop_front();
@@ -175,12 +181,12 @@ impl ShipHandle {
         }
     }
 
-    /// Everything buffered, the drop notice first, or `None` when there is nothing to ship.
+    /// Everything buffered that the current level ships, the drop notice first, or `None` when
+    /// there is nothing to ship. A buffered line the level no longer ships (it was lowered, or set
+    /// to `off`, after the line was kept) is discarded here, not shipped (R1 M1).
     pub(crate) fn take(&self) -> Option<Taken> {
+        let level = self.level();
         let mut pending = self.pending();
-        if pending.lines.is_empty() && pending.dropped == 0 {
-            return None;
-        }
         let dropped = std::mem::take(&mut pending.dropped);
         let mut lines = Vec::with_capacity(pending.lines.len() + 1);
         if dropped > 0 {
@@ -188,10 +194,18 @@ impl ShipHandle {
                 logged_at: Utc::now(),
                 level: WorkerLogLevel::Warn,
                 target: module_path!().to_owned(),
-                text: format!("{dropped} log lines dropped while database unreachable"),
+                text: drop_notice(dropped),
             });
         }
-        lines.extend(pending.lines.drain(..));
+        lines.extend(
+            pending
+                .lines
+                .drain(..)
+                .filter(|line| level.ships(line.level)),
+        );
+        if lines.is_empty() {
+            return None;
+        }
         pending.in_flight += lines.len() - usize::from(dropped > 0);
         Some(Taken { lines, dropped })
     }
@@ -289,13 +303,20 @@ impl<S: Subscriber> Layer<S> for ShipLayer {
         if !admits(level_of(&self.shared.level), meta.level(), &target) {
             return;
         }
-        let text = scrubbed(&self.shared.scrubber, line.text());
-        ShipHandle(Arc::clone(&self.shared)).push(NewWorkerLog {
+        let mut kept = NewWorkerLog {
             logged_at: Utc::now(),
             level: worker_level(*meta.level()),
-            target,
-            text,
-        });
+            target: scrubbed(&self.shared.scrubber, target)
+                .unwrap_or_else(|| WITHHELD_TARGET.to_owned()),
+            text: scrubbed(&self.shared.scrubber, line.text())
+                .unwrap_or_else(|| WITHHELD.to_owned()),
+        };
+        // Cut only after the scrub (R1 L1): cutting first could shorten a credential below a
+        // rule's minimum and let part of it through.
+        if kept.text.len() > WORKER_LOG_TEXT_MAX {
+            kept.text = kept.stored_text().into_owned();
+        }
+        ShipHandle(Arc::clone(&self.shared)).push(kept);
     }
 }
 
@@ -336,16 +357,26 @@ fn level_of(level: &AtomicU8) -> LogShipLevel {
         .unwrap_or_default()
 }
 
-/// `text` as the scrubber leaves it, or [`WITHHELD`] when a rule refuses it (plan D9; the shape of
-/// `htui-agent`'s `scrubbed_text`). The refused text goes nowhere.
-fn scrubbed(scrubber: &MinimalScrubber, text: String) -> String {
+/// The drop notice for `dropped` lines (plan D3's words).
+fn drop_notice(dropped: u64) -> String {
+    if dropped == 1 {
+        "1 log line was dropped while the database was unreachable".to_owned()
+    } else {
+        format!("{dropped} log lines were dropped while the database was unreachable")
+    }
+}
+
+/// `text` as the scrubber leaves it, or `None` when a rule refuses it (plan D9; the shape of
+/// `htui-agent`'s `scrubbed_text`): the caller puts [`WITHHELD`] or [`WITHHELD_TARGET`] in its
+/// place. The refused text goes nowhere.
+fn scrubbed(scrubber: &MinimalScrubber, text: String) -> Option<String> {
     let mut value = Value::String(text);
     match scrubber.scrub(&mut value) {
         Ok(()) => match value {
-            Value::String(text) => text,
-            _ => WITHHELD.to_owned(),
+            Value::String(text) => Some(text),
+            _ => None,
         },
-        Err(_) => WITHHELD.to_owned(),
+        Err(_) => None,
     }
 }
 
@@ -435,19 +466,48 @@ mod tests {
         assert_eq!(handle.buffered()[1].target, "sqlx::query");
     }
 
+    /// Set in the child [`worker_log_a_level_change_reaches_a_callsite_seen_while_refused`] runs.
+    const GLOBAL_CHILD: &str = "HTUI_WORKER_LOG_GLOBAL_CHILD";
+
     /// Claim V2: a callsite first seen while its level was refused ships once the level admits it.
+    /// Proved under a global subscriber, the worker's shape, where `tracing` caches the callsite's
+    /// interest (a scoped dispatcher re-asks, so it passes even without `rebuild_interest_cache`).
+    /// A global subscriber is once per process: the case runs in a child of this test binary.
     #[test]
     fn worker_log_a_level_change_reaches_a_callsite_seen_while_refused() {
-        let handle = ShipHandle::new();
-        captured(&handle, || {
+        if std::env::var_os(GLOBAL_CHILD).is_some() {
+            let handle = ShipHandle::new();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(handle.layer()),
+            )
+            .expect("the child's only global subscriber");
             for round in 0..2 {
                 if round == 1 {
                     handle.set_level(LogShipLevel::Info);
                 }
                 tracing::info!(target: "htui", "round {round}");
             }
-        });
-        assert_eq!(texts(&handle), ["round 1"]);
+            assert_eq!(texts(&handle), ["round 1"]);
+            return;
+        }
+        let name = module_path!()
+            .split_once("::")
+            .map(|(_, tests)| {
+                format!("{tests}::worker_log_a_level_change_reaches_a_callsite_seen_while_refused")
+            })
+            .expect("a module below the crate");
+        let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(GLOBAL_CHILD, "1")
+            .output()
+            .expect("the child runs");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(child.status.success(), "{said}");
+        assert!(said.contains("1 passed"), "the child ran the case: {said}");
     }
 
     #[test]
@@ -483,7 +543,7 @@ mod tests {
             [
                 (
                     WorkerLogLevel::Warn,
-                    "5 log lines dropped while database unreachable"
+                    "5 log lines were dropped while the database was unreachable"
                 ),
                 (WorkerLogLevel::Error, "e2"),
                 (WorkerLogLevel::Error, "e3"),
@@ -498,6 +558,7 @@ mod tests {
     #[test]
     fn worker_log_a_failed_flush_keeps_its_lines_in_front_and_counts_against_the_cap() {
         let handle = ShipHandle::with_cap(4);
+        handle.set_level(LogShipLevel::Info);
         handle.push(line(WorkerLogLevel::Info, "a"));
         handle.push(line(WorkerLogLevel::Info, "b"));
         let taken = handle.take().expect("lines wait");
@@ -514,7 +575,7 @@ mod tests {
         let taken = handle.take().expect("lines wait");
         assert_eq!(
             taken.lines[0].text,
-            "1 log lines dropped while database unreachable"
+            "1 log line was dropped while the database was unreachable"
         );
         handle.restore(taken);
         assert_eq!(texts(&handle), ["a", "b", "d", "e"]);
@@ -547,6 +608,90 @@ mod tests {
         }
         let woke = ready_now(handle.filled());
         assert!(woke, "{BATCH_LINES} lines store a wake");
+    }
+
+    /// R1 L4: the plan's wording, plural and singular.
+    #[test]
+    fn worker_log_the_drop_notice_and_the_withheld_text_use_the_plans_words() {
+        assert_eq!(WITHHELD, "[line withheld: it matched a credential rule]");
+        assert_eq!(
+            drop_notice(2),
+            "2 log lines were dropped while the database was unreachable"
+        );
+        assert_eq!(
+            drop_notice(1),
+            "1 log line was dropped while the database was unreachable"
+        );
+    }
+
+    /// R1 M1: a line buffered at a level since lowered is not taken.
+    #[test]
+    fn worker_log_lines_the_level_no_longer_ships_are_not_taken() {
+        let handle = ShipHandle::new();
+        handle.push(line(WorkerLogLevel::Warn, "w"));
+        handle.set_level(LogShipLevel::Off);
+        assert!(handle.take().is_none(), "off ships nothing buffered");
+        assert!(handle.buffered().is_empty());
+
+        handle.set_level(LogShipLevel::Info);
+        handle.push(line(WorkerLogLevel::Info, "i"));
+        handle.push(line(WorkerLogLevel::Error, "e"));
+        handle.set_level(LogShipLevel::Error);
+        let taken = handle.take().expect("the error waits");
+        let texts: Vec<&str> = taken.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["e"]);
+        handle.shipped(&taken);
+        assert!(format!("{handle:?}").contains("in_flight: 0"), "{handle:?}");
+    }
+
+    /// R1 L2: at the cap with every line in flight, an incoming error is the line dropped, and the
+    /// buffer stays within the cap.
+    #[test]
+    fn worker_log_the_cap_holds_when_every_line_is_in_flight() {
+        let handle = ShipHandle::with_cap(2);
+        handle.push(line(WorkerLogLevel::Error, "e1"));
+        handle.push(line(WorkerLogLevel::Error, "e2"));
+        let taken = handle.take().expect("lines wait");
+        handle.push(line(WorkerLogLevel::Error, "e3"));
+        handle.push(line(WorkerLogLevel::Info, "i1"));
+        assert!(handle.buffered().is_empty(), "{:?}", texts(&handle));
+        assert_eq!(handle.dropped(), 2);
+        handle.restore(taken);
+        assert_eq!(texts(&handle), ["e1", "e2"]);
+    }
+
+    /// R1 L1: a huge field is held at most [`WORKER_LOG_TEXT_MAX`] bytes, with the stored `…`.
+    #[test]
+    fn worker_log_a_huge_line_is_held_capped() {
+        let handle = ShipHandle::new();
+        let huge = "x".repeat(1024 * 1024);
+        captured(&handle, || tracing::warn!(target: "htui", "big {huge}"));
+        let lines = handle.buffered();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].text.len() <= WORKER_LOG_TEXT_MAX,
+            "{}",
+            lines[0].text.len()
+        );
+        assert!(lines[0].text.starts_with("big xxx"));
+        assert!(lines[0].text.ends_with('…'));
+    }
+
+    /// R1 L5: a target the scrubber refuses, bridged or static, is kept as [`WITHHELD_TARGET`].
+    #[test]
+    fn worker_log_a_credential_target_is_withheld() {
+        let handle = ShipHandle::new();
+        let secret = token();
+        captured(&handle, || {
+            tracing::warn!(target: "log", { "log.target" = secret.as_str() }, "bridged");
+            tracing::warn!(target: concat!("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"), "static");
+            tracing::warn!(target: "htui::plain", "plain");
+        });
+        let lines = handle.buffered();
+        let targets: Vec<&str> = lines.iter().map(|l| l.target.as_str()).collect();
+        assert_eq!(targets, [WITHHELD_TARGET, WITHHELD_TARGET, "htui::plain"]);
+        assert_eq!(lines[0].text, "bridged");
+        assert!(!format!("{lines:?}").contains(&secret));
     }
 
     /// Polls `future` once: whether it was ready.
