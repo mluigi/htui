@@ -15,7 +15,7 @@ use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{Claim, CommandRun, CommandRunStatus, Transport};
 use htui_core::prompt::render::HostnameLine;
-use htui_core::scrub::{Scrubber, Unmasked};
+use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
 use htui_core::store::{MemStore, StepFence, WriteStore};
 use htui_mcp::protocol::CallResult;
 use htui_mcp::{ENV_TOKEN, McpClient, McpHost};
@@ -583,6 +583,171 @@ async fn a_fifth_started_command_is_refused() {
     }
     until_gone("sleep 30.5327", Duration::from_secs(5)).await;
     start(&mut client, "echo again").await;
+}
+
+/// MOD-152 R1 F1, D3: a live wait scrubs the whole log before it cuts the tail, so PEM body lines
+/// whose header scrolled above the 20-line tail are withheld with it, not answered.
+#[tokio::test]
+async fn a_live_wait_never_answers_a_pem_body_below_its_header() {
+    const PATTERN: &str = "sleep 30.5331";
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let (_lease, mut client) = open(&host, scope(dir.path())).await;
+    // The command line spells the marker in two halves: the scrubber refuses it whole.
+    let id = start(
+        &mut client,
+        &format!(
+            "printf -- '-----BEGIN RSA PRIVATE %s-----\\n' KEY; \
+             for i in $(seq 1 30); do echo MIIbody$i; done; {PATTERN}"
+        ),
+    )
+    .await;
+    until_alive(PATTERN).await;
+
+    let seen = ok(&call(
+        &mut client,
+        "command_wait",
+        json!({"command_run_id": id, "deadline": deadline(2), "pattern": "MIIbody30"}),
+    )
+    .await);
+    assert!(
+        !seen.to_string().contains("MIIbody"),
+        "the key leaked: {seen}"
+    );
+    assert_eq!(seen["matched"], json!(false), "{seen}");
+    assert_eq!(
+        seen["tail"],
+        json!("[log withheld: it matched credential rule private_key_pem]\n")
+    );
+
+    ok(&call(&mut client, "command_cancel", json!({"command_run_id": id})).await);
+    until_gone(PATTERN, Duration::from_secs(5)).await;
+}
+
+/// MOD-152 R1 F1, D3: a known secret straddling the 4 KiB cut of a long last line is masked
+/// before the cut, so no part of it is answered.
+#[tokio::test]
+async fn a_live_wait_never_answers_the_end_of_a_secret_the_tail_cut() {
+    const PATTERN: &str = "sleep 30.5332";
+    const SECRET: &str = "secret-5332-abcdef";
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store).with_scrubber(Arc::new(MinimalScrubber::new([SECRET.to_owned()])));
+    let (_lease, mut client) = open(&host, scope(dir.path())).await;
+    // The tail keeps the last 4095 bytes of the line: the secret's last 9 and 4086 `b`s.
+    let id = start(
+        &mut client,
+        &format!(
+            "head -c 100 /dev/zero | tr '\\0' a; printf 'secret-5332-%s' abcdef; \
+             head -c 4086 /dev/zero | tr '\\0' b; echo; {PATTERN}"
+        ),
+    )
+    .await;
+    until_alive(PATTERN).await;
+
+    let seen = ok(&call(
+        &mut client,
+        "command_wait",
+        json!({"command_run_id": id, "deadline": deadline(2), "pattern": "bbbb$"}),
+    )
+    .await);
+    assert_eq!(seen["matched"], json!(true), "{seen}");
+    for field in ["tail", "line"] {
+        let text = seen[field].as_str().expect("a text");
+        assert!(
+            !text.contains("abcdef"),
+            "{field} leaked the secret: {text}"
+        );
+        assert!(!text.contains("32-ab"), "{field} leaked the secret: {text}");
+    }
+
+    ok(&call(&mut client, "command_cancel", json!({"command_run_id": id})).await);
+    until_gone(PATTERN, Duration::from_secs(5)).await;
+}
+
+/// MOD-152 R1 F2: line numbers count the command's output from its first line, also once the
+/// log passed 2 MiB and slides: a wait from the last answer's `next_line` finds the next line,
+/// and a read numbers it the same way, live and stored.
+#[tokio::test]
+async fn line_numbers_stay_absolute_past_the_log_cap() {
+    const PATTERN: &str = "sleep 30.5333";
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let (_lease, mut client) = open(&host, scope(dir.path())).await;
+    let id = start(
+        &mut client,
+        &format!(
+            "seq 1 600000; echo checkpoint-5333; sleep 2; seq 1 250000; echo marker-5333; \
+             {PATTERN}"
+        ),
+    )
+    .await;
+
+    let first = ok(&call(
+        &mut client,
+        "command_wait",
+        json!({"command_run_id": id, "deadline": deadline(60), "pattern": "^checkpoint-5333$"}),
+    )
+    .await);
+    assert_eq!(first["matched"], json!(true), "{first}");
+    assert_eq!(first["line_no"], json!(600_001));
+    assert_eq!(first["next_line"], json!(600_001));
+
+    let second = ok(&call(
+        &mut client,
+        "command_wait",
+        json!({
+            "command_run_id": id,
+            "deadline": deadline(60),
+            "pattern": "^marker-5333$",
+            "after_line": first["next_line"],
+        }),
+    )
+    .await);
+    assert_eq!(second["matched"], json!(true), "{second}");
+    assert_eq!(second["line_no"], json!(850_002));
+    assert_eq!(second["total_lines"], json!(850_002));
+    assert_eq!(second["status"], json!("running"));
+
+    let live = ok(&call(
+        &mut client,
+        "command_output_read",
+        json!({"command_run_id": id, "pattern": "^marker-5333$", "context": 1}),
+    )
+    .await);
+    assert_eq!(live["status"], json!("running"), "{live}");
+    assert_eq!(live["text"], json!("850001-250000\n850002:marker-5333\n"));
+    assert_eq!(live["total_lines"], json!(850_002));
+    let range = ok(&call(
+        &mut client,
+        "command_output_read",
+        json!({"command_run_id": id, "from_line": 850_000, "to_line": 850_001}),
+    )
+    .await);
+    assert_eq!(range["text"], json!("249999\n250000\n"), "{range}");
+    assert_eq!(range["first_line"], json!(850_000));
+
+    ok(&call(&mut client, "command_cancel", json!({"command_run_id": id})).await);
+    until_gone(PATTERN, Duration::from_secs(5)).await;
+    let stored = ok(&call(
+        &mut client,
+        "command_output_read",
+        json!({"command_run_id": id, "pattern": "^marker-5333$", "context": 0}),
+    )
+    .await);
+    assert_eq!(stored["status"], json!("cancelled"), "{stored}");
+    assert_eq!(stored["text"], json!("850002:marker-5333\n"));
+    assert_eq!(stored["total_lines"], json!(850_002));
+    assert_eq!(stored["log_truncated"], json!(true));
+    let tail = ok(&call(
+        &mut client,
+        "command_output_read",
+        json!({"command_run_id": id, "tail_lines": 1}),
+    )
+    .await);
+    assert_eq!(tail["first_line"], json!(850_002), "{tail}");
 }
 
 /// D8: a deadline that is not an RFC 3339 time, and a pattern that does not compile, are refused.

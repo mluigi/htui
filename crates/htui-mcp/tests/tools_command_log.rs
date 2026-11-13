@@ -171,18 +171,43 @@ async fn a_long_log_keeps_a_capped_tail_on_a_line_boundary() {
         log.text.len()
     );
     let mut lines = log.text.lines();
-    assert_eq!(lines.next(), Some("[… earlier output truncated]"));
     let first: u64 = lines
-        .next()
+        .nth(1)
         .and_then(|line| line.parse().ok())
         .expect("a whole number opens the tail");
     assert!(first > 1, "the head was dropped");
+    // MOD-152 R1 F2: the truncation line says which lines it stands for.
+    assert_eq!(
+        log.text.lines().next(),
+        Some(format!("[… earlier output truncated] (lines 1-{})", first - 1).as_str())
+    );
     assert!(log.text.ends_with("500000\n"));
     assert!(log.total_bytes > COMMAND_LOG_CAP as u64);
 
     let tail = ok(&read(&mut client, json!({"tail_lines": 2})).await);
     assert_eq!(tail["text"], json!("499999\n500000\n"));
     assert_eq!(tail["log_truncated"], json!(true));
+    // Lines are the output's own: line N of `seq` is N.
+    assert_eq!(tail["first_line"], json!(499_999));
+    assert_eq!(tail["total_lines"], json!(500_000));
+    let range = ok(&read(
+        &mut client,
+        json!({"from_line": first, "to_line": first + 1}),
+    )
+    .await);
+    assert_eq!(
+        range["text"],
+        json!(format!("{first}\n{}\n", first + 1)),
+        "{range}"
+    );
+    let marker = ok(&read(&mut client, json!({"from_line": 1, "to_line": first})).await);
+    assert_eq!(marker["first_line"], json!(first - 1), "{marker}");
+    assert!(
+        marker["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[… earlier output truncated] (lines 1-")),
+        "{marker}"
+    );
 }
 
 /// A tail read answers the last lines, in order, with their numbers.

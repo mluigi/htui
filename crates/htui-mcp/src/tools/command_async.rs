@@ -12,11 +12,13 @@
 //!
 //! `command_wait` answers when the row is terminal, a line matching `pattern` appears after
 //! `after_line`, or the deadline (clamped to [`MAX_WAIT`]) passes. A live row of the session is read
-//! from the registry, every other row of the run from the store (D5). Every text it answers is
-//! scrubbed, fail closed (D3); a pattern is matched on the scrubbed text only.
+//! from the registry, every other row of the run from the store (D5). The log is scrubbed as one
+//! text, fail closed, before its tail, its matched line or a pattern sees it (D3, MOD-152 R1 F1);
+//! a running row's scrubbed log is kept until it grows (R1 F5). Line numbers are those of the
+//! command's output (R1 F2).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -29,13 +31,19 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::command::{Checked, CommandArgs, Runner, Watch, check, class_limit, tick};
-use super::command_log::{LogBuffer, Mode, SharedLog, compile, cut_head, scrub, slice, withheld};
+use super::command_log::{
+    LogBuffer, Mode, ScrubbedLog, SharedLog, compile, cut_head, scrub, slice, withheld,
+};
 use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of, store_error};
 use crate::host::Session;
 use crate::protocol::Progress;
 
 /// D7: the most started commands one session may have queued or running.
 pub(crate) const START_LIMIT: usize = 4;
+
+/// MOD-152 R1 F4: the most ended entries a session's registry keeps; past it the oldest ended
+/// go, and `command_cancel` answers them from the store.
+pub(crate) const ENDED_KEEP: usize = 64;
 
 /// D8: the longest a `command_wait` waits, whatever its deadline.
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(300);
@@ -106,6 +114,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct Live {
     /// The merged output so far; emptied once the row ended and the store holds it.
     log: SharedLog,
+    /// The log as last scrubbed, with the [`LogBuffer::total`] it was read at (R1 F5).
+    view: Mutex<Option<(u64, Arc<ScrubbedLog>)>>,
+    /// When the row ended: the registry lets the oldest ended go first (R1 F4).
+    ended_at: OnceLock<Instant>,
     /// Notified when a line was written or the phase moved.
     changed: Notify,
     /// The phase.
@@ -118,6 +130,8 @@ impl Live {
     fn new(cancel: CancellationToken) -> Self {
         Self {
             log: SharedLog::default(),
+            view: Mutex::new(None),
+            ended_at: OnceLock::new(),
             changed: Notify::new(),
             state: watch::Sender::new(Phase::Queued),
             cancel,
@@ -129,25 +143,46 @@ impl Live {
         *self.state.borrow()
     }
 
-    /// The phase and, while the row has not ended, its complete lines and whether earlier output
-    /// was dropped — read together, so an ended row is never read as an empty running one. Not
-    /// scrubbed: the reader scrubs (D3).
-    pub(crate) fn snapshot(&self) -> (Phase, String, bool) {
-        let log = lock(&self.log);
-        let phase = self.phase();
-        if phase.ended() {
-            return (phase, String::new(), false);
+    /// The phase and, while the row has not ended, its complete lines scrubbed by `scrubber` as
+    /// one text (D3, R1 F1) — read together, so an ended row is never read as an empty running
+    /// one. The lines are copied under the lock and scrubbed outside it, once per size of the
+    /// log (R1 F5).
+    pub(crate) fn snapshot(&self, scrubber: &dyn Scrubber) -> (Phase, Option<Arc<ScrubbedLog>>) {
+        let (phase, total, complete) = {
+            let log = lock(&self.log);
+            let phase = self.phase();
+            if phase.ended() {
+                return (phase, None);
+            }
+            let total = log.total();
+            if let Some((read_at, view)) = lock(&self.view).as_ref()
+                && *read_at == total
+            {
+                return (phase, Some(Arc::clone(view)));
+            }
+            (phase, total, log.complete())
+        };
+        let view = Arc::new(complete.scrubbed(scrubber));
+        // Under the log's lock, so a row that ended meanwhile keeps nothing.
+        let _log = lock(&self.log);
+        if !self.phase().ended() {
+            let mut cached = lock(&self.view);
+            if cached.as_ref().is_none_or(|(read_at, _)| *read_at < total) {
+                *cached = Some((total, Arc::clone(&view)));
+            }
         }
-        let (text, cut) = log.complete_lines();
-        (phase, text, cut)
+        (phase, Some(view))
     }
 
     /// The row ended as `phase`: the log is in the store now, so the memory is let go.
     fn end(&self, phase: Phase) {
         {
             let mut log = lock(&self.log);
+            // Set before the phase, so an ended entry always says when it ended.
+            let _ = self.ended_at.set(Instant::now());
             self.state.send_replace(phase);
             *log = LogBuffer::default();
+            *lock(&self.view) = None;
         }
         self.changed.notify_waiters();
     }
@@ -168,16 +203,46 @@ impl Watch for Live {
     }
 }
 
-/// D7: a session's started commands, by row. An ended entry stays (its log let go), so
-/// `command_cancel` answers how it ended; it no longer counts toward [`START_LIMIT`].
+/// What [`LiveCommands`] holds.
 #[derive(Default)]
-pub(crate) struct LiveCommands(Mutex<HashMap<CommandRunId, Arc<Live>>>);
+struct Registry {
+    /// The entries, by row.
+    entries: HashMap<CommandRunId, Arc<Live>>,
+    /// Every row this session started, its entry kept or let go (R1 F4).
+    started: HashSet<CommandRunId>,
+}
+
+impl Registry {
+    /// R1 F4: lets the oldest ended entries go, past [`ENDED_KEEP`].
+    fn prune(&mut self) {
+        let mut ended: Vec<(Instant, CommandRunId)> = self
+            .entries
+            .iter()
+            .filter_map(|(id, live)| live.ended_at.get().map(|at| (*at, *id)))
+            .collect();
+        let Some(excess) = ended.len().checked_sub(ENDED_KEEP).filter(|n| *n > 0) else {
+            return;
+        };
+        ended.sort_unstable_by_key(|(at, _)| *at);
+        for (_, id) in &ended[..excess] {
+            self.entries.remove(id);
+        }
+    }
+}
+
+/// D7: a session's started commands, by row. An ended entry stays (its log let go), so
+/// `command_cancel` answers how it ended; it no longer counts toward [`START_LIMIT`]. At most
+/// [`ENDED_KEEP`] ended entries stay; the session still knows every row it started (R1 F4).
+#[derive(Default, Clone)]
+pub(crate) struct LiveCommands(Arc<Mutex<Registry>>);
 
 impl LiveCommands {
     /// A new entry `id` stopped by `cancel`, or the [`START_LIMIT`] refusal.
     fn reserve(&self, id: CommandRunId, cancel: CancellationToken) -> Result<Arc<Live>, ToolError> {
-        let mut entries = lock(&self.0);
-        let busy = entries
+        let mut registry = lock(&self.0);
+        registry.prune();
+        let busy = registry
+            .entries
             .values()
             .filter(|live| !live.phase().ended())
             .count();
@@ -187,18 +252,31 @@ impl LiveCommands {
             )));
         }
         let live = Arc::new(Live::new(cancel));
-        entries.insert(id, Arc::clone(&live));
+        registry.entries.insert(id, Arc::clone(&live));
+        registry.started.insert(id);
         Ok(live)
     }
 
     /// Drops the entry `id` (its row was never queued).
     fn forget(&self, id: CommandRunId) {
-        lock(&self.0).remove(&id);
+        let mut registry = lock(&self.0);
+        registry.entries.remove(&id);
+        registry.started.remove(&id);
     }
 
-    /// The entry `id`, if this session started it.
+    /// R1 F4: lets the oldest ended entries go, past [`ENDED_KEEP`].
+    fn prune(&self) {
+        lock(&self.0).prune();
+    }
+
+    /// The entry `id`, if this session started it and still keeps it.
     pub(crate) fn get(&self, id: CommandRunId) -> Option<Arc<Live>> {
-        lock(&self.0).get(&id).cloned()
+        lock(&self.0).entries.get(&id).cloned()
+    }
+
+    /// Whether this session started the row `id`.
+    fn started(&self, id: CommandRunId) -> bool {
+        lock(&self.0).started.contains(&id)
     }
 }
 
@@ -294,6 +372,7 @@ pub(crate) async fn start<S: htui_core::store::WorkerStore + Clone + Send + Sync
     let queued = runner.enqueue(id, checked).await?;
     reserved.armed = false;
     let session_end = session.cancel.clone();
+    let registry = session.commands.clone();
     drop(htui_agent::contained::spawn(async move {
         let halt = async {
             live.cancel.cancelled().await;
@@ -315,6 +394,7 @@ pub(crate) async fn start<S: htui_core::store::WorkerStore + Clone + Send + Sync
             }
         };
         live.end(phase);
+        registry.prune();
     }));
     Ok(id)
 }
@@ -345,7 +425,26 @@ pub(crate) async fn cancel<S: htui_core::store::WorkerStore>(
     session: &Session<S>,
     id: CommandRunId,
 ) -> ToolResult {
-    let live = session.commands.get(id).ok_or_else(|| not_found(id))?;
+    let Some(live) = session.commands.get(id) else {
+        // R1 F4: a row this session started whose entry was let go has ended: the store says how.
+        if !session.commands.started(id) {
+            return Err(not_found(id));
+        }
+        let row = htui_core::store::WorkerStore::command_log_of_run(
+            &session.store,
+            session.scope.run_id,
+            Some(id),
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| not_found(id))?
+        .row;
+        return Ok(json!({
+            "command_run_id": id,
+            "status": row.status.as_str(),
+            "exit_code": row.exit_code,
+        }));
+    };
     live.cancel.cancel();
     let mut state = live.state.subscribe();
     let settled = tokio::time::timeout(SETTLE, state.wait_for(|phase| phase.ended()))
@@ -447,24 +546,23 @@ struct View {
     exit_code: Option<i32>,
     /// Whether the row ended.
     terminal: bool,
-    /// The log so far: complete lines of a live row, the stored text of another (not scrubbed
-    /// yet by this read).
-    text: String,
+    /// The log so far, scrubbed as one text: complete lines of a live row, the stored text of
+    /// another.
+    log: Arc<ScrubbedLog>,
 }
 
 impl<S: htui_core::store::WorkerStore> Source<'_, S> {
-    /// The row now.
-    async fn view(&self) -> Result<View, ToolError> {
-        if let Some(live) = &self.live {
-            let (phase, text, _) = live.snapshot();
-            if !phase.ended() {
-                return Ok(View {
-                    status: phase.status(),
-                    exit_code: None,
-                    terminal: false,
-                    text,
-                });
-            }
+    /// The row now, its log scrubbed by `scrubber`.
+    async fn view(&self, scrubber: &dyn Scrubber) -> Result<View, ToolError> {
+        if let Some(live) = &self.live
+            && let (phase, Some(log)) = live.snapshot(scrubber)
+        {
+            return Ok(View {
+                status: phase.status(),
+                exit_code: None,
+                terminal: false,
+                log,
+            });
         }
         let stored =
             htui_core::store::WorkerStore::command_log_of_run(self.store, self.run, Some(self.id))
@@ -476,7 +574,10 @@ impl<S: htui_core::store::WorkerStore> Source<'_, S> {
             status: status.as_str(),
             exit_code: stored.row.exit_code,
             terminal: !matches!(status, CommandRunStatus::Queued | CommandRunStatus::Running),
-            text: stored.log.map(|log| log.text).unwrap_or_default(),
+            log: Arc::new(match stored.log {
+                Some(log) => ScrubbedLog::of(log.text, log.truncated, scrubber),
+                None => ScrubbedLog::of(String::new(), false, scrubber),
+            }),
         })
     }
 }
@@ -501,8 +602,8 @@ pub(crate) async fn wait<S: htui_core::store::WorkerStore>(
             .as_ref()
             .filter(|live| !live.phase().ended())
             .map(|live| live.changed.notified());
-        let view = source.view().await?;
-        let seen = seen(&view.text, pattern, after, scrubber);
+        let view = source.view(scrubber).await?;
+        let seen = seen(&view.log, pattern, after, scrubber);
         let now = Instant::now();
         let reached = now >= until;
         if seen.matched || view.terminal || reached {
@@ -543,7 +644,7 @@ pub(crate) async fn wait<S: htui_core::store::WorkerStore>(
 pub(crate) struct Seen {
     /// A line after `after` matched.
     pub(crate) matched: bool,
-    /// The matched line's number, counted from 1.
+    /// The matched line's number in the command's output, counted from 1.
     pub(crate) line_no: Option<usize>,
     /// The matched line, scrubbed, cut to [`LINE_BYTES`].
     pub(crate) line: Option<String>,
@@ -551,34 +652,34 @@ pub(crate) struct Seen {
     pub(crate) tail: String,
     /// The `after_line` that goes on after this answer: the match, or the last line read.
     pub(crate) next_line: usize,
-    /// The lines of the log.
+    /// The number of the log's last line.
     pub(crate) total_lines: usize,
 }
 
-/// D3, D8: the first line after `after` that `pattern` matches in `text`, and its tail. The lines
-/// after `after` are scrubbed as one text before they are matched, fail closed: lines that cannot
-/// be masked match nothing.
+/// D3, D8: the first line after `after` that `pattern` matches in `log`, and its tail. The log
+/// was scrubbed as one text before it is cut (MOD-152 R1 F1), and what is cut from it is scrubbed
+/// again on its way out, fail closed; a log that could not be masked matches nothing.
 pub(crate) fn seen(
-    text: &str,
+    log: &ScrubbedLog,
     pattern: Option<&Regex>,
     after: usize,
     scrubber: &dyn Scrubber,
 ) -> Seen {
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
-    let tail = slice(text, &Mode::Tail(TAIL_LINES), TAIL_BYTES).text;
+    let lines: Vec<&str> = log.text.lines().collect();
+    let total_lines = log.offset + lines.len();
+    let tail = slice(&log.text, &Mode::Tail(TAIL_LINES), TAIL_BYTES, log.offset).text;
     let tail = scrub(scrubber, tail).unwrap_or_else(|rule| withheld(&rule));
-    let found = pattern.filter(|_| after < total_lines).and_then(|pattern| {
-        let region: String = lines[after..]
+    let found = pattern.filter(|_| !log.withheld).and_then(|pattern| {
+        lines
             .iter()
-            .flat_map(|line| [*line, "\n"])
-            .collect();
-        let clean = scrub(scrubber, region).ok()?;
-        clean
-            .lines()
             .enumerate()
+            .skip(after.saturating_sub(log.offset))
             .find(|(_, line)| pattern.is_match(line))
-            .map(|(index, line)| (after + index + 1, cut_head(line, LINE_BYTES).to_owned()))
+            .map(|(index, line)| {
+                let line = cut_head(line, LINE_BYTES).to_owned();
+                let line = scrub(scrubber, line).unwrap_or_else(|rule| withheld(&rule));
+                (log.offset + index + 1, line)
+            })
     });
     match found {
         Some((line_no, line)) => Seen {
@@ -619,15 +720,21 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        LiveCommands, MAX_WAIT, Phase, START_LIMIT, Source, budget, cancel, seen, start, wait,
+        ENDED_KEEP, LiveCommands, MAX_WAIT, Phase, START_LIMIT, Source, budget, cancel, seen,
+        start, wait,
     };
     use crate::host::Session;
     use crate::tools::HostCaps;
     use crate::tools::command::{CommandArgs, check};
-    use crate::tools::command_log::compile;
+    use crate::tools::command_log::{ScrubbedLog, compile, truncated_line};
 
     fn scrubber() -> MinimalScrubber {
         MinimalScrubber::new(["secret-4f1e".to_owned()])
+    }
+
+    /// `text` as a reader serves it: scrubbed whole.
+    fn log(text: &str) -> ScrubbedLog {
+        ScrubbedLog::of(text.to_owned(), false, &scrubber())
     }
 
     /// A session on the demo's `R2/prd` step and box, never connected to a client.
@@ -767,6 +874,77 @@ mod tests {
             .expect("an ended entry frees its place");
     }
 
+    /// MOD-152 R1 F2: past the cap a log's lines keep the numbers the command printed them
+    /// under: `after_line` and the matched line count from the output's first line.
+    #[test]
+    fn a_pattern_counts_lines_from_the_offset() {
+        let text = format!("{}c\nready\n", truncated_line(41));
+        let log = ScrubbedLog::of(text, true, &scrubber());
+        let pattern = compile("^ready$").expect("a pattern");
+        let found = seen(&log, Some(&pattern), 42, &scrubber());
+        assert_eq!(
+            (found.line_no, found.next_line, found.total_lines),
+            (Some(43), 43, 43)
+        );
+        assert!(!seen(&log, Some(&pattern), 43, &scrubber()).matched);
+        assert_eq!(seen(&log, Some(&pattern), 3, &scrubber()).line_no, Some(43));
+    }
+
+    /// MOD-152 R1 F4: the registry keeps at most `ENDED_KEEP` ended entries, the oldest ended
+    /// going first; `command_cancel` on a row whose entry went answers its stored status, and a
+    /// row never started here is still not found. Real `true` children, in real time.
+    #[tokio::test]
+    async fn the_registry_lets_the_oldest_ended_entries_go() {
+        let store = MemStore::demo();
+        let session = session(&store);
+        let mut started = Vec::new();
+        for _ in 0..ENDED_KEEP + 6 {
+            let id = start(&session, checked(&session, "true"), 1)
+                .await
+                .expect("started");
+            let mut state = session
+                .commands
+                .get(id)
+                .expect("an entry")
+                .state
+                .subscribe();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                state.wait_for(|phase| phase.ended()),
+            )
+            .await
+            .expect("the row ended in time")
+            .expect("the entry");
+            started.push(id);
+        }
+        // The last task prunes after it ends; give it the moment it needs.
+        let registry = &session.commands;
+        for _ in 0..100 {
+            if registry.get(started[5]).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let kept: Vec<bool> = started
+            .iter()
+            .map(|id| registry.get(*id).is_some())
+            .collect();
+        assert_eq!(kept.iter().filter(|kept| **kept).count(), ENDED_KEEP);
+        assert!(
+            kept[..6].iter().all(|kept| !kept),
+            "the oldest went: {kept:?}"
+        );
+
+        let answer = cancel(&session, started[0]).await.expect("an answer");
+        assert_eq!(answer["status"], json!("done"), "{answer}");
+        assert_eq!(answer["exit_code"], json!(0));
+        assert_eq!(answer["command_run_id"], json!(started[0]));
+        assert!(
+            cancel(&session, CommandRunId::new()).await.is_err(),
+            "a row the session did not start is not found"
+        );
+    }
+
     /// D8: a deadline is clamped to `MAX_WAIT`, and one already passed waits not at all.
     #[test]
     fn the_wait_budget_is_clamped() {
@@ -785,18 +963,18 @@ mod tests {
     fn a_pattern_matches_after_the_line_asked_for() {
         let text = "ready 1\nnoise\nready 2\nsecret-4f1e ready\n";
         let pattern = compile("^ready").expect("a pattern");
-        let first = seen(text, Some(&pattern), 0, &scrubber());
+        let first = seen(&log(text), Some(&pattern), 0, &scrubber());
         assert_eq!(
             (first.matched, first.line_no, first.line.as_deref()),
             (true, Some(1), Some("ready 1"))
         );
         assert_eq!((first.next_line, first.total_lines), (1, 4));
-        let second = seen(text, Some(&pattern), first.next_line, &scrubber());
+        let second = seen(&log(text), Some(&pattern), first.next_line, &scrubber());
         assert_eq!(
             (second.line_no, second.line.as_deref()),
             (Some(3), Some("ready 2"))
         );
-        let none = seen(text, Some(&pattern), 3, &scrubber());
+        let none = seen(&log(text), Some(&pattern), 3, &scrubber());
         assert!(!none.matched);
         assert_eq!(none.next_line, 4);
         assert_eq!(
@@ -804,7 +982,7 @@ mod tests {
             "the tail is scrubbed"
         );
         let masked = seen(
-            text,
+            &log(text),
             Some(&compile("secret").expect("a pattern")),
             0,
             &scrubber(),
@@ -826,7 +1004,9 @@ mod tests {
             }
         }
         let pattern = compile("x").expect("a pattern");
-        let seen = seen("x\n", Some(&pattern), 0, &Refuses);
+        let unmasked = ScrubbedLog::of("x\n".to_owned(), false, &Refuses);
+        assert!(unmasked.withheld);
+        let seen = seen(&unmasked, Some(&pattern), 0, &Refuses);
         assert!(!seen.matched);
         assert_eq!(
             seen.tail,

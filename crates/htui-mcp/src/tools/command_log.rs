@@ -5,9 +5,12 @@
 //! most [`COMMAND_LOG_CAP`] bytes, opening with the executor's truncation line when earlier output
 //! was dropped and starting on a line boundary, scrubbed as one text and fail closed (D3). The
 //! tool answers a slice of it: the last lines, a line range, or the lines matching a pattern, at
-//! most `max_bytes`. Line numbers count the lines of the stored text, the truncation line being
-//! the first of a cut log. The read is scoped to the caller's run (D5); a command the session
-//! started and that still runs is read from its live log (MOD-152 T5).
+//! most `max_bytes`. Line numbers are those of the command's output, counted from its first line
+//! (MOD-152 R1 F2): a cut log's truncation line says which lines it stands for
+//! ([`truncated_line`]) and takes the number of the last of them, so a line keeps its number
+//! while the live log slides and once the log is stored. The read is scoped to the caller's run
+//! (D5); a command the session started and that still runs is read from its live log (MOD-152
+//! T5).
 
 use std::sync::Mutex;
 
@@ -19,8 +22,73 @@ use serde_json::{Value, json};
 
 use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of, store_error};
 
-/// The line a cut log opens with (the executor's own, OQ-7).
+/// The line a cut row output opens with (the executor's own, OQ-7).
 pub(crate) const TRUNCATED: &str = "[… earlier output truncated]\n";
+
+/// How a cut log's truncation line opens: [`TRUNCATED`]'s text, then the lines it stands for.
+const TRUNCATED_LINES: &str = "[… earlier output truncated] (lines 1-";
+
+/// How a withheld log opens.
+const WITHHELD: &str = "[log withheld: it matched credential rule ";
+
+/// MOD-152 R1 F2: the line a cut log opens with, standing for its `dropped` first lines (at
+/// least one: the cut dropped a line, or the start of one).
+pub(crate) fn truncated_line(dropped: usize) -> String {
+    format!("{TRUNCATED_LINES}{})\n", dropped.max(1))
+}
+
+/// What a line's place in `text` (counted from 1) adds up to its line number in the command's
+/// output: the lines a cut log's truncation line stands for, but the one it takes itself.
+fn offset_of(text: &str, truncated: bool) -> usize {
+    if !truncated {
+        return 0;
+    }
+    text.strip_prefix(TRUNCATED_LINES)
+        .and_then(|rest| rest.split_once(')'))
+        .and_then(|(dropped, _)| dropped.parse::<usize>().ok())
+        .map_or(0, |dropped| dropped.saturating_sub(1))
+}
+
+/// A log as a reader serves it (D3, MOD-152 R1 F1): scrubbed as one text, fail closed, before any
+/// slice of it is taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScrubbedLog {
+    /// The text; a cut log opens with its [`truncated_line`], an unmaskable one is the withheld
+    /// line.
+    pub(crate) text: String,
+    /// Earlier output was dropped.
+    pub(crate) truncated: bool,
+    /// The text could not be masked: it is the withheld line, which matches no pattern.
+    pub(crate) withheld: bool,
+    /// What a line's place in `text` adds up to its line number in the command's output (F2).
+    pub(crate) offset: usize,
+}
+
+impl ScrubbedLog {
+    /// `text` scrubbed by `scrubber`, or the withheld line.
+    pub(crate) fn of(text: String, truncated: bool, scrubber: &dyn Scrubber) -> Self {
+        match scrub(scrubber, text) {
+            Ok(text) => Self {
+                offset: offset_of(&text, truncated),
+                // A stored log the runner withheld stays withheld.
+                withheld: text.starts_with(WITHHELD) && !text.contains('\n'),
+                text,
+                truncated,
+            },
+            Err(rule) => Self {
+                text: withheld(&rule),
+                truncated,
+                withheld: true,
+                offset: 0,
+            },
+        }
+    }
+
+    /// The number of the log's last line.
+    pub(crate) fn total_lines(&self) -> usize {
+        self.offset + self.text.lines().count()
+    }
+}
 
 /// Lines a tail read answers when it names no mode.
 const DEFAULT_TAIL: usize = 200;
@@ -87,46 +155,49 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
                 .map_err(|_| refuse(&format!("command_run_id `{text}` is not an id")))?,
         ),
     };
-    let stored =
+    let scrubber = session.scrubber.as_ref();
+    let read_store = |id| async move {
         htui_core::store::WorkerStore::command_log_of_run(&session.store, session.scope.run_id, id)
             .await
             .map_err(store_error)?
-            .ok_or_else(|| ToolError(NO_LOG.to_owned()))?;
+            .ok_or_else(|| ToolError(NO_LOG.to_owned()))
+    };
+    let mut stored = read_store(id).await?;
+    let row_id = stored.row.id;
     // MOD-152 T5: a command this session started and that still runs is read from its live log,
-    // complete lines only, scrubbed as one text before a pattern sees it (D3).
+    // complete lines only, scrubbed as one text before a pattern sees it (D3). R1 F3: a row that
+    // ended since the store was read has its log and status in the store now: read it again.
     let live = session
         .commands
-        .get(stored.row.id)
-        .map(|live| live.snapshot())
-        .filter(|(phase, _, _)| !phase.ended());
-    let (text, log_truncated, status, exit_code) = match live {
-        Some((phase, text, cut)) => {
-            let text =
-                scrub(session.scrubber.as_ref(), text).unwrap_or_else(|rule| withheld(&rule));
-            (text, cut, phase.status(), None)
-        }
-        None => {
+        .get(row_id)
+        .map(|live| live.snapshot(scrubber));
+    let (log, status, exit_code) = match live {
+        Some((phase, Some(log))) => (log, phase.status(), None),
+        live => {
+            if live.is_some() {
+                stored = read_store(Some(row_id)).await?;
+            }
             let log = stored.log.ok_or_else(|| ToolError(NO_LOG.to_owned()))?;
             (
-                log.text,
-                log.truncated,
+                std::sync::Arc::new(ScrubbedLog::of(log.text, log.truncated, scrubber)),
                 stored.row.status.as_str(),
                 stored.row.exit_code,
             )
         }
     };
+    let log_truncated = log.truncated;
 
-    let total_lines = text.lines().count();
-    let mut slice = slice(&text, &mode, max_bytes);
+    let total_lines = log.total_lines();
+    let mut slice = slice(&log.text, &mode, max_bytes, log.offset);
     // D3: the stored text was scrubbed; the slice is scrubbed again on its way out, fail closed.
-    match scrub(session.scrubber.as_ref(), slice.text) {
+    match scrub(scrubber, slice.text) {
         Ok(text) => slice.text = text,
         Err(rule) => {
             slice.text = withheld(&rule);
         }
     }
     Ok(json!({
-        "command_run_id": stored.row.id,
+        "command_run_id": row_id,
         "status": status,
         "exit_code": exit_code,
         "total_lines": total_lines,
@@ -325,8 +396,10 @@ fn cut_tail(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
-/// The slice of `text` that `mode` names, within `max_bytes`.
-pub(crate) fn slice(text: &str, mode: &Mode, max_bytes: usize) -> Slice {
+/// The slice of `text` that `mode` names, within `max_bytes`. A line's number is its place in
+/// `text` plus `offset` (MOD-152 R1 F2): a range names those numbers, and the slice answers
+/// them.
+pub(crate) fn slice(text: &str, mode: &Mode, max_bytes: usize, offset: usize) -> Slice {
     let lines: Vec<&str> = text.lines().collect();
     let mut emit = Emit::new(max_bytes);
     match mode {
@@ -342,20 +415,21 @@ pub(crate) fn slice(text: &str, mode: &Mode, max_bytes: usize) -> Slice {
                 // Not even the last line fits whole: its tail is the answer.
                 if let Some(last) = lines.last() {
                     let kept = cut_tail(last, max_bytes.saturating_sub(1));
-                    emit.push(lines.len(), "", "", kept);
+                    emit.push(offset + lines.len(), "", "", kept);
                     emit.capped = true;
                 }
             } else {
                 for (index, line) in lines.iter().enumerate().skip(start) {
-                    emit.line(index + 1, "", "", line);
+                    emit.line(offset + index + 1, "", "", line);
                 }
                 emit.capped = start > wanted;
             }
         }
         Mode::Range(from, to) => {
-            let end = (*to).min(lines.len());
-            for number in *from..=end {
-                if !emit.line(number, "", "", lines[number - 1]) {
+            let first = from.saturating_sub(offset).max(1);
+            let end = to.saturating_sub(offset).min(lines.len());
+            for place in first..=end {
+                if !emit.line(offset + place, "", "", lines[place - 1]) {
                     break;
                 }
             }
@@ -381,8 +455,9 @@ pub(crate) fn slice(text: &str, mode: &Mode, max_bytes: usize) -> Slice {
                         ""
                     };
                     let mark = if pattern.is_match(line) { ':' } else { '-' };
-                    let prefix = format!("{}{mark}", index + 1);
-                    if !emit.line(index + 1, separator, &prefix, line) {
+                    let number = offset + index + 1;
+                    let prefix = format!("{number}{mark}");
+                    if !emit.line(number, separator, &prefix, line) {
                         break 'groups;
                     }
                 }
@@ -410,8 +485,8 @@ pub(crate) fn withheld(rule: &str) -> String {
 }
 
 /// The merged output of one command while it runs (D2): the tail of at most [`COMMAND_LOG_CAP`]
-/// bytes, plus the size of everything written to it. A running command's reader asks
-/// [`complete_lines`](Self::complete_lines); the runner ends it with
+/// bytes, plus the size of everything written to it and the lines dropped from its front. A
+/// running command's reader asks [`complete`](Self::complete); the runner ends it with
 /// [`into_stored`](Self::into_stored).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct LogBuffer {
@@ -419,6 +494,8 @@ pub(crate) struct LogBuffer {
     bytes: Vec<u8>,
     /// Every byte pushed.
     total: u64,
+    /// The newlines dropped from the front of `bytes` (MOD-152 R1 F2).
+    dropped: usize,
     /// Earlier output was dropped from the front of `bytes`.
     cut: bool,
     /// What `bytes` starts with is the middle of a line.
@@ -427,6 +504,37 @@ pub(crate) struct LogBuffer {
 
 /// A shared, lockable [`LogBuffer`]: the sink writes it, the runner and a reader read it.
 pub(crate) type SharedLog = Mutex<LogBuffer>;
+
+/// The newlines in `bytes`.
+fn newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+}
+
+/// A running command's complete lines, copied out of its [`LogBuffer`] so that they are decoded
+/// and scrubbed outside its lock (MOD-152 R1 F5).
+#[derive(Debug)]
+pub(crate) struct Complete {
+    /// The whole lines of the tail.
+    bytes: Vec<u8>,
+    /// Earlier output was dropped.
+    cut: bool,
+    /// The lines of output before `bytes`.
+    dropped: usize,
+}
+
+impl Complete {
+    /// The lines as a log opens (with the truncation line when they are a tail), scrubbed as one
+    /// text, fail closed (D3, R1 F1). A NUL is U+FFFD.
+    pub(crate) fn scrubbed(self, scrubber: &dyn Scrubber) -> ScrubbedLog {
+        let body = decode(&self.bytes);
+        let text = if self.cut {
+            format!("{}{body}", truncated_line(self.dropped))
+        } else {
+            body
+        };
+        ScrubbedLog::of(text, self.cut, scrubber)
+    }
+}
 
 impl LogBuffer {
     /// Appends a chunk of the command's output.
@@ -437,67 +545,74 @@ impl LogBuffer {
             let cut = self.bytes.len() - COMMAND_LOG_CAP;
             self.partial = self.bytes[cut - 1] != b'\n';
             self.cut = true;
+            self.dropped += newlines(&self.bytes[..cut]);
             self.bytes.drain(..cut);
         }
     }
 
-    /// The last [`COMMAND_LOG_CAP`] bytes, from a line boundary when that cut anything; whether
-    /// earlier output is missing.
-    fn tail(&self) -> (&[u8], bool) {
-        let (mut bytes, mut cut, mut partial) = (self.bytes.as_slice(), self.cut, self.partial);
-        if bytes.len() > COMMAND_LOG_CAP {
-            let start = bytes.len() - COMMAND_LOG_CAP;
-            partial = bytes[start - 1] != b'\n';
-            cut = true;
-            bytes = &bytes[start..];
-        }
-        if cut
-            && partial
-            && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
-        {
-            bytes = &bytes[newline + 1..];
-        }
-        (bytes, cut)
+    /// Every byte pushed so far.
+    pub(crate) const fn total(&self) -> u64 {
+        self.total
     }
 
-    /// The output so far, whole lines only, as a log opens: with the truncation line when it is
-    /// a tail. Not scrubbed: the reader scrubs the slice it serves (D3). A NUL is U+FFFD.
-    pub(crate) fn complete_lines(&self) -> (String, bool) {
-        let (bytes, cut) = self.tail();
-        let whole = bytes
+    /// Where in `bytes` the last [`COMMAND_LOG_CAP`] bytes start, from a line boundary when that
+    /// cut anything — with nothing of a line the cut split (MOD-152 R1 F6: a line over the cap
+    /// is dropped, never kept from its middle); whether earlier output is missing.
+    fn tail_start(&self) -> (usize, bool) {
+        let (mut start, mut cut, mut partial) = (0, self.cut, self.partial);
+        if self.bytes.len() > COMMAND_LOG_CAP {
+            start = self.bytes.len() - COMMAND_LOG_CAP;
+            partial = self.bytes[start - 1] != b'\n';
+            cut = true;
+        }
+        if cut && partial {
+            start = self.bytes[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(self.bytes.len(), |newline| start + newline + 1);
+        }
+        (start, cut)
+    }
+
+    /// The output so far, whole lines only, and the lines before them; not decoded nor scrubbed
+    /// yet: [`Complete::scrubbed`] does that once the lock is let go.
+    pub(crate) fn complete(&self) -> Complete {
+        let (start, cut) = self.tail_start();
+        let bytes = &self.bytes[start..];
+        let end = bytes
             .iter()
             .rposition(|byte| *byte == b'\n')
-            .map_or(&[][..], |last| &bytes[..=last]);
-        let body = decode(whole);
-        (
-            if cut {
-                format!("{TRUNCATED}{body}")
-            } else {
-                body
-            },
+            .map_or(0, |last| last + 1);
+        Complete {
+            bytes: bytes[..end].to_vec(),
             cut,
-        )
+            dropped: self.dropped + newlines(&self.bytes[..start]),
+        }
     }
 
     /// The row's log (D2, D3): the tail within the cap, scrubbed as one text, fail closed — a text
-    /// that cannot be masked is stored as the rule that stopped it.
+    /// that cannot be masked is stored as the rule that stopped it. A cut log opens with the
+    /// [`truncated_line`] of the lines it dropped (R1 F2).
     pub(crate) fn into_stored(
         self,
         scrubber: &dyn Scrubber,
         command_run_id: CommandRunId,
         now: DateTime<Utc>,
     ) -> CommandLog {
-        let (bytes, mut truncated) = self.tail();
+        let (start, mut truncated) = self.tail_start();
+        let mut dropped = self.dropped + newlines(&self.bytes[..start]);
         // Decoding can grow a text (U+FFFD is three bytes), and so can masking: the cap is kept
         // on the text that is stored.
-        let (body, cut) = cap_tail(decode(bytes), COMMAND_LOG_CAP);
+        let (body, cut, lines) = cap_tail(decode(&self.bytes[start..]), COMMAND_LOG_CAP);
         truncated |= cut;
+        dropped += lines;
         let text = match scrub(scrubber, body) {
             Ok(body) => {
-                let (body, cut) = cap_tail(body, COMMAND_LOG_CAP);
+                let (body, cut, lines) = cap_tail(body, COMMAND_LOG_CAP);
                 truncated |= cut;
+                dropped += lines;
                 if truncated {
-                    format!("{TRUNCATED}{body}")
+                    format!("{}{body}", truncated_line(dropped))
                 } else {
                     body
                 }
@@ -519,18 +634,21 @@ fn decode(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace('\0', "\u{fffd}")
 }
 
-/// `text` cut to its last `max` bytes, from a line boundary; whether it was cut.
-fn cap_tail(text: String, max: usize) -> (String, bool) {
+/// `text` cut to its last `max` bytes, from a line boundary, with nothing of a line the cut split
+/// (MOD-152 R1 F6); whether it was cut, and the lines it dropped.
+fn cap_tail(text: String, max: usize) -> (String, bool, usize) {
     if text.len() <= max {
-        return (text, false);
+        return (text, false, 0);
     }
     let kept = cut_tail(&text, max);
-    let boundary = text.as_bytes()[text.len() - kept.len() - 1] == b'\n';
-    let kept = match kept.find('\n') {
-        Some(newline) if !boundary => &kept[newline + 1..],
-        _ => kept,
-    };
-    (kept.to_owned(), true)
+    let mut start = text.len() - kept.len();
+    if text.as_bytes()[start - 1] != b'\n' {
+        start = kept
+            .find('\n')
+            .map_or(text.len(), |newline| start + newline + 1);
+    }
+    let lines = newlines(&text.as_bytes()[..start]);
+    (text[start..].to_owned(), true, lines)
 }
 
 #[cfg(test)]
@@ -540,7 +658,7 @@ mod tests {
     use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
     use serde_json::Value;
 
-    use super::{LogBuffer, Mode, TRUNCATED, slice};
+    use super::{LogBuffer, Mode, ScrubbedLog, TRUNCATED_LINES, slice, truncated_line};
 
     /// Masks `secret-9d8e7f`; what the real scrubber does with a known value.
     fn scrubber() -> MinimalScrubber {
@@ -549,6 +667,20 @@ mod tests {
 
     fn stored(buffer: LogBuffer) -> htui_core::model::CommandLog {
         buffer.into_stored(&scrubber(), CommandRunId::new(), Utc::now())
+    }
+
+    /// A cut log's dropped line count and the lines under its truncation line.
+    fn cut_body(text: &str) -> (usize, &str) {
+        let rest = text
+            .strip_prefix(TRUNCATED_LINES)
+            .expect("the truncation line opens it");
+        let (dropped, body) = rest.split_once(")\n").expect("a whole truncation line");
+        (dropped.parse().expect("a count"), body)
+    }
+
+    /// What a reader of the running command sees.
+    fn live(buffer: &LogBuffer) -> ScrubbedLog {
+        buffer.complete().scrubbed(&scrubber())
     }
 
     /// `1\n2\n...` up to `last`.
@@ -580,16 +712,15 @@ mod tests {
         let log = stored(buffer);
         assert!(log.truncated);
         assert_eq!(log.total_bytes, total);
-        assert!(log.text.len() <= COMMAND_LOG_CAP + TRUNCATED.len());
+        assert!(log.text.len() <= COMMAND_LOG_CAP + truncated_line(600_000).len());
         assert!(log.text.len() <= COMMAND_LOG_STORE_MAX);
-        let body = log
-            .text
-            .strip_prefix(TRUNCATED)
-            .expect("the marker opens it");
+        let (dropped, body) = cut_body(&log.text);
         let first = body.lines().next().expect("a line");
-        assert!(
-            first.parse::<u32>().is_ok(),
-            "a whole line opens the tail: {first}"
+        // MOD-152 R1 F2: the truncation line counts the lines before the first one kept.
+        assert_eq!(
+            first.parse::<usize>().ok(),
+            Some(dropped + 1),
+            "a whole line opens the tail"
         );
         assert!(body.ends_with("600000\n"));
         // The tail is contiguous: every number follows the one before.
@@ -609,8 +740,9 @@ mod tests {
             buffer.push(line.as_bytes());
         }
         let log = stored(buffer);
-        let body = log.text.strip_prefix(TRUNCATED).expect("a cut log");
+        let (dropped, body) = cut_body(&log.text);
         assert_eq!(body.len(), COMMAND_LOG_CAP, "the cap falls on a line");
+        assert_eq!(dropped, 5);
         assert!(body.lines().all(|line| line.len() == 1023));
     }
 
@@ -669,28 +801,119 @@ mod tests {
     #[test]
     fn complete_lines_hold_back_the_line_still_being_written() {
         let mut buffer = LogBuffer::default();
-        assert_eq!(buffer.complete_lines(), (String::new(), false));
+        assert_eq!(live(&buffer).text, "");
         buffer.push(b"one\ntw");
-        assert_eq!(buffer.complete_lines(), ("one\n".to_owned(), false));
+        assert_eq!(live(&buffer).text, "one\n");
         buffer.push(b"o\n");
-        assert_eq!(buffer.complete_lines(), ("one\ntwo\n".to_owned(), false));
+        let log = live(&buffer);
+        assert_eq!((log.text.as_str(), log.truncated), ("one\ntwo\n", false));
     }
 
+    /// MOD-152 R1 F2: a cut live log numbers its lines as the command printed them.
     #[test]
-    fn complete_lines_of_a_cut_log_open_with_the_marker() {
+    fn complete_lines_of_a_cut_log_open_with_the_marker_and_keep_their_numbers() {
         let mut buffer = LogBuffer::default();
-        buffer.push(&numbers(600_000));
+        for chunk in numbers(600_000).chunks(65_536) {
+            buffer.push(chunk);
+        }
         buffer.push(b"par");
-        let (text, cut) = buffer.complete_lines();
-        assert!(cut);
-        assert!(text.starts_with(TRUNCATED));
-        assert!(text.ends_with("600000\n"), "the partial line is held back");
+        let log = live(&buffer);
+        assert!(log.truncated);
+        assert!(log.text.starts_with(TRUNCATED_LINES));
+        assert!(
+            log.text.ends_with("600000\n"),
+            "the partial line is held back"
+        );
+        assert_eq!(log.total_lines(), 600_000);
+        for (place, line) in log.text.lines().enumerate().skip(1) {
+            assert_eq!(line.parse::<usize>().ok(), Some(log.offset + place + 1));
+        }
+        // The truncation line takes the number of the last line it stands for.
+        let (dropped, _) = cut_body(&log.text);
+        assert_eq!(log.offset + 1, dropped);
+    }
+
+    /// MOD-152 R1 F1: a live log is scrubbed as one text, fail closed.
+    #[test]
+    fn a_live_log_is_scrubbed_whole() {
+        let mut buffer = LogBuffer::default();
+        buffer.push(b"token secret-9d8e7f\n-----BEGIN RSA PRIVATE KEY-----\nMIIa\n");
+        let log = buffer.complete().scrubbed(&MinimalScrubber::new([]));
+        assert!(log.withheld);
+        assert_eq!(
+            log.text,
+            "[log withheld: it matched credential rule private_key_pem]"
+        );
+        let mut buffer = LogBuffer::default();
+        buffer.push(b"token secret-9d8e7f\n");
+        assert_eq!(live(&buffer).text, "token [REDACTED]\n");
+    }
+
+    /// MOD-152 R1 F6: a line over the cap is dropped whole, not kept from its middle, so a secret
+    /// the cut split leaves nothing behind.
+    #[test]
+    fn a_line_over_the_cap_is_dropped_not_split() {
+        const SECRET: &str = "secret-9d8e7f";
+        // The cap falls five bytes before the secret ends.
+        let tail = "b".repeat(COMMAND_LOG_CAP - 5);
+        let head = "a".repeat(3 * 1024 * 1024 - SECRET.len() - tail.len());
+        let line = format!("{head}{SECRET}{tail}");
+        for chunked in [false, true] {
+            let mut buffer = LogBuffer::default();
+            if chunked {
+                // Past twice the cap: the buffer drops the front itself.
+                buffer.push(head.as_bytes());
+                buffer.push(&b"a".repeat(2 * COMMAND_LOG_CAP));
+                buffer.push(SECRET.as_bytes());
+                buffer.push(tail.as_bytes());
+            } else {
+                buffer.push(line.as_bytes());
+            }
+            assert_eq!(live(&buffer).text, truncated_line(1));
+            let log = stored(buffer.clone());
+            assert_eq!(log.text, truncated_line(1), "chunked: {chunked}");
+            assert!(log.truncated);
+            buffer.push(b"\nnext\n");
+            assert_eq!(live(&buffer).text, format!("{}next\n", truncated_line(1)));
+            assert_eq!(live(&buffer).total_lines(), 2);
+        }
+    }
+
+    /// MOD-152 R1 F2: a stored cut log is numbered from its truncation line; an uncut one, or a
+    /// text that only looks cut, from 1.
+    #[test]
+    fn a_stored_log_numbers_its_lines_from_its_truncation_line() {
+        let text = format!("{}x\ny\n", truncated_line(41));
+        let log = ScrubbedLog::of(text.clone(), true, &scrubber());
+        assert_eq!((log.offset, log.total_lines()), (40, 43));
+        let forged = ScrubbedLog::of(text, false, &scrubber());
+        assert_eq!((forged.offset, forged.total_lines()), (0, 3));
+    }
+
+    /// MOD-152 R1 F2: a slice names and answers lines by their number in the output.
+    #[test]
+    fn a_slice_counts_lines_from_the_offset() {
+        let text = "m\nx\ny\n";
+        let range = slice(text, &Mode::Range(11, 12), 1024, 9);
+        assert_eq!(
+            (range.text.as_str(), range.first_line, range.last_line),
+            ("x\ny\n", Some(11), Some(12))
+        );
+        let before = slice(text, &Mode::Range(1, 10), 1024, 9);
+        assert_eq!((before.text.as_str(), before.first_line), ("m\n", Some(10)));
+        assert_eq!(slice(text, &Mode::Range(1, 9), 1024, 9).first_line, None);
+        let pattern = Mode::Pattern {
+            pattern: super::compile("^y$").expect("a pattern"),
+            context: 1,
+        };
+        assert_eq!(slice(text, &pattern, 1024, 9).text, "11-x\n12:y\n");
+        assert_eq!(slice(text, &Mode::Tail(1), 1024, 9).first_line, Some(12));
     }
 
     #[test]
     fn a_tail_slice_answers_the_last_lines_and_counts_them() {
         let text = "a\nb\nc\nd\n";
-        let tail = slice(text, &Mode::Tail(2), 1024);
+        let tail = slice(text, &Mode::Tail(2), 1024, 0);
         assert_eq!(
             (
                 tail.text.as_str(),
@@ -700,7 +923,7 @@ mod tests {
             ),
             ("c\nd\n", Some(3), Some(4), false)
         );
-        let none = slice("", &Mode::Tail(2), 1024);
+        let none = slice("", &Mode::Tail(2), 1024, 0);
         assert_eq!(
             (none.first_line, none.last_line, none.capped),
             (None, None, false)
@@ -710,14 +933,14 @@ mod tests {
     #[test]
     fn a_line_longer_than_the_budget_is_cut_to_it() {
         let text = format!("{}\n", "é".repeat(100));
-        let tail = slice(&text, &Mode::Tail(1), 11);
+        let tail = slice(&text, &Mode::Tail(1), 11, 0);
         assert!(tail.capped);
         assert!(
             tail.text.len() <= 11 && tail.text.ends_with('\n'),
             "{:?}",
             tail.text
         );
-        let range = slice(&text, &Mode::Range(1, 1), 11);
+        let range = slice(&text, &Mode::Range(1, 1), 11, 0);
         assert!(range.capped);
         assert!(
             range.text.len() <= 11 && range.text.ends_with('\n'),

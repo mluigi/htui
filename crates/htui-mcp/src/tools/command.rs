@@ -500,9 +500,22 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Runner<S>
             }
             live.clone()
         };
-        let stored = buffer.into_stored(scrubber, id, self.clock.now());
-        if let Err(err) = htui_core::store::WorkerStore::put_command_log(store, stored).await {
-            tracing::warn!(%id, %err, "a command's log could not be written");
+        // MOD-152 R1 F5: decoding and scrubbing up to 2 MiB is blocking work.
+        let now = self.clock.now();
+        let owned = Arc::clone(&self.scrubber);
+        match htui_agent::contained::spawn_blocking(move || {
+            buffer.into_stored(owned.as_ref(), id, now)
+        })
+        .await
+        {
+            Ok(stored) => {
+                if let Err(err) =
+                    htui_core::store::WorkerStore::put_command_log(store, stored).await
+                {
+                    tracing::warn!(%id, %err, "a command's log could not be written");
+                }
+            }
+            Err(err) => tracing::warn!(%id, %err, "a command's log could not be prepared"),
         }
         let truncated = ran.truncated;
         match stopped.get() {
