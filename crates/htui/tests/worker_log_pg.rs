@@ -108,7 +108,7 @@ async fn a_worker_warn_line_is_read_back_within_one_flush() {
         .wait_for(FLUSH_EVERY + ONE_POLL, |lines| !lines.is_empty())
         .await;
     let waited = started.elapsed();
-    flusher.abort();
+    drop(flusher);
 
     assert_eq!(
         texts(&lines),
@@ -185,7 +185,51 @@ async fn a_level_set_on_the_box_row_is_picked_up_by_the_running_flusher() {
         LogShipLevel::Warn,
         "a cleared level is the default"
     );
-    flusher.abort();
+    drop(flusher);
+    stack.drop_db().await;
+}
+
+/// Plan V18 (R1 M3): at `debug`, a flush's own statements add no `sqlx` line. On a
+/// `current_thread` runtime with the ship layer as this thread's default, the flusher's real
+/// `sqlx` events are seen by the layer: one cycle ships the seed, then the final flush ships
+/// whatever that cycle's statements added, and no row is a `sqlx` one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_flush_at_debug_adds_no_sqlx_line() {
+    let Some(stack) = Stack::new().await else {
+        return;
+    };
+    let pg = stack.db.store.clone();
+    pg.set_box_log_level(pg.this_box(), Some(LogShipLevel::Debug))
+        .await
+        .expect("the level writes");
+    let handle = ShipHandle::new();
+    handle.set_level(LogShipLevel::Debug);
+    {
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(handle.layer()));
+        tracing::debug!(target: "htui::worker", "the seed");
+        run_flusher(pg.clone(), handle.clone(), std::future::ready(())).await;
+    }
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT target, text FROM worker_log ORDER BY id")
+            .fetch_all(&stack.db.pool)
+            .await
+            .expect("the rows read");
+    assert!(
+        rows.iter().any(|(_, text)| text == "the seed"),
+        "the cycle shipped: {rows:?}"
+    );
+    let sqlx_rows: Vec<&(String, String)> = rows
+        .iter()
+        .filter(|(target, _)| {
+            target == "sqlx" || target.starts_with("sqlx::") || target.starts_with("sqlx_")
+        })
+        .collect();
+    assert!(
+        sqlx_rows.is_empty(),
+        "{} sqlx lines: {sqlx_rows:?}",
+        sqlx_rows.len()
+    );
     stack.drop_db().await;
 }
 
@@ -304,6 +348,7 @@ async fn measure_ten_thousand_lines_a_second_for_thirty_seconds() {
             appends: Arc::clone(&appends),
         },
         handle.clone(),
+        std::future::pending::<()>(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let loaded = tokio::spawn(claim_shaped(stack.db.pool.clone(), Arc::clone(&stop)));
@@ -357,7 +402,7 @@ async fn measure_ten_thousand_lines_a_second_for_thirty_seconds() {
     }
     flusher.abort();
     let notices: Vec<String> = sqlx::query_scalar(
-        "SELECT text FROM worker_log WHERE text LIKE '% log lines dropped while database unreachable'",
+        "SELECT text FROM worker_log WHERE text LIKE '% dropped while the database was unreachable'",
     )
     .fetch_all(&stack.db.pool)
     .await
