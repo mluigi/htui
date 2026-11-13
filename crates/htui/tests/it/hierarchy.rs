@@ -4242,3 +4242,158 @@ async fn the_section_at_80_columns() {
     assert!(frame.contains("alpha \u{b7} primary"), "{frame}");
     insta::assert_snapshot!("demo_80", frame);
 }
+
+// ---- MOD-147 M3 T2: the scope row in the tree, the folder line (D11, D12) ----
+
+/// MOD-147 M3 D11: the tree carries the workspace's scope row beside its projects, for the
+/// Secrets section's workspace row, and still never lists it as a project.
+#[tokio::test]
+async fn the_tree_carries_the_scope_row() {
+    let tree = tree(serve(&demo(), &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await);
+    let scope_row = tree.scope_row.as_ref().expect("Graphics has a scope row");
+    assert_eq!(scope_row.id, ids::PROJECT_SCOPE_GRAPHICS);
+    assert_eq!(scope_row.slug, "@graphics");
+    assert_eq!(scope_row.owner_workspace_id, Some(ids::WORKSPACE_GRAPHICS));
+    assert!(
+        tree.projects
+            .iter()
+            .all(|entry| entry.project.id != ids::PROJECT_SCOPE_GRAPHICS),
+        "the scope row is not a project of the tree"
+    );
+}
+
+/// The section over `tree`, with `$HOME` fixed at `home`.
+fn folder_section(
+    bench: &SectionBench,
+    tree: &HierarchySnapshot,
+    home: Option<&str>,
+) -> HierarchySection {
+    let mut section = HierarchySection::new().with_home(home);
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(tree.clone()))),
+    );
+    let _ = bench.drained();
+    section
+}
+
+/// The workspace row's text: the first drawn line naming the workspace.
+fn workspace_line(frame: &str) -> String {
+    frame
+        .lines()
+        .find(|line| line.contains("Graphics (graphics)"))
+        .map(|line| {
+            line.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace())
+                .to_owned()
+        })
+        .unwrap_or_else(|| panic!("no workspace row in {frame}"))
+}
+
+/// MOD-147 M3 D12: with no row for this box the workspace row shows the default folder under
+/// `$HOME`, written `~/…`, and says it is the default.
+#[tokio::test]
+async fn the_workspace_row_shows_the_default_folder_on_this_box() {
+    let bench = SectionBench::new().await;
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    let section = folder_section(&bench, &opened, Some("/home/u"));
+
+    let line = workspace_line(&bench.render_section(&section, 100));
+    assert!(
+        line.ends_with(
+            "Graphics (graphics) \u{2014} folder on this box: ~/workspaces/graphics (default)"
+        ),
+        "{line}"
+    );
+}
+
+/// A stored root is the folder, without `(default)`; one under `$HOME` is written `~/…`.
+#[tokio::test]
+async fn a_stored_root_drops_the_default_mark() {
+    let bench = SectionBench::new().await;
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+
+    let section = folder_section(
+        &bench,
+        &with_root(opened.clone(), "/srv/graphics"),
+        Some("/home/u"),
+    );
+    let line = workspace_line(&bench.render_section(&section, 100));
+    assert!(
+        line.ends_with("folder on this box: /srv/graphics"),
+        "{line}"
+    );
+
+    let section = folder_section(&bench, &with_root(opened, "/home/u/art"), Some("/home/u"));
+    let line = workspace_line(&bench.render_section(&section, 100));
+    assert!(line.ends_with("folder on this box: ~/art"), "{line}");
+}
+
+/// Without `$HOME` and without a row there is no folder to name: `unset`; a row still is one.
+#[tokio::test]
+async fn no_home_and_no_row_is_unset() {
+    let bench = SectionBench::new().await;
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+
+    let section = folder_section(&bench, &opened, None);
+    let line = workspace_line(&bench.render_section(&section, 100));
+    assert!(line.ends_with("folder on this box: unset"), "{line}");
+
+    let section = folder_section(&bench, &with_root(opened, "/srv/graphics"), None);
+    let line = workspace_line(&bench.render_section(&section, 100));
+    assert!(
+        line.ends_with("folder on this box: /srv/graphics"),
+        "{line}"
+    );
+}
+
+/// A slug that is not one plain name has no default folder (MOD-147 M1 R1): `unset`.
+#[tokio::test]
+async fn a_slug_that_is_not_one_name_is_unset() {
+    let bench = SectionBench::new().await;
+    let mut opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    opened.workspace.slug = "art/graphics".to_owned();
+    let section = folder_section(&bench, &opened, Some("/home/u"));
+
+    let frame = bench.render_section(&section, 100);
+    let line = frame
+        .lines()
+        .find(|line| line.contains("Graphics (art/graphics)"))
+        .unwrap_or_else(|| panic!("no workspace row in {frame}"));
+    assert!(line.contains("folder on this box: unset"), "{line}");
+    assert!(!line.contains("(default)"), "{line}");
+}
+
+/// The workspace editor shows the same folder line, read only, under its fields, naming the key
+/// that picks another.
+#[tokio::test]
+async fn the_workspace_editor_shows_the_folder_line() {
+    let bench = SectionBench::new().await;
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    let mut section = folder_section(&bench, &opened, Some("/home/u"));
+
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().collect();
+    let description = lines
+        .iter()
+        .position(|line| line.contains("description"))
+        .unwrap_or_else(|| panic!("the workspace editor is open: {frame}"));
+    let folder = lines
+        .iter()
+        .rposition(|line| line.contains("~/workspaces/graphics (default)"))
+        .unwrap_or_else(|| panic!("the editor names the folder: {frame}"));
+    assert!(
+        folder > description,
+        "the folder line sits under the fields: {frame}"
+    );
+    assert!(lines[folder].contains("folder on this box"), "{frame}");
+    assert!(
+        lines[folder].contains("`b`"),
+        "the line names the path key: {frame}"
+    );
+
+    // Typing does not reach it: it is not a field.
+    type_at(&bench, &mut section, "x");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("~/workspaces/graphics (default)"), "{frame}");
+}

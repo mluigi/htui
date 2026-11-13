@@ -25,7 +25,9 @@
 //! `kit::form`, the notice a `kit::text` notice line and the empty states `kit::empty` with a next
 //! step; the picker is a `kit::modal` ([`PathPicker`]).
 
+use std::borrow::Cow;
 use std::cell::Cell;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -41,7 +43,7 @@ use htui_core::store::{DeleteReach, DeleteTarget};
 use crate::app::{Action, Ctx, Handled};
 use crate::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
-    RepoEntry, reach_parts, reach_totals,
+    RepoEntry, reach_parts, reach_totals, workspace_root,
 };
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::memory::REQUEST_NAMES as MEMORY_REQUEST_NAMES;
@@ -137,6 +139,34 @@ const HINT_PICKING: HintSpec = &[
     Hint::Text("choosing a directory"),
     Hint::One(Act::Back, "cancel"),
 ];
+
+/// The workspace row's and the workspace editor's words for the folder (MOD-147 M3 D12).
+const FOLDER_ON_THIS_BOX: &str = "folder on this box";
+
+/// What a folder with no `workspace_box_path` row for this box adds after it (D12).
+const DEFAULT_FOLDER: &str = " (default)";
+
+/// MOD-147 M3 D12: the tree's workspace folder on this box as the section writes it — the stored
+/// root, else `<home>/workspaces/<slug>` with ` (default)`, a path under `home` written `~/…`;
+/// `unset` when there is neither (no row, and no home or a slug that is not one plain name).
+/// Computed here rather than carried by the tree: [`snapshot`](crate::hierarchy::snapshot) has
+/// no home, and the worker's is the same `$HOME` anyway.
+fn folder_on_this_box(snapshot: &HierarchySnapshot, home: Option<&str>) -> String {
+    let home = home.map(Path::new).filter(|home| home.parent().is_some());
+    let Some(folder) = workspace_root(snapshot, home) else {
+        return "unset".to_owned();
+    };
+    let shown = match home.and_then(|home| folder.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => folder.display().to_string(),
+    };
+    if snapshot.folder_path.is_some() {
+        shown
+    } else {
+        format!("{shown}{DEFAULT_FOLDER}")
+    }
+}
 
 /// What a CAS miss says when the row the editor opened on is gone from the reloaded tree.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
@@ -467,13 +497,10 @@ impl HierarchySection {
             .into_iter()
             .map(|row| match row {
                 Row::Workspace => group(format!(
-                    "{} ({}) \u{2014} root on this box: {}",
+                    "{} ({}) \u{2014} {FOLDER_ON_THIS_BOX}: {}",
                     snapshot.workspace.name,
                     snapshot.workspace.slug,
-                    snapshot
-                        .folder_path
-                        .as_ref()
-                        .map_or("unset", |path| path.folder_path.as_str())
+                    folder_on_this_box(snapshot, self.home.as_deref()),
                 )),
                 Row::Project { index } => group(
                     snapshot
@@ -519,7 +546,31 @@ impl HierarchySection {
         let theme = ctx.theme;
         match &self.mode {
             Mode::Browse => Vec::new(),
-            Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
+            Mode::Editing(editor) => {
+                let form = editor.form();
+                // The workspace editor shows the folder too, read only (MOD-147 M3 D12): the
+                // path is not one of its fields, so the line names the key that picks it.
+                let form = match (editor.kind, &self.snapshot) {
+                    (EditorKind::EditWorkspace(_), Some(snapshot)) => {
+                        let folder = folder_on_this_box(snapshot, self.home.as_deref());
+                        let choose = ctx
+                            .keys()
+                            .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
+                        let line = match choose {
+                            Some(choose) => format!(
+                                "{folder} \u{b7} `{choose}` on the workspace row picks another"
+                            ),
+                            None => folder,
+                        };
+                        form.field(form::Field::new(
+                            FOLDER_ON_THIS_BOX,
+                            Value::ReadOnly(Cow::Owned(line)),
+                        ))
+                    }
+                    _ => form,
+                };
+                form.lines(width, ctx.accent(), theme)
+            }
             // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty;
             // the memory pane draws over the whole section too (MOD-163 D20).
             Mode::Picking { .. } | Mode::Memory { .. } => Vec::new(),
