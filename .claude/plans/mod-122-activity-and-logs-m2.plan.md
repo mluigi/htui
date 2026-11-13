@@ -43,9 +43,13 @@ PRD open questions that M2 touches are answered here (D2–D6). Maintainer check
   ```
 - **D2 — batching.** The shipper flushes at **200 lines or 2 s**, whichever comes first, one
   `INSERT … SELECT … FROM UNNEST(…)` per flush (at most 500 rows a statement; a larger batch loops).
-  Provisional: T2 measures it (below) and records the number in this plan before the defaults freeze.
-  *(PRD open question "batch size and interval" answered, subject to the measurement.)*
-- **D3 — worker buffer cap and what is dropped.** 5 000 lines. At the cap the oldest line **below
+  **Measured (T2, sandbox Postgres, 10 000 `info` lines/s for 30 s = 300 000 lines):** shipped
+  300 000, dropped 0; flush p50 2.6 ms, p95 4.3 ms, max 443 ms over 1 429 flushes; a concurrent
+  `claim_run`-shaped query went p95 0.72 ms → 0.77 ms (max 98 ms). The 200 lines / 2 s default
+  stands. *(PRD open question "batch size and interval" answered.)*
+- **D3 — worker buffer cap and what is dropped.** **20 000 lines** (raised from 5 000 by the T2
+  measurement: at 5 000 one 1.1 s flush stall dropped 22 600 of 300 000 lines, all reported in the
+  drop line; at 20 000 none dropped). At the cap the oldest line **below
   `error`** goes first; an `error` line goes only when the buffer holds nothing else. Drops are
   counted and shipped as one `warn` line, `N log lines were dropped while the database was
   unreachable`, with the next successful flush. A failed flush keeps its lines and retries on the
@@ -103,6 +107,10 @@ PRD open questions that M2 touches are answered here (D2–D6). Maintainer check
   - A failed read is absorbed (`Tab::absorbs_failure("worker_logs")`) so a down database does not fill the status
     line once a second; the last rows stay.
   - History `location`/`restore`: `source:worker:<box id>`; a box with no lines restores to `all`.
+  - *Review note (R1):* a box deleted during a session keeps its lines under its id until the TUI
+    restarts (the overlap re-read skips ids already held); after a restart they list as `(removed)`.
+    Accepted. The list row for a worker never cuts the `(removed)` marker and keeps the hostname's
+    distinct end (R1 M1).
 - **D11 — Settings › Boxes.** The box detail gets one row, **Worker log level**. *Amended by blueprint
   F8:* the browse key `settings.boxes.log_level` (default `v`) cycles `off · error · warn · info ·
   debug` over the listed box and saves at once through `StoreRequest::SetBoxLogLevel`; `←`/`→` stay
