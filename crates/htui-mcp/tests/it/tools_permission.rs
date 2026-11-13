@@ -136,7 +136,7 @@ async fn the_prompt_tool_is_advertised_only_on_cli_scopes() {
 #[tokio::test]
 async fn the_recorded_prompt_call_is_answered_allow_with_its_input() {
     let (_host, _lease, mut client, mut rx) = cli_session().await;
-    let transcript = include_str!("transcripts/claude-2.1.287.ndjson");
+    let transcript = include_str!("../transcripts/claude-2.1.287.ndjson");
     let line: Value = transcript
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))

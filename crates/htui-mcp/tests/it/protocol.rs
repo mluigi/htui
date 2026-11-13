@@ -187,7 +187,7 @@ fn initialize(id: u64, version: &str) -> Value {
 
 #[tokio::test]
 async fn the_recorded_claude_transcript_is_answered() {
-    let transcript = include_str!("transcripts/claude-2.1.287.ndjson");
+    let transcript = include_str!("../transcripts/claude-2.1.287.ndjson");
     let mut client = Client::start();
     for line in transcript.lines() {
         client.send_raw(line.as_bytes()).await;
