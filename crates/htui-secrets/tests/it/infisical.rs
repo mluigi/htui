@@ -6,15 +6,13 @@
 //! So errors are compared with `assert_err` and unwrapped with `Quiet::must`/`must_fail`, which
 //! name the variant, never with `assert_eq!`, `expect` or `unwrap_err`, which print it.
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::support::{ClosedPort, Reply, Stub};
 use htui_core::secret::{MachineIdentity, SecretError, SecretProvider, SecretScope};
 use htui_secrets::{InfisicalConfig, InfisicalProvider};
 use serde_json::{Value, json};
-use support::{ClosedPort, Reply, Stub};
 
 const CLIENT_ID: &str = "cid-sentinel-1";
 const CLIENT_SECRET: &str = "csecret-sentinel-1";
@@ -1605,14 +1603,14 @@ async fn a_loopback_base_never_goes_through_the_proxy() {
     let proxy = Stub::start();
     let stub = serving(json!([secret("A", VALUE)]));
     let exe = std::env::current_exe().expect("the test binary's path");
+    // libtest drops the crate name: the child is `infisical::<fn>`, not the bare fn name.
+    let name = format!(
+        "{}::a_loopback_base_never_goes_through_the_proxy",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
     let mut child = std::process::Command::new(exe);
     child
-        .args([
-            "a_loopback_base_never_goes_through_the_proxy",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
         .env(PROXY_CHILD_BASE, stub.base())
         .env_remove("NO_PROXY")
         .env_remove("no_proxy")
@@ -1634,6 +1632,10 @@ async fn a_loopback_base_never_goes_through_the_proxy() {
         "the child test failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the child must run exactly one test; its filter matched nothing or more than one"
     );
     assert_eq!(
         routes(&stub),
