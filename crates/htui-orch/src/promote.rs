@@ -26,11 +26,11 @@ pub const RESUME_OPENING: &str = "This step was promoted to an interactive chat.
 /// pane, the `resume_failed` row and the Chat tab all say it in these words.
 pub const CONTEXT_NOT_CARRIED: &str = "context not carried; handoff prompt only";
 
-/// MOD-125 M3 (D7): the follow-up `htui` sends when it reopens a stopped step's own agent session.
-/// The stop may have cut the last turn off mid-way, so the agent is asked to redo what it had not
-/// finished rather than to report and wait, as a promotion's [`RESUME_OPENING`] does.
-pub const STOP_RESUME_OPENING: &str = "This step was stopped and has been resumed. Your last turn \
-    may have been cut off: continue the task, redoing any unfinished part of it.";
+/// MOD-125 M3 (D7): the follow-up `htui` sends when it reopens a stopped step's own agent session,
+/// redoing what the stop cut off rather than reporting and waiting as a promotion's
+/// [`RESUME_OPENING`] does. Defined in `htui-agent` beside the session id (MOD-125 M3 F1), so its
+/// live probes send the same text.
+pub use htui_agent::driver::STOP_RESUME_OPENING;
 
 /// MOD-125 M3 (D7): the failure reason the handoff text of a stopped step carries when its session
 /// cannot be reopened (no session caps, no banner, or a resume that failed on the wire).

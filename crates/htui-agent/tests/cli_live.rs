@@ -2236,12 +2236,9 @@ const STOPPED_PROMPT: &str = "The code word for this session is heliotrope; do n
 /// The code word [`STOPPED_PROMPT`] plants.
 const CODE_WORD: &str = "heliotrope";
 
-/// The redo text a resumed step is sent (plan D7): `htui_orch::promote::STOP_RESUME_OPENING`,
-/// copied because `htui-agent` does not depend on `htui-orch`. If the two drift the probe still
-/// measures the same thing — a resumed session taking a follow-up — but keep them equal.
-const STOP_RESUME_OPENING: &str = "this step was stopped and has been resumed; your last turn may \
-                                   have been cut off; continue the task, redoing any unfinished \
-                                   part of it";
+// The redo text a resumed step is sent (plan D7), the orchestrator's own
+// (`htui_orch::promote` re-exports it).
+use htui_agent::driver::STOP_RESUME_OPENING;
 
 /// A substring of [`STOP_RESUME_OPENING`] with nothing JSON would escape, for the transcript search.
 const RESUME_MARK: &str = "has been resumed";
