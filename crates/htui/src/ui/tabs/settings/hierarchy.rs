@@ -157,21 +157,34 @@ const DEFAULT_FOLDER: &str = " (default)";
 /// root, else `<home>/workspaces/<slug>` with ` (default)`, a path under `home` written `~/…`;
 /// `unset` when there is neither (no row, and no home or a slug that is not one plain name).
 /// Computed here rather than carried by the tree: [`snapshot`](crate::hierarchy::snapshot) has
-/// no home, and the worker's is the same `$HOME` anyway.
+/// no home, and the section's is the worker's `dirs::home_dir()` anyway.
 fn folder_on_this_box(snapshot: &HierarchySnapshot, home: Option<&str>) -> String {
     let home = home.map(Path::new).filter(|home| home.parent().is_some());
     let Some(folder) = workspace_root(snapshot, home) else {
         return "unset".to_owned();
     };
     let shown = match home.and_then(|home| folder.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => under_home(rest),
         None => folder.display().to_string(),
     };
     if snapshot.folder_path.is_some() {
         shown
     } else {
         format!("{shown}{DEFAULT_FOLDER}")
+    }
+}
+
+/// `rest`, a path under the home, written `~/…` with its components joined by `/` rather than
+/// the native separator (review M1); `~` alone for the home itself.
+fn under_home(rest: &Path) -> String {
+    let parts: Vec<_> = rest
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    if parts.is_empty() {
+        "~".to_owned()
+    } else {
+        format!("~/{}", parts.join("/"))
     }
 }
 
@@ -426,8 +439,8 @@ pub struct HierarchySection {
     /// write it follows, or `None` for `i`. Held apart from `notice`, which a key refused during
     /// the walk overwrites with "still in flight" (R-57).
     carried: Option<String>,
-    /// `$HOME`, read once by [`new`](HierarchySection::new) (MOD-49 blueprint D9): the picker's
-    /// last start directory before `/` (P7).
+    /// The home directory, read once by [`new`](HierarchySection::new) (MOD-49 blueprint D9):
+    /// the picker's last start directory before `/` (P7), and what the folder line writes `~`.
     home: Option<String>,
     /// The tree's `(lines, first line drawn)` as of the last render, for the Settings pane's
     /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the rows under the tree (an open editor
@@ -440,17 +453,18 @@ impl HierarchySection {
     /// Identity of the hierarchy section.
     pub const ID: SectionId = SectionId("hierarchy");
 
-    /// A section with nothing read yet. Reads `$HOME` once, here, so opening the picker touches no
-    /// environment (MOD-49 blueprint D9).
+    /// A section with nothing read yet. Reads the home directory once, here, so opening the picker
+    /// touches no environment (MOD-49 blueprint D9): `dirs::home_dir()`, the one the worker puts
+    /// the default workspace folder under (MOD-147 M3 D12), which is not `$HOME` on Windows.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            home: std::env::var("HOME").ok(),
+            home: dirs::home_dir().and_then(|home| home.to_str().map(str::to_owned)),
             ..Self::default()
         }
     }
 
-    /// The same section with `$HOME` fixed, so a test's start directory doesn't depend on the box
+    /// The same section with the home fixed, so a test's start directory doesn't depend on the box
     /// running it (MOD-49 blueprint D9).
     #[must_use]
     pub fn with_home(mut self, home: Option<&str>) -> Self {
@@ -2286,6 +2300,23 @@ fn delete_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MOD-147 M3 review M1: the section's home is the one the worker resolves the default folder
+    /// under (`dirs::home_dir()`), not `$HOME`, which Windows does not set.
+    #[test]
+    fn the_home_is_the_workers_home_dir() {
+        let worker = dirs::home_dir().and_then(|home| home.to_str().map(str::to_owned));
+        assert_eq!(HierarchySection::new().home, worker);
+    }
+
+    /// MOD-147 M3 review M1: the part under the home is written with `/` whatever the native
+    /// separator, so `~/workspaces/graphics` reads the same on every box.
+    #[test]
+    fn the_part_under_home_is_joined_with_slashes() {
+        let rest = Path::new("workspaces").join("graphics");
+        assert_eq!(under_home(&rest), "~/workspaces/graphics");
+        assert_eq!(under_home(Path::new("")), "~");
+    }
 
     /// MOD-60: the confirm field's room is what the prompt leaves in **cells**. A CJK slug is
     /// twice as wide as its `char` count, and measuring it by `char` handed the field 8 cells

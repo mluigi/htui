@@ -1584,12 +1584,21 @@ async fn a_checkout_held_by_another_repo_is_not_a_candidate() {
 // for the keys and replies a frame cannot show (a request that was emitted, a scope that moved).
 // -------------------------------------------------------------------------------------------
 
+/// The home every section here runs under (review M1): the frames read
+/// `~/workspaces/graphics (default)` whatever the home of the box running them.
+const HOME: &str = "/home/u";
+
+/// A section with its home fixed at [`HOME`].
+fn homed() -> HierarchySection {
+    HierarchySection::new().with_home(Some(HOME))
+}
+
 /// A settled Settings tab over `store`, both sections registered and the strip already cycled onto
 /// `Hierarchy` — the product's own registration order (D4), so `l` is what reaches this section.
 async fn hierarchy_over(store: MemStore) -> Harness {
     let mut harness = Harness::over(store).with_tab(Box::new(SettingsTab::with_sections(vec![
         Box::new(AgentsSection::new()),
-        Box::new(HierarchySection::new()),
+        Box::new(homed()),
     ])));
     harness.settle().await;
     harness.key("l");
@@ -1727,7 +1736,7 @@ async fn n_on_a_project_opens_the_repo_editor() {
 #[tokio::test]
 async fn a_stale_reply_keeps_the_typed_text() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
@@ -1796,7 +1805,7 @@ async fn a_stale_reply_keeps_the_typed_text() {
 #[tokio::test]
 async fn a_joined_reply_naming_shared_prefixes_shows_the_notice() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
         &mut section,
@@ -1825,7 +1834,7 @@ async fn a_joined_reply_naming_shared_prefixes_shows_the_notice() {
 #[tokio::test]
 async fn a_joined_reply_without_shared_prefixes_shows_no_notice() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
         &mut section,
@@ -1858,7 +1867,7 @@ async fn no_workspace_says_so() {
 #[tokio::test]
 async fn deleting_the_last_workspace_leaves_the_pane_empty() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
@@ -1927,7 +1936,7 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
 #[tokio::test]
 async fn a_second_enter_does_not_resend_the_write() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
@@ -1955,7 +1964,7 @@ async fn a_second_enter_does_not_resend_the_write() {
 #[tokio::test]
 async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
@@ -2001,7 +2010,7 @@ async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
 #[tokio::test]
 async fn a_refused_count_leaves_the_confirmation() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
@@ -2033,7 +2042,7 @@ async fn a_refused_count_leaves_the_confirmation() {
 #[tokio::test]
 async fn a_refused_read_is_echoed_and_then_cleared() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::Failed {
@@ -2088,7 +2097,7 @@ async fn offline_says_it_needs_postgres() {
     })
     .with_tab(Box::new(SettingsTab::with_sections(vec![
         Box::new(AgentsSection::new()),
-        Box::new(HierarchySection::new()),
+        Box::new(homed()),
     ])))
     // `offline · 3s` would age between the render and the next tick.
     .with_store_state("offline \u{b7} 0s", None);
@@ -2127,7 +2136,7 @@ async fn p_moves_the_primary() {
     let beta = with_repos.projects[0].repos[1].repo.clone();
 
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(with_repos))),
@@ -2204,7 +2213,7 @@ async fn b_on_the_workspace_row_picks_the_root() {
 #[tokio::test]
 async fn a_reply_from_another_workspace_moves_the_scope() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let elsewhere = demo_tree(&backend, ids::WORKSPACE_PLATFORM).await;
 
@@ -2356,7 +2365,7 @@ async fn tree_with_two_repos(backend: &Backend) -> HierarchySnapshot {
 #[tokio::test]
 async fn i_sends_infer_repo_paths_for_the_scope() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
@@ -2380,7 +2389,7 @@ async fn i_is_refused_while_a_write_is_in_flight() {
     let backend = demo();
     let with_repos = tree_with_two_repos(&backend).await;
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(with_repos))),
@@ -2450,7 +2459,7 @@ async fn a_root_write_that_applied_is_followed_by_one_inference() {
 #[tokio::test]
 async fn a_new_repo_on_a_workspace_without_a_root_is_not_followed() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
@@ -2485,7 +2494,7 @@ async fn a_new_repo_on_a_workspace_without_a_root_is_not_followed() {
 #[tokio::test]
 async fn a_new_repo_on_a_workspace_with_a_root_is_followed_by_one_inference() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = with_root(
         demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await,
@@ -2526,7 +2535,7 @@ async fn an_edited_repo_on_a_workspace_with_a_root_is_followed_by_one_inference(
     let backend = demo();
     let with_repos = with_root(tree_with_two_repos(&backend).await, "/srv/htui");
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(with_repos.clone()))),
@@ -2566,7 +2575,7 @@ async fn p_is_not_followed_by_an_inference() {
     let backend = demo();
     let with_repos = with_root(tree_with_two_repos(&backend).await, "/srv/htui");
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(with_repos.clone()))),
@@ -2632,7 +2641,7 @@ async fn an_inference_reply_renders_the_tree_and_the_report() {
     };
 
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(
         &mut section,
         &StoreReply::RepoPathsInferred {
@@ -2818,7 +2827,7 @@ async fn the_report_notice_names_what_was_not_inferred() {
     let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     for (report, expected) in cases {
         let bench = SectionBench::new().await;
-        let mut section = HierarchySection::new();
+        let mut section = homed();
         bench.reply(
             &mut section,
             &StoreReply::RepoPathsInferred {
@@ -3392,7 +3401,7 @@ fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
 #[tokio::test]
 async fn the_cursor_row_is_drawn_selected() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
@@ -3412,7 +3421,7 @@ async fn the_cursor_row_is_drawn_selected() {
 
 /// A bench section over the demo tree, with what the reply emitted drained.
 async fn bench_over_demo(bench: &SectionBench) -> HierarchySection {
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
     let _ = bench.drained();
@@ -3636,7 +3645,7 @@ async fn a_rebound_new_workspace_key_is_the_one_the_empty_tree_names() {
     let bench = SectionBench::new()
         .await
         .with_keys(keys_from("[settings.hierarchy]\nnew_workspace = \"W\"\n"));
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(&mut section, &StoreReply::Hierarchy(None));
     let _ = bench.drained();
 
@@ -3845,7 +3854,7 @@ async fn the_typed_confirmation_names_the_field_keys_in_force() {
 #[tokio::test]
 async fn a_stale_reply_names_the_retry_key_in_force() {
     let bench = SectionBench::new().await.with_keys(rebound(FIELD_REBOUND));
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
         &mut section,
@@ -3942,7 +3951,7 @@ async fn the_editor_marks_its_focused_row_and_no_label_takes_the_accent() {
 #[tokio::test]
 async fn the_empty_states_carry_a_next_step() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = homed();
     bench.reply(&mut section, &StoreReply::Hierarchy(None));
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("no workspace"), "{frame}");
