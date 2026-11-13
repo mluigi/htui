@@ -4874,6 +4874,68 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan acceptance (M3 F2): the walk of `ANA-2` in `PLATFORM`, with no gate on `ANA`'s
+    /// phases, stopped in `mode` while its first session parks, then resumed: it runs to `done`,
+    /// its first step finished on the row and attempt the stop left.
+    async fn a_stop_resumes_to_done(mode: StopMode) {
+        let mut data = htui_core::fixtures::demo_data();
+        for phase in data
+            .phases
+            .iter_mut()
+            .filter(|phase| phase.graph_id == ids::GRAPH_HTUI_ANA)
+        {
+            phase.gate = Gate::Never;
+            phase.gate_hard = false;
+        }
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(3));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let start = worker.send(
+            Origin::App,
+            start_run_in(ids::HTUI_ANA_2, ids::WORKSPACE_PLATFORM),
+        );
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        stop_platform(&fixture, mode).await;
+        rests_at(&fixture, run, RunStatus::Stopped).await;
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED)
+        );
+        let grace = match mode {
+            StopMode::Graceful => Duration::from_secs(3),
+            StopMode::Forced => Duration::ZERO,
+        };
+        assert_eq!(park.grace(), Some(grace), "{mode:?}");
+
+        resume_platform(&fixture).await;
+        rests_at(&fixture, run, RunStatus::Done).await;
+        let first = step_at(&fixture, run, 0).await;
+        assert_eq!(
+            (first.id, first.attempt, first.status),
+            (parked.run_step_id, 1, StepStatus::Done),
+            "{mode:?}: the stopped step finished on its own row and attempt"
+        );
+        assert!(
+            fixture.run(run).await.finished_at.is_some(),
+            "{mode:?}: the run ended"
+        );
+    }
+
+    /// Plan acceptance (M3 F2): a graceful stop resumes to `done` on the TUI side.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_stop_resumes_to_done() {
+        a_stop_resumes_to_done(StopMode::Graceful).await;
+    }
+
+    /// Plan acceptance (M3 F2): a forced stop, its session cut with zero grace, resumes to
+    /// `done` on the TUI side.
+    #[tokio::test(start_paused = true)]
+    async fn a_forced_stop_resumes_to_done() {
+        a_stop_resumes_to_done(StopMode::Forced).await;
+    }
+
     /// D8, I-1: `pending_resumes` lists per box, so on a box whose executor is the worker only the
     /// worker's runtime resumes: the TUI's poll leaves the run `stopped`, the worker's walks it.
     #[tokio::test(start_paused = true)]
