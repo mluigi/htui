@@ -9,8 +9,9 @@
 //! `HTUI_TEST_DATABASE_URL` is unset, as every other Postgres-backed suite in this crate does: it
 //! is the only store where the ten seeded `app_setting` rows exist before anything writes one
 //! (`0002_agent_probe.sql:68-79`), and therefore the only one where a set carries a token rather
-//! than `expected: None`. MOD-163's `memory_capture` and MOD-141's `compete_fan_out` are the two
-//! `App` keys past `0002`'s ten and have no seed row, so each is `expected: None` on both stores.
+//! than `expected: None`. MOD-163's `memory_capture`, MOD-141's `compete_fan_out` and MOD-164's
+//! `light_model` are the three `App` keys past `0002`'s ten and have no seed row, so each is
+//! `expected: None` on both stores.
 #![cfg(feature = "testkit")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,9 +27,11 @@ use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, PromptSection, SettingsSection, SettingsTab,
 };
 use htui_core::fixtures::ids;
-use htui_core::model::{ProjectId, Scope, WorkspaceId};
+use htui_core::model::{AgentId, AgentSummary, ProjectId, Scope, WorkspaceId};
 use htui_core::prompt::settings::{resolve_allow_env_files, resolve_box_hostname};
-use htui_core::prompt::{BudgetSource, DEFAULTS, Rungs, SettingKey};
+use htui_core::prompt::{
+    BudgetSource, DEFAULTS, LightModel, Rungs, SettingKey, resolve_light_model,
+};
 use htui_core::store::{MemStore, SettingRung, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
@@ -99,7 +102,7 @@ async fn demo_settings(backend: &Backend) -> SettingsSnapshot {
 fn app_token(snapshot: &SettingsSnapshot, key: SettingKey) -> DateTime<Utc> {
     snapshot
         .app_entry(key)
-        .expect("the snapshot carries all twelve keys")
+        .expect("the snapshot carries all thirteen keys")
         .updated_at
         .expect("an applied write leaves the row a token")
 }
@@ -148,9 +151,10 @@ fn prompt_settings_names_are_stable() {
     assert_eq!(unique.len(), REQUEST_NAMES.len(), "three distinct names");
 }
 
-/// The shape of one read (D3/D4): twelve `App` entries in `SettingKey::app_keys` order (`0002`'s
-/// ten plus MOD-163's `memory_capture` and MOD-141's `compete_fan_out`; the test keeps the name
-/// it was given at eleven), all empty on a fresh `MemStore` (F-7), and one project
+/// The shape of one read (D3/D4): thirteen `App` entries in `SettingKey::app_keys` order (`0002`'s
+/// ten plus MOD-163's `memory_capture`, MOD-141's `compete_fan_out` and MOD-164's `light_model`;
+/// the test keeps the name it was given at eleven), all empty on a fresh `MemStore` (F-7), the
+/// agent registry the `light_model` row cycles through (MOD-164 D7), and one project
 /// entry per scope project carrying exactly the keys the `Project` rung accepts, in
 /// [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then `box_hostname` (MOD-33
 /// D276), then `memory_capture` (MOD-163 D19).
@@ -162,7 +166,17 @@ fn prompt_settings_names_are_stable() {
 async fn the_demo_snapshot_has_eleven_app_entries_and_five_keys_per_project() {
     let snapshot = demo_settings(&demo()).await;
 
-    assert_eq!(snapshot.app.len(), 12);
+    assert_eq!(snapshot.app.len(), 13);
+    let names: Vec<&str> = snapshot
+        .agents
+        .iter()
+        .map(|summary| summary.agent.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["agy", "claude", "claude-cli"],
+        "the same read carries the agents, by name (MOD-164 D7)"
+    );
     let keys: Vec<SettingKey> = snapshot.app.iter().map(|entry| entry.key).collect();
     assert_eq!(keys, SettingKey::app_keys().collect::<Vec<_>>());
     for entry in &snapshot.app {
@@ -213,7 +227,7 @@ async fn app_map_holds_only_entries_with_a_value() {
     );
 
     let map = snapshot.app_map();
-    assert_eq!(map.len(), 1, "ten entries hold nothing: {map:?}");
+    assert_eq!(map.len(), 1, "twelve entries hold nothing: {map:?}");
     assert_eq!(map.get("max_skill_tokens"), Some(&json!(4_000)));
 }
 
@@ -240,7 +254,7 @@ async fn set_setting_on_app_with_no_row_applies_then_the_old_token_is_stale() {
     let applied = settings(serve(&backend, &set_budget(None)).await);
     let entry = applied
         .app_entry(SettingKey::TokenBudget)
-        .expect("the snapshot carries all twelve keys");
+        .expect("the snapshot carries all thirteen keys");
     assert_eq!(entry.value, Some(json!(5_000)));
     let first = app_token(&applied, SettingKey::TokenBudget);
 
@@ -289,7 +303,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     );
     let entry = cleared
         .app_entry(SettingKey::MaxSkillTokens)
-        .expect("the snapshot carries all twelve keys");
+        .expect("the snapshot carries all thirteen keys");
     assert_eq!(entry.value, None);
     assert_eq!(entry.updated_at, None);
     assert!(cleared.app_map().is_empty());
@@ -298,7 +312,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     assert_eq!(
         reset
             .app_entry(SettingKey::MaxSkillTokens)
-            .expect("the snapshot carries all twelve keys")
+            .expect("the snapshot carries all thirteen keys")
             .value,
         Some(json!(4_000)),
         "the rung is writable again with `expected: None`"
@@ -629,8 +643,9 @@ async fn serve_refuses_a_foreign_request_by_name() {
 /// The store difference D16 exists for: a migrated Postgres holds all ten seeded `app_setting`
 /// rows before anything writes one, so each of those entries carries a value **and** a token, and
 /// the map the resolvers read is the compiled default table verbatim. MOD-163's `memory_capture`
-/// (D19) and MOD-141's `compete_fan_out` (M2 D5) are the two `App` keys past the ten and have no
-/// seed row: no value, no token, and each resolver falls through to its compiled default.
+/// (D19), MOD-141's `compete_fan_out` (M2 D5) and MOD-164's `light_model` (D7) are the three
+/// `App` keys past the ten and have no seed row: no value, no token, and each resolver falls
+/// through to its compiled default.
 ///
 /// Skipped, not failed, with `HTUI_TEST_DATABASE_URL` unset.
 #[tokio::test(flavor = "multi_thread")]
@@ -639,22 +654,33 @@ async fn a_migrated_postgres_presents_ten_seeded_app_rows_and_an_unseeded_memory
         return;
     };
 
-    let snapshot = prompt_settings::snapshot(&db.store, &vulkan_scope())
+    let agents = db.store.agents().await.expect("the seeded agents");
+    let snapshot = prompt_settings::snapshot(&db.store, agents, &vulkan_scope())
         .await
         .expect("one read of the migrated scope");
 
-    assert_eq!(snapshot.app.len(), 12);
+    assert_eq!(snapshot.app.len(), 13);
     let capture = snapshot
         .app_entry(SettingKey::MemoryCapture)
-        .expect("the snapshot carries all twelve keys");
+        .expect("the snapshot carries all thirteen keys");
     assert_eq!(capture.value, None, "0002 seeds no `memory_capture` row");
     assert_eq!(capture.updated_at, None, "so a set passes `expected: None`");
     let compete = snapshot
         .app_entry(SettingKey::CompeteFanOut)
-        .expect("the snapshot carries all twelve keys");
+        .expect("the snapshot carries all thirteen keys");
     assert_eq!(compete.value, None, "0002 seeds no `compete_fan_out` row");
     assert_eq!(compete.updated_at, None, "so a set passes `expected: None`");
-    let unseeded = [SettingKey::MemoryCapture, SettingKey::CompeteFanOut];
+    let light = snapshot
+        .app_entry(SettingKey::LightModel)
+        .expect("the snapshot carries all thirteen keys");
+    assert_eq!(light.value, None, "0002 seeds no `light_model` row");
+    assert_eq!(light.updated_at, None, "so a set passes `expected: None`");
+    assert!(!snapshot.agents.is_empty(), "the seeded agents come along");
+    let unseeded = [
+        SettingKey::MemoryCapture,
+        SettingKey::CompeteFanOut,
+        SettingKey::LightModel,
+    ];
     for entry in snapshot
         .app
         .iter()
@@ -788,15 +814,15 @@ fn project_token(snapshot: &SettingsSnapshot) -> DateTime<Utc> {
     snapshot.projects[0].project.updated_at
 }
 
-/// Which row of the tree one `App` key is: the `app` header is row 0 and the twelve keys follow in
+/// Which row of the tree one `App` key is: the `app` header is row 0 and the thirteen keys follow in
 /// `SettingKey::app_keys` order (D9).
 fn app_row(key: SettingKey) -> usize {
     1 + SettingKey::app_keys()
         .position(|candidate| candidate == key)
-        .expect("one of the twelve")
+        .expect("one of the thirteen")
 }
 
-/// Which row of the tree one `Project`-rung key of the scope's single project is: the twelve `App`
+/// Which row of the tree one `Project`-rung key of the scope's single project is: the thirteen `App`
 /// rows and their header, then the `project` header.
 fn project_row(key: SettingKey) -> usize {
     SettingKey::app_keys().count()
@@ -977,7 +1003,7 @@ fn row_of(frame: &str, key: SettingKey, nth: usize) -> &str {
         .unwrap_or_else(|| panic!("no row {nth} for `{key}`: {frame}"))
 }
 
-/// The demo world as the section draws it (D9): the `app` group with the twelve registry keys, then
+/// The demo world as the section draws it (D9): the `app` group with the thirteen registry keys, then
 /// one group per project of the scope with the keys the `Project` rung accepts.
 ///
 /// The demo project's blob already holds `token_budget` (`fixtures.rs:644-648`), so that row reads
@@ -1001,7 +1027,15 @@ async fn the_demo_snapshot_renders_the_tree() {
         "and the scope's one project: {frame}"
     );
 
-    for key in SettingKey::app_keys() {
+    // MOD-164 D7: the light model is a choice, not a number: the row says `not set` alone.
+    assert_eq!(
+        row_of(&frame, SettingKey::LightModel, 0)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["light_model", "not", "set"],
+        "{frame}"
+    );
+    for key in SettingKey::app_keys().filter(|key| *key != SettingKey::LightModel) {
         let row = row_of(&frame, key, 0);
         assert!(
             row.contains("unset |"),
@@ -1060,7 +1094,7 @@ async fn the_demo_snapshot_renders_the_tree() {
 }
 
 /// A scope with no project is the `app` group alone: there is no rung below it to list, and the
-/// twelve `App` rows are never empty.
+/// thirteen `App` rows are never empty.
 #[tokio::test]
 async fn no_workspace_lists_the_app_group_alone() {
     let mut harness = prompt_over(MemStore::new()).await;
@@ -1124,7 +1158,7 @@ async fn offline_is_unavailable_with_the_worker_sentence() {
     insta::assert_snapshot!("offline", frame);
 }
 
-/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the twelve of
+/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the thirteen of
 /// `SettingKey::app_keys`; a project group is `project_keys()` and nothing else.
 #[tokio::test]
 async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
@@ -1135,7 +1169,7 @@ async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
     assert_eq!(
         rows.len(),
         SettingKey::app_keys().count() + project_keys().count(),
-        "twelve app rows and one group of project rows: {frame}"
+        "thirteen app rows and one group of project rows: {frame}"
     );
 
     let project_rows = &rows[SettingKey::app_keys().count()..];
@@ -1351,7 +1385,7 @@ async fn memory_capture_is_listed_and_set_on_both_rungs() {
     .await;
     assert_eq!(
         off.app_entry(SettingKey::MemoryCapture)
-            .expect("the snapshot carries all twelve keys")
+            .expect("the snapshot carries all thirteen keys")
             .value,
         Some(json!(false))
     );
@@ -1412,7 +1446,7 @@ async fn compete_fan_out_is_listed_on_the_app_rung_only_and_set_there() {
     .await;
     assert_eq!(
         on.app_entry(SettingKey::CompeteFanOut)
-            .expect("the snapshot carries all twelve keys")
+            .expect("the snapshot carries all thirteen keys")
             .value,
         Some(json!(true))
     );
@@ -1435,6 +1469,277 @@ async fn compete_fan_out_is_listed_on_the_app_rung_only_and_set_there() {
     assert!(
         project_keys().all(|key| key != SettingKey::CompeteFanOut),
         "the project rung refuses the key, so no project lists it"
+    );
+}
+
+/// The `light_model` value naming `agent` and `model` (MOD-164 D7's shape).
+fn light(agent: AgentId, model: &str) -> Value {
+    json!({ "agent_id": agent.to_string(), "model": model })
+}
+
+/// `base` re-made as a fresh agent `name` with `models`, `default` and the `enabled` switch.
+fn agent_like(
+    base: &AgentSummary,
+    name: &str,
+    models: &[&str],
+    default: Option<&str>,
+    enabled: bool,
+) -> AgentSummary {
+    let mut summary = base.clone();
+    summary.agent.id = AgentId::new();
+    summary.agent.name = name.to_owned();
+    summary.agent.models = models.iter().map(|model| (*model).to_owned()).collect();
+    summary.agent.default_model = default.map(str::to_owned);
+    summary.agent.enabled = enabled;
+    summary
+}
+
+/// `snapshot` with its `light_model` row holding `held` under the token `at`, as the re-read after
+/// an applied write would carry it.
+fn with_light(
+    snapshot: &SettingsSnapshot,
+    held: Option<Value>,
+    at: Option<DateTime<Utc>>,
+) -> SettingsSnapshot {
+    let mut next = snapshot.clone();
+    let entry = next
+        .app
+        .iter_mut()
+        .find(|entry| entry.key == SettingKey::LightModel)
+        .expect("the snapshot carries all thirteen keys");
+    entry.value = held;
+    entry.updated_at = at;
+    next
+}
+
+/// The demo agent called `name`.
+#[track_caller]
+fn demo_agent<'a>(snapshot: &'a SettingsSnapshot, name: &str) -> &'a AgentSummary {
+    snapshot
+        .agents
+        .iter()
+        .find(|summary| summary.agent.name == name)
+        .unwrap_or_else(|| panic!("the demo registry has `{name}`"))
+}
+
+/// MOD-164 D7: on a fresh store the `light_model` row reads `not set` alone — no stored JSON,
+/// no number, no unit — and its help says how it is chosen and where it lives.
+#[tokio::test]
+async fn the_light_model_row_shows_not_set() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::LightModel));
+    let frame = bench.render_section(&section, 100);
+
+    assert_eq!(
+        row_of(&frame, SettingKey::LightModel, 0)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["light_model", "not", "set"],
+        "{frame}"
+    );
+    let flat = flat(&frame);
+    assert!(
+        flat.contains("cycles through the enabled agents' models, then not set \u{b7} rungs app"),
+        "{frame}"
+    );
+    assert!(!flat.contains("range "), "no numeric range: {frame}");
+}
+
+/// MOD-164 D7: the edit act opens no editor on the `light_model` row. Each press writes the next
+/// `(agent, model)` pair of the enabled agents, in registry order and each agent's `models`
+/// order — an agent with no models offers its `default_model` — and past the last pair it
+/// clears the row (`not set`). A disabled agent offers nothing, and neither does an agent with
+/// no models and no default.
+#[tokio::test]
+async fn the_edit_act_cycles_enabled_agents_pairs_then_not_set() {
+    let mut snapshot = demo_settings(&demo()).await;
+    let base = snapshot.agents[0].clone();
+    let alpha = agent_like(&base, "alpha", &["a1", "a2"], Some("a2"), true);
+    let gamma = agent_like(&base, "gamma", &["g1"], Some("g1"), false);
+    let delta = agent_like(&base, "delta", &[], None, true);
+    let beta = agent_like(&base, "beta", &[], Some("b-default"), true);
+    snapshot.agents = vec![alpha.clone(), gamma, delta, beta.clone()];
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, app_row(SettingKey::LightModel));
+
+    let mut token: Option<DateTime<Utc>> = None;
+    for (step, (agent, model)) in [
+        (alpha.agent.id, "a1"),
+        (alpha.agent.id, "a2"),
+        (beta.agent.id, "b-default"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+        assert!(!section.captures_input(), "a choice opens no editor");
+        let asked = bench.drained();
+        let [
+            Action::Store(StoreRequest::SetSetting {
+                rung,
+                key,
+                value,
+                expected,
+                ..
+            }),
+        ] = asked.as_slice()
+        else {
+            panic!("press {step} writes the next pair, once: {asked:?}");
+        };
+        assert_eq!(*rung, SettingRung::App);
+        assert_eq!(*key, SettingKey::LightModel);
+        assert_eq!(*value, light(agent, model), "press {step}");
+        assert_eq!(*expected, token, "press {step} carries the row's token");
+
+        let at = DateTime::from_timestamp(1_800_000_000 + i64::try_from(step).expect("small"), 0)
+            .expect("a valid timestamp");
+        token = Some(at);
+        feed(
+            &bench,
+            &mut section,
+            &with_light(&snapshot, Some(value.clone()), token),
+        );
+    }
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        row_of(&frame, SettingKey::LightModel, 0).contains("beta \u{b7} b-default"),
+        "the row names the agent and the model: {frame}"
+    );
+
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::ClearSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("past the last pair is `not set`, a clear: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::App);
+    assert_eq!(*key, SettingKey::LightModel);
+    assert_eq!(Some(*expected), token);
+
+    feed(&bench, &mut section, &with_light(&snapshot, None, None));
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::SetSetting { value, .. })] = asked.as_slice() else {
+        panic!("from `not set` the cycle starts again: {asked:?}");
+    };
+    assert_eq!(*value, light(alpha.agent.id, "a1"));
+}
+
+/// MOD-164 D7, unlike the graph editor's `agent_pairs`: an agent with no models and no default
+/// offers nothing. The demo registry's two such agents are skipped, so the first press picks
+/// `agy`'s first model; with only such agents there is nothing to pick and nothing is asked.
+#[tokio::test]
+async fn an_agent_with_no_models_and_no_default_is_left_out() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    let agy = demo_agent(&snapshot, "agy").agent.clone();
+    move_to(&bench, &mut section, app_row(SettingKey::LightModel));
+
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::SetSetting { value, .. })] = asked.as_slice() else {
+        panic!("one write: {asked:?}");
+    };
+    assert_eq!(*value, light(agy.id, &agy.models[0]));
+
+    let mut bare = snapshot.clone();
+    bare.agents
+        .retain(|summary| summary.agent.models.is_empty() && summary.agent.default_model.is_none());
+    assert_eq!(bare.agents.len(), 2, "claude and claude-cli");
+    let (bench, mut section) = bench_from(&bare).await;
+    move_to(&bench, &mut section, app_row(SettingKey::LightModel));
+    bench.key(&mut section, "e");
+
+    assert!(bench.drained().is_empty(), "nothing to pick, nothing asked");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        flat(&frame).contains("no enabled agent offers a model"),
+        "{frame}"
+    );
+}
+
+/// MOD-164 D7: `not set` is a clear, which deletes the `app_setting` row, so the resolver is
+/// back to "not configured". The set before it goes through the seam's own `validate`.
+#[tokio::test]
+async fn not_set_clears_the_row() {
+    let backend = demo();
+    let before = demo_settings(&backend).await;
+    let agy = demo_agent(&before, "agy").agent.clone();
+    let last = agy.models.last().expect("agy lists models").clone();
+
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::LightModel, light(agy.id, &last), None),
+    )
+    .await;
+    assert_eq!(
+        resolve_light_model(&seeded.app_map()),
+        Some(LightModel {
+            agent_id: agy.id,
+            model: last.clone(),
+        })
+    );
+    let token = app_token(&seeded, SettingKey::LightModel);
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(&bench, &mut section, app_row(SettingKey::LightModel));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        row_of(&frame, SettingKey::LightModel, 0).contains(&format!("agy \u{b7} {last}")),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [Action::Store(request @ StoreRequest::ClearSetting { expected, .. })] = asked.as_slice()
+    else {
+        panic!("the last pair moves on to `not set`: {asked:?}");
+    };
+    assert_eq!(*expected, token);
+
+    let cleared = applied(&backend, request.clone()).await;
+    let entry = cleared
+        .app_entry(SettingKey::LightModel)
+        .expect("the snapshot carries all thirteen keys");
+    assert_eq!(entry.value, None, "the row is gone");
+    assert_eq!(entry.updated_at, None);
+    assert_eq!(resolve_light_model(&cleared.app_map()), None);
+
+    feed(&bench, &mut section, &cleared);
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        row_of(&frame, SettingKey::LightModel, 0)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["light_model", "not", "set"],
+        "{frame}"
+    );
+}
+
+/// MOD-164 D7: the seam refuses a malformed value with `validate`'s sentence.
+#[tokio::test]
+async fn a_malformed_light_model_is_refused_by_the_seam() {
+    let (request, message) = refusal(
+        serve(
+            &demo(),
+            &set_app(
+                SettingKey::LightModel,
+                json!({ "agent_id": "nope", "model": "opus" }),
+                None,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(request, "set_setting");
+    assert!(
+        message.contains("`light_model` must be null or "),
+        "the seam's own sentence: {message}"
     );
 }
 
@@ -2553,10 +2858,18 @@ async fn the_section_at_80_columns() {
         .filter_map(row_text)
         .filter(|row| row.contains(" | "))
         .collect();
+    // Every value row but `light_model`, which reads `not set` alone (MOD-164 D7).
     assert_eq!(
         rows.len(),
-        SettingKey::app_keys().count() + project_keys().count(),
+        SettingKey::app_keys().count() + project_keys().count() - 1,
         "{frame}"
+    );
+    assert!(
+        body(&frame)
+            .into_iter()
+            .filter_map(row_text)
+            .any(|row| row.trim_end().ends_with("not set") && row.starts_with("light_model")),
+        "the light model row fits too: {frame}"
     );
     for row in rows {
         assert!(

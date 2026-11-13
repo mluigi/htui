@@ -914,6 +914,14 @@ pub struct LightModel {
     pub model: String,
 }
 
+impl LightModel {
+    /// The `light_model` value that resolves back to `self`, as the Settings row writes it.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::json!({ "agent_id": self.agent_id, "model": self.model })
+    }
+}
+
 /// The JSON shape of a `light_model` value, and nothing more: two fields, no third.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1479,12 +1487,19 @@ mod tests {
                 "{dud} is not a light model"
             );
         }
+        let haiku = LightModel {
+            agent_id: AGENT.parse().expect("a uuid"),
+            model: "haiku".to_owned(),
+        };
         assert_eq!(
             resolve_light_model(&app(&[("light_model", light(AGENT, "haiku"))])),
-            Some(LightModel {
-                agent_id: AGENT.parse().expect("a uuid"),
-                model: "haiku".to_owned(),
-            })
+            Some(haiku.clone())
+        );
+        assert_eq!(haiku.to_value(), light(AGENT, "haiku"), "the written shape");
+        assert_eq!(
+            validate(SettingKey::LightModel, Rungs::APP, &haiku.to_value(), None),
+            Ok(()),
+            "what the row writes is what the writer accepts"
         );
     }
 
