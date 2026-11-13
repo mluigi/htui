@@ -1250,9 +1250,9 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   in parallel); `pg_store_conformance` dealt across four tests; both gate twins drop `--test-threads=1`;
   `box_probe` scripts written by a `sh` child (`ETXTBSY`). htui-store `it` at default threads 1022 s to
   169 s; the workspace `cargo test` at default threads 532 s with the build; the gate 30 min to 7.5 min
-  (test step 1732 s to 414 s). **Landed after:** `tests/rust/write_executable.rs` (a `sh` child writes the
+  (test step 1732 s to 414-457 s); the gate on `1dd0d52f` is red only on the three base failures. **Landed after:** `tests/rust/write_executable.rs` (a `sh` child writes the
   fixture executable) for the six files that wrote and exec'd without an `ETXTBSY` retry; `gate.sh --detach`
-  runs `set -m` first: without it the detached gate ignored SIGINT, and `cli_driver::a_cancel_drains…` and
+  launches through `env --default-signal`: before, the detached gate ignored SIGINT, and `cli_driver::a_cancel_drains…` and
   `launch::an_interrupt_lets…` failed in every detached gate (TOOL-15's "load flakes"). **Open:** the dev
   Postgres's load-related crash
   (a backend `exited with exit code 2`, every case after it `57P03`) hit the first default-thread gate and

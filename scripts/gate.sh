@@ -383,12 +383,13 @@ fi
 if [[ $DETACH -eq 1 ]]; then
     mkdir -p "$GATE_DIR"
     args=(); [[ -n "$ONLY" ]] && args=(--only "$ONLY")
-    # `set -m` first (TOOL-16): without job control a non-interactive shell starts a background job
-    # with SIGINT and SIGQUIT ignored, every process under it inherits that, and a shell that starts
-    # with a signal ignored cannot trap it. Two tests interrupt a `trap ... INT` child and failed in
-    # every detached gate; the orphaned children showed `SigIgn: 0x6`.
-    set -m
-    setsid bash "${BASH_SOURCE[0]}" "${args[@]}" > "$GATE_DIR/run.log" 2>&1 < /dev/null &
+    # `env --default-signal` (TOOL-16): a non-interactive shell starts a background job with SIGINT
+    # and SIGQUIT ignored, every process under it inherits that, and a shell that starts with a
+    # signal ignored cannot trap it. Two tests interrupt a `trap ... INT` child and failed in every
+    # detached gate; the orphaned children showed `SigIgn: 0x6`. Bare `--default-signal` (every
+    # signal) is the form GNU and uutils `env` agree on. Not `set -m`: a job-control job leads its
+    # process group, `setsid` then forks, and `$!` would name a parent that exits at once.
+    setsid env --default-signal bash "${BASH_SOURCE[0]}" "${args[@]}" > "$GATE_DIR/run.log" 2>&1 < /dev/null &
     echo "gate started, pid $! - log $GATE_DIR/run.log, result: bash scripts/gate.sh --status"
     exit 0
 fi
