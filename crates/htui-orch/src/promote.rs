@@ -74,14 +74,15 @@ pub fn resume_failed_notice(session_ref: &AgentSessionRef, reason: &str) -> Othe
 
 /// MOD-37 M5: `run_step.opening`, written through any [`WriteStore`](htui_core::store::WriteStore)
 /// (MOD-125 M3 D5: the chat's `Writer` today). A failed write is logged and never fails the
-/// caller: the column is a label, and the session is what the user is waiting on.
+/// caller: the column is a label, and the session is what the user is waiting on. The log line
+/// is the chat's, verbatim, which `agent_worker`'s tests pin.
 pub async fn record_opening<S: htui_core::store::WriteStore + ?Sized>(
     store: &S,
     step: StepId,
     opening: StepOpening,
 ) {
     if let Err(err) = store.record_opening(step, opening).await {
-        tracing::warn!(%err, %step, %opening, "the step's opening could not be recorded");
+        tracing::warn!(%err, %step, %opening, "the chat's opening could not be recorded");
     }
 }
 
