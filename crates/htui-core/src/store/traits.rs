@@ -3969,16 +3969,17 @@ pub fn resolution_not_closable(item: ItemId, state: ItemState, resolution: Resol
 /// item named.
 #[must_use]
 pub fn close_out_needs_a_link(item: ItemId, resolution: Resolution) -> String {
-    if resolution == Resolution::Superseded {
-        format!(
+    match resolution {
+        Resolution::Superseded => format!(
             "item {item} closes as `superseded` only with a live `supersedes` link to it or the \
              item that supersedes it named (R-ENT-9)"
-        )
-    } else {
-        format!(
-            "item {item} closes as `{resolution}` only with a live `duplicates` link from it or \
-             the item it duplicates named (R-ENT-9)"
-        )
+        ),
+        Resolution::Duplicate => format!(
+            "item {item} closes as `duplicate` only with a live `duplicates` link from it or the \
+             item it duplicates named (R-ENT-9)"
+        ),
+        // Unreachable by contract: no other resolution needs a link.
+        _ => format!("item {item} closes as `{resolution}` with no link needed (R-ENT-9)"),
     }
 }
 
