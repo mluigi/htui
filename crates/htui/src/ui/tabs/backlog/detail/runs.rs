@@ -114,6 +114,10 @@ pub const NOTE_NEEDED: &str = "a rejection needs a note";
 /// What the typed close-out stage says to a key that is not the item's (D167).
 pub const NOT_THE_KEY: &str = "that is not the item's key";
 
+/// What the close-out's naming stage says to an empty submit (MOD-150 M2 D8): `duplicate` and
+/// `superseded` close only with the item they link to.
+pub const NAME_NEEDED: &str = "type the key of the item it links to";
+
 /// `Orch(CloseOutPreview)`'s and `Orch(Command(CloseOut))`'s names (blueprint D209), which a
 /// refusal is answered under.
 const CLOSE_OUT_PREVIEW: &str = "close_out_preview";
@@ -458,12 +462,24 @@ enum CloseOutStage {
     /// `CloseOutPreview` is on its way.
     Counting,
     /// The counts are shown; `←`/`→` pick the resolution in `Preview::resolution` (MOD-39 plan
-    /// P13) and `y` goes on to the typed stage, which sends it.
+    /// P13) and `y` goes on to the naming stage when the resolution needs a link none stands
+    /// for, else to the typed stage, which sends it.
     Warn(Preview),
+    /// MOD-150 M2 D8: `duplicate` with no live canonical, or `superseded` with no live
+    /// supersessor: the key of the item it links to has to be typed first.
+    Naming {
+        /// The counts, and the resolution that needs the link.
+        preview: Preview,
+        /// What was typed.
+        field: TextField,
+    },
     /// The item key has to be typed back.
     Typed {
         /// The counts, and the key to match.
         preview: Preview,
+        /// The item named in the naming stage, which `CloseOut` sends; `None` when no naming
+        /// stage was asked.
+        names: Option<String>,
         /// What was typed.
         field: TextField,
     },
@@ -762,9 +778,11 @@ impl RunsTab {
             Mode::Browse => views::RUNS_BROWSE,
             Mode::RejectNote { .. }
             | Mode::FollowUp { .. }
-            | Mode::CloseOut(CloseOutStage::Typed { .. } | CloseOutStage::InFlight) => {
-                views::CAPTURE
-            }
+            | Mode::CloseOut(
+                CloseOutStage::Naming { .. }
+                | CloseOutStage::Typed { .. }
+                | CloseOutStage::InFlight,
+            ) => views::CAPTURE,
             Mode::ConfirmCancel { .. } => views::RUNS_CANCEL,
             Mode::CloseOut(CloseOutStage::Warn(_)) => views::RUNS_CONFIRM,
             Mode::CloseOut(CloseOutStage::Counting) => views::RUNS_COUNTING,
@@ -1175,9 +1193,8 @@ fn cycle(preview: &Preview, forward: bool) -> Resolution {
 /// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
 /// `confirm.yes` (`y`); the warning's `choice.prev`/`next` (`←`/`→`, `h`/`l`) pick the
 /// resolution, and `choice.toggle` (Space) steps forward (MOD-39 plan P13, MOD-115 M2 D7); the
-/// typed stage
-/// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
-/// answer. A key no stage used is `modal_rest`'s.
+/// naming stage (MOD-150 M2 D8) and the typed stage leave on `Esc` only, because `n` is a letter
+/// there; in flight, every key waits for the answer. A key no stage used is `modal_rest`'s.
 fn close_out_key(
     item: ItemId,
     stage: CloseOutStage,
@@ -1198,9 +1215,17 @@ fn close_out_key(
                 preview.resolution = cycle(&preview, forward);
                 (CloseOutStage::Warn(preview), Handled::Consumed)
             }
+            Some(Act::ConfirmYes) if needs_a_name(&preview) => (
+                CloseOutStage::Naming {
+                    preview,
+                    field: TextField::new(),
+                },
+                Handled::Consumed,
+            ),
             Some(Act::ConfirmYes) => (
                 CloseOutStage::Typed {
                     preview,
+                    names: None,
                     field: TextField::new(),
                 },
                 Handled::Consumed,
@@ -1208,24 +1233,69 @@ fn close_out_key(
             Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
             _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
         },
-        CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
+        CloseOutStage::Naming { preview, mut field } => match field.on_key(key) {
+            FieldOutcome::Submit => match field.text().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(name) => (
+                    CloseOutStage::Typed {
+                        names: Some(name.to_owned()),
+                        preview,
+                        field: TextField::new(),
+                    },
+                    Handled::Consumed,
+                ),
+                None => {
+                    field.clear();
+                    ctx.emit(Action::Error(NAME_NEEDED.to_owned()));
+                    (CloseOutStage::Naming { preview, field }, Handled::Consumed)
+                }
+            },
+            FieldOutcome::Cancel => return (Mode::Browse, Handled::Consumed),
+            FieldOutcome::Consumed => (CloseOutStage::Naming { preview, field }, Handled::Consumed),
+            FieldOutcome::Pass => (
+                CloseOutStage::Naming { preview, field },
+                modal_rest(stack, chord),
+            ),
+        },
+        CloseOutStage::Typed {
+            preview,
+            names,
+            mut field,
+        } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
                 ctx.request(command(Command::CloseOut {
                     item,
                     resolution: preview.resolution,
-                    names: None,
+                    names,
                 }));
                 (CloseOutStage::InFlight, Handled::Consumed)
             }
             FieldOutcome::Submit => {
                 field.clear();
                 ctx.emit(Action::Error(NOT_THE_KEY.to_owned()));
-                (CloseOutStage::Typed { preview, field }, Handled::Consumed)
+                (
+                    CloseOutStage::Typed {
+                        preview,
+                        names,
+                        field,
+                    },
+                    Handled::Consumed,
+                )
             }
             FieldOutcome::Cancel => return (Mode::Browse, Handled::Consumed),
-            FieldOutcome::Consumed => (CloseOutStage::Typed { preview, field }, Handled::Consumed),
+            FieldOutcome::Consumed => (
+                CloseOutStage::Typed {
+                    preview,
+                    names,
+                    field,
+                },
+                Handled::Consumed,
+            ),
             FieldOutcome::Pass => (
-                CloseOutStage::Typed { preview, field },
+                CloseOutStage::Typed {
+                    preview,
+                    names,
+                    field,
+                },
                 modal_rest(stack, chord),
             ),
         },
@@ -1265,17 +1335,51 @@ struct Question<'a> {
     hint: String,
 }
 
+/// Whether the picked resolution needs an item named before the typed key (MOD-150 M2 D8):
+/// `duplicate` with no live canonical, `superseded` with no live supersessor.
+fn needs_a_name(preview: &Preview) -> bool {
+    match preview.resolution {
+        Resolution::Duplicate => preview.duplicate_of.is_none(),
+        Resolution::Superseded => preview.superseded_by.is_empty(),
+        _ => false,
+    }
+}
+
 /// The close-out's summary (D167, MOD-115 M4 E10): the item, the resolution's word, the runs and
-/// commit rows counted with [`plural`], and the summary version it writes.
-fn close_out_summary(preview: &Preview) -> String {
+/// commit rows counted with [`plural`], and the summary version it writes. A `duplicate` or
+/// `superseded` close-out then names its link (MOD-150 M2 D8): the live one, else `names`, the
+/// item typed at the naming stage; any other resolution names none.
+fn close_out_summary(preview: &Preview, names: Option<&str>) -> String {
+    let link = match preview.resolution {
+        Resolution::Duplicate => preview
+            .duplicate_of
+            .as_deref()
+            .or(names)
+            .map(|key| format!(" \u{b7} duplicate of {key}")),
+        Resolution::Superseded if !preview.superseded_by.is_empty() => Some(format!(
+            " \u{b7} superseded by {}",
+            preview.superseded_by.join(", ")
+        )),
+        Resolution::Superseded => names.map(|key| format!(" \u{b7} superseded by {key}")),
+        _ => None,
+    };
     format!(
-        "close {} as {} \u{b7} {} \u{b7} {} \u{b7} summary v{}",
+        "close {} as {} \u{b7} {} \u{b7} {} \u{b7} summary v{}{}",
         preview.key,
         label::resolution(preview.resolution),
         plural(preview.runs, "run", "runs"),
         plural(preview.rows, "commit row", "commit rows"),
-        preview.version
+        preview.version,
+        link.unwrap_or_default()
     )
+}
+
+/// The naming stage's question (MOD-150 M2 D8), by the resolution that needs the link.
+const fn naming_question(resolution: Resolution) -> &'static str {
+    match resolution {
+        Resolution::Superseded => "superseded by which item? type its key:",
+        _ => "duplicate of which item? type its key:",
+    }
 }
 
 /// The style a run status renders with. `Theme::status_style` is about items, not runs.
@@ -1938,7 +2042,9 @@ impl DetailTab for RunsTab {
         match &mut self.mode {
             Mode::RejectNote { field, .. }
             | Mode::FollowUp { field, .. }
-            | Mode::CloseOut(CloseOutStage::Typed { field, .. }) => {
+            | Mode::CloseOut(
+                CloseOutStage::Naming { field, .. } | CloseOutStage::Typed { field, .. },
+            ) => {
                 field.on_paste(text);
                 Handled::Consumed
             }
@@ -2342,13 +2448,27 @@ impl RunsTab {
     fn question(&self, keys: &Keys) -> Option<Question<'_>> {
         let (title, lines, input) = match &self.mode {
             Mode::ConfirmCancel { .. } => (CANCEL_TITLE, vec![CANCEL_QUESTION.to_owned()], None),
-            Mode::CloseOut(CloseOutStage::Warn(preview)) => {
-                (CLOSE_OUT_TITLE, vec![close_out_summary(preview)], None)
-            }
-            Mode::CloseOut(CloseOutStage::Typed { preview, field }) => (
+            Mode::CloseOut(CloseOutStage::Warn(preview)) => (
+                CLOSE_OUT_TITLE,
+                vec![close_out_summary(preview, None)],
+                None,
+            ),
+            Mode::CloseOut(CloseOutStage::Naming { preview, field }) => (
                 CLOSE_OUT_TITLE,
                 vec![
-                    close_out_summary(preview),
+                    close_out_summary(preview, None),
+                    naming_question(preview.resolution).to_owned(),
+                ],
+                Some(field),
+            ),
+            Mode::CloseOut(CloseOutStage::Typed {
+                preview,
+                names,
+                field,
+            }) => (
+                CLOSE_OUT_TITLE,
+                vec![
+                    close_out_summary(preview, names.as_deref()),
                     format!("type {} to close it:", preview.key),
                 ],
                 Some(field),
@@ -2379,7 +2499,9 @@ impl RunsTab {
             Mode::ConfirmCancel { .. } => CONFIRM_CANCEL_HINT,
             Mode::CloseOut(CloseOutStage::Counting) => COUNTING_HINT,
             Mode::CloseOut(CloseOutStage::Warn(_)) => WARN_HINT,
-            Mode::CloseOut(CloseOutStage::Typed { .. }) => TYPED_HINT,
+            Mode::CloseOut(CloseOutStage::Naming { .. } | CloseOutStage::Typed { .. }) => {
+                TYPED_HINT
+            }
             Mode::CloseOut(CloseOutStage::InFlight) => IN_FLIGHT_HINT,
         }
     }
@@ -4429,6 +4551,198 @@ mod tests {
                 names: None,
             }]
         );
+    }
+
+    /// MOD-150 M2 D8: `duplicate` with no live canonical asks for the item it duplicates before
+    /// the typed key; the summary then names it, and the close-out sends it.
+    #[tokio::test]
+    async fn a_duplicate_with_no_canonical_asks_for_it() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        walk(&mut pane, &shell, KeyCode::Left, 1);
+        assert_eq!(picked(&pane), Resolution::Duplicate);
+
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert!(
+            matches!(&pane.mode, Mode::CloseOut(CloseOutStage::Naming { .. })),
+            "{:?}",
+            pane.mode
+        );
+        assert_eq!(
+            footer(&pane),
+            [
+                "close FEAT-1 as duplicate · 1 run · 3 commit rows · summary v2",
+                "duplicate of which item? type its key:",
+                "",
+                "Enter close · Esc cancel",
+            ]
+        );
+        type_text(&mut pane, &shell, "FIX-17");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert!(shell.emit.is_empty(), "naming sends nothing");
+        assert_eq!(
+            footer(&pane),
+            [
+                "close FEAT-1 as duplicate · 1 run · 3 commit rows · summary v2 · duplicate of \
+                 FIX-17",
+                "type FEAT-1 to close it:",
+                "",
+                "Enter close · Esc cancel",
+            ]
+        );
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: Resolution::Duplicate,
+                names: Some("FIX-17".to_owned()),
+            }]
+        );
+    }
+
+    /// MOD-150 M2 D8: a live canonical stands, so `y` goes straight to the typed key, the
+    /// summary names the canonical, and the close-out names nothing.
+    #[tokio::test]
+    async fn a_standing_canonical_skips_the_naming() {
+        let shell = Shell::new();
+        let standing = Preview {
+            resolution: Resolution::Duplicate,
+            duplicate_of: Some("FIX-17".to_owned()),
+            ..preview()
+        };
+        let mut pane = warned_with(&shell, standing).await;
+        assert_eq!(
+            footer(&pane)[0],
+            "close FEAT-1 as duplicate · 1 run · 3 commit rows · summary v2 · duplicate of FIX-17"
+        );
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert!(
+            matches!(&pane.mode, Mode::CloseOut(CloseOutStage::Typed { .. })),
+            "{:?}",
+            pane.mode
+        );
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: Resolution::Duplicate,
+                names: None,
+            }]
+        );
+    }
+
+    /// MOD-150 M2 D8: an empty name is refused on the status line and the question stays; `Esc`
+    /// leaves the close-out.
+    #[tokio::test]
+    async fn the_naming_refuses_an_empty_key_and_esc_leaves() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        walk(&mut pane, &shell, KeyCode::Left, 1);
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NAME_NEEDED),
+            "{emitted:?}"
+        );
+        assert!(
+            matches!(&pane.mode, Mode::CloseOut(CloseOutStage::Naming { .. })),
+            "{:?}",
+            pane.mode
+        );
+
+        type_text(&mut pane, &shell, "FIX");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Esc), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(matches!(pane.mode, Mode::Browse), "{:?}", pane.mode);
+        assert!(shell.emit.is_empty(), "nothing is sent");
+    }
+
+    /// MOD-150 M2 D8: `superseded` asks for its supersessor the same way when none stands, and
+    /// names the standing ones, sorted as the preview has them, when they do.
+    #[tokio::test]
+    async fn a_superseded_close_out_asks_for_or_names_its_supersessor() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        walk(&mut pane, &shell, KeyCode::Left, 2);
+        assert_eq!(picked(&pane), Resolution::Superseded);
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert_eq!(footer(&pane)[1], "superseded by which item? type its key:");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert!(
+            matches!(shell.emit.take().as_slice(), [Action::Error(sentence)] if sentence == NAME_NEEDED)
+        );
+        type_text(&mut pane, &shell, "agy:FIX-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert!(footer(&pane)[0].ends_with(" · superseded by agy:FIX-1"));
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert_eq!(
+            shell
+                .emit
+                .take()
+                .iter()
+                .filter_map(sent_command)
+                .collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: Resolution::Superseded,
+                names: Some("agy:FIX-1".to_owned()),
+            }]
+        );
+
+        let standing = Preview {
+            resolution: Resolution::Superseded,
+            superseded_by: vec!["FIX-2".to_owned(), "agy:FIX-1".to_owned()],
+            ..preview()
+        };
+        let mut pane = warned_with(&shell, standing).await;
+        assert!(
+            footer(&pane)[0].ends_with(" · superseded by FIX-2, agy:FIX-1"),
+            "{:?}",
+            footer(&pane)
+        );
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert!(
+            matches!(&pane.mode, Mode::CloseOut(CloseOutStage::Typed { .. })),
+            "{:?}",
+            pane.mode
+        );
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert_eq!(
+            shell
+                .emit
+                .take()
+                .iter()
+                .filter_map(sent_command)
+                .collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: Resolution::Superseded,
+                names: None,
+            }]
+        );
+    }
+
+    /// MOD-150 M2 D8: the naming field takes a paste, as the typed key's does.
+    #[tokio::test]
+    async fn the_naming_field_takes_a_paste() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        walk(&mut pane, &shell, KeyCode::Left, 1);
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert_eq!(pane.on_paste("FIX-17", &mut shell.ctx()), Handled::Consumed);
+        assert_eq!(footer(&pane)[2], "FIX-17");
     }
 
     /// MOD-39 plan P13: the warning names the picker in its hint and the picked resolution in its
@@ -7446,7 +7760,7 @@ mod tests {
     #[test]
     fn the_close_out_summary_counts_in_words() {
         assert_eq!(
-            close_out_summary(&preview()),
+            close_out_summary(&preview(), None),
             "close FEAT-1 as done \u{b7} 1 run \u{b7} 3 commit rows \u{b7} summary v2"
         );
         let other = Preview {
@@ -7456,8 +7770,33 @@ mod tests {
             ..preview()
         };
         assert_eq!(
-            close_out_summary(&other),
+            close_out_summary(&other, None),
             "close FEAT-1 as duplicate \u{b7} 2 runs \u{b7} 1 commit row \u{b7} summary v2"
+        );
+        // MOD-150 M2 D8: the standing canonical wins over a typed name; other resolutions name
+        // no link at all.
+        let standing = Preview {
+            duplicate_of: Some("agy:FIX-1".to_owned()),
+            ..other.clone()
+        };
+        assert_eq!(
+            close_out_summary(&standing, Some("FIX-17")),
+            "close FEAT-1 as duplicate \u{b7} 2 runs \u{b7} 1 commit row \u{b7} summary v2 \
+             \u{b7} duplicate of agy:FIX-1"
+        );
+        assert_eq!(
+            close_out_summary(&other, Some("FIX-17")),
+            "close FEAT-1 as duplicate \u{b7} 2 runs \u{b7} 1 commit row \u{b7} summary v2 \
+             \u{b7} duplicate of FIX-17"
+        );
+        let done = Preview {
+            duplicate_of: Some("FIX-17".to_owned()),
+            superseded_by: vec!["FIX-2".to_owned()],
+            ..preview()
+        };
+        assert_eq!(
+            close_out_summary(&done, None),
+            close_out_summary(&preview(), None)
         );
     }
 

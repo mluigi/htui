@@ -12,8 +12,9 @@ use htui::run_worker::RunRuntime;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::WorkspaceSummary;
-use htui_core::store::MemStore;
+use htui_core::fixtures::ids;
+use htui_core::model::{LinkKind, Status, WorkspaceSummary};
+use htui_core::store::{MemStore, ReadStore};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 
 /// Rows down from the arrival row (`ANA-1`) to htui `FEAT-1`, whose one run has four steps.
@@ -207,4 +208,77 @@ async fn the_typed_close_out_shows_the_key_typed_at_80_columns() {
         "the key typed is whole on its own row:\n{frame}"
     );
     insta::assert_snapshot!("closeout_typed_80", frame);
+}
+
+/// MOD-150 M2 D8 end to end: `ANA-1` closes as `duplicate` of `ANA-2`. With no canonical
+/// standing, the question asks which item it duplicates before the typed key; once closed, the
+/// store holds the `duplicates` link the close-out recorded.
+#[tokio::test]
+async fn a_duplicate_close_out_names_its_canonical() {
+    let store = MemStore::demo();
+    let runtime = RunRuntime::with_parts(
+        Arc::new(FakeIsolator::new()),
+        Arc::new(FakeVerifier::new()),
+        DriverFactory::new(),
+    );
+    let mut harness = Harness::over(store.clone())
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_run_runtime(runtime);
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    on_runs(&mut harness, 0).await;
+    // `ANA-1` finished, so the warning starts on `done`; `←` wraps to `duplicate`.
+    for key in ["C", "left", "y"] {
+        harness.key(key);
+        harness.drive_to_end().await;
+    }
+    let frame = harness.render();
+    assert!(
+        frame.contains("duplicate of which item?"),
+        "the question asks for the canonical:\n{frame}"
+    );
+    insta::assert_snapshot!("closeout_naming", frame);
+
+    for key in ["A", "N", "A", "-", "2", "enter"] {
+        harness.key(key);
+    }
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("which item?") && frame.contains("to close it"),
+        "the name is taken and the key is asked for:\n{frame}"
+    );
+    for key in ["A", "N", "A", "-", "1", "enter"] {
+        harness.key(key);
+    }
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("Close out"),
+        "the close-out ended:\n{frame}"
+    );
+
+    let item = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the fixture holds ANA-1");
+    assert_eq!(item.status, Status::Closed, "{item:?}");
+    let links = store
+        .links(ids::HTUI_ANA_1, 1)
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        links
+            .edges
+            .iter()
+            .any(|edge| edge.from_item_id == ids::HTUI_ANA_1
+                && edge.to_item_id == ids::HTUI_ANA_2
+                && edge.kind == LinkKind::Duplicates),
+        "the close-out recorded the canonical: {links:?}"
+    );
 }
