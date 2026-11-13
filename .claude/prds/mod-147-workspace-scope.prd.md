@@ -89,19 +89,20 @@ Decisions taken in this PRD (maintainer, 2026-11-08):
 |---|---|---|---|---|
 | 1 | Scope row and owner documents in the store | Creating a workspace creates its scope row (`@<slug>`, type `workspace`) in the same transaction, and the bootstrap creates one for every existing workspace; the workspace seed gives it the `WS` kind (plan → review); items mint `WS-N` from its own counter; documents carry `project_id` with a nullable `item_id`, so a project or workspace can own one; `workspace_box_path.folder_path` with its `~/workspaces/<slug>` default; the scope row never appears in any listing; the cache mirrors the scope row and owner documents (the folder stays online-only, as `workspace_box_path` always has) | complete | `.claude/plans/mod-147-m1-scope-row.plan.md` |
 | 2 | Keys and links across a workspace | A workspace kind's prefix equal to a member's is refused, a colliding project may join with a warning; keys are qualified `slug:KEY` wherever ambiguous (MCP, CLI), `@shop:WS-1` for workspace items; `propose_link` reaches the step's workspaces and their member projects | complete | `.claude/plans/mod-147-m2-keys-and-links.plan.md` |
-| 3 | TUI surfaces | The Backlog shows each workspace's own items as the workspace's group; Settings' project and workspace entries list, show and add owner documents (goals preset for a workspace); the workspace form sets the scope row's secret binding and shows the folder path | pending | — |
+| 3 | TUI surfaces | The Backlog shows each workspace's own items as the workspace's group; Settings' project and workspace entries list, show and add owner documents (goals preset for a workspace); Settings › Secrets binds the scope row's secret scope from a workspace row (maintainer, 2026-11-13: not the workspace form) and the workspace row and form show the folder path; `N` on the workspace group creates a `WS` item | in-progress | `.claude/plans/mod-147-m3-tui-surfaces.plan.md` |
 | 4 | Search | Owner documents (no item) are indexed as `Owner::Document` points by an owner-document pass beside the item loop, in today's collection (payload stamp bump → drop and reindex); a workspace-scoped search in the TUI/CLI covers member projects plus the scope row | pending | — |
 
 ## Open Questions
 
-- [ ] Workspace deletion: ANA-35's DDL cascades the scope row (and with it the workspace's items,
+- [x] Workspace deletion: ANA-35's DDL cascades the scope row (and with it the workspace's items,
   documents and runs) from `workspace` (`ON DELETE CASCADE`). Is cascading acceptable, or must deleting a
-  workspace that owns items refuse? TBD — needs validation by reading today's workspace-delete path in `/plan`.
-- [ ] The workspace seed's `plan` phase: which prompt template body it uses until MOD-148 adds the
-  workspace `plan` body (likely today's software `plan` template). TBD — settle in `/plan` M1.
-- [ ] Which existing listing sites need the visible-projects predicate (lists, Settings hierarchy, cwd
+  workspace that owns items refuse? TBD — needs validation by reading today's workspace-delete path in `/plan`. **Settled in M1:** cascade with counted reach, refused while a
+  scope-row run is live (`.claude/plans/mod-147-m1-scope-row.plan.md`).
+- [x] The workspace seed's `plan` phase: which prompt template body it uses until MOD-148 adds the
+  workspace `plan` body (likely today's software `plan` template). TBD — settle in `/plan` M1. **Settled in M1** (`.claude/plans/mod-147-m1-scope-row.plan.md`).
+- [x] Which existing listing sites need the visible-projects predicate (lists, Settings hierarchy, cwd
   mapping, `htui status`, membership pickers, fixtures, demo loader). TBD — enumerate in `/plan` M1's
-  fact-check.
+  fact-check. **Settled in M1:** the row never joins `workspace_project`, so no lister shows it.
 
 ## Risks
 
