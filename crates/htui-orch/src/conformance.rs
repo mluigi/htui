@@ -1095,6 +1095,9 @@ pub const CASES: &[&str] = &[
     "a_stopped_part_resumes_before_its_queued_sibling",
     "a_stopped_shared_serialized_candidate_is_reacquired_not_reset",
     "a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict",
+    // MOD-125 M3 F1 (review L3): a stopped step beside a parked sibling resumes before the run
+    // parks again.
+    "a_stopped_step_beside_a_park_resumes_before_the_run_parks_again",
 ];
 
 /// Run one case by name.
@@ -17207,6 +17210,9 @@ fn resume_case<'a, H: CaseHarness>(
         "a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict" => Box::pin(
             a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict(harness),
         ),
+        "a_stopped_step_beside_a_park_resumes_before_the_run_parks_again" => {
+            Box::pin(a_stopped_step_beside_a_park_resumes_before_the_run_parks_again(harness))
+        }
         _ => return None,
     })
 }
@@ -17931,6 +17937,92 @@ async fn a_stopped_shared_serialized_candidate_is_reacquired_not_reset<H: CaseHa
     );
 }
 
+/// MOD-125 M3 F1 (review L3): on the diamond, `plan` parks at its gate while `implement`'s
+/// session is live beside it, and the run is stopped between the park's step write and its run
+/// write (D96's window): `implement` stops, `plan` stays parked. The resume runs `implement` on its own row to `done`, as it ran beside the park
+/// before the stop, and only then parks the run again on `plan`; the join is not created.
+async fn a_stopped_step_beside_a_park_resumes_before_the_run_parks_again<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, DIAMOND, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    primary_repo(&orch).await;
+    let hold = orch.hold_sessions(&[("implement", 1)]);
+    let run = orch
+        .enqueue(ids::HTUI_FEAT_3)
+        .await
+        .expect("resolve takes the diamond");
+    // The forced stop's shape: the walk is dropped where it stands.
+    let parked = async {
+        within(hold.live(1), "`implement` held").await;
+        within(
+            until_steps(&orch, run, |steps| {
+                latest_row(steps, 1).is_some_and(|plan| plan.status == StepStatus::AwaitingApproval)
+            }),
+            "`plan` parked",
+        )
+        .await;
+    };
+    match futures::future::select(Box::pin(orch.claim(run)), Box::pin(parked)).await {
+        Either::Left((outcome, _)) => panic!("the walk finished instead of holding: {outcome:?}"),
+        Either::Right(((), walk)) => drop(walk),
+    }
+    hold.release();
+    // The stop lands between `gate::park`'s two writes (D96): `plan`'s step write landed, the
+    // run's did not, so the run is `running` over a parked step and a live one when it stops.
+    assert!(
+        orch.store()
+            .transition_run(
+                run,
+                RunStatus::AwaitingApproval,
+                RunStatus::Running,
+                orch.clock().now(),
+            )
+            .await
+            .expect("MemStore takes the move"),
+        "the park's run write is undone"
+    );
+    settled_stopped(&orch, run).await;
+    let steps = steps_of(&orch, run).await;
+    let implement = latest_row(&steps, 2).expect("`implement` ran").clone();
+    assert_eq!(
+        (
+            latest_row(&steps, 1).map(|plan| plan.status),
+            implement.status
+        ),
+        (Some(StepStatus::AwaitingApproval), StepStatus::Stopped),
+        "`plan` parked, `implement` stopped"
+    );
+
+    let resumed = orch.resume_stopped(run).await;
+
+    assert!(
+        matches!(
+            &resumed,
+            Ok(Some(rest)) if rest.run == RunStatus::AwaitingApproval && rest.position == Some(1)
+        ),
+        "the run parks again on `plan`: {resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let after = latest_row(&steps, 2).expect("`implement` stays");
+    assert_eq!(
+        (after.id, after.attempt, after.status),
+        (implement.id, 1, StepStatus::Done),
+        "`implement` resumed on its own row and ran to `done` before the park"
+    );
+    assert_eq!(
+        latest_row(&steps, 1).map(|plan| plan.status),
+        Some(StepStatus::AwaitingApproval)
+    );
+    assert!(latest_row(&steps, 3).is_none(), "the join is not created");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+}
+
 /// [`a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict`]'s shape: `ANA-2`'s `research`
 /// fanned out three ways with `agy` judging, the judge's walk dropped after call 1's `done` (both
 /// calls' documents written, each naming candidate 0), and the stop settled: the run is `stopped`
@@ -18029,8 +18121,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            247,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            248,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -18125,7 +18217,8 @@ mod tests {
              D9: a stopped step's saved session reopened, a failed resume's fallback, no caps, no \
              rows, no banner, the planner, the pre-merge, integrate, and a stopped run's cancel on \
              this box and on none), and MOD-125 M3 T4's three (plan D4, D9: a stopped part before \
-             its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run) 247"
+             its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run), and MOD-125 M3 F1's one (review L3: a \
+             stopped step beside a park resumed before the run parks again) 248"
         );
     }
 

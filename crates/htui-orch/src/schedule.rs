@@ -6,7 +6,10 @@
 //! 1. **Blocking rests (A6).** Nothing is admitted while any cursor is a `Rest` at
 //!    `awaiting_approval`, `running` or `stopped`: a parked step, or a session this walk does not
 //!    own. With nothing in flight the pass re-parks a `running` run over a parked step
-//!    ([`PassPlan::RePark`], V20) or rests ([`PassPlan::Rest`]).
+//!    ([`PassPlan::RePark`], V20) or rests ([`PassPlan::Rest`]). One exception (MOD-125 M3 F1):
+//!    a `running` run whose only blocking rests are parks admits its `Resume` cursors (and only
+//!    them) through rule 3, since those steps ran beside the park when the run stopped; it
+//!    re-parks once they settle.
 //! 2. `[Finished]` finishes the run once nothing is in flight.
 //! 3. Every other cursor is a candidate, in `ready` order, admitted when all of these hold:
 //!    - (a) its node is not taken already (F16: one future per node);
@@ -93,18 +96,31 @@ pub(crate) fn plan_pass(
             .iter()
             .any(|cursor| matches!(cursor, Cursor::Rest { status, .. } if wanted.contains(status)))
     };
-    if blocking(&[
-        StepStatus::AwaitingApproval,
-        StepStatus::Running,
-        StepStatus::Stopped,
-    ]) {
-        return if !idle {
+    let rule_one = || {
+        if !idle {
             PassPlan::Wait
         } else if status == RunStatus::Running && blocking(&[StepStatus::AwaitingApproval]) {
             PassPlan::RePark
         } else {
             PassPlan::Rest
-        };
+        }
+    };
+    // MOD-125 M3 F1 (review L3): a resumed run's stopped steps were in flight beside its park
+    // when it stopped, so they run on (alone: nothing else is admitted) before it parks again.
+    let resumes_beside_a_park = status == RunStatus::Running
+        && blocking(&[StepStatus::AwaitingApproval])
+        && !blocking(&[StepStatus::Running, StepStatus::Stopped])
+        && cursors
+            .iter()
+            .any(|cursor| matches!(cursor, Cursor::Resume(_)));
+    if !resumes_beside_a_park
+        && blocking(&[
+            StepStatus::AwaitingApproval,
+            StepStatus::Running,
+            StepStatus::Stopped,
+        ])
+    {
+        return rule_one();
     }
     // Rule 2.
     if matches!(cursors, [Cursor::Finished]) {
@@ -127,6 +143,9 @@ pub(crate) fn plan_pass(
     let waits = crate::walk::input_waits(snapshot, steps, &in_flight.keys().copied().collect());
     let mut held = Vec::new();
     for cursor in cursors {
+        if resumes_beside_a_park && !matches!(cursor, Cursor::Resume(_)) {
+            continue;
+        }
         let Some((position, flight)) = candidate(snapshot, steps, cursor) else {
             continue;
         };
@@ -178,6 +197,10 @@ pub(crate) fn plan_pass(
         }
         taken.push((position, flight));
         admitted.push((cursor.clone(), position, flight));
+    }
+    // Nothing of the park's resumed steps admitted: rule 1 answers, as it would have.
+    if resumes_beside_a_park && admitted.is_empty() {
+        return rule_one();
     }
     match (admitted.is_empty(), idle) {
         (false, _) => PassPlan::Admit(admitted),
