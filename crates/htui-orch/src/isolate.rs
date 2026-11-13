@@ -326,7 +326,9 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// Only `shared_serialized` holds a guard, so `local`, `worktree` and `copy` rows answer `Ok`
     /// unread. A `shared_serialized` row is checked once its guard is held: its `HEAD` must be
     /// its `base_ref` or descend from it, and no `htui/<s>` label of another step may lie on
-    /// `base_ref..HEAD`. Otherwise another walk moved the checkout while the step was stopped,
+    /// `base_ref..HEAD` (a `worktree` step's branch point that nothing moved is not one: it marks
+    /// where that step started, MOD-125 M3 F1). Otherwise another walk moved the checkout while
+    /// the step was stopped,
     /// and the call refuses (`real::moved_while_stopped`) with every guard it took released, so
     /// the step fails rather than work on someone else's tree. The guards are held to the step's
     /// own [`capture`](Isolator::capture), as `prepare`'s are.

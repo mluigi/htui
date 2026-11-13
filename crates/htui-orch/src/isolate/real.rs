@@ -5782,6 +5782,68 @@ mod tests {
         );
     }
 
+    /// MOD-125 M3 F1 (review M2): a `worktree` step of another run on the same repository,
+    /// prepared while the stopped step's checkout sits above its base, branches `htui/<W>` off
+    /// that `HEAD`. Committing nothing, it keeps the branch after its tree is removed at capture.
+    /// The branch only marks where `W` started, which is the stopped step's own work: the
+    /// stopped step is reacquired, its guard held and its `HEAD` left where it was.
+    #[tokio::test]
+    async fn reacquire_admits_a_worktree_step_s_unmoved_branch_point_on_the_range() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, stopped) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, stopped, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let stopped_rows = rows(&prepared);
+        let own = commit_file(&core_path, "g", "mine\n", "the stopped step's commit");
+        isolator.release(run).await.expect("release answers");
+
+        let worktree_step = StepId::new();
+        let branched = isolator
+            .prepare(
+                RunId::new(),
+                worktree_step,
+                &[core],
+                Isolation::Worktree,
+                None,
+            )
+            .await
+            .expect("another run's worktree step prepares");
+        assert_eq!(branched.trees[0].before_hash, own, "it branched off HEAD");
+        let commits = isolator
+            .capture(worktree_step, &rows(&branched))
+            .await
+            .expect("the worktree step captures with no commit");
+        assert!(commits.iter().all(|commit| commit.after_hash.is_none()));
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{worktree_step}"))
+                .expect("the ref store reads"),
+            Some(own.clone()),
+            "the premise: its branch point stays on base..HEAD"
+        );
+
+        isolator
+            .reacquire(run, stopped, &stopped_rows)
+            .await
+            .expect("a branch point is not a walk of the checkout");
+        assert_held(&isolator, core, "after reacquire").await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            own,
+            "never reset"
+        );
+    }
+
     /// D5a: a `HEAD` that no longer descends from the step's base (another walk reset the
     /// checkout under it) is refused and released.
     #[tokio::test]

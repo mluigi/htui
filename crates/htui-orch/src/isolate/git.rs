@@ -1902,7 +1902,9 @@ pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateE
 /// the stopped step's base was walked by that step while this one was stopped. A label at `base`
 /// itself is not on the range, so the previous step's own label never counts. A label on a
 /// merge's second parent does not count either: integrate's pre-merge takes each part tip in
-/// that way, labelled by its part, and a walk's capture labels its first-parent line. A `gix`
+/// that way, labelled by its part, and a walk's capture labels its first-parent line. Nor does a
+/// `worktree` step's branch point that nothing moved ([`unmoved_branch_point`], MOD-125 M3 F1):
+/// `worktree add -b` makes `htui/<W>` at the checkout's `HEAD` whoever's work that is. A `gix`
 /// read: the walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
 ///
 /// # Errors
@@ -1963,12 +1965,37 @@ pub fn labels_between(path: &Path, base: &str, head: &str) -> Result<Vec<String>
             .peel_to_id()
             .map_err(|err| IsolateError::Git(format!("cannot peel {name}: {err}")))?
             .detach();
-        if range.contains(&target) {
+        if range.contains(&target) && !unmoved_branch_point(&branch, target)? {
             labels.push(step);
         }
     }
     labels.sort();
     Ok(labels)
+}
+
+/// Whether `branch`, pointing at `target`, is a `worktree` step's branch point nothing moved
+/// (MOD-125 M3 F1): its newest reflog line is the `branch: Created from` one `worktree add -b`
+/// wrote, and it still points where that line put it. Such a branch is made at the checkout's
+/// `HEAD` and kept after a tree that committed nothing is removed, so it marks where that step
+/// started, not a walk of the checkout. A branch with no reflog, or one `htui`'s own label writer
+/// made ([`create_branch`], `htui: label`), is not one.
+fn unmoved_branch_point(
+    branch: &gix::Reference<'_>,
+    target: gix::ObjectId,
+) -> Result<bool, IsolateError> {
+    let name = branch.name().as_bstr().to_string();
+    let fail = |err: &dyn std::fmt::Display| {
+        IsolateError::Git(format!("cannot read the reflog of {name}: {err}"))
+    };
+    let mut log = branch.log_iter();
+    let Some(mut newest_first) = log.rev().map_err(|err| fail(&err))? else {
+        return Ok(false);
+    };
+    let Some(newest) = newest_first.next() else {
+        return Ok(false);
+    };
+    let newest = newest.map_err(|err| fail(&err))?;
+    Ok(newest.new_oid == target && newest.message.starts_with(b"branch: Created from"))
 }
 
 /// One entry of `worktrees()`, flattened so it can outlive the `Repository` that read it.
@@ -3009,6 +3036,57 @@ mod tests {
         assert_eq!(
             super::labels_between(dir.path(), &base, &merge).expect("the labels read"),
             vec!["merge".to_owned()]
+        );
+    }
+
+    /// MOD-125 M3 F1 (review M2): a worktree step's `htui/<W>` branch that `worktree add -b`
+    /// made at the checkout's `HEAD` and nothing moved since marks only where that tree branched
+    /// off, so it does not count. A label `htui` wrote ([`super::create_branch`]) does, and so
+    /// does a branch moved after it was made.
+    #[tokio::test]
+    async fn labels_between_skips_an_unmoved_worktree_branch_point() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let middle = commit_file(&repo, "g", "second\n", "two");
+        let tip = commit_file(&repo, "h", "third\n", "three");
+        git.add_worktree(
+            &repo,
+            &dir.path().join("tree"),
+            htui_core::model::StepId::new(),
+            htui_core::model::RunId::new(),
+            &middle,
+        )
+        .await
+        .expect("the worktree step's tree is added");
+        super::create_branch(&repo, "htui/label", &middle).expect("the label is written");
+        git_in(
+            &git,
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("htui/moved"),
+                OsStr::new(&base),
+            ],
+        );
+        git_in(
+            &git,
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("-f"),
+                OsStr::new("htui/moved"),
+                OsStr::new(&tip),
+            ],
+        );
+
+        assert_eq!(
+            super::labels_between(&repo, &base, &tip).expect("the labels read"),
+            vec!["label".to_owned(), "moved".to_owned()]
         );
     }
 
