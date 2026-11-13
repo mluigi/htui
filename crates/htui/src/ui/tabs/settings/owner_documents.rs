@@ -2,7 +2,7 @@
 //! owner's documents, one version's body, and a new document or a new version written through
 //! `$EDITOR`, opened from a workspace or project row of Settings › Hierarchy.
 //!
-//! Self-contained, as the memory pane ([`super::memory`]) is: the Hierarchy section holds one
+//! Self-contained, as the memory pane ([`memory`]) is: the Hierarchy section holds one
 //! [`OwnerDocumentsPane`] in its `Mode::Documents` and hands it every key, paste, reply, `$EDITOR`
 //! outcome and frame while it is open. It holds no store handle (`R-NF-3`): the read and the
 //! write leave through `ctx.request` for [`crate::owner_documents::serve`].
@@ -15,8 +15,23 @@
 //! and its title, and hands that version's body. An edited body is written as the kind's next
 //! version; an unchanged one writes nothing and says [`NO_CHANGES`].
 //!
+//! A write that did not land keeps its draft (review M2, the Backlog compose's rule): kind, title
+//! and the edited text. A refusal (offline, a constraint, no scope row) says so at once; any other
+//! failure may follow a COMMIT whose answer was lost, so the pane re-reads the list and reports
+//! the write saved when the kind's newest version is newer than before it, else keeps the draft.
+//! While a draft is kept, `Enter`, `n` and `v` reopen `$EDITOR` on its text, and closing it
+//! untouched is the retry. A list read offline says no write is taken (`writable`), and `n`/`v`
+//! refuse before `$EDITOR` opens.
+//!
 //! Every hint and every sentence that names a key reads it from the stack in force, and every act
 //! resolves from [`Ctx::pressed`].
+//!
+//! [`memory`]: crate::ui::tabs::settings::memory
+//! [`OwnerDocumentsPane`]: crate::ui::tabs::settings::owner_documents::OwnerDocumentsPane
+//! [`GOALS_KIND`]: htui_core::model::document::GOALS_KIND
+//! [`GOALS_NONE_YET`]: crate::ui::tabs::settings::owner_documents::GOALS_NONE_YET
+//! [`NO_CHANGES`]: crate::editor::NO_CHANGES
+//! [`Ctx::pressed`]: crate::app::Ctx::pressed
 
 use core::cell::Cell;
 use core::cmp::Reverse;
@@ -35,8 +50,11 @@ use crate::editor::{
     ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline, without_controls,
 };
 use crate::hand_written::HandText;
+use crate::hand_written::answered_from_the_mirror;
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
-use crate::owner_documents::{DocumentOwner, READ_NAME, WRITE_NAME};
+use crate::owner_documents::{
+    DocumentOwner, READ_NAME, WRITE_NAME, offline_refusal, write_refused,
+};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
@@ -45,6 +63,7 @@ use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::markdown;
+use crate::ui::tabs::backlog::detail::compose::{could_not_check, may_have_landed, not_written};
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 pub use crate::ui::tabs::settings::memory::PaneKey;
@@ -228,12 +247,23 @@ impl DocumentForm {
     }
 }
 
-/// What `$EDITOR` was handed, kept until its outcome comes back (D10). `Debug` hand-written:
-/// lengths only.
+/// What `$EDITOR` was handed, kept until its outcome comes back (D10), and, once edited, the
+/// text a write sent or a failed write kept (review M2). `Debug` hand-written: lengths only.
 struct Draft {
     kind: String,
     title: String,
+    /// The text `$EDITOR` holds: the form's body, or a kept draft's edited text.
     handed: String,
+    /// The text that counts as no change: the form's body (empty for `n`, the version's for
+    /// `v`). A kept draft's `handed` differs from it, so closing `$EDITOR` untouched retries.
+    base: String,
+}
+
+impl Draft {
+    /// The draft holds text no write has stored yet.
+    fn is_kept_text(&self) -> bool {
+        self.handed != self.base
+    }
 }
 
 impl core::fmt::Debug for Draft {
@@ -241,8 +271,28 @@ impl core::fmt::Debug for Draft {
         f.debug_struct("Draft")
             .field("kind", &self.kind)
             .field("handed_len", &self.handed.len())
+            .field("base_len", &self.base.len())
             .finish_non_exhaustive()
     }
+}
+
+/// A write in flight (review M2): its draft, and the kind's newest version before it, which an
+/// ambiguous failure's re-read compares against.
+#[derive(Debug)]
+struct Sent {
+    draft: Draft,
+    before: i32,
+}
+
+/// An ambiguous write failure whose re-read is in flight (review M2).
+#[derive(Debug)]
+struct Hedged {
+    sent: Sent,
+    /// The failure's message.
+    why: String,
+    /// The failure was an `Unreachable`, so the re-read is the mirror's, which cannot hold a
+    /// write whose answer was lost: not finding it there proves nothing.
+    mirror: bool,
 }
 
 /// One line on the notice row.
@@ -276,8 +326,14 @@ pub struct OwnerDocumentsPane {
     cursor: usize,
     /// What the pane is doing.
     mode: Mode,
-    /// A write is in flight.
-    busy: bool,
+    /// The last list's `writable`: `false` offline, where `n` and `v` refuse (review M2).
+    writable: bool,
+    /// The write in flight.
+    sent: Option<Sent>,
+    /// An ambiguous write failure, until the re-read settles it.
+    hedged: Option<Hedged>,
+    /// A draft whose write did not land: `Enter`, `n` and `v` reopen `$EDITOR` on it.
+    kept: Option<Draft>,
     /// The version a landed write minted: the next list's cursor goes to it.
     follow: Option<(String, i32)>,
     /// What `$EDITOR` holds (D10).
@@ -302,7 +358,10 @@ impl OwnerDocumentsPane {
             refused: None,
             cursor: 0,
             mode: Mode::Browse,
-            busy: false,
+            writable: true,
+            sent: None,
+            hedged: None,
+            kept: None,
             follow: None,
             pending: None,
             notice: None,
@@ -394,16 +453,24 @@ impl OwnerDocumentsPane {
         let goals_first = matches!(self.owner, DocumentOwner::Workspace(_));
         let mut documents = documents.to_vec();
         documents.sort_by(|left, right| {
-            let key = |row: &OwnerDocument| {
-                (
-                    !(goals_first && row.kind == GOALS_KIND),
-                    row.kind.as_bytes().to_vec(),
-                    Reverse(row.version),
-                )
-            };
-            key(left).cmp(&key(right))
+            order_key(left, goals_first).cmp(&order_key(right, goals_first))
         });
         documents
+    }
+
+    /// A write is in flight, or its ambiguous failure is being checked.
+    const fn busy(&self) -> bool {
+        self.sent.is_some() || self.hedged.is_some()
+    }
+
+    /// The newest version of `kind` in the list, `0` with none.
+    fn newest(&self, kind: &str) -> i32 {
+        self.versions()
+            .iter()
+            .filter(|row| row.kind == kind)
+            .map(|row| row.version)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Why a write key is refused now, if it is.
@@ -414,7 +481,10 @@ impl OwnerDocumentsPane {
         if self.documents.is_none() {
             return Some(NOT_READ.to_owned());
         }
-        if self.busy {
+        if !self.writable {
+            return Some(format!("not saved: {}", offline_refusal()));
+        }
+        if self.busy() {
             return Some(STILL_SAVING.to_owned());
         }
         self.pending.as_ref().map(|_| EDITOR_OPEN.to_owned())
@@ -443,6 +513,10 @@ impl OwnerDocumentsPane {
                 }
                 Act::ListUp => self.cursor = self.cursor.saturating_sub(1),
                 Act::Back => return PaneKey::Close,
+                // Review M2: a kept draft is what these keys reopen.
+                Act::DocumentsView | Act::New | Act::DocumentsNewVersion if self.kept.is_some() => {
+                    self.reopen(ctx);
+                }
                 Act::DocumentsView => match self.selected_version() {
                     Some(document) => {
                         self.mode = Mode::Viewing {
@@ -482,6 +556,23 @@ impl OwnerDocumentsPane {
             }
         };
         self.mode = Mode::Form(form);
+        self.notice = None;
+    }
+
+    /// Review M2: `$EDITOR` again on the kept draft's text, refused in place as `n` is.
+    fn reopen(&mut self, ctx: &Ctx<'_>) {
+        if let Some(why) = self.write_refusal() {
+            self.notice = Some(Notice::Error(why));
+            return;
+        }
+        let Some(draft) = self.kept.take() else {
+            return;
+        };
+        ctx.emit(Action::EditExternally(ExternalEdit {
+            text: draft.handed.clone(),
+            stem: format!("{}-{}", self.slug, draft.kind),
+        }));
+        self.pending = Some(draft);
         self.notice = None;
     }
 
@@ -599,7 +690,8 @@ impl OwnerDocumentsPane {
         self.pending = Some(Draft {
             kind,
             title,
-            handed: form.body,
+            handed: form.body.clone(),
+            base: form.body,
         });
         self.notice = None;
     }
@@ -607,38 +699,100 @@ impl OwnerDocumentsPane {
     /// D10: what `$EDITOR` did with the body the form handed it. `Edited` writes the kind's next
     /// version; `Unchanged` writes nothing and says so; `Failed` says its sentence. Ignored unless
     /// the pane handed a body out.
+    ///
+    /// Review M2: a reopened kept draft closed untouched is the retry, and writes its text (a
+    /// `quick` return keeps it, the editor did not wait); a refused body or an editor that failed
+    /// keeps the edited text rather than dropping it.
     pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         let Some(draft) = self.pending.take() else {
             return;
         };
+        let reopen = reopen_label(ctx.keys());
         match outcome {
             ExternalEditOutcome::Edited(returned) => {
                 let returned = without_controls(&returned);
-                let text = strip_added_newline(&draft.handed, &returned);
-                if text == draft.handed {
+                let text = strip_added_newline(&draft.handed, &returned).to_owned();
+                if text == draft.base {
                     self.notice = Some(Notice::Info(NO_CHANGES.to_owned()));
                     return;
                 }
-                if let Err(error) = rules::document_body(text) {
-                    self.notice =
-                        Some(Notice::Error(format!("body: {error}; nothing was written")));
-                    return;
+                let error = rules::document_body(&text).err();
+                let draft = Draft {
+                    handed: text,
+                    ..draft
+                };
+                match error {
+                    Some(error) => self.keep(
+                        draft,
+                        &format!("body: {error}; nothing was written"),
+                        reopen.as_deref(),
+                    ),
+                    None => self.send(draft, ctx),
                 }
-                self.busy = true;
-                self.notice = None;
-                ctx.request(StoreRequest::WriteOwnerDocument {
-                    owner: self.owner,
-                    kind: draft.kind,
-                    title: draft.title,
-                    body: HandText::new(text),
-                });
             }
             ExternalEditOutcome::Unchanged { quick } => {
+                if draft.is_kept_text() && !quick {
+                    self.send(draft, ctx);
+                    return;
+                }
                 let wait = if quick { WAIT_FLAG } else { "" };
-                self.notice = Some(Notice::Info(format!("{NO_CHANGES}{wait}")));
+                let said = format!("{NO_CHANGES}{wait}");
+                if draft.is_kept_text() {
+                    self.keep(draft, &said, reopen.as_deref());
+                } else {
+                    self.notice = Some(Notice::Info(said));
+                }
             }
-            ExternalEditOutcome::Failed(message) => self.notice = Some(Notice::Error(message)),
+            ExternalEditOutcome::Failed(message) => {
+                if draft.is_kept_text() {
+                    self.keep(draft, &message, reopen.as_deref());
+                } else {
+                    self.notice = Some(Notice::Error(message));
+                }
+            }
         }
+    }
+
+    /// Sends `draft` as the kind's next version, noting the kind's newest version before it.
+    fn send(&mut self, draft: Draft, ctx: &Ctx<'_>) {
+        let before = self.newest(&draft.kind);
+        self.notice = None;
+        ctx.request(StoreRequest::WriteOwnerDocument {
+            owner: self.owner,
+            kind: draft.kind.clone(),
+            title: draft.title.clone(),
+            body: HandText::new(draft.handed.clone()),
+        });
+        self.sent = Some(Sent { draft, before });
+    }
+
+    /// Review M2: keeps `draft` for `Enter`, `n` or `v`, saying `head` and how to reopen it.
+    fn keep(&mut self, draft: Draft, head: &str, reopen: Option<&str>) {
+        self.notice = Some(Notice::Error(kept_sentence(head, reopen)));
+        self.kept = Some(draft);
+    }
+
+    /// Review M2: the re-read after an ambiguous failure. The kind's newest version past the one
+    /// before the write means it landed; otherwise the draft is kept, and, read from the mirror,
+    /// the sentence says it could not be checked.
+    fn settle(&mut self, hedged: Hedged, keys: &Keys) {
+        let Hedged { sent, why, mirror } = hedged;
+        let kind = sent.draft.kind.clone();
+        let newest = self.newest(&kind);
+        if newest > sent.before {
+            self.notice = Some(Notice::Info(format!("saved {kind}{DOT}v{newest}")));
+            self.follow = Some((kind, newest));
+            return;
+        }
+        let head = if mirror {
+            format!(
+                "{}; saving it again may write it twice",
+                could_not_check(&why, "list", None)
+            )
+        } else {
+            not_written(&why, None)
+        };
+        self.keep(sent.draft, &head, reopen_label(keys).as_deref());
     }
 
     /// A bracketed paste into the form's focused field; dropped anywhere else.
@@ -650,16 +804,25 @@ impl OwnerDocumentsPane {
     }
 
     /// One reply. A reply for another owner is ignored; a write's `Failed` lands only on the
-    /// write in flight.
+    /// write in flight. Review M2: a refused write keeps its draft; any other failure re-reads
+    /// the list, and that list settles it.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::OwnerDocuments { owner, documents } if *owner == self.owner => {
-                let keep = self.follow.take().or_else(|| {
-                    self.selected_version()
-                        .map(|row| (row.kind.clone(), row.version))
-                });
+            StoreReply::OwnerDocuments {
+                owner,
+                documents,
+                writable,
+            } if *owner == self.owner => {
+                let prior = self
+                    .selected_version()
+                    .map(|row| (row.kind.clone(), row.version));
                 self.documents = Some(self.ordered(documents));
                 self.refused = None;
+                self.writable = *writable;
+                if let Some(hedged) = self.hedged.take() {
+                    self.settle(hedged, ctx.keys());
+                }
+                let keep = self.follow.take().or(prior);
                 self.reselect(keep);
             }
             StoreReply::OwnerDocumentWritten {
@@ -667,17 +830,44 @@ impl OwnerDocumentsPane {
                 kind,
                 version,
             } if *owner == self.owner => {
-                self.busy = false;
+                self.sent = None;
+                self.hedged = None;
                 self.follow = Some((kind.clone(), *version));
                 self.notice = Some(Notice::Info(format!("saved {kind}{DOT}v{version}")));
                 ctx.request(self.read_request());
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
-                self.refused = Some(message.clone());
+                match self.hedged.take() {
+                    // The check itself failed: the list stays as it was, the draft is kept.
+                    Some(Hedged { sent, why, .. }) => {
+                        let head = format!(
+                            "{}; saving it again may write it twice",
+                            could_not_check(&why, "list", None)
+                        );
+                        self.keep(sent.draft, &head, reopen_label(ctx.keys()).as_deref());
+                    }
+                    None => self.refused = Some(message.clone()),
+                }
             }
-            StoreReply::Failed { request, message } if *request == WRITE_NAME && self.busy => {
-                self.busy = false;
-                self.notice = Some(Notice::Error(format!("not saved: {message}")));
+            StoreReply::Failed { request, message } if *request == WRITE_NAME => {
+                let Some(sent) = self.sent.take() else {
+                    return;
+                };
+                if write_refused(message) {
+                    self.keep(
+                        sent.draft,
+                        &format!("not saved: {message}"),
+                        reopen_label(ctx.keys()).as_deref(),
+                    );
+                } else {
+                    self.notice = Some(Notice::Info(may_have_landed(message, "list")));
+                    self.hedged = Some(Hedged {
+                        sent,
+                        why: message.clone(),
+                        mirror: answered_from_the_mirror(message),
+                    });
+                    ctx.request(self.read_request());
+                }
             }
             _ => {}
         }
@@ -845,6 +1035,29 @@ fn row_line(document: &OwnerDocument) -> String {
         document.title,
         document.created_at.format("%Y-%m-%d")
     )
+}
+
+/// The list order's key: a workspace's `goals` first (D8), then kind byte order (`str` order is
+/// byte order), the newest version first.
+fn order_key(row: &OwnerDocument, goals_first: bool) -> (bool, &str, Reverse<i32>) {
+    (
+        !(goals_first && row.kind == GOALS_KIND),
+        row.kind.as_str(),
+        Reverse(row.version),
+    )
+}
+
+/// The key in force that reopens a kept draft: `n`'s label under the defaults.
+fn reopen_label(keys: &Keys) -> Option<String> {
+    keys.label(views::DOCUMENTS_BROWSE, Act::New)
+}
+
+/// Review M2: `head`, then that the text is kept and the key that reopens `$EDITOR` on it.
+fn kept_sentence(head: &str, reopen: Option<&str>) -> String {
+    match reopen {
+        Some(key) => format!("{head}; your text is kept and {key} reopens $EDITOR on it"),
+        None => format!("{head}; your text is kept"),
+    }
 }
 
 /// The next step of [`NO_DOCUMENTS`]: the key in force that adds one.

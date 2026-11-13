@@ -7,18 +7,20 @@
 use chrono::{DateTime, TimeZone as _, Utc};
 use htui::app::Action;
 use htui::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES};
-use htui::keys::views;
-use htui::owner_documents::DocumentOwner;
+use htui::keys::{KeyChord, views};
+use htui::owner_documents::{DocumentOwner, READ_NAME, WRITE_NAME};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::SectionBench;
 use htui::ui::tabs::registry::Tab as _;
 use htui::ui::tabs::settings::hierarchy::PICK_AN_OWNER;
-use htui::ui::tabs::settings::owner_documents::GOALS_NONE_YET;
-use htui::ui::tabs::settings::{HierarchySection, SettingsSection, SettingsTab};
+use htui::ui::tabs::settings::owner_documents::{
+    EDITOR_OPEN, GOALS_NONE_YET, STILL_SAVING, UNAVAILABLE,
+};
+use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::document::GOALS_KIND;
 use htui_core::model::{DocumentId, OwnerDocument};
-use htui_core::store::MemStore;
+use htui_core::store::{MemStore, StoreError};
 use htui_store::Backend;
 use uuid::Uuid;
 
@@ -88,6 +90,7 @@ async fn opened(documents: Vec<OwnerDocument>) -> (SectionBench, HierarchySectio
         &StoreReply::OwnerDocuments {
             owner: WORKSPACE,
             documents,
+            writable: true,
         },
     );
     (bench, section)
@@ -192,6 +195,7 @@ async fn o_on_the_workspace_row_opens_the_pane_with_goals_none_yet_first() {
         &StoreReply::OwnerDocuments {
             owner: WORKSPACE,
             documents: briefs(),
+            writable: true,
         },
     );
     let shown = frame(&bench, &section);
@@ -234,6 +238,7 @@ async fn a_project_row_opens_its_own_documents() {
         &StoreReply::OwnerDocuments {
             owner,
             documents: Vec::new(),
+            writable: true,
         },
     );
     let shown = frame(&bench, &section);
@@ -431,7 +436,28 @@ async fn the_outcome_reaches_the_pane_through_the_settings_tab() {
     bench.key(&mut section, "enter");
     assert_eq!(edits(&bench).len(), 1);
 
-    let mut tab = SettingsTab::with_sections(vec![Box::new(section)]);
+    // Review Low 2: two sections, `Agents` active first; the outcome goes to the active one only.
+    let mut tab =
+        SettingsTab::with_sections(vec![Box::new(AgentsSection::new()), Box::new(section)]);
+    let _ = bench.drained();
+    tab.on_external_edit(
+        ExternalEditOutcome::Edited("Ship.".to_owned()),
+        &mut bench.ctx(),
+    );
+    let sent = requests(&bench);
+    assert!(
+        sent.is_empty(),
+        "the inactive Hierarchy got the outcome: {sent:?}"
+    );
+
+    let next = KeyChord::parse("l").expect("a chord").to_event();
+    tab.on_key(next, &mut bench.ctx());
+    let _ = bench.drained();
+    assert_eq!(
+        tab.key_stack(),
+        Some(views::DOCUMENTS_BROWSE),
+        "Hierarchy, its documents pane open, is active"
+    );
     tab.on_external_edit(
         ExternalEditOutcome::Edited("Ship.".to_owned()),
         &mut bench.ctx(),
@@ -457,4 +483,313 @@ async fn a_bad_title_stays_in_the_form_and_hands_nothing_out() {
         "{}",
         frame(&bench, &section)
     );
+}
+
+// ---- review fix round R1 (M2, Low 2, Low 3) ----
+
+/// A worker's `Failed` for the write.
+fn write_failed(message: &str) -> StoreReply {
+    StoreReply::Failed {
+        request: WRITE_NAME,
+        message: message.to_owned(),
+    }
+}
+
+/// The refusal a constraint answers: nothing was written.
+fn constraint() -> String {
+    StoreError::Constraint("a document needs a title".to_owned()).to_string()
+}
+
+/// The answer to a write whose COMMIT may have landed before the connection dropped.
+fn ambiguous() -> String {
+    StoreError::Backend("connection reset by peer".to_owned()).to_string()
+}
+
+/// A second goals version, as the store would hold it once the write landed.
+fn goals_v2() -> OwnerDocument {
+    document(9, GOALS_KIND, 2, "Goals 2027", "Draft.", 5)
+}
+
+/// `v` on the goals row, the title typed on, `$EDITOR` returning `Draft.`: the write is in flight.
+async fn writing_a_new_goals_version() -> (SectionBench, HierarchySection) {
+    let (bench, mut section) = opened(vec![goals_v1()]).await;
+    bench.key(&mut section, "v");
+    type_text(&bench, &mut section, " 2027");
+    bench.key(&mut section, "enter");
+    assert_eq!(edits(&bench).len(), 1);
+    section.on_external_edit(
+        ExternalEditOutcome::Edited("Draft.".to_owned()),
+        &mut bench.ctx(),
+    );
+    let sent = requests(&bench);
+    assert!(
+        matches!(sent.as_slice(), [write] if written(write) == Some((GOALS_KIND, "Goals 2027", "Draft."))),
+        "{sent:?}"
+    );
+    (bench, section)
+}
+
+/// Review M2: a refused write (a constraint, or the offline refusal) keeps the kind, the title
+/// and the text; `Enter`, `n` and `v` each reopen `$EDITOR` on the kept text, and its edit
+/// writes with the kept kind and title.
+#[tokio::test]
+async fn a_refused_write_keeps_the_draft_and_reopening_hands_the_kept_text() {
+    let offline = format!(
+        "{}",
+        StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned())
+    );
+    for message in [constraint(), offline] {
+        for reopen in ["enter", "n", "v"] {
+            let (bench, mut section) = writing_a_new_goals_version().await;
+            bench.reply(&mut section, &write_failed(&message));
+
+            assert!(
+                requests(&bench).is_empty(),
+                "a refusal is not re-read: {message}"
+            );
+            let shown = frame(&bench, &section);
+            assert!(shows(&shown, &format!("not saved: {message}")), "{shown}");
+            assert!(shows(&shown, "your text is kept"), "{shown}");
+
+            bench.key(&mut section, reopen);
+            let handed = edits(&bench);
+            assert!(
+                matches!(handed.as_slice(), [edit] if edit.text == "Draft." && edit.stem == "graphics-goals"),
+                "`{reopen}` reopens $EDITOR on the kept text: {handed:?}"
+            );
+            assert_eq!(section.key_stack(), Some(views::DOCUMENTS_BROWSE));
+
+            section.on_external_edit(
+                ExternalEditOutcome::Edited("Draft, fixed.".to_owned()),
+                &mut bench.ctx(),
+            );
+            let sent = requests(&bench);
+            assert!(
+                matches!(sent.as_slice(), [write] if written(write) == Some((GOALS_KIND, "Goals 2027", "Draft, fixed."))),
+                "{sent:?}"
+            );
+        }
+    }
+}
+
+/// Review M2: closing `$EDITOR` untouched on a kept draft is the retry, and writes the kept text.
+#[tokio::test]
+async fn an_untouched_reopen_writes_the_kept_text() {
+    let (bench, mut section) = writing_a_new_goals_version().await;
+    bench.reply(&mut section, &write_failed(&constraint()));
+    bench.key(&mut section, "enter");
+    assert_eq!(edits(&bench).len(), 1);
+
+    section.on_external_edit(
+        ExternalEditOutcome::Unchanged { quick: false },
+        &mut bench.ctx(),
+    );
+
+    let sent = requests(&bench);
+    assert!(
+        matches!(sent.as_slice(), [write] if written(write) == Some((GOALS_KIND, "Goals 2027", "Draft."))),
+        "{sent:?}"
+    );
+}
+
+/// Review M2: an ambiguous failure re-reads the list, and a newer version of the kind there means
+/// the write landed: the pane says saved and keeps no draft.
+#[tokio::test]
+async fn an_ambiguous_failure_whose_reread_shows_the_new_version_reports_saved() {
+    let (bench, mut section) = writing_a_new_goals_version().await;
+    let why = ambiguous();
+    bench.reply(&mut section, &write_failed(&why));
+
+    let reread = requests(&bench);
+    assert!(
+        matches!(reread.as_slice(), [StoreRequest::OwnerDocuments(owner)] if *owner == WORKSPACE),
+        "{reread:?}"
+    );
+    let shown = frame(&bench, &section);
+    assert!(
+        shows(
+            &shown,
+            &format!("{why} \u{2014} it may have been written; the list is being re-read to check")
+        ),
+        "{shown}"
+    );
+    // Still settling: another write waits.
+    bench.key(&mut section, "n");
+    assert!(shows(&frame(&bench, &section), STILL_SAVING));
+    assert!(edits(&bench).is_empty());
+
+    bench.reply(
+        &mut section,
+        &StoreReply::OwnerDocuments {
+            owner: WORKSPACE,
+            documents: vec![goals_v1(), goals_v2()],
+            writable: true,
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert!(shows(&shown, "saved goals \u{b7} v2"), "{shown}");
+    assert!(!shows(&shown, "your text is kept"), "{shown}");
+    // No draft: `Enter` views the version the cursor followed to.
+    bench.key(&mut section, "enter");
+    assert!(edits(&bench).is_empty());
+    assert_eq!(section.key_stack(), Some(views::DOCUMENTS_VIEW));
+    assert!(frame(&bench, &section).contains("goals \u{b7} v2 \u{b7} Goals 2027"));
+}
+
+/// Review M2: an ambiguous failure whose re-read holds no newer version was not written: the draft
+/// is kept and `Enter` reopens `$EDITOR` on it.
+#[tokio::test]
+async fn an_ambiguous_failure_whose_reread_shows_nothing_new_keeps_the_draft() {
+    let (bench, mut section) = writing_a_new_goals_version().await;
+    let why = ambiguous();
+    bench.reply(&mut section, &write_failed(&why));
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::OwnerDocuments {
+            owner: WORKSPACE,
+            documents: vec![goals_v1()],
+            writable: true,
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert!(
+        shows(
+            &shown,
+            &format!("{why} \u{2014} the re-read shows it was not written")
+        ),
+        "{shown}"
+    );
+    assert!(shows(&shown, "your text is kept"), "{shown}");
+    bench.key(&mut section, "enter");
+    let handed = edits(&bench);
+    assert!(
+        matches!(handed.as_slice(), [edit] if edit.text == "Draft."),
+        "{handed:?}"
+    );
+}
+
+/// Review M2: a write key while `$EDITOR` holds a body says so, and one while a write is in
+/// flight says to wait; neither hands anything out.
+#[tokio::test]
+async fn a_write_key_while_the_editor_is_open_or_a_write_is_in_flight_is_refused() {
+    let (bench, mut section) = opened(vec![goals_v1()]).await;
+    bench.key(&mut section, "v");
+    bench.key(&mut section, "enter");
+    assert_eq!(edits(&bench).len(), 1);
+
+    for key in ["n", "v"] {
+        bench.key(&mut section, key);
+        assert!(edits(&bench).is_empty(), "`{key}`");
+        assert!(shows(&frame(&bench, &section), EDITOR_OPEN), "`{key}`");
+    }
+
+    section.on_external_edit(
+        ExternalEditOutcome::Edited("Changed.".to_owned()),
+        &mut bench.ctx(),
+    );
+    assert_eq!(requests(&bench).len(), 1);
+    for key in ["n", "v"] {
+        bench.key(&mut section, key);
+        assert!(edits(&bench).is_empty(), "`{key}`");
+        assert!(shows(&frame(&bench, &section), STILL_SAVING), "`{key}`");
+    }
+}
+
+/// Review Low 3: a refused read shows `documents unavailable: …`, offers only `Esc`, and refuses
+/// the write keys with the same sentence.
+#[tokio::test]
+async fn a_refused_read_shows_unavailable_and_refuses_the_write_keys() {
+    let (bench, mut section) = opened(vec![goals_v1()]).await;
+    let why = StoreError::Backend("the pool is closed".to_owned()).to_string();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: READ_NAME,
+            message: why.clone(),
+        },
+    );
+
+    let unavailable = format!("{UNAVAILABLE}: {why}");
+    let shown = frame(&bench, &section);
+    assert!(shows(&shown, &unavailable), "{shown}");
+    assert!(
+        !shown.contains("goals \u{b7} v1"),
+        "no list while unavailable: {shown}"
+    );
+    assert!(
+        bench.key_hint(&section).ends_with("back"),
+        "{}",
+        bench.key_hint(&section)
+    );
+    bench.key(&mut section, "n");
+    assert!(edits(&bench).is_empty());
+    assert_eq!(section.key_stack(), Some(views::DOCUMENTS_BROWSE));
+    assert!(
+        shows(&frame(&bench, &section), &unavailable),
+        "{}",
+        frame(&bench, &section)
+    );
+}
+
+/// Review M2 (optional half): a list read offline says it cannot be written, and `n`/`v` refuse
+/// with the offline sentence before `$EDITOR` opens.
+#[tokio::test]
+async fn offline_the_write_keys_refuse_before_the_editor_opens() {
+    let (bench, mut section) = opened(Vec::new()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::OwnerDocuments {
+            owner: WORKSPACE,
+            documents: vec![goals_v1()],
+            writable: false,
+        },
+    );
+    let offline = StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned());
+    for key in ["n", "v"] {
+        bench.key(&mut section, key);
+        assert!(edits(&bench).is_empty(), "`{key}`");
+        assert_eq!(
+            section.key_stack(),
+            Some(views::DOCUMENTS_BROWSE),
+            "`{key}`"
+        );
+        assert!(
+            shows(&frame(&bench, &section), &format!("not saved: {offline}")),
+            "`{key}`: {}",
+            frame(&bench, &section)
+        );
+    }
+}
+
+/// Review M2: after an `Unreachable` failure the re-read is the mirror's, which cannot hold a
+/// write whose answer was lost: nothing new there says it could not be checked, and keeps the
+/// draft.
+#[tokio::test]
+async fn an_unreachable_failure_cannot_be_settled_by_the_mirror() {
+    let (bench, mut section) = writing_a_new_goals_version().await;
+    let why = StoreError::Unreachable("connection reset by peer".to_owned()).to_string();
+    bench.reply(&mut section, &write_failed(&why));
+    assert_eq!(requests(&bench).len(), 1, "the list is re-read");
+    bench.reply(
+        &mut section,
+        &StoreReply::OwnerDocuments {
+            owner: WORKSPACE,
+            documents: vec![goals_v1()],
+            writable: false,
+        },
+    );
+
+    let shown = frame(&bench, &section);
+    assert!(
+        shows(
+            &shown,
+            "it may have been written, and the list could not be re-read to check"
+        ),
+        "{shown}"
+    );
+    assert!(shows(&shown, "your text is kept"), "{shown}");
+    assert!(!shows(&shown, "it was not written"), "{shown}");
 }

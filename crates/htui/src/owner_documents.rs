@@ -4,14 +4,16 @@
 //!
 //! **An owner is a project or a workspace** ([`DocumentOwner`]). A workspace's documents are its
 //! scope row's (MOD-147 D1, D2): the worker resolves it through `scope_project`, and a workspace
-//! without one answers `NotFound { entity: "workspace" }`. The reply names the owner as asked, so
-//! the pane that asked recognises it.
+//! without one answers `NotFound { entity: SCOPE_ROW }`, which reads "scope row of workspace `…`
+//! not found": the workspace is there, its scope row is not. The reply names the owner as asked,
+//! so the pane that asked recognises it.
 //!
 //! **The read works offline; the write does not.** That differs on purpose from
 //! [`crate::hand_written`], which refuses its form reads offline too: the list is a read the
-//! mirror answers ([`Backend::owner_documents`]), so an offline box still shows its documents. The
-//! write takes [`Backend::writer`] before it reads anything and answers
-//! `Unreachable(DATABASE_UNREACHABLE)` without one.
+//! mirror answers ([`Backend::owner_documents`]), so an offline box still shows its documents, and
+//! says whether a write would be taken (`writable`), so the pane refuses one before `$EDITOR`
+//! opens. The write takes [`Backend::writer`] before it reads anything and answers
+//! `Unreachable(DATABASE_UNREACHABLE)` without one ([`offline_refusal`]).
 //!
 //! **The write is append-only** (`R-ENT-12`): a new document of a kind is that kind's next
 //! version, which the store allocates under the owner's row lock. The worker fills the id (a
@@ -20,7 +22,8 @@
 //! [`htui_core::model::hand_written`], the rules the item documents use, so a refusal reads the
 //! same sentence; a refusal is a [`StoreError::Constraint`].
 //!
-//! Redaction: a body travels as [`HandText`], whose `Debug` prints its length only.
+//! Redaction: a body travels as [`HandText`](crate::hand_written::HandText), whose `Debug` prints
+//! its length only.
 
 use chrono::Utc;
 use htui_core::model::hand_written::{self as rules, HandWrittenError};
@@ -40,6 +43,33 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// The write; its `Failed` frees the pane for another.
 pub const WRITE_NAME: &str = REQUEST_NAMES[1];
 
+/// The `NotFound` entity of a workspace with no scope row (review Low 6): the sentence names the
+/// row that is missing, not the workspace, which exists.
+pub const SCOPE_ROW: &str = "scope row of workspace";
+
+/// The write's answer offline, rendered as the worker's `Failed` carries it.
+#[must_use]
+pub fn offline_refusal() -> String {
+    offline().to_string()
+}
+
+/// MOD-147 M3 review M2: whether `message`, a write's `Failed`, was given before the insert, so
+/// nothing was written: the [`crate::hand_written::write_refused`] answers (offline, a
+/// `Constraint`) and a workspace with no scope row ([`SCOPE_ROW`]). Anything else may follow a
+/// COMMIT whose answer was lost, and the pane re-reads the list to check.
+#[must_use]
+pub fn write_refused(message: &str) -> bool {
+    let missing = StoreError::NotFound {
+        entity: SCOPE_ROW,
+        id: String::new(),
+    }
+    .to_string();
+    let scope_row_missing = missing
+        .split_once("``")
+        .is_some_and(|(head, tail)| message.starts_with(head) && message.ends_with(tail));
+    crate::hand_written::write_refused(message) || scope_row_missing
+}
+
 /// Whose documents: a project's, or a workspace's through its scope row (D7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocumentOwner {
@@ -55,7 +85,7 @@ pub enum DocumentOwner {
 /// [`StoreReply::OwnerDocumentWritten`].
 ///
 /// # Errors
-/// `NotFound { entity: "workspace" }` for a workspace with no scope row. A write offline:
+/// `NotFound { entity: SCOPE_ROW }` for a workspace with no scope row. A write offline:
 /// `Unreachable(DATABASE_UNREACHABLE)` before anything is read. `Constraint` for a kind, title or
 /// body the rules refuse. `Backend` for a request that is not one of the two.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
@@ -66,6 +96,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             Ok(StoreReply::OwnerDocuments {
                 owner: *owner,
                 documents,
+                writable: backend.writer().is_some(),
             })
         }
         StoreRequest::WriteOwnerDocument {
@@ -113,7 +144,7 @@ async fn owner_project(store: &impl ReadStore, owner: DocumentOwner) -> Result<P
                 .scope_project(workspace)
                 .await?
                 .ok_or_else(|| StoreError::NotFound {
-                    entity: "workspace",
+                    entity: SCOPE_ROW,
                     id: workspace.to_string(),
                 })
         }
@@ -132,7 +163,10 @@ fn refused(err: HandWrittenError) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentOwner, READ_NAME, REQUEST_NAMES, WRITE_NAME, serve};
+    use super::{
+        DocumentOwner, READ_NAME, REQUEST_NAMES, SCOPE_ROW, WRITE_NAME, offline_refusal, serve,
+        write_refused,
+    };
     use crate::hand_written::HandText;
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use htui_core::fixtures::ids;
@@ -159,11 +193,20 @@ mod tests {
     }
 
     async fn listed(backend: &Backend, owner: DocumentOwner) -> Vec<OwnerDocument> {
+        listed_writable(backend, owner).await.0
+    }
+
+    /// The list and the reply's `writable`.
+    async fn listed_writable(
+        backend: &Backend,
+        owner: DocumentOwner,
+    ) -> (Vec<OwnerDocument>, bool) {
         match serve(backend, &StoreRequest::OwnerDocuments(owner)).await {
             Ok(StoreReply::OwnerDocuments {
                 owner: answered,
                 documents,
-            }) if answered == owner => documents,
+                writable,
+            }) if answered == owner => (documents, writable),
             other => panic!("the read answered {other:?}"),
         }
     }
@@ -199,7 +242,7 @@ mod tests {
             "the demo item has documents of its own"
         );
         let owner = DocumentOwner::Project(ids::PROJECT_HTUI);
-        assert_eq!(listed(&backend, owner).await, []);
+        assert_eq!(listed_writable(&backend, owner).await, (Vec::new(), true));
 
         written(&backend, &write(owner, "plan", "Plan", "Body.")).await;
         let documents = listed(&backend, owner).await;
@@ -235,7 +278,8 @@ mod tests {
     #[tokio::test]
     async fn a_workspace_without_a_scope_row_answers_not_found() {
         let (_, backend) = demo();
-        let owner = DocumentOwner::Workspace(WorkspaceId::new());
+        let workspace = WorkspaceId::new();
+        let owner = DocumentOwner::Workspace(workspace);
         for request in [
             StoreRequest::OwnerDocuments(owner),
             write(owner, "goals", "Goals", "Body."),
@@ -243,14 +287,20 @@ mod tests {
             let reply = serve(&backend, &request).await;
             assert!(
                 matches!(
-                    reply,
+                    &reply,
                     Err(StoreError::NotFound {
-                        entity: "workspace",
+                        entity: SCOPE_ROW,
                         ..
                     })
                 ),
                 "{reply:?}"
             );
+            let message = reply.expect_err("refused").to_string();
+            assert_eq!(
+                message,
+                format!("scope row of workspace `{workspace}` not found")
+            );
+            assert!(write_refused(&message), "nothing was written: {message}");
         }
     }
 
@@ -341,13 +391,44 @@ mod tests {
             matches!(&reply, Err(StoreError::Unreachable(message)) if message == DATABASE_UNREACHABLE),
             "{reply:?}"
         );
+        let message = reply.expect_err("refused").to_string();
+        assert_eq!(message, offline_refusal());
+        assert!(write_refused(&message), "nothing was written: {message}");
 
-        let documents = listed(&backend, owner).await;
+        let (documents, writable) = listed_writable(&backend, owner).await;
+        assert!(!writable, "offline, the list says the write is refused");
         let mirrored: Vec<(&str, i32, &str)> = documents
             .iter()
             .map(|row| (row.kind.as_str(), row.version, row.body.as_str()))
             .collect();
         assert_eq!(mirrored, [("goals", 1, "Mirrored.")]);
+    }
+
+    /// Review M2: the refusals given before anything is written, and nothing else.
+    #[test]
+    fn write_refused_names_the_answers_given_before_the_insert() {
+        let refused = [
+            StoreError::Constraint("a document needs a title".to_owned()),
+            StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()),
+            StoreError::NotFound {
+                entity: SCOPE_ROW,
+                id: WorkspaceId::new().to_string(),
+            },
+        ];
+        for error in refused {
+            assert!(write_refused(&error.to_string()), "{error:?}");
+        }
+        let hedged = [
+            StoreError::Backend("connection reset by peer".to_owned()),
+            StoreError::Unreachable("the pool is closed".to_owned()),
+            StoreError::NotFound {
+                entity: "workspace",
+                id: WorkspaceId::new().to_string(),
+            },
+        ];
+        for error in hedged {
+            assert!(!write_refused(&error.to_string()), "{error:?}");
+        }
     }
 
     /// Both requests reach this module through the worker's dispatch.

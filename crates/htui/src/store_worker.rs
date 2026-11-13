@@ -2003,6 +2003,9 @@ pub enum StoreReply {
         owner: DocumentOwner,
         /// Its documents, bodies included.
         documents: Vec<OwnerDocument>,
+        /// Whether a write would be taken now (review M2): `false` offline, where the pane
+        /// refuses `n` and `v` before `$EDITOR` opens.
+        writable: bool,
     },
     /// An owner document that landed (self-naming): `version` is the one the store allocated.
     OwnerDocumentWritten {
