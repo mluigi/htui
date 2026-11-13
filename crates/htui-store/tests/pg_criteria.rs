@@ -20,16 +20,16 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
-    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
-    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemState,
-    MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject,
-    NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus,
-    Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
-    RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
-    RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
-    StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch,
+    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
+    FollowUpSettle, FollowUpText, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemState, MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch,
+    MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem,
+    NewMemoryEntry, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission,
+    PermissionId, PermissionStatus, Priority, ProjectId, QueuedFollowUp, RelayOption,
+    RelayOptionKind, RelaySessionId, RepoId, RequirementId, RunCommandId, RunCommandStatus, RunId,
+    RunMode, RunStatus, RunStepCommit, RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph,
+    SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
+    Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
