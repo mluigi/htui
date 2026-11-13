@@ -2964,10 +2964,12 @@ async fn migration_0023_equals_default_edges() {
 
     let once = edge_names(pool).await;
     let mut tx = pool.begin().await.expect("begin the second application");
-    sqlx::raw_sql(include_str!("../migrations/0023_default_edges_repair.sql"))
-        .execute(&mut *tx)
-        .await
-        .expect("apply 0023 again");
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0023_default_edges_repair.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .expect("apply 0023 again");
     tx.commit().await.expect("commit the second application");
     assert_eq!(
         edge_names(pool).await,
