@@ -29,6 +29,10 @@ pub struct Document {
     pub created_at: DateTime<Utc>,
 }
 
+/// The owner-document kind a workspace's documents pane offers first (MOD-147 M3 D8, PRD "goals
+/// preset for a workspace"): listed even before one exists, and `n` on that row pre-fills it.
+pub const GOALS_KIND: &str = "goals";
+
 /// A `document` row a project — or a workspace's scope row — owns: `item_id IS NULL` (MOD-147 D2,
 /// ANA-35 §7.5). Body included; versions are per `(project, kind)`. [`Document`] stays item-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,4 +148,17 @@ pub struct ResolvedInput {
     pub kind: String,
     /// `None` = the item has no eligible document of this kind.
     pub document: Option<Document>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GOALS_KIND;
+    use crate::model::hand_written::document_kind;
+
+    /// MOD-147 M3 D8: the preset is a kind the hand-written rules store as it is.
+    #[test]
+    fn the_goals_kind_is_a_stored_kind_as_written() {
+        assert_eq!(GOALS_KIND, "goals");
+        assert_eq!(document_kind(GOALS_KIND).as_deref(), Ok(GOALS_KIND));
+    }
 }

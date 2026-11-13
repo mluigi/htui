@@ -33,8 +33,8 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
-    LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, QueueMove,
-    QueueOverview, QueueSetting, WorkerLogLine,
+    LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
+    QueueMove, QueueOverview, QueueSetting, WorkerLogLine,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -63,6 +63,7 @@ use crate::hand_written::{self, DocumentFormContext, HandText};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete, ScopeWrite};
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::memory::{self, MemoryWrite};
+use crate::owner_documents::{self, DocumentOwner};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
@@ -1300,6 +1301,22 @@ pub enum StoreRequest {
         /// The text; prints as its length (D1).
         body: HandText,
     },
+    /// MOD-147 M3 D7: an owner's documents, every version, body included; a workspace's are its
+    /// scope row's. Answered with [`StoreReply::OwnerDocuments`], offline from the mirror.
+    OwnerDocuments(DocumentOwner),
+    /// MOD-147 M3 D7: a hand-written owner document at the store's next version of `kind`
+    /// (`R-ENT-12`). Answered with [`StoreReply::OwnerDocumentWritten`]; offline
+    /// `Unreachable(DATABASE_UNREACHABLE)`.
+    WriteOwnerDocument {
+        /// The owner.
+        owner: DocumentOwner,
+        /// The kind, as typed; the worker trims it.
+        kind: String,
+        /// The title, as typed; plain in `Debug`.
+        title: String,
+        /// The text; prints as its length.
+        body: HandText,
+    },
     /// MOD-12 M2 D8: the queue settings of this scope: the three `app_setting` keys with their
     /// tokens, each scope project's two caps, and this box's `max_concurrent_items` with the
     /// effective value. Answered with [`StoreReply::QueueSettings`]; offline `DATABASE_UNREACHABLE`.
@@ -1527,6 +1544,9 @@ impl StoreRequest {
             Self::AddNote { .. } => "add_note",
             Self::DocumentForm { .. } => "document_form",
             Self::WriteDocument { .. } => "write_document",
+            // The two of `owner_documents::REQUEST_NAMES`, in that order (MOD-147 M3 D7).
+            Self::OwnerDocuments(..) => "owner_documents",
+            Self::WriteOwnerDocument { .. } => "write_owner_document",
             // The three of `queue_settings::REQUEST_NAMES`, in that order (MOD-12 M2 D9).
             Self::QueueSettings(..) => "queue_settings",
             Self::SetQueueSetting { .. } => "set_queue_setting",
@@ -1971,6 +1991,23 @@ pub enum StoreReply {
     DocumentWritten {
         /// The item the document landed on.
         item: ItemId,
+        /// The kind as stored (trimmed).
+        kind: String,
+        /// The version the store allocated.
+        version: i32,
+    },
+    /// Answer to [`StoreRequest::OwnerDocuments`] (MOD-147 M3 D7): every version, `(kind bytes,
+    /// version)` ordered.
+    OwnerDocuments {
+        /// The owner as asked.
+        owner: DocumentOwner,
+        /// Its documents, bodies included.
+        documents: Vec<OwnerDocument>,
+    },
+    /// An owner document that landed (self-naming): `version` is the one the store allocated.
+    OwnerDocumentWritten {
+        /// The owner as asked.
+        owner: DocumentOwner,
         /// The kind as stored (trimmed).
         kind: String,
         /// The version the store allocated.
@@ -2643,6 +2680,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::AddNote { .. }
         | StoreRequest::DocumentForm { .. }
         | StoreRequest::WriteDocument { .. } => hand_written::serve(backend, request).await?,
+        // The two owner-document requests, or-ed for the reason the arms above are (MOD-147 M3
+        // D7).
+        StoreRequest::OwnerDocuments(..) | StoreRequest::WriteOwnerDocument { .. } => {
+            owner_documents::serve(backend, request).await?
+        }
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
