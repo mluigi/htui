@@ -4945,7 +4945,8 @@ mod tests {
     }
 
     /// MOD-147 M3 review L5: a refused scope-row lookup (here the mirrored row's id is not a
-    /// uuid) costs the group, not the Backlog: the members are read alone and no row is named.
+    /// uuid) costs the group, not the Backlog: the members are read alone (the demo's member items,
+    /// seeded into the mirror, all come back) and no row is named.
     #[tokio::test]
     async fn a_refused_scope_row_lookup_still_lists_the_members() {
         let root = tempfile::tempdir().expect("temp root");
@@ -4964,6 +4965,37 @@ mod tests {
             .execute(&pool)
             .await
             .expect("break the scope row");
+        let demo = demo_data();
+        for item in &demo.items {
+            sqlx::query(
+                "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, key, title, body, \
+                                   status, priority, required_tags, touched_paths, step_graph_id, \
+                                   version, created_by, created_at, updated_at, closed_at, resolution) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(item.id.to_string())
+            .bind(item.project_id.to_string())
+            .bind(item.kind_id.to_string())
+            .bind(&item.key_prefix)
+            .bind(i64::from(item.key_number))
+            .bind(&item.key)
+            .bind(&item.title)
+            .bind(&item.body)
+            .bind(item.status.as_str())
+            .bind(i64::from(item.priority))
+            .bind(serde_json::to_string(&item.required_tags).expect("tags serialise"))
+            .bind(serde_json::to_string(&item.touched_paths).expect("paths serialise"))
+            .bind(item.step_graph_id.map(|id| id.to_string()))
+            .bind(i64::from(item.version))
+            .bind(item.created_by.to_string())
+            .bind(item.created_at.timestamp_micros())
+            .bind(item.updated_at.timestamp_micros())
+            .bind(item.closed_at.map(|at| at.timestamp_micros()))
+            .bind(item.resolution.map(|r| r.as_str()))
+            .execute(&pool)
+            .await
+            .expect("a mirror item row");
+        }
         pool.close().await;
         let backend = Backend::Offline { cache, since: None };
         let scope = Scope {
@@ -4975,7 +5007,17 @@ mod tests {
             "the lookup is refused"
         );
         let (items, scope_row) = items_and_row(&backend, scope, ItemFilter::default()).await;
-        assert!(items.is_empty(), "the mirror holds no item");
+        let members = [ids::PROJECT_HTUI, ids::PROJECT_AGY];
+        assert_eq!(
+            items.len(),
+            demo.items
+                .iter()
+                .filter(|i| members.contains(&i.project_id))
+                .count(),
+            "every member item is still listed"
+        );
+        assert!(!items.is_empty(), "the demo's member items are mirrored");
+        assert!(items.iter().all(|i| members.contains(&i.project_id)));
         assert_eq!(scope_row, None);
     }
 
