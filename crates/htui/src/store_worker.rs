@@ -2972,13 +2972,26 @@ async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> 
 /// read only (the `waiting_reads` shape), and the row itself. Two reads per request, uncached:
 /// the loop's `scope_rows` memo is out of `serve`'s reach. A project facet needs no guard: every
 /// backend intersects `filter.project_ids` with the scope, so it leaves the scope row's items out.
+///
+/// A refused scope-row lookup costs the group, not the list (review L5): the members are read
+/// alone, no row is named, and the refusal is logged.
 async fn serve_items(
     backend: &Backend,
     scope: &Scope,
     filter: &ItemFilter,
     ready_here: bool,
 ) -> StoreResult<StoreReply> {
-    let scope_row = scope_row_ref(backend, scope.workspace_id).await?;
+    let scope_row = match scope_row_ref(backend, scope.workspace_id).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                workspace = %scope.workspace_id,
+                %error,
+                "items: the workspace's scope-row lookup failed; listing its members alone"
+            );
+            None
+        }
+    };
     let read = scope_row
         .as_ref()
         .map_or_else(|| scope.clone(), |row| scope.with_scope_row(row.project_id));
@@ -4929,6 +4942,41 @@ mod tests {
         let (items, scope_row) = items_and_row(&backend, scope, ItemFilter::default()).await;
         assert!(items.is_empty(), "the mirror holds no item");
         assert_eq!(scope_row, Some(platform_row()));
+    }
+
+    /// MOD-147 M3 review L5: a refused scope-row lookup (here the mirrored row's id is not a
+    /// uuid) costs the group, not the Backlog: the members are read alone and no row is named.
+    #[tokio::test]
+    async fn a_refused_scope_row_lookup_still_lists_the_members() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "items-scope-row-refused", 1)
+            .await
+            .expect("open a throwaway mirror");
+        htui_store::testkit::seed_mirror(&cache, &demo_data())
+            .await
+            .expect("the mirror is seeded");
+        let file = cache.dir().join(htui_store::cache::CACHE_FILE);
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", file.display()))
+            .await
+            .expect("open the mirror's file");
+        sqlx::query("UPDATE project SET id = 'not-a-uuid' WHERE owner_workspace_id = ?")
+            .bind(ids::WORKSPACE_PLATFORM.to_string())
+            .execute(&pool)
+            .await
+            .expect("break the scope row");
+        pool.close().await;
+        let backend = Backend::Offline { cache, since: None };
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        assert!(
+            backend.scope_project(scope.workspace_id).await.is_err(),
+            "the lookup is refused"
+        );
+        let (items, scope_row) = items_and_row(&backend, scope, ItemFilter::default()).await;
+        assert!(items.is_empty(), "the mirror holds no item");
+        assert_eq!(scope_row, None);
     }
 
     /// The demo plus one open htui item needing `cuda`, a tag the demo box has neither probed nor
