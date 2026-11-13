@@ -1139,11 +1139,13 @@ async fn a_harness_without_an_agent_runtime_refuses_the_scope_check_by_name() {
 /// The normalised URL the keyring rows show when one is stored.
 const STORED_URL: &str = "https://infisical.example.com";
 
-/// Row indices in cursor order: the four fixed rows, then the projects.
+/// Row indices in cursor order: the four fixed rows, the workspace's own row (MOD-147 M3 D11),
+/// then the projects.
 const ROW_URL: usize = 1;
 const ROW_IDENTITY: usize = 2;
 const ROW_HEALTH: usize = 3;
-const ROW_FIRST_PROJECT: usize = 4;
+const ROW_WORKSPACE: usize = 4;
+const ROW_FIRST_PROJECT: usize = 5;
 
 /// A keyring snapshot reply.
 fn keyring(url: UrlState, identity: IdentityState) -> StoreReply {
@@ -3486,4 +3488,258 @@ async fn the_scroll_names_the_form_rows_it_measures() {
     let rows = span.rows.expect("the rect the form was drawn into");
     assert_eq!((rows.y, rows.width), (0, 100), "{rows:?}");
     assert!(span.total <= 30, "the form's own lines, unpadded: {span:?}");
+}
+
+// ---- MOD-147 M3 T2: the workspace row (D11) ----
+
+/// The demo store with `Graphics`' scope row `@graphics` on Infisical at [`a_scope`].
+fn workspace_scoped_store() -> MemStore {
+    let store = MemStore::demo();
+    store.set_project_secret_columns(
+        ids::PROJECT_SCOPE_GRAPHICS,
+        Some(INFISICAL),
+        Some(&a_scope().to_column()),
+    );
+    store
+}
+
+/// `tree`'s scope row, or a panic.
+#[track_caller]
+fn scope_row_of(tree: &HierarchySnapshot) -> Project {
+    tree.scope_row.clone().expect("Graphics has a scope row")
+}
+
+/// The drawn line holding `needle`, flattened.
+#[track_caller]
+fn line_with(shown: &str, needle: &str) -> String {
+    shown
+        .lines()
+        .find(|line| line.contains(needle))
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|| panic!("no `{needle}` in {shown}"))
+}
+
+#[tokio::test]
+async fn the_workspace_row_sits_between_the_fixed_rows_and_the_projects() {
+    let (bench, section, _) = loaded(configured()).await;
+    let shown = frame(&bench, &section);
+    let lines: Vec<&str> = shown.lines().collect();
+    let position = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no `{needle}` in {shown}"))
+    };
+    let health = position("Health");
+    let workspace = position("workspace Graphics");
+    let project = position("vulkan-tutorials");
+    assert!(health < workspace && workspace < project, "{shown}");
+    assert!(
+        line_with(&shown, "workspace Graphics").contains("no secret provider"),
+        "{shown}"
+    );
+
+    // The row text shows the binding.
+    let (bench, section, _) = loaded_over(&workspace_scoped_store(), configured()).await;
+    let shown = frame(&bench, &section);
+    assert!(
+        line_with(&shown, "workspace Graphics")
+            .contains("infisical \u{b7} p-graphics \u{b7} dev \u{b7} /app"),
+        "{shown}"
+    );
+    assert!(
+        line_with(&shown, "vulkan-tutorials").contains("no secret provider"),
+        "the project row is its own: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn e_on_the_workspace_row_writes_the_scope_row_with_its_token() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "e");
+    assert!(section.captures_input(), "the scope form is open");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "app");
+    bench.key(&mut section, "Enter");
+
+    let (id, expected, scope) = the_scope_write(&requests(&bench));
+    assert_eq!(id, ids::PROJECT_SCOPE_GRAPHICS);
+    assert_eq!(expected, scope_row_of(&tree).updated_at);
+    assert_eq!(scope, Some(a_scope()));
+}
+
+#[tokio::test]
+async fn the_workspace_rows_applied_write_closes_the_form_and_shows_the_binding() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "app");
+    bench.key(&mut section, "Enter");
+    let request = requests(&bench).pop().expect("the write");
+    let reply = serve(&backend, &request).await;
+    assert!(
+        matches!(
+            reply,
+            StoreReply::SecretScopeWritten {
+                project,
+                outcome: ScopeWrite::Applied,
+                ..
+            } if project == ids::PROJECT_SCOPE_GRAPHICS
+        ),
+        "{reply:?}"
+    );
+
+    bench.reply(&mut section, &reply);
+    assert!(!section.captures_input(), "closed");
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("scope saved"), "{shown}");
+    assert!(
+        line_with(&shown, "workspace Graphics")
+            .contains("infisical \u{b7} p-graphics \u{b7} dev \u{b7} /app"),
+        "the row is the written tree's: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_workspace_row_write_keeps_the_form_and_takes_the_new_token() {
+    let store = MemStore::demo();
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let (_, first, _) = the_scope_write(&requests(&bench));
+
+    // Someone else moves the scope row.
+    let row = stored(&store, ids::PROJECT_SCOPE_GRAPHICS).await;
+    store
+        .update_project(
+            ids::PROJECT_SCOPE_GRAPHICS,
+            row.updated_at,
+            htui_core::model::ProjectPatch {
+                name: Some("Graphics elsewhere".to_owned()),
+                ..htui_core::model::ProjectPatch::default()
+            },
+        )
+        .await
+        .expect("the store writes");
+    let current = refreshed(&store).await;
+    assert_ne!(
+        scope_row_of(&current).updated_at,
+        row.updated_at,
+        "the scope row moved"
+    );
+    bench.reply(
+        &mut section,
+        &scope_written(ids::PROJECT_SCOPE_GRAPHICS, &current, ScopeWrite::Stale),
+    );
+
+    assert!(section.captures_input(), "the form is kept");
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("changed elsewhere since you opened it"),
+        "not `deleted elsewhere`: {shown}"
+    );
+
+    bench.key(&mut section, "Enter");
+    let (_, second, _) = the_scope_write(&requests(&bench));
+    assert_ne!(first, second);
+    assert_eq!(second, scope_row_of(&current).updated_at);
+}
+
+#[tokio::test]
+async fn c_on_a_scoped_workspace_row_asks_then_sends_scope_none() {
+    let (bench, mut section, tree) = loaded_over(&workspace_scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "c");
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("Remove `@graphics`'s secret scope?"),
+        "{shown}"
+    );
+    bench.key(&mut section, "y");
+    let (id, expected, scope) = the_scope_write(&requests(&bench));
+    assert_eq!(id, ids::PROJECT_SCOPE_GRAPHICS);
+    assert_eq!(expected, scope_row_of(&tree).updated_at);
+    assert_eq!(scope, None);
+
+    // An unscoped workspace has nothing to clear.
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "c");
+    assert!(bench.drained().is_empty());
+    assert!(frame(&bench, &section).contains("this project has no secret scope to clear"));
+}
+
+#[tokio::test]
+async fn a_passive_tree_keeps_the_workspace_rows_form_and_question_open() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.reply(&mut section, &tree_reply(&tree));
+    bench.reply(&mut section, &secrets_tree_reply(&tree));
+    assert!(section.captures_input(), "the form stays open");
+    assert!(!frame(&bench, &section).contains("deleted elsewhere"));
+
+    let (bench, mut section, tree) = loaded_over(&workspace_scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "c");
+    bench.reply(&mut section, &secrets_tree_reply(&tree));
+    assert!(section.captures_input(), "the question stays open");
+    bench.key(&mut section, "y");
+    let (id, _, scope) = the_scope_write(&requests(&bench));
+    assert_eq!((id, scope), (ids::PROJECT_SCOPE_GRAPHICS, None));
+}
+
+#[tokio::test]
+async fn t_on_a_scoped_workspace_row_sends_a_scope_check_and_shows_its_count() {
+    let (bench, mut section, _) = loaded_over(&workspace_scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "t");
+    match requests(&bench).as_slice() {
+        [StoreRequest::CheckSecretScope { project }] => {
+            assert_eq!(*project, ids::PROJECT_SCOPE_GRAPHICS);
+        }
+        other => panic!("exactly one scope check, got {other:?}"),
+    }
+    let shown = frame(&bench, &section);
+    assert!(
+        line_with(&shown, "workspace Graphics").contains("\u{b7} checking\u{2026}"),
+        "{shown}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Scope {
+            project: ids::PROJECT_SCOPE_GRAPHICS,
+            at: at(14, 3, 5),
+            outcome: Ok(3),
+        }),
+    );
+    let shown = frame(&bench, &section);
+    assert!(
+        line_with(&shown, "workspace Graphics").contains("checked 14:03:05: 3 keys visible"),
+        "{shown}"
+    );
+
+    // An unscoped workspace row has nothing to check.
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_WORKSPACE);
+    bench.key(&mut section, "t");
+    assert!(bench.drained().is_empty());
 }

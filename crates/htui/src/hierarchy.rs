@@ -45,6 +45,10 @@ pub struct HierarchySnapshot {
     pub folder_path: Option<WorkspaceBoxPath>,
     /// The workspace's projects, ordered by `workspace_project.position`.
     pub projects: Vec<ProjectEntry>,
+    /// The workspace's scope row (MOD-147 D1), which joins no workspace and so is never one of
+    /// [`projects`](Self::projects): the Secrets section's workspace row binds its scope (M3 D11).
+    /// `None` when the store names none, as the mirror may before it has the row.
+    pub scope_row: Option<Project>,
 }
 
 /// One project inside a workspace: its link row, the project itself and its repos.
@@ -224,10 +228,16 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
         });
     }
 
+    let scope_row = match store.scope_project(ws).await? {
+        Some(id) => store.project(id).await?,
+        None => None,
+    };
+
     Ok(Some(HierarchySnapshot {
         workspace,
         folder_path,
         projects,
+        scope_row,
     }))
 }
 

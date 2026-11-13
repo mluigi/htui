@@ -43,7 +43,7 @@ use ratatui::widgets::Paragraph;
 use zeroize::Zeroizing;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::hierarchy::{HierarchySnapshot, ProjectEntry, ScopeWrite};
+use crate::hierarchy::{HierarchySnapshot, ScopeWrite};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::secrets_settings::{
     CHECK_SECRET_PROVIDER, CHECK_SECRET_SCOPE, IdentityEntry, IdentityState, READ_NAME,
@@ -87,6 +87,8 @@ const NO_WORKSPACE: &str = "no workspace: project scopes need one";
 const UNAVAILABLE: &str = "secret settings are unavailable";
 /// The heading over the project rows.
 const PROJECTS: &str = "Projects";
+/// What the workspace row's label puts in front of the workspace's name (MOD-147 M3 D11).
+const WORKSPACE_PREFIX: &str = "workspace ";
 /// `SetInfisicalUrl` landed.
 const URL_STORED: &str = "stored; the next walk, chat or check uses it";
 /// `ClearInfisicalUrl` landed.
@@ -198,6 +200,21 @@ const HINT_CONFIRM: HintSpec = &[
     Hint::All(Act::ConfirmNo, "cancel"),
 ];
 
+/// The project row `id` names in `tree`: the workspace's scope row, else one of its projects
+/// (MOD-147 M3 D11). Every lookup by id goes through here, so a tree that holds the scope row
+/// never reads as one that lost it.
+fn project_in(tree: &HierarchySnapshot, id: ProjectId) -> Option<&Project> {
+    tree.scope_row
+        .as_ref()
+        .filter(|row| row.id == id)
+        .or_else(|| {
+            tree.projects
+                .iter()
+                .map(|entry| &entry.project)
+                .find(|project| project.id == id)
+        })
+}
+
 /// `c` on a scoped project, ended by `answers` ([`answers`], MOD-67 M6 PA-6).
 fn confirm_clear_scope(slug: &str, answers: &str) -> String {
     asked(
@@ -206,7 +223,8 @@ fn confirm_clear_scope(slug: &str, answers: &str) -> String {
     )
 }
 
-/// One row, top to bottom: the four fixed rows, then one per project of the tree.
+/// One row, top to bottom: the four fixed rows, the workspace's own row when the tree names its
+/// scope row (MOD-147 M3 D11), then one per project of the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     /// The provider kind; fixed in this build.
@@ -217,6 +235,9 @@ enum Row {
     Identity,
     /// The last provider check of this session.
     Health,
+    /// The workspace's scope row, `tree.scope_row` (MOD-147 M3 D11): a project row in all but
+    /// its label.
+    Workspace,
     /// A project, by index into `tree.projects`.
     Project(usize),
 }
@@ -232,7 +253,7 @@ impl Row {
             Self::Url => "URL",
             Self::Identity => "Identity",
             Self::Health => "Health",
-            Self::Project(_) => "",
+            Self::Workspace | Self::Project(_) => "",
         }
     }
 }
@@ -409,8 +430,13 @@ pub struct SecretsSection {
     snapshot: Option<SecretsSnapshot>,
     /// `Some(message)` after `Failed { request: "secrets_info" }`.
     unavailable: Option<String>,
-    /// The scope's workspace tree: the project rows and their tokens.
+    /// The scope's workspace tree: the project rows and their tokens. Set through
+    /// [`set_tree`](Self::set_tree) only, which keeps [`workspace_label`](Self::workspace_label)
+    /// in step.
     tree: Option<HierarchySnapshot>,
+    /// The workspace row's label, `workspace <name>` of [`tree`](Self::tree) (MOD-147 M3 D11):
+    /// held here because a form label borrows the section.
+    workspace_label: String,
     /// Index into the rows, in [`row_at`](SecretsSection::row_at)'s order.
     cursor: usize,
     /// Browsing, typing, or being asked a question.
@@ -469,16 +495,31 @@ impl SecretsSection {
         Self::default()
     }
 
-    /// How many rows: the four fixed, then one per project of the tree.
+    /// How many rows: the four fixed, the workspace's, then one per project of the tree.
     fn row_count(&self) -> usize {
-        Row::FIXED.len() + self.tree.as_ref().map_or(0, |tree| tree.projects.len())
+        Row::FIXED.len()
+            + self.workspace_rows()
+            + self.tree.as_ref().map_or(0, |tree| tree.projects.len())
+    }
+
+    /// `1` when the tree names the workspace's scope row, so it has a row, else `0`.
+    fn workspace_rows(&self) -> usize {
+        usize::from(
+            self.tree
+                .as_ref()
+                .is_some_and(|tree| tree.scope_row.is_some()),
+        )
     }
 
     /// Row `index` in cursor order; `index < row_count()`.
     fn row_at(&self, index: usize) -> Row {
-        match Row::FIXED.get(index) {
-            Some(row) => *row,
-            None => Row::Project(index - Row::FIXED.len()),
+        if let Some(row) = Row::FIXED.get(index) {
+            return *row;
+        }
+        let index = index - Row::FIXED.len();
+        match index.checked_sub(self.workspace_rows()) {
+            Some(project) => Row::Project(project),
+            None => Row::Workspace,
         }
     }
 
@@ -502,9 +543,23 @@ impl SecretsSection {
         self.cursor = self.cursor.min(self.row_count() - 1);
     }
 
-    /// A project of the tree, by row index.
-    fn entry(&self, index: usize) -> Option<&ProjectEntry> {
-        self.tree.as_ref().and_then(|tree| tree.projects.get(index))
+    /// The project row `row` binds: the scope row for [`Row::Workspace`], a project of the tree
+    /// for [`Row::Project`], none for a fixed row.
+    fn row_project(&self, row: Row) -> Option<&Project> {
+        let tree = self.tree.as_ref()?;
+        match row {
+            Row::Workspace => tree.scope_row.as_ref(),
+            Row::Project(index) => tree.projects.get(index).map(|entry| &entry.project),
+            Row::Provider | Row::Url | Row::Identity | Row::Health => None,
+        }
+    }
+
+    /// Replaces the tree, and the workspace row's label with it.
+    fn set_tree(&mut self, tree: Option<HierarchySnapshot>) {
+        self.workspace_label = tree.as_ref().map_or_else(String::new, |tree| {
+            format!("{WORKSPACE_PREFIX}{}", tree.workspace.name)
+        });
+        self.tree = tree;
     }
 
     /// Whether this session is `--demo`: the keyring read answered `NotApplicable`.
@@ -573,14 +628,13 @@ impl SecretsSection {
                     focus: 0,
                 };
             }
-            Row::Project(index) => {
+            row @ (Row::Workspace | Row::Project(_)) => {
                 if self.refused_busy() {
                     return;
                 }
-                let Some(entry) = self.entry(index) else {
+                let Some(project) = self.row_project(row) else {
                     return;
                 };
-                let project = &entry.project;
                 let fields = match project_scope(project) {
                     Ok(Some(scope)) => [
                         TextField::with_text(scope.project_id()),
@@ -645,14 +699,13 @@ impl SecretsSection {
                     self.refuse(self.row_text(Row::Identity));
                 }
             }
-            Row::Project(index) => {
+            row @ (Row::Workspace | Row::Project(_)) => {
                 if self.refused_busy() {
                     return;
                 }
-                let Some(entry) = self.entry(index) else {
+                let Some(project) = self.row_project(row) else {
                     return;
                 };
-                let project = &entry.project;
                 if project.secret_provider.is_some() {
                     let mode = Mode::ConfirmClearScope {
                         project: project.id,
@@ -671,12 +724,12 @@ impl SecretsSection {
     /// `t`: a provider check on the fixed rows, a scope check on a project.
     fn test(&mut self, ctx: &Ctx<'_>) {
         match self.row() {
-            Row::Project(index) => {
-                let Some(entry) = self.entry(index) else {
+            row @ (Row::Workspace | Row::Project(_)) => {
+                let Some(entry) = self.row_project(row) else {
                     return;
                 };
-                let project = entry.project.id;
-                if !matches!(project_scope(&entry.project), Ok(Some(_))) {
+                let project = entry.id;
+                if !matches!(project_scope(entry), Ok(Some(_))) {
                     self.refuse(NO_SCOPE_TO_CHECK.to_owned());
                 } else if self.demo() {
                     self.refuse(DEMO_CHECK.to_owned());
@@ -936,9 +989,9 @@ impl SecretsSection {
                 Some(IdentityState::Unreadable(why)) => format!("{UNREADABLE}: {why}"),
             },
             Row::Health => self.health_text(),
-            Row::Project(index) => self
-                .entry(index)
-                .map(|entry| self.project_text(&entry.project))
+            Row::Workspace | Row::Project(_) => self
+                .row_project(row)
+                .map(|project| self.project_text(project))
                 .unwrap_or_default(),
         }
     }
@@ -1016,11 +1069,18 @@ impl SecretsSection {
     /// ([`Self::slug_fits`]), whole.
     fn label_width(&self, width: u16) -> u16 {
         let cap = usize::from(width / 3);
+        let workspace = self
+            .tree
+            .as_ref()
+            .filter(|tree| tree.scope_row.is_some())
+            .map(|_| self.workspace_label.as_str());
         let slugs = self
             .tree
             .iter()
             .flat_map(|tree| &tree.projects)
-            .map(|entry| cell_width(&entry.project.slug))
+            .map(|entry| entry.project.slug.as_str())
+            .chain(workspace)
+            .map(cell_width)
             .filter(|cells| *cells < cap);
         let labels = Row::FIXED
             .iter()
@@ -1141,15 +1201,28 @@ impl SecretsSection {
         form = form.blank();
         item += 1;
         if let Some(tree) = &self.tree {
-            form = form.heading(PROJECTS);
-            item += 1;
-            for (index, entry) in tree.projects.iter().enumerate() {
-                let project = &entry.project;
+            // The workspace's own row first (MOD-147 M3 D11), then the `Projects` heading and
+            // the projects: one loop, since the workspace row is a project row in all but its
+            // label.
+            let workspace = tree
+                .scope_row
+                .iter()
+                .map(|project| (self.workspace_label.as_str(), project));
+            let projects = tree
+                .projects
+                .iter()
+                .map(|entry| (entry.project.slug.as_str(), &entry.project));
+            let first_project = self.workspace_rows();
+            for (index, (label, project)) in workspace.chain(projects).enumerate() {
+                if index == first_project {
+                    form = form.heading(PROJECTS);
+                    item += 1;
+                }
                 let text = self.project_text(project);
-                let mut field = if Self::slug_fits(&project.slug, column) {
-                    form::Field::new(project.slug.as_str(), Value::ReadOnly(Cow::Owned(text)))
+                let mut field = if Self::slug_fits(label, column) {
+                    form::Field::new(label, Value::ReadOnly(Cow::Owned(text)))
                 } else {
-                    let whole = format!("{} \u{b7} {text}", project.slug);
+                    let whole = format!("{label} \u{b7} {text}");
                     form::Field::new("", Value::ReadOnly(Cow::Owned(whole)))
                 };
                 if let Mode::ConfirmClearScope {
@@ -1184,6 +1257,10 @@ impl SecretsSection {
                         item += 1;
                     }
                 }
+            }
+            if tree.projects.is_empty() {
+                // No project to head: the heading still says where they would be.
+                form = form.heading(PROJECTS);
             }
         }
         form.focus(focus.unwrap_or(0)).editing(self.editing())
@@ -1280,7 +1357,7 @@ impl SecretsSection {
         if tree.workspace.id != ctx.scope.workspace_id {
             return false;
         }
-        self.tree = Some(tree.clone());
+        self.set_tree(Some(tree.clone()));
         self.clamp_cursor();
         true
     }
@@ -1302,11 +1379,10 @@ impl SecretsSection {
             }
             _ => return false,
         };
-        let known = self.tree.as_ref().is_some_and(|tree| {
-            tree.projects
-                .iter()
-                .any(|entry| entry.project.id == project)
-        });
+        let known = self
+            .tree
+            .as_ref()
+            .is_some_and(|tree| project_in(tree, project).is_some());
         if known {
             return false;
         }
@@ -1317,7 +1393,7 @@ impl SecretsSection {
 
     /// No tree for the scope: no project rows, and a scope form or question on one is closed.
     fn on_tree_gone(&mut self) {
-        self.tree = None;
+        self.set_tree(None);
         self.clamp_cursor();
         self.closed_if_gone();
     }
@@ -1395,11 +1471,7 @@ impl SecretsSection {
     /// A stale scope write: refresh the open form's token, close it if the project left, or say so,
     /// naming the retry key in force (`field.submit` through `SECRETS_FORM`, D-5).
     fn on_scope_stale(&mut self, project: ProjectId, tree: &HierarchySnapshot, keys: &Keys) {
-        let current = tree
-            .projects
-            .iter()
-            .find(|entry| entry.project.id == project)
-            .map(|entry| entry.project.updated_at);
+        let current = project_in(tree, project).map(|row| row.updated_at);
         match (&mut self.mode, current) {
             (
                 Mode::EditingScope {
@@ -1450,11 +1522,10 @@ impl SecretsSection {
                 outcome,
             } => {
                 let outdated = self.answered(Checking::Scope(*project));
-                let known = self.tree.as_ref().is_some_and(|tree| {
-                    tree.projects
-                        .iter()
-                        .any(|entry| entry.project.id == *project)
-                });
+                let known = self
+                    .tree
+                    .as_ref()
+                    .is_some_and(|tree| project_in(tree, *project).is_some());
                 if known && !outdated {
                     self.scope_checks.insert(*project, (*at, outcome.clone()));
                 }
@@ -1522,7 +1593,7 @@ impl SettingsSection for SecretsSection {
         // The keyring rows and the provider check survive: neither is scoped. A half-typed form
         // does not: a scope change is one of the three disposal points (D3), beside `Esc` and
         // the `take` at submit.
-        self.tree = None;
+        self.set_tree(None);
         self.scope_checks.clear();
         self.mode = Mode::Browse;
         if matches!(self.busy, Some(Write::Scope { .. })) {
@@ -1886,8 +1957,9 @@ mod tests {
         );
     }
 
-    /// CLEAN-8 #5: the rows, indexed without a `Vec`, are the four fixed ones, then one per
-    /// project of the tree; with no tree, the four alone.
+    /// CLEAN-8 #5: the rows, indexed without a `Vec`, are the four fixed ones, the workspace's
+    /// own row (MOD-147 M3 D11), then one per project of the tree; a tree without a scope row
+    /// has no workspace row; with no tree, the four alone.
     #[tokio::test]
     async fn row_at_walks_the_fixed_rows_then_the_projects() {
         let tree = crate::hierarchy::snapshot(
@@ -1908,6 +1980,26 @@ mod tests {
 
         let section = SecretsSection {
             tree: Some(tree.clone()),
+            ..SecretsSection::new()
+        };
+        assert!(
+            tree.scope_row.is_some(),
+            "the graphics workspace has a scope row"
+        );
+        assert_eq!(
+            walk(&section),
+            Row::FIXED
+                .into_iter()
+                .chain([Row::Workspace])
+                .chain((0..n).map(Row::Project))
+                .collect::<Vec<_>>()
+        );
+
+        let section = SecretsSection {
+            tree: Some(HierarchySnapshot {
+                scope_row: None,
+                ..tree.clone()
+            }),
             ..SecretsSection::new()
         };
         assert_eq!(
