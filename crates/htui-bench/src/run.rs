@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_wires_a_tiny_corpus() {
+    async fn live_qdrant_run_with_wires_a_tiny_corpus() {
         use htui_store::embed::{DENSE_DIM, HashEmbedder};
 
         let qdrant = live_env("HTUI_TEST_QDRANT_URL");

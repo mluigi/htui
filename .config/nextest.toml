@@ -1,0 +1,40 @@
+# TOOL-17: cargo-nextest configuration.
+
+# The pinned version (TOOL-17 D3) as a minimum: an older cargo-nextest refuses
+# this config with a message naming the version it needs.
+nextest-version = { required = "0.9.151" }
+
+# Every case that reaches the test Qdrant shares one single-thread group, so
+# two such cases never overlap under nextest's process-per-test model. The
+# rule for a new live Qdrant test: it lives in `qdrant_live`/`qdrant_worker`,
+# or its name starts with `live_qdrant_`. `cargo nextest show-config
+# test-groups --all-features` lists what the group holds (without the flag the
+# state_cli_pg cases are not built and drop out).
+#
+# The `#[ignore]`d live agent cases in htui-agent's `it` binary whose modules
+# hold an in-process `ONE_AT_A_TIME` lock (agy_live, auth_live, cli_live,
+# isolation_live) share `live-agent` the same way: that lock serialises them
+# under cargo test only, since nextest gives each test its own process. A new
+# such module joins the filter below.
+
+[test-groups]
+live-qdrant = { max-threads = 1 }
+live-agent = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^qdrant_live::|^qdrant_worker::|live_qdrant/)'
+test-group = 'live-qdrant'
+
+[[profile.default.overrides]]
+filter = 'package(htui-agent) and binary(it) and test(/^(agy|auth|cli|isolation)_live::/)'
+test-group = 'live-agent'
+
+# The gate's profile: run everything, retry once (a pass on retry shows as
+# FLAKY in the summary), and write per-test times to
+# target/nextest/gate/junit.xml.
+[profile.gate]
+fail-fast = false
+retries = 1
+
+[profile.gate.junit]
+path = "junit.xml"

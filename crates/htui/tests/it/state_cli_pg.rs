@@ -821,7 +821,7 @@ async fn a_search_reads_the_url_row() {
 /// MOD-158 D3: `HTUI_QDRANT_URL` wins over the row. The row names a Qdrant that does not answer;
 /// the override names the test Qdrant, where the throwaway collection does not exist: `empty`.
 #[tokio::test]
-async fn the_env_url_wins_over_the_row() {
+async fn live_qdrant_the_env_url_wins_over_the_row() {
     let Some((_turn, url)) = test_qdrant().await else {
         return;
     };
@@ -974,7 +974,7 @@ async fn a_search_scope_refusal_comes_before_the_index() {
 
 /// No collection: `empty`/0 with `hits: []`, nothing created, and no model loaded (review R1 M3).
 #[tokio::test]
-async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
+async fn live_qdrant_a_search_without_a_collection_is_empty_and_loads_no_model() {
     let Some((_turn, url)) = test_qdrant().await else {
         return;
     };
@@ -1009,7 +1009,7 @@ async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
 /// Over an index of the demo: the model loads once, `--project` and `--cwd` narrow the search to
 /// one project, and a model that fails, at load or on the query, is `model_unavailable`/1.
 #[tokio::test]
-async fn a_search_over_an_index_answers_in_scope() {
+async fn live_qdrant_a_search_over_an_index_answers_in_scope() {
     let Some((_turn, url)) = test_qdrant().await else {
         return;
     };

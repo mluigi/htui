@@ -7,8 +7,9 @@ gets:
 - a fresh clone of this repo on branch `hr/<ITEM>`, taken from your local `main` (unpushed commits
   included);
 - its own Postgres and Qdrant, on the same `localhost` ports as on the host;
-- the full toolchain (Rust 1.98.1, `sqlx-cli`, `cargo-insta`, `psql`) plus your own Claude Code,
-  Gortex, serena, headroom and graphify, with the same skills, plugins, hooks and MCP servers;
+- the full toolchain (Rust 1.98.1, `sqlx-cli`, `cargo-insta`, `cargo-nextest`, `psql`) plus your
+  own Claude Code, Gortex, serena, headroom and graphify, with the same skills, plugins, hooks and
+  MCP servers;
 - no git credentials. Work leaves a sandbox only when you collect it on the host.
 
 The sandboxes keep runs apart from **accidents**. They are not a security boundary against a run
@@ -90,8 +91,10 @@ build it in a terminal and otherwise exits `2` naming `scripts/hr build`.
 Rebuild whenever `docker/hr/Dockerfile` changes — for instance after the change that narrowed the
 `~/.local` mounts to four directories: the image creates their mount points owned by you, and Docker
 would otherwise create them owned by root. The Dockerfile pins Rust, `sqlx-cli` and `cargo-insta`
-to match `rust-toolchain.toml` and `Cargo.lock`, so bump it together with them. `down --purge` and
-`gc` need the image too: they check a clone in a throwaway container of it.
+to match `rust-toolchain.toml` and `Cargo.lock`, so bump it together with them. It also pins
+`cargo-nextest`, the gate's test runner (TOOL-17): an image built before that has none, and the
+gate's `test` step fails in it until you run `scripts/hr build`. `down --purge` and `gc` need the
+image too: they check a clone in a throwaway container of it.
 
 ## Starting a run
 

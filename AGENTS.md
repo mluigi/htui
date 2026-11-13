@@ -38,20 +38,37 @@ Overview: `.claude/skills/handoff-docs.md`.
   libtest **substring** match: `settings::` also runs `box_settings::` and its kin, so read the
   names that run. Snapshots live in `tests/it/snapshots/it__<name>__<test>.snap`. Without
   `--all-features` (or `--features testkit` for `htui`, `test-support` for `htui-core` and
-  `htui-agent`) the `it` binary fails on a canary test instead of passing with 0 tests. A crash in
-  one test (stack overflow, SIGABRT) now ends its crate's whole `it` binary; `abort-grep` in the gate
-  names it. Two files stay outside `it`: `htui-agent/tests/extensibility.rs` (its path is hard-coded in
-  the `htui-dev` mod) and `htui/tests/panic_hook.rs` (it installs a process-wide panic hook that
+  `htui-agent`) the `it` binary fails on a canary test instead of passing with 0 tests. Under
+  `cargo test` a crash in one test (stack overflow, SIGABRT) ends its crate's whole `it` binary;
+  under nextest it ends that test. `abort-grep` in the gate names it either way. Two files stay
+  outside `it`: `htui-agent/tests/extensibility.rs` (its path is hard-coded in the `htui-dev` mod)
+  and `htui/tests/panic_hook.rs` (it installs a process-wide panic hook that, under `cargo test`,
   would see every parallel test's panics). A new test that sets process-wide state (`set_hook`,
-  environment, cwd) gets its own top-level `tests/<name>.rs` target, or re-runs itself as a child.
-- Tests run in parallel (TOOL-16): the gate uses libtest's default threads, so a crate's tests share
-  one process and run side by side. A test of the live Qdrant holds `htui_store::testkit::qdrant_turn()`
-  for its whole body and creates its collection with `testkit::qdrant_connect_to` (retries the client's 5 s
-  deadline under load); a test that writes a script and executes it writes it with
-  `tests/rust/write_executable.rs` (included through `#[path]`), never `fs::write` plus `chmod`
-  (`ETXTBSY`). `testkit::fresh_db`/`demo_db` copy a template database, so `migrations_at_connect` is
-  `UpToDate`; a test about pending migrations starts from `bare_db`. Item runs:
-  `cargo test -p <crate> --all-features --test it <module>::` at default threads.
+  environment, cwd) gets its own top-level `tests/<name>.rs` target, or re-runs itself as a child,
+  so it stays correct under both runners.
+- Test runners (TOOL-17): the gate's `test` step runs
+  `cargo nextest run --workspace --all-features --no-fail-fast --profile gate` (one process per
+  test; a test that passes on its retry is named `FLAKY`), then
+  `cargo test --workspace --all-features --doc`, since nextest runs no doctests. Both runners work
+  for item runs, at default threads:
+  `cargo nextest run -p <crate> --all-features -E 'binary(it) and test(/^<module>::/)'` (without
+  `binary(it)` the filter also runs the crate's unit tests in a same-named `src/` module) or
+  `cargo test -p <crate> --all-features --test it <module>::`. Under `cargo test` a crate's tests
+  share one process and run side by side (TOOL-16), so the rules below are written for that case.
+- A test of the live Qdrant lives in `qdrant_live`/`qdrant_worker` or its name starts with
+  `live_qdrant_`: `.config/nextest.toml` runs those one at a time in the `live-qdrant` group
+  (`cargo nextest show-config test-groups --all-features` lists it). It still holds
+  `htui_store::testkit::qdrant_turn()` for its whole body, as a keyring test holds `mock_keyring()`:
+  the locks serialise it under `cargo test` and cost nothing under nextest. It creates its
+  collection with `testkit::qdrant_connect_to` (retries the client's 5 s deadline under load). A
+  test that writes a script and executes it writes it with `tests/rust/write_executable.rs`
+  (included through `#[path]`), never `fs::write` plus `chmod` (`ETXTBSY`).
+  `testkit::fresh_db`/`demo_db` copy a template database, so `migrations_at_connect` is
+  `UpToDate`; a test about pending migrations starts from `bare_db`.
+- The `#[ignore]`d live agent cases in `htui-agent`'s `agy_live`, `auth_live`, `cli_live` and
+  `isolation_live` take their module's `ONE_AT_A_TIME` lock, which serialises them under
+  `cargo test`; under nextest the `live-agent` group in `.config/nextest.toml` does, and a new
+  `*_live` module with such a lock joins that group's filter.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.
