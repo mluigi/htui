@@ -607,7 +607,7 @@ key listing against a real Infisical. It reads five variables:
 | `HTUI_TEST_INFISICAL_ENVIRONMENT` | An environment slug whose root folder holds at least one secret |
 
 ```
-cargo test -p htui-secrets --test infisical_live -- --nocapture
+cargo test -p htui-secrets --all-features --test it infisical_live:: -- --nocapture
 ```
 
 Without `HTUI_TEST_INFISICAL_URL` it prints `skipped: HTUI_TEST_INFISICAL_URL not set` and passes.

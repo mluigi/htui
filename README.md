@@ -702,7 +702,7 @@ included `compose.yaml`). The gate's `qdrant` step reports whether they ran: ski
 
 The Infisical live test reads `HTUI_TEST_INFISICAL_URL`, `HTUI_TEST_INFISICAL_CLIENT_ID`,
 `HTUI_TEST_INFISICAL_CLIENT_SECRET`, `HTUI_TEST_INFISICAL_PROJECT_ID` and
-`HTUI_TEST_INFISICAL_ENVIRONMENT` (`cargo test -p htui-secrets --test infisical_live`); without the
+`HTUI_TEST_INFISICAL_ENVIRONMENT` (`cargo test -p htui-secrets --all-features --test it infisical_live::`); without the
 URL it prints `skipped: HTUI_TEST_INFISICAL_URL not set` and passes. Use a throwaway identity with
 read access to one test environment.
 
