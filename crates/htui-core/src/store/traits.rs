@@ -61,23 +61,23 @@ use crate::model::{
     CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
     FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
-    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope,
+    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
@@ -3900,6 +3900,22 @@ pub fn memory_entry_closed(id: MemoryEntryId, state: MemoryState) -> String {
 /// MOD-164 D4: [`WriteStore::write_run_memory`] writes for a run's capture stage only (`role =
 /// stage`, `node_key = capture`). A stable code word, so the engine can tell it apart.
 pub const MEMORY_NEEDS_A_CAPTURE_STEP: &str = "memory_needs_a_capture_step";
+
+/// MOD-164 D4 (review L4): a run's entry rests on quotes of its own run.
+/// [`WriteStore::write_run_memory`] refuses an empty `evidence.citations` and a citation whose
+/// `step_id` is not a step of the capture step's run. A stable code word, as
+/// [`MEMORY_NEEDS_A_CAPTURE_STEP`].
+pub const MEMORY_EVIDENCE_OUTSIDE_THE_RUN: &str = "memory_evidence_outside_the_run";
+
+/// MOD-164 D4 (review M1): whether a live entry holding a capture write's subject is a person's,
+/// so the run leaves it alone ([`RunMemoryWrite::PersonHolds`]). A `person` entry is; so is a
+/// `run` entry past version 1, since a run only creates entries (version 1) and only moves them
+/// to `superseded` (out of the live set): a live run entry at version 2 or later was amended by a
+/// person, and the text is theirs now. Shared so the two stores cannot disagree.
+#[must_use]
+pub fn run_memory_held_by_a_person(source: MemorySource, version: i32) -> bool {
+    source == MemorySource::Person || version > 1
+}
 
 // ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
 
