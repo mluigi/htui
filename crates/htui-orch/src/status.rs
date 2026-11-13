@@ -702,8 +702,11 @@ pub fn run_resumable(snapshot: &GraphSnapshot, steps: &[RunStep]) -> bool {
 ///
 /// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
 /// position before anything else is read; a slot retired whole is re-created at `attempt + 1`; a
-/// `running` candidate or judge rests the walk before a `pending` sibling is driven; a short or
-/// `pending` slot is driven; anything else is settled and goes to selection.
+/// `running` candidate or judge rests the walk before a `pending` sibling is driven; a short slot,
+/// or one with a `pending` or `stopped` candidate, is driven (MOD-125 M3 D4: `drive_group` resumes
+/// a stopped candidate on its own row; resting on it would rest forever, as only `Fan` reaches
+/// `drive_group`); anything else is settled and goes to selection, which re-runs a `stopped`
+/// judge.
 ///
 /// The slot's attempt is the highest over its candidates (every `fanout_index >= 0` row) rather
 /// than [`latest_at`]'s index-0 reading, which agrees whenever a group was created whole (plan
@@ -748,7 +751,11 @@ pub(crate) fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Op
         });
     }
     let short = i32::try_from(group.len()).is_ok_and(|len| len < fan_out);
-    if short || group.iter().any(|step| step.status == StepStatus::Pending) {
+    if short
+        || group
+            .iter()
+            .any(|step| matches!(step.status, StepStatus::Pending | StepStatus::Stopped))
+    {
         return Some(Cursor::Fan { position, attempt });
     }
     Some(Cursor::Select { position, attempt })

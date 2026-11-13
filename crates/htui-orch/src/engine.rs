@@ -319,6 +319,15 @@ impl SessionOpening<'_> {
     }
 }
 
+/// MOD-125 M3 D4: what [`Engine::resumed_member`] answers: the member's trees, its session's `cwd`
+/// and extra directories, and how its session opens.
+type ReopenedMember = (
+    Vec<RunStepTree>,
+    PathBuf,
+    Vec<PathBuf>,
+    SessionOpening<'static>,
+);
+
 /// MOD-125 M3 D5: what [`Engine::open_recorder`] opens on.
 #[derive(Debug)]
 pub(crate) enum RecorderStart<'p> {
@@ -5767,6 +5776,35 @@ where
         })
     }
 
+    /// MOD-125 M3 D4: a fan-out candidate or a part, moved `stopped -> running` by its round,
+    /// whose log holds session rows: its trees reopened ([`Self::reopen_trees`]: its guards
+    /// retaken, nothing prepared, recorded or reset) and handed to the caller's `trees` at once,
+    /// so a failure from here releases them as a prepared member's are; then its opening
+    /// ([`Self::stopped_opening`]). The member's prompt, `before` commits and tree rows stand as
+    /// its first run wrote them. Answers the trees, the session's `cwd` and extra directories,
+    /// and the opening.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the member's run, snapshot, row and phase, its item and log, all handed to \
+                  `stopped_opening`, and the caller's slot for the trees it must release"
+    )]
+    async fn resumed_member(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &mut Option<Vec<RunStepTree>>,
+    ) -> Result<ReopenedMember, EngineError> {
+        let (rows, cwd, extra_dirs) = self.reopen_trees(run, step, phase).await?;
+        *trees = Some(rows.clone());
+        let opening =
+            Box::pin(self.stopped_opening(run, snapshot, step, phase, item, events, &rows)).await?;
+        Ok((rows, cwd, extra_dirs, opening))
+    }
+
     /// MOD-139 M3 D1: what one integrate attempt reads, read once and shared by its hooks: the
     /// divided node's latest done planner, its admitted plan (decoded by [`plan_parts`], the parts
     /// round's own decode) and a [`PartTip`] per latest done part, in plan order.
@@ -6137,6 +6175,10 @@ where
     /// concurrently through stages 2 to 5 (plan D58). `Some(rest)` is a refusal that stopped the
     /// run; `None` means the next pass re-derives — normally `Select`.
     ///
+    /// MOD-125 M3 D4: a `stopped` candidate of a resumed run is driven too, on its own row and
+    /// ahead of the `pending` ones (under `shared_serialized`, each to its end before any other
+    /// starts); [`Self::candidate_live`] reopens it when its log holds session rows.
+    ///
     /// The prompt is assembled **once**, before any candidate is live (plan D58): every candidate
     /// records the same text and `prompt_digest`, and none reads `resolve_inputs` while a sibling
     /// writes its output. A missing required input therefore fails the group before a token is
@@ -6192,12 +6234,31 @@ where
 
         let steps = self.parts.store.run_steps(run.id).await?;
         let slot = group_at(&steps, phase.position, attempt);
-        let pending: Vec<&RunStep> = slot
+        // MOD-125 M3 D4: the members this call drives, every `stopped` one (resumed on its own
+        // row) before every `pending` one.
+        let resumed = slot
+            .iter()
+            .filter(|step| step.status == StepStatus::Stopped)
+            .count();
+        let members: Vec<&RunStep> = slot
             .iter()
             .copied()
-            .filter(|step| step.status == StepStatus::Pending)
+            .filter(|step| step.status == StepStatus::Stopped)
+            .chain(
+                slot.iter()
+                    .copied()
+                    .filter(|step| step.status == StepStatus::Pending),
+            )
             .collect();
-        let Some(first) = pending.first() else {
+        // The group's one prompt is the first `pending` member's, else the first member's: only
+        // a member with no session row (a `pending` one, or one stopped before its recorder
+        // opened) sends it.
+        let Some(first) = members
+            .iter()
+            .find(|step| step.status == StepStatus::Pending)
+            .or_else(|| members.first())
+            .copied()
+        else {
             return Ok(None);
         };
         // MOD-10 D11, D13 (blueprint A-1, A-2): one resolution for the whole group, before its
@@ -6208,7 +6269,7 @@ where
                 .fail_group_before_a_token(
                     run,
                     phase,
-                    &pending,
+                    &members,
                     RunFailure::SecretsRefused { cause },
                     false,
                 )
@@ -6232,7 +6293,7 @@ where
                     .fail_group_before_a_token(
                         run,
                         phase,
-                        &pending,
+                        &members,
                         RunFailure::MissingInput(missing),
                         false,
                     )
@@ -6247,7 +6308,7 @@ where
                     reason: err.to_string(),
                 };
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .fail_group_before_a_token(run, phase, &members, failure, true)
                     .await
                     .map(Some);
             }
@@ -6258,7 +6319,7 @@ where
                     reason: refusal.to_string(),
                 };
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .fail_group_before_a_token(run, phase, &members, failure, true)
                     .await
                     .map(Some);
             }
@@ -6272,19 +6333,43 @@ where
                 reason: refusal.to_string(),
             })?;
 
-        let settled = futures::future::join_all(pending.iter().map(|step| {
-            self.run_candidate(CandidateStage {
-                run,
-                phase,
-                step,
-                prompt: &prompt,
-                base: &base,
-                persona,
-                reads_verdict: snapshot.reads_verdict(&phase.name),
-                live_siblings: live,
-            })
-        }))
-        .await;
+        let stage = |step| CandidateStage {
+            run,
+            snapshot,
+            phase,
+            step,
+            prompt: &prompt,
+            base: &base,
+            persona,
+            reads_verdict: snapshot.reads_verdict(&phase.name),
+            live_siblings: live,
+        };
+        // MOD-125 M3 D4: under `shared_serialized` the stopped members run to their end one at a
+        // time, before any other member starts: a sibling's `prepare` resets the shared checkout
+        // (and refuses on dirt), so a stopped member's tree must be captured first. Left to the
+        // `join_all`, tokio's FIFO guard and each future's awaits would pick who goes first. A
+        // member that answers an error ends the sequence, the rest left as they are, as a parts
+        // round stops pulling.
+        let (first_members, rest) = if phase.isolation == Isolation::SharedSerialized {
+            members.split_at(resumed)
+        } else {
+            members.split_at(0)
+        };
+        let mut settled = Vec::with_capacity(members.len());
+        for step in first_members {
+            let outcome = Box::pin(self.run_candidate(stage(*step))).await;
+            let failed = outcome.is_err();
+            settled.push(outcome);
+            if failed {
+                break;
+            }
+        }
+        if settled.iter().all(Result::is_ok) {
+            settled.extend(
+                futures::future::join_all(rest.iter().map(|step| self.run_candidate(stage(*step))))
+                    .await,
+            );
+        }
         let mut errors = Vec::new();
         let mut refusals = Vec::with_capacity(settled.len());
         for outcome in settled {
@@ -6415,14 +6500,9 @@ where
         let now = self.now();
         for step in pending {
             // Plan D125: a candidate another writer moved stops the walk before the run is failed.
-            self.move_step(
-                run.id,
-                step.id,
-                StepStatus::Pending,
-                StepStatus::Running,
-                now,
-            )
-            .await?;
+            // MOD-125 M3 D4: a stopped member moves from `stopped`.
+            self.move_step(run.id, step.id, step.status, StepStatus::Running, now)
+                .await?;
             self.fail_candidate(run, phase, step, &failure.to_string())
                 .await?;
         }
@@ -6487,11 +6567,12 @@ where
     ) -> Result<Option<RunFailure>, EngineError> {
         let started_at = self.now();
         // Plan D144: a candidate another writer moved is `StaleWrite` (D125), raised once the
-        // group's `join_all` has settled every sibling.
+        // group's `join_all` has settled every sibling. MOD-125 M3 D4: a stopped candidate moves
+        // `stopped -> running` on its own row (same row and attempt, no retry spent).
         self.move_step(
             stage.run.id,
             stage.step.id,
-            StepStatus::Pending,
+            stage.step.status,
             StepStatus::Running,
             started_at,
         )
@@ -6566,6 +6647,7 @@ where
     ) -> Result<(), EngineError> {
         let CandidateStage {
             run,
+            snapshot,
             phase,
             step,
             prompt,
@@ -6576,73 +6658,106 @@ where
         } = *stage;
         let item = Self::item_of(run)?;
 
-        // -- stage 2: prepare, from the group's base (plan D54(a)) ----------------------------
-        let prepared = self
-            .parts
-            .isolator
-            .prepare(
-                run.id,
-                step.id,
-                &run.repo_scope,
-                phase.isolation,
-                Some(FanoutSlot {
-                    index: step.fanout_index,
-                    width: phase.fan_out,
-                    base,
-                }),
-            )
-            .await?;
-        // The candidate's own clock starts here, not at its `running` move: a `shared_serialized`
-        // `prepare` waits on the per-repo lock until the sibling before it is captured, and a
-        // deadline that counted that wait would charge the last sibling for every session ahead
-        // of it. `run_step.started_at` keeps the `running` instant.
-        let started_at = self.now();
-        let rows: Vec<_> = prepared
-            .trees
-            .iter()
-            .map(|tree| tree.tree.clone())
-            .collect();
-        *trees = Some(rows.clone());
-        self.parts
-            .store
-            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
-            .await?;
-        let before: Vec<RunStepCommit> = prepared
-            .trees
-            .iter()
-            .map(|tree| RunStepCommit {
-                run_step_id: step.id,
-                repo_id: tree.tree.repo_id,
-                before_hash: tree.before_hash.clone(),
-                after_hash: None,
-            })
-            .collect();
-        self.parts
-            .store
-            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
-            .await?;
+        // MOD-125 M3 D4: a candidate stopped with session rows reopens its trees and its log
+        // ([`Self::resumed_member`]); one stopped before its recorder opened walks from stage 2
+        // again, as a pending one does (its tree is still at the group's base).
+        let events = if step.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(step.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (rows, cwd, extra_dirs, started_at, start, opening) = if events.is_empty() {
+            // -- stage 2: prepare, from the group's base (plan D54(a)) ------------------------
+            let prepared = self
+                .parts
+                .isolator
+                .prepare(
+                    run.id,
+                    step.id,
+                    &run.repo_scope,
+                    phase.isolation,
+                    Some(FanoutSlot {
+                        index: step.fanout_index,
+                        width: phase.fan_out,
+                        base,
+                    }),
+                )
+                .await?;
+            // The candidate's own clock starts here, not at its `running` move: a
+            // `shared_serialized` `prepare` waits on the per-repo lock until the sibling before it
+            // is captured, and a deadline that counted that wait would charge the last sibling
+            // for every session ahead of it. `run_step.started_at` keeps the `running` instant.
+            let started_at = self.now();
+            let rows: Vec<_> = prepared
+                .trees
+                .iter()
+                .map(|tree| tree.tree.clone())
+                .collect();
+            *trees = Some(rows.clone());
+            self.parts
+                .store
+                .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+                .await?;
+            let before: Vec<RunStepCommit> = prepared
+                .trees
+                .iter()
+                .map(|tree| RunStepCommit {
+                    run_step_id: step.id,
+                    repo_id: tree.tree.repo_id,
+                    before_hash: tree.before_hash.clone(),
+                    after_hash: None,
+                })
+                .collect();
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+                .await?;
 
-        // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
-        let trim = prompt
-            .trim
-            .to_value(self.parts.scrubber)
-            .map_err(htui_agent::RecordError::from)?;
-        self.parts
-            .store
-            .set_step_prompt(
-                StepFence::Lease(self.parts.owner),
-                step.id,
-                &prompt.digest,
-                &trim,
+            // -- stage 3: the group's one prompt (plan D58) ------------------------------------
+            let trim = prompt
+                .trim
+                .to_value(self.parts.scrubber)
+                .map_err(htui_agent::RecordError::from)?;
+            self.parts
+                .store
+                .set_step_prompt(
+                    StepFence::Lease(self.parts.owner),
+                    step.id,
+                    &prompt.digest,
+                    &trim,
+                )
+                .await?;
+            (
+                rows,
+                prepared.cwd,
+                prepared.extra_dirs,
+                started_at,
+                RecorderStart::Prompt(prompt),
+                SessionOpening::Fresh(&prompt.text),
             )
-            .await?;
+        } else {
+            let (rows, cwd, extra_dirs, opening) =
+                Box::pin(self.resumed_member(run, snapshot, step, phase, item, &events, trees))
+                    .await?;
+            (
+                rows,
+                cwd,
+                extra_dirs,
+                self.now(),
+                RecorderStart::Tail(events),
+                opening,
+            )
+        };
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self
-            .open_recorder(run, step, RecorderStart::Prompt(prompt))
-            .await?;
-        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
+        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48,
+        // or from its resume, MOD-125 M3 D4).
         let deadline = self.deadline_at(phase, started_at);
         let Driven {
             result,
@@ -6654,9 +6769,9 @@ where
                 phase,
                 persona,
                 &key,
-                &SessionOpening::Fresh(&prompt.text),
-                prepared.cwd.clone(),
-                prepared.extra_dirs,
+                &opening,
+                cwd.clone(),
+                extra_dirs,
                 deadline,
                 live_siblings,
                 &mut recorder,
@@ -6683,7 +6798,7 @@ where
                 phase,
                 trees: &rows,
                 started_at,
-                session_cwd: &prepared.cwd,
+                session_cwd: &cwd,
                 result: &result,
                 deadline_cut,
             })
@@ -6988,7 +7103,8 @@ where
     /// ([`part_retries`]: every latest part that failed with an attempt left gets its next
     /// attempt at its own position, unless some part is out of attempts, which is the divided
     /// step's failure and [`Self::settle_exhausted_part`]'s); its `pending` latest parts in
-    /// position order, and its admitted plan with the `base_refs` the parts branch from.
+    /// position order (MOD-125 M3 D4: after its `stopped` ones, each resumed on its own row by
+    /// [`Self::part_live`]), and its admitted plan with the `base_refs` the parts branch from.
     /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part and
     /// the run. Then every pending part through [`Self::run_part`], at most
     /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
@@ -7022,12 +7138,22 @@ where
             }
             steps = self.parts.store.run_steps(run.id).await?;
         }
-        let pending: Vec<RunStep> = crate::divide::latest_parts(&steps, planner.id)
-            .into_iter()
-            .filter(|part| part.status == StepStatus::Pending)
-            .cloned()
+        // MOD-125 M3 D4: the round's members, every `stopped` part (resumed on its own row) before
+        // every `pending` one, each in position order. A round runs at most `parts_width` at once,
+        // one under `shared_serialized`, so there a stopped part runs to its capture before a
+        // pending sibling's `prepare` resets the shared checkout.
+        let latest = crate::divide::latest_parts(&steps, planner.id);
+        let members: Vec<RunStep> = latest
+            .iter()
+            .filter(|part| part.status == StepStatus::Stopped)
+            .chain(
+                latest
+                    .iter()
+                    .filter(|part| part.status == StepStatus::Pending),
+            )
+            .map(|part| (*part).clone())
             .collect();
-        if pending.is_empty() {
+        if members.is_empty() {
             return Ok(None);
         }
         let plan = self
@@ -7051,15 +7177,10 @@ where
         if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
             let failure = RunFailure::SecretsRefused { cause };
             let now = self.now();
-            for step in &pending {
-                self.move_step(
-                    run.id,
-                    step.id,
-                    StepStatus::Pending,
-                    StepStatus::Running,
-                    now,
-                )
-                .await?;
+            for step in &members {
+                // MOD-125 M3 D4: a stopped part moves from `stopped`.
+                self.move_step(run.id, step.id, step.status, StepStatus::Running, now)
+                    .await?;
                 self.fail_part(run, node, step, &failure.to_string())
                     .await?;
             }
@@ -7075,8 +7196,8 @@ where
             }));
         }
 
-        let mut stages = Vec::with_capacity(pending.len());
-        for step in &pending {
+        let mut stages = Vec::with_capacity(members.len());
+        for step in &members {
             let key = step
                 .node_key
                 .as_deref()
@@ -7118,7 +7239,7 @@ where
         for stage in queue.by_ref().take(width) {
             running.push(Box::pin(self.run_part(stage)));
         }
-        let mut settled = Vec::with_capacity(pending.len());
+        let mut settled = Vec::with_capacity(members.len());
         let mut stopped = false;
         while let Some(outcome) = futures::StreamExt::next(&mut running).await {
             stopped |= !matches!(outcome, Ok(PartOutcome::Settled));
@@ -7140,7 +7261,7 @@ where
                     failure,
                     block,
                 }) => {
-                    let position = pending
+                    let position = members
                         .iter()
                         .find(|part| part.id == step)
                         .map_or(i32::MAX, |part| part.position);
@@ -7178,7 +7299,7 @@ where
 
         if node.isolation == Isolation::SharedSerialized {
             let mut last = None;
-            for step in pending.iter().rev() {
+            for step in members.iter().rev() {
                 let trees = self.parts.store.step_trees(step.id).await?;
                 if !trees.is_empty() {
                     last = Some((step.id, trees));
@@ -7213,10 +7334,11 @@ where
         if self.cancel_read(stage.run.id, &self.session_control(stage.run.id)) {
             return Err(EngineError::Cancelled { run: stage.run.id });
         }
+        // MOD-125 M3 D4: a stopped part moves `stopped -> running` on its own row.
         self.move_step(
             stage.run.id,
             stage.step.id,
-            StepStatus::Pending,
+            stage.step.status,
             StepStatus::Running,
             self.now(),
         )
@@ -7275,113 +7397,162 @@ where
         let item = Self::item_of(run)?;
         let name = step.phase_name.as_str();
 
-        // -- stage 2: prepare, from the plan's `base_refs` (D4) --------------------------------
-        let prepared = match self
-            .parts
-            .isolator
-            .prepare(run.id, step.id, &run.repo_scope, node.isolation, slot)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(err @ IsolateError::Refused(_)) => {
-                let text = failure_text(name, &EngineError::Isolate(err));
-                return self.refuse_part(run, node, step, text, None, false).await;
-            }
-            Err(err) => return Err(err.into()),
+        // MOD-125 M3 D4: a part stopped with session rows reopens its trees and its log
+        // ([`Self::resumed_member`]); one stopped before its recorder opened walks from stage 2
+        // again, as a pending one does (its tree is still at the plan's `base_refs`).
+        let events = if step.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(step.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        let started_at = self.now();
-        let rows: Vec<RunStepTree> = prepared
-            .trees
-            .iter()
-            .map(|tree| tree.tree.clone())
-            .collect();
-        *trees = Some(rows.clone());
-        self.parts
-            .store
-            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
-            .await?;
-        let before: Vec<RunStepCommit> = prepared
-            .trees
-            .iter()
-            .map(|tree| RunStepCommit {
-                run_step_id: step.id,
-                repo_id: tree.tree.repo_id,
-                before_hash: tree.before_hash.clone(),
-                after_hash: None,
-            })
-            .collect();
-        self.parts
-            .store
-            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
-            .await?;
+        let mut assembled = None;
+        let (rows, cwd, extra_dirs, started_at, live, persona, start, opening) = if events
+            .is_empty()
+        {
+            // -- stage 2: prepare, from the plan's `base_refs` (D4) --------------------------------
+            let prepared = match self
+                .parts
+                .isolator
+                .prepare(run.id, step.id, &run.repo_scope, node.isolation, slot)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(err @ IsolateError::Refused(_)) => {
+                    let text = failure_text(name, &EngineError::Isolate(err));
+                    return self.refuse_part(run, node, step, text, None, false).await;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let started_at = self.now();
+            let rows: Vec<RunStepTree> = prepared
+                .trees
+                .iter()
+                .map(|tree| tree.tree.clone())
+                .collect();
+            *trees = Some(rows.clone());
+            self.parts
+                .store
+                .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+                .await?;
+            let before: Vec<RunStepCommit> = prepared
+                .trees
+                .iter()
+                .map(|tree| RunStepCommit {
+                    run_step_id: step.id,
+                    repo_id: tree.tree.repo_id,
+                    before_hash: tree.before_hash.clone(),
+                    after_hash: None,
+                })
+                .collect();
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+                .await?;
 
-        // -- stage 3: the part's own prompt (D10, D13) ------------------------------------------
-        let live =
-            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
-        let prompt = match self
-            .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
-            .await?
-        {
-            Ok(prompt) => prompt,
-            Err(StageThree::MissingInput(kind)) => {
-                let failure = RunFailure::MissingInput(kind);
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), false)
-                    .await;
-            }
-            Err(StageThree::Refused(err)) => {
-                let failure = RunFailure::PromptRefused {
-                    phase: name.to_owned(),
-                    reason: err.to_string(),
-                };
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), true)
-                    .await;
-            }
-            Err(StageThree::NoPersona(refusal)) => {
-                let failure = RunFailure::PromptRefused {
-                    phase: name.to_owned(),
+            // -- stage 3: the part's own prompt (D10, D13) ------------------------------------------
+            let live =
+                crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+            let prompt = match self
+                .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
+                .await?
+            {
+                Ok(prompt) => prompt,
+                Err(StageThree::MissingInput(kind)) => {
+                    let failure = RunFailure::MissingInput(kind);
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), false)
+                        .await;
+                }
+                Err(StageThree::Refused(err)) => {
+                    let failure = RunFailure::PromptRefused {
+                        phase: name.to_owned(),
+                        reason: err.to_string(),
+                    };
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), true)
+                        .await;
+                }
+                Err(StageThree::NoPersona(refusal)) => {
+                    let failure = RunFailure::PromptRefused {
+                        phase: name.to_owned(),
+                        reason: refusal.to_string(),
+                    };
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), true)
+                        .await;
+                }
+            };
+            let persona = snapshot
+                .persona_for(node)
+                .map_err(|refusal| EngineError::Snapshot {
+                    run: run.id,
                     reason: refusal.to_string(),
-                };
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), true)
-                    .await;
-            }
-        };
-        let persona = snapshot
-            .persona_for(node)
-            .map_err(|refusal| EngineError::Snapshot {
-                run: run.id,
-                reason: refusal.to_string(),
-            })?;
-        let trim = match prompt.trim.to_value(self.parts.scrubber) {
-            Ok(trim) => trim,
-            Err(unmasked) => {
-                let failure = RunFailure::scrub_refused(name, &unmasked);
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), false)
-                    .await;
-            }
-        };
-        self.parts
-            .store
-            .set_step_prompt(
-                StepFence::Lease(self.parts.owner),
-                step.id,
-                &prompt.digest,
-                &trim,
+                })?;
+            let trim = match prompt.trim.to_value(self.parts.scrubber) {
+                Ok(trim) => trim,
+                Err(unmasked) => {
+                    let failure = RunFailure::scrub_refused(name, &unmasked);
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), false)
+                        .await;
+                }
+            };
+            self.parts
+                .store
+                .set_step_prompt(
+                    StepFence::Lease(self.parts.owner),
+                    step.id,
+                    &prompt.digest,
+                    &trim,
+                )
+                .await?;
+            let prompt: &AssembledPrompt = assembled.insert(prompt);
+            (
+                rows,
+                prepared.cwd,
+                prepared.extra_dirs,
+                started_at,
+                live,
+                persona,
+                RecorderStart::Prompt(prompt),
+                SessionOpening::Fresh(&prompt.text),
             )
-            .await?;
+        } else {
+            let (rows, cwd, extra_dirs, opening) =
+                Box::pin(self.resumed_member(run, snapshot, step, node, item, &events, trees))
+                    .await?;
+            let live =
+                crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+            // MOD-26 D12: the part's stage 3 passed when it first ran, on the same snapshot.
+            let persona = snapshot
+                .persona_for(node)
+                .map_err(|refusal| EngineError::Snapshot {
+                    run: run.id,
+                    reason: refusal.to_string(),
+                })?;
+            (
+                rows,
+                cwd,
+                extra_dirs,
+                self.now(),
+                live,
+                persona,
+                RecorderStart::Tail(events),
+                opening,
+            )
+        };
 
         // -- stage 4: the part's own session (D4: `<divided>/<key>` keys it) -------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self
-            .open_recorder(run, step, RecorderStart::Prompt(&prompt))
-            .await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
         let deadline = self.deadline_at(node, started_at);
         let Driven {
             result,
@@ -7393,9 +7564,9 @@ where
                 node,
                 persona,
                 &key,
-                &SessionOpening::Fresh(&prompt.text),
-                prepared.cwd.clone(),
-                prepared.extra_dirs,
+                &opening,
+                cwd.clone(),
+                extra_dirs,
                 deadline,
                 live,
                 &mut recorder,
@@ -7617,14 +7788,14 @@ where
                         .await
                         .map(Some);
                 }
-                StepStatus::Pending => {
+                // MOD-125 M3 D4: a stopped judge re-runs fresh on its own row, as a pending one runs.
+                StepStatus::Pending | StepStatus::Stopped => {
                     let passing = pre.passing.iter().map(|view| view.step).collect();
                     return self
                         .run_judge(run, snapshot, phase, attempt, passing, Some(judge.clone()))
                         .await;
                 }
                 StepStatus::Running
-                | StepStatus::Stopped
                 | StepStatus::Done
                 | StepStatus::Superseded
                 | StepStatus::Cancelled => {}
@@ -7871,15 +8042,10 @@ where
             .judge_row(run, snapshot, phase, attempt, existing)
             .await?;
         let now = self.now();
-        // Plan D144: a judge another writer moved is `StaleWrite` (D125).
-        self.move_step(
-            run.id,
-            judge.id,
-            StepStatus::Pending,
-            StepStatus::Running,
-            now,
-        )
-        .await?;
+        // Plan D144: a judge another writer moved is `StaleWrite` (D125). MOD-125 M3 D4: a
+        // stopped judge moves `stopped -> running` on its own row.
+        self.move_step(run.id, judge.id, judge.status, StepStatus::Running, now)
+            .await?;
         self.step_started(run, judge.id);
         let prompts = match prompts {
             Ok(prompts) => prompts,
@@ -8329,11 +8495,43 @@ where
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
-        let (mut recorder, cap_batch) = self
-            .open_recorder(run, judge, RecorderStart::Prompt(&prompts.forward))
-            .await?;
+        // MOD-125 M3 D4: a stopped judge with session rows re-runs fresh, both calls, on its
+        // continuing log: no second prompt row, and each call's text a follow-up. Its prompts are
+        // rebuilt from the same rows, so the digest and trim above are its first run's again.
+        let events = if judge.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(judge.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let rerun = !events.is_empty();
+        // The judge document the stopped attempt left newest, which no re-run call may read as
+        // its own (`output_of` is newest-by-version).
+        let stale = self
+            .output_of(Self::item_of(run)?, &jp, judge.id)
+            .await?
+            .map(|document| document.id);
+        let start = if rerun {
+            RecorderStart::Tail(events)
+        } else {
+            RecorderStart::Prompt(&prompts.forward)
+        };
+        let (mut recorder, cap_batch) = self.open_recorder(run, judge, start).await?;
         let calls = self
-            .judge_calls(run, &jp, attempt, judge, prompts, &prepared, &mut recorder)
+            .judge_calls(
+                run,
+                &jp,
+                attempt,
+                judge,
+                prompts,
+                &prepared,
+                &mut recorder,
+                rerun,
+                stale,
+            )
             .await;
         let finished = recorder.finish().await;
         let documents = match calls? {
@@ -8352,10 +8550,16 @@ where
     /// Call 0 and call 1 of [`judge_sessions`](Self::judge_sessions): each drives a fresh session
     /// keyed `(<phase>:judge, attempt, -1, call)`, hands its `done` to the sink, and reads the
     /// newest `judge` document the judge step wrote — which must be **new** after each call.
+    ///
+    /// MOD-125 M3 D4: on a stopped judge's re-run (`rerun`), call 0's text is a follow-up too (the
+    /// log's prompt row is the first run's), and `stale`, the newest document before the calls,
+    /// is never new: a re-run call that writes nothing is `MissingDocument`, not the stopped
+    /// attempt's verdict read again.
     #[expect(
         clippy::too_many_arguments,
         reason = "the judge's row and phase, its two prompts, its tree and the recorder both calls \
-                  share; bundling them would name a struct used here only"
+                  share, and a re-run's two facts (MOD-125 M3 D4); bundling them would name a \
+                  struct used here only"
     )]
     async fn judge_calls(
         &self,
@@ -8366,11 +8570,13 @@ where
         prompts: &JudgePrompts,
         prepared: &crate::isolate::Prepared,
         recorder: &mut Recorder<'a, S>,
+        rerun: bool,
+        stale: Option<DocumentId>,
     ) -> Result<Result<[Document; 2], JudgeFailure>, EngineError> {
         let item = Self::item_of(run)?;
         let mut documents: Vec<Document> = Vec::with_capacity(2);
         for (call, text) in [(0, &prompts.forward.text), (1, &prompts.reversed.text)] {
-            if call > 0 {
+            if call > 0 || rerun {
                 recorder.record_follow_up(text, self.now()).await?;
             }
             let key = SessionKey {
@@ -8412,7 +8618,10 @@ where
                 .await?;
             let document = self.output_of(item, jp, judge.id).await?;
             match document {
-                Some(document) if !documents.iter().any(|seen| seen.id == document.id) => {
+                Some(document)
+                    if Some(document.id) != stale
+                        && !documents.iter().any(|seen| seen.id == document.id) =>
+                {
                     documents.push(document);
                 }
                 _ => return Ok(Err(JudgeFailure::MissingDocument { call })),
@@ -8469,11 +8678,12 @@ where
         let reason = failure.to_string();
         match existing {
             Some(judge) => {
-                // Plan D144: a judge another writer moved is `StaleWrite` (D125).
+                // Plan D144: a judge another writer moved is `StaleWrite` (D125). MOD-125 M3 D4:
+                // a stopped judge moves from `stopped`.
                 self.move_step(
                     run.id,
                     judge.id,
-                    StepStatus::Pending,
+                    judge.status,
                     StepStatus::Running,
                     self.now(),
                 )
@@ -10304,9 +10514,11 @@ enum StageThree {
 struct CandidateStage<'s> {
     /// The run, re-read by the group's pass.
     run: &'s Run,
+    /// The run's snapshot (MOD-125 M3 D7: a resumed candidate's handoff reads it).
+    snapshot: &'s GraphSnapshot,
     /// The fanned-out phase.
     phase: &'s SnapshotPhase,
-    /// The candidate, still `pending`.
+    /// The candidate, still `pending`, or `stopped` (MOD-125 M3 D4) as the group read it.
     step: &'s RunStep,
     /// The group's one assembled prompt.
     prompt: &'s AssembledPrompt,
@@ -14346,6 +14558,7 @@ mod tests {
         let refused = engine
             .run_candidate(super::CandidateStage {
                 run: &row,
+                snapshot: &snapshot,
                 phase,
                 step: &stale,
                 prompt: &prompt,

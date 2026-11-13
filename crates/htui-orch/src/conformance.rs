@@ -1081,6 +1081,12 @@ pub const CASES: &[&str] = &[
     "a_stopped_integrate_step_resumes_its_session",
     "a_cancel_of_a_stopped_run_on_this_box_cancels_and_cleans_up",
     "a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup",
+    // MOD-125 M3 T4: a stopped member resumed inside its round (plan D4, D9): a part before its
+    // queued sibling, a `shared_serialized` candidate before its sibling's prepare, and the judge
+    // re-run fresh.
+    "a_stopped_part_resumes_before_its_queued_sibling",
+    "a_stopped_shared_serialized_candidate_is_reacquired_not_reset",
+    "a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict",
 ];
 
 /// Run one case by name.
@@ -17184,6 +17190,15 @@ fn resume_case<'a, H: CaseHarness>(
         "a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup" => Box::pin(
             a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup(harness),
         ),
+        "a_stopped_part_resumes_before_its_queued_sibling" => {
+            Box::pin(a_stopped_part_resumes_before_its_queued_sibling(harness))
+        }
+        "a_stopped_shared_serialized_candidate_is_reacquired_not_reset" => {
+            Box::pin(a_stopped_shared_serialized_candidate_is_reacquired_not_reset(harness))
+        }
+        "a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict" => Box::pin(
+            a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict(harness),
+        ),
         _ => return None,
     })
 }
@@ -17692,6 +17707,270 @@ async fn a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup<H: CaseHarne
     assert_eq!(orch.isolator().cleanups(), 0, "no cleanup");
 }
 
+// -- MOD-125 M3 T4: a stopped part, candidate and judge resume inside their rounds (D4, D9) ------
+
+/// The isolator calls logged from `mark` on, and the index of each `call` among them.
+fn calls_since<O: Orchestrate>(orch: &O, mark: usize) -> Vec<IsolatorCall> {
+    orch.isolator().call_log().split_off(mark)
+}
+
+/// Where `call` first sits in `log`.
+///
+/// # Panics
+/// When `log` never holds it.
+fn index_of(log: &[IsolatorCall], call: IsolatorCall) -> usize {
+    log.iter()
+        .position(|logged| *logged == call)
+        .unwrap_or_else(|| panic!("{call:?} is logged: {log:?}"))
+}
+
+/// MOD-125 M3 D4, D9: a `shared_serialized` part stopped after its session (its banner logged)
+/// while the round's queued sibling waits `pending`. The resumed round reopens the stopped part
+/// first, on its own row (its guard reacquired, never prepared again), runs it to its capture
+/// before the sibling's `prepare` resets the shared checkout, runs the sibling, and keeps the
+/// round-end reset.
+async fn a_stopped_part_resumes_before_its_queued_sibling<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |phase| {
+        phase.isolation = Some(Isolation::SharedSerialized);
+    })
+    .await;
+    primary_repo(&orch).await;
+    let stalled = orch.stall_after_done("implement/api", 1, None, false);
+    let run = crash_divided(&orch, &[stalled]).await;
+    settled_stopped(&orch, run).await;
+    let steps = steps_of(&orch, run).await;
+    let api = part_named(&steps, "implement/api").clone();
+    let ui = part_named(&steps, "implement/ui").clone();
+    assert_eq!(
+        (api.status, ui.status),
+        (StepStatus::Stopped, StepStatus::Pending),
+        "the live part stopped, its sibling queued"
+    );
+    let mark = orch.isolator().call_log().len();
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    for before in [&api, &ui] {
+        let after = part_named(&steps, &before.phase_name);
+        assert_eq!(
+            (after.id, after.attempt, after.status),
+            (before.id, 1, StepStatus::Done),
+            "{}: its own row, done",
+            before.phase_name
+        );
+    }
+    assert_eq!(
+        opening_of(&orch, run, api.id).await,
+        Some(htui_core::model::StepOpening::Resumed)
+    );
+    let events = events_of(&orch, api.id).await;
+    assert_eq!(
+        follow_ups_in(&events),
+        vec![promote::STOP_RESUME_OPENING.to_owned()]
+    );
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(
+        prepares_of(&orch, api.id),
+        1,
+        "the stopped part is never prepared again"
+    );
+    assert_eq!(
+        prepares_of(&orch, ui.id),
+        1,
+        "the queued part is prepared once"
+    );
+    let log = calls_since(&orch, mark);
+    assert!(
+        index_of(&log, IsolatorCall::Reacquire(api.id))
+            < index_of(&log, IsolatorCall::Capture(api.id))
+            && index_of(&log, IsolatorCall::Capture(api.id))
+                < index_of(&log, IsolatorCall::Prepare(ui.id)),
+        "the stopped part runs to its capture before its sibling prepares: {log:?}"
+    );
+    assert!(
+        log.contains(&IsolatorCall::Reset(ui.id)),
+        "the round-end reset is kept: {log:?}"
+    );
+}
+
+/// MOD-125 M3 D4, D9: under `shared_serialized` a candidate stopped after its session (its
+/// banner logged) and the sibling queued behind its guard (stopped before it prepared). The
+/// resumed group reacquires the stopped candidate's guard and reopens its session on its own row
+/// (never prepared again, so the shared checkout is not reset under it), runs it to its capture,
+/// and only then walks the sibling again from `prepare`. The judge then selects as ever.
+async fn a_stopped_shared_serialized_candidate_is_reacquired_not_reset<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 3;
+            phase.isolation = Some(Isolation::SharedSerialized);
+        }
+        phase.gate = Gate::Never;
+    })
+    .await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 0, "complete");
+    let stalled = orch.stall_after_done("research", 1, Some((1, 0)), false);
+    let run = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
+    settled_stopped(&orch, run).await;
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1)
+            .into_iter()
+            .map(|(index, status, _)| (index, status))
+            .collect::<Vec<_>>(),
+        [
+            (0, StepStatus::Done),
+            (1, StepStatus::Stopped),
+            (2, StepStatus::Stopped),
+        ],
+        "the live candidate and the one queued on its guard stopped"
+    );
+    let stopped = candidate(&steps, 0, 1, 1).clone();
+    let queued = candidate(&steps, 0, 1, 2).clone();
+    assert!(
+        events_of(&orch, queued.id).await.is_empty(),
+        "the queued candidate never opened a session"
+    );
+    // Each session yields before its first event, so a `join_all` of the two members would
+    // poll the sibling's `prepare` while the stopped one's session is live.
+    orch.interleave_sessions();
+    let mark = orch.isolator().call_log().len();
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Done, Some(true)),
+            (1, StepStatus::Superseded, Some(false)),
+            (2, StepStatus::Superseded, Some(false)),
+        ],
+        "the judge's pick selected over two settled candidates"
+    );
+    assert_eq!(candidate(&steps, 0, 1, 1).id, stopped.id);
+    assert_eq!(
+        opening_of(&orch, run, stopped.id).await,
+        Some(htui_core::model::StepOpening::Resumed)
+    );
+    assert_eq!(
+        orch.spec_for(&SessionKey {
+            phase: "research",
+            attempt: 1,
+            fanout_index: 1,
+            call: 0,
+        })
+        .expect("the stopped candidate's session reopened")
+        .resume,
+        Some(AgentSessionRef::new(format!("fake-{}", stopped.id)))
+    );
+    assert_eq!(
+        prompts_in(&events_of(&orch, stopped.id).await),
+        1,
+        "no second prompt row"
+    );
+    let log = calls_since(&orch, mark);
+    assert!(
+        !log.contains(&IsolatorCall::Prepare(stopped.id))
+            && !log.contains(&IsolatorCall::Reset(stopped.id)),
+        "the stopped candidate's tree is not prepared or reset again: {log:?}"
+    );
+    assert!(
+        index_of(&log, IsolatorCall::Reacquire(stopped.id))
+            < index_of(&log, IsolatorCall::Capture(stopped.id))
+            && index_of(&log, IsolatorCall::Capture(stopped.id))
+                < index_of(&log, IsolatorCall::Prepare(queued.id)),
+        "the stopped candidate runs to its capture before its sibling prepares: {log:?}"
+    );
+}
+
+/// [`a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict`]'s shape: `ANA-2`'s `research`
+/// fanned out three ways with `agy` judging, the judge's walk dropped after call 1's `done` (both
+/// calls' documents written, each naming candidate 0), and the stop settled: the run is `stopped`
+/// over its `stopped` judge.
+async fn stopped_judge<O: Orchestrate>(orch: &O) -> (RunId, RunStep) {
+    primary_repo(orch).await;
+    fan_research(orch, Gate::Never, false).await;
+    set_judge(orch, ids::HTUI_ANA_2).await;
+    research_candidates(orch, 1);
+    judge_both(orch, "research", 1, 0, "first");
+    let stalled = orch.stall_after_done("research:judge", 1, Some((-1, 1)), true);
+    let run = crash(orch, ids::HTUI_ANA_2, &stalled).await;
+    settled_stopped(orch, run).await;
+    let judge = judge_of(&steps_of(orch, run).await, 0, 1)
+        .expect("the judge ran")
+        .clone();
+    assert_eq!(judge.status, StepStatus::Stopped, "the judge row stopped");
+    (run, judge)
+}
+
+/// MOD-125 M3 D4, D9: a stopped judge re-runs fresh on its own row, both calls, on its continuing
+/// log (no second prompt row, each call's text a follow-up, no session reopened), and the
+/// verdict is read from the documents the re-run wrote, never the stopped attempt's.
+async fn a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (run, judge) = stopped_judge(&orch).await;
+    let before = events_of(&orch, judge.id).await;
+    // The re-run's verdict differs from the stopped attempt's.
+    judge_both(&orch, "research", 1, 2, "third");
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let after = judge_of(&steps, 0, 1).expect("the judge row stays");
+    assert_eq!(
+        (after.id, after.attempt, after.status),
+        (judge.id, 1, StepStatus::Done),
+        "the same judge row, done"
+    );
+    assert_eq!(
+        slot_of(&steps, 0, 1)
+            .into_iter()
+            .map(|(index, _, selected)| (index, selected))
+            .collect::<Vec<_>>(),
+        [(0, Some(false)), (1, Some(false)), (2, Some(true))],
+        "the re-run's verdict selected"
+    );
+    assert_eq!(opening_of(&orch, run, judge.id).await, None, "no resume");
+    for call in 0..2 {
+        assert_eq!(
+            orch.spec_for(&SessionKey {
+                phase: "research:judge",
+                attempt: 1,
+                fanout_index: -1,
+                call,
+            })
+            .expect("both calls ran again")
+            .resume,
+            None,
+            "call {call} is fresh"
+        );
+    }
+    let events = events_of(&orch, judge.id).await;
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(
+        follow_ups_in(&events).len(),
+        follow_ups_in(&before).len() + 2,
+        "each re-run call's text is a follow-up"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -17716,8 +17995,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            244,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            247,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -17811,7 +18090,8 @@ mod tests {
              MOD-125 M2's four divided-step stops (plan D6), and MOD-125 M3 T3's ten (plan D3-D7, \
              D9: a stopped step's saved session reopened, a failed resume's fallback, no caps, no \
              rows, no banner, the planner, the pre-merge, integrate, and a stopped run's cancel on \
-             this box and on none) 244"
+             this box and on none), and MOD-125 M3 T4's three (plan D4, D9: a stopped part before \
+             its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run) 247"
         );
     }
 
@@ -17854,7 +18134,7 @@ mod fanout_paths {
         FakeOrchestrator, Orchestrate, RunFailure, ScriptedStep, candidate, fan_research,
         free_feat_3, item_of, judge_both, judge_of, latch_quota, notes_of, primary_repo, repoint,
         research_candidates, run_of, selection_parks, set_input_kinds, set_judge, slot_of, start,
-        steps_of,
+        steps_of, stopped_judge,
     };
     use crate::engine::Resume;
     use crate::isolate::Clock as _;
@@ -18340,6 +18620,38 @@ mod fanout_paths {
         assert_eq!(
             (judge.status, judge.gate_note.as_deref()),
             (StepStatus::Failed, Some("judge_missing_document: call 1"))
+        );
+    }
+
+    /// MOD-125 M3 D4: a stopped judge's re-run reads only the documents it wrote. Its call 0
+    /// writing nothing is `judge_missing_document: call 0`, not the stopped attempt's verdict
+    /// read as new (`output_of` is newest-by-version).
+    #[tokio::test]
+    async fn a_rerun_judge_call_that_writes_nothing_is_a_missing_document() {
+        let orch = FakeOrchestrator::demo();
+        let (run, judge) = stopped_judge(&orch).await;
+        orch.script_candidate(
+            "research:judge",
+            1,
+            -1,
+            0,
+            ScriptedStep::done_without_output(),
+        );
+
+        let resumed = orch.resume_stopped(run).await;
+        assert!(
+            matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::AwaitingApproval),
+            "{resumed:?}"
+        );
+        let steps = steps_of(&orch, run).await;
+        let row = judge_of(&steps, 0, 1).expect("the judge row stays");
+        assert_eq!(
+            (row.id, row.status, row.gate_note.as_deref()),
+            (
+                judge.id,
+                StepStatus::Failed,
+                Some("judge_missing_document: call 0")
+            )
         );
     }
 

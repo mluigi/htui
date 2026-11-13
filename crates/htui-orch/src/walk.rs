@@ -111,8 +111,9 @@ pub fn node_state<'s>(phase: &SnapshotPhase, steps: &'s [RunStep]) -> NodeState<
 
 /// MOD-139 M2 D3: a divided node whose planner row is `done` reads its parts (the latest attempt
 /// at each part position under that planner row), first rule wins (blueprint P-14, P-15):
-/// 1. a part `running`, `stopped` or `awaiting_approval` rests the node on it: a session this
-///    walk does not own;
+/// 1. a part `running` or `awaiting_approval` rests the node on it: a session this walk does not
+///    own (MOD-125 M3 D4: a `stopped` part does not rest the node; the resumed run's round reopens
+///    it on its own row, so rule 5 drives it);
 /// 2. a part `failed` with [`crate::recover::NOT_RESET`] rests the node on it whatever its budget
 ///    says (plan D93, D14): the sweep left its tree alone and parked the run for a human, so no
 ///    retry is created over that tree and no resume walks past the park (T4 repair 2);
@@ -129,7 +130,7 @@ fn parts_state<'s>(
     if let Some(live) = parts.iter().find(|part| {
         matches!(
             part.status,
-            StepStatus::Running | StepStatus::Stopped | StepStatus::AwaitingApproval
+            StepStatus::Running | StepStatus::AwaitingApproval
         )
     }) {
         return NodeState::Live(Cursor::Rest {
