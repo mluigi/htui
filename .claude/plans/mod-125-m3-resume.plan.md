@@ -8,7 +8,8 @@ method, a resume path through the engine's walk for every step role, the session
 **Status**: fact-checked 2026-11-12 (six read-only agents: three grounding readers, three fact-checkers over the
 first draft; falsified claims amended below), **confirmed by the maintainer 2026-11-13**. Routed plan (PRD continuing) by
 `/handoff-run MOD-125`; ultracode recommended for implement; all stages inherit (Opus 5.5). Sandbox run
-`hr/MOD-125`.
+`hr/MOD-125`. **Complete 2026-11-13:** T1-T7 landed, review gate (rust-reviewer, two area instances) and one
+fix round (F1 orch, F2 the rest; briefs beside T1-T7) applied; the `pending_resumes` index is deferred to M4's `0031`.
 
 ## Summary
 
