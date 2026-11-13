@@ -10,8 +10,11 @@
 #   -Status       print target/gate/last.json and exit
 #
 # Every step runs even after one fails. Exit 0 all passed or skipped, 1 a step failed, 2 usage.
-# The test step's output goes to target/gate/test.log; abort-grep reads it, because a stack
-# overflow aborts a test binary with no failure counted.
+# The test step runs the whole workspace test suite under cargo-nextest without fail-fast and
+# then its doctests (TOOL-17). Its output goes to target/gate/test.log; abort-grep reads it,
+# because a stack overflow aborts a test binary with no failure counted. The test step needs
+# cargo-nextest and fails without it: there is no fallback to cargo test, which would be a
+# different green.
 
 [CmdletBinding()]
 param(
@@ -33,6 +36,12 @@ $script:MigrationsDir = if ($env:GATE_MIGRATIONS_DIR) { $env:GATE_MIGRATIONS_DIR
 $PluginDir = Join-Path $RepoRoot '.claude/skills/htui-dev'
 $MinClaude = [version]'2.1.287'
 $Steps = @('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
+# The pinned cargo-nextest (TOOL-17 D3), printed when the test step finds none on PATH.
+$NextestInstall = if ($IsWindows) {
+    'curl.exe -LsSf https://get.nexte.st/0.9.151/windows-tar | tar zxf - -C $HOME\.cargo\bin'
+} else {
+    'curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C ~/.cargo/bin'
+}
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Started = ''
@@ -132,12 +141,22 @@ function Step-Qdrant {
 }
 
 function Step-Test {
+    # TOOL-17 (D6): cargo-nextest runs each test in its own process, so tests no longer share one
+    # per binary; the live Qdrant cases take turns through the live-qdrant test group in
+    # .config/nextest.toml. Profile `gate` retries a failure once and names a pass on retry FLAKY.
+    # nextest runs no doctests, so cargo test --doc follows into the same log. Red if either is.
+    # No cargo-nextest: fail before running anything, with the install line.
+    if (-not (Get-Command cargo-nextest -CommandType Application -ErrorAction SilentlyContinue)) {
+        Write-Host "test: cargo-nextest not installed - $NextestInstall"
+        return $Fail
+    }
     New-Item -ItemType Directory -Force $script:GateDir | Out-Null
-    # Default threads (TOOL-16): each crate's integration tests are one binary (TOOL-15), so what
-    # must not overlap takes a process-wide turn inside it (testkit::qdrant_turn, mock_keyring).
-    & cargo test --workspace --all-features --no-fail-fast 2>&1 | Tee-Object -FilePath $script:TestLog
+    & cargo nextest run --workspace --all-features --no-fail-fast --profile gate 2>&1 | Tee-Object -FilePath $script:TestLog
     # $LASTEXITCODE is cargo's: Tee-Object is a cmdlet and does not touch it.
-    if ($LASTEXITCODE -eq 0) { return $Pass } else { return $Fail }
+    $nextestCode = $LASTEXITCODE
+    & cargo test --workspace --all-features --doc 2>&1 | Tee-Object -FilePath $script:TestLog -Append
+    $docCode = $LASTEXITCODE
+    if ($nextestCode -eq 0 -and $docCode -eq 0) { return $Pass } else { return $Fail }
 }
 
 function Step-AbortGrep {
@@ -278,6 +297,30 @@ function Invoke-GateSelfTest {
         if ((Step-AbortGrep | Select-Object -Last 1) -eq $Pass) { $failures += 'abort-grep: SIGABRT passed' }
         $script:TestLog = Join-Path $tmp 'missing.log'
         if ((Step-AbortGrep | Select-Object -Last 1) -eq $Pass) { $failures += 'abort-grep: a missing log passed' }
+
+        # TOOL-17 D6: without cargo-nextest the test step fails at once and prints the install line.
+        # PATH holds only a stand-in cargo that leaves a mark, so a broken check cannot start a real run.
+        $bin = Join-Path $tmp 'bin'
+        New-Item -ItemType Directory -Force $bin | Out-Null
+        $mark = Join-Path $tmp 'cargo-ran'
+        if ($IsWindows) {
+            Set-Content -LiteralPath (Join-Path $bin 'cargo.cmd') "@type nul > `"$mark`""
+        } else {
+            Set-Content -LiteralPath (Join-Path $bin 'cargo') "#!/bin/sh`n: > '$mark'"
+            & chmod +x (Join-Path $bin 'cargo')
+        }
+        $savedPath = $env:PATH; $savedGateDir = $script:GateDir
+        try {
+            $env:PATH = $bin
+            $script:GateDir = Join-Path $tmp 'nextest'; $script:TestLog = Join-Path $tmp 'nextest.log'
+            $r = @(Step-Test 6>&1)
+        } finally { $env:PATH = $savedPath; $script:GateDir = $savedGateDir }
+        $verdict = if ($r.Count -gt 0 -and $r[-1] -is [int]) { $r[-1] } else { $null }
+        if ($verdict -ne $Fail) { $failures += "test: a missing cargo-nextest returned $verdict, not a failure" }
+        if ("$r" -notlike '*test: cargo-nextest not installed - *https://get.nexte.st/0.9.151/*') {
+            $failures += 'test: a missing cargo-nextest printed no install line'
+        }
+        if (Test-Path -LiteralPath $mark) { $failures += 'test: a missing cargo-nextest still ran cargo' }
 
         $savedDsn = $env:HTUI_TEST_DATABASE_URL
         try {

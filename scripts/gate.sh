@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # gate.sh - the canonical htui gate (TOOL-9, ANA-29 D5). One sequence, so a green means the
 # same thing everywhere: fmt, clippy with and without --all-features, the whole workspace test
-# suite at libtest's default threads without fail-fast (TOOL-16), a scan of that output for aborts, the migration
-# numbering, the workflow validator, and the htui-dev mod when it exists. Bash twin of gate.ps1
+# suite under cargo-nextest without fail-fast and then its doctests (TOOL-17), a scan of that output for aborts,
+# the migration numbering, the workflow validator, and the htui-dev mod when it exists. Bash twin of gate.ps1
 # - keep the two in lockstep (same step names, same last.json shape).
 #
 # Usage:
@@ -16,7 +16,8 @@
 # Every step runs even after one fails. Exit 0 all passed or skipped, 1 a step failed, 2 usage.
 # Result: target/gate/last.json, written as "running" at the start and replaced atomically.
 # The test step's output goes to target/gate/test.log; abort-grep reads it, because a stack
-# overflow aborts a test binary with no failure counted.
+# overflow aborts a test binary with no failure counted. The test step needs cargo-nextest and
+# fails without it (TOOL-17): there is no fallback to cargo test, which would be a different green.
 
 set -u
 
@@ -42,6 +43,8 @@ MIGRATIONS_DIR="${GATE_MIGRATIONS_DIR:-$REPO_ROOT/crates/htui-store/migrations}"
 PLUGIN_DIR="$REPO_ROOT/.claude/skills/htui-dev"
 MIN_CLAUDE="2.1.287"
 STEPS=(fmt clippy-all clippy-bare postgres qdrant test abort-grep migrations workflow-docs plugin)
+# The pinned cargo-nextest (TOOL-17 D3), printed when the test step finds none on PATH.
+NEXTEST_INSTALL='curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C ~/.cargo/bin'
 
 STEP_NAMES=(); STEP_STATUS=(); STEP_SECONDS=()
 STARTED=""
@@ -132,12 +135,23 @@ step_qdrant() {
 }
 
 step_test() {
+    # TOOL-17 (D6): cargo-nextest runs each test in its own process, so tests no longer share one
+    # per binary; the live Qdrant cases take turns through the live-qdrant test group in
+    # .config/nextest.toml. Profile `gate` retries a failure once and names a pass on retry FLAKY.
+    # nextest runs no doctests, so cargo test --doc follows into the same log. Red if either is.
+    # No cargo-nextest: fail before running anything, with the install line.
+    local rc_nextest rc_doc
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "test: cargo-nextest not installed - $NEXTEST_INSTALL"
+        return 1
+    fi
     mkdir -p "$GATE_DIR"
     # PIPESTATUS, not $?: tee would otherwise report success for a failed cargo.
-    # Default threads (TOOL-16): each crate's integration tests are one binary (TOOL-15), so what
-    # must not overlap takes a process-wide turn inside it (testkit::qdrant_turn, mock_keyring).
-    cargo test --workspace --all-features --no-fail-fast 2>&1 | tee "$TEST_LOG"
-    return "${PIPESTATUS[0]}"
+    cargo nextest run --workspace --all-features --no-fail-fast --profile gate 2>&1 | tee "$TEST_LOG"
+    rc_nextest="${PIPESTATUS[0]}"
+    cargo test --workspace --all-features --doc 2>&1 | tee -a "$TEST_LOG"
+    rc_doc="${PIPESTATUS[0]}"
+    [[ $rc_nextest -eq 0 && $rc_doc -eq 0 ]]
 }
 
 step_abort_grep() {
@@ -285,6 +299,18 @@ run_self_test() {
     step_abort_grep >/dev/null && failures+=('abort-grep: SIGABRT passed')
     TEST_LOG="$tmp/missing.log"
     step_abort_grep >/dev/null && failures+=('abort-grep: a missing log passed')
+
+    # TOOL-17 D6: without cargo-nextest the test step fails at once and prints the install line.
+    # PATH holds only a stand-in cargo that leaves a mark, so a broken check cannot start a real run.
+    mkdir -p "$tmp/bin"
+    printf '#!/bin/sh\n: > "%s/cargo-ran"\n' "$tmp" > "$tmp/bin/cargo"
+    chmod +x "$tmp/bin/cargo"
+    out="$(PATH="$tmp/bin"; GATE_DIR="$tmp/nextest"; TEST_LOG="$tmp/nextest.log"; step_test 2>&1)"
+    rc=$?
+    [[ $rc -eq 1 ]] || failures+=("test: a missing cargo-nextest returned $rc, not a failure")
+    [[ "$out" == *"test: cargo-nextest not installed - "*"https://get.nexte.st/0.9.151/"* ]] \
+        || failures+=('test: a missing cargo-nextest printed no install line')
+    [[ ! -e "$tmp/cargo-ran" ]] || failures+=('test: a missing cargo-nextest still ran cargo')
 
     ( unset HTUI_TEST_DATABASE_URL; step_postgres >/dev/null; [[ $? -eq 3 ]] ) \
         || failures+=('postgres: an unset DSN was not skipped')
