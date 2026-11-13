@@ -25,7 +25,10 @@ module path). Directory modules keep their shape: `backlog_keys.rs` + `backlog_k
 `token_scan/mod.rs` (declared by two files) and `support/mod.rs` become a single `mod` in `main.rs` that the
 users reach as `crate::token_scan` / `crate::support`.
 
-**D2 — One exemption: `crates/htui-agent/tests/extensibility.rs` stays a top-level target.** It is not std-only
+**D2 — Two exemptions (amended after review): `crates/htui/tests/panic_hook.rs` also stays a top-level target**, because
+it installs a process-wide panic hook that would see every parallel test's panics (its own doc comment says it needs
+its own binary). The text below is the original reasoning for the first exemption.
+**`crates/htui-agent/tests/extensibility.rs` stays a top-level target.** It is not std-only
 (it imports `htui_agent::{conformance, fake, record, ...}`, so it does link the crate), but its path is
 hard-coded in two places that a move would break: its own self-exclusion (`tests/extensibility.rs:110`) and the
 `htui-dev` mod's guard (`.claude/skills/htui-dev/hooks/guards.ts`, `slice(-4)` compare, and its tests). Moving it
@@ -234,6 +237,8 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh               
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | One big crate compiles serially: cold wall time rises although total disk falls | Medium | D8 threshold and the split fallback; T0 and T6 time cold and warm builds |
+| **Found after the plan (gate + Opus review):** code in `src/` that reads a moved test file by path (`htui-core/src/store/conformance.rs` read `htui-store/tests/{pg_criteria,box_identity}.rs`); a test that installs a process-wide panic hook (`htui/tests/panic_hook.rs`) | Happened | Fixed in the fix round: paths now `tests/it/...`; `panic_hook.rs` is a second top-level exemption (D2). The D3 audit covered `tests/` and `src/` statics but not `src/` path reads or `set_hook`; both were found only by the gate and the reviewer |
+| A crash (stack overflow, SIGABRT) in one test ends its crate's whole `it` binary | Low | `abort-grep` in the gate fails and names it; AGENTS.md records it |
 | A module silently drops out (cfg, typo in `main.rs`) | Medium | `<names>` before/after diff per task, `--list --ignored` too; the canary for gated crates |
 | A re-exec child matches no test and the parent passes | Medium | D7.2: every parent asserts the child ran one test; T4/T5 run those cases by name |
 | Order dependence between files that never shared a process | Low-Medium | T6 shuffled runs (3 seeds) on htui, agent, store; per-test guards already exist for the keyring |

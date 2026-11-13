@@ -1,9 +1,11 @@
 //! MOD-65: every thread and task `htui_agent::contained` starts runs inside the contain window, and
 //! a raw tokio spawn does not.
 //!
-//! Its own test binary, and one `#[test]` in it, because [`std::panic::set_hook`] is **process**
-//! state: a second case running in parallel in this binary would see this one's hook, and this one
-//! would see its panics (the precedent is `crates/htui/tests/panic_hook.rs`, for the same reason).
+//! One `#[test]` in it, and a [`std::panic::set_hook`] that is **process** state. It started as its
+//! own test binary (the precedent is `crates/htui/tests/panic_hook.rs`, which still is one). In the
+//! merged `it` binary it is safe because its hook hands every panic that is not `contained:` or
+//! `raw:` prefixed to the previous hook, and no other test in this crate panics with those prefixes
+//! (TOOL-15 review). Keep it that way: a second hook-installing test here needs its own target.
 //!
 //! It asks [`htui_agent::excerpt::panic_is_contained`] and not
 //! `htui::terminal::restores_the_terminal`, because `htui` is not a dependency of this crate, and

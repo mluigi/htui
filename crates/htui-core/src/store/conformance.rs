@@ -31522,15 +31522,15 @@ mod tests {
         // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.
         let pg_criteria = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../htui-store/tests/pg_criteria.rs"),
+                .join("../htui-store/tests/it/pg_criteria.rs"),
         )
-        .expect("read crates/htui-store/tests/pg_criteria.rs");
+        .expect("read crates/htui-store/tests/it/pg_criteria.rs");
         // The same, for MOD-7 milestone 2's Postgres-only box editor tests (D54).
         let box_identity = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../htui-store/tests/box_identity.rs"),
+                .join("../htui-store/tests/it/box_identity.rs"),
         )
-        .expect("read crates/htui-store/tests/box_identity.rs");
+        .expect("read crates/htui-store/tests/it/box_identity.rs");
 
         // `(` for a plain fn, `<` for a generic one: every case in this module is `fn name<S: ..>`.
         let defines = |source: &str, name: &str| {

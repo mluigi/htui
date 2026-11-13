@@ -34,7 +34,6 @@ mod kit_chrome;
 mod mcp_stdio;
 mod no_hardcoded_keys;
 mod overlays;
-mod panic_hook;
 mod panic_hook_order;
 mod personas;
 mod probe;
