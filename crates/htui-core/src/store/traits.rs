@@ -3787,7 +3787,7 @@ pub fn scope_row_joins_no_workspace(slug: &str) -> String {
 /// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
 /// Everything else the scope row owns cascades and is counted. The advice is "finish or cancel",
 /// never "stop": a `stopped` run is live too, so stopping cannot clear the refusal (a stopped run
-/// is resumed first, then finishes or is cancelled).
+/// is cancelled directly, or resumed and then finishes, MOD-125 M3).
 #[must_use]
 pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3803,8 +3803,9 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
 
 /// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` while `runs` (≥ 1) of its member projects'
 /// runs that recorded this workspace are stopped (DV-2: or still running under its stop). A
-/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names resume: a
-/// stopped run is cancelled or finished only once resumed (M3).
+/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names the direct
+/// cancel first, then the resume: a stopped run is cancelled directly, or resumed and then
+/// finishes (M3 F2).
 #[must_use]
 pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3813,8 +3814,8 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
         ("runs", "them")
     };
     format!(
-        "workspace `{workspace}` has {runs} stopped {noun}; resume the workspace and finish or \
-         cancel {pronoun} before deleting the workspace"
+        "workspace `{workspace}` has {runs} stopped {noun}; cancel {pronoun}, or resume the \
+         workspace and let {pronoun} finish, before deleting the workspace"
     )
 }
 
@@ -4661,18 +4662,19 @@ mod tests {
         );
     }
 
-    /// MOD-125 M2 D9: the stopped-run refusal counts its runs and names the resume.
+    /// MOD-125 M2 D9: the stopped-run refusal counts its runs; M3 F2: it names the direct
+    /// cancel first, then the resume.
     #[test]
     fn workspace_has_stopped_run_counts_runs() {
         assert_eq!(
             workspace_has_stopped_run("shop", 1),
-            "workspace `shop` has 1 stopped run; resume the workspace and finish or cancel it \
-             before deleting the workspace"
+            "workspace `shop` has 1 stopped run; cancel it, or resume the workspace and let it \
+             finish, before deleting the workspace"
         );
         assert_eq!(
             workspace_has_stopped_run("shop", 2),
-            "workspace `shop` has 2 stopped runs; resume the workspace and finish or cancel \
-             them before deleting the workspace"
+            "workspace `shop` has 2 stopped runs; cancel them, or resume the workspace and let \
+             them finish, before deleting the workspace"
         );
     }
 
