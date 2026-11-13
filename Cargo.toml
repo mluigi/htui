@@ -140,7 +140,7 @@ bytes                 = "1"
 # MOD-20 (plan D10): deflate-only zip, plain tar, pure-Rust gzip. The default feature sets buy
 # four decompressors and an AES stack nobody has an archive for; `tar`'s default `xattr` is a
 # unix-only extra with no use here.
-zip                   = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip                   = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 tar                   = { version = "0.4", default-features = false }
 flate2                = "1.1"
 # MOD-20 (plan D11): free space without `unsafe` — `rustix` on unix, `windows-sys` on Windows,
