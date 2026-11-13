@@ -19594,6 +19594,83 @@ mod tests {
         assert_eq!(harness.orch.isolator.reacquires(), reacquires + 1);
     }
 
+    /// MOD-125 M3 F1 (review L5): `cancel_stopped` read the run `stopped`, but another process's
+    /// resume won the CAS before it: the run is read again, `running` under that process's live
+    /// lease, and takes the leased path, which refuses with `LeaseHeld` and writes nothing.
+    #[tokio::test]
+    async fn a_cancel_of_a_stopped_run_another_process_resumed_meanwhile_is_lease_held() {
+        let harness = Harness::new().await;
+        let (stale, _plan) = stopped_in_plan(&harness).await;
+        let stranger = uuid::Uuid::now_v7();
+        assert!(
+            harness
+                .orch
+                .store
+                .resume_run(stale.id, ids::BOX, stranger, TimeDelta::days(1))
+                .await
+                .expect("MemStore resumes"),
+            "another process resumes the run"
+        );
+        let (before, steps) = (
+            harness.orch.run(stale.id).await,
+            harness.orch.steps(stale.id).await,
+        );
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine.cancel_stopped(&stale).await;
+
+        assert!(
+            matches!(refused, Err(EngineError::LeaseHeld { run }) if run == stale.id),
+            "{refused:?}"
+        );
+        assert_eq!(
+            harness.orch.run(stale.id).await,
+            before,
+            "the run is untouched"
+        );
+        assert_eq!(harness.orch.steps(stale.id).await, steps, "and its steps");
+        assert_eq!(harness.orch.isolator.cleanups(), 0, "no cleanup");
+    }
+
+    /// MOD-125 M3 F1 (review L5): a run stopped on another box is that box's to cancel (its
+    /// trees and sessions are its own): `RunStatus { Stopped }`, nothing written.
+    #[tokio::test]
+    async fn a_cancel_of_a_run_stopped_on_another_box_is_refused_and_writes_nothing() {
+        let harness = Harness::new().await;
+        let (stopped, _plan) = stopped_in_plan(&harness).await;
+        let steps = harness.orch.steps(stopped.id).await;
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
+        let mut parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        parts.box_id = htui_core::model::BoxId::new();
+        let elsewhere = super::Engine::new(parts);
+
+        let refused = elsewhere.cancel_run(stopped.id).await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::RunStatus {
+                    run,
+                    status: RunStatus::Stopped,
+                    ..
+                }) if run == stopped.id
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            harness.orch.run(stopped.id).await,
+            stopped,
+            "the run is untouched"
+        );
+        assert_eq!(harness.orch.steps(stopped.id).await, steps, "and its steps");
+        assert_eq!(harness.orch.isolator.cleanups(), 0, "no cleanup");
+    }
+
     /// How long a case waits on a walk or a `prepare` that must not queue behind a stale
     /// `shared_serialized` guard; nothing it waits on sleeps, so reaching it is the hang.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
