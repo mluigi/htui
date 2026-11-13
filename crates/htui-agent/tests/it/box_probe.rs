@@ -78,12 +78,20 @@ fn script(tmp: &Path, name: &str, body: &str) -> PathBuf {
     let path = tmp.join("bin").join(name);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
     let status = std::process::Command::new("/bin/sh")
-        .args(["-c", "printf '#!/bin/sh\\n%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .args([
+            "-c",
+            "printf '#!/bin/sh\\n%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+            "sh",
+        ])
         .arg(&path)
         .arg(body)
         .status()
         .expect("run /bin/sh to write the script");
-    assert!(status.success(), "/bin/sh could not write {}", path.display());
+    assert!(
+        status.success(),
+        "/bin/sh could not write {}",
+        path.display()
+    );
     path
 }
 
