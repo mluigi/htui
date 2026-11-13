@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status = 'cancelled', finished_at = COALESCE(finished_at, $2) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1a01762158cc440514df999205fc5cbe1b889b3cdcda0b2748b4b95212047d4f"
+}
