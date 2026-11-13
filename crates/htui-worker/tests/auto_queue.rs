@@ -2289,6 +2289,8 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
             .map(|step| (step.phase_name.as_str(), step.attempt, step.status))
             .collect::<Vec<_>>(),
         [
+            // MOD-164 D11: the failed run ends with its capture row, skipped (no light model).
+            ("capture", 1, StepStatus::Done),
             ("research", 1, StepStatus::Done),
             ("verdict", 1, StepStatus::Failed)
         ],
@@ -2299,7 +2301,14 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
     let codes: Vec<serde_json::Value> = sqlx::query_scalar(
         "SELECT payload->'code' FROM session_event WHERE run_step_id = $1 AND kind = 'error'",
     )
-    .bind(steps[1].id.as_uuid())
+    .bind(
+        steps
+            .iter()
+            .find(|step| step.phase_name == "verdict")
+            .expect("verdict ran")
+            .id
+            .as_uuid(),
+    )
     .fetch_all(&db.pool)
     .await
     .expect("the events read");
