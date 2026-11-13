@@ -446,14 +446,13 @@ pub(super) async fn request_cancel(
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-        match status {
-            None => {
-                return Err(StoreError::NotFound {
-                    entity: "run",
-                    id: run.to_string(),
-                });
-            }
-            Some(_) => {}
+        // The share lock is what serialises this with `stop_run`; any status takes the cancel
+        // (MOD-125 M3 D6), so the read only tells an unknown run apart.
+        if status.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
         }
         let inserted = sqlx::query_scalar!(
             r#"INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
