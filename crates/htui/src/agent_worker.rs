@@ -68,6 +68,7 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::{SecretError, SecretSource, project_scope, resolve_project};
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
+use htui_orch::promote::{falls_back, record_opening, resume_failed_notice};
 use htui_orch::tools::{ToolHost, ToolLease, ToolScope};
 use htui_store::{Backend, Writer};
 use serde::Deserialize;
@@ -5439,48 +5440,6 @@ async fn record_answer(
     match to {
         Some(addr) => frames.reply(addr, StoreReply::Chat(ChatFrame::Event(Box::new(frame)))),
         None => frames.event(frame),
-    }
-}
-
-/// MOD-37 M5: whether a failed resume is worth a handoff start (review L-2): only when it failed on
-/// the wire (`Transport`, `Closed`), which is what an agent that lost or refused the session
-/// answers. Not when the adapter cannot run at all: a missing or unspawnable command (`Spawn`), an
-/// unresolved launch placeholder (`Unresolved`) or no transport (`UnknownAdapter`) would fail the
-/// handoff start the same way (blueprint A-2, H-18). Not on a transport that cannot restore
-/// (`Unsupported`), a cancel (`Cancelled`), or the driver's own write or scrub (`Store`, `Scrub`),
-/// which are not the resume's to fall back from. Exhaustive, with no wildcard: a new variant is a
-/// decision, not a default.
-const fn falls_back(err: &DriverError) -> bool {
-    match err {
-        DriverError::Transport(_) | DriverError::Closed => true,
-        DriverError::Unresolved(_)
-        | DriverError::UnknownAdapter(_)
-        | DriverError::Spawn(_)
-        | DriverError::Unsupported(_)
-        | DriverError::Cancelled
-        | DriverError::Store(_)
-        | DriverError::Scrub(_) => false,
-    }
-}
-
-/// MOD-37 M5: the `resume_failed` notice: the session tried, why it failed, and what the chat
-/// opens with instead.
-fn resume_failed_notice(session_ref: &AgentSessionRef, reason: &str) -> OtherEvent {
-    OtherEvent {
-        update: htui_agent::event::RESUME_FAILED.to_owned(),
-        body: json!({
-            "session_id": session_ref.as_str(),
-            "reason": reason,
-            "note": htui_orch::promote::CONTEXT_NOT_CARRIED,
-        }),
-    }
-}
-
-/// MOD-37 M5: `run_step.opening`, written through the bind's writer. A failed write is logged and
-/// never fails the chat: the column is a label, and the session is what the user is waiting on.
-async fn record_opening(writer: &Writer, step: StepId, opening: StepOpening) {
-    if let Err(err) = writer.record_opening(step, opening).await {
-        tracing::warn!(%err, %step, %opening, "the chat's opening could not be recorded");
     }
 }
 
