@@ -347,6 +347,59 @@ pub enum MemorySupersede {
     },
 }
 
+/// Arguments of [`WriteStore::write_run_memory`](crate::store::WriteStore::write_run_memory)
+/// (MOD-164 D4). No serde, as [`NewMemoryEntry`]: the text is checked on the way in. The
+/// provenance is not here: the store stamps it from the step's and the run's rows, never from
+/// the model's answer. `commit` is the engine's (the run's newest landed commit), never the model's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRunMemory {
+    /// Client-minted id (`MemoryEntryId::new()`).
+    pub id: MemoryEntryId,
+    /// The kind.
+    pub kind: MemoryKind,
+    /// The checked subject.
+    pub subject: MemorySubject,
+    /// The checked body.
+    pub body: MemoryBody,
+    /// The quotes the entry rests on, stored as `memory_entry.evidence`.
+    pub evidence: MemoryEvidence,
+    /// `memory_entry.commit_hash`.
+    pub commit: Option<String>,
+}
+
+/// Result of [`WriteStore::write_run_memory`](crate::store::WriteStore::write_run_memory)
+/// (MOD-164 D4).
+#[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is built per capture write and matched straight away; boxing the pair would buy \
+              an allocation per write to shrink a value nothing keeps (the shape is plan D4's, \
+              as `MemorySupersede`'s)"
+)]
+pub enum RunMemoryWrite {
+    /// No live entry held the folded subject: the new entry is live at version 1.
+    Created(MemoryEntry),
+    /// A live run-written entry held the folded subject: it is now `superseded` naming the new
+    /// entry, which is live at version 1.
+    Superseded {
+        /// The old entry's new head.
+        old: MemoryEntry,
+        /// The new entry.
+        new: MemoryEntry,
+    },
+    /// A live person-written entry holds the folded subject. A run never replaces a person's
+    /// entry; nothing was written.
+    PersonHolds {
+        /// The person's entry.
+        existing: MemoryEntryId,
+    },
+    /// The step already wrote [`MEMORY_RUN_WRITE_CAP`] entries; nothing was written.
+    CapReached {
+        /// The cap, [`MEMORY_RUN_WRITE_CAP`].
+        cap: u32,
+    },
+}
+
 /// Plan D5 (`R-ID-7`): a subject, checked when built. The text is trimmed and must be non-empty
 /// and free of NUL (Postgres `text` cannot hold one), then scrubbed fail-closed by the caller's
 /// [`Scrubber`] (a known secret masked, credential-shaped text refused), and the **scrubbed** text

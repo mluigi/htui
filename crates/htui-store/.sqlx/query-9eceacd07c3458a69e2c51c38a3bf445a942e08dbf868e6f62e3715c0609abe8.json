@@ -1,0 +1,305 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH e AS (\n            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by, source,\n                                      run_id, step_id, item_id, agent_id, model, commit_hash,\n                                      evidence)\n            VALUES ($1, $2, $3, $4, $5, $6, 'run', $7, $8, $9, $10, $11, $12, $13)\n            RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,\n                      superseded_by, created_by, created_at, updated_at, source, run_id,\n                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,\n                      shown_done, shown_failed\n        ), v AS (\n            INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,\n                                               author_id, box_id, reason)\n            SELECT id, version, kind, subject, body, state, $6, $14, 'created' FROM e\n            RETURNING entry_id\n        )\n        SELECT e.id            AS \"id!: MemoryEntryId\",\n               e.project_id    AS \"project_id!: ProjectId\",\n               e.kind          AS \"kind!: MemoryKind\",\n               e.subject       AS \"subject!\",\n               e.body          AS \"body!\",\n               e.state         AS \"state!: MemoryState\",\n               e.version       AS \"version!\",\n               e.confirmed_at  AS \"confirmed_at!\",\n               e.superseded_by AS \"superseded_by: MemoryEntryId\",\n               e.created_by    AS \"created_by!: UserId\",\n               e.created_at    AS \"created_at!\",\n               e.updated_at    AS \"updated_at!\",\n               e.source        AS \"source!: MemorySource\",\n               e.run_id        AS \"run_id: RunId\",\n               e.step_id       AS \"step_id: StepId\",\n               e.item_id       AS \"item_id: ItemId\",\n               e.agent_id      AS \"agent_id: AgentId\",\n               e.model         AS \"model\",\n               e.commit_hash   AS \"commit_hash\",\n               e.evidence      AS \"evidence: Json<MemoryEvidence>\",\n               e.shown_steps   AS \"shown_steps!\",\n               e.shown_done    AS \"shown_done!\",\n               e.shown_failed  AS \"shown_failed!\"\n          FROM e, v\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!: MemoryKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "subject!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "state!: MemoryState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "confirmed_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "confirmed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "superseded_by: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "superseded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_by!: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "source!: MemorySource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "commit_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "commit_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "evidence: Json<MemoryEvidence>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "evidence"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "shown_steps!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "shown_steps"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "shown_done!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "shown_done"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "shown_failed!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "shown_failed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9eceacd07c3458a69e2c51c38a3bf445a942e08dbf868e6f62e3715c0609abe8"
+}

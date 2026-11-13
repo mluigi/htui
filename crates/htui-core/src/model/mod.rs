@@ -151,7 +151,8 @@ pub use memory::{
     MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,
     MemoryEntry, MemoryEvidence, MemoryKind, MemoryPatch, MemoryRevision, MemorySource,
     MemoryState, MemorySubject, MemorySupersede, MemoryTextError, MemoryUpdate, MemoryUsage,
-    NewMemoryEntry, RunProvenance, SnapshotMemory, SnapshotMemoryEntry, memory_subject_key,
+    NewMemoryEntry, NewRunMemory, RunMemoryWrite, RunProvenance, SnapshotMemory,
+    SnapshotMemoryEntry, memory_subject_key,
 };
 pub use note::{NewNote, Note};
 pub use overlap::{

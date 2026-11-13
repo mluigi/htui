@@ -64,19 +64,20 @@ use crate::model::{
     MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
     MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
     NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
-    NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
@@ -2690,6 +2691,38 @@ pub trait WriteStore: ReadStore {
         expected_version: i32,
         new: NewMemoryEntry,
     ) -> Result<MemorySupersede>;
+
+    // ---- MOD-164: a run's capture step writes memory (plan D4) -------------------------------
+
+    /// A capture step's memory write, one transaction (MOD-164 D4). Decided in this order:
+    ///
+    /// 1. `step` exists and its run carries `fence`'s lease (`NotFound { entity: "run_step" }`,
+    ///    then `Fenced { step }`: `write_step_document`'s order);
+    /// 2. the step is a `stage` row keyed `capture`, else
+    ///    `Constraint(`[`MEMORY_NEEDS_A_CAPTURE_STEP`]`)`;
+    /// 3. [`MEMORY_RUN_WRITE_CAP`](crate::model::MEMORY_RUN_WRITE_CAP) entries already name
+    ///    `step` (every state): [`RunMemoryWrite::CapReached`], nothing written;
+    /// 4. the live entry of the run's project whose subject folds to `new.subject`'s:
+    ///    none - the entry is created ([`RunMemoryWrite::Created`]); a person's - nothing is
+    ///    written ([`RunMemoryWrite::PersonHolds`]); a run's - it is superseded as
+    ///    [`supersede_memory_entry`](WriteStore::supersede_memory_entry) supersedes one
+    ///    ([`RunMemoryWrite::Superseded`]).
+    ///
+    /// The new entry is `source = run`, stamped from the rows, never from `new`: `run_id`,
+    /// `step_id`, `item_id`, `agent_id` and `model` from the step and its run, `created_by` (and
+    /// the revisions' author) the run's `started_by`, the revisions' `box_id` its
+    /// `lease_box_id`. `commit` and `evidence` are `new`'s. Revision 1 is `created`; the old
+    /// entry's is `superseded`.
+    ///
+    /// # Errors
+    /// The four above, then `Constraint(`[`already_exists`]`)` for a duplicate `new.id`, and the
+    /// backend's own failures.
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -3863,6 +3896,10 @@ pub fn memory_subject_taken(subject: &str, existing: MemoryEntryId) -> String {
 pub fn memory_entry_closed(id: MemoryEntryId, state: MemoryState) -> String {
     format!("memory entry {id} is `{state}`; only an active or suspect entry changes")
 }
+
+/// MOD-164 D4: [`WriteStore::write_run_memory`] writes for a run's capture stage only (`role =
+/// stage`, `node_key = capture`). A stable code word, so the engine can tell it apart.
+pub const MEMORY_NEEDS_A_CAPTURE_STEP: &str = "memory_needs_a_capture_step";
 
 // ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
 

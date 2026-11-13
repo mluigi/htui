@@ -37,14 +37,15 @@ use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
     DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry,
-    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunPlan, NewRunStep, Note,
-    OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
-    PhaseId, PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch,
-    QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
-    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
-    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
+    MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunMemory, NewRunPlan, NewRunStep,
+    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus,
+    PhaseAgent, PhaseId, PlanAdmission, Project, ProjectId, PromptScope, PromptTemplate,
+    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
+    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
+    WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -462,6 +463,13 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         fence: StepFence,
         note: NewNote,
     ) -> impl Future<Output = Result<Note>> + Send;
+    /// [`WriteStore::write_run_memory`] (MOD-164 D4): the capture step's memory write.
+    fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> impl Future<Output = Result<RunMemoryWrite>> + Send;
     /// [`WriteStore::propose_link`].
     fn propose_link(
         &self,
@@ -1018,6 +1026,14 @@ impl WorkerStore for MemStore {
     }
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
         WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        WriteStore::write_run_memory(self, fence, step, new).await
     }
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
         WriteStore::propose_link(self, fence, link).await

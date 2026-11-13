@@ -22,25 +22,27 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
     ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
-    MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    MEMORY_RUN_WRITE_CAP, MemoryBody, MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence,
+    MemoryKind, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem,
     NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PendingStop,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
-    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
-    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId,
-    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
-    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
-    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
-    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
+    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
+    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer,
+    PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
+    PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind,
+    RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementState, RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind,
+    RunCommandStatus, RunId, RunKind, RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId,
+    VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    executor_scrub_refusal, missing_tags_failure,
 };
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{
@@ -59,16 +61,16 @@ use crate::store::error::StoreError;
 use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
-    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
-    QueueStored, QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore, SettingRung,
-    StepFence, StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
-    citation_key, command_finish_status, command_not_claimable, command_not_queued,
-    document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
-    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_reach,
-    memory_entry_closed, memory_subject_taken, not_a_tool_name, note_needs_a_step,
-    queue_target_refusal, queue_token_refusal, references_no_row, requirement_withdrawn,
-    resolution_not_closable, rule_kind_unknown, self_link, step_writes_own_item,
-    withdrawn_requirement_cited,
+    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
+    MEMORY_NEEDS_A_CAPTURE_STEP, ParkOutcome, QueueStored, QueueTarget, QueueToken,
+    RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
+    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, command_finish_status,
+    command_not_claimable, command_not_queued, document_needs_a_step, has_nul, illegal_move,
+    invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
+    link_not_proposed_by_run, link_outside_reach, memory_entry_closed, memory_subject_taken,
+    not_a_tool_name, note_needs_a_step, queue_target_refusal, queue_token_refusal,
+    references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
+    self_link, step_writes_own_item, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
     MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
@@ -335,6 +337,15 @@ pub const CASES: &[&str] = &[
     "memory_supersede_refuses_stale_closed_and_clashing",
     "memory_unknown_rows_and_authors_are_refused",
     "project_delete_counts_memory",
+    // MOD-164: the capture write and the usage tally (plan D4, D5)
+    "run_memory_creates_a_run_entry_with_stamped_provenance",
+    "run_memory_supersedes_a_live_run_entry_on_the_folded_subject",
+    "run_memory_never_replaces_a_person_entry",
+    "run_memory_stops_at_the_write_cap",
+    "run_memory_refuses_a_step_that_is_not_capture",
+    "run_memory_refuses_a_lost_fence",
+    "finish_run_counts_memory_usage_once",
+    "finish_run_skips_deleted_or_unlisted_entries",
     // MOD-144: the item status reduction (ANA-35 §7.1, plan "The rules")
     "create_run_refuses_a_second_live_graph_run",
     "readiness_skips_cancelled_runs",
@@ -1100,6 +1111,31 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             memory_unknown_rows_and_authors_are_refused(store).await
         }
         "project_delete_counts_memory" => project_delete_counts_memory(store).await,
+        "run_memory_creates_a_run_entry_with_stamped_provenance" => {
+            Box::pin(run_memory_creates_a_run_entry_with_stamped_provenance(
+                store,
+            ))
+            .await
+        }
+        "run_memory_supersedes_a_live_run_entry_on_the_folded_subject" => {
+            Box::pin(run_memory_supersedes_a_live_run_entry_on_the_folded_subject(store)).await
+        }
+        "run_memory_never_replaces_a_person_entry" => {
+            Box::pin(run_memory_never_replaces_a_person_entry(store)).await
+        }
+        "run_memory_stops_at_the_write_cap" => {
+            Box::pin(run_memory_stops_at_the_write_cap(store)).await
+        }
+        "run_memory_refuses_a_step_that_is_not_capture" => {
+            Box::pin(run_memory_refuses_a_step_that_is_not_capture(store)).await
+        }
+        "run_memory_refuses_a_lost_fence" => Box::pin(run_memory_refuses_a_lost_fence(store)).await,
+        "finish_run_counts_memory_usage_once" => {
+            Box::pin(finish_run_counts_memory_usage_once(store)).await
+        }
+        "finish_run_skips_deleted_or_unlisted_entries" => {
+            Box::pin(finish_run_skips_deleted_or_unlisted_entries(store)).await
+        }
         "create_run_refuses_a_second_live_graph_run" => {
             Box::pin(create_run_refuses_a_second_live_graph_run(store)).await
         }
@@ -28001,6 +28037,685 @@ async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
         memory_history(CASE, store, entry.id).await.len(),
         1,
         "{CASE}: no refusal wrote a revision"
+    );
+}
+
+// ---- MOD-164: a run's capture step writes memory, and `finish_run` tallies its use (D4, D5) ---
+
+/// The commit a capture write carries: the engine's, never the model's (MOD-164 D4).
+const CAPTURE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The model a capture step runs on, distinct from [`new_run_step`]'s `opus`, so the stamp is
+/// seen to come from the step row.
+const CAPTURE_MODEL: &str = "light";
+
+/// A fresh run of `HTUI_ANA_2` claimed by `owner` on the fixture box (with
+/// [`leased_step`]'s ordinary step at 0), and its capture stage at `attempt` on
+/// [`CAPTURE_POSITION`].
+async fn capture_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+) -> (RunId, StepId, StepId) {
+    let (run, ordinary) = leased_step(case, store, owner, seam_clock()).await;
+    let step = store.create_step(capture_row(run, 1)).await.expect(case).id;
+    (run, ordinary, step)
+}
+
+/// The capture stage row of `run` at `attempt`, on the light model.
+fn capture_row(run: RunId, attempt: i32) -> NewRunStep {
+    NewRunStep {
+        attempt,
+        model: Some(CAPTURE_MODEL.to_owned()),
+        ..role_step(
+            run,
+            CAPTURE_POSITION,
+            StepRole::Stage,
+            None,
+            Some(CAPTURE_KEY),
+        )
+    }
+}
+
+/// A capture write with a fresh id, citing `step`, carrying [`CAPTURE_COMMIT`].
+fn run_memory_new(case: &str, step: StepId, subject: &str, body: &str) -> NewRunMemory {
+    let scrubber = memory_scrubber();
+    NewRunMemory {
+        id: MemoryEntryId::new(),
+        kind: MemoryKind::Gotcha,
+        subject: MemorySubject::new(subject, &scrubber).expect(case),
+        body: MemoryBody::new(body, &scrubber).expect(case),
+        evidence: MemoryEvidence {
+            citations: vec![MemoryCitation {
+                step_id: step,
+                quote: "error: linker `cc` not found".to_owned(),
+            }],
+        },
+        commit: Some(CAPTURE_COMMIT.to_owned()),
+    }
+}
+
+/// The entry a capture write created, or a panic naming the case.
+fn run_memory_created(case: &str, outcome: RunMemoryWrite) -> MemoryEntry {
+    match outcome {
+        RunMemoryWrite::Created(row) => row,
+        other => panic!("{case}: expected Created, got {other:?}"),
+    }
+}
+
+/// The provenance [`capture_step`]'s rows stamp on `run`'s entries.
+fn capture_provenance(run: RunId, step: StepId) -> Option<RunProvenance> {
+    Some(RunProvenance {
+        run_id: Some(run),
+        step_id: Some(step),
+        item_id: Some(ids::HTUI_ANA_2),
+        agent_id: Some(ids::AGENT_CLAUDE),
+        model: Some(CAPTURE_MODEL.to_owned()),
+        commit: Some(CAPTURE_COMMIT.to_owned()),
+    })
+}
+
+/// MOD-164 D4: with no live entry on its folded subject, a capture write creates a live `run`
+/// entry stamped from the step's and the run's rows (run, step, item, agent, model; the run's
+/// starter as author, its lease box on the revision), carrying the caller's commit and evidence,
+/// at version 1 with revision 1 `created` and no usage yet.
+async fn run_memory_creates_a_run_entry_with_stamped_provenance<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_creates_a_run_entry_with_stamped_provenance";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let new = run_memory_new(
+        CASE,
+        step,
+        " Linker ",
+        "Install a C toolchain before building.",
+    );
+    let (id, evidence) = (new.id, new.evidence.clone());
+    let row = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(StepFence::Lease(a), step, new)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            row.id,
+            row.project_id,
+            row.kind,
+            row.subject.as_str(),
+            row.body.as_str(),
+            row.state,
+            row.version,
+            row.superseded_by,
+            row.created_by,
+            row.source,
+        ),
+        (
+            id,
+            ids::PROJECT_HTUI,
+            MemoryKind::Gotcha,
+            "Linker",
+            "Install a C toolchain before building.",
+            MemoryState::Active,
+            1,
+            None,
+            ids::USER,
+            MemorySource::Run,
+        ),
+        "{CASE}: a live run entry at version 1 in the run's project, written by its starter"
+    );
+    assert_eq!(
+        row.provenance,
+        capture_provenance(run, step),
+        "{CASE}: the provenance is the step's and the run's, the commit the caller's"
+    );
+    assert_eq!(row.evidence, Some(evidence), "{CASE}: the evidence is kept");
+    assert_eq!(
+        row.usage,
+        MemoryUsage::default(),
+        "{CASE}: no step has shown it yet"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![row.clone()],
+        "{CASE}: the list reads the entry back as the write returned it"
+    );
+    assert_eq!(
+        memory_history(CASE, store, id).await,
+        vec![MemoryRevision {
+            entry_id: id,
+            version: 1,
+            kind: MemoryKind::Gotcha,
+            subject: "Linker".to_owned(),
+            body: "Install a C toolchain before building.".to_owned(),
+            state: MemoryState::Active,
+            author_id: ids::USER,
+            box_id: Some(ids::BOX),
+            reason: "created".to_owned(),
+            created_at: row.created_at,
+        }],
+        "{CASE}: revision 1 is `created`, by the run's starter on its lease box"
+    );
+}
+
+/// MOD-164 D4: a capture write whose subject folds to a live run entry's supersedes it as
+/// `supersede_memory_entry` does: the old entry moves to `superseded` naming the new one, with a
+/// `superseded` revision by the run's starter on its lease box; the new entry is live.
+async fn run_memory_supersedes_a_live_run_entry_on_the_folded_subject<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_supersedes_a_live_run_entry_on_the_folded_subject";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let first = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+    let second = run_memory_new(CASE, step, "  LINKER ", "Install a C toolchain first.");
+    let second_id = second.id;
+    let outcome = store
+        .write_run_memory(StepFence::Lease(a), step, second)
+        .await
+        .expect(CASE);
+    let RunMemoryWrite::Superseded { old, new } = outcome else {
+        panic!("{CASE}: expected Superseded, got {outcome:?}");
+    };
+    assert_eq!(
+        (
+            old.id,
+            old.state,
+            old.superseded_by,
+            old.version,
+            old.source,
+            old.subject.as_str(),
+            old.body.as_str(),
+        ),
+        (
+            first.id,
+            MemoryState::Superseded,
+            Some(second_id),
+            2,
+            MemorySource::Run,
+            "Linker",
+            "Install cc.",
+        ),
+        "{CASE}: the old entry is superseded by the new one, its text kept"
+    );
+    assert_eq!(
+        old.provenance, first.provenance,
+        "{CASE}: the old entry keeps its provenance"
+    );
+    assert_eq!(
+        (
+            new.id,
+            new.state,
+            new.version,
+            new.source,
+            new.subject.as_str(),
+            new.body.as_str(),
+        ),
+        (
+            second_id,
+            MemoryState::Active,
+            1,
+            MemorySource::Run,
+            "LINKER",
+            "Install a C toolchain first.",
+        ),
+        "{CASE}: the new entry is live at version 1"
+    );
+    assert_eq!(
+        new.provenance,
+        capture_provenance(run, step),
+        "{CASE}: the new entry is stamped from the rows"
+    );
+    let history = memory_history(CASE, store, first.id).await;
+    assert_eq!(
+        memory_history_view(&history),
+        vec![
+            (1, "created", MemoryState::Active, "Install cc."),
+            (2, "superseded", MemoryState::Superseded, "Install cc."),
+        ],
+        "{CASE}: the old entry's history ends in a `superseded` revision"
+    );
+    assert_eq!(
+        (history[1].author_id, history[1].box_id),
+        (ids::USER, Some(ids::BOX)),
+        "{CASE}: the `superseded` revision is the run's starter's, on its lease box"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active, MemoryState::Suspect])
+        )
+        .await,
+        vec![new],
+        "{CASE}: one live entry holds the subject"
+    );
+}
+
+/// MOD-164 D4: a run never replaces a person's entry. A capture write whose subject folds to a
+/// live person entry's answers `PersonHolds` naming it, and writes nothing.
+async fn run_memory_never_replaces_a_person_entry<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_never_replaces_a_person_entry";
+    let person = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Default branch",
+        "The default branch is main.",
+    )
+    .await;
+    let a = Uuid::now_v7();
+    let (_, _, step) = capture_step(CASE, store, a).await;
+
+    assert_eq!(
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "default BRANCH", "The default branch is trunk."),
+            )
+            .await
+            .expect(CASE),
+        RunMemoryWrite::PersonHolds {
+            existing: person.id
+        },
+        "{CASE}: the person's entry holds the subject"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![person.clone()],
+        "{CASE}: no entry was written, and the person's is as it was"
+    );
+    assert_eq!(
+        memory_history(CASE, store, person.id).await.len(),
+        1,
+        "{CASE}: the person's entry gained no revision"
+    );
+}
+
+/// MOD-164 D4: a capture step writes at most [`MEMORY_RUN_WRITE_CAP`] entries, counted over every
+/// entry naming the step (a superseded one included). Past it the write answers `CapReached` and
+/// writes nothing, before the subject is looked at; another capture step has a cap of its own.
+async fn run_memory_stops_at_the_write_cap<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_stops_at_the_write_cap";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    for (subject, body) in [("One", "First."), ("Two", "Second.")] {
+        run_memory_created(
+            CASE,
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, step, subject, body),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let third = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            step,
+            run_memory_new(CASE, step, "one", "First, restated."),
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(third, RunMemoryWrite::Superseded { .. }),
+        "{CASE}: the third write supersedes the first, got {third:?}"
+    );
+    let before = memory_list(CASE, store, ids::PROJECT_HTUI, None).await;
+    assert_eq!(before.len(), 3, "{CASE}: three entries name the step");
+
+    for (subject, body) in [("Four", "Fourth."), ("Two", "Second, restated.")] {
+        assert_eq!(
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, step, subject, body),
+                )
+                .await
+                .expect(CASE),
+            RunMemoryWrite::CapReached {
+                cap: MEMORY_RUN_WRITE_CAP
+            },
+            "{CASE}: `{subject}` is past the cap"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        before,
+        "{CASE}: the refused writes wrote nothing"
+    );
+
+    let retry = store.create_step(capture_row(run, 2)).await.expect(CASE).id;
+    let fourth = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                retry,
+                run_memory_new(CASE, retry, "Four", "Fourth."),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        fourth.provenance.and_then(|stamp| stamp.step_id),
+        Some(retry),
+        "{CASE}: another capture step writes under a cap of its own"
+    );
+}
+
+/// MOD-164 D4: only a `stage` row keyed `capture` writes memory. An ordinary step and another
+/// stage are refused with [`MEMORY_NEEDS_A_CAPTURE_STEP`], and nothing is written.
+async fn run_memory_refuses_a_step_that_is_not_capture<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_a_step_that_is_not_capture";
+    let a = Uuid::now_v7();
+    let (run, ordinary, _) = capture_step(CASE, store, a).await;
+    let collect = store
+        .create_step(role_step(run, -1, StepRole::Stage, None, Some("collect")))
+        .await
+        .expect(CASE)
+        .id;
+
+    for (step, what) in [
+        (ordinary, "an ordinary step"),
+        (collect, "the collect stage"),
+    ] {
+        let refused = store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(code)) if code == MEMORY_NEEDS_A_CAPTURE_STEP),
+            "{CASE}: {what} is refused with the code word, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: no refusal wrote an entry"
+    );
+}
+
+/// MOD-164 D4: a capture write is fenced like `write_step_document`: an unknown step is
+/// `NotFound`, an unleased or a stranger's fence is `Fenced`, and so is the old owner's after
+/// another took the run. Nothing is written until the new owner writes.
+async fn run_memory_refuses_a_lost_fence<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_a_lost_fence";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let unknown = StepId::new();
+    let missing = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            unknown,
+            run_memory_new(CASE, step, "Linker", "Install cc."),
+        )
+        .await;
+    assert!(
+        matches!(&missing, Err(StoreError::NotFound { entity: "run_step", id }) if *id == unknown.to_string()),
+        "{CASE}: an unknown step is NotFound, got {missing:?}"
+    );
+    for fence in [StepFence::Unleased, StepFence::Lease(b)] {
+        let refused = store
+            .write_run_memory(
+                fence,
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Fenced { step: s }) if s == step),
+            "{CASE}: a write under {fence:?} on A's run is fenced, got {refused:?}"
+        );
+    }
+    taken_by(CASE, store, run, a, b).await;
+    let stale = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            step,
+            run_memory_new(CASE, step, "Linker", "Install cc."),
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's write after B took the run is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: the fenced writes wrote nothing"
+    );
+    run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(b),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+}
+
+/// `trim_record` as the assembler writes it when the prompt showed `shown` (MOD-163 D17).
+fn trim_showing(shown: &[Value]) -> Value {
+    json!({
+        "v": 5,
+        "sections": [],
+        "memory": { "shown": shown, "total": 3 },
+    })
+}
+
+/// One `trim_record.memory.shown[]` row of `entry`.
+fn shown_row(entry: MemoryEntryId) -> Value {
+    json!({ "id": entry.to_string(), "version": 1 })
+}
+
+/// A step of `run` at `position` whose prompt record is `trim`, moved `pending -> running ->
+/// to` (`None` leaves it pending).
+async fn shown_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+    run: RunId,
+    position: i32,
+    trim: Option<&Value>,
+    to: Option<StepStatus>,
+) -> StepId {
+    let at = seam_clock();
+    let step = store
+        .create_step(new_run_step(run, position, 1, 0))
+        .await
+        .expect(case)
+        .id;
+    if let Some(trim) = trim {
+        store
+            .set_step_prompt(StepFence::Lease(owner), step, "sha256:shown", trim)
+            .await
+            .expect(case);
+    }
+    if let Some(to) = to {
+        for (from, next) in [
+            (StepStatus::Pending, StepStatus::Running),
+            (StepStatus::Running, to),
+        ] {
+            assert!(
+                store
+                    .transition_step(step, from, next, at)
+                    .await
+                    .expect(case),
+                "{case}: {from} -> {next} is a sanctioned move"
+            );
+        }
+    }
+    step
+}
+
+/// The usage of `id` as the list reads it.
+async fn usage_of<S: ReadStore>(case: &str, store: &S, id: MemoryEntryId) -> MemoryUsage {
+    memory_list(case, store, ids::PROJECT_HTUI, None)
+        .await
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("{case}: {id} is listed"))
+        .usage
+}
+
+/// MOD-164 D5: `finish_run` counts, for each step of the run whose prompt record lists an entry,
+/// one showing, and one done or one failed by the step's status. The run's terminal move happens
+/// once, so a second `finish_run` is refused and the counts stay. The entry's version and history
+/// do not move.
+async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_run_counts_memory_usage_once";
+    let entry = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Linker",
+        "Install a C toolchain before building.",
+    )
+    .await;
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    let trim = trim_showing(&[shown_row(entry.id)]);
+    shown_step(CASE, store, a, run, 1, Some(&trim), Some(StepStatus::Done)).await;
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        2,
+        Some(&trim),
+        Some(StepStatus::Failed),
+    )
+    .await;
+    assert_eq!(
+        usage_of(CASE, store, entry.id).await,
+        MemoryUsage::default(),
+        "{CASE}: nothing is counted before the run ends"
+    );
+
+    store
+        .finish_run(run, RunStatus::Done, None, seam_clock())
+        .await
+        .expect(CASE);
+    let tallied = MemoryUsage {
+        shown: 2,
+        done: 1,
+        failed: 1,
+    };
+    assert_eq!(
+        usage_of(CASE, store, entry.id).await,
+        tallied,
+        "{CASE}: two steps showed it, one done and one failed"
+    );
+
+    let again = store
+        .finish_run(run, RunStatus::Failed, Some("again"), seam_clock())
+        .await;
+    assert!(
+        matches!(again, Err(StoreError::Constraint(_))),
+        "{CASE}: a finished run is not finished again, got {again:?}"
+    );
+    let row = memory_list(CASE, store, ids::PROJECT_HTUI, None)
+        .await
+        .into_iter()
+        .find(|row| row.id == entry.id)
+        .unwrap_or_else(|| panic!("{CASE}: the entry is listed"));
+    assert_eq!(
+        (row.usage, row.version, row.state),
+        (tallied, 1, MemoryState::Active),
+        "{CASE}: the refusal counted nothing, and the tally moved no version"
+    );
+    assert_eq!(
+        memory_history(CASE, store, entry.id).await.len(),
+        1,
+        "{CASE}: the tally wrote no revision"
+    );
+}
+
+/// MOD-164 D5: the tally takes only listed ids that still exist. An id with no row (a deleted
+/// entry), a row id that is not a UUID, a step with no record or a record with no memory audit
+/// count nothing and refuse nothing; an entry no step listed stays at zero; a listed entry on a
+/// step that ended neither done nor failed counts as shown only; and a step that lists an entry
+/// twice counts it once.
+async fn finish_run_skips_deleted_or_unlisted_entries<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_run_skips_deleted_or_unlisted_entries";
+    let shown = memory_create(CASE, store, ids::PROJECT_HTUI, "Shown", "Listed once.").await;
+    let unlisted = memory_create(CASE, store, ids::PROJECT_HTUI, "Unlisted", "Never shown.").await;
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+
+    let listed = trim_showing(&[
+        shown_row(MemoryEntryId::new()),
+        json!({ "id": "not-a-uuid", "version": 1 }),
+        shown_row(shown.id),
+        shown_row(shown.id),
+    ]);
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        1,
+        Some(&listed),
+        Some(StepStatus::Cancelled),
+    )
+    .await;
+    shown_step(CASE, store, a, run, 2, None, Some(StepStatus::Done)).await;
+    let bare = json!({ "v": 4, "sections": [] });
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        3,
+        Some(&bare),
+        Some(StepStatus::Failed),
+    )
+    .await;
+    let odd = json!({ "memory": { "shown": "not a list", "total": 0 } });
+    shown_step(CASE, store, a, run, 4, Some(&odd), Some(StepStatus::Done)).await;
+
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        usage_of(CASE, store, shown.id).await,
+        MemoryUsage {
+            shown: 1,
+            done: 0,
+            failed: 0,
+        },
+        "{CASE}: one cancelled step showed it, once"
+    );
+    assert_eq!(
+        usage_of(CASE, store, unlisted.id).await,
+        MemoryUsage::default(),
+        "{CASE}: an entry no step listed is not counted"
     );
 }
 
