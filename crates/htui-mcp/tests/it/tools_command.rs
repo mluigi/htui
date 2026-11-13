@@ -51,6 +51,7 @@ fn scope(cwd: &Path, exposed: bool) -> ToolScope {
         hostname: HostnameLine::Omitted,
         command_queue: exposed,
         cwd: cwd.to_path_buf(),
+        extra_dirs: Vec::new(),
         transport: Transport::Acp,
     }
 }
@@ -867,7 +868,14 @@ async fn command_run_is_not_advertised_when_exposure_is_off() {
     let (_on, mut on) = open(&host, scope(dir.path(), true)).await;
     assert_eq!(
         on.tool_names().await.expect("tools/list"),
-        ["box_profile", "command_run"]
+        [
+            "box_profile",
+            "command_run",
+            "command_output_read",
+            "command_start",
+            "command_wait",
+            "command_cancel",
+        ]
     );
 }
 
@@ -1000,4 +1008,128 @@ async fn a_lease_lost_while_queued_cancels_the_row() {
     let ours = until_status(&store, CommandRunStatus::Cancelled).await;
     assert_ne!(ours.id, held.id);
     assert_eq!((ours.started_at, ours.output), (None, None), "it never ran");
+}
+
+/// MOD-152 D11: `repo` names one of the session's extra directories by its final path component,
+/// and the command runs there; `cwd` is then relative to that directory.
+#[tokio::test]
+async fn repo_resolves_an_extra_directory() {
+    let base = tempfile::tempdir().expect("a scratch tree");
+    let own = base.path().join("own");
+    let first = base.path().join("first");
+    let second = base.path().join("second");
+    for dir in [&own, &first, &second, &second.join("sub")] {
+        std::fs::create_dir_all(dir).expect("a directory");
+    }
+    let store = MemStore::demo();
+    let host = host(&store);
+    let (_lease, mut client) = open(
+        &host,
+        ToolScope {
+            extra_dirs: vec![first.clone(), second.clone()],
+            ..scope(&own, true)
+        },
+    )
+    .await;
+
+    let there = ok(&client
+        .call(
+            "command_run",
+            json!({"class": "build", "command": "pwd -P", "repo": "second"}),
+        )
+        .await
+        .expect("the call"));
+    let want = second.canonicalize().expect("canonical");
+    assert_eq!(
+        there["output"].as_str().map(str::trim),
+        want.to_str(),
+        "{there}"
+    );
+    let stored = row(&store, there["command_run_id"].as_str().expect("id")).await;
+    assert_eq!(stored.cwd, second.display().to_string());
+
+    let nested = ok(&client
+        .call(
+            "command_run",
+            json!({"class": "build", "command": "pwd -P", "repo": "second", "cwd": "sub"}),
+        )
+        .await
+        .expect("the call"));
+    let want = second.join("sub").canonicalize().expect("canonical");
+    assert_eq!(nested["output"].as_str().map(str::trim), want.to_str());
+
+    let own_dir = ok(&client
+        .call(
+            "command_run",
+            json!({"class": "build", "command": "pwd -P"}),
+        )
+        .await
+        .expect("the call"));
+    let want = own.canonicalize().expect("canonical");
+    assert_eq!(
+        own_dir["output"].as_str().map(str::trim),
+        want.to_str(),
+        "no repo: the session's own directory"
+    );
+}
+
+/// MOD-152 D11: an unknown name lists the names there are; a name two directories share is
+/// refused; `..` stays refused under a repo; nothing is queued by any of them.
+#[tokio::test]
+async fn repo_refusals_name_the_choices_and_queue_nothing() {
+    let base = tempfile::tempdir().expect("a scratch tree");
+    let own = base.path().join("own");
+    let dirs = [
+        base.path().join("x").join("web"),
+        base.path().join("y").join("web"),
+        base.path().join("api"),
+    ];
+    std::fs::create_dir_all(&own).expect("own");
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).expect("a directory");
+    }
+    let store = MemStore::demo();
+    let host = host(&store);
+    let (_lease, mut client) = open(
+        &host,
+        ToolScope {
+            extra_dirs: dirs.to_vec(),
+            ..scope(&own, true)
+        },
+    )
+    .await;
+    let call = |repo: &'static str, cwd: Option<&'static str>| {
+        let mut arguments = json!({"class": "build", "command": "true", "repo": repo});
+        if let Some(cwd) = cwd {
+            arguments["cwd"] = json!(cwd);
+        }
+        arguments
+    };
+
+    let unknown = client
+        .call("command_run", call("db", None))
+        .await
+        .expect("the call");
+    assert_eq!(
+        refused(&unknown),
+        "refused: repo `db` is not one of: web, web, api"
+    );
+    let ambiguous = client
+        .call("command_run", call("web", None))
+        .await
+        .expect("the call");
+    assert_eq!(
+        refused(&ambiguous),
+        "refused: repo `web` names more than one directory"
+    );
+    let escaping = client
+        .call("command_run", call("api", Some("../own")))
+        .await
+        .expect("the call");
+    assert!(
+        refused(&escaping).starts_with("refused: cwd `../own` must be a relative path"),
+        "{}",
+        escaping.text
+    );
+    assert!(rows(&store).await.is_empty(), "no refusal queued a row");
 }

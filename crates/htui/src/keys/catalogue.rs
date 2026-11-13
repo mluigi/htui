@@ -573,6 +573,8 @@ pub enum Act {
     BoxesProbe,
     /// `settings.boxes.edit_spec`: edit the box's probe spec.
     BoxesEditSpec,
+    /// `settings.boxes.log_level`: cycle the box's worker log level and save it (MOD-122 M2 D11).
+    BoxesLogLevel,
     /// `settings.personas.body`: edit the persona's body.
     PersonasBody,
     /// `settings.personas.rules`: edit the persona's rules.
@@ -1506,6 +1508,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "edit_spec",
         &["s"],
         "edit probe spec",
+    ),
+    // MOD-122 M2 D11, F8: cycles off, error, warn, info, debug and saves at once.
+    row(
+        Act::BoxesLogLevel,
+        SettingsBoxes,
+        "log_level",
+        &["v"],
+        "worker log level",
     ),
     // [settings.personas]
     // personas.rs:444 `'b'`.
@@ -2995,6 +3005,7 @@ mod tests {
         Act::LinksClose,
         Act::KindsEditor,
         Act::GraphEditorOpenPart,
+        Act::BoxesLogLevel,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3247,6 +3258,7 @@ mod tests {
             Act::LinksClose => 243,
             Act::KindsEditor => 244,
             Act::GraphEditorOpenPart => 245,
+            Act::BoxesLogLevel => 246,
         }
     }
 
@@ -3280,8 +3292,8 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        // MOD-141 M2 D14: `graph_editor.open_part`, 246.
-        assert_eq!(CATALOGUE.len(), 246);
+        // MOD-122 M2 D11: `settings.boxes.log_level`, 247.
+        assert_eq!(CATALOGUE.len(), 247);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

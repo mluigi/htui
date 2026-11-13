@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT r.id AS \"id: RunId\"\n              FROM run r\n             WHERE r.status = 'stopped' AND r.executing_box_id = $1\n               AND NOT EXISTS (SELECT 1 FROM workspace_stop ws\n                                WHERE ws.workspace_id = r.workspace_id)\n             ORDER BY r.queued_at, r.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "870dfe664a83aaade5eb9d5e49c313200c5f3a9d3f3f8160506095d0e11b7c41"
+}

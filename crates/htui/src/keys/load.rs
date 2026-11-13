@@ -1436,8 +1436,8 @@ quit = ["x", "shift-a"]
 
     #[test]
     fn a_view_table_refuses_what_none_of_its_modes_offer() {
-        let boxes = "has edit_tags, edit_quirks, executor, probe, edit_spec, and may override \
-                     down, up, yes, no, save, reload, dismiss, next_section, prev_section";
+        let boxes = "has edit_tags, edit_quirks, executor, probe, edit_spec, log_level, and may \
+                     override down, up, yes, no, save, reload, dismiss, next_section, prev_section";
         assert_eq!(
             errors("[settings.boxes]\nedit = \"E\"\n"),
             one(

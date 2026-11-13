@@ -346,7 +346,7 @@ fn deadline_elapsed(input: &SettleInput<'_>) -> bool {
 /// A borrowed bundle rather than eight arguments repeated across [`apply`] and [`edge_loop`]:
 /// both need the same seven things, and the engine builds it once per iteration.
 #[derive(Debug)]
-pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> {
+pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd> {
     /// The store every write goes through.
     pub store: &'a S,
     /// Plan D8's clock: every instant below comes from here and from nowhere else.
@@ -367,6 +367,58 @@ pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> 
     /// accept a run that already reads `awaiting_approval`: any other parked run is another
     /// writer's, and plan D125/D145's `StaleWrite` stands.
     pub walk: Option<&'a dyn WalkPark>,
+    /// MOD-164 D11: who writes the run's terminal `finish_run` when the gate ends it — the
+    /// engine's `end_run`, which captures first. `None` writes `finish_run` here directly.
+    pub end: Option<&'a E>,
+}
+
+/// MOD-164 D11: the run end a [`GateContext`] hands its terminal `finish_run` to. The engine
+/// implements it with `end_run`, so a run the gate ends gets its capture step first.
+pub trait RunEnd: Sync {
+    /// Ends `run` at `to` with `failure` at `at`: whatever the end owes, then `finish_run`.
+    ///
+    /// # Errors
+    /// What the end and `finish_run` raise.
+    fn end(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), EngineError>>;
+}
+
+/// The [`RunEnd`] of a [`GateContext`] with `end: None`, which names none: never built.
+#[derive(Debug)]
+pub enum NoEnd {}
+
+impl RunEnd for NoEnd {
+    async fn end(
+        &self,
+        _run: RunId,
+        _to: RunStatus,
+        _failure: Option<&str>,
+        _at: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        match *self {}
+    }
+}
+
+/// The run's terminal write from the gate: through [`GateContext::end`] when the engine named
+/// one (MOD-164 D11), else `finish_run` directly.
+async fn finish<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
+    to: RunStatus,
+    failure: &str,
+    at: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    match ctx.end {
+        Some(end) => end.end(ctx.run.id, to, Some(failure), at).await,
+        None => Ok(ctx
+            .store
+            .finish_run(ctx.run.id, to, Some(failure), at)
+            .await?),
+    }
 }
 
 /// MOD-138 M3 D3 (F6): the open walk a [`GateContext`] runs in, asked by a park whether the run it
@@ -377,7 +429,7 @@ pub trait WalkPark: core::fmt::Debug + Sync {
     fn shares_park(&self, run: RunId) -> bool;
 }
 
-impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> {
+impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd> GateContext<'_, S, C, E> {
     /// The run's item, or `None` for a chat run (which the walk never produces).
     const fn item(&self) -> Option<ItemId> {
         self.run.item_id
@@ -442,8 +494,8 @@ pub enum Landing {
 ///
 /// # Errors
 /// [`EngineError::StaleWrite`], and every [`EngineError`] the writes can raise.
-pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     phase: &SnapshotPhase,
     settle: Settle,
@@ -550,8 +602,8 @@ fn gate_note(settle: &Settle) -> Option<String> {
 /// `park_step` writes no note, and `answer_gate` is the gate's answer, not its question.
 ///
 /// A settle with nothing to say writes nothing: the happy path adds no rows.
-async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     note: Option<&str>,
     now: DateTime<Utc>,
@@ -584,8 +636,8 @@ async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// MOD-138 M3 D3 (V15, blueprint §3.7): a run a sibling node of the walk parked first is parked
 /// already, so only the step moves (`running -> awaiting_approval`); the store's `park_step`
 /// moves both or neither, so the move is made here. Its note was written before the park.
-async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     phase: &SnapshotPhase,
 ) -> Result<Landing, EngineError> {
@@ -652,8 +704,8 @@ pub fn asks_you(snapshot: &GraphSnapshot, node: &str) -> bool {
 /// The shared validator refuses a back `asks_you` edge beside another `asks_you` edge (rule W5 of
 /// `walk_refusal`, MOD-138 M3 D8: at save and at resolve), so the node has forward `asks_you`
 /// edges only, or exactly one back one; only the first back edge is read.
-async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn asks_you_stop<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     phase: &SnapshotPhase,
     note: Option<&str>,
@@ -859,8 +911,8 @@ fn escalation_note(edge: &SnapshotEdge, target: &str, attempts: i32, reason: Loo
 /// **not** created here — the walk's cursor creates it at `next_attempt`, which is the one place
 /// that reads `max(attempt) + 1` from rows and therefore the one place that cannot trip
 /// `UNIQUE (run_id, position, attempt, fanout_index)` (blueprint H-4).
-async fn retry_or_fail<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn retry_or_fail<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     phase: &SnapshotPhase,
     failure: &StepFailure,
@@ -876,14 +928,7 @@ async fn retry_or_fail<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
             attempt: step.attempt + 1,
         });
     }
-    ctx.store
-        .finish_run(
-            ctx.run.id,
-            RunStatus::Failed,
-            Some(&failure.run_failure_text()),
-            now,
-        )
-        .await?;
+    finish(ctx, RunStatus::Failed, &failure.run_failure_text(), now).await?;
     Ok(Landing::Rest(Rest {
         run: RunStatus::Failed,
         position: Some(phase.position),
@@ -894,8 +939,8 @@ async fn retry_or_fail<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// One step compare-and-set on the walk's path. `Ok(false)` is plan D125's
 /// [`EngineError::StaleWrite`]: another writer moved the row first, and the walk writes nothing
 /// further.
-async fn move_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn move_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: StepId,
     from: StepStatus,
     to: StepStatus,
@@ -941,8 +986,8 @@ pub(crate) async fn reject_step<S: htui_core::store::WorkerStore + ?Sized>(
 /// sibling node of the walk may have parked it ([`WalkPark::shares_park`], the engine twin's
 /// rule). Outside a walk, or in one with no sibling to have parked it, a parked run is another
 /// writer's (T3 repair 1), and the caller's `StaleWrite` stands (plan D125, D145).
-async fn sibling_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn sibling_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
 ) -> Result<bool, EngineError> {
     if !ctx.walk.is_some_and(|walk| walk.shares_park(ctx.run.id)) {
         return Ok(false);
@@ -957,8 +1002,8 @@ async fn sibling_parked<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// MOD-138 M3 D3 (blueprint §3.7): the run `running -> awaiting_approval`, or already there
 /// because a sibling parked it first ([`sibling_parked`]). Any other status, and a run another
 /// writer parked, is `stale_run`, as before.
-async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
     if ctx
@@ -982,8 +1027,8 @@ async fn park_the_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 }
 
 /// Re-reads one step row after a write moved it (plan D16: nothing is remembered across a write).
-async fn reread<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn reread<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
 ) -> Result<RunStep, EngineError> {
     let steps = ctx.store.run_steps(ctx.run.id).await?;
@@ -1092,8 +1137,8 @@ pub enum LoopOutcome {
 /// # Errors
 /// Every [`EngineError`] the writes can raise, and [`EngineError::StaleWrite`] when a retired row
 /// or, on escalation, the run was moved by another writer first (plan D125).
-pub async fn edge_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+pub async fn edge_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     source: &RunStep,
     edge: &SnapshotEdge,
 ) -> Result<LoopOutcome, EngineError> {
@@ -1143,18 +1188,17 @@ pub async fn edge_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 }
 
 /// The loop found nothing to go back to: the run fails `no_loop_target` (plan D5, blueprint A4).
-async fn no_target<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn no_target<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     now: DateTime<Utc>,
 ) -> Result<LoopOutcome, EngineError> {
-    ctx.store
-        .finish_run(
-            ctx.run.id,
-            RunStatus::Failed,
-            Some(&RunFailure::NoLoopTarget.to_string()),
-            now,
-        )
-        .await?;
+    finish(
+        ctx,
+        RunStatus::Failed,
+        &RunFailure::NoLoopTarget.to_string(),
+        now,
+    )
+    .await?;
     Ok(LoopOutcome::NoTarget)
 }
 
@@ -1203,8 +1247,8 @@ fn landing(outcome: LoopOutcome, edge: &SnapshotEdge, source: &RunStep) -> Landi
 /// the latest per kind, and hashes them through `prompt::digest::canonical`, the workspace's one
 /// normalisation, so a review re-emitted with different line endings does not read as progress.
 /// The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
-async fn no_progress<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn no_progress<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     target: i32,
     review_position: i32,
@@ -1238,8 +1282,8 @@ async fn no_progress<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// commit it makes is a descendant of both of attempt `a`'s hashes, pre- and post-merge, and
 /// differs from each. Keeping the pre-merge hash as well would therefore change no answer, and
 /// reconcile keeps a `NULL` `after_hash` `NULL`.
-async fn commits_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn commits_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     target: i32,
     attempt: i32,
@@ -1290,8 +1334,8 @@ async fn commits_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Siz
 /// Every "cannot tell" answers `false`, so the loop is not stopped: a chat run, a snapshot with
 /// no such position, fewer than two turns, a turn that wrote no review, or a head whose body read
 /// answers `None` because the row went between the two reads.
-async fn reviews_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn reviews_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     review_position: i32,
 ) -> Result<bool, EngineError> {
@@ -1340,8 +1384,8 @@ async fn reviews_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Siz
 /// §4.4 step 3, widened to the whole chain by plan D5, split by status by fact-check F14b and
 /// carried to the loop's region by MOD-138 M2 D7: every position of `region`, in its order
 /// (target first, source last, blueprint A6), is retired through [`retire_slot`].
-async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     region: &[i32],
     now: DateTime<Utc>,
@@ -1387,8 +1431,8 @@ async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// # Errors
 /// Every [`EngineError`] `supersede_step`, `transition_step` and `abandon_plans` can raise, and
 /// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
-pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     position: i32,
     now: DateTime<Utc>,
@@ -1421,8 +1465,8 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
 ///
 /// # Errors
 /// As [`retire_slot`].
-async fn retire_parts<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn retire_parts<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     steps: &[RunStep],
     planner: &RunStep,
     now: DateTime<Utc>,
@@ -1437,8 +1481,8 @@ async fn retire_parts<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 ///
 /// # Errors
 /// As [`retire_slot`].
-async fn retire_row<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn retire_row<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     step: &RunStep,
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
@@ -1484,8 +1528,8 @@ async fn retire_row<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
 /// for it (blueprint A5), so its budget-spent escalation is [`asks_you_stop`]'s (A9), which never
 /// blocks the item. The `AsksYou` guard below only keeps a direct caller from blocking the item
 /// over a source that is `done` + `approved`, which `answer_gate` (no item guard) would walk on.
-async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
-    ctx: &GateContext<'_, S, C>,
+async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized, E: RunEnd>(
+    ctx: &GateContext<'_, S, C, E>,
     source: &RunStep,
     target: &SnapshotPhase,
     edge: &SnapshotEdge,
@@ -2166,6 +2210,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let done = [StepStatus::Running, StepStatus::Done];
         let a = step_at(&store, 10, "a", 1, 0, &done).await;
@@ -2222,6 +2267,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let implement = step_at(
             &store,
@@ -2305,6 +2351,7 @@ mod tests {
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
                 walk: None,
+                end: None::<&super::NoEnd>,
             };
             let prd = step_of(
                 &store,
@@ -2428,6 +2475,7 @@ mod tests {
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
                 walk: None,
+                end: None::<&super::NoEnd>,
             };
             let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
@@ -2506,6 +2554,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let item = run.item_id.expect("a graph run has an item");
         let before = store
@@ -2606,6 +2655,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         // `plan` has no row: a decision skipped it.
         let review = step_of(
@@ -2672,6 +2722,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let prd = step_of(&store, ids::RUN_4, (0, 1, 0), "prd", &[StepStatus::Running]).await;
 
@@ -2725,6 +2776,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         step_of(
             &store,
@@ -2840,6 +2892,7 @@ mod tests {
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
                 walk: walk.as_ref().map(|walk| walk as &dyn super::WalkPark),
+                end: None::<&super::NoEnd>,
             };
             let running = step_of(
                 &store,
@@ -2925,6 +2978,7 @@ mod tests {
                 box_id: ids::BOX,
                 fence: StepFence::Unleased,
                 walk: walk.as_ref().map(|walk| walk as &dyn super::WalkPark),
+                end: None::<&super::NoEnd>,
             };
             let source = step_of(
                 &store,
@@ -3119,6 +3173,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let third = step(&store, 1, 2, &[]).await;
         let judge = step(&store, 1, -1, &[StepStatus::Running, StepStatus::Done]).await;
@@ -3156,6 +3211,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let live = step(&store, 2, 0, &[StepStatus::Running]).await;
         let failed = step(&store, 2, 1, &[StepStatus::Running, StepStatus::Failed]).await;
@@ -3200,6 +3256,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let row = |position: i32, attempt: i32, name: &str, role, parent| NewRunStep {
             id: StepId::new(),
@@ -3323,6 +3380,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let row = |position: i32, name: &str, role, parent| NewRunStep {
             id: StepId::new(),
@@ -3468,6 +3526,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let settled = [StepStatus::Running, StepStatus::Done];
         let loser = step(&store, 2, 0, &settled).await;
@@ -3543,6 +3602,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -3589,6 +3649,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -3671,6 +3732,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         produce(&store, "review", Some(&first), "no tests").await;
@@ -3734,6 +3796,7 @@ mod tests {
             box_id: ids::BOX,
             fence: StepFence::Unleased,
             walk: None,
+            end: None::<&super::NoEnd>,
         };
         let failed = step(&store, 2, 0, &[StepStatus::Running, StepStatus::Failed]).await;
         let refused = super::apply(

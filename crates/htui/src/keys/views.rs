@@ -539,6 +539,7 @@ pub const BOXES_BROWSE: Stack<'static> = Stack::new(&[
             Act::BoxesExecutor,
             Act::BoxesProbe,
             Act::BoxesEditSpec,
+            Act::BoxesLogLevel,
         ],
     ),
     SETTINGS,
@@ -1626,6 +1627,10 @@ mod tests {
             resolve(BOXES_BROWSE, "w"),
             [Act::BoxesExecutor, Act::Workspaces]
         );
+        // MOD-122 M2 F8: `v` cycles the worker log level; section navigation is untouched.
+        assert_eq!(resolve(BOXES_BROWSE, "v"), [Act::BoxesLogLevel]);
+        assert_eq!(resolve(BOXES_BROWSE, "shift-right"), [Act::NextSection]);
+        assert_eq!(resolve(BOXES_BROWSE, "shift-left"), [Act::PrevSection]);
         assert_eq!(resolve(KINDS_BROWSE, "g"), [Act::KindsGraph]);
         assert_eq!(resolve(KINDS_BROWSE, "enter"), [Act::KindsEditor]);
         assert_eq!(resolve(CONCEPTS_QUERY, "?"), []);

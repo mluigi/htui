@@ -1,7 +1,7 @@
-//! The prompt settings behind `Settings > Prompt`: the twelve `app_setting` keys of the registry
-//! (`0002`'s ten plus MOD-163's unseeded `memory_capture` and MOD-141's unseeded
-//! `compete_fan_out`) and, per project of the scope, the keys the `Project` rung accepts (MOD-15
-//! milestone 5, D1/D3).
+//! The prompt settings behind `Settings > Prompt`: the thirteen `app_setting` keys of the registry
+//! (`0002`'s ten plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded `compete_fan_out`
+//! and MOD-164's unseeded `light_model`), the agent registry the `light_model` row picks from, and,
+//! per project of the scope, the keys the `Project` rung accepts (MOD-15 milestone 5, D1/D3).
 //!
 //! One read per event and never one per keystroke (M3 D5's trade), one reply out, and every write
 //! through milestone 1's compare-and-set seam. The section renders from the snapshot and never
@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use htui_core::model::{Project, Scope};
+use htui_core::model::{AgentSummary, Project, Scope};
 use htui_core::prompt::{Rungs, SettingKey};
 use htui_core::store::{CasOutcome, ReadStore, Result, SettingRung, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
@@ -27,18 +27,21 @@ use serde_json::Value;
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
-/// One read of the scope: the twelve `App` rows, then every project of the scope that still names a
-/// row, each with the keys the `Project` rung accepts.
+/// One read of the scope: the thirteen `App` rows, the agents, then every project of the scope that
+/// still names a row, each with the keys the `Project` rung accepts.
 ///
 /// `Eq` is absent for the reason [`CatalogueSnapshot`](crate::catalogue::CatalogueSnapshot) gives:
 /// [`Project`] derives `PartialEq` only, and adding a derive to `htui-core` for this crate's
 /// convenience is not this milestone's to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsSnapshot {
-    /// The `App` rung, in [`SettingKey::app_keys`] order — always twelve entries; `memory_capture`
-    /// (MOD-163 D19) and `compete_fan_out` (MOD-141 M2 D5) have no `0002` seed row, so each reads
-    /// `value: None` until someone sets it.
+    /// The `App` rung, in [`SettingKey::app_keys`] order — always thirteen entries;
+    /// `memory_capture` (MOD-163 D19), `compete_fan_out` (MOD-141 M2 D5) and `light_model`
+    /// (MOD-164 D7) have no `0002` seed row, so each reads `value: None` until someone sets it.
     pub app: Vec<AppEntry>,
+    /// The agent registry as `Backend::agents` lists it (MOD-164 D7): the `light_model` row names
+    /// its agent from here and cycles through the enabled agents' models.
+    pub agents: Vec<AgentSummary>,
     /// The scope's projects, in `scope.project_ids` order; an id that names no row is skipped
     /// (D3), exactly as [`crate::catalogue::snapshot`] skips one.
     pub projects: Vec<ProjectEntry>,
@@ -103,7 +106,7 @@ impl SettingsSnapshot {
             .collect()
     }
 
-    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than twelve.
+    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than thirteen.
     #[must_use]
     pub fn app_entry(&self, key: SettingKey) -> Option<&AppEntry> {
         self.app.iter().find(|entry| entry.key == key)
@@ -121,12 +124,16 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
         .filter(|key| key.spec().rungs.contains(Rungs::PROJECT))
 }
 
-/// One read of the whole scope: the twelve `App` rows with their tokens, then every project of
-/// `scope.project_ids` that still names a row, with the keys the `Project` rung accepts.
+/// One read of the whole scope: the thirteen `App` rows with their tokens, `agents` as the caller
+/// read them in the same request, then every project of `scope.project_ids` that still names a
+/// row, with the keys the `Project` rung accepts.
 ///
-/// N+1 reads on purpose (D3, M3 D5's trade, same words): twelve `setting(App, _)` plus, per project,
-/// one `project()` and one `setting(Project(id), _)` per project key. They happen per event —
-/// activation, a scope change, after a write — never per keystroke.
+/// `agents` is a parameter rather than a read here because the registry is an inherent
+/// `Backend`/`PgStore` read that the [`Writer`] this runs over does not carry (MOD-164 D7).
+///
+/// N+1 reads on purpose (D3, M3 D5's trade, same words): thirteen `setting(App, _)` plus, per
+/// project, one `project()` and one `setting(Project(id), _)` per project key. They happen per
+/// event — activation, a scope change, after a write — never per keystroke.
 ///
 /// A project that vanishes between its `project()` and its `setting()` calls yields `value: None`
 /// rather than an error: a torn read is not a state to render, and the write that follows answers
@@ -140,6 +147,7 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
 /// Whatever the store reports.
 pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
     store: &S,
+    agents: Vec<AgentSummary>,
     scope: &Scope,
 ) -> Result<SettingsSnapshot> {
     let mut app = Vec::with_capacity(SettingKey::app_keys().count());
@@ -170,7 +178,11 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
         projects.push(ProjectEntry { project, values });
     }
 
-    Ok(SettingsSnapshot { app, projects })
+    Ok(SettingsSnapshot {
+        app,
+        agents,
+        projects,
+    })
 }
 
 /// Serves one prompt settings request, off the UI task.
@@ -191,7 +203,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
 
     match request {
-        StoreRequest::PromptSettings(scope) => reread(&writer, scope).await,
+        StoreRequest::PromptSettings(scope) => reread(backend, &writer, scope).await,
         // `set` and `clear` are separate operations because clearing lets the rung below — and in
         // the end the compiled default — answer, rather than the editor guessing at a constant
         // (PRD D7, D10). `expected` keeps the seam's own asymmetry: `Option` on the set, where
@@ -206,7 +218,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let outcome = writer
                 .set_setting(*rung, *key, value.clone(), *expected)
                 .await?;
-            cas(&writer, scope, &outcome).await
+            cas(backend, &writer, scope, &outcome).await
         }
         StoreRequest::ClearSetting {
             scope,
@@ -215,7 +227,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             expected,
         } => {
             let outcome = writer.clear_setting(*rung, *key, *expected).await?;
-            cas(&writer, scope, &outcome).await
+            cas(backend, &writer, scope, &outcome).await
         }
         // `try_serve` routes exactly this module's three variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
@@ -227,10 +239,15 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
     }
 }
 
+/// The settings as they are now, with the agents read in the same request (MOD-164 D7).
+async fn read(backend: &Backend, writer: &Writer, scope: &Scope) -> Result<SettingsSnapshot> {
+    snapshot(writer, backend.agents().await?, scope).await
+}
+
 /// The settings as they are now, for a read or for a write that applied.
-async fn reread(writer: &Writer, scope: &Scope) -> Result<StoreReply> {
+async fn reread(backend: &Backend, writer: &Writer, scope: &Scope) -> Result<StoreReply> {
     Ok(StoreReply::PromptSettings(Box::new(
-        snapshot(writer, scope).await?,
+        read(backend, writer, scope).await?,
     )))
 }
 
@@ -240,8 +257,13 @@ async fn reread(writer: &Writer, scope: &Scope) -> Result<StoreReply> {
 ///
 /// The worker re-reads rather than handing the section the single row `Stale` carries: the section
 /// renders a tree of rungs, and a row patched in locally would be a second source of truth (D3).
-async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Result<StoreReply> {
-    let fresh = Box::new(snapshot(writer, scope).await?);
+async fn cas<T>(
+    backend: &Backend,
+    writer: &Writer,
+    scope: &Scope,
+    outcome: &CasOutcome<T>,
+) -> Result<StoreReply> {
+    let fresh = Box::new(read(backend, writer, scope).await?);
     Ok(match outcome {
         CasOutcome::Applied(_) => StoreReply::PromptSettings(fresh),
         CasOutcome::Stale(_) => StoreReply::PromptSettingsStale(fresh),

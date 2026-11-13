@@ -2120,6 +2120,15 @@ impl Isolator for StallAfterReconcile<'_> {
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
         self.inner.release(run)
     }
+
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        self.inner.reacquire(run, step, trees)
+    }
 }
 
 impl Fixture {

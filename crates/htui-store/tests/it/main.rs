@@ -11,3 +11,4 @@ mod qdrant_url_pg;
 mod read_only_pg;
 mod skill_attachments;
 mod skill_writers;
+mod worker_log_pg;

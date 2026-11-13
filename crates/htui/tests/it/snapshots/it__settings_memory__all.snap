@@ -3,12 +3,12 @@ source: crates/htui/tests/settings_memory.rs
 expression: "frame(&bench, &section)"
 ---
 memory · vulkan-tutorials (all states)
-▌gotcha   Build cache     active      2026-11-07
+▌gotcha   Build cache     active      person  2026-11-07
      Clear target/ when the sqlx offline data goes stale.
- decision Error crates    active      2026-11-05
- fact     Shader dir      suspect     2026-11-03
- lesson   Flaky test      retired     2026-11-02
- fact     Old shader dir  superseded  2026-11-01
+ decision Error crates    active      person  2026-11-05
+ fact     Shader dir      suspect     person  2026-11-03
+ lesson   Flaky test      retired     person  2026-11-02
+ fact     Old shader dir  superseded  person  2026-11-01
 
 
 

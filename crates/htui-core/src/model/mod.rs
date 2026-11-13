@@ -111,6 +111,7 @@ pub mod stop;
 pub mod usage;
 pub mod user;
 pub mod waiting;
+pub mod worker_log;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
@@ -148,9 +149,11 @@ pub use kind::{
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use memory::{
-    MEMORY_BODY_MAX, MEMORY_SUBJECT_MAX, MemoryBody, MemoryEntry, MemoryKind, MemoryPatch,
-    MemoryRevision, MemorySource, MemoryState, MemorySubject, MemorySupersede, MemoryTextError,
-    MemoryUpdate, NewMemoryEntry, SnapshotMemory, SnapshotMemoryEntry, memory_subject_key,
+    MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,
+    MemoryEntry, MemoryEvidence, MemoryKind, MemoryPatch, MemoryRevision, MemorySource,
+    MemoryState, MemorySubject, MemorySupersede, MemoryTextError, MemoryUpdate, MemoryUsage,
+    NewMemoryEntry, NewRunMemory, RunMemoryWrite, RunProvenance, SnapshotMemory,
+    SnapshotMemoryEntry, memory_subject_key,
 };
 pub use note::{NewNote, Note};
 pub use overlap::{
@@ -193,15 +196,16 @@ pub use requirement::{
     RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
 };
 pub use run::{
-    ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
-    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
-    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotDivide, SnapshotEdge, SnapshotGraph,
-    SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource,
-    SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
-    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    CAPTURE_KEY, CAPTURE_POSITION, COMMAND_LOG_CAP, COMMAND_LOG_STORE_MAX, ChatRunSpec, CommandLog,
+    CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun, NewRunPlan,
+    NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission, PlanStatus,
+    PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode, RunPlan, RunStatus,
+    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS,
+    SnapshotCandidate, SnapshotCapture, SnapshotCaptureModel, SnapshotDivide, SnapshotEdge,
+    SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings,
+    SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
+    StoredCommandLog, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
+    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -215,6 +219,9 @@ pub use stop::{PendingStop, StopMode, WorkspaceStop};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 pub use waiting::{WaitingCandidate, WaitingPermission};
+pub use worker_log::{
+    LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
+};
 
 #[cfg(test)]
 mod tests {

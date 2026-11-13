@@ -54,8 +54,14 @@ use crate::model::{
     WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
     moved_order, overlaps, prompt_summary, scope_of,
 };
+use crate::model::{
+    CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
+    RunProvenance,
+};
+use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
+use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::DEFAULT_TEMPLATES;
@@ -68,7 +74,7 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
-use crate::store::traits::cancel_of_a_stopped_run;
+use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
@@ -91,6 +97,9 @@ use crate::store::traits::{
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
+};
+use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     workspace_graph_is_held,
 };
@@ -104,6 +113,7 @@ use crate::store::traits::{
     scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
+use crate::store::worker_log::WorkerLogStore;
 use uuid::Uuid;
 
 /// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
@@ -172,6 +182,9 @@ pub enum MemFault {
     /// [`WriteStore::admit_plan`] (MOD-139 M2 D14): the admission a crash cut off before its
     /// commit.
     AdmitPlan,
+    /// [`ReadStore::repos`] (MOD-125 M3 F1): a read a stopped step's resume makes beside its
+    /// trees, which must fail before any guard is retaken.
+    Repos,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -328,6 +341,9 @@ struct State {
     /// filter-and-sort [`State::command_runs`] does is cheaper than a compound key that would have
     /// to be maintained. No fixture loads it — MOD-4 milestone 3 is its first writer anywhere.
     command_runs: BTreeMap<CommandRunId, CommandRun>,
+    /// `command_log` (MOD-152 D1), keyed by its row's id; it goes with the row, as
+    /// `ON DELETE CASCADE` takes it on Postgres.
+    command_logs: BTreeMap<CommandRunId, CommandLog>,
     /// The liveness of every `running` `command_run` row a claim admitted (MOD-11 D14, B-16), by
     /// row id; a row leaves the map when it finishes, is cancelled or is reaped.
     command_claims: HashMap<CommandRunId, CommandClaim>,
@@ -377,6 +393,20 @@ struct State {
     memory_revisions: Vec<MemoryRevision>,
     /// MOD-139 D1: `run_plan`, append-only in revisions. No fixture loads one (plan D8).
     run_plans: Vec<RunPlan>,
+    /// MOD-122 M2 plan D1: `worker_log`, in id order, each row with its `user_id`. No fixture
+    /// loads one (plan D12).
+    worker_logs: Vec<WorkerLogRow>,
+    /// The last `worker_log.id` handed out, the identity column's counter.
+    worker_log_last_id: i64,
+}
+
+/// One `worker_log` row: the line the TUI reads, and the user it belongs to.
+#[derive(Debug, Clone)]
+struct WorkerLogRow {
+    /// `worker_log.user_id`.
+    user_id: UserId,
+    /// Every other column.
+    line: WorkerLogLine,
 }
 
 impl MemStore {
@@ -467,6 +497,7 @@ impl MemStore {
             step_trees: BTreeMap::new(),
             step_commits: BTreeMap::new(),
             command_runs: BTreeMap::new(),
+            command_logs: BTreeMap::new(),
             command_claims: HashMap::new(),
             lease_owners: HashMap::new(),
             openings: HashMap::new(),
@@ -500,6 +531,8 @@ impl MemStore {
             memory_entries: HashMap::new(),
             memory_revisions: Vec::new(),
             run_plans: Vec::new(),
+            worker_logs: Vec::new(),
+            worker_log_last_id: 0,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -5972,6 +6005,8 @@ impl State {
         self.command_runs
             .retain(|_, row| !gone.steps.contains(&row.run_step_id));
         let command_runs = &self.command_runs;
+        self.command_logs
+            .retain(|id, _| command_runs.contains_key(id));
         self.command_claims
             .retain(|id, _| command_runs.contains_key(id));
         self.steps.retain(|id, _| !gone.steps.contains(id));
@@ -6054,6 +6089,39 @@ impl State {
         }) {
             row.superseded_by = None;
             row.updated_at = now;
+        }
+        // MOD-164 D1: a surviving run's entry naming a gone run, step or item loses that pointer
+        // (`ON DELETE SET NULL`), and the trigger stamps it. The capture step writes into its
+        // run's own project, so today such an entry went with the project above.
+        for row in self.memory_entries.values_mut() {
+            let Some(provenance) = row.provenance.as_mut() else {
+                continue;
+            };
+            let mut cleared = false;
+            if provenance
+                .run_id
+                .is_some_and(|run| gone.runs.contains(&run))
+            {
+                provenance.run_id = None;
+                cleared = true;
+            }
+            if provenance
+                .step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                provenance.step_id = None;
+                cleared = true;
+            }
+            if provenance
+                .item_id
+                .is_some_and(|item| gone.items.contains(&item))
+            {
+                provenance.item_id = None;
+                cleared = true;
+            }
+            if cleared {
+                row.updated_at = now;
+            }
         }
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
@@ -6777,13 +6845,8 @@ impl State {
         if self.lease_owners.get(&run) != Some(&owner) || status != RunStatus::Running {
             return Ok(false);
         }
-        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4); stopping the run would strand
-        // it, since no executor's poll lists a stopped run's cancel.
-        if self.run_commands.values().any(|c| {
-            c.run_id == run
-                && c.kind == RunCommandKind::Cancel
-                && c.status == RunCommandStatus::Pending
-        }) {
+        // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4).
+        if self.cancel_pending(run) {
             return Ok(false);
         }
         self.lease_owners.remove(&run);
@@ -6793,6 +6856,112 @@ impl State {
             row.updated_at = now;
         }
         self.stop_running_steps(run, now);
+        Ok(true)
+    }
+
+    /// MOD-125 M3 D1: [`WriteStore::pending_resumes`]: the box's stopped runs whose workspace has
+    /// no stop record (a run without a workspace has none), by `(queued_at, id)`.
+    fn pending_resumes(&self, box_id: BoxId) -> Vec<RunId> {
+        let mut rows: Vec<(DateTime<Utc>, RunId)> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.status == RunStatus::Stopped
+                    && row.executing_box_id == Some(box_id)
+                    && row
+                        .workspace_id
+                        .is_none_or(|workspace| !self.workspace_stops.contains_key(&workspace))
+            })
+            .map(|row| (row.queued_at, row.id))
+            .collect();
+        rows.sort_unstable();
+        rows.into_iter().map(|(_, run)| run).collect()
+    }
+
+    /// MOD-125 M3 D2: the compare-and-set `stopped -> running` that takes the lease; `false`
+    /// writes nothing.
+    fn resume_run(
+        &mut self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self.require_run(run)?;
+        let gated = row
+            .workspace_id
+            .is_some_and(|workspace| self.workspace_stops.contains_key(&workspace));
+        if row.status != RunStatus::Stopped
+            || row.executing_box_id != Some(box_id)
+            || gated
+            || self.cancel_pending(run)
+        {
+            return Ok(false);
+        }
+        self.lease_owners.insert(run, owner);
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Running;
+            row.lease_box_id = Some(box_id);
+            row.lease_expires_at = Some(now + ttl);
+            row.updated_at = now;
+        }
+        Ok(true)
+    }
+
+    /// Whether a `pending` cancel of `run` exists: the hold-off of [`State::stop_run`] and
+    /// [`State::resume_run`] (the cancel wins).
+    fn cancel_pending(&self, run: RunId) -> bool {
+        self.run_commands.values().any(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        })
+    }
+
+    /// MOD-125 M3 D2, D6: the compare-and-set `stopped -> cancelled`, with the run's unsettled
+    /// steps, its pending follow-ups and windows, and its pending cancel; `false` writes nothing.
+    fn cancel_stopped_run(
+        &mut self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self.require_run(run)?;
+        if row.status != RunStatus::Stopped || row.executing_box_id != box_id {
+            return Ok(false);
+        }
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Cancelled;
+            row.finished_at = row.finished_at.or(Some(at));
+            row.updated_at = now;
+        }
+        for step in self
+            .steps
+            .values_mut()
+            .filter(|step| step.run_id == run && !step.status.is_terminal())
+        {
+            step.status = StepStatus::Cancelled;
+            step.finished_at = step.finished_at.or(Some(at));
+            step.updated_at = now;
+        }
+        // `close_dropped_follow_ups` writes for a lease owner only, and a stopped run has none.
+        for window in self.follow_up_windows.values_mut() {
+            if window.run_id == run && window.closed_at.is_none() {
+                window.closed_at = Some(now);
+            }
+        }
+        self.refuse_follow_ups(|row, _| row.run_id == run, FOLLOW_UP_RUN_CANCELLED, now);
+        for command in self.run_commands.values_mut().filter(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        }) {
+            command.status = RunCommandStatus::Applied;
+            command.resolution = None;
+            command.resolved_at = Some(now);
+        }
         Ok(true)
     }
 
@@ -7495,9 +7664,13 @@ impl State {
         for id in losers {
             if let Some(row) = self.steps.get_mut(&id) {
                 row.selected = Some(false);
+                // MOD-125 M3 (L-7): a stopped loser is superseded too.
                 if matches!(
                     row.status,
-                    StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done
+                    StepStatus::Pending
+                        | StepStatus::AwaitingApproval
+                        | StepStatus::Done
+                        | StepStatus::Stopped
                 ) {
                     row.status = StepStatus::Superseded;
                 }
@@ -7505,16 +7678,20 @@ impl State {
             }
         }
         for id in judges {
-            if let Some(row) = self.steps.get_mut(&id)
-                && matches!(
-                    row.status,
-                    StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
-                )
-            {
-                row.status = StepStatus::Done;
-                row.gate_note.clone_from(&reason);
-                row.updated_at = now;
-            }
+            let Some(row) = self.steps.get_mut(&id) else {
+                continue;
+            };
+            let to = match row.status {
+                StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval => {
+                    StepStatus::Done
+                }
+                // MOD-125 M3 (L-7): `stopped -> done` is illegal; a stopped judge is superseded.
+                StepStatus::Stopped => StepStatus::Superseded,
+                _ => continue,
+            };
+            row.status = to;
+            row.gate_note.clone_from(&reason);
+            row.updated_at = now;
         }
         Ok(())
     }
@@ -7872,6 +8049,43 @@ impl State {
         Ok(true)
     }
 
+    /// MOD-152 D5: [`WriteStore::put_command_log`]'s act: upsert by row id, the row must exist.
+    fn put_command_log(&mut self, log: CommandLog) -> Result<()> {
+        if log.text.len() > COMMAND_LOG_STORE_MAX {
+            return Err(StoreError::Constraint(command_log_too_large(
+                log.text.len(),
+            )));
+        }
+        self.require_command_run(log.command_run_id)?;
+        self.command_logs.insert(log.command_run_id, log);
+        Ok(())
+    }
+
+    /// MOD-152 D5: [`WriteStore::command_log_of_run`]'s read: a row of any step of `run`.
+    fn command_log_of_run(&self, run: RunId, id: Option<CommandRunId>) -> Option<StoredCommandLog> {
+        let of_run = |row: &&CommandRun| {
+            self.steps
+                .get(&row.run_step_id)
+                .is_some_and(|step| step.run_id == run)
+        };
+        let row = match id {
+            Some(id) => self.command_runs.get(&id).filter(of_run),
+            None => self
+                .command_runs
+                .values()
+                .filter(of_run)
+                .max_by(|left, right| {
+                    left.queued_at
+                        .cmp(&right.queued_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                }),
+        }?;
+        Some(StoredCommandLog {
+            row: row.clone(),
+            log: self.command_logs.get(&row.id).cloned(),
+        })
+    }
+
     /// A step's `command_run` rows in `(queued_at, id)` order; an unknown step reads empty.
     fn command_runs(&self, step: StepId) -> Vec<CommandRun> {
         let mut rows: Vec<CommandRun> = self
@@ -8132,6 +8346,8 @@ impl State {
         // A terminal row reaches nothing, so `run_is_terminal` would only say the same thing in a
         // second sentence: the law already refuses `done -> done`.
         legal_move(from, to)?;
+        // MOD-164 D5: the terminal move happens once, so the usage tally does too.
+        self.tally_memory_usage(run);
 
         if let Some(row) = self.runs.get_mut(&run) {
             row.status = to;
@@ -9227,6 +9443,10 @@ impl State {
             created_by: new.created_by,
             created_at: now,
             updated_at: now,
+            source: MemorySource::Person,
+            provenance: None,
+            evidence: None,
+            usage: MemoryUsage::default(),
         };
         self.memory_revisions.push(MemoryRevision {
             entry_id: row.id,
@@ -9380,6 +9600,150 @@ impl State {
             .create_memory_entry(head.project_id, new, now)
             .expect("every check of the create passed above under the same lock");
         Ok(MemorySupersede::Superseded { old, new })
+    }
+
+    /// [`WriteStore::write_run_memory`] (MOD-164 D4), in Postgres's order: the fence, the capture
+    /// stage, the cap, then the folded subject's live holder. Every refusal is decided before the
+    /// first write; then at most one supersede and one insert, the supersede first.
+    fn write_run_memory(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+        now: DateTime<Utc>,
+    ) -> Result<RunMemoryWrite> {
+        let (run, item, project) = self.step_scope(step, fence)?;
+        let row = self.require_step(step)?;
+        if row.role != StepRole::Stage || row.node_key.as_deref() != Some(CAPTURE_KEY) {
+            return Err(StoreError::Constraint(
+                MEMORY_NEEDS_A_CAPTURE_STEP.to_owned(),
+            ));
+        }
+        let (agent_id, model) = (row.agent_id, row.model.clone());
+        let cites_the_run = |cited: &crate::model::MemoryCitation| {
+            self.steps
+                .get(&cited.step_id)
+                .is_some_and(|cited| cited.run_id == run)
+        };
+        if new.evidence.citations.is_empty() || !new.evidence.citations.iter().all(cites_the_run) {
+            return Err(StoreError::Constraint(
+                MEMORY_EVIDENCE_OUTSIDE_THE_RUN.to_owned(),
+            ));
+        }
+        let written = self
+            .memory_entries
+            .values()
+            .filter(|entry| entry.provenance.as_ref().and_then(|stamp| stamp.step_id) == Some(step))
+            .count();
+        if u32::try_from(written).unwrap_or(u32::MAX) >= MEMORY_RUN_WRITE_CAP {
+            return Ok(RunMemoryWrite::CapReached {
+                cap: MEMORY_RUN_WRITE_CAP,
+            });
+        }
+        let run_row = self.require_run(run)?;
+        let (author, box_id) = (run_row.started_by, run_row.lease_box_id);
+
+        let key = memory_subject_key(new.subject.as_str());
+        let holder = self
+            .memory_entries
+            .values()
+            .filter(|entry| {
+                entry.project_id == project
+                    && entry.state.is_live()
+                    && memory_subject_key(&entry.subject) == key
+            })
+            .min_by_key(|entry| entry.id)
+            .map(|entry| {
+                (
+                    entry.id,
+                    run_memory_held_by_a_person(entry.source, entry.version),
+                )
+            });
+        if let Some((existing, true)) = holder {
+            return Ok(RunMemoryWrite::PersonHolds { existing });
+        }
+        if self.memory_entries.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "memory_entry",
+                new.id,
+            )));
+        }
+        self.require_user(author, "memory_entry.created_by")?;
+        self.require_memory_box(box_id)?;
+
+        let entry = NewMemoryEntry {
+            id: new.id,
+            kind: new.kind,
+            subject: new.subject,
+            body: new.body,
+            created_by: author,
+            box_id,
+        };
+        let old = holder
+            .map(|(old, _)| self.apply_memory_edit(old, MemoryEdit::superseded_by(&entry), now));
+        let id = self
+            .create_memory_entry(project, entry, now)
+            .expect("every check of the create passed above under the same lock")
+            .id;
+        let created = self
+            .memory_entries
+            .get_mut(&id)
+            .expect("the create inserted the row under the same lock");
+        created.source = MemorySource::Run;
+        created.provenance = Some(RunProvenance {
+            run_id: Some(run),
+            step_id: Some(step),
+            item_id: item,
+            agent_id,
+            model,
+            commit: new.commit,
+        });
+        created.evidence = Some(new.evidence);
+        let created = created.clone();
+        Ok(match old {
+            Some(old) => RunMemoryWrite::Superseded { old, new: created },
+            None => RunMemoryWrite::Created(created),
+        })
+    }
+
+    /// MOD-164 D5: [`WriteStore::finish_run`]'s usage tally. For every step of `run` whose
+    /// `trim_record.memory.shown` is an array, each distinct listed `id` naming an entry (the
+    /// text equal to the entry id's, as Postgres compares `id::text`) gains one showing, and one
+    /// done or one failed by the step's status. `updated_at` stays, as 0033's trigger keeps it in
+    /// Postgres: memory is walked newest first by it (D6), and a count is not an edit.
+    fn tally_memory_usage(&mut self, run: RunId) {
+        let mut shown: Vec<(MemoryEntryId, StepStatus)> = Vec::new();
+        for step in self.steps.values().filter(|row| row.run_id == run) {
+            let Some(rows) = step
+                .trim_record
+                .as_ref()
+                .and_then(|record| record.get("memory"))
+                .and_then(|memory| memory.get("shown"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let listed: BTreeSet<MemoryEntryId> = rows
+                .iter()
+                .filter_map(|row| row.get("id")?.as_str())
+                .filter_map(|text| {
+                    let id = Uuid::parse_str(text).ok()?;
+                    (id.to_string() == text).then(|| MemoryEntryId::from_uuid(id))
+                })
+                .collect();
+            shown.extend(listed.into_iter().map(|id| (id, step.status)));
+        }
+        for (id, status) in shown {
+            let Some(entry) = self.memory_entries.get_mut(&id) else {
+                continue;
+            };
+            entry.usage.shown += 1;
+            match status {
+                StepStatus::Done => entry.usage.done += 1,
+                StepStatus::Failed => entry.usage.failed += 1,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -9692,11 +10056,9 @@ impl State {
         box_id: BoxId,
         now: DateTime<Utc>,
     ) -> Result<CancelRequest> {
-        // MOD-125 M2 R1 (review M-1): a stopped run takes no cancel row, which no executor's
-        // poll would apply; the state's one lock serialises this with `stop_run`.
-        if self.require_run(run)?.status == RunStatus::Stopped {
-            return Err(StoreError::Constraint(cancel_of_a_stopped_run(run)));
-        }
+        // MOD-125 M3 D6: a stopped run takes the cancel too; its box's poll lists it. The
+        // state's one lock serialises this with `stop_run` (MOD-125 M2 R1).
+        self.require_run(run)?;
         self.require_actor(user, box_id, "run_command", "issued")?;
         // MOD-70 D5, B-14: both answers refuse the run's pending follow-ups, idempotently.
         if let Some(pending) = self
@@ -9741,6 +10103,8 @@ impl State {
             };
             row.executing_box_id == Some(box_id)
                 && (row.status.is_terminal()
+                    // MOD-125 M3 D6: a stopped run holds no lease; its box applies the cancel.
+                    || row.status == RunStatus::Stopped
                     || (matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
                         && (!self.lease_owners.contains_key(&run)
                             || row.lease_expires_at.is_none_or(|expiry| expiry <= now))))
@@ -10496,6 +10860,8 @@ impl WriteStore for MemStore {
     }
 
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::Repos)?;
         Ok(self.read(|state| state.repo_rows(project)))
     }
 
@@ -10867,6 +11233,32 @@ impl WriteStore for MemStore {
         self.write(|state| state.stop_run(run, owner, now))
     }
 
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        Ok(self.read(|state| state.pending_resumes(box_id)))
+    }
+
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.resume_run(run, box_id, owner, ttl, now))
+    }
+
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.cancel_stopped_run(run, box_id, at, now))
+    }
+
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         let now = self.now();
         self.write(|state| state.create_step(new, now))
@@ -11123,6 +11515,16 @@ impl WriteStore for MemStore {
         let now = self.now();
         self.write(|state| state.cancel_command(id, now))
     }
+    async fn put_command_log(&self, log: CommandLog) -> Result<()> {
+        self.write(|state| state.put_command_log(log))
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>> {
+        Ok(self.read(|state| state.command_log_of_run(run, id)))
+    }
 
     // ---- ANA-11 §5.1 (MOD-38): requirements and citations, one `write` closure each ----
 
@@ -11358,6 +11760,15 @@ impl WriteStore for MemStore {
         let now = self.now();
         self.write(|state| state.supersede_memory_entry(old, expected_version, new, now))
     }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        let now = self.now();
+        self.write(|state| state.write_run_memory(fence, step, new, now))
+    }
 
     // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
 
@@ -11408,6 +11819,159 @@ impl WriteStore for MemStore {
     async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
         let now = self.now();
         Ok(self.write(|state| state.close_dropped_follow_ups(run, owner, reason, now)))
+    }
+}
+
+/// MOD-122 M2 plan D1: `worker_log` in memory, `PgStore`'s rules (blueprint F13). `received_at`
+/// is this handle's clock; `logged_at` is kept at Postgres's precision.
+impl WorkerLogStore for MemStore {
+    async fn append_worker_logs(&self, box_id: BoxId, lines: &[NewWorkerLog]) -> Result<u64> {
+        if lines.is_empty() {
+            return Ok(0);
+        }
+        // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.append_worker_logs(user, box_id, lines, now))
+    }
+
+    async fn worker_logs(&self, after: Option<i64>, limit: u32) -> Result<Vec<WorkerLogLine>> {
+        let user = self.this_user();
+        Ok(self.read(|state| state.worker_logs(user, after, limit)))
+    }
+
+    async fn prune_worker_logs(&self, older_than: DateTime<Utc>, per_box_cap: u32) -> Result<u64> {
+        Ok(self.write(|state| state.prune_worker_logs(older_than, per_box_cap)))
+    }
+
+    async fn set_box_log_level(&self, box_id: BoxId, level: Option<LogShipLevel>) -> Result<bool> {
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.set_box_log_level(user, box_id, level, now))
+    }
+}
+
+impl State {
+    /// [`MemStore::append_worker_logs`]'s body: `NotFound` for a box that is not `user`'s, else
+    /// every line, in order, under rising ids.
+    fn append_worker_logs(
+        &mut self,
+        user: Option<UserId>,
+        box_id: BoxId,
+        lines: &[NewWorkerLog],
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        let Some(row) = self
+            .boxes
+            .get(&box_id)
+            .filter(|row| Some(row.user_id) == user)
+        else {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        };
+        let (user_id, box_name) = (row.user_id, row.hostname.clone());
+        for line in lines {
+            self.worker_log_last_id += 1;
+            self.worker_logs.push(WorkerLogRow {
+                user_id,
+                line: WorkerLogLine {
+                    id: self.worker_log_last_id,
+                    box_id: Some(box_id),
+                    box_name: box_name.clone(),
+                    logged_at: line.logged_at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
+                    received_at: now,
+                    level: line.level,
+                    target: line.stored_target().into_owned(),
+                    text: line.stored_text().into_owned(),
+                },
+            });
+        }
+        Ok(u64::try_from(lines.len()).unwrap_or(u64::MAX))
+    }
+
+    /// [`MemStore::worker_logs`]'s body: `user`'s rows only, none for no user.
+    fn worker_logs(
+        &self,
+        user: Option<UserId>,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Vec<WorkerLogLine> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mine = self
+            .worker_logs
+            .iter()
+            .filter(|row| Some(row.user_id) == user)
+            .map(|row| &row.line);
+        if let Some(after) = after {
+            return mine
+                .filter(|line| line.id > after)
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        let mut newest: Vec<WorkerLogLine> = mine.rev().take(limit).cloned().collect();
+        newest.reverse();
+        newest
+    }
+
+    /// [`MemStore::prune_worker_logs`]'s body: the age cut, then the cap over rows whose box is
+    /// still set, newest kept (blueprint F14).
+    fn prune_worker_logs(&mut self, older_than: DateTime<Utc>, per_box_cap: u32) -> u64 {
+        let before = self.worker_logs.len();
+        self.worker_logs
+            .retain(|row| row.line.received_at >= older_than);
+        let cap = usize::try_from(per_box_cap).unwrap_or(usize::MAX);
+        let mut seen: HashMap<BoxId, usize> = HashMap::new();
+        let mut keep = vec![true; self.worker_logs.len()];
+        for (index, row) in self.worker_logs.iter().enumerate().rev() {
+            if let Some(box_id) = row.line.box_id {
+                let count = seen.entry(box_id).or_default();
+                *count += 1;
+                keep[index] = *count <= cap;
+            }
+        }
+        let mut keep = keep.into_iter();
+        self.worker_logs.retain(|_| keep.next().unwrap_or(true));
+        u64::try_from(before - self.worker_logs.len()).unwrap_or(u64::MAX)
+    }
+
+    /// [`MemStore::set_box_log_level`]'s body: `false` for a box that is not `user`'s,
+    /// `Constraint` for a blob that is not an object, else the one key. `now` stands in for
+    /// Postgres's `set_updated_at` trigger; `edit_version` does not move.
+    fn set_box_log_level(
+        &mut self,
+        user: Option<UserId>,
+        box_id: BoxId,
+        level: Option<LogShipLevel>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(row) = self
+            .boxes
+            .get_mut(&box_id)
+            .filter(|row| Some(row.user_id) == user)
+        else {
+            return Ok(false);
+        };
+        let Some(settings) = row.settings.as_object_mut() else {
+            return Err(StoreError::Constraint(
+                BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+            ));
+        };
+        match level {
+            Some(level) => {
+                settings.insert(
+                    LogShipLevel::KEY.to_owned(),
+                    Value::String(level.as_str().to_owned()),
+                );
+            }
+            None => {
+                settings.remove(LogShipLevel::KEY);
+            }
+        }
+        row.updated_at = now;
+        Ok(true)
     }
 }
 
@@ -14834,6 +15398,7 @@ mod tests {
             scope: None,
             personas: Vec::new(),
             memory: None,
+            capture: None,
             source: None,
             edges: Vec::new(),
         }
@@ -15009,6 +15574,226 @@ mod tests {
             ),
             "an unknown item is NotFound before the law is asked (plan D14)"
         );
+    }
+
+    /// The fixture plus a stranger (created after the fixture user, so not this user) owning a
+    /// copy of the fixture box, and a second box of this user's named `SECOND`. Returns the
+    /// store, the stranger, the stranger's box and the second box.
+    fn demo_with_foreign_and_second_box() -> (MemStore, UserId, BoxId, BoxId) {
+        use crate::model::AppUser;
+
+        let mut data = crate::fixtures::demo_data();
+        let fixture_box = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let stranger = UserId::new();
+        let now = Utc::now();
+        data.users.push(AppUser {
+            id: stranger,
+            name: "stranger".to_owned(),
+            email: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let foreign = BoxId::from_uuid(Uuid::from_u128(2));
+        let mut theirs = fixture_box.clone();
+        theirs.id = foreign;
+        theirs.user_id = stranger;
+        theirs.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(theirs);
+        let second = BoxId::from_uuid(Uuid::from_u128(3));
+        let mut mine = fixture_box;
+        mine.id = second;
+        mine.hostname = "SECOND".to_owned();
+        data.boxes.push(mine);
+        let store = MemStore::from_demo(data);
+        assert_ne!(
+            store.this_user(),
+            Some(stranger),
+            "the fixture user stays this user"
+        );
+        (store, stranger, foreign, second)
+    }
+
+    fn worker_line(text: &str) -> crate::model::NewWorkerLog {
+        crate::model::NewWorkerLog {
+            logged_at: Utc::now(),
+            level: crate::model::WorkerLogLevel::Info,
+            target: "htui::worker".to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    /// MOD-122 M2 plan D1 (blueprint F2): another user's box is `NotFound` on append and `false`
+    /// on the level, its blob untouched; a read returns only this user's rows. The Postgres half
+    /// is `worker_log_pg.rs::another_users_box_is_refused_and_unread`.
+    #[tokio::test]
+    async fn worker_log_another_user_s_box_is_refused_and_unread_in_memory() {
+        use crate::model::LogShipLevel;
+        use crate::store::WorkerLogStore as _;
+
+        let (store, stranger, foreign, _) = demo_with_foreign_and_second_box();
+        let answer = store
+            .append_worker_logs(foreign, &[worker_line("theirs")])
+            .await;
+        assert!(
+            matches!(answer, Err(StoreError::NotFound { entity: "box", .. })),
+            "another user's box is NotFound, got {answer:?}"
+        );
+        let before = store.box_row(foreign).await.expect("box_row never fails");
+        assert!(
+            !store
+                .set_box_log_level(foreign, Some(LogShipLevel::Debug))
+                .await
+                .expect("the level is answered"),
+            "another user's box is `false`"
+        );
+        assert_eq!(
+            store.box_row(foreign).await.expect("box_row never fails"),
+            before,
+            "their blob is untouched"
+        );
+
+        // No trait path writes a stranger's row, so it is planted, as Postgres would hold it.
+        store.write(|state| {
+            state.worker_log_last_id += 1;
+            state.worker_logs.push(super::WorkerLogRow {
+                user_id: stranger,
+                line: crate::model::WorkerLogLine {
+                    id: state.worker_log_last_id,
+                    box_id: Some(foreign),
+                    box_name: "ELSEWHERE".to_owned(),
+                    logged_at: Utc::now(),
+                    received_at: Utc::now(),
+                    level: crate::model::WorkerLogLevel::Error,
+                    target: "htui::worker".to_owned(),
+                    text: "theirs".to_owned(),
+                },
+            });
+        });
+        store
+            .append_worker_logs(ids::BOX, &[worker_line("mine")])
+            .await
+            .expect("this user's box takes the line");
+        for after in [None, Some(0)] {
+            let read = store.worker_logs(after, 100).await.expect("a read");
+            let texts: Vec<&str> = read.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(texts, ["mine"], "only this user's rows ({after:?})");
+        }
+    }
+
+    /// MOD-122 M2 plan D4 (blueprint F2): the cap is per box, so one box over it leaves another
+    /// box's rows alone, and a row is stamped with its own box's hostname. The Postgres half is
+    /// `worker_log_pg.rs::the_cap_leaves_another_box_alone`.
+    #[tokio::test]
+    async fn worker_log_cap_leaves_another_box_alone_in_memory() {
+        use crate::store::WorkerLogStore as _;
+
+        let (store, _, _, second) = demo_with_foreign_and_second_box();
+        let four: Vec<_> = (1..=4).map(|n| worker_line(&format!("a-{n}"))).collect();
+        store
+            .append_worker_logs(ids::BOX, &four)
+            .await
+            .expect("the fixture box takes four");
+        store
+            .append_worker_logs(second, &[worker_line("b-1"), worker_line("b-2")])
+            .await
+            .expect("the second box takes two");
+        let far_past = Utc::now() - TimeDelta::days(3650);
+        assert_eq!(
+            store.prune_worker_logs(far_past, 3).await.expect("a sweep"),
+            1,
+            "only the fixture box is over the cap"
+        );
+        let read = store.worker_logs(None, 100).await.expect("a read");
+        let rows: Vec<(&str, &str)> = read
+            .iter()
+            .map(|line| (line.box_name.as_str(), line.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("DESKTOP-HTUI", "a-2"),
+                ("DESKTOP-HTUI", "a-3"),
+                ("DESKTOP-HTUI", "a-4"),
+                ("SECOND", "b-1"),
+                ("SECOND", "b-2"),
+            ]
+        );
+    }
+
+    /// MOD-122 M2 plan D7: a `box.settings` blob that is not an object takes no level, set or
+    /// cleared: `Constraint(BOX_SETTINGS_NOT_AN_OBJECT)`, and the row is untouched. The Postgres
+    /// half is `worker_log_pg.rs::a_non_object_blob_takes_no_level`.
+    #[tokio::test]
+    async fn worker_log_level_refuses_a_non_object_blob_in_memory() {
+        use crate::model::LogShipLevel;
+        use crate::store::WorkerLogStore as _;
+        use crate::store::traits::BOX_SETTINGS_NOT_AN_OBJECT;
+
+        for blob in [json!([]), json!("x"), Value::Null] {
+            let store = demo_with_box_settings(blob.clone());
+            let before = store.box_row(ids::BOX).await.expect("box_row never fails");
+            for level in [Some(LogShipLevel::Debug), None] {
+                match store.set_box_log_level(ids::BOX, level).await {
+                    Err(StoreError::Constraint(said)) => {
+                        assert_eq!(said, BOX_SETTINGS_NOT_AN_OBJECT, "{blob}");
+                    }
+                    other => panic!("{blob}: a non-object blob is a Constraint, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                store.box_row(ids::BOX).await.expect("box_row never fails"),
+                before,
+                "{blob}: the refusal wrote nothing"
+            );
+        }
+    }
+
+    /// MOD-122 M2 (blueprint F13): an empty store has no user, so an append is `NotFound` and a
+    /// read is empty; setting a level stamps `updated_at` and leaves `edit_version` alone.
+    #[tokio::test]
+    async fn worker_log_needs_a_user_and_a_level_stamps_updated_at_in_memory() {
+        use crate::model::LogShipLevel;
+        use crate::store::WorkerLogStore as _;
+
+        let empty = MemStore::new();
+        assert!(matches!(
+            empty
+                .append_worker_logs(ids::BOX, &[worker_line("x")])
+                .await,
+            Err(StoreError::NotFound { entity: "box", .. })
+        ));
+        assert_eq!(
+            empty.worker_logs(None, 10).await.expect("a read"),
+            Vec::new()
+        );
+
+        let store = demo_with_box_settings(json!({}));
+        let before = store
+            .box_row(ids::BOX)
+            .await
+            .expect("box_row never fails")
+            .expect("the fixture box");
+        assert!(
+            store
+                .set_box_log_level(ids::BOX, Some(LogShipLevel::Info))
+                .await
+                .expect("the level is set")
+        );
+        let after = store
+            .box_row(ids::BOX)
+            .await
+            .expect("box_row never fails")
+            .expect("the fixture box");
+        assert!(
+            after.updated_at > before.updated_at,
+            "updated_at is stamped"
+        );
+        assert_eq!(after.edit_version, before.edit_version);
     }
 
     /// The demo store with the fixture box's `box.settings` replaced by `settings`.
@@ -16247,6 +17032,142 @@ mod tests {
             None,
             "another position is not part of this fan-out"
         );
+
+        // MOD-125 M3 (L-7): a stopped loser and a stopped judge, in a slot of their own.
+        let kept = gated_step(&store, new_step(ids::RUN_2, 4, 1, 0)).await;
+        let mut halted = Vec::new();
+        for fanout in [1, -1] {
+            let spec = new_step(ids::RUN_2, 4, 1, fanout);
+            let id = spec.id;
+            store.create_step(spec).await.expect("the step lands");
+            for (from, to) in [
+                (StepStatus::Pending, StepStatus::Running),
+                (StepStatus::Running, StepStatus::Stopped),
+            ] {
+                assert!(
+                    store
+                        .transition_step(id, from, to, at)
+                        .await
+                        .expect("the move reads"),
+                    "{from} -> {to} is a sanctioned move"
+                );
+            }
+            halted.push(id);
+        }
+        store
+            .select_fanout(ids::RUN_2, 4, 1, kept, Some("cut short".to_owned()))
+            .await
+            .expect("the selection lands");
+        assert_eq!(
+            (by_id(halted[0]).selected, by_id(halted[0]).status),
+            (Some(false), StepStatus::Superseded),
+            "a stopped loser is superseded"
+        );
+        assert_eq!(
+            (
+                by_id(halted[1]).status,
+                by_id(halted[1]).gate_note.as_deref()
+            ),
+            (StepStatus::Superseded, Some("cut short")),
+            "a stopped judge is superseded, never done, with the reason"
+        );
+        assert_eq!(by_id(kept).status, StepStatus::Done);
+    }
+
+    /// MOD-125 M3 D2: what the generic case cannot read back once the run is terminal. A stopped
+    /// run's cancel row is resolved `applied` with no resolution, its pending follow-up refused
+    /// with `FOLLOW_UP_RUN_CANCELLED` and its windows closed, all in the one write.
+    #[tokio::test]
+    async fn cancel_stopped_run_applies_the_cancel_and_closes_the_windows() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let at = Utc::now();
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run lands")
+            .id;
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                .await
+                .expect("the claim reads"),
+            Claim::Admitted
+        );
+        let spec = new_step(run, 0, 1, 0);
+        let step = spec.id;
+        store.create_step(spec).await.expect("the step lands");
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect("the move reads")
+        );
+        let session = RelaySessionId::new();
+        assert!(
+            store
+                .open_follow_ups(run, step, session, owner)
+                .await
+                .expect("the window opens")
+        );
+        let asked = crate::model::RunCommandId::new();
+        store
+            .request_follow_up(NewFollowUp {
+                id: asked,
+                run_step_id: step,
+                text: FollowUpText::new("use the smaller fixture".to_owned()).expect("prose"),
+                issued_by: ids::USER,
+                issued_box: ids::BOX,
+            })
+            .await
+            .expect("the follow-up is queued");
+        assert!(store.stop_run(run, owner).await.expect("the stop reads"));
+        let CancelRequest::Inserted(cancel) = store
+            .request_cancel(run, ids::USER, ids::BOX)
+            .await
+            .expect("the cancel lands")
+        else {
+            panic!("a stopped run's cancel writes its row");
+        };
+        // The cancel itself refuses the follow-up; put it back to pending to see this write's.
+        store.write(|state| {
+            let row = state.run_commands.get_mut(&asked).expect("the follow-up");
+            row.status = RunCommandStatus::Pending;
+            row.resolution = None;
+            row.resolved_at = None;
+        });
+
+        assert!(
+            store
+                .cancel_stopped_run(run, Some(ids::BOX), at)
+                .await
+                .expect("the cancel reads")
+        );
+        store.read(|state| {
+            let applied = &state.run_commands[&cancel];
+            assert_eq!(
+                (applied.status, applied.resolution.as_deref()),
+                (RunCommandStatus::Applied, None),
+                "the pending cancel is applied"
+            );
+            let refused = &state.run_commands[&asked];
+            assert_eq!(
+                (refused.status, refused.resolution.as_deref()),
+                (
+                    RunCommandStatus::Refused,
+                    Some(crate::model::FOLLOW_UP_RUN_CANCELLED)
+                ),
+                "the pending follow-up is refused with the run"
+            );
+            assert!(
+                state
+                    .follow_up_windows
+                    .values()
+                    .filter(|window| window.run_id == run)
+                    .all(|window| window.closed_at.is_some()),
+                "every window of the run is closed"
+            );
+        });
     }
 
     /// `run_step_tree` and `run_step_commit` upsert on `(run_step_id, repo_id)` and read back in

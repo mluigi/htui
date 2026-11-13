@@ -18,7 +18,8 @@ use crate::model::ids::{ItemId, MemoryEntryId, RepoId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::{
-    MemoryEntry, MemoryKind, MemorySource, MemoryState, SnapshotMemory, SnapshotMemoryEntry,
+    MemoryEntry, MemoryKind, MemorySource, MemoryState, MemoryUsage, SnapshotMemory,
+    SnapshotMemoryEntry,
 };
 use crate::model::run::{PartMerge, PartPremerge, PremergeReport, RepoPremerge, RunStatus};
 use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
@@ -804,6 +805,10 @@ pub fn memory_entry(
         created_by: crate::fixtures::ids::USER,
         created_at: updated_at,
         updated_at,
+        source: MemorySource::Person,
+        provenance: None,
+        evidence: None,
+        usage: MemoryUsage::default(),
     }
 }
 

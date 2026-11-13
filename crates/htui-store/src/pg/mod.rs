@@ -9,6 +9,7 @@ mod demo;
 mod read;
 mod relay;
 mod rows;
+mod worker_log;
 mod write;
 
 use std::str::FromStr as _;

@@ -1258,6 +1258,26 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn stop_run(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
         self.inner.stop_run(run, owner).await
     }
+    async fn pending_resumes(&self, box_id: BoxId) -> StoreResult<Vec<RunId>> {
+        self.inner.pending_resumes(box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> StoreResult<bool> {
+        self.inner.resume_run(run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.cancel_stopped_run(run, box_id, at).await
+    }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
     }
@@ -1484,6 +1504,16 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> StoreResult<bool> {
         self.inner.cancel_command(id).await
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> StoreResult<()> {
+        self.inner.put_command_log(log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> StoreResult<Option<htui_core::model::StoredCommandLog>> {
+        self.inner.command_log_of_run(run, id).await
+    }
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
     async fn set_requirement_spec(
         &self,
@@ -1671,6 +1701,16 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         self.inner
             .supersede_memory_entry(old, expected_version, new)
             .await
+    }
+
+    // MOD-164: forwarded, never logged.
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: htui_core::model::NewRunMemory,
+    ) -> StoreResult<htui_core::model::RunMemoryWrite> {
+        self.inner.write_run_memory(fence, step, new).await
     }
 
     // MOD-70: forwarded, never logged (as MOD-42's relay methods).

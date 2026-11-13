@@ -1,3 +1,4 @@
+mod capture;
 mod mem_store;
 mod prompt_digest;
 mod prompt_golden;

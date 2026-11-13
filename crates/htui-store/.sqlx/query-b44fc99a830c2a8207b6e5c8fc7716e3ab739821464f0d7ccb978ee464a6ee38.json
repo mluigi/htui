@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO worker_log (user_id, box_id, box_name, logged_at, level, target, text)\n                SELECT b.user_id, b.id, b.hostname, t.logged_at, t.level, t.target, t.text\n                  FROM box b\n                 CROSS JOIN UNNEST($3::timestamptz[], $4::text[], $5::text[], $6::text[])\n                       WITH ORDINALITY AS t(logged_at, level, target, text, n)\n                 WHERE b.id = $1 AND b.user_id = $2\n                 ORDER BY t.n\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TimestamptzArray",
+        "TextArray",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b44fc99a830c2a8207b6e5c8fc7716e3ab739821464f0d7ccb978ee464a6ee38"
+}

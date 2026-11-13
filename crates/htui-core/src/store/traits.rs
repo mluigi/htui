@@ -51,32 +51,34 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::ItemState;
+use crate::model::StoredCommandLog;
 use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
-    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
-    CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
+    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandLog,
+    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
     FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
-    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
-    NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunPlan, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope,
+    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
@@ -1696,20 +1698,85 @@ pub trait WriteStore: ReadStore {
     /// `lease_expires_at = <store now>`, `lease_box_id` and `executing_box_id` kept). No
     /// `finished_at`, no item write. `Ok(false)` when the run is not `running` or not `owner`'s,
     /// or (MOD-125 M2 R1, review M-1) a cancel of it is `pending`, decided under the run's lock:
-    /// a pending cancel wins (M2 D4), and a stopped run would strand it, since no executor's poll
-    /// lists a stopped run's cancel. Nothing is written then. The caller has quiesced its walk
+    /// a pending cancel wins (M2 D4). Nothing is written then. The caller has quiesced its walk
     /// (M2): a step it starts concurrently is not this verb's to stop.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool>;
 
+    // ---- MOD-125 M3 (plan D1, D2): resume and cancel of a stopped run --------------------------
+
+    /// MOD-125 M3 D1: the runs `box_id` owes a resume: `status = 'stopped' AND executing_box_id =
+    /// box_id` and no `workspace_stop` row for the run's `workspace_id`, in `(queued_at, id)`
+    /// order. The request is the absence of the stop row ([`resume_workspace`] deletes it), so a
+    /// box that was offline resumes its runs when it comes back. A run without a workspace has no
+    /// stop row and is listed as soon as it stops; a box-less stopped run never is (it can only be
+    /// cancelled). No index serves the read; a scan of the box's runs is accepted.
+    ///
+    /// [`resume_workspace`]: WriteStore::resume_workspace
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>>;
+
+    /// MOD-125 M3 D2: one compare-and-set `stopped -> running` that takes the lease, in
+    /// [`take_lease`]'s shape: `lease_owner = owner`, `lease_box_id = box_id`, `lease_expires_at =
+    /// <store now> + ttl`. No step moves (the engine resumes them). `Ok(false)`, nothing written,
+    /// when the run is not `stopped`, executes on another box, its workspace has a
+    /// `workspace_stop` row (stopped again), or a cancel of it is `pending` (the hold-off
+    /// [`stop_run`] has: the cancel wins). A run without a workspace passes the gate. On Postgres,
+    /// as [`claim_run`]: the run locked, then the stop row `FOR SHARE`, then the cancel read; a
+    /// stop committed after the gate read finds a `running` run leased to `owner`, which
+    /// [`pending_stops`] lists.
+    ///
+    /// [`take_lease`]: WriteStore::take_lease
+    /// [`stop_run`]: WriteStore::stop_run
+    /// [`claim_run`]: WriteStore::claim_run
+    /// [`pending_stops`]: WriteStore::pending_stops
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range,
+    /// before any read; [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run" }`, the first read.
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool>;
+
+    /// MOD-125 M3 D2, D6: one compare-and-set `stopped -> cancelled`, `finished_at =
+    /// COALESCE(finished_at, at)` (the caller's clock, as [`finish_run`]), lease-less. In the same
+    /// transaction every step of the run that is not terminal (`stopped`, `pending`,
+    /// `awaiting_approval`, `failed`) moves to `cancelled` with the same `finished_at`, every
+    /// `pending` follow-up of the run is refused with
+    /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) and its windows closed
+    /// (`close_dropped_follow_ups` writes only for a lease owner, and the run has none), and a
+    /// `pending` cancel of the run is resolved `applied`. `Some(b)` requires `executing_box_id =
+    /// b`, `None` requires it `NULL`. `Ok(false)`, nothing written, when the run is not `stopped`
+    /// or executes elsewhere. The item is not written (MOD-144). On Postgres the steps are locked
+    /// before the run, as [`stop_run`] locks them.
+    ///
+    /// [`finish_run`]: WriteStore::finish_run
+    /// [`stop_run`]: WriteStore::stop_run
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted. `role`,
     /// `parent_step_id` and `node_key` (MOD-139 D3) are written once, here.
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) first for a row
-    /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -3..-1 or off
+    /// [`run_step_refusal`] refuses (a part without its parent or key; a stage off -4..-1 or off
     /// [`STAGE_KEYS`](crate::model::STAGE_KEYS); a negative position on any other role; a NUL key),
     /// judged before any read and worded alike on every backend; then on an unknown run, agent or
     /// parent step (foreign key, like [`append_events`](WriteStore::append_events)), a duplicate
@@ -1795,10 +1862,12 @@ pub trait WriteStore: ReadStore {
     /// ANA-2 §4.5's bookkeeping, one transaction (plan D6): among the steps of
     /// `(run, position, attempt)` with `fanout_index >= 0`, the winner becomes
     /// `selected = true, status = done`; every other candidate becomes `selected = false` and,
-    /// when its status is `pending`, `awaiting_approval` or `done`, `superseded` (a `failed` or
-    /// `cancelled` loser keeps its status); the judge row (`fanout_index = -1`), when there is
-    /// one, becomes `done` with `gate_note = reason` — but only from `pending`, `running` or
-    /// `awaiting_approval`. A judge that already reached an outcome is left alone entirely, status
+    /// when its status is `pending`, `awaiting_approval`, `done` or (MOD-125 M3, L-7) `stopped`,
+    /// `superseded` (a `failed` or `cancelled` loser keeps its status); the judge row
+    /// (`fanout_index = -1`), when there is one, becomes `done` with `gate_note = reason` — but
+    /// only from `pending`, `running` or `awaiting_approval`; a `stopped` judge becomes
+    /// `superseded` with `gate_note = reason` instead (`stopped -> done` is not a move §4.3
+    /// sanctions). A judge that already reached an outcome is left alone entirely, status
     /// and `gate_note` both: §4.5's judge-failure path (`docs/ANA-2.md:858-862`) parks the run at
     /// `awaiting_approval` with the failure reason in the judge's `gate_note` and has *a human*
     /// pick through this method, so settling it here would be the `failed -> done` §4.3 rejects,
@@ -2289,15 +2358,16 @@ pub trait WriteStore: ReadStore {
     /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) (MOD-70 D5, B-14; on
     /// `AlreadyPending` too).
     ///
-    /// MOD-125 M2 R1 (review M-1): a `stopped` run is refused, read under a share lock on the run
-    /// row that [`stop_run`](WriteStore::stop_run)'s own lock waits on (and the reverse), so a
-    /// cancel and a stop of one run serialise: either the row is written first and the stop
-    /// answers `false`, or the stop commits first and the cancel is refused. No row, no
-    /// follow-up refused then.
+    /// MOD-125 M2 R1 (review M-1): the run row is read under a share lock that
+    /// [`stop_run`](WriteStore::stop_run)'s own lock waits on (and the reverse), so a cancel and a
+    /// stop of one run serialise: either the row is written first and the stop answers `false`,
+    /// or the stop commits first and the cancel is written on the `stopped` run. MOD-125 M3 D6:
+    /// a `stopped` run takes the cancel, which [`pending_commands`](WriteStore::pending_commands)
+    /// lists for the box it executes on, and which
+    /// [`cancel_stopped_run`](WriteStore::cancel_stopped_run) applies.
     ///
     /// # Errors
-    /// `NotFound { entity: "run" }`; `Constraint` ([`cancel_of_a_stopped_run`]) for a `stopped`
-    /// run; `Constraint` for an unknown user or box (B-7), in that order.
+    /// `NotFound { entity: "run" }`; `Constraint` for an unknown user or box (B-7), in that order.
     async fn request_cancel(
         &self,
         run: RunId,
@@ -2308,8 +2378,10 @@ pub trait WriteStore: ReadStore {
     /// D13, B-4: the `pending` commands this process applies, **cancels only** (MOD-70 D5, I-9),
     /// `(issued_at, id)` order: runs whose
     /// `lease_owner = owner`; runs executing on `box_id` whose lease is free or expired by the
-    /// store's clock and whose status is `running` or `awaiting_approval`; and runs executing on
-    /// `box_id` that are already terminal (the caller refuses those with their status).
+    /// store's clock and whose status is `running` or `awaiting_approval`; runs executing on
+    /// `box_id` that are `stopped` (MOD-125 M3 D6: no lease, so the box applies them); and runs
+    /// executing on `box_id` that are already terminal (the caller refuses those with their
+    /// status).
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -2584,6 +2656,30 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }`.
     async fn cancel_command(&self, id: CommandRunId) -> Result<bool>;
 
+    /// MOD-152 D1, D5: the log of one `command_run` row, upserted by `command_run_id` (the second
+    /// write replaces the first). Unfenced like the queue's own writes: the row is the fence. The
+    /// text arrives scrubbed and capped by the caller (D2, D3); the store only refuses more than
+    /// [`COMMAND_LOG_STORE_MAX`](crate::model::COMMAND_LOG_STORE_MAX) bytes.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }` for
+    /// an unknown row; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a text
+    /// over the maximum (before any write).
+    async fn put_command_log(&self, log: CommandLog) -> Result<()>;
+
+    /// MOD-152 D5: a `command_run` row of `run` (a row of any of the run's steps) with its log, if
+    /// one was written. `id: None` is the run's latest row by `(queued_at, id)`. `Ok(None)`: `id`
+    /// names no row of that run (an unknown row, or another run's), or `id` is `None` and the run
+    /// has no command row. A read on `WriteStore` by the `command_runs` precedent.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<CommandRunId>,
+    ) -> Result<Option<StoredCommandLog>>;
+
     /// MOD-69 plan D4: every `pending` permission request of a scope project's **item** runs whose
     /// owner holds the run's lease live by the store's clock — [`relay_view`](Self::relay_view)'s
     /// predicate over a scope instead of one item — each with the item's key and project, the
@@ -2690,6 +2786,46 @@ pub trait WriteStore: ReadStore {
         expected_version: i32,
         new: NewMemoryEntry,
     ) -> Result<MemorySupersede>;
+
+    // ---- MOD-164: a run's capture step writes memory (plan D4) -------------------------------
+
+    /// A capture step's memory write, one transaction (MOD-164 D4). Decided in this order:
+    ///
+    /// 1. `step` exists and its run carries `fence`'s lease (`NotFound { entity: "run_step" }`,
+    ///    then `Fenced { step }`: `write_step_document`'s order);
+    /// 2. the step is a `stage` row keyed `capture`, else
+    ///    `Constraint(`[`MEMORY_NEEDS_A_CAPTURE_STEP`]`)`;
+    /// 3. `new.evidence` cites at least one step, and every cited step is a step of `step`'s run,
+    ///    else `Constraint(`[`MEMORY_EVIDENCE_OUTSIDE_THE_RUN`]`)`;
+    /// 4. [`MEMORY_RUN_WRITE_CAP`](crate::model::MEMORY_RUN_WRITE_CAP) entries already name
+    ///    `step` (every state): [`RunMemoryWrite::CapReached`], nothing written;
+    /// 5. the live entry of the run's project whose subject folds to `new.subject`'s:
+    ///    none - the entry is created ([`RunMemoryWrite::Created`]); a person's - nothing is
+    ///    written ([`RunMemoryWrite::PersonHolds`]); a run's - it is superseded as
+    ///    [`supersede_memory_entry`](WriteStore::supersede_memory_entry) supersedes one
+    ///    ([`RunMemoryWrite::Superseded`]). A person's is a `person` entry, or a `run` entry a
+    ///    person amended: one past version 1, since a run only creates entries and only moves
+    ///    them to `superseded` ([`run_memory_held_by_a_person`]).
+    ///
+    /// Two writes on one step are serialized: Postgres locks the step row `FOR NO KEY UPDATE`
+    /// before step 1, so the cap's count in step 4 is never read by two writers at once; the
+    /// in-memory store holds its one lock throughout.
+    ///
+    /// The new entry is `source = run`, stamped from the rows, never from `new`: `run_id`,
+    /// `step_id`, `item_id`, `agent_id` and `model` from the step and its run, `created_by` (and
+    /// the revisions' author) the run's `started_by`, the revisions' `box_id` its
+    /// `lease_box_id`. `commit` and `evidence` are `new`'s. Revision 1 is `created`; the old
+    /// entry's is `superseded`.
+    ///
+    /// # Errors
+    /// The refusals of steps 1 to 3 above, then `Constraint(`[`already_exists`]`)` for a
+    /// duplicate `new.id`, and the backend's own failures.
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -2889,12 +3025,13 @@ pub fn phase_name_refusal(name: &str) -> Option<String> {
         .then(|| plan_suffix_phase_name(name))
 }
 
-/// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` and `chk_run_step_stage` of
-/// `0029_divided_fanout.sql`, plus a `node_key` NUL Postgres `text` cannot hold, in the one sentence
-/// both stores give; `None` when the row may be written. Judged before any read. In order: a part
-/// names its parent step and its node key; a step is not its own parent (the self-parent CHECK,
-/// MOD-139 M1 R1); a stage sits at -3..-1; a negative position is a stage's only; a stage's key is
-/// one of [`STAGE_KEYS`]; then the NUL.
+/// MOD-139 D1, D4 (blueprint P-7): `chk_run_step_part` of `0029_divided_fanout.sql` and
+/// `chk_run_step_stage` as `0033_memory_capture.sql` restated it, plus a `node_key` NUL Postgres
+/// `text` cannot hold, in the one sentence both stores give; `None` when the row may be written.
+/// Judged before any read. In order: a part names its parent step and its node key; a step is not
+/// its own parent (the self-parent CHECK, MOD-139 M1 R1); a stage sits at -4..-1 (MOD-164 D3 added
+/// -4); a negative position is a stage's only; a stage's key is one of [`STAGE_KEYS`]; then the
+/// NUL. As in the CHECK, nothing binds a key to its position.
 #[must_use]
 pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     let stage = new.role == StepRole::Stage;
@@ -2904,9 +3041,9 @@ pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
     if new.parent_step_id == Some(new.id) {
         return Some("a step is not its own parent".to_owned());
     }
-    if stage && !(-3..=-1).contains(&new.position) {
+    if stage && !(-4..=-1).contains(&new.position) {
         return Some(format!(
-            "a stage step sits at position -3, -2 or -1, not {}",
+            "a stage step sits at position -4, -3, -2 or -1, not {}",
             new.position
         ));
     }
@@ -2923,7 +3060,7 @@ pub fn run_step_refusal(new: &NewRunStep) -> Option<String> {
             .is_some_and(|key| STAGE_KEYS.contains(&key))
     {
         return Some(format!(
-            "a stage step's node key is pick, prepare or collect, not {}",
+            "a stage step's node key is capture, pick, prepare or collect, not {}",
             new.node_key
                 .as_deref()
                 .map_or_else(|| "none".to_owned(), |key| format!("`{key}`"))
@@ -3717,7 +3854,7 @@ pub fn scope_row_joins_no_workspace(slug: &str) -> String {
 /// ([`RunStatus::is_active`]: `queued`, `running`, `awaiting_approval` or `stopped`, R1 M2).
 /// Everything else the scope row owns cascades and is counted. The advice is "finish or cancel",
 /// never "stop": a `stopped` run is live too, so stopping cannot clear the refusal (a stopped run
-/// is resumed first, then finishes or is cancelled).
+/// is cancelled directly, or resumed and then finishes, MOD-125 M3).
 #[must_use]
 pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3733,8 +3870,9 @@ pub fn workspace_has_live_run(workspace: &str, runs: u64) -> String {
 
 /// MOD-125 M2 D9 (M1 review M-3): `delete_workspace` while `runs` (≥ 1) of its member projects'
 /// runs that recorded this workspace are stopped (DV-2: or still running under its stop). A
-/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names resume: a
-/// stopped run is cancelled or finished only once resumed (M3).
+/// scope-row run is counted by [`workspace_has_live_run`] alone. The advice names the direct
+/// cancel first, then the resume: a stopped run is cancelled directly, or resumed and then
+/// finishes (M3 F2).
 #[must_use]
 pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
     let (noun, pronoun) = if runs == 1 {
@@ -3743,8 +3881,8 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
         ("runs", "them")
     };
     format!(
-        "workspace `{workspace}` has {runs} stopped {noun}; resume the workspace and finish or \
-         cancel {pronoun} before deleting the workspace"
+        "workspace `{workspace}` has {runs} stopped {noun}; cancel {pronoun}, or resume the \
+         workspace and let {pronoun} finish, before deleting the workspace"
     )
 }
 
@@ -3753,15 +3891,6 @@ pub fn workspace_has_stopped_run(workspace: &str, runs: u64) -> String {
 #[must_use]
 pub fn workspace_gone() -> String {
     "this workspace no longer exists: switch workspace".to_owned()
-}
-
-/// MOD-125 M2 R1 (review M-1): a cancel of a `stopped` run. `request_cancel` refuses it in both
-/// stores (no `run_command` row a stopped run's executor would never apply), and the runtime
-/// refuses a pending row that reaches a stopped run in the same words. A stopped run is cancelled
-/// once its workspace is resumed (M3).
-#[must_use]
-pub fn cancel_of_a_stopped_run(run: RunId) -> String {
-    format!("run `{run}` is stopped: resume its workspace first, then cancel it")
 }
 
 /// MOD-147 A2: `delete_project` on a scope row (`slug` is the scope row's, `@<workspace slug>`);
@@ -3861,6 +3990,26 @@ pub fn memory_subject_taken(subject: &str, existing: MemoryEntryId) -> String {
 #[must_use]
 pub fn memory_entry_closed(id: MemoryEntryId, state: MemoryState) -> String {
     format!("memory entry {id} is `{state}`; only an active or suspect entry changes")
+}
+
+/// MOD-164 D4: [`WriteStore::write_run_memory`] writes for a run's capture stage only (`role =
+/// stage`, `node_key = capture`). A stable code word, so the engine can tell it apart.
+pub const MEMORY_NEEDS_A_CAPTURE_STEP: &str = "memory_needs_a_capture_step";
+
+/// MOD-164 D4 (review L4): a run's entry rests on quotes of its own run.
+/// [`WriteStore::write_run_memory`] refuses an empty `evidence.citations` and a citation whose
+/// `step_id` is not a step of the capture step's run. A stable code word, as
+/// [`MEMORY_NEEDS_A_CAPTURE_STEP`].
+pub const MEMORY_EVIDENCE_OUTSIDE_THE_RUN: &str = "memory_evidence_outside_the_run";
+
+/// MOD-164 D4 (review M1): whether a live entry holding a capture write's subject is a person's,
+/// so the run leaves it alone ([`RunMemoryWrite::PersonHolds`]). A `person` entry is; so is a
+/// `run` entry past version 1, since a run only creates entries (version 1) and only moves them
+/// to `superseded` (out of the live set): a live run entry at version 2 or later was amended by a
+/// person, and the text is theirs now. Shared so the two stores cannot disagree.
+#[must_use]
+pub fn run_memory_held_by_a_person(source: MemorySource, version: i32) -> bool {
+    source == MemorySource::Person || version > 1
 }
 
 // ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
@@ -4000,6 +4149,16 @@ pub fn command_not_queued() -> String {
 #[must_use]
 pub fn command_not_claimable(status: CommandRunStatus) -> String {
     format!("command is {status}, not queued")
+}
+
+/// MOD-152 D2: [`WriteStore::put_command_log`] refuses a text over
+/// [`COMMAND_LOG_STORE_MAX`](crate::model::COMMAND_LOG_STORE_MAX) bytes.
+#[must_use]
+pub fn command_log_too_large(len: usize) -> String {
+    format!(
+        "a command log holds at most {} bytes, not {len}",
+        crate::model::COMMAND_LOG_STORE_MAX
+    )
 }
 
 /// D14: [`WriteStore::finish_command`] ends a row; `queued` and `running` are not ends.
@@ -4600,18 +4759,19 @@ mod tests {
         );
     }
 
-    /// MOD-125 M2 D9: the stopped-run refusal counts its runs and names the resume.
+    /// MOD-125 M2 D9: the stopped-run refusal counts its runs; M3 F2: it names the direct
+    /// cancel first, then the resume.
     #[test]
     fn workspace_has_stopped_run_counts_runs() {
         assert_eq!(
             workspace_has_stopped_run("shop", 1),
-            "workspace `shop` has 1 stopped run; resume the workspace and finish or cancel it \
-             before deleting the workspace"
+            "workspace `shop` has 1 stopped run; cancel it, or resume the workspace and let it \
+             finish, before deleting the workspace"
         );
         assert_eq!(
             workspace_has_stopped_run("shop", 2),
-            "workspace `shop` has 2 stopped runs; resume the workspace and finish or cancel \
-             them before deleting the workspace"
+            "workspace `shop` has 2 stopped runs; cancel them, or resume the workspace and let \
+             them finish, before deleting the workspace"
         );
     }
 
@@ -4750,7 +4910,14 @@ mod tests {
             refused(row(StepRole::Part, 5, parent, Some("implement/api"))),
             None
         );
-        for (position, key) in [(-3, "pick"), (-2, "prepare"), (-1, "collect")] {
+        // MOD-164 D3: capture at -4; nothing binds a key to its position, so -4/pick passes too.
+        for (position, key) in [
+            (-4, "capture"),
+            (-4, "pick"),
+            (-3, "pick"),
+            (-2, "prepare"),
+            (-1, "collect"),
+        ] {
             assert_eq!(
                 refused(row(StepRole::Stage, position, None, Some(key))),
                 None,
@@ -4786,11 +4953,15 @@ mod tests {
         // chk_run_step_stage.
         assert_eq!(
             refused(row(StepRole::Stage, 0, None, Some("pick"))).as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not 0")
+            Some("a stage step sits at position -4, -3, -2 or -1, not 0")
         );
         assert_eq!(
-            refused(row(StepRole::Stage, -4, None, Some("pick"))).as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not -4")
+            refused(row(StepRole::Stage, -5, None, Some("capture"))).as_deref(),
+            Some("a stage step sits at position -4, -3, -2 or -1, not -5")
+        );
+        assert_eq!(
+            refused(row(StepRole::Step, -4, None, None)).as_deref(),
+            Some("position -4 is reserved for stage steps, not a step step")
         );
         assert_eq!(
             refused(row(StepRole::Step, -1, None, None)).as_deref(),
@@ -4802,11 +4973,11 @@ mod tests {
         );
         assert_eq!(
             refused(row(StepRole::Stage, -1, None, Some("nope"))).as_deref(),
-            Some("a stage step's node key is pick, prepare or collect, not `nope`")
+            Some("a stage step's node key is capture, pick, prepare or collect, not `nope`")
         );
         assert_eq!(
             refused(row(StepRole::Stage, -1, None, None)).as_deref(),
-            Some("a stage step's node key is pick, prepare or collect, not none")
+            Some("a stage step's node key is capture, pick, prepare or collect, not none")
         );
 
         // The NUL Postgres `text` cannot hold.
@@ -4947,7 +5118,7 @@ mod tests {
                 part.run_id = RunId::new();
             }))
             .as_deref(),
-            Some("a stage step sits at position -3, -2 or -1, not 5")
+            Some("a stage step sits at position -4, -3, -2 or -1, not 5")
         );
         // …then the role…
         let part = clean.parts[0].id;

@@ -15,14 +15,14 @@ use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
     GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry, MemoryState, NewCommandRun,
-    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PendingStop, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope,
-    PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath,
-    RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
-    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
-    WorkspaceSummary,
+    NewDocument, NewNote, NewRun, NewRunMemory, NewRunStep, Note, OpenPermission, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
+    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo,
+    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId,
+    WorkspaceStop, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -247,6 +247,29 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::stop_run(self, run, owner).await
     }
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        WriteStore::pending_resumes(self, box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        WriteStore::resume_run(self, run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::cancel_stopped_run(self, run, box_id, at).await
+    }
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        WriteStore::record_opening(self, step, opening).await
+    }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await
     }
@@ -407,6 +430,14 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
         WriteStore::add_step_note(self, fence, note).await
     }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        WriteStore::write_run_memory(self, fence, step, new).await
+    }
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
         WriteStore::propose_link(self, fence, link).await
     }
@@ -450,6 +481,16 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        WriteStore::put_command_log(self, log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        WriteStore::command_log_of_run(self, run, id).await
+    }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         PgStore::run_batch_spend(self, run).await
     }
@@ -476,6 +517,65 @@ impl htui_core::store::RecorderStore for Writer {
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
         WriteStore::set_agent_box_quota(self, agent_id, box_id, quota, quota_at).await
+    }
+}
+
+/// MOD-122 M2 (blueprint F9): the Settings › Boxes level row writes through `backend.writer()`,
+/// which is `Memory` under every `SectionBench` and Harness test, so the trait forwards per arm.
+impl htui_core::store::WorkerLogStore for Writer {
+    async fn append_worker_logs(
+        &self,
+        box_id: BoxId,
+        lines: &[htui_core::model::NewWorkerLog],
+    ) -> Result<u64> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::append_worker_logs(store, box_id, lines).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::append_worker_logs(pg, box_id, lines).await
+            }
+        }
+    }
+    async fn worker_logs(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<htui_core::model::WorkerLogLine>> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::worker_logs(store, after, limit).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::worker_logs(pg, after, limit).await
+            }
+        }
+    }
+    async fn prune_worker_logs(&self, older_than: DateTime<Utc>, per_box_cap: u32) -> Result<u64> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::prune_worker_logs(store, older_than, per_box_cap)
+                    .await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::prune_worker_logs(pg, older_than, per_box_cap)
+                    .await
+            }
+        }
+    }
+    async fn set_box_log_level(
+        &self,
+        box_id: BoxId,
+        level: Option<htui_core::model::LogShipLevel>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::set_box_log_level(store, box_id, level).await
+            }
+            Self::Online(pg) => {
+                htui_core::store::WorkerLogStore::set_box_log_level(pg, box_id, level).await
+            }
+        }
     }
 }
 
@@ -670,6 +770,29 @@ impl htui_core::store::WorkerStore for Writer {
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::stop_run(self, run, owner).await
     }
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        WriteStore::pending_resumes(self, box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        WriteStore::resume_run(self, run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::cancel_stopped_run(self, run, box_id, at).await
+    }
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        WriteStore::record_opening(self, step, opening).await
+    }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await
     }
@@ -830,6 +953,14 @@ impl htui_core::store::WorkerStore for Writer {
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
         WriteStore::add_step_note(self, fence, note).await
     }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        WriteStore::write_run_memory(self, fence, step, new).await
+    }
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
         WriteStore::propose_link(self, fence, link).await
     }
@@ -872,6 +1003,16 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
+    }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        WriteStore::put_command_log(self, log).await
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        WriteStore::command_log_of_run(self, run, id).await
     }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         match self {

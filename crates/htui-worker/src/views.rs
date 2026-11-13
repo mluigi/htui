@@ -2530,6 +2530,33 @@ mod tests {
         assert!(unblock_case(&open.item, &open.runs).is_err());
     }
 
+    /// MOD-125 M3 D6: a run's cancel greys by `cancel_enabled`, which admits every live status,
+    /// `stopped` included (the way out of every stopped run), and refuses a finished one.
+    #[test]
+    fn cancel_is_enabled_over_a_stopped_run_and_refused_over_a_finished_one() {
+        let open = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
+        let cancel = |status: RunStatus| {
+            let row = run(1, &open, status, Some(snapshot(1)), 1);
+            let id = row.id;
+            verdicts(&open, &[(row, Vec::new())], &[], &LiveChats::default())
+                .runs
+                .remove(&id)
+                .expect("the run has its actions")
+                .cancel
+        };
+        for live in [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            RunStatus::Stopped,
+        ] {
+            assert_eq!(cancel(live), Ok(()), "over a {live} run");
+        }
+        for finished in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
+            assert!(cancel(finished).is_err(), "over a {finished} run");
+        }
+    }
+
     /// MOD-144: `R` greys by `start_enabled` over the item's runs, `create_run`'s own law: an
     /// `open` item over a live graph run (a `stopped` one included) is refused with the sentence
     /// `create_run` answers, naming the item's derived state; one over a finished, failed or

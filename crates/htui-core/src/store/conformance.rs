@@ -22,32 +22,38 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
     ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
-    MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    MEMORY_RUN_WRITE_CAP, MemoryBody, MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence,
+    MemoryKind, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem,
     NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PendingStop,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
-    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
-    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId,
-    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
-    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
-    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
-    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
+    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
+    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer,
+    PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
+    PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind,
+    RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementState, RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind,
+    RunCommandStatus, RunId, RunKind, RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId,
+    VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
+use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
 use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{ItemState, latest_graph_run};
-use crate::model::{NewOwnerDocument, Project, StepRole};
+use crate::model::{
+    LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
+};
 use crate::model::{NewRunPlan, PlanStatus, RunPlan, RunPlanId};
 use crate::model::{PlanAdmission, PlanToAdmit};
 use crate::prompt::TemplateRole;
@@ -56,12 +62,12 @@ use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::error::StoreError;
-use crate::store::traits::cancel_of_a_stopped_run;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
-    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
-    QueueStored, QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore, SettingRung,
-    StepFence, StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
+    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, ParkOutcome, QueueStored,
+    QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
     citation_key, command_finish_status, command_not_claimable, command_not_queued,
     document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
     kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_reach,
@@ -99,6 +105,7 @@ use crate::store::traits::{
     scope_row_joins_no_workspace, scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run,
     workspace_has_stopped_run,
 };
+use crate::store::worker_log::WorkerLogStore;
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -250,6 +257,9 @@ pub const CASES: &[&str] = &[
     "claim_command_admits_up_to_the_limit_in_queue_order",
     "beat_and_finish_need_the_claimant",
     "cancel_command_ends_a_queued_or_running_row",
+    "put_command_log_upserts_by_row",
+    "command_log_of_run_reads_the_callers_runs_rows",
+    "command_log_goes_with_its_step",
     "waiting_candidates_hold_every_park_and_nothing_else",
     "open_permissions_list_live_pending_item_requests",
     "a_follow_up_is_refused_in_the_documented_order",
@@ -283,8 +293,15 @@ pub const CASES: &[&str] = &[
     "pending_stops_is_empty_after_resume",
     "delete_workspace_refuses_while_a_member_run_of_it_is_stopped",
     "create_run_naming_a_gone_workspace_reads_switch_workspace",
-    // MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise
-    "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop",
+    // MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise; M3 D6 lets a
+    // stopped run take the cancel its box lists
+    "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop",
+    // MOD-125 M3 (plan D1, D2): resume and cancel of a stopped run
+    "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes",
+    "resume_run_is_a_cas_that_takes_the_lease",
+    "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists",
+    "cancel_stopped_run_settles_run_and_steps_cancelled",
+    "cancel_and_resume_of_one_stopped_run_race_on_one_cas",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -335,6 +352,17 @@ pub const CASES: &[&str] = &[
     "memory_supersede_refuses_stale_closed_and_clashing",
     "memory_unknown_rows_and_authors_are_refused",
     "project_delete_counts_memory",
+    // MOD-164: the capture write and the usage tally (plan D4, D5)
+    "run_memory_creates_a_run_entry_with_stamped_provenance",
+    "run_memory_supersedes_a_live_run_entry_on_the_folded_subject",
+    "run_memory_never_replaces_a_person_entry",
+    "run_memory_keeps_a_run_entry_a_person_amended",
+    "run_memory_stops_at_the_write_cap",
+    "run_memory_refuses_a_step_that_is_not_capture",
+    "run_memory_refuses_a_lost_fence",
+    "run_memory_refuses_evidence_outside_the_run",
+    "finish_run_counts_memory_usage_once",
+    "finish_run_skips_deleted_or_unlisted_entries",
     // MOD-144: the item status reduction (ANA-35 §7.1, plan "The rules")
     "create_run_refuses_a_second_live_graph_run",
     "readiness_skips_cancelled_runs",
@@ -845,6 +873,15 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "cancel_command_ends_a_queued_or_running_row" => {
             Box::pin(cancel_command_ends_a_queued_or_running_row(store)).await;
         }
+        "put_command_log_upserts_by_row" => {
+            Box::pin(put_command_log_upserts_by_row(store)).await;
+        }
+        "command_log_of_run_reads_the_callers_runs_rows" => {
+            Box::pin(command_log_of_run_reads_the_callers_runs_rows(store)).await;
+        }
+        "command_log_goes_with_its_step" => {
+            Box::pin(command_log_goes_with_its_step(store)).await;
+        }
         "waiting_candidates_hold_every_park_and_nothing_else" => {
             Box::pin(waiting_candidates_hold_every_park_and_nothing_else(store)).await;
         }
@@ -958,9 +995,30 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             ))
             .await;
         }
-        "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop" => {
-            Box::pin(a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop(store))
+        "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop" => {
+            Box::pin(
+                a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop(
+                    store,
+                ),
+            )
+            .await;
+        }
+        "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes" => {
+            Box::pin(pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes(store))
                 .await;
+        }
+        "resume_run_is_a_cas_that_takes_the_lease" => {
+            Box::pin(resume_run_is_a_cas_that_takes_the_lease(store)).await;
+        }
+        "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists" => {
+            Box::pin(a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists(store))
+                .await;
+        }
+        "cancel_stopped_run_settles_run_and_steps_cancelled" => {
+            Box::pin(cancel_stopped_run_settles_run_and_steps_cancelled(store)).await;
+        }
+        "cancel_and_resume_of_one_stopped_run_race_on_one_cas" => {
+            Box::pin(cancel_and_resume_of_one_stopped_run_race_on_one_cas(store)).await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
@@ -1100,6 +1158,37 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             memory_unknown_rows_and_authors_are_refused(store).await
         }
         "project_delete_counts_memory" => project_delete_counts_memory(store).await,
+        "run_memory_creates_a_run_entry_with_stamped_provenance" => {
+            Box::pin(run_memory_creates_a_run_entry_with_stamped_provenance(
+                store,
+            ))
+            .await
+        }
+        "run_memory_supersedes_a_live_run_entry_on_the_folded_subject" => {
+            Box::pin(run_memory_supersedes_a_live_run_entry_on_the_folded_subject(store)).await
+        }
+        "run_memory_never_replaces_a_person_entry" => {
+            Box::pin(run_memory_never_replaces_a_person_entry(store)).await
+        }
+        "run_memory_keeps_a_run_entry_a_person_amended" => {
+            Box::pin(run_memory_keeps_a_run_entry_a_person_amended(store)).await
+        }
+        "run_memory_stops_at_the_write_cap" => {
+            Box::pin(run_memory_stops_at_the_write_cap(store)).await
+        }
+        "run_memory_refuses_a_step_that_is_not_capture" => {
+            Box::pin(run_memory_refuses_a_step_that_is_not_capture(store)).await
+        }
+        "run_memory_refuses_a_lost_fence" => Box::pin(run_memory_refuses_a_lost_fence(store)).await,
+        "run_memory_refuses_evidence_outside_the_run" => {
+            Box::pin(run_memory_refuses_evidence_outside_the_run(store)).await
+        }
+        "finish_run_counts_memory_usage_once" => {
+            Box::pin(finish_run_counts_memory_usage_once(store)).await
+        }
+        "finish_run_skips_deleted_or_unlisted_entries" => {
+            Box::pin(finish_run_skips_deleted_or_unlisted_entries(store)).await
+        }
         "create_run_refuses_a_second_live_graph_run" => {
             Box::pin(create_run_refuses_a_second_live_graph_run(store)).await
         }
@@ -1376,6 +1465,375 @@ where
 {
     for name in READ_CASES {
         run_read_case(name, &make().await).await;
+    }
+}
+
+/// The worker log half of the suite (MOD-122 M2 plan D1, blueprint F1), in run order. A name
+/// never changes.
+///
+/// A third list beside [`CASES`] and [`READ_CASES`] rather than more entries in `CASES`: these
+/// cases need [`WorkerLogStore`], a narrow trait only `MemStore` and `PgStore` implement, and
+/// widening [`run_case`]'s bound would ask it of every `WriteStore`. Each case writes, so
+/// [`run_all_worker_logs`] builds a fresh store per case.
+///
+/// What a generic case cannot plant (another user's box, a second box of this user, a settings
+/// blob that is not an object) is shown per backend: `mem.rs` and `worker_log_pg.rs`.
+pub const WORKER_LOG_CASES: &[&str] = &[
+    "worker_log_append_then_read_in_id_order",
+    "worker_log_unknown_box_is_not_found",
+    "worker_log_text_is_capped_and_nul_free",
+    "worker_log_prune_cuts_by_age_then_caps_per_box",
+    "worker_log_set_box_log_level_keeps_the_rest_of_the_blob",
+];
+
+/// Runs one [`WORKER_LOG_CASES`] case by name against an already-loaded store. Every arm is
+/// boxed, as [`run_case`]'s are (MOD-137).
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_worker_log_case<S: WriteStore + WorkerLogStore>(name: &str, store: &S) {
+    Box::pin(run_worker_log_case_inline(name, store)).await;
+}
+
+async fn run_worker_log_case_inline<S: WriteStore + WorkerLogStore>(name: &str, store: &S) {
+    match name {
+        "worker_log_append_then_read_in_id_order" => {
+            Box::pin(worker_log_append_then_read_in_id_order(store)).await;
+        }
+        "worker_log_unknown_box_is_not_found" => {
+            Box::pin(worker_log_unknown_box_is_not_found(store)).await;
+        }
+        "worker_log_text_is_capped_and_nul_free" => {
+            Box::pin(worker_log_text_is_capped_and_nul_free(store)).await;
+        }
+        "worker_log_prune_cuts_by_age_then_caps_per_box" => {
+            Box::pin(worker_log_prune_cuts_by_age_then_caps_per_box(store)).await;
+        }
+        "worker_log_set_box_log_level_keeps_the_rest_of_the_blob" => {
+            Box::pin(worker_log_set_box_log_level_keeps_the_rest_of_the_blob(
+                store,
+            ))
+            .await;
+        }
+        other => panic!(
+            "unknown worker log case `{other}`; WORKER_LOG_CASES and run_worker_log_case disagree"
+        ),
+    }
+}
+
+/// Runs every case in [`WORKER_LOG_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_worker_logs<S, F, Fut>(make: F)
+where
+    S: WriteStore + WorkerLogStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in WORKER_LOG_CASES {
+        run_worker_log_case(name, &make().await).await;
+    }
+}
+
+/// One line at `level` with `text`, logged now at Postgres's precision.
+fn worker_line(level: WorkerLogLevel, text: &str) -> NewWorkerLog {
+    NewWorkerLog {
+        logged_at: seam_clock(),
+        level,
+        target: "htui::worker".to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+/// The fixture box's row, read through [`WriteStore::boxes`].
+async fn fixture_box_row<S: WriteStore>(store: &S, case: &str) -> BoxRow {
+    store
+        .boxes()
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|record| record.row.id == ids::BOX)
+        .unwrap_or_else(|| panic!("{case}: the fixture box is one of this user's"))
+        .row
+}
+
+/// Every stored line's text, in read order.
+fn texts(lines: &[WorkerLogLine]) -> Vec<&str> {
+    lines.iter().map(|line| line.text.as_str()).collect()
+}
+
+/// MOD-122 M2 plan D1: a batch is stored in order and stamped with the box; ids rise; a read is
+/// in id order, `after` is exclusive, and `None` is the newest `limit` rows, oldest first.
+async fn worker_log_append_then_read_in_id_order<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_append_then_read_in_id_order";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    assert_eq!(
+        store.worker_logs(None, 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the fixture ships no worker log"
+    );
+    assert_eq!(
+        store.append_worker_logs(ids::BOX, &[]).await.expect(CASE),
+        0,
+        "{CASE}: an empty batch writes nothing"
+    );
+
+    let first = [
+        worker_line(WorkerLogLevel::Error, "one"),
+        worker_line(WorkerLogLevel::Warn, "two"),
+    ];
+    let second = [
+        worker_line(WorkerLogLevel::Info, "three"),
+        worker_line(WorkerLogLevel::Debug, "four"),
+        worker_line(WorkerLogLevel::Trace, "five"),
+    ];
+    assert_eq!(
+        store
+            .append_worker_logs(ids::BOX, &first)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: the first batch's two rows"
+    );
+    assert_eq!(
+        store
+            .append_worker_logs(ids::BOX, &second)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: the second batch's three rows"
+    );
+
+    let all = store.worker_logs(None, 100).await.expect(CASE);
+    assert_eq!(
+        texts(&all),
+        ["one", "two", "three", "four", "five"],
+        "{CASE}"
+    );
+    assert!(
+        all.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "{CASE}: ids rise in read order: {all:?}"
+    );
+    for (line, wrote) in all.iter().zip(first.iter().chain(&second)) {
+        assert_eq!(line.box_id, Some(ids::BOX), "{CASE}: stamped with the box");
+        assert_eq!(
+            line.box_name, hostname,
+            "{CASE}: stamped with the box's hostname"
+        );
+        assert_eq!(line.level, wrote.level, "{CASE}");
+        assert_eq!(line.target, wrote.target, "{CASE}");
+        assert_eq!(
+            line.logged_at, wrote.logged_at,
+            "{CASE}: the worker's clock, kept"
+        );
+    }
+
+    let ids: Vec<i64> = all.iter().map(|line| line.id).collect();
+    assert_eq!(
+        texts(&store.worker_logs(Some(ids[0]), 100).await.expect(CASE)),
+        ["two", "three", "four", "five"],
+        "{CASE}: `after` is exclusive"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(Some(ids[1]), 2).await.expect(CASE)),
+        ["three", "four"],
+        "{CASE}: `after` reads forward, oldest first, at most `limit`"
+    );
+    assert_eq!(
+        store.worker_logs(Some(ids[4]), 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: nothing after the newest"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 2).await.expect(CASE)),
+        ["four", "five"],
+        "{CASE}: `None` is the newest `limit`, oldest first"
+    );
+    assert_eq!(
+        store.worker_logs(None, 0).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: a zero limit reads nothing"
+    );
+}
+
+/// MOD-122 M2 plan D1: an unknown box is `NotFound` and writes nothing. Another user's box is
+/// the same answer; that half is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_unknown_box_is_not_found<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_unknown_box_is_not_found";
+    let unknown = BoxId::new();
+    let answer = store
+        .append_worker_logs(unknown, &[worker_line(WorkerLogLevel::Error, "lost")])
+        .await;
+    assert!(
+        matches!(answer, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        store.worker_logs(None, 100).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the refused batch wrote nothing"
+    );
+    assert!(
+        !store
+            .set_box_log_level(unknown, Some(LogShipLevel::Debug))
+            .await
+            .expect(CASE),
+        "{CASE}: an unknown box's level is `false`"
+    );
+}
+
+/// MOD-122 M2 plan T1: a text over [`WORKER_LOG_TEXT_MAX`] bytes is stored cut, with a `…`; a NUL
+/// (which Postgres text refuses) is stored as U+FFFD, in the text and in the target.
+async fn worker_log_text_is_capped_and_nul_free<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_text_is_capped_and_nul_free";
+    let long = "x".repeat(WORKER_LOG_TEXT_MAX + 100);
+    let mut nul = worker_line(WorkerLogLevel::Warn, "a\0b");
+    nul.target = "t\0".to_owned();
+    let written = store
+        .append_worker_logs(ids::BOX, &[worker_line(WorkerLogLevel::Warn, &long), nul])
+        .await
+        .expect(CASE);
+    assert_eq!(written, 2, "{CASE}");
+    let read = store.worker_logs(None, 10).await.expect(CASE);
+    assert_eq!(read.len(), 2, "{CASE}");
+    assert_eq!(
+        read[0].text.len(),
+        WORKER_LOG_TEXT_MAX,
+        "{CASE}: cut to the cap"
+    );
+    assert!(read[0].text.ends_with('…'), "{CASE}: the cut is marked");
+    assert_eq!(read[1].text, "a\u{FFFD}b", "{CASE}");
+    assert_eq!(read[1].target, "t\u{FFFD}", "{CASE}");
+}
+
+/// MOD-122 M2 plan D4: the age cut deletes the rows received before it, the cap then keeps each
+/// box's newest rows, and a second sweep deletes nothing. The cap's per-box partition (another
+/// box's rows untouched) is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_prune_cuts_by_age_then_caps_per_box<S: WriteStore + WorkerLogStore>(store: &S) {
+    const CASE: &str = "worker_log_prune_cuts_by_age_then_caps_per_box";
+    let far_past = seam_clock() - TimeDelta::days(3650);
+    let old = [
+        worker_line(WorkerLogLevel::Error, "old-1"),
+        worker_line(WorkerLogLevel::Info, "old-2"),
+    ];
+    store.append_worker_logs(ids::BOX, &old).await.expect(CASE);
+    // Both stores stamp `received_at` from a real clock; the pause keeps the two batches apart.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let new: Vec<NewWorkerLog> = (1..=5)
+        .map(|n| worker_line(WorkerLogLevel::Info, &format!("new-{n}")))
+        .collect();
+    store.append_worker_logs(ids::BOX, &new).await.expect(CASE);
+    let all = store.worker_logs(None, 100).await.expect(CASE);
+    assert_eq!(all.len(), 7, "{CASE}");
+    let cut = all[2].received_at;
+    assert!(
+        all[1].received_at < cut,
+        "{CASE}: the batches were received apart: {all:?}"
+    );
+
+    assert_eq!(
+        store.prune_worker_logs(far_past, 100).await.expect(CASE),
+        0,
+        "{CASE}: nothing is older than the far past, and nothing is over the cap"
+    );
+    assert_eq!(
+        store.prune_worker_logs(cut, 100).await.expect(CASE),
+        2,
+        "{CASE}: the rows received before the cut go"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 100).await.expect(CASE)),
+        ["new-1", "new-2", "new-3", "new-4", "new-5"],
+        "{CASE}: a row received at the cut stays"
+    );
+    assert_eq!(
+        store.prune_worker_logs(far_past, 3).await.expect(CASE),
+        2,
+        "{CASE}: the cap removes the two oldest of five"
+    );
+    assert_eq!(
+        texts(&store.worker_logs(None, 100).await.expect(CASE)),
+        ["new-3", "new-4", "new-5"],
+        "{CASE}: the cap keeps the newest"
+    );
+    assert_eq!(
+        store.prune_worker_logs(cut, 3).await.expect(CASE),
+        0,
+        "{CASE}: a second sweep deletes nothing"
+    );
+}
+
+/// MOD-122 M2 plan D7: setting the level writes `log_level` alone and clearing it removes that
+/// key alone; the rest of the blob is compared whole, and `edit_version` does not move. The
+/// non-object blob is per backend, `mem.rs` and `worker_log_pg.rs`.
+async fn worker_log_set_box_log_level_keeps_the_rest_of_the_blob<S: WriteStore + WorkerLogStore>(
+    store: &S,
+) {
+    const CASE: &str = "worker_log_set_box_log_level_keeps_the_rest_of_the_blob";
+    let token = fixture_box_row(store, CASE).await.edit_version;
+    let edited = store
+        .edit_box(
+            ids::BOX,
+            token,
+            BoxEdit {
+                executor: Some(Executor::Worker),
+                ..BoxEdit::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(edited, CasOutcome::Applied(_)),
+        "{CASE}: {edited:?}"
+    );
+    let before = fixture_box_row(store, CASE).await;
+    let Value::Object(blob) = before.settings.clone() else {
+        panic!("{CASE}: the fixture blob is an object: {}", before.settings);
+    };
+    assert!(!blob.contains_key(LogShipLevel::KEY), "{CASE}: {blob:?}");
+    assert_eq!(
+        LogShipLevel::of(&before.settings),
+        LogShipLevel::Warn,
+        "{CASE}"
+    );
+
+    for level in [LogShipLevel::Debug, LogShipLevel::Off] {
+        assert!(
+            store
+                .set_box_log_level(ids::BOX, Some(level))
+                .await
+                .expect(CASE),
+            "{CASE}: this user's box answers `true`"
+        );
+        let after = fixture_box_row(store, CASE).await;
+        let mut want = blob.clone();
+        want.insert(
+            LogShipLevel::KEY.to_owned(),
+            Value::String(level.as_str().to_owned()),
+        );
+        assert_eq!(after.settings, Value::Object(want), "{CASE}: {level}");
+        assert_eq!(LogShipLevel::of(&after.settings), level, "{CASE}");
+        assert_eq!(
+            after.edit_version, before.edit_version,
+            "{CASE}: a level is not under the compare-and-set"
+        );
+    }
+
+    for _ in 0..2 {
+        assert!(
+            store.set_box_log_level(ids::BOX, None).await.expect(CASE),
+            "{CASE}: clearing answers `true`, twice"
+        );
+        let cleared = fixture_box_row(store, CASE).await;
+        assert_eq!(
+            cleared.settings,
+            Value::Object(blob.clone()),
+            "{CASE}: clearing removes `log_level` alone"
+        );
+        assert_eq!(cleared.edit_version, before.edit_version, "{CASE}");
     }
 }
 
@@ -5596,6 +6054,7 @@ fn run_snapshot() -> GraphSnapshot {
         scope: None,
         personas: Vec::new(),
         memory: None,
+        capture: None,
         source: None,
         edges: Vec::new(),
     }
@@ -5671,6 +6130,28 @@ async fn gated_step<S: WriteStore>(case: &str, store: &S, spec: NewRunStep) -> S
     for (from, to) in [
         (StepStatus::Pending, StepStatus::Running),
         (StepStatus::Running, StepStatus::AwaitingApproval),
+    ] {
+        assert!(
+            store.transition_step(id, from, to, at).await.expect(case),
+            "{case}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    id
+}
+
+/// MOD-125 M3: creates `spec` and drives it `pending -> running -> stopped`, a step a stop
+/// interrupted. Only the step moves: its run's status is the case's own.
+async fn stopped_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    spec: NewRunStep,
+    at: DateTime<Utc>,
+) -> StepId {
+    let id = spec.id;
+    store.create_step(spec).await.expect(case);
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::Stopped),
     ] {
         assert!(
             store.transition_step(id, from, to, at).await.expect(case),
@@ -8872,37 +9353,54 @@ async fn create_run_naming_a_gone_workspace_reads_switch_workspace<S: WriteStore
     );
 }
 
-/// MOD-125 M2 R1 (review M-1): a cancel and a stop of one run serialise in the store, so no
-/// cancel row is ever left pending on a `stopped` run, where no executor's poll would apply it
-/// (`pending_commands` lists a run only for its lease owner, which a stop clears, or as a free or
-/// finished run of the box). `request_cancel` refuses a stopped run and writes nothing, and
-/// `stop_run` answers `false` while a cancel of the run is pending (D4: the cancel wins); once
-/// that cancel is resolved the stop goes through.
-async fn a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop<S: WriteStore>(
+/// MOD-125 M3 D6 (retiring M2 R1's refusal, review M-1): a stopped run takes a cancel. Its row is
+/// listed by the poll of the box the run executes on (the run holds no lease, so the box branch of
+/// `pending_commands` is the one that reaches it), never by another box's, and the box applies it
+/// with [`WriteStore::cancel_stopped_run`]. The R1 hold-off is kept: `stop_run` answers `false`
+/// while a cancel of the run is pending (M2 D4: the cancel wins), and goes through once that
+/// cancel is resolved.
+async fn a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop<
+    S: WriteStore,
+>(
     store: &S,
 ) {
-    const CASE: &str = "a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop";
+    const CASE: &str =
+        "a_stopped_run_takes_a_cancel_the_box_lists_and_a_pending_cancel_holds_off_its_stop";
     let owner = Uuid::now_v7();
     let stopped = claimed_in(CASE, store, ids::HTUI_ANA_2, None, owner).await;
     assert!(
         store.stop_run(stopped, owner).await.expect(CASE),
         "{CASE}: the first run stops"
     );
-    let cancels_before = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels;
-    assert_eq!(
-        store.request_cancel(stopped, ids::USER, ids::BOX).await,
-        Err(StoreError::Constraint(cancel_of_a_stopped_run(stopped))),
-        "{CASE}: a stopped run's cancel is refused in one readable sentence"
-    );
-    assert_eq!(
-        store.relay_view(ids::HTUI_ANA_2).await.expect(CASE).cancels,
-        cancels_before,
-        "{CASE}: and no pending cancel row was written"
-    );
+    let CancelRequest::Inserted(listed) = cancel_of(CASE, store, stopped).await else {
+        panic!("{CASE}: a stopped run's cancel writes its row");
+    };
     assert_eq!(
         run_row(CASE, store, stopped).await.status,
         RunStatus::Stopped,
-        "{CASE}: the run is still stopped"
+        "{CASE}: the request moves nothing"
+    );
+    assert_eq!(
+        pending_ids(CASE, store, Uuid::now_v7(), ids::BOX).await,
+        vec![listed],
+        "{CASE}: the box's poll lists the stopped run's cancel, whoever polls"
+    );
+    assert!(
+        pending_ids(CASE, store, owner, BoxId::new())
+            .await
+            .is_empty(),
+        "{CASE}: another box's poll does not"
+    );
+    assert!(
+        store
+            .cancel_stopped_run(stopped, Some(ids::BOX), seam_clock())
+            .await
+            .expect(CASE),
+        "{CASE}: the box applies it"
+    );
+    assert!(
+        pending_ids(CASE, store, owner, ids::BOX).await.is_empty(),
+        "{CASE}: and the row is pending no more"
     );
 
     let running = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
@@ -8940,6 +9438,616 @@ async fn a_stopped_run_takes_no_cancel_and_a_pending_cancel_holds_off_its_stop<S
     assert!(
         store.stop_run(running, owner).await.expect(CASE),
         "{CASE}: with no cancel pending the stop goes through"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-125 M3 (plan D1, D2): resume through the absence of the `workspace_stop` row. A stopped
+// run of a box whose workspace has no stop row is owed a resume; `resume_run` takes it back
+// under a fresh lease in one compare-and-set, and `cancel_stopped_run` settles it instead.
+// ------------------------------------------------------------------------------------------
+
+/// `pending_resumes(box_id)` restricted to `ours`, in the order it answers: a case reads its own
+/// runs only, whatever else the fixture or an earlier step left on the box.
+async fn resumes_among<S: WriteStore>(
+    case: &str,
+    store: &S,
+    box_id: BoxId,
+    ours: &[RunId],
+) -> Vec<RunId> {
+    store
+        .pending_resumes(box_id)
+        .await
+        .expect(case)
+        .into_iter()
+        .filter(|run| ours.contains(run))
+        .collect()
+}
+
+/// `runs` in `(queued_at, id)` order, read back.
+async fn runs_in_queue_order<S: WriteStore>(case: &str, store: &S, runs: &[RunId]) -> Vec<RunId> {
+    let mut keyed = Vec::new();
+    for run in runs {
+        keyed.push((run_row(case, store, *run).await.queued_at, *run));
+    }
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, run)| run).collect()
+}
+
+/// A fresh workspace named `slug`.
+async fn fresh_workspace<S: WriteStore>(case: &str, store: &S, slug: &str) -> WorkspaceId {
+    store
+        .create_workspace(new_workspace(slug))
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-125 M3 D1, D2: `pending_resumes(box)` lists the box's `stopped` runs whose workspace has
+/// no `workspace_stop` row, in `(queued_at, id)` order: none while the workspace is stopped, each
+/// of them once it resumes. A run without a workspace has no gate row, so it is listed as soon as
+/// it stops. Another box's run, a box-less run (the fixture's `RUN_8`) and a running run never
+/// are.
+async fn pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "pending_resumes_lists_the_boxs_stopped_runs_once_the_workspace_resumes";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "resumes").await;
+    let a = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let b = claimed_in(CASE, store, ids::HTUI_CLEAN_1, Some(workspace), owner).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    for run in [a, b] {
+        assert!(
+            store.stop_run(run, owner).await.expect(CASE),
+            "{CASE}: the poll stops {run}"
+        );
+    }
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b]).await,
+        Vec::new(),
+        "{CASE}: no run is owed a resume while its workspace is stopped"
+    );
+
+    let unscoped = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    let u = claimed_in(CASE, store, unscoped, None, owner).await;
+    assert!(
+        store.stop_run(u, owner).await.expect(CASE),
+        "{CASE}: the run without a workspace stops"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b, u]).await,
+        vec![u],
+        "{CASE}: a run without a workspace has no gate row, so it is listed at once"
+    );
+
+    let live_item = mint_tagged(CASE, store, "Live", &[]).await;
+    let live = claimed_in(CASE, store, live_item, None, owner).await;
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[a, b, u, live]).await,
+        runs_in_queue_order(CASE, store, &[a, b, u]).await,
+        "{CASE}: every stopped run of the box, in (queued_at, id) order; never a running one"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, BoxId::new(), &[a, b, u]).await,
+        Vec::new(),
+        "{CASE}: another box is owed none of them"
+    );
+
+    let box_less = run_row(CASE, store, ids::RUN_8).await;
+    assert_eq!(
+        (box_less.status, box_less.executing_box_id),
+        (RunStatus::Stopped, None),
+        "{CASE}: control: the fixture's RUN_8 is stopped and executes nowhere"
+    );
+    store
+        .resume_workspace(ids::WORKSPACE_GRAPHICS)
+        .await
+        .expect(CASE);
+    assert!(
+        !store
+            .pending_resumes(ids::BOX)
+            .await
+            .expect(CASE)
+            .contains(&ids::RUN_8),
+        "{CASE}: a box-less stopped run is never listed: it can only be cancelled"
+    );
+}
+
+/// MOD-125 M3 D2: `resume_run` is one compare-and-set `stopped -> running` that takes the lease
+/// (`lease_owner`, `lease_box_id`, `lease_expires_at = <store now> + ttl`). It refuses, writing
+/// nothing, a run that is not stopped, one executing on another box, one whose workspace is
+/// stopped (again), and one with a pending cancel. A TTL out of range is `Constraint` before any
+/// read, an unknown run `NotFound`. No step moves, and a run without a workspace passes the gate.
+async fn resume_run_is_a_cas_that_takes_the_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "resume_run_is_a_cas_that_takes_the_lease";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    for ttl in [
+        TimeDelta::microseconds(-1),
+        MAX_LEASE_TTL + TimeDelta::microseconds(1),
+    ] {
+        let answer = store.resume_run(RunId::new(), ids::BOX, resumer, ttl).await;
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: a TTL out of range is Constraint before any read, got {answer:?}"
+        );
+    }
+    let unknown = RunId::new();
+    assert_eq!(
+        store.resume_run(unknown, ids::BOX, resumer, LEASE).await,
+        Err(StoreError::NotFound {
+            entity: "run",
+            id: unknown.to_string(),
+        }),
+        "{CASE}: an unknown run is NotFound"
+    );
+
+    let workspace = fresh_workspace(CASE, store, "resumed").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let step = running_step(CASE, store, run, (1, 1, 0), at).await;
+    assert!(
+        !store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a running run is not stopped"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    let stopped = run_row(CASE, store, run).await;
+    let refused = async |what: &str, box_id: BoxId| {
+        assert!(
+            !store
+                .resume_run(run, box_id, resumer, LEASE)
+                .await
+                .expect(CASE),
+            "{CASE}: {what}: refused"
+        );
+        assert_eq!(
+            run_row(CASE, store, run).await,
+            stopped,
+            "{CASE}: {what}: and nothing is written"
+        );
+    };
+    refused("its workspace is stopped", ids::BOX).await;
+
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    refused("it executes on another box", BoxId::new()).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    refused("its workspace is stopped again", ids::BOX).await;
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes again"
+    );
+    let CancelRequest::Inserted(cancel) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the stopped run's cancel writes its row");
+    };
+    refused("a cancel of it is pending", ids::BOX).await;
+    assert!(
+        store
+            .resolve_command(cancel, RunCommandStatus::Refused, Some("test".to_owned()))
+            .await
+            .expect(CASE),
+        "{CASE}: the cancel is resolved"
+    );
+
+    assert!(
+        store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes"
+    );
+    let resumed = run_row(CASE, store, run).await;
+    assert_eq!(
+        (
+            resumed.status,
+            resumed.executing_box_id,
+            resumed.lease_box_id
+        ),
+        (RunStatus::Running, Some(ids::BOX), Some(ids::BOX)),
+        "{CASE}: running on its box, the lease taken there"
+    );
+    assert_leased_for(CASE, &resumed, LEASE, "the resumed run");
+    assert_eq!(
+        step_row(CASE, store, run, step).await.status,
+        StepStatus::Stopped,
+        "{CASE}: no step moves: the engine resumes its steps"
+    );
+    assert!(
+        !store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: the first owner holds nothing"
+    );
+    assert!(
+        store.refresh_lease(run, resumer, LEASE).await.expect(CASE),
+        "{CASE}: the resumer holds the lease"
+    );
+    assert!(
+        !store
+            .resume_run(run, ids::BOX, Uuid::now_v7(), LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a second resume finds the run running"
+    );
+
+    let unscoped = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    let free = claimed_in(CASE, store, unscoped, None, owner).await;
+    assert!(
+        store.stop_run(free, owner).await.expect(CASE),
+        "{CASE}: the run without a workspace stops"
+    );
+    assert!(
+        store
+            .resume_run(free, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: a NULL workspace passes the gate"
+    );
+}
+
+/// MOD-125 M3 D2: a stop committed after a resume finds a `running` run leased to the resumer,
+/// which `pending_stops` lists for that owner, so M2 stops it again; once stopped, its workspace
+/// stopped, it is owed no resume.
+async fn a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "restopped").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert!(
+        store
+            .resume_run(run, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.pending_stops(resumer).await.expect(CASE),
+        vec![PendingStop {
+            run,
+            mode: StopMode::Forced
+        }],
+        "{CASE}: the resumed run is the resumer's to stop"
+    );
+    assert_eq!(
+        store.pending_stops(owner).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: never the first owner's"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[run]).await,
+        Vec::new(),
+        "{CASE}: a running run is owed no resume"
+    );
+    assert!(
+        store.stop_run(run, resumer).await.expect(CASE),
+        "{CASE}: M2's stop applies to it again"
+    );
+    assert_eq!(
+        resumes_among(CASE, store, ids::BOX, &[run]).await,
+        Vec::new(),
+        "{CASE}: and, its workspace stopped, it waits for the next resume"
+    );
+}
+
+/// MOD-125 M3 D2, D6: `cancel_stopped_run` is one compare-and-set `stopped -> cancelled`, with
+/// `finished_at` the caller's clock. Every step that is not terminal (stopped, pending, failed)
+/// is cancelled with it, a terminal one keeps its status, pending follow-ups are refused and a
+/// pending cancel of the run is resolved. `Some(box)` needs the run to execute on that box,
+/// `None` needs it to execute nowhere. It refuses, writing nothing, a run that is not stopped;
+/// an unknown run is `NotFound`.
+async fn cancel_stopped_run_settles_run_and_steps_cancelled<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_stopped_run_settles_run_and_steps_cancelled";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let when = at + TimeDelta::minutes(1);
+    let unknown = RunId::new();
+    for box_id in [Some(ids::BOX), None] {
+        assert_eq!(
+            store.cancel_stopped_run(unknown, box_id, when).await,
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: unknown.to_string(),
+            }),
+            "{CASE}: an unknown run is NotFound"
+        );
+    }
+
+    let workspace = fresh_workspace(CASE, store, "cancels").await;
+    let run = claimed_in(CASE, store, ids::HTUI_ANA_2, Some(workspace), owner).await;
+    let halted = running_step(CASE, store, run, (0, 1, 0), at).await;
+    let failed = running_step(CASE, store, run, (1, 1, 0), at).await;
+    assert!(
+        store
+            .transition_step(failed, StepStatus::Running, StepStatus::Failed, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the second step fails"
+    );
+    let done = done_step(CASE, store, run, (2, 1, 0), at).await;
+    let pending = store
+        .create_step(new_run_step(run, 3, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let session = window_of(CASE, store, run, halted, owner).await;
+    let asked = queued(CASE, store, follow_up(halted, "use the smaller fixture")).await;
+    assert!(
+        !store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a running run is refused"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.status,
+        RunStatus::Running,
+        "{CASE}: and stays running"
+    );
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the poll stops the run"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(asked, owner, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Fenced,
+        "{CASE}: control: the follow-up is still pending, its run's lease released"
+    );
+    let stopped = run_row(CASE, store, run).await;
+    for (box_id, what) in [
+        (Some(BoxId::new()), "another box"),
+        (None, "no box, for a run that executes on one"),
+    ] {
+        assert!(
+            !store
+                .cancel_stopped_run(run, box_id, when)
+                .await
+                .expect(CASE),
+            "{CASE}: {what} is refused"
+        );
+        assert_eq!(
+            run_row(CASE, store, run).await,
+            stopped,
+            "{CASE}: {what}: nothing is written"
+        );
+    }
+
+    assert!(
+        store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: the box cancels its stopped run"
+    );
+    let cancelled = run_row(CASE, store, run).await;
+    assert_eq!(
+        (
+            cancelled.status,
+            cancelled.finished_at,
+            cancelled.failure.as_deref()
+        ),
+        (RunStatus::Cancelled, Some(when), None),
+        "{CASE}: cancelled at the caller's clock, no failure"
+    );
+    for (step, status, what) in [
+        (halted, StepStatus::Cancelled, "the stopped step"),
+        (failed, StepStatus::Cancelled, "the failed step"),
+        (pending, StepStatus::Cancelled, "the pending step"),
+        (done, StepStatus::Done, "the done step keeps its status"),
+    ] {
+        assert_eq!(
+            step_row(CASE, store, run, step).await.status,
+            status,
+            "{CASE}: {what}"
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, run, halted).await.finished_at,
+        Some(when),
+        "{CASE}: a cancelled step finishes at the caller's clock"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(asked, owner, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::NotPending,
+        "{CASE}: the pending follow-up was refused with the run"
+    );
+    assert_eq!(
+        store.next_follow_up(halted, session).await.expect(CASE),
+        None,
+        "{CASE}: and the step's window offers nothing"
+    );
+    assert!(
+        !store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: no lease was taken"
+    );
+    assert!(
+        !store
+            .cancel_stopped_run(run, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a second cancel finds the run cancelled"
+    );
+
+    let other = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
+    assert!(
+        store.stop_run(other, owner).await.expect(CASE),
+        "{CASE}: a second run stops"
+    );
+    let CancelRequest::Inserted(cancel) = cancel_of(CASE, store, other).await else {
+        panic!("{CASE}: the stopped run's cancel writes its row");
+    };
+    assert!(
+        store
+            .cancel_stopped_run(other, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: the box applies the cancel"
+    );
+    assert!(
+        !store
+            .resolve_command(cancel, RunCommandStatus::Refused, Some("test".to_owned()))
+            .await
+            .expect(CASE),
+        "{CASE}: the pending cancel row was resolved with the run"
+    );
+
+    let before = store.run_steps(ids::RUN_8).await.expect(CASE);
+    assert!(
+        !store
+            .cancel_stopped_run(ids::RUN_8, Some(ids::BOX), when)
+            .await
+            .expect(CASE),
+        "{CASE}: a box-less run is refused under a box"
+    );
+    assert!(
+        store
+            .cancel_stopped_run(ids::RUN_8, None, when)
+            .await
+            .expect(CASE),
+        "{CASE}: and cancelled with none"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_8).await.status,
+        RunStatus::Cancelled,
+        "{CASE}: the box-less run is cancelled"
+    );
+    let after = store.run_steps(ids::RUN_8).await.expect(CASE);
+    for step in before {
+        let expected = if step.status.is_terminal() {
+            step.status
+        } else {
+            StepStatus::Cancelled
+        };
+        assert_eq!(
+            after
+                .iter()
+                .find(|row| row.id == step.id)
+                .map(|row| row.status),
+            Some(expected),
+            "{CASE}: RUN_8's step {} was {}",
+            step.id,
+            step.status
+        );
+    }
+}
+
+/// MOD-125 M3 D2, D6: a cancel and a resume of one stopped run contend for the one `stopped`
+/// compare-and-set, so exactly one of them wins: a cancelled run is not resumed, and a resumed
+/// run is not cancelled as a stopped one (it is `running`, under the resumer's lease).
+async fn cancel_and_resume_of_one_stopped_run_race_on_one_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_and_resume_of_one_stopped_run_race_on_one_cas";
+    let (owner, resumer) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let first = claimed_in(CASE, store, ids::HTUI_ANA_2, None, owner).await;
+    let second = claimed_in(CASE, store, ids::HTUI_CLEAN_1, None, owner).await;
+    for run in [first, second] {
+        assert!(
+            store.stop_run(run, owner).await.expect(CASE),
+            "{CASE}: {run} stops"
+        );
+    }
+
+    assert!(
+        store
+            .cancel_stopped_run(first, Some(ids::BOX), at)
+            .await
+            .expect(CASE),
+        "{CASE}: the cancel wins the first run"
+    );
+    assert!(
+        !store
+            .resume_run(first, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: and its resume loses"
+    );
+    assert_eq!(
+        run_row(CASE, store, first).await.status,
+        RunStatus::Cancelled,
+        "{CASE}: the first run stays cancelled"
+    );
+    assert!(
+        !store
+            .refresh_lease(first, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: with no lease taken"
+    );
+
+    assert!(
+        store
+            .resume_run(second, ids::BOX, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the resume wins the second run"
+    );
+    assert!(
+        !store
+            .cancel_stopped_run(second, Some(ids::BOX), at)
+            .await
+            .expect(CASE),
+        "{CASE}: and its cancel as a stopped run loses"
+    );
+    assert_eq!(
+        run_row(CASE, store, second).await.status,
+        RunStatus::Running,
+        "{CASE}: the second run is running"
+    );
+    assert!(
+        store
+            .refresh_lease(second, resumer, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: under the resumer's lease"
     );
 }
 
@@ -13199,6 +14307,41 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
         settled(beaten).await.status,
         StepStatus::Superseded,
         "{CASE}: and so is its loser"
+    );
+
+    // MOD-125 M3 (L-7): a backstop for a slot a stop interrupted. A stopped loser is superseded
+    // like a pending one, and a stopped judge goes to `superseded`, never `done` (`stopped ->
+    // done` is not a move the law sanctions); it records the reason all the same. A fourth slot,
+    // since a slot holds one judge.
+    let kept = gated_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, 0)).await;
+    let halted = stopped_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, 1), at).await;
+    let halted_judge = stopped_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, -1), at).await;
+    store
+        .select_fanout(
+            ids::RUN_2,
+            4,
+            1,
+            kept,
+            Some("the stop cut it short".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    let loser = settled(halted).await;
+    assert_eq!(
+        (loser.selected, loser.status),
+        (Some(false), StepStatus::Superseded),
+        "{CASE}: a stopped loser is superseded"
+    );
+    let judge = settled(halted_judge).await;
+    assert_eq!(
+        (judge.status, judge.gate_note.as_deref()),
+        (StepStatus::Superseded, Some("the stop cut it short")),
+        "{CASE}: a stopped judge is superseded, with the reason"
+    );
+    assert_eq!(
+        settled(kept).await.status,
+        StepStatus::Done,
+        "{CASE}: and the winner is done"
     );
 
     let listed = store
@@ -22514,6 +23657,197 @@ async fn cancel_command_ends_a_queued_or_running_row<S: WriteStore>(store: &S) {
     );
 }
 
+// ------------------------------------------------------------------------------------------
+// MOD-152 T1 (plan D1, D5): the command log. One scrubbed text per `command_run` row, written by
+// the runner before the row ends, read back by the owning run's later steps.
+// ------------------------------------------------------------------------------------------
+
+/// A [`CommandLog`] for `id` with `text`, written at `at`.
+fn command_log(id: CommandRunId, text: &str, at: DateTime<Utc>) -> CommandLog {
+    CommandLog {
+        command_run_id: id,
+        text: text.to_owned(),
+        truncated: false,
+        total_bytes: text.len() as u64,
+        written_at: at,
+    }
+}
+
+/// MOD-152 D5: [`WriteStore::put_command_log`] upserts by row id (the second write replaces the
+/// first, every column), accepts a text of exactly [`COMMAND_LOG_STORE_MAX`] bytes, refuses one
+/// byte more as `Constraint` and writes nothing, and names an unknown row `NotFound`.
+async fn put_command_log_upserts_by_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "put_command_log_upserts_by_row";
+    let t0 = seam_clock();
+    let row = queued_command("build", t0);
+    store.enqueue_command(row.clone()).await.expect(CASE);
+
+    let first = command_log(row.id, "first\n", t0);
+    store.put_command_log(first.clone()).await.expect(CASE);
+    let stored = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(stored.log, Some(first), "{CASE}: the log reads back");
+
+    let second = CommandLog {
+        command_run_id: row.id,
+        text: "second\n".to_owned(),
+        truncated: true,
+        total_bytes: 9_999_999_999,
+        written_at: t0 + TimeDelta::seconds(5),
+    };
+    store.put_command_log(second.clone()).await.expect(CASE);
+    let replaced = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        replaced.log,
+        Some(second.clone()),
+        "{CASE}: a second write replaces the first, every column"
+    );
+
+    let max = command_log(row.id, &"x".repeat(COMMAND_LOG_STORE_MAX), t0);
+    store.put_command_log(max.clone()).await.expect(CASE);
+    let over = command_log(row.id, &"x".repeat(COMMAND_LOG_STORE_MAX + 1), t0);
+    assert!(
+        matches!(
+            store.put_command_log(over).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: one byte over the store's maximum is a Constraint"
+    );
+    let kept = store
+        .command_log_of_run(ids::RUN_2, Some(row.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(kept.log, Some(max), "{CASE}: and the refusal wrote nothing");
+
+    let unknown = CommandRunId::new();
+    assert_eq!(
+        store.put_command_log(command_log(unknown, "x", t0)).await,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
+    );
+}
+
+/// MOD-152 D5: [`WriteStore::command_log_of_run`] answers a row of the run with its log (or none
+/// yet); `id: None` is the run's latest row by `queued_at` across its steps; a row of another run,
+/// an unknown row and a run with no command row answer `None`.
+async fn command_log_of_run_reads_the_callers_runs_rows<S: WriteStore>(store: &S) {
+    const CASE: &str = "command_log_of_run_reads_the_callers_runs_rows";
+    let t0 = seam_clock();
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, None)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a run with no command row answers None"
+    );
+
+    let older = queued_command("build", t0);
+    let newer = queued_command("test", t0 + TimeDelta::seconds(10));
+    let foreign = NewCommandRun {
+        run_step_id: ids::STEP_R3_RESEARCH_A,
+        ..queued_command("build", t0 + TimeDelta::seconds(20))
+    };
+    for new in [&older, &newer, &foreign] {
+        store.enqueue_command((*new).clone()).await.expect(CASE);
+    }
+    let log = command_log(older.id, "older\n", t0);
+    store.put_command_log(log.clone()).await.expect(CASE);
+
+    let by_id = store
+        .command_log_of_run(ids::RUN_2, Some(older.id))
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        (by_id.row.id, by_id.log),
+        (older.id, Some(log)),
+        "{CASE}: a row of the run reads with its log"
+    );
+    let latest = store
+        .command_log_of_run(ids::RUN_2, None)
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        (latest.row.id, latest.log),
+        (newer.id, None),
+        "{CASE}: id None is the latest row of the run by queued_at, and it has no log yet"
+    );
+    assert_eq!(
+        latest.row,
+        command_row(CASE, store, newer.id).await,
+        "{CASE}: the row is the stored row"
+    );
+
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(foreign.id))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a row of another run answers None"
+    );
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(CommandRunId::new()))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: an unknown row answers None"
+    );
+    let other = store
+        .command_log_of_run(ids::RUN_3, None)
+        .await
+        .expect(CASE)
+        .expect(CASE);
+    assert_eq!(
+        other.row.id, foreign.id,
+        "{CASE}: the other run's latest row is its own"
+    );
+}
+
+/// MOD-152 D1: a log goes with its row (`ON DELETE CASCADE`): deleting the project that owns the
+/// step succeeds with a log in place, and the log is no longer readable.
+async fn command_log_goes_with_its_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "command_log_goes_with_its_step";
+    let t0 = seam_clock();
+    let row = queued_command("build", t0);
+    store.enqueue_command(row.clone()).await.expect(CASE);
+    store
+        .put_command_log(command_log(row.id, "gone\n", t0))
+        .await
+        .expect(CASE);
+    store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        store
+            .command_log_of_run(ids::RUN_2, Some(row.id))
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: the row and its log are gone"
+    );
+    let reborn = CommandRunId::new();
+    assert!(
+        matches!(
+            store.put_command_log(command_log(reborn, "x", t0)).await,
+            Err(StoreError::NotFound { .. })
+        ),
+        "{CASE}: nothing is left to write to"
+    );
+}
+
 /// MOD-78 D1, D2: [`WriteStore::lease_holds`] answers whether the run's `lease_owner` is the
 /// fence's owner, `IS NOT DISTINCT FROM`: a claimed run holds its owner's fence and no other, a
 /// taken run its taker's, an expired lease nobody took still its owner's (owner only, never the
@@ -28004,6 +29338,850 @@ async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
     );
 }
 
+// ---- MOD-164: a run's capture step writes memory, and `finish_run` tallies its use (D4, D5) ---
+
+/// The commit a capture write carries: the engine's, never the model's (MOD-164 D4).
+const CAPTURE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The model a capture step runs on, distinct from [`new_run_step`]'s `opus`, so the stamp is
+/// seen to come from the step row.
+const CAPTURE_MODEL: &str = "light";
+
+/// A fresh run of `HTUI_ANA_2` claimed by `owner` on the fixture box (with
+/// [`leased_step`]'s ordinary step at 0), and its capture stage at `attempt` on
+/// [`CAPTURE_POSITION`].
+async fn capture_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+) -> (RunId, StepId, StepId) {
+    let (run, ordinary) = leased_step(case, store, owner, seam_clock()).await;
+    let step = store.create_step(capture_row(run, 1)).await.expect(case).id;
+    (run, ordinary, step)
+}
+
+/// The capture stage row of `run` at `attempt`, on the light model.
+fn capture_row(run: RunId, attempt: i32) -> NewRunStep {
+    NewRunStep {
+        attempt,
+        model: Some(CAPTURE_MODEL.to_owned()),
+        ..role_step(
+            run,
+            CAPTURE_POSITION,
+            StepRole::Stage,
+            None,
+            Some(CAPTURE_KEY),
+        )
+    }
+}
+
+/// A capture write with a fresh id, citing `step`, carrying [`CAPTURE_COMMIT`].
+fn run_memory_new(case: &str, step: StepId, subject: &str, body: &str) -> NewRunMemory {
+    let scrubber = memory_scrubber();
+    NewRunMemory {
+        id: MemoryEntryId::new(),
+        kind: MemoryKind::Gotcha,
+        subject: MemorySubject::new(subject, &scrubber).expect(case),
+        body: MemoryBody::new(body, &scrubber).expect(case),
+        evidence: MemoryEvidence {
+            citations: vec![MemoryCitation {
+                step_id: step,
+                quote: "error: linker `cc` not found".to_owned(),
+            }],
+        },
+        commit: Some(CAPTURE_COMMIT.to_owned()),
+    }
+}
+
+/// The entry a capture write created, or a panic naming the case.
+fn run_memory_created(case: &str, outcome: RunMemoryWrite) -> MemoryEntry {
+    match outcome {
+        RunMemoryWrite::Created(row) => row,
+        other => panic!("{case}: expected Created, got {other:?}"),
+    }
+}
+
+/// The provenance [`capture_step`]'s rows stamp on `run`'s entries.
+fn capture_provenance(run: RunId, step: StepId) -> Option<RunProvenance> {
+    Some(RunProvenance {
+        run_id: Some(run),
+        step_id: Some(step),
+        item_id: Some(ids::HTUI_ANA_2),
+        agent_id: Some(ids::AGENT_CLAUDE),
+        model: Some(CAPTURE_MODEL.to_owned()),
+        commit: Some(CAPTURE_COMMIT.to_owned()),
+    })
+}
+
+/// MOD-164 D4: with no live entry on its folded subject, a capture write creates a live `run`
+/// entry stamped from the step's and the run's rows (run, step, item, agent, model; the run's
+/// starter as author, its lease box on the revision), carrying the caller's commit and evidence,
+/// at version 1 with revision 1 `created` and no usage yet.
+async fn run_memory_creates_a_run_entry_with_stamped_provenance<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_creates_a_run_entry_with_stamped_provenance";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let new = run_memory_new(
+        CASE,
+        step,
+        " Linker ",
+        "Install a C toolchain before building.",
+    );
+    let (id, evidence) = (new.id, new.evidence.clone());
+    let row = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(StepFence::Lease(a), step, new)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            row.id,
+            row.project_id,
+            row.kind,
+            row.subject.as_str(),
+            row.body.as_str(),
+            row.state,
+            row.version,
+            row.superseded_by,
+            row.created_by,
+            row.source,
+        ),
+        (
+            id,
+            ids::PROJECT_HTUI,
+            MemoryKind::Gotcha,
+            "Linker",
+            "Install a C toolchain before building.",
+            MemoryState::Active,
+            1,
+            None,
+            ids::USER,
+            MemorySource::Run,
+        ),
+        "{CASE}: a live run entry at version 1 in the run's project, written by its starter"
+    );
+    assert_eq!(
+        row.provenance,
+        capture_provenance(run, step),
+        "{CASE}: the provenance is the step's and the run's, the commit the caller's"
+    );
+    assert_eq!(row.evidence, Some(evidence), "{CASE}: the evidence is kept");
+    assert_eq!(
+        row.usage,
+        MemoryUsage::default(),
+        "{CASE}: no step has shown it yet"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![row.clone()],
+        "{CASE}: the list reads the entry back as the write returned it"
+    );
+    assert_eq!(
+        memory_history(CASE, store, id).await,
+        vec![MemoryRevision {
+            entry_id: id,
+            version: 1,
+            kind: MemoryKind::Gotcha,
+            subject: "Linker".to_owned(),
+            body: "Install a C toolchain before building.".to_owned(),
+            state: MemoryState::Active,
+            author_id: ids::USER,
+            box_id: Some(ids::BOX),
+            reason: "created".to_owned(),
+            created_at: row.created_at,
+        }],
+        "{CASE}: revision 1 is `created`, by the run's starter on its lease box"
+    );
+}
+
+/// MOD-164 D4: a capture write whose subject folds to a live run entry's supersedes it as
+/// `supersede_memory_entry` does: the old entry moves to `superseded` naming the new one, with a
+/// `superseded` revision by the run's starter on its lease box; the new entry is live.
+async fn run_memory_supersedes_a_live_run_entry_on_the_folded_subject<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_supersedes_a_live_run_entry_on_the_folded_subject";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let first = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+    let second = run_memory_new(CASE, step, "  LINKER ", "Install a C toolchain first.");
+    let second_id = second.id;
+    let outcome = store
+        .write_run_memory(StepFence::Lease(a), step, second)
+        .await
+        .expect(CASE);
+    let RunMemoryWrite::Superseded { old, new } = outcome else {
+        panic!("{CASE}: expected Superseded, got {outcome:?}");
+    };
+    assert_eq!(
+        (
+            old.id,
+            old.state,
+            old.superseded_by,
+            old.version,
+            old.source,
+            old.subject.as_str(),
+            old.body.as_str(),
+        ),
+        (
+            first.id,
+            MemoryState::Superseded,
+            Some(second_id),
+            2,
+            MemorySource::Run,
+            "Linker",
+            "Install cc.",
+        ),
+        "{CASE}: the old entry is superseded by the new one, its text kept"
+    );
+    assert_eq!(
+        old.provenance, first.provenance,
+        "{CASE}: the old entry keeps its provenance"
+    );
+    assert_eq!(
+        (
+            new.id,
+            new.state,
+            new.version,
+            new.source,
+            new.subject.as_str(),
+            new.body.as_str(),
+        ),
+        (
+            second_id,
+            MemoryState::Active,
+            1,
+            MemorySource::Run,
+            "LINKER",
+            "Install a C toolchain first.",
+        ),
+        "{CASE}: the new entry is live at version 1"
+    );
+    assert_eq!(
+        new.provenance,
+        capture_provenance(run, step),
+        "{CASE}: the new entry is stamped from the rows"
+    );
+    let history = memory_history(CASE, store, first.id).await;
+    assert_eq!(
+        memory_history_view(&history),
+        vec![
+            (1, "created", MemoryState::Active, "Install cc."),
+            (2, "superseded", MemoryState::Superseded, "Install cc."),
+        ],
+        "{CASE}: the old entry's history ends in a `superseded` revision"
+    );
+    assert_eq!(
+        (history[1].author_id, history[1].box_id),
+        (ids::USER, Some(ids::BOX)),
+        "{CASE}: the `superseded` revision is the run's starter's, on its lease box"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active, MemoryState::Suspect])
+        )
+        .await,
+        vec![new],
+        "{CASE}: one live entry holds the subject"
+    );
+}
+
+/// MOD-164 D4: a run never replaces a person's entry. A capture write whose subject folds to a
+/// live person entry's answers `PersonHolds` naming it, and writes nothing.
+async fn run_memory_never_replaces_a_person_entry<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_never_replaces_a_person_entry";
+    let person = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Default branch",
+        "The default branch is main.",
+    )
+    .await;
+    let a = Uuid::now_v7();
+    let (_, _, step) = capture_step(CASE, store, a).await;
+
+    assert_eq!(
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "default BRANCH", "The default branch is trunk."),
+            )
+            .await
+            .expect(CASE),
+        RunMemoryWrite::PersonHolds {
+            existing: person.id
+        },
+        "{CASE}: the person's entry holds the subject"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![person.clone()],
+        "{CASE}: no entry was written, and the person's is as it was"
+    );
+    assert_eq!(
+        memory_history(CASE, store, person.id).await.len(),
+        1,
+        "{CASE}: the person's entry gained no revision"
+    );
+}
+
+/// MOD-164 D4 (review M1): a run entry a person amended is the person's. Runs create entries at
+/// version 1 and only move them to `superseded`, so a live run entry past version 1 was edited by
+/// a person: a later capture write on its folded subject answers `PersonHolds` naming it, writes
+/// nothing, and the person's text stays.
+async fn run_memory_keeps_a_run_entry_a_person_amended<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_keeps_a_run_entry_a_person_amended";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let written = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+    let amended = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(
+                written.id,
+                1,
+                memory_patch(CASE, None, Some("Install the mingw toolchain.")),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (amended.source, amended.version),
+        (MemorySource::Run, 2),
+        "{CASE}: the amend keeps the run's source and moves the version"
+    );
+
+    let retry = store.create_step(capture_row(run, 2)).await.expect(CASE).id;
+    assert_eq!(
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                retry,
+                run_memory_new(CASE, retry, " LINKER", "Install cc again."),
+            )
+            .await
+            .expect(CASE),
+        RunMemoryWrite::PersonHolds {
+            existing: written.id
+        },
+        "{CASE}: the amended entry holds the subject as a person's does"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![amended.clone()],
+        "{CASE}: nothing was written, and the person's text is kept"
+    );
+    assert_eq!(
+        memory_history(CASE, store, written.id).await.len(),
+        2,
+        "{CASE}: the amended entry gained no revision"
+    );
+}
+
+/// MOD-164 D4: a capture step writes at most [`MEMORY_RUN_WRITE_CAP`] entries, counted over every
+/// entry naming the step (a superseded one included). Past it the write answers `CapReached` and
+/// writes nothing, before the subject is looked at; another capture step has a cap of its own.
+async fn run_memory_stops_at_the_write_cap<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_stops_at_the_write_cap";
+    let a = Uuid::now_v7();
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    for (subject, body) in [("One", "First."), ("Two", "Second.")] {
+        run_memory_created(
+            CASE,
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, step, subject, body),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let third = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            step,
+            run_memory_new(CASE, step, "one", "First, restated."),
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(third, RunMemoryWrite::Superseded { .. }),
+        "{CASE}: the third write supersedes the first, got {third:?}"
+    );
+    let before = memory_list(CASE, store, ids::PROJECT_HTUI, None).await;
+    assert_eq!(before.len(), 3, "{CASE}: three entries name the step");
+
+    for (subject, body) in [("Four", "Fourth."), ("Two", "Second, restated.")] {
+        assert_eq!(
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, step, subject, body),
+                )
+                .await
+                .expect(CASE),
+            RunMemoryWrite::CapReached {
+                cap: MEMORY_RUN_WRITE_CAP
+            },
+            "{CASE}: `{subject}` is past the cap"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        before,
+        "{CASE}: the refused writes wrote nothing"
+    );
+
+    let retry = store.create_step(capture_row(run, 2)).await.expect(CASE).id;
+    let fourth = run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(a),
+                retry,
+                run_memory_new(CASE, retry, "Four", "Fourth."),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        fourth.provenance.and_then(|stamp| stamp.step_id),
+        Some(retry),
+        "{CASE}: another capture step writes under a cap of its own"
+    );
+}
+
+/// MOD-164 D4: only a `stage` row keyed `capture` writes memory. An ordinary step and another
+/// stage are refused with [`MEMORY_NEEDS_A_CAPTURE_STEP`], and nothing is written.
+async fn run_memory_refuses_a_step_that_is_not_capture<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_a_step_that_is_not_capture";
+    let a = Uuid::now_v7();
+    let (run, ordinary, _) = capture_step(CASE, store, a).await;
+    let collect = store
+        .create_step(role_step(run, -1, StepRole::Stage, None, Some("collect")))
+        .await
+        .expect(CASE)
+        .id;
+
+    for (step, what) in [
+        (ordinary, "an ordinary step"),
+        (collect, "the collect stage"),
+    ] {
+        let refused = store
+            .write_run_memory(
+                StepFence::Lease(a),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(code)) if code == MEMORY_NEEDS_A_CAPTURE_STEP),
+            "{CASE}: {what} is refused with the code word, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: no refusal wrote an entry"
+    );
+}
+
+/// MOD-164 D4: a capture write is fenced like `write_step_document`: an unknown step is
+/// `NotFound`, an unleased or a stranger's fence is `Fenced`, and so is the old owner's after
+/// another took the run. Nothing is written until the new owner writes.
+async fn run_memory_refuses_a_lost_fence<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_a_lost_fence";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, _, step) = capture_step(CASE, store, a).await;
+
+    let unknown = StepId::new();
+    let missing = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            unknown,
+            run_memory_new(CASE, step, "Linker", "Install cc."),
+        )
+        .await;
+    assert!(
+        matches!(&missing, Err(StoreError::NotFound { entity: "run_step", id }) if *id == unknown.to_string()),
+        "{CASE}: an unknown step is NotFound, got {missing:?}"
+    );
+    for fence in [StepFence::Unleased, StepFence::Lease(b)] {
+        let refused = store
+            .write_run_memory(
+                fence,
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Fenced { step: s }) if s == step),
+            "{CASE}: a write under {fence:?} on A's run is fenced, got {refused:?}"
+        );
+    }
+    taken_by(CASE, store, run, a, b).await;
+    let stale = store
+        .write_run_memory(
+            StepFence::Lease(a),
+            step,
+            run_memory_new(CASE, step, "Linker", "Install cc."),
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's write after B took the run is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: the fenced writes wrote nothing"
+    );
+    run_memory_created(
+        CASE,
+        store
+            .write_run_memory(
+                StepFence::Lease(b),
+                step,
+                run_memory_new(CASE, step, "Linker", "Install cc."),
+            )
+            .await
+            .expect(CASE),
+    );
+}
+
+/// MOD-164 D4 (review L4): a capture write rests on quotes of its own run. No citation, or a
+/// citation naming a step of another run or no step, is refused with
+/// [`MEMORY_EVIDENCE_OUTSIDE_THE_RUN`] and nothing is written. The check comes after the
+/// capture-step check and before the cap.
+async fn run_memory_refuses_evidence_outside_the_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_memory_refuses_evidence_outside_the_run";
+    let a = Uuid::now_v7();
+    let (_, ordinary, step) = capture_step(CASE, store, a).await;
+    let other = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let stranger = store
+        .create_step(new_run_step(other, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let citing = |cited: Vec<StepId>| {
+        let mut new = run_memory_new(CASE, step, "Linker", "Install cc.");
+        new.evidence.citations = cited
+            .into_iter()
+            .map(|step_id| MemoryCitation {
+                step_id,
+                quote: "error: linker `cc` not found".to_owned(),
+            })
+            .collect();
+        new
+    };
+    let outside = |refused: &Result<RunMemoryWrite, StoreError>| matches!(refused, Err(StoreError::Constraint(code)) if code == MEMORY_EVIDENCE_OUTSIDE_THE_RUN);
+
+    let not_capture = store
+        .write_run_memory(StepFence::Lease(a), ordinary, citing(Vec::new()))
+        .await;
+    assert!(
+        matches!(&not_capture, Err(StoreError::Constraint(code)) if code == MEMORY_NEEDS_A_CAPTURE_STEP),
+        "{CASE}: the capture-step check comes first, got {not_capture:?}"
+    );
+    for (cited, what) in [
+        (Vec::new(), "no citation"),
+        (vec![step, stranger], "a step of another run"),
+        (vec![StepId::new(), ordinary], "no step"),
+    ] {
+        let refused = store
+            .write_run_memory(StepFence::Lease(a), step, citing(cited))
+            .await;
+        assert!(
+            outside(&refused),
+            "{CASE}: {what} is refused with the code word, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        Vec::new(),
+        "{CASE}: no refusal wrote an entry"
+    );
+
+    for subject in ["One", "Two", "Three"] {
+        run_memory_created(
+            CASE,
+            store
+                .write_run_memory(
+                    StepFence::Lease(a),
+                    step,
+                    run_memory_new(CASE, ordinary, subject, "Cited from the run's own step."),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let past_cap = store
+        .write_run_memory(StepFence::Lease(a), step, citing(vec![stranger]))
+        .await;
+    assert!(
+        outside(&past_cap),
+        "{CASE}: the evidence is judged before the cap, got {past_cap:?}"
+    );
+}
+
+/// `trim_record` as the assembler writes it when the prompt showed `shown` (MOD-163 D17).
+fn trim_showing(shown: &[Value]) -> Value {
+    json!({
+        "v": 5,
+        "sections": [],
+        "memory": { "shown": shown, "total": 3 },
+    })
+}
+
+/// One `trim_record.memory.shown[]` row of `entry`.
+fn shown_row(entry: MemoryEntryId) -> Value {
+    json!({ "id": entry.to_string(), "version": 1 })
+}
+
+/// A step of `run` at `position` whose prompt record is `trim`, moved `pending -> running ->
+/// to` (`None` leaves it pending).
+async fn shown_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+    run: RunId,
+    position: i32,
+    trim: Option<&Value>,
+    to: Option<StepStatus>,
+) -> StepId {
+    let at = seam_clock();
+    let step = store
+        .create_step(new_run_step(run, position, 1, 0))
+        .await
+        .expect(case)
+        .id;
+    if let Some(trim) = trim {
+        store
+            .set_step_prompt(StepFence::Lease(owner), step, "sha256:shown", trim)
+            .await
+            .expect(case);
+    }
+    if let Some(to) = to {
+        for (from, next) in [
+            (StepStatus::Pending, StepStatus::Running),
+            (StepStatus::Running, to),
+        ] {
+            assert!(
+                store
+                    .transition_step(step, from, next, at)
+                    .await
+                    .expect(case),
+                "{case}: {from} -> {next} is a sanctioned move"
+            );
+        }
+    }
+    step
+}
+
+/// The usage of `id` as the list reads it.
+async fn usage_of<S: ReadStore>(case: &str, store: &S, id: MemoryEntryId) -> MemoryUsage {
+    memory_list(case, store, ids::PROJECT_HTUI, None)
+        .await
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("{case}: {id} is listed"))
+        .usage
+}
+
+/// MOD-164 D5: `finish_run` counts, for each step of the run whose prompt record lists an entry,
+/// one showing, and one done or one failed by the step's status. The run's terminal move happens
+/// once, so a second `finish_run` is refused and the counts stay. The entry's version and history
+/// do not move, and neither does its `updated_at`: the prompt's memory section and the Settings
+/// list walk entries newest first by `updated_at` (D6), so a tally that moved it would reorder
+/// them on every run end.
+async fn finish_run_counts_memory_usage_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_run_counts_memory_usage_once";
+    let older = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Toolchain",
+        "Pin the toolchain in rust-toolchain.toml.",
+    )
+    .await;
+    let entry = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Linker",
+        "Install a C toolchain before building.",
+    )
+    .await;
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    let trim = trim_showing(&[shown_row(older.id), shown_row(entry.id)]);
+    shown_step(CASE, store, a, run, 1, Some(&trim), Some(StepStatus::Done)).await;
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        2,
+        Some(&trim),
+        Some(StepStatus::Failed),
+    )
+    .await;
+    assert_eq!(
+        usage_of(CASE, store, entry.id).await,
+        MemoryUsage::default(),
+        "{CASE}: nothing is counted before the run ends"
+    );
+    let walk = |rows: Vec<MemoryEntry>| {
+        rows.into_iter()
+            .filter(|row| row.id == older.id || row.id == entry.id)
+            .map(|row| (row.id, row.updated_at))
+            .collect::<Vec<_>>()
+    };
+    let before = walk(memory_list(CASE, store, ids::PROJECT_HTUI, None).await);
+
+    store
+        .finish_run(run, RunStatus::Done, None, seam_clock())
+        .await
+        .expect(CASE);
+    let tallied = MemoryUsage {
+        shown: 2,
+        done: 1,
+        failed: 1,
+    };
+    assert_eq!(
+        usage_of(CASE, store, entry.id).await,
+        tallied,
+        "{CASE}: two steps showed it, one done and one failed"
+    );
+    assert_eq!(
+        walk(memory_list(CASE, store, ids::PROJECT_HTUI, None).await),
+        before,
+        "{CASE}: the tally moved no updated_at, so the newest-first order stands"
+    );
+
+    let again = store
+        .finish_run(run, RunStatus::Failed, Some("again"), seam_clock())
+        .await;
+    assert!(
+        matches!(again, Err(StoreError::Constraint(_))),
+        "{CASE}: a finished run is not finished again, got {again:?}"
+    );
+    let row = memory_list(CASE, store, ids::PROJECT_HTUI, None)
+        .await
+        .into_iter()
+        .find(|row| row.id == entry.id)
+        .unwrap_or_else(|| panic!("{CASE}: the entry is listed"));
+    assert_eq!(
+        (row.usage, row.version, row.state),
+        (tallied, 1, MemoryState::Active),
+        "{CASE}: the refusal counted nothing, and the tally moved no version"
+    );
+    assert_eq!(
+        memory_history(CASE, store, entry.id).await.len(),
+        1,
+        "{CASE}: the tally wrote no revision"
+    );
+}
+
+/// MOD-164 D5: the tally takes only listed ids that still exist. An id with no row (a deleted
+/// entry), a row id that is not a UUID, a step with no record or a record with no memory audit
+/// count nothing and refuse nothing; an entry no step listed stays at zero; a listed entry on a
+/// step that ended neither done nor failed counts as shown only; and a step that lists an entry
+/// twice counts it once.
+async fn finish_run_skips_deleted_or_unlisted_entries<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_run_skips_deleted_or_unlisted_entries";
+    let shown = memory_create(CASE, store, ids::PROJECT_HTUI, "Shown", "Listed once.").await;
+    let unlisted = memory_create(CASE, store, ids::PROJECT_HTUI, "Unlisted", "Never shown.").await;
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+
+    let listed = trim_showing(&[
+        shown_row(MemoryEntryId::new()),
+        json!({ "id": "not-a-uuid", "version": 1 }),
+        shown_row(shown.id),
+        shown_row(shown.id),
+    ]);
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        1,
+        Some(&listed),
+        Some(StepStatus::Cancelled),
+    )
+    .await;
+    shown_step(CASE, store, a, run, 2, None, Some(StepStatus::Done)).await;
+    let bare = json!({ "v": 4, "sections": [] });
+    shown_step(
+        CASE,
+        store,
+        a,
+        run,
+        3,
+        Some(&bare),
+        Some(StepStatus::Failed),
+    )
+    .await;
+    let odd = json!({ "memory": { "shown": "not a list", "total": 0 } });
+    shown_step(CASE, store, a, run, 4, Some(&odd), Some(StepStatus::Done)).await;
+
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        usage_of(CASE, store, shown.id).await,
+        MemoryUsage {
+            shown: 1,
+            done: 0,
+            failed: 0,
+        },
+        "{CASE}: one cancelled step showed it, once"
+    );
+    assert_eq!(
+        usage_of(CASE, store, unlisted.id).await,
+        MemoryUsage::default(),
+        "{CASE}: an entry no step listed is not counted"
+    );
+}
+
 /// Plan D8: a project delete takes its memory entries and their revisions, every state, counts
 /// both in the reach it shows first, and leaves another project's entries alone.
 async fn project_delete_counts_memory<S: WriteStore>(store: &S) {
@@ -29867,9 +32045,9 @@ async fn create_step_refuses_a_part_without_parent_or_key<S: WriteStore>(store: 
     .await;
 }
 
-/// MOD-139 D1 (ANA-33 §7.11): positions -3..-1 are the stage rows' and only theirs, and a stage
-/// names pick, prepare or collect. Each refusal is [`run_step_refusal`]'s sentence on every store,
-/// and nothing is written.
+/// MOD-139 D1 (ANA-33 §7.11), MOD-164 D3: positions -4..-1 are the stage rows' and only theirs,
+/// and a stage names capture, pick, prepare or collect. Each refusal is [`run_step_refusal`]'s
+/// sentence on every store, and nothing is written. The capture stage at -4 is accepted.
 async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store: &S) {
     const CASE: &str = "create_step_reserves_negative_positions_for_stages";
     let (run, _) = leased_step(CASE, store, Uuid::now_v7(), seam_clock()).await;
@@ -29879,8 +32057,12 @@ async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store
             "a stage at position 0",
         ),
         (
-            role_step(run, -4, StepRole::Stage, None, Some("pick")),
-            "a stage at position -4",
+            role_step(run, -5, StepRole::Stage, None, Some("capture")),
+            "a stage at position -5",
+        ),
+        (
+            role_step(run, -5, StepRole::Step, None, None),
+            "a step at position -5",
         ),
         (
             role_step(run, -1, StepRole::Stage, None, Some("nope")),
@@ -29902,6 +32084,16 @@ async fn create_step_reserves_negative_positions_for_stages<S: WriteStore>(store
     for (new, what) in refused {
         step_refused_exactly(CASE, store, new, what).await;
     }
+    let capture = role_step(run, -4, StepRole::Stage, None, Some(CAPTURE_KEY));
+    let written = store
+        .create_step(capture.clone())
+        .await
+        .unwrap_or_else(|e| panic!("{CASE}: the capture stage at -4 is accepted: {e:?}"));
+    assert_eq!(
+        (written.position, written.role, written.node_key.as_deref()),
+        (CAPTURE_POSITION, StepRole::Stage, Some(CAPTURE_KEY)),
+        "{CASE}: the capture stage reads back"
+    );
 }
 
 /// The sentence both stores give a `run_step.parent_step_id` that names no step of `run`, an
@@ -31455,7 +33647,9 @@ async fn new_kinds_never_gate_readiness<S: WriteStore>(store: &S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CASES, READ_CASES, run_case, run_read_case};
+    use super::{
+        CASES, READ_CASES, WORKER_LOG_CASES, run_case, run_read_case, run_worker_log_case,
+    };
     use crate::store::MemStore;
 
     #[test]
@@ -31465,15 +33659,20 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
 
-        // The two lists are reported separately by MOD-6's binding, so a name may not be in both
+        // The three lists are reported separately by MOD-6's binding, so a name may not be in two
         // either: a duplicate across them would be run twice and reported once.
-        let mut both: Vec<&str> = CASES.iter().chain(READ_CASES).copied().collect();
-        both.sort_unstable();
-        both.dedup();
+        let mut all: Vec<&str> = CASES
+            .iter()
+            .chain(READ_CASES)
+            .chain(WORKER_LOG_CASES)
+            .copied()
+            .collect();
+        all.sort_unstable();
+        all.dedup();
         assert_eq!(
-            both.len(),
-            CASES.len() + READ_CASES.len(),
-            "a case name is unique across both lists"
+            all.len(),
+            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len(),
+            "a case name is unique across the three lists"
         );
     }
 
@@ -31626,6 +33825,15 @@ mod tests {
         let store = MemStore::demo();
         for name in READ_CASES {
             run_read_case(name, &store).await;
+        }
+    }
+
+    /// The same guard for the worker log half (MOD-122 M2, blueprint F1): each case writes, so
+    /// each gets a fresh store.
+    #[tokio::test]
+    async fn run_worker_log_case_accepts_every_name() {
+        for name in WORKER_LOG_CASES {
+            run_worker_log_case(name, &MemStore::demo()).await;
         }
     }
 }

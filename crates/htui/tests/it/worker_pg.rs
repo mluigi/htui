@@ -1149,6 +1149,115 @@ async fn a_forced_stop_from_another_box_settles_a_live_worker_walk_stopped() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// MOD-125 M3 T5: a stopped worker run resumes (plan D1, D4, D8)
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-125 M3: a resumed worker run finishes within one poll, its walk and a margin of the
+/// workspace's resume.
+const RESUME_BOUND: Duration = Duration::from_secs(COMMAND_POLL.as_secs() + 5);
+
+/// MOD-125 M3 D1, D4, D8: a client on another box stops, in `mode`, the workspace of a run the
+/// worker walks while its session is parked ([`a_stop_from_another_box_settles`]'s path), then
+/// resumes the workspace. The worker's next command poll lists the run (`pending_resumes`) and
+/// resumes it on its own task: the stopped step on its own row and attempt, the run `done` within
+/// [`RESUME_BOUND`], no `run_command` row, the lease given back.
+async fn a_stopped_worker_run_resumes_and_finishes(mode: StopMode) {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, _) = stack
+        .start_in(ids::HTUI_FEAT_3, ids::WORKSPACE_PLATFORM)
+        .await;
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::default()));
+    let (client, _client_root) = another_box(&stack.db).await;
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+    client
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            mode,
+            client.this_user(),
+            Utc::now(),
+        )
+        .await
+        .expect("the stop is written");
+    let deadline = Instant::now() + PATIENCE;
+    while stack.run_row(run).await.status != RunStatus::Stopped {
+        assert!(Instant::now() < deadline, "the run was never stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Stopped).await;
+    let stopped = stack
+        .db
+        .store
+        .run_steps(run)
+        .await
+        .expect("the read answers")
+        .into_iter()
+        .find(|step| step.id == parked.run_step_id)
+        .expect("the parked step");
+
+    let asked = Instant::now();
+    assert!(
+        client
+            .resume_workspace(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("the resume is written"),
+        "the workspace was stopped"
+    );
+    let deadline = asked + PATIENCE;
+    while stack.run_row(run).await.status != RunStatus::Done {
+        assert!(
+            Instant::now() < deadline,
+            "the run never finished: {:?}",
+            stack.run_row(run).await.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let took = asked.elapsed();
+    assert!(
+        took < RESUME_BOUND,
+        "the {mode} stop's run finished {took:?} after the resume, not within {RESUME_BOUND:?}"
+    );
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Done).await;
+    let at_its_position: Vec<(StepId, i32)> = stack
+        .db
+        .store
+        .run_steps(run)
+        .await
+        .expect("the read answers")
+        .into_iter()
+        .filter(|step| step.position == stopped.position)
+        .map(|step| (step.id, step.attempt))
+        .collect();
+    assert_eq!(
+        at_its_position,
+        [(parked.run_step_id, stopped.attempt)],
+        "the step resumed on its own row and attempt"
+    );
+    assert!(
+        command_statuses(&stack, run).await.is_empty(),
+        "a resume writes no run_command row"
+    );
+    stack.released(run).await;
+    worker.stop().await;
+    stack.finish().await;
+}
+
+/// [`a_stopped_worker_run_resumes_and_finishes`], graceful.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_worker_run_resumes_and_finishes_graceful() {
+    a_stopped_worker_run_resumes_and_finishes(StopMode::Graceful).await;
+}
+
+/// [`a_stopped_worker_run_resumes_and_finishes`], forced.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_worker_run_resumes_and_finishes_forced() {
+    a_stopped_worker_run_resumes_and_finishes(StopMode::Forced).await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // MOD-70 T4: follow-ups across boxes
 // ---------------------------------------------------------------------------------------------
 

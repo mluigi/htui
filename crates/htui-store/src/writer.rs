@@ -30,19 +30,19 @@ use htui_core::model::{
     ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState,
     MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
     NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
-    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
+    NewWorkspace, Note, OpenPermission, PendingStop, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
@@ -1144,6 +1144,38 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        match self {
+            Self::Memory(store) => store.pending_resumes(box_id).await,
+            Self::Online(pg) => pg.pending_resumes(box_id).await,
+        }
+    }
+
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.resume_run(run, box_id, owner, ttl).await,
+            Self::Online(pg) => pg.resume_run(run, box_id, owner, ttl).await,
+        }
+    }
+
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.cancel_stopped_run(run, box_id, at).await,
+            Self::Online(pg) => pg.cancel_stopped_run(run, box_id, at).await,
+        }
+    }
+
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         match self {
             Self::Memory(store) => store.create_step(new).await,
@@ -1501,6 +1533,22 @@ impl WriteStore for Writer {
             Self::Online(pg) => pg.cancel_command(id).await,
         }
     }
+    async fn put_command_log(&self, log: htui_core::model::CommandLog) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.put_command_log(log).await,
+            Self::Online(pg) => pg.put_command_log(log).await,
+        }
+    }
+    async fn command_log_of_run(
+        &self,
+        run: RunId,
+        id: Option<htui_core::model::CommandRunId>,
+    ) -> Result<Option<htui_core::model::StoredCommandLog>> {
+        match self {
+            Self::Memory(store) => store.command_log_of_run(run, id).await,
+            Self::Online(pg) => pg.command_log_of_run(run, id).await,
+        }
+    }
 
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
 
@@ -1781,6 +1829,18 @@ impl WriteStore for Writer {
                     .await
             }
             Self::Online(pg) => pg.supersede_memory_entry(old, expected_version, new).await,
+        }
+    }
+
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        match self {
+            Self::Memory(store) => store.write_run_memory(fence, step, new).await,
+            Self::Online(pg) => pg.write_run_memory(fence, step, new).await,
         }
     }
 

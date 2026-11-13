@@ -16,7 +16,9 @@ use htui::ui::tabs::settings::memory::{
 };
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
-use htui_core::model::{MemoryEntry, MemoryEntryId, MemoryKind, MemoryState, ProjectId};
+use htui_core::model::{
+    MemoryEntry, MemoryEntryId, MemoryKind, MemorySource, MemoryState, ProjectId, RunProvenance,
+};
 use htui_core::store::{MemStore, ReadStore as _};
 use htui_store::Backend;
 use uuid::Uuid;
@@ -51,6 +53,10 @@ fn entry(
         created_by: ids::USER,
         created_at: at(1),
         updated_at: at(day),
+        source: MemorySource::Person,
+        provenance: None,
+        evidence: None,
+        usage: htui_core::model::MemoryUsage::default(),
     }
 }
 
@@ -290,9 +296,34 @@ async fn m_on_the_workspace_or_a_repo_row_says_pick_a_project() {
 }
 
 #[tokio::test]
-async fn the_list_shows_kind_subject_state_and_date() {
+async fn the_list_shows_kind_subject_state_source_and_date() {
     let (bench, section) = opened(Some(live())).await;
     insta::assert_snapshot!("list", frame(&bench, &section));
+}
+
+/// `e` as a run's capture step wrote it (MOD-164): `source` run, provenance present.
+fn by_run(mut e: MemoryEntry) -> MemoryEntry {
+    e.source = MemorySource::Run;
+    e.provenance = Some(RunProvenance::default());
+    e
+}
+
+#[tokio::test]
+async fn the_source_column_names_a_person_or_a_run() {
+    let mut entries = live();
+    entries[1] = by_run(entries[1].clone());
+    entries[2] = by_run(entries[2].clone());
+    let (bench, section) = opened(Some(entries)).await;
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("active      person  2026-11-07"),
+        "a person's entry says person after its state: {shown}"
+    );
+    assert!(
+        shown.contains("active      run     2026-11-05"),
+        "a run's entry says run after its state: {shown}"
+    );
+    insta::assert_snapshot!("source", shown);
 }
 
 #[tokio::test]
@@ -482,7 +513,7 @@ async fn a_stale_reply_keeps_the_text_and_moves_the_token() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head,
+            head: Box::new(head),
             entries: fresh,
         },
     );
@@ -550,7 +581,7 @@ async fn clashed() -> (SectionBench, HierarchySection) {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: live()[0].clone(),
+            existing: Box::new(live()[0].clone()),
         },
     );
     (bench, section)
@@ -635,7 +666,7 @@ async fn an_amend_clash_offers_only_edit() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: live()[0].clone(),
+            existing: Box::new(live()[0].clone()),
         },
     );
 
@@ -734,7 +765,7 @@ async fn a_reply_for_another_project_is_ignored() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: other,
-            existing: live()[1].clone(),
+            existing: Box::new(live()[1].clone()),
         },
     );
 
@@ -845,7 +876,7 @@ async fn a_clash_whose_holder_was_renamed_frees_the_subject() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head,
+            head: Box::new(head),
             entries: fresh,
         },
     );
@@ -884,7 +915,7 @@ async fn a_second_clash_names_the_new_holder() {
         &mut section,
         &StoreReply::MemorySubjectTaken {
             project: ids::PROJECT_VULKAN,
-            existing: holder.clone(),
+            existing: Box::new(holder.clone()),
         },
     );
 
@@ -916,7 +947,7 @@ async fn a_stale_retire_follows_its_entry_to_its_new_row() {
         &mut section,
         &StoreReply::MemoryStale {
             project: ids::PROJECT_VULKAN,
-            head: head.clone(),
+            head: Box::new(head.clone()),
             entries: fresh,
         },
     );
@@ -1159,7 +1190,7 @@ async fn a_stale_reply_whose_head_closed_returns_to_browse() {
             &mut section,
             &StoreReply::MemoryStale {
                 project: ids::PROJECT_VULKAN,
-                head,
+                head: Box::new(head),
                 entries: live()[1..].to_vec(),
             },
         );

@@ -706,9 +706,8 @@ recovery sweep's settlement; the "who" column names the milestone that first wri
 |---|---|---|---|---|
 | `running` | workspace stop applied | - | `stopped` | orchestrator (executor's command poll, M2) |
 | `running` | lease expired, workspace stopped | recovery sweep (§4.9), MOD-125 D6 | `stopped` | recovery sweep |
-| `stopped` | resume | session reopened or rerun fresh | `running` | orchestrator (M3) |
-| `stopped` | cancel | - | `cancelled` | user (M3) |
-| `stopped` | resume impossible and no rerun | - | `failed` | orchestrator (M3) |
+| `stopped` | resume | no `workspace_stop` row, `executing_box_id` is the polling box, no cancel pending (`resume_run`) | `running` | orchestrator (executor's command poll, M3) |
+| `stopped` | cancel | `executing_box_id` is this box or none; another box's applies the cancel row in its poll | `cancelled` | user (M3) |
 
 *Amended by MOD-125 M2, 2026-11-12 (plan D1-D4, `.claude/plans/mod-125-m2-stop-applied.plan.md`):*
 the "workspace stop applied" row is written by the process that leases the run. Its command poll
@@ -718,6 +717,22 @@ workspace has a `workspace_stop` row, and interrupts each walk through the cance
 once on an escalation). It then retakes the lease and calls `stop_run` (`Engine::settle_stop`).
 Trees, branch and the session banner stay; there is no `finished_at`. A pending cancel of the run
 wins; a run whose lease lapsed is the sweep's row below.
+
+*Amended by MOD-125 M3, 2026-11-13 (plan D1, D2, D6, D8, `.claude/plans/mod-125-m3-resume.plan.md`):*
+the resume request is the absence of the `workspace_stop` row (`resume_workspace` deletes it); no
+other record is written. The box that executed the run resumes it: its command poll, in the process
+whose role executes (as the sweep), lists `pending_resumes(box)`, its `stopped` runs whose workspace
+has no `workspace_stop` row, and walks each through `Engine::resume_stopped`, whose `resume_run` is
+one CAS `stopped -> running` that takes the lease. The CAS refuses a run stopped again, on another
+box, or with a cancel pending, so a cancel and a resume race on the one `stopped` row. A box that is
+offline resumes its runs when it comes back. The cancel row is `cancel_stopped_run`: the run
+`cancelled` with `finished_at`, its non-terminal steps `cancelled` and its pending follow-ups
+refused, in one transaction; a stopped run of another box is cancelled through its durable command
+row, which that box's poll applies. The M1 row `stopped -> failed` ("resume impossible and no rerun")
+leaves this table but stays allowed by `RunStatus::can_move_to`, written by nothing: `fail_run`
+admits a stopped run on both stores, and no path fails one. A resumed run fails as any `running`
+run does, from its steps, and a stopped run whose box is gone cannot be resumed (its CLI sessions
+live there) and is cancelled. Moving it to another box is out of scope.
 
 `run.status` is **derived from its steps** at every step transition, except `queued` (set at insert)
 and `cancelled` (only a human sets it). That derivation is the single reason the two machines cannot
@@ -767,8 +782,8 @@ its list of who writes `superseded`.
 |---|---|---|---|---|
 | `running` | workspace stop applied | - | `stopped` | orchestrator (executor's command poll, M2) |
 | `running` | lease expired, workspace stopped | recovery sweep | `stopped` | recovery sweep |
-| `stopped` | resume | session reopened | `running` | orchestrator (M3) |
-| `stopped` | resume cannot reopen the session | fresh rerun inserted | `superseded` | orchestrator (M3) |
+| `stopped` | resume | session reopened, or a fresh session on the same row | `running` | orchestrator (M3) |
+| `stopped` | fan-out selection chose another candidate, or the judge's group was decided | `select_fanout` (MOD-125 M1 L-7) | `superseded` | orchestrator or judge |
 | `stopped` | run cancelled | - | `cancelled` | orchestrator |
 | `stopped` | run failed | - | `failed` | orchestrator |
 
@@ -786,6 +801,35 @@ unchanged: a lapsed lease in a workspace that is not stopped is still adjudicate
 artefacts, and a `running` step is never re-attached after a crash. A step halted by an explicit
 stop resumes in M3, by reopening its CLI session on the box that holds the session files (the run
 keeps `executing_box_id` for that) or by a fresh rerun.
+
+*Amended by MOD-125 M3, 2026-11-13 (plan D3-D7, `.claude/plans/mod-125-m3-resume.plan.md`):* a
+stopped step resumes on its own row: `stopped -> running`, same row, same attempt, same trees, no
+retry budget spent and no new row inserted, so the M1 row "resume cannot reopen the session, fresh
+rerun inserted, `superseded`" is retired. What the row holds picks the opening:
+
+1. no session rows (a forced stop before the recorder opened): the step is walked again from its
+   first stage; its tree is still at base, so `prepare` and the integrate pre-merge are safe to
+   repeat;
+2. rows but no `session_started` banner, or an agent without session resume in its `DriverCaps`:
+   a fresh session on the continuing recorder, opened with the handoff text (`handoff_opening`,
+   the phase's task, the transcript summary, the diff so far and the stop reason), no opening row;
+3. a banner and `DriverCaps.resume`: the session is reopened from the banner's session id (ACP
+   load/resume, CLI `--resume`) with `STOP_RESUME_OPENING`, which asks the agent to redo a turn the
+   stop cut off; the opening is recorded `resumed`. A reopen that fails at start with a transport
+   or closed error records `resume_failed`, posts the notice and starts the fresh session of case 2.
+
+Cases 2 and 3 never run `prepare`, the pre-merge or the prompt write again: the working directory is
+rebuilt from the step's `step_trees`, and `Isolator::reacquire` retakes a `shared_serialized`
+checkout's guard without a reset, failing the step when another walk moved its `HEAD`. After the
+session the step's walk runs on, so verify and the checks rerun; the deadline restarts from the
+resume. Parts and candidates resume inside their round beside pending siblings (under
+`shared_serialized`, stopped members finish before a pending sibling starts); a stopped planner is
+admitted, as recovery does; a stopped judge re-runs both calls fresh on its own row and its verdict
+is read from that re-run. Crash recovery still writes no `stopped` row and supersedes none: a crash
+between `resume_run` and the step's move leaves a `running` run over a `stopped` step, which the
+adopting walk resumes rather than adjudicates. `superseded` keeps its two meanings: a stopped
+fan-out loser, or a stopped judge whose group was decided, is the fan-out selection's (`Stopped ->
+Done` is illegal, so a stopped judge goes to `superseded`, not `done`).
 
 `superseded` carries exactly the two meanings its shipped doc comment gives it, "Replaced by a retry
 or by a fan-out winner", and this table is the complete list of who writes it.

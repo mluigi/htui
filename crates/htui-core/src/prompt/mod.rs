@@ -47,8 +47,8 @@ pub use estimate::TokenEstimator;
 pub use excerpt::ExcerptSet;
 pub use memory::{MEMORY_PREAMBLE, MEMORY_TOKEN_CAP, select as select_memory};
 pub use settings::{
-    Budget, BudgetSource, DEFAULTS, Defaults, Rungs, SPECS, SettingKey, SettingKind, SettingSpec,
-    rung_refusal, validate,
+    Budget, BudgetSource, DEFAULTS, Defaults, LightModel, Rungs, SPECS, SettingKey, SettingKind,
+    SettingSpec, resolve_light_model, rung_refusal, validate,
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
 pub use trim::{

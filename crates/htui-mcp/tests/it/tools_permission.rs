@@ -46,6 +46,7 @@ fn scope(transport: Transport) -> ToolScope {
         hostname: HostnameLine::Omitted,
         command_queue: false,
         cwd: PathBuf::from("."),
+        extra_dirs: Vec::new(),
         transport,
     }
 }

@@ -38,7 +38,6 @@ use htui_core::model::{
     RunCommandKind, RunCommandStatus, RunId, RunKind, RunStatus, Scope, SettleOutcome, StepId,
     StepPermission, StepStatus, UserId, WaitingPermission,
 };
-use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{Result, StoreError, references_no_row};
 use sqlx::types::Json;
 use uuid::Uuid;
@@ -426,9 +425,9 @@ pub(super) async fn answer_permission(
 ///
 /// MOD-125 M2 R1 (review M-1): each attempt first reads the run `FOR SHARE`, which conflicts
 /// with [`stop_run`](htui_core::store::WriteStore::stop_run)'s `FOR NO KEY UPDATE` of the run:
-/// a stop committed first is seen (`READ COMMITTED` re-reads the locked row) and refused with
-/// [`cancel_of_a_stopped_run`], writing nothing; a cancel committed first is seen by the stop,
-/// which then answers `false`. Lock order: the run, then `run_command` rows; no transaction
+/// a cancel committed first is seen by the stop, which then answers `false`; a stop committed
+/// first is followed by the cancel's row on the `stopped` run, which MOD-125 M3 D6 accepts (the
+/// box lists it, and `cancel_stopped_run` applies it). Lock order: the run, then `run_command` rows; no transaction
 /// takes them the other way round, and `stop_run`'s steps-then-run order touches no
 /// `run_command` row.
 pub(super) async fn request_cancel(
@@ -447,17 +446,13 @@ pub(super) async fn request_cancel(
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-        match status {
-            None => {
-                return Err(StoreError::NotFound {
-                    entity: "run",
-                    id: run.to_string(),
-                });
-            }
-            Some(RunStatus::Stopped) => {
-                return Err(StoreError::Constraint(cancel_of_a_stopped_run(run)));
-            }
-            Some(_) => {}
+        // The share lock is what serialises this with `stop_run`; any status takes the cancel
+        // (MOD-125 M3 D6), so the read only tells an unknown run apart.
+        if status.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
         }
         let inserted = sqlx::query_scalar!(
             r#"INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
@@ -546,8 +541,39 @@ where
     Ok(moved)
 }
 
+/// MOD-125 M3 D2: the relay half of
+/// [`WriteStore::cancel_stopped_run`](htui_core::store::WriteStore::cancel_stopped_run), on the
+/// caller's transaction after the run moved: the run's pending cancel is applied, its open
+/// windows close and its pending follow-ups are refused with [`FOLLOW_UP_RUN_CANCELLED`]. Not
+/// [`close_dropped_follow_ups`]: that one writes for a lease owner only, and the run has none.
+pub(super) async fn close_cancelled_run_relay(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: RunId,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE run_command \
+            SET status = 'applied', resolution = NULL, text = NULL, resolved_at = clock_timestamp() \
+          WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending'",
+        run.as_uuid(),
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    sqlx::query!(
+        "UPDATE follow_up_window SET closed_at = clock_timestamp() \
+          WHERE run_id = $1 AND closed_at IS NULL",
+        run.as_uuid(),
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    refuse_run_follow_ups(&mut **tx, run).await?;
+    Ok(())
+}
+
 /// [`WriteStore::pending_commands`](htui_core::store::WriteStore::pending_commands) (B-4):
-/// **cancels only** (MOD-70 D5, I-9); a follow-up is read by the walk that owns its step.
+/// **cancels only** (MOD-70 D5, I-9); a follow-up is read by the walk that owns its step. The
+/// box branch lists a `stopped` run's cancel too (MOD-125 M3 D6): it holds no lease.
 pub(super) async fn pending_commands(
     store: &PgStore,
     owner: Uuid,
@@ -568,7 +594,7 @@ pub(super) async fn pending_commands(
             WHERE c.status = 'pending' AND c.kind = 'cancel'
               AND (r.lease_owner = $1
                    OR (r.executing_box_id = $2
-                       AND (r.status IN ('done', 'failed', 'cancelled')
+                       AND (r.status IN ('done', 'failed', 'cancelled', 'stopped')
                             OR (r.status IN ('running', 'awaiting_approval')
                                 AND (r.lease_owner IS NULL OR r.lease_expires_at IS NULL
                                      OR r.lease_expires_at <= clock_timestamp())))))

@@ -166,8 +166,11 @@ str_enum!(
         Running => "running",
         /// Stopped at a gate.
         AwaitingApproval => "awaiting_approval",
-        /// Interrupted by a workspace stop (MOD-125 D1); resumes to `running` (M3), or is
-        /// superseded by a fresh rerun (M3's fallback), or is cancelled or failed with its run.
+        /// Interrupted by a workspace stop (MOD-125 D1). Resumes to `running` on its own row (M3):
+        /// its agent session reopened, or, when that cannot be done, a fresh session on the same
+        /// row and attempt opened with the handoff text (M3's fallback). Otherwise cancelled or
+        /// failed with its run, or superseded when `select_fanout` passes over it: a stopped
+        /// fan-out loser, or a stopped judge whose group was decided (MOD-125 M1 L-7).
         Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
@@ -255,14 +258,16 @@ str_enum!(
 );
 
 str_enum!(
-    /// `run_step.opening` (MOD-37 M5, R-48): how a promoted step's chat opened. `NULL` on a step
-    /// never bound to a promoted chat.
+    /// `run_step.opening` (MOD-37 M5, R-48): how a promoted step's chat opened, or how a stopped
+    /// step's session reopened when it resumed (MOD-125 M3). `NULL` on a step never bound to a
+    /// promoted chat and never resumed through its saved session.
     StepOpening {
         /// The step's own agent session was restored.
         Resumed => "resumed",
         /// A fresh session opened with the handoff prompt.
         Handoff => "handoff",
-        /// A requested resume failed; the chat opened with the handoff prompt instead.
+        /// A requested resume failed; the session opened fresh, with the handoff prompt (a
+        /// promoted chat) or the stop's fallback text on the same row (a resumed stopped step).
         ResumeFailed => "resume_failed",
     }
 );
@@ -381,9 +386,10 @@ pub struct RunStep {
     /// planner step; `None` on every other row today. Written once.
     #[serde(default)]
     pub parent_step_id: Option<StepId>,
-    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11): a part's `<divided>/<part_key>`, or a
-    /// stage's `pick` | `prepare` | `collect` ([`STAGE_KEYS`]); `None` on a node of the frozen
-    /// snapshot, which `position` names. Written once.
+    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11; MOD-164 D3): a part's
+    /// `<divided>/<part_key>`, or a stage's `capture` | `pick` | `prepare` | `collect`
+    /// ([`STAGE_KEYS`]); `None` on a node of the frozen snapshot, which `position` names. Written
+    /// once.
     #[serde(default)]
     pub node_key: Option<String>,
     /// `run_step.updated_at`.
@@ -725,6 +731,33 @@ pub struct GraphSnapshot {
     /// snapshot written before MOD-163, which renders no memory section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::model::memory::SnapshotMemory>,
+    /// MOD-164 D8: the run-end memory capture, frozen at `StartRun`: `Some` iff the project's
+    /// `memory_capture` switch resolved on, with the light model it resolved to. `None` means
+    /// capture is off: the switch is off, or the snapshot was written before MOD-164. **Not**
+    /// hashed by `topology` and [`GraphSnapshot::V`] not bumped; absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<SnapshotCapture>,
+}
+
+/// MOD-164 D8: [`GraphSnapshot::capture`], what the run's capture step runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCapture {
+    /// The `light_model` App setting at `StartRun`, its agent's name frozen beside it. `None`
+    /// when the setting is unset, malformed, or names an agent that is missing or disabled: the
+    /// capture step is then skipped on its row.
+    #[serde(default)]
+    pub model: Option<SnapshotCaptureModel>,
+}
+
+/// MOD-164 D8: the light model a capture step runs on, as frozen at `StartRun`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCaptureModel {
+    /// `agent.id`.
+    pub agent_id: AgentId,
+    /// `agent.name` at `StartRun`.
+    pub agent_name: String,
+    /// The model the agent is asked for.
+    pub model: String,
 }
 
 impl GraphSnapshot {
@@ -1099,16 +1132,26 @@ str_enum!(
         Subgraph => "subgraph",
         /// A read-only consult-mode subagent (MOD-27).
         Consult => "consult",
-        /// One of htui's own stages at positions -3..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
-        /// `chk_run_step_stage`); MOD-126 and MOD-132 write them.
+        /// One of htui's own stages at positions -4..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
+        /// `chk_run_step_stage`); MOD-126 and MOD-132 write pick, prepare and collect, MOD-164
+        /// writes capture.
         Stage => "stage",
     }
 );
 
-/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `pick` at -3,
-/// `prepare` at -2, `collect` at -1 (ANA-33 §7.11). `chk_run_step_stage` lists the same three; the
-/// CHECK does not bind a key to its position (blueprint F-1).
-pub const STAGE_KEYS: [&str; 3] = ["pick", "prepare", "collect"];
+/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `capture` at -4
+/// (MOD-164 D3), `pick` at -3, `prepare` at -2, `collect` at -1 (ANA-33 §7.11).
+/// `chk_run_step_stage` lists the same four (`0033_memory_capture.sql`); the CHECK does not bind a
+/// key to its position (blueprint F-1), so neither does [`run_step_refusal`].
+///
+/// [`run_step_refusal`]: crate::store::run_step_refusal
+pub const STAGE_KEYS: [&str; 4] = ["capture", "pick", "prepare", "collect"];
+
+/// The capture stage's `node_key` and `phase_name` (MOD-164 D3): the run-end memory capture turn.
+pub const CAPTURE_KEY: &str = "capture";
+
+/// The capture stage row's reserved position (MOD-164 D3), the first of [`STAGE_KEYS`]'s.
+pub const CAPTURE_POSITION: i32 = -4;
 
 /// The suffix of an expanded `divide` node's planner key, `<name>:plan` (MOD-138 D11). A phase may
 /// not be named with it (MOD-139 D6, [`phase_name_refusal`](crate::store::phase_name_refusal)), so a
@@ -1553,6 +1596,43 @@ impl From<NewCommandRun> for CommandRun {
     }
 }
 
+/// MOD-152 D2: the most a `command_log` text keeps, counted in bytes: the tail of a command's merged
+/// output, 32 times the row's own 64 KiB tail. A cut log opens with the executor's truncation line
+/// and starts on a line boundary.
+pub const COMMAND_LOG_CAP: usize = 2 * 1024 * 1024;
+
+/// MOD-152 D2: the most [`WriteStore::put_command_log`](crate::store::WriteStore::put_command_log)
+/// accepts, [`COMMAND_LOG_CAP`] plus room for the truncation marker; more is a `Constraint`.
+pub const COMMAND_LOG_STORE_MAX: usize = COMMAND_LOG_CAP + 4096;
+
+/// A row of `command_log` (MOD-152 D1): the scrubbed, size-capped merged output of one
+/// [`CommandRun`], written once by its runner before the row ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandLog {
+    /// `command_log.command_run_id`, the key: one log per row.
+    pub command_run_id: CommandRunId,
+    /// `command_log.text`, already scrubbed (R-ID-7, R-SEC-3) and at most
+    /// [`COMMAND_LOG_STORE_MAX`] bytes; the store neither redacts nor truncates it.
+    pub text: String,
+    /// `command_log.truncated`: the text is a tail, earlier output was dropped.
+    pub truncated: bool,
+    /// `command_log.total_bytes`: the size of the whole output before any cut.
+    pub total_bytes: u64,
+    /// `command_log.written_at`.
+    pub written_at: DateTime<Utc>,
+}
+
+/// What [`WriteStore::command_log_of_run`](crate::store::WriteStore::command_log_of_run) answers:
+/// the `command_run` row and its log, if the runner has written one (a reaped or crashed row has
+/// none, and neither has a row still running).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredCommandLog {
+    /// The row.
+    pub row: CommandRun,
+    /// Its log, if any.
+    pub log: Option<CommandLog>,
+}
+
 /// Step projection carried inside a [`RunSummary`]: what the Runs sub-tab lists per step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStepSummary {
@@ -1729,6 +1809,8 @@ mod tests {
         (RunStatus::Running, RunStatus::Stopped),
         (RunStatus::Stopped, RunStatus::Running),
         (RunStatus::Stopped, RunStatus::Cancelled),
+        // M3 dropped `stopped -> failed` from the document's table; the law keeps it, written by
+        // nothing (`docs/ANA-2.md`'s M3 amendment): `fail_run` admits a stopped run on both stores.
         (RunStatus::Stopped, RunStatus::Failed),
         // `done`, `failed`, `cancelled` are terminal.
     ];
@@ -2226,6 +2308,7 @@ mod tests {
             scope: None,
             personas,
             memory: None,
+            capture: None,
         }
     }
 
@@ -2294,6 +2377,36 @@ mod tests {
             (&back.phases, &back.edges),
             (&snapshot.phases, &snapshot.edges)
         );
+    }
+
+    /// MOD-164 D8: a pre-MOD-164 snapshot has no `capture` key and decodes as `None` (capture
+    /// off); a `None` snapshot writes no key; a frozen capture round-trips, its model or not.
+    #[test]
+    fn a_snapshot_without_capture_decodes_as_none_and_writes_no_key() {
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let value = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(value.get("capture").is_none(), "{value}");
+        let back: super::GraphSnapshot = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(back.capture, None);
+
+        for model in [
+            None,
+            Some(super::SnapshotCaptureModel {
+                agent_id: crate::model::AgentId::from_uuid(Uuid::from_u128(7)),
+                agent_name: "agy".to_owned(),
+                model: "light-1".to_owned(),
+            }),
+        ] {
+            let mut with = snapshot.clone();
+            with.capture = Some(super::SnapshotCapture { model });
+            let value = serde_json::to_value(&with).expect("encodes");
+            assert!(value["capture"].is_object(), "{value}");
+            let back: super::GraphSnapshot = serde_json::from_value(value).expect("decodes");
+            assert_eq!(back, with);
+        }
+        let off: super::SnapshotCapture =
+            serde_json::from_value(serde_json::json!({})).expect("a model-less capture decodes");
+        assert_eq!(off.model, None);
     }
 
     #[test]
@@ -2981,5 +3094,15 @@ mod tests {
             },
             step
         );
+    }
+
+    /// MOD-164 D3: `capture` is the fourth stage key, at the reserved position -4, ahead of the
+    /// other three in reserved-position order.
+    #[test]
+    fn capture_is_a_stage_key_at_minus_four() {
+        assert_eq!(super::STAGE_KEYS, ["capture", "pick", "prepare", "collect"]);
+        assert_eq!(super::CAPTURE_KEY, "capture");
+        assert_eq!(super::CAPTURE_POSITION, -4);
+        assert!(super::STAGE_KEYS.contains(&super::CAPTURE_KEY));
     }
 }

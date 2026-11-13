@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::ids::{BoxId, MemoryEntryId, ProjectId, UserId};
+use crate::model::ids::{AgentId, BoxId, ItemId, MemoryEntryId, ProjectId, RunId, StepId, UserId};
 use crate::scrub::{Scrubber, Unmasked};
 
 /// `memory_entry.subject`'s cap in characters (`char_length`), the CHECK's upper bound (plan D5).
@@ -14,6 +14,9 @@ pub const MEMORY_SUBJECT_MAX: usize = 120;
 
 /// `memory_entry.body`'s cap in characters (plan D5).
 pub const MEMORY_BODY_MAX: usize = 2000;
+
+/// MOD-164 D4: how many entries one capture step may write (`memory_entry.step_id`'s count).
+pub const MEMORY_RUN_WRITE_CAP: u32 = 3;
 
 str_enum!(
     /// `memory_entry.kind` (MOD-163 plan D1).
@@ -55,21 +58,24 @@ impl MemoryState {
 }
 
 str_enum!(
-    /// Who wrote a memory entry, as a run snapshot records it (MOD-163 D15). M2 freezes `person`
-    /// only (M1 D9: every entry is a person's); MOD-164 adds `run`.
+    /// Who wrote a memory entry: `memory_entry.source` (MOD-164 D1), and what a run snapshot
+    /// records (MOD-163 D15).
     MemorySource {
         /// A person: the Settings pane, the CLI or the MCP note tool.
         Person => "person",
+        /// A run's capture step (MOD-164).
+        Run => "run",
     }
 );
 
 impl MemorySource {
-    /// The `trust` attribute the memory section renders (D15): `person-written` today. MOD-164's
-    /// `run` source is `model-written`; MOD-166 adds `pinned`.
+    /// The `trust` attribute the memory section renders (D15): `person-written` for a person's
+    /// entry, `model-written` for a run's (MOD-164 D2); MOD-166 adds `pinned`.
     #[must_use]
     pub const fn trust(self) -> &'static str {
         match self {
             Self::Person => "person-written",
+            Self::Run => "model-written",
         }
     }
 }
@@ -181,6 +187,64 @@ pub struct MemoryEntry {
     pub created_at: DateTime<Utc>,
     /// `memory_entry.updated_at`.
     pub updated_at: DateTime<Utc>,
+    /// `memory_entry.source` (MOD-164 D1): a person's entry or a run's.
+    pub source: MemorySource,
+    /// The writing run's provenance (MOD-164 D2): `Some` iff `source` is [`MemorySource::Run`].
+    pub provenance: Option<RunProvenance>,
+    /// `memory_entry.evidence` (MOD-164 D2): the quotes a run's entry rests on; `None` on a
+    /// person's entry.
+    pub evidence: Option<MemoryEvidence>,
+    /// `memory_entry.shown_*` (MOD-164 D5).
+    pub usage: MemoryUsage,
+}
+
+/// Where a run's entry came from (MOD-164 D2): `memory_entry.run_id`, `step_id`, `item_id`,
+/// `agent_id`, `model` and `commit_hash`. Every field is an `Option` because each foreign key is
+/// `ON DELETE SET NULL`, and a run may have landed no commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunProvenance {
+    /// `memory_entry.run_id`: the run whose capture step wrote the entry.
+    pub run_id: Option<RunId>,
+    /// `memory_entry.step_id`: the capture step.
+    pub step_id: Option<StepId>,
+    /// `memory_entry.item_id`: the item the run worked on.
+    pub item_id: Option<ItemId>,
+    /// `memory_entry.agent_id`: the agent that ran the capture step.
+    pub agent_id: Option<AgentId>,
+    /// `memory_entry.model`: the model the capture step ran on.
+    pub model: Option<String>,
+    /// `memory_entry.commit_hash`: the newest commit the run landed, stamped by htui.
+    pub commit: Option<String>,
+}
+
+/// `memory_entry.evidence` (MOD-164 D2): the verbatim quotes from the run's steps a run's entry
+/// rests on, stored as JSONB `{"citations":[{"step_id","quote"}]}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEvidence {
+    /// One per quoted passage, in the order the capture step cited them.
+    pub citations: Vec<MemoryCitation>,
+}
+
+/// One quote of [`MemoryEvidence`]: a passage of one step's evidence block (MOD-164 D2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCitation {
+    /// The step whose evidence block holds the quote.
+    pub step_id: StepId,
+    /// The quote, verbatim and scrubbed.
+    pub quote: String,
+}
+
+/// `memory_entry.shown_steps`, `shown_done` and `shown_failed` (MOD-164 D5): how many finished
+/// steps' prompts showed the entry, and how many of those ended done or failed. Written once per
+/// run by `finish_run`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUsage {
+    /// `memory_entry.shown_steps`.
+    pub shown: i32,
+    /// `memory_entry.shown_done`.
+    pub done: i32,
+    /// `memory_entry.shown_failed`.
+    pub failed: i32,
 }
 
 /// A row of `memory_entry_revision`: the entry as it stood at `version`.
@@ -280,6 +344,59 @@ pub enum MemorySupersede {
         head: MemoryEntry,
         /// Its revision at the version the caller edited from.
         ancestor: MemoryRevision,
+    },
+}
+
+/// Arguments of [`WriteStore::write_run_memory`](crate::store::WriteStore::write_run_memory)
+/// (MOD-164 D4). No serde, as [`NewMemoryEntry`]: the text is checked on the way in. The
+/// provenance is not here: the store stamps it from the step's and the run's rows, never from
+/// the model's answer. `commit` is the engine's (the run's newest landed commit), never the model's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRunMemory {
+    /// Client-minted id (`MemoryEntryId::new()`).
+    pub id: MemoryEntryId,
+    /// The kind.
+    pub kind: MemoryKind,
+    /// The checked subject.
+    pub subject: MemorySubject,
+    /// The checked body.
+    pub body: MemoryBody,
+    /// The quotes the entry rests on, stored as `memory_entry.evidence`.
+    pub evidence: MemoryEvidence,
+    /// `memory_entry.commit_hash`.
+    pub commit: Option<String>,
+}
+
+/// Result of [`WriteStore::write_run_memory`](crate::store::WriteStore::write_run_memory)
+/// (MOD-164 D4).
+#[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is built per capture write and matched straight away; boxing the pair would buy \
+              an allocation per write to shrink a value nothing keeps (the shape is plan D4's, \
+              as `MemorySupersede`'s)"
+)]
+pub enum RunMemoryWrite {
+    /// No live entry held the folded subject: the new entry is live at version 1.
+    Created(MemoryEntry),
+    /// A live run-written entry held the folded subject: it is now `superseded` naming the new
+    /// entry, which is live at version 1.
+    Superseded {
+        /// The old entry's new head.
+        old: MemoryEntry,
+        /// The new entry.
+        new: MemoryEntry,
+    },
+    /// A live person-written entry holds the folded subject. A run never replaces a person's
+    /// entry; nothing was written.
+    PersonHolds {
+        /// The person's entry.
+        existing: MemoryEntryId,
+    },
+    /// The step already wrote [`MEMORY_RUN_WRITE_CAP`] entries; nothing was written.
+    CapReached {
+        /// The cap, [`MEMORY_RUN_WRITE_CAP`].
+        cap: u32,
     },
 }
 
@@ -599,16 +716,52 @@ mod tests {
         assert_eq!(memory_subject_key("\tX"), "\tx", "btrim keeps a tab");
     }
 
-    /// MOD-163 D15: M2 freezes person-written entries only.
+    /// MOD-163 D15: a person's entry is person-written. MOD-164 D2 adds `run`.
     #[test]
     fn memory_source_is_person_and_person_written() {
-        assert_eq!(MemorySource::ALL, [MemorySource::Person]);
+        assert_eq!(MemorySource::ALL, [MemorySource::Person, MemorySource::Run]);
         assert_eq!(MemorySource::Person.as_str(), "person");
         assert_eq!(MemorySource::Person.trust(), "person-written");
         let json = serde_json::to_value(MemorySource::Person).expect("serialise");
         assert_eq!(json, serde_json::json!("person"));
         let back: MemorySource = serde_json::from_value(json).expect("decode");
         assert_eq!(back, MemorySource::Person);
+    }
+
+    /// MOD-164 D2: a run's capture step writes `source = 'run'`, rendered `model-written`.
+    #[test]
+    fn memory_source_run_is_model_written() {
+        assert_eq!(MemorySource::Run.as_str(), "run");
+        assert_eq!(MemorySource::Run.trust(), "model-written");
+        let json = serde_json::to_value(MemorySource::Run).expect("serialise");
+        assert_eq!(json, serde_json::json!("run"));
+        let back: MemorySource = serde_json::from_value(json).expect("decode");
+        assert_eq!(back, MemorySource::Run);
+        assert_eq!(MEMORY_RUN_WRITE_CAP, 3);
+    }
+
+    /// MOD-164 D2: the `evidence` JSONB's shape, one citation per quoted step.
+    #[test]
+    fn memory_evidence_round_trips() {
+        let step = StepId::from_uuid(uuid::Uuid::from_u128(9));
+        let evidence = MemoryEvidence {
+            citations: vec![MemoryCitation {
+                step_id: step,
+                quote: "error: linker `cc` not found".to_owned(),
+            }],
+        };
+        let json = serde_json::to_value(&evidence).expect("serialise");
+        assert_eq!(
+            json,
+            serde_json::json!({"citations": [{
+                "step_id": step.to_string(),
+                "quote": "error: linker `cc` not found",
+            }]})
+        );
+        assert_eq!(
+            serde_json::from_value::<MemoryEvidence>(json).expect("decode"),
+            evidence
+        );
     }
 
     /// Blueprint P-15: a later builder's snapshot (MOD-164, MOD-166 add fields) still decodes.

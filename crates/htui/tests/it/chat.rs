@@ -1276,8 +1276,8 @@ async fn promotion_opens_the_chat_on_the_same_step() {
 
 /// MOD-37 M5 (R-48): an ACP row whose caps say `resume` resumes a promoted step that has a
 /// banner. The header says `resumed`, the opening is the resume sentence, and the step records
-/// that it resumed. The fake ignores `spec.resume` and mints the same `fake-<step>` id, so the
-/// banner matches.
+/// that it resumed. The fake's banner reports `spec.resume`, which is the step's own
+/// `fake-<step>` banner id, so the banner matches.
 #[tokio::test]
 async fn an_acp_promotion_with_a_banner_resumes_its_session() {
     let (mut harness, store) = promotion_harness_over(

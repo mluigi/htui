@@ -5,6 +5,13 @@
 maintainer decision on 2026-09-25: a run survives a crash through ANA-2 §4.9's reset-and-retry, as
 built by MOD-4 M6. What was left was the proof under `htui worker` (MOD-41), ANA-27 §5.1 T11's kill
 points, and MOD-53's leftover (a chat that panics mid-turn).
+**Narrowed by MOD-125 M3, 2026-11-13** (`docs/ANA-2.md` §4.3's M3 amendments): crash recovery is
+unchanged and still never re-attaches a step, but a step halted by an explicit workspace stop
+resumes mid-step on its own row once the workspace is resumed. The box that executed it (the run
+keeps `executing_box_id`) reopens the CLI or ACP session from its `session_started` banner with a
+redo text; a session that does not reopen, or a step with no banner, gets a fresh session on the
+same row with a handoff text. Nothing is checkpointed or re-hydrated from agent memory: the decision
+reads only store rows (the step's events) and the agent's own saved session.
 **Artifacts:** plan
 [`.claude/plans/mod-24-worker-crash-recovery.plan.md`](../../../.claude/plans/mod-24-worker-crash-recovery.plan.md)
 (fact-checked: 27 claims, 7 falsified and amended before CONFIRM) and blueprint

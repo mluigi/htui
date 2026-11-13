@@ -24,7 +24,6 @@ use htui_core::model::{
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
-use htui_core::store::traits::cancel_of_a_stopped_run;
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::kill_point::{KillPoint, Site};
 use htui_orch::tools::ToolHost;
@@ -270,6 +269,9 @@ struct Shared<P: ReplySink> {
     /// asked so far. Not on `Walks::Parent`, which a preempt removes. Same or weaker mode: the
     /// poll does nothing; `forced` over `graceful`: the walk is dropped at once (escalation).
     stopping: StdMutex<HashMap<RunId, StopMode>>,
+    /// MOD-125 M3 D8: the runs a resume task of this process walks, so a later poll that still
+    /// lists one (its `stopped -> running` CAS not yet taken) spawns no second task of it.
+    resuming: StdMutex<HashSet<RunId>>,
     /// MOD-24 D3 (B5): the live chats the last command poll was handed; the sweep's own cancels
     /// honour them as the poll does (D212). Always empty for the worker.
     last_live: StdMutex<LiveChats>,
@@ -705,6 +707,40 @@ impl<P: ReplySink> Drop for StopInFlight<P> {
     fn drop(&mut self) {
         self.shared
             .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.run);
+    }
+}
+
+impl<P: ReplySink> Shared<P> {
+    /// MOD-125 M3 D8: `run` claimed for one resume task until the guard drops; `None` while a
+    /// resume task of this process has it. The set's lock is released before the guard exists
+    /// ([`Self::applying`]'s rule: a guard dropped under it would lock the set again).
+    fn resume_turn(self: &Arc<Self>, run: RunId) -> Option<ResumeInFlight<P>> {
+        let inserted = self
+            .resuming
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(run);
+        inserted.then(|| ResumeInFlight {
+            shared: Arc::clone(self),
+            run,
+        })
+    }
+}
+
+/// MOD-125 M3 D8: removes `run` from [`Shared::resuming`] however its resume task ends
+/// ([`StopInFlight`]'s shape).
+struct ResumeInFlight<P: ReplySink> {
+    shared: Arc<Shared<P>>,
+    run: RunId,
+}
+
+impl<P: ReplySink> Drop for ResumeInFlight<P> {
+    fn drop(&mut self) {
+        self.shared
+            .resuming
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.run);
@@ -1358,6 +1394,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 polling: AtomicBool::new(false),
                 applying: StdMutex::default(),
                 stopping: StdMutex::default(),
+                resuming: StdMutex::default(),
                 last_live: StdMutex::default(),
                 applied: Notify::new(),
                 cancel_grace: CANCEL_GRACE,
@@ -2968,14 +3005,14 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// MOD-42 review L-4: whether `err` says the run is no longer queued because a claim won the race
 /// with a cancel that read it `queued` — a live lease elsewhere on this box, or a run executing
-/// (or parked) rather than queued or terminal.
+/// (or parked) rather than queued or terminal. MOD-125 M3 D6: a `stopped` run counts too, since
+/// the engine answers `stopped` only for a run stopped on another box, whose cancel is that box's
+/// to apply through the durable row.
 fn lost_to_a_claim(err: &EngineError) -> bool {
     match err {
         EngineError::LeaseHeld { .. } => true,
         EngineError::RunStatus { status, .. } => {
-            // MOD-125 D2: a `stopped` run's cancel is refused by `cancel_enabled` (wired in M3),
-            // which is an answer, not a lost race.
-            !matches!(*status, RunStatus::Queued | RunStatus::Stopped) && !status.is_terminal()
+            !matches!(*status, RunStatus::Queued) && !status.is_terminal()
         }
         _ => false,
     }
@@ -3201,9 +3238,10 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     // Review L-4: a claim by another process that lands between this snapshot and the queued CAS
     // leaves a run that is no longer queued, so D12 step 2's "otherwise" holds: the run is read
     // again (its `executing_box_id` decides step 4) and the cancel goes durable. A run that reads
-    // queued or terminal again keeps today's rowless refusal. MOD-125 D2: so does a `stopped`
-    // run, whose cancel `cancel_enabled` refuses until M3 wires it: a durable row nobody applies
-    // would be a cancel M1 shows but cannot do.
+    // queued or terminal again keeps today's rowless refusal. MOD-125 M3 D6: a `stopped` run takes
+    // the rowless path too, so one stopped on no box or on this one is cancelled at once; one
+    // stopped on another box is the engine's "on another box" answer, a lost race here, so the
+    // durable row is written and left to that box (step 4).
     let row = if existing.is_none()
         && (row.status == RunStatus::Queued
             || row.status == RunStatus::Stopped
@@ -3221,13 +3259,7 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         };
         match ctx.tag(run).await {
-            Some(row)
-                if row.status != RunStatus::Queued
-                    && row.status != RunStatus::Stopped
-                    && !row.status.is_terminal() =>
-            {
-                row
-            }
+            Some(row) if row.status != RunStatus::Queued && !row.status.is_terminal() => row,
             _ => return refuse(&ctx, lost.to_string()),
         }
     } else {
@@ -3310,17 +3342,6 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             resolve(RunCommandStatus::Applied, None).await;
             refuse(&ctx, err.to_string());
         }
-        // MOD-125 M2 R1 (review M-1, defence in depth): a `stopped` run's cancel row would stay
-        // pending until a resume retook the lease and fired it, so it is refused now, in the
-        // store's sentence (the store refuses a new one and holds a stop off a pending one).
-        Some(Err(EngineError::RunStatus {
-            status: RunStatus::Stopped,
-            ..
-        })) => {
-            let sentence = cancel_of_a_stopped_run(run);
-            resolve(RunCommandStatus::Refused, Some(sentence.clone())).await;
-            refuse(&ctx, sentence);
-        }
         // D13, B-4: otherwise already terminal → refused with the actual status.
         Some(Err(err @ EngineError::RunStatus { status, .. })) if status.is_terminal() => {
             let sentence = err.to_string();
@@ -3335,8 +3356,10 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// MOD-42 plan D13: one command poll. Every pending row this process may apply
 /// (`pending_commands(owner, box)`, B-4), unless a task of this process is applying it already
-/// (B-5), runs as an internal cancel on a supervised task of its own; and every pending workspace
-/// stop (`pending_stops(owner)`, MOD-125 M2 D4) runs as [`stop_walk`] on a task of its own.
+/// (B-5), runs as an internal cancel on a supervised task of its own; every pending workspace
+/// stop (`pending_stops(owner)`, MOD-125 M2 D4) runs as [`stop_walk`] on a task of its own; and,
+/// when this process's role executes on the box, every stopped run the box owes a resume
+/// (`pending_resumes(box)`, MOD-125 M3 D8) runs as [`resume_walk`] on a task of its own.
 async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     live: LiveChats,
@@ -3408,6 +3431,76 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
             }
         }
     }
+    // MOD-125 M3 D8: the resumes, after the stops, and only by the role that executes here: the
+    // listing is per box, so a TUI and a worker on one box must not both walk it (`sweep_once`'s
+    // check, on the executor read fresh). A run with a pending cancel is left to it (the store's
+    // `resume_run` holds off for it too); one walking in this process, or whose resume task is in
+    // flight, is not resumed twice.
+    let executor = match ctx.host.box_row(box_id).await {
+        Ok(Some(row)) => Executor::of(&row.settings),
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the command poll could not read this box's executor");
+            return;
+        }
+    };
+    if !ctx.shared.role.executes(&executor) {
+        return;
+    }
+    let resumes = match htui_core::store::WorkerStore::pending_resumes(&writer, box_id).await {
+        Ok(resumes) => resumes,
+        Err(err) => {
+            tracing::warn!(%err, "reading the pending resumes failed");
+            return;
+        }
+    };
+    for run in resumes {
+        if cancelling.contains(&run) || ctx.shared.walks.is_live(run) {
+            continue;
+        }
+        let Some(in_flight) = ctx.shared.resume_turn(run) else {
+            continue;
+        };
+        let task = ctx.unaddressed("resume_run");
+        spawn_supervised(task.clone(), async move {
+            resume_walk(task, run, in_flight).await;
+        });
+    }
+}
+
+/// MOD-125 M3 D8: one stopped run's resume, [`resumed`]'s walk without adoption's backoff, dead-walk
+/// mark and shutdown release (a resume retakes no lease until its CAS). The walk's token is minted
+/// before the lock, so a stop or a cancel reaches it through `is_live` and the graceful preempt.
+/// `Engine::resume_stopped` takes the lease with its `stopped -> running` CAS and walks the run
+/// to rest; a refused CAS (a cancel or a second stop won, or another box executes it) writes
+/// nothing and publishes nothing.
+async fn resume_walk<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    _in_flight: ResumeInFlight<P>,
+) {
+    ctx.tag(run).await;
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return;
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match walked(&walk, engine.resume_stopped(run)).await {
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        None | Some(Err(EngineError::Cancelled { .. })) => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(None)) => {}
+        Some(Ok(Some(rest))) => ctx.publish(Some(run), FrameKind::Rested(rest)),
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
 }
 
 /// MOD-125 M2 D4: one run's workspace stop. A live walk of the run is preempted through the
@@ -5216,86 +5309,6 @@ mod role_gate {
         runtime.sweep_with(&backend, &sink);
         rests_at(&store, later, RunStatus::AwaitingApproval).await;
         assert!(runtime.settle(PATIENCE).await.is_empty());
-    }
-
-    /// Every `Failed` answer's sentence, in arrival order.
-    #[derive(Debug, Clone, Default)]
-    struct Refusals(Arc<StdMutex<Vec<String>>>);
-
-    impl ReplySink for Refusals {
-        type Addr = u64;
-        type Subscriber = u64;
-
-        fn subscriber(addr: &u64) -> u64 {
-            *addr
-        }
-
-        fn send(&self, _to: &u64, reply: RunReply) {
-            if let RunReply::Failed { message, .. } = reply {
-                self.0
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(message);
-            }
-        }
-    }
-
-    /// MOD-125 D2 (blueprint F4): `cancel_enabled` refuses a `stopped` run until M3 wires its
-    /// cancel, so `c` on one is answered with that refusal and leaves no durable `run_command`
-    /// row that no executor would ever apply.
-    #[tokio::test]
-    async fn a_cancel_of_a_stopped_run_is_refused_and_writes_no_row() {
-        let store = seeded(MemStore::demo()).await;
-        let run = stranded(&store, ids::HTUI_ANA_2).await;
-        assert!(
-            store
-                .transition_run(run, RunStatus::Running, RunStatus::Stopped, Utc::now())
-                .await
-                .expect("the move answers"),
-            "`running -> stopped` is sanctioned (MOD-125 D1)"
-        );
-        let mut runtime: RunRuntime<Backend, Refusals> = RunRuntime::with_parts(
-            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
-            Arc::new(FakeVerifier::new()),
-            DriverFactory::new(),
-        );
-        let backend = Backend::memory(store.clone());
-        let sink = Refusals::default();
-
-        runtime
-            .serve_request(
-                &backend,
-                &sink,
-                1,
-                RunRequest::Orch(crate::OrchRequest::Command(htui_orch::Command::CancelRun {
-                    run,
-                })),
-                &LiveChats::default(),
-            )
-            .await;
-        assert!(runtime.settle(PATIENCE).await.is_empty());
-
-        let refusals = sink
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        assert_eq!(refusals.len(), 1, "one answer: {refusals:?}");
-        assert!(
-            refusals[0].contains("stopped"),
-            "the refusal names the status: {}",
-            refusals[0]
-        );
-        assert_eq!(status_of(&store, run).await, RunStatus::Stopped);
-        let relay = store
-            .relay_view(ids::HTUI_ANA_2)
-            .await
-            .expect("the read answers");
-        assert!(
-            relay.cancels.is_empty(),
-            "no pending cancel row: {:?}",
-            relay.cancels
-        );
     }
 
     /// MOD-12 D8 (blueprint H-8): a sweep asked for while one runs is not dropped. The first

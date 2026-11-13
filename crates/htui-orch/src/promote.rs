@@ -3,11 +3,16 @@
 //!
 //! The engine reads the step's rows, its agent's caps and its trees; this module decides from
 //! them and builds nothing it would have to read for itself.
+//!
+//! The resume-with-fallback helpers ([`falls_back`], [`resume_failed_notice`],
+//! [`record_opening`]) live here too (MOD-125 M3 D5): a promoted chat (`run_chat`) and a stopped
+//! step's resume share them, as they share [`opening_kind`].
 
 use htui_agent::driver::{AgentSessionRef, DriverCaps};
-use htui_agent::event::{DriverEvent, SESSION_STARTED};
+use htui_agent::error::DriverError;
+use htui_agent::event::{DriverEvent, OtherEvent, RESUME_FAILED, SESSION_STARTED};
 use htui_agent::replay::envelope_from_row;
-use htui_core::model::{EventKind, PromptTemplate, SessionEvent};
+use htui_core::model::{EventKind, PromptTemplate, SessionEvent, StepId, StepOpening};
 use htui_core::prompt::excerpt::RepoRoot;
 use htui_core::prompt::{
     DiffBlock, HandoffInputs, PromptSpec, StepSummary, TemplateRef, TemplateRole,
@@ -20,6 +25,66 @@ pub const RESUME_OPENING: &str = "This step was promoted to an interactive chat.
 /// MOD-37 M5 (ANA-27 T5): what a chat that opened with the handoff prompt did not carry. The Runs
 /// pane, the `resume_failed` row and the Chat tab all say it in these words.
 pub const CONTEXT_NOT_CARRIED: &str = "context not carried; handoff prompt only";
+
+/// MOD-125 M3 (D7): the follow-up `htui` sends when it reopens a stopped step's own agent session,
+/// redoing what the stop cut off rather than reporting and waiting as a promotion's
+/// [`RESUME_OPENING`] does. Defined in `htui-agent` beside the session id (MOD-125 M3 F1), so its
+/// live probes send the same text.
+pub use htui_agent::driver::STOP_RESUME_OPENING;
+
+/// MOD-125 M3 (D7): the failure reason the handoff text of a stopped step carries when its session
+/// cannot be reopened (no session caps, no banner, or a resume that failed on the wire).
+pub const STOP_REASON: &str = "the step was stopped and its session could not be reopened";
+
+/// MOD-37 M5: whether a failed resume is worth a handoff start (review L-2): only when it failed on
+/// the wire (`Transport`, `Closed`), which is what an agent that lost or refused the session
+/// answers. Not when the adapter cannot run at all: a missing or unspawnable command (`Spawn`), an
+/// unresolved launch placeholder (`Unresolved`) or no transport (`UnknownAdapter`) would fail the
+/// handoff start the same way (blueprint A-2, H-18). Not on a transport that cannot restore
+/// (`Unsupported`), a cancel (`Cancelled`), or the driver's own write or scrub (`Store`, `Scrub`),
+/// which are not the resume's to fall back from. Exhaustive, with no wildcard: a new variant is a
+/// decision, not a default.
+#[must_use]
+pub const fn falls_back(err: &DriverError) -> bool {
+    match err {
+        DriverError::Transport(_) | DriverError::Closed => true,
+        DriverError::Unresolved(_)
+        | DriverError::UnknownAdapter(_)
+        | DriverError::Spawn(_)
+        | DriverError::Unsupported(_)
+        | DriverError::Cancelled
+        | DriverError::Store(_)
+        | DriverError::Scrub(_) => false,
+    }
+}
+
+/// MOD-37 M5: the `resume_failed` notice: the session tried, why it failed, and what the session
+/// opens with instead.
+#[must_use]
+pub fn resume_failed_notice(session_ref: &AgentSessionRef, reason: &str) -> OtherEvent {
+    OtherEvent {
+        update: RESUME_FAILED.to_owned(),
+        body: serde_json::json!({
+            "session_id": session_ref.as_str(),
+            "reason": reason,
+            "note": CONTEXT_NOT_CARRIED,
+        }),
+    }
+}
+
+/// MOD-37 M5: `run_step.opening`, written through any [`WriteStore`](htui_core::store::WriteStore)
+/// (MOD-125 M3 D5: the chat's `Writer` today). A failed write is logged and never fails the
+/// caller: the column is a label, and the session is what the user is waiting on. The log line
+/// is the chat's, verbatim, which `agent_worker`'s tests pin.
+pub async fn record_opening<S: htui_core::store::WriteStore + ?Sized>(
+    store: &S,
+    step: StepId,
+    opening: StepOpening,
+) {
+    if let Err(err) = store.record_opening(step, opening).await {
+        tracing::warn!(%err, %step, %opening, "the chat's opening could not be recorded");
+    }
+}
 
 /// How a promoted step's chat opens (blueprint D192).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,5 +679,83 @@ mod tests {
         assert!(spec.skills.is_empty(), "{:?}", spec.skills);
         let assembled = assemble(&spec, &MinimalScrubber::new([])).expect("the handoff assembles");
         assert_eq!(assembled.trim.skill_choices, Vec::new());
+    }
+
+    /// MOD-37 M5 (review L-2), moved here by MOD-125 M3 (D5): only a failure on the wire falls
+    /// back; every other variant is the adapter's, a cancel, or the driver's own write.
+    #[test]
+    fn only_a_wire_failure_falls_back() {
+        use htui_agent::error::DriverError;
+        assert!(falls_back(&DriverError::Transport("gone".to_owned())));
+        assert!(falls_back(&DriverError::Closed));
+        for refused in [
+            DriverError::Unresolved("x".to_owned()),
+            DriverError::UnknownAdapter("x".to_owned()),
+            DriverError::Spawn("x".to_owned()),
+            DriverError::Unsupported("resume"),
+            DriverError::Cancelled,
+            DriverError::Store(htui_core::store::StoreError::Backend("x".to_owned())),
+            DriverError::Scrub(htui_core::scrub::Unmasked {
+                path: String::new(),
+                rule: "anthropic_api_key",
+            }),
+        ] {
+            assert!(!falls_back(&refused), "{refused:?} does not fall back");
+        }
+    }
+
+    /// The `resume_failed` notice names the session, the reason and what the opening lacks.
+    #[test]
+    fn the_resume_failed_notice_names_the_session_and_the_reason() {
+        let notice = resume_failed_notice(&AgentSessionRef("sess_9".to_owned()), "closed");
+        assert_eq!(notice.update, RESUME_FAILED);
+        assert_eq!(
+            notice.body,
+            json!({
+                "session_id": "sess_9",
+                "reason": "closed",
+                "note": CONTEXT_NOT_CARRIED,
+            })
+        );
+    }
+
+    /// MOD-125 M3 (D7): the stop's resume sentence is its own, not promotion's, and the stop
+    /// reason says why a fresh session opened.
+    #[test]
+    fn the_stop_texts_are_their_own() {
+        assert_ne!(STOP_RESUME_OPENING, RESUME_OPENING);
+        assert!(STOP_RESUME_OPENING.contains("stopped and has been resumed"));
+        assert!(STOP_RESUME_OPENING.contains("redoing any unfinished part"));
+        assert_eq!(
+            STOP_REASON,
+            "the step was stopped and its session could not be reopened"
+        );
+    }
+
+    /// `record_opening` writes through any `WriteStore`, and a failed write (an unknown step) is
+    /// logged and swallowed rather than surfaced.
+    #[tokio::test]
+    async fn record_opening_writes_and_swallows_a_failure() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, ReadStore as _};
+
+        let store = MemStore::demo();
+        record_opening(&store, ids::STEP_PRD, StepOpening::Resumed).await;
+        let opening = store
+            .runs(ids::HTUI_FEAT_1)
+            .await
+            .expect("the demo lists FEAT-1's runs")
+            .into_iter()
+            .find(|run| run.id == ids::RUN_1)
+            .expect("RUN_1 is FEAT-1's")
+            .steps
+            .into_iter()
+            .find(|step| step.id == ids::STEP_PRD)
+            .expect("RUN_1 lists its prd step")
+            .opening;
+        assert_eq!(opening, Some(StepOpening::Resumed));
+
+        // An unknown step: the store answers `NotFound`, which is logged, never a panic.
+        record_opening(&store, StepId::new(), StepOpening::ResumeFailed).await;
     }
 }

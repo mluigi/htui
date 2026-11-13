@@ -14,7 +14,7 @@
 
 use htui_agent::box_probe::spec;
 use htui_core::model::{BoxId, BoxRecord};
-use htui_core::store::{CasOutcome, Result, StoreError, StoredSetting, WriteStore};
+use htui_core::store::{CasOutcome, Result, StoreError, StoredSetting, WorkerLogStore, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -78,18 +78,21 @@ pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapsho
     })
 }
 
-/// Serves `Boxes`, `EditBox` and `SetProbeSpec` (D45, D46; MOD-51 D4).
+/// Serves `Boxes`, `EditBox`, `SetProbeSpec` and `SetBoxLogLevel` (D45, D46; MOD-51 D4; MOD-122
+/// M2 F9).
 /// `Err(Unreachable(DATABASE_UNREACHABLE))` offline (the writer is `None`), for the read too.
 /// `EditBox` answers `Boxes` on `Applied`, `BoxesStale` on `Stale`, and `BoxesStale` on
 /// `NotFound { entity: "box" }` too, so a box that vanished under an open editor reaches the
 /// section as a snapshot without it. `SetProbeSpec` answers `Boxes` on `Applied` and
 /// `BoxesStale` on `Stale` (the row gone included); an overlay `spec::check` refuses is
 /// `Err(Constraint("{SPEC_REFUSED}: {fault}"))` before the store is reached (MOD-51 D3).
+/// `SetBoxLogLevel` answers `Boxes` when the level was written and `BoxesStale` when the box is
+/// gone (no box of mine), `EditBox`'s `NotFound` rule.
 ///
 /// # Errors
 /// Whatever the seam reports (a `Constraint` becomes `Failed` with the store's tag, executor or
 /// overlay sentence), the checker's refusal above, plus
-/// `Unreachable` offline and `Backend` for a request that is not one of the three.
+/// `Unreachable` offline and `Backend` for a request that is not one of the four.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -142,7 +145,18 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 StoreReply::BoxesStale(fresh)
             })
         }
-        // `try_serve` routes exactly this module's three variants here, so the last arm is
+        StoreRequest::SetBoxLogLevel { box_id, level } => {
+            // MOD-122 M2 D7: last write wins, so there is no token to spend; `false` is a box
+            // that is not (or no longer) one of mine, a miss like `EditBox`'s `NotFound`.
+            let applied = writer.set_box_log_level(*box_id, Some(*level)).await?;
+            let fresh = Box::new(snapshot(backend, &writer).await?);
+            Ok(if applied {
+                StoreReply::Boxes(fresh)
+            } else {
+                StoreReply::BoxesStale(fresh)
+            })
+        }
+        // `try_serve` routes exactly this module's four variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -152,11 +166,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
     }
 }
 
-/// The three request names, in [`StoreRequest`] order.
+/// The four request names, in [`StoreRequest`] order.
 ///
-/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a fourth
+/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a fifth
 /// request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 3] = ["boxes", "edit_box", "set_probe_spec"];
+pub const REQUEST_NAMES: [&str; 4] = ["boxes", "edit_box", "set_probe_spec", "set_box_log_level"];
 
 /// The **read**'s name: a refused read leaves the section with no list; a refused write leaves the
 /// editor over its text.

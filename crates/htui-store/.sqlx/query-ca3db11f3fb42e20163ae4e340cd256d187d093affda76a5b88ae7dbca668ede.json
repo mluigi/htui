@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH listed AS (\n            SELECT DISTINCT s.id AS step_id, s.status, e.value ->> 'id' AS entry\n              FROM run_step s\n             CROSS JOIN LATERAL jsonb_array_elements(\n                   CASE WHEN jsonb_typeof(s.trim_record -> 'memory' -> 'shown') = 'array'\n                        THEN s.trim_record -> 'memory' -> 'shown'\n                        ELSE '[]'::jsonb END) AS e(value)\n             WHERE s.run_id = $1\n        ), tally AS (\n            SELECT CASE WHEN entry ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\n                        THEN entry::uuid END                         AS entry_id,\n                   count(*)::int                                     AS steps,\n                   (count(*) FILTER (WHERE status = 'done'))::int    AS done,\n                   (count(*) FILTER (WHERE status = 'failed'))::int  AS failed\n              FROM listed\n             GROUP BY 1\n        ), locked AS (\n            SELECT m.id FROM memory_entry m JOIN tally t ON t.entry_id = m.id\n             ORDER BY m.id\n               FOR UPDATE OF m\n        )\n        UPDATE memory_entry m\n           SET shown_steps  = m.shown_steps + t.steps,\n               shown_done   = m.shown_done + t.done,\n               shown_failed = m.shown_failed + t.failed\n          FROM tally t, locked l\n         WHERE m.id = t.entry_id AND l.id = m.id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ca3db11f3fb42e20163ae4e340cd256d187d093affda76a5b88ae7dbca668ede"
+}

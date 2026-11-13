@@ -287,7 +287,7 @@ async fn stale(
         .unwrap_or_default();
     Ok(StoreReply::MemoryStale {
         project,
-        head,
+        head: Box::new(head),
         entries,
     })
 }
@@ -310,7 +310,10 @@ async fn clash(
         .into_iter()
         .find(|entry| Some(entry.id) != except && memory_subject_key(&entry.subject) == key)
     {
-        Some(existing) => Ok(StoreReply::MemorySubjectTaken { project, existing }),
+        Some(existing) => Ok(StoreReply::MemorySubjectTaken {
+            project,
+            existing: Box::new(existing),
+        }),
         None => Err(StoreError::Constraint(refusal)),
     }
 }

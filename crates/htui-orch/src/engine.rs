@@ -40,9 +40,9 @@ use htui_core::model::{
     PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunPlanId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
-    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
-    min_budget_micros, missing_tags_failure,
+    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOpening,
+    StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome,
+    WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -282,6 +282,80 @@ type SessionResult = Result<DoneEvent, DriverError>;
 struct Driven {
     result: SessionResult,
     cut: bool,
+}
+
+/// MOD-125 M3 D5: what [`Engine::drive_once`] starts its session with.
+#[derive(Debug)]
+pub(crate) enum SessionOpening<'t> {
+    /// A first run: the session starts with the step's prompt, which the caller's recorder
+    /// already wrote as its seq-0 row.
+    Fresh(&'t str),
+    /// A fresh session on a continuing recorder (D4 branch 2): it starts with `text`, which
+    /// `drive_once` records as a `follow_up` once the session started. No opening is recorded.
+    Continue {
+        /// The handoff (D7).
+        text: String,
+    },
+    /// The step's own session reopened (D4 branch 3): `spec.resume` is `session_ref`, `text` the
+    /// follow-up it is sent. A resume that fails on the wire (`promote::falls_back`) opens a
+    /// fresh session with `fallback` instead; with none, the failure is the start's.
+    Resume {
+        /// The banner's agent-side id.
+        session_ref: htui_agent::driver::AgentSessionRef,
+        /// [`promote::STOP_RESUME_OPENING`].
+        text: String,
+        /// The handoff, best effort (D7).
+        fallback: Option<String>,
+    },
+}
+
+impl SessionOpening<'_> {
+    /// The text the first `start` is sent.
+    fn text(&self) -> &str {
+        match self {
+            Self::Fresh(text) => text,
+            Self::Continue { text } | Self::Resume { text, .. } => text,
+        }
+    }
+}
+
+/// MOD-125 M3 D4: what [`Engine::resumed_member`] answers: the member's trees, its session's `cwd`
+/// and extra directories, and how its session opens.
+type ReopenedMember = (
+    Vec<RunStepTree>,
+    PathBuf,
+    Vec<PathBuf>,
+    SessionOpening<'static>,
+);
+
+/// MOD-125 M3 D5: what [`Engine::open_recorder`] opens on.
+#[derive(Debug)]
+pub(crate) enum RecorderStart<'p> {
+    /// A new log: the prompt is its seq-0 row (and its digest the step's).
+    Prompt(&'p AssembledPrompt),
+    /// A step's existing log, continued (`Recorder::continuing`): no prompt row is written.
+    Tail(Vec<SessionEvent>),
+}
+
+/// MOD-125 M3 D4: what [`Engine::walk_live_session`] runs a step's session on, from the session
+/// onward: stage 2's trees and directories, integrate's inputs, MOD-139 M2 D13's `live_siblings`,
+/// and how the recorder and the session open.
+#[derive(Debug)]
+pub(crate) struct LiveSession<'p> {
+    /// The step's trees, as `upsert_step_tree` recorded them.
+    trees: Vec<RunStepTree>,
+    /// The session's working directory.
+    cwd: PathBuf,
+    /// Every tree not under `cwd`.
+    extra_dirs: Vec<PathBuf>,
+    /// Integrate's inputs, read once; `None` for any other node.
+    integrate: Option<IntegrateStage>,
+    /// Whether a sibling of the step is live.
+    live: bool,
+    /// How the recorder opens.
+    start: RecorderStart<'p>,
+    /// How the session opens.
+    opening: SessionOpening<'p>,
 }
 
 /// How the walk gets a driver for one session.
@@ -559,6 +633,27 @@ struct WalkScopes {
     /// still owed (a walk `heartbeaten` abandoned, or one that raised before it drained), each
     /// warned with the manual `Cleanup` retry (R-25) named.
     owed_dropped: std::sync::atomic::AtomicU32,
+    /// MOD-164 F1 (review H2): the runs [`Engine::end_run`] is ending in this engine, its capture
+    /// and its `finish_run` included. Each sender is dropped when that end returns, which wakes
+    /// every later end of the run waiting on it ([`Self::end`]).
+    ends: std::sync::Mutex<BTreeMap<RunId, watch::Sender<()>>>,
+}
+
+/// MOD-164 F1 (review H2): one run end in progress in this engine ([`WalkScopes::end`]); removes
+/// it on drop, which wakes the ends waiting on it.
+struct EndGuard<'e> {
+    scopes: &'e WalkScopes,
+    run: RunId,
+}
+
+impl Drop for EndGuard<'_> {
+    fn drop(&mut self) {
+        self.scopes
+            .ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run);
+    }
 }
 
 /// One open walk (blueprint §3.1).
@@ -572,6 +667,9 @@ struct WalkScope {
     cleanup_owed: bool,
     /// A node future of the walk parked the run (D3).
     parked: bool,
+    /// The walk's cut was sent ([`WalkScopes::cut`]), by the scheduler or by a node future's
+    /// run-end capture (MOD-164 F1): the scheduler admits nothing more ([`WalkScopes::is_cut`]).
+    cut: bool,
 }
 
 /// Removes its run's [`WalkScope`] on drop, the drop of a walk `heartbeaten` abandons included.
@@ -608,6 +706,30 @@ impl WalkScopes {
         Self {
             scopes: std::sync::Mutex::new(BTreeMap::new()),
             owed_dropped: std::sync::atomic::AtomicU32::new(0),
+            ends: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// MOD-164 F1 (review H2): `run`'s end, once no other end of it is in progress in this
+    /// engine: a later end waits for the earlier one (its capture and its `finish_run`) to
+    /// return, so it never interrupts a live capture nor finishes the run under it.
+    async fn end(&self, run: RunId) -> EndGuard<'_> {
+        loop {
+            let mut earlier = {
+                let mut ends = self
+                    .ends
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match ends.get(&run) {
+                    Some(end) => end.subscribe(),
+                    None => {
+                        ends.insert(run, watch::channel(()).0);
+                        return EndGuard { scopes: self, run };
+                    }
+                }
+            };
+            // Only a closed channel answers: the earlier end's guard dropped its sender.
+            while earlier.changed().await.is_ok() {}
         }
     }
 
@@ -668,6 +790,7 @@ impl WalkScopes {
                     in_flight: 0,
                     cleanup_owed: false,
                     parked: false,
+                    cut: false,
                 },
             );
         }
@@ -693,9 +816,21 @@ impl WalkScopes {
         }
     }
 
-    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once.
+    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once, and
+    /// the walk marked cut, so its scheduler admits nothing more ([`Self::is_cut`]).
     fn cut(&self, run: RunId) {
+        if let Some(scope) = self.lock().get_mut(&run) {
+            scope.cut = true;
+        }
         self.send_cancel(run, Signal::Cancel { grace: RELAY_GRACE });
+    }
+
+    /// MOD-164 F1 (review: the capture's cut admits nothing): whether `run`'s walk was cut. A
+    /// node future's run-end capture cuts the walk from inside it, where the scheduler's own
+    /// [`WalkEnd`] cannot see it; the scheduler reads this before it admits. A run cancel
+    /// forwarded into the walk's channel is not a cut.
+    fn is_cut(&self, run: RunId) -> bool {
+        self.lock().get(&run).is_some_and(|scope| scope.cut)
     }
 
     fn send_cancel(&self, run: RunId, signal: Signal) {
@@ -756,6 +891,9 @@ impl WalkScopes {
     }
 }
 
+/// MOD-164 D11: the run-end capture step, [`Engine::capture`].
+mod capture;
+
 #[cfg(test)]
 mod walk_scopes {
     use htui_agent::record::{Control, RELAY_GRACE, Signal, control_channel};
@@ -773,6 +911,28 @@ mod walk_scopes {
         assert!(scopes.control(run).is_some());
         drop(guard);
         assert!(scopes.control(run).is_none());
+    }
+
+    /// MOD-164 F1 (review H2): a second end of a run waits until the first returns; another
+    /// run's end waits for nothing.
+    #[tokio::test]
+    async fn a_second_end_of_a_run_waits_for_the_first() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let first = scopes.end(run).await;
+        let other = scopes.end(RunId::new()).await;
+        let mut second = Box::pin(scopes.end(run));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "the first end is in progress"
+        );
+        drop(first);
+        let second = second.await;
+        let mut third = Box::pin(scopes.end(run));
+        assert!(futures::poll!(third.as_mut()).is_pending());
+        drop(second);
+        drop(third.await);
+        drop(other);
     }
 
     /// A run cancel is forwarded once, its grace kept; the cut then changes nothing. A cut alone
@@ -911,7 +1071,8 @@ struct WalkEnd {
     ender: Option<i32>,
     /// The walk's cut was sent.
     cut: bool,
-    /// The run was read away from `running` with futures in flight (F21): admit nothing more.
+    /// The run was read away from `running` with futures in flight (F21), or a node future's
+    /// run-end capture cut the walk (MOD-164 F1, [`WalkScopes::is_cut`]): admit nothing more.
     drained: bool,
     /// More than one future was ever in flight at once, or the walk drained (T3 repair 1): a
     /// terminal end may leave a sibling's unsettled row behind with nothing in flight to cut. A
@@ -1090,6 +1251,28 @@ pub enum Next {
     /// mid-recovery (plan D145), where another writer moved one of the run's rows, has no note
     /// either, and its lease was given back by the leased walk's own `Err` release (plan D139).
     Error(String),
+}
+
+/// MOD-164 D11: the gate's terminal `finish_run` goes through [`Engine::end_run`].
+impl<S, G, I, V, C, A, K> gate::RunEnd for Engine<'_, S, G, I, V, C, A, K>
+where
+    S: htui_core::store::WorkerStore,
+    G: GraphSource,
+    I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
+    C: Clock + ?Sized,
+    A: AgentSelector + ?Sized,
+    K: SessionSink + ?Sized,
+{
+    fn end(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), EngineError>> {
+        self.end_run(run, to, failure, at)
+    }
 }
 
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
@@ -1624,20 +1807,18 @@ where
                 .cloned()
         };
         let Some(edge) = edge else {
-            self.parts
-                .store
-                .finish_run(
-                    run.id,
-                    RunStatus::Failed,
-                    Some(
-                        &RunFailure::Rejected {
-                            phase: phase.name.clone(),
-                        }
-                        .to_string(),
-                    ),
-                    now,
-                )
-                .await?;
+            self.end_run(
+                run.id,
+                RunStatus::Failed,
+                Some(
+                    &RunFailure::Rejected {
+                        phase: phase.name.clone(),
+                    }
+                    .to_string(),
+                ),
+                now,
+            )
+            .await?;
             self.cleanup_walk(run.id).await?;
             return Ok(Some(Rest {
                 run: RunStatus::Failed,
@@ -2196,9 +2377,9 @@ where
         // MOD-37 M5: the handoff is built for both openings. A `Resume` carries it as the fallback
         // the worker opens with when the resume fails. Boxed: this future sits in every dispatch
         // future (`every_case_name_dispatches`, H-9).
-        let handoff = Box::pin(
-            self.handoff_opening(run, snapshot, step, phase, item, &events, &trees, &repos),
-        )
+        let handoff = Box::pin(self.handoff_opening(
+            run, snapshot, step, phase, item, &events, &trees, &repos, None,
+        ))
         .await;
         let path = match promote::opening_kind(caps, &events) {
             // Review M-1: best effort. Whatever refused the handoff (a template, the assembler, a
@@ -2235,10 +2416,14 @@ where
 
     /// §4.6(c)'s handoff text and digest for a promoted `step` (MOD-4 D193): what a `Handoff`
     /// opening sends, and what a `Resume` opening falls back to (MOD-37 M5). Nothing here writes.
+    ///
+    /// MOD-125 M3 D7: a resumed stopped step's fallback is this text too, with `reason`
+    /// ([`promote::STOP_REASON`]); `None` reads the run's failure, else the gate's note.
     #[expect(
         clippy::too_many_arguments,
         reason = "the step's run, snapshot, row and phase, its item, and the three reads `opening` \
-                  already made; re-reading them here would double the promotion's store round trips"
+                  already made; re-reading them here would double the promotion's store round \
+                  trips; and the stop's reason (MOD-125 M3 D7)"
     )]
     async fn handoff_opening(
         &self,
@@ -2250,6 +2435,7 @@ where
         events: &[SessionEvent],
         trees: &[RunStepTree],
         repos: &[Repo],
+        reason: Option<String>,
     ) -> Result<(String, String), EngineError> {
         let spec = match self
             // MOD-139 M2 D13: a handoff opens a chat, no session beside a live sibling.
@@ -2310,11 +2496,14 @@ where
                 None
             }
         };
-        let failure_reason = run
-            .failure
-            .clone()
-            .or_else(|| step.gate_note.clone())
-            .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
+        // MOD-125 M3 D7: a resumed stopped step names its own reason (`run.failure` is NULL
+        // while the run is stopped); a promotion reads the run's failure or the gate's note.
+        let failure_reason = reason.unwrap_or_else(|| {
+            run.failure
+                .clone()
+                .or_else(|| step.gate_note.clone())
+                .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned())
+        });
         let spec =
             promote::handoff_spec(spec, &template, events, &roots, diff_so_far, failure_reason);
         let assembled = assemble(&spec, self.parts.scrubber)?;
@@ -2626,10 +2815,57 @@ where
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
-        if row.status == RunStatus::Queued {
-            return self.cancel_from_queued(&row).await;
+        match row.status {
+            RunStatus::Queued => self.cancel_from_queued(&row).await,
+            RunStatus::Stopped => Box::pin(self.cancel_stopped(&row)).await,
+            _ => self.cancel_leased(&row).await,
         }
-        self.cancel_leased(&row).await
+    }
+
+    /// MOD-125 M3 D6: [`Self::cancel_run`] of a run read `stopped`, by its executing box: with
+    /// none, the store's CAS alone (`cancel_stopped_run(None)`: no tree is this box's); on this
+    /// box, the CAS then plan D36's cleanup, lease-less, as [`Self::cancel_queued`]; on another
+    /// box, [`EngineError::RunStatus`] with nothing written (that box's trees and sessions are
+    /// its own). The CAS cancels every unsettled step, refuses the pending follow-ups and
+    /// resolves a pending cancel row in one transaction (D2). A `false` CAS means a resume or
+    /// another cancel won: the run is read again and takes the guard and the leased path, as
+    /// [`Self::cancel_from_queued`] does.
+    async fn cancel_stopped(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        let position = self.resting(row).await?.position;
+        let on_another_box = |run: RunId| EngineError::RunStatus {
+            run,
+            status: RunStatus::Stopped,
+            expected: "stopped on this box or on none",
+        };
+        let on = match row.executing_box_id {
+            None => None,
+            Some(box_id) if box_id == self.parts.box_id => Some(box_id),
+            Some(_) => return Err(on_another_box(row.id)),
+        };
+        if !self
+            .parts
+            .store
+            .cancel_stopped_run(row.id, on, self.now())
+            .await?
+        {
+            let row = self.run(row.id).await?;
+            crate::command::cancel_enabled(&row)?;
+            // Still stopped yet refused: its box moved under this call, and nothing was written.
+            if row.status == RunStatus::Stopped {
+                return Err(on_another_box(row.id));
+            }
+            return self.cancel_leased(&row).await;
+        }
+        if on.is_some() {
+            self.cleanup_walk(row.id).await?;
+        }
+        Ok(CommandOutcome::Cancelled {
+            rest: Rest {
+                run: RunStatus::Cancelled,
+                position,
+                failure: None,
+            },
+        })
     }
 
     /// [`Self::cancel_run`] of a run read `queued` (OQ-4): the compare-and-set first. When a
@@ -2691,10 +2927,7 @@ where
             }
             // `finish_run` ends the live run, which frees the item for a second run; `failure`
             // stays NULL because a cancel is a human's decision and not a failure.
-            self.parts
-                .store
-                .finish_run(run, RunStatus::Cancelled, None, now)
-                .await?;
+            self.end_run(run, RunStatus::Cancelled, None, now).await?;
             self.cleanup_walk(run).await
         };
         self.leased_window(run, window).await?;
@@ -3999,9 +4232,7 @@ where
             phase: phase.name.clone(),
             attempt: step.attempt,
         };
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Some(Rest {
@@ -4050,15 +4281,13 @@ where
                 .to_owned(),
             attempts: part.attempt,
         };
-        self.parts
-            .store
-            .finish_run(
-                run.id,
-                RunStatus::Failed,
-                Some(&failure.to_string()),
-                self.now(),
-            )
-            .await?;
+        self.end_run(
+            run.id,
+            RunStatus::Failed,
+            Some(&failure.to_string()),
+            self.now(),
+        )
+        .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Some(Rest {
             run: RunStatus::Failed,
@@ -4127,6 +4356,11 @@ where
         loop {
             self.walks.forward(run, &watched);
             self.walks.forward(run, &(self.parts.control)(run));
+            // MOD-164 F1: a capture cut the walk from inside a node future (the run's outcome is
+            // decided); the futures in flight drain, and nothing more is admitted.
+            if self.walks.is_cut(run) {
+                end.drained = true;
+            }
             if end.admits() {
                 passes += 1;
                 let siblings = !flights.is_empty();
@@ -4145,10 +4379,7 @@ where
                     match Box::pin(self.pass(run, &flights, &mut end)).await {
                         Ok(Pass::Finished) => {
                             let now = self.now();
-                            self.parts
-                                .store
-                                .finish_run(run, RunStatus::Done, None, now)
-                                .await?;
+                            self.end_run(run, RunStatus::Done, None, now).await?;
                             self.cleanup_walk(run).await?;
                             return Ok(Rest {
                                 run: RunStatus::Done,
@@ -4329,7 +4560,9 @@ where
                 let phase = Self::phase_at(run, snapshot, position)?;
                 self.select_stage(row, snapshot, &phase, attempt).await
             }
-            Cursor::Run(step) => match find(step) {
+            // MOD-125 M3 D4: a stopped step resumes as a pending one runs; `walk_step` and
+            // `admit_planner` move it from the status it holds.
+            Cursor::Run(step) | Cursor::Resume(step) => match find(step) {
                 // MOD-139 M2 D1, D2: a row maps to its node by role; a planner node runs admission,
                 // not a session (boxed, the stack rule).
                 Some(step) => {
@@ -4465,8 +4698,10 @@ where
         let now = self.now();
         let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
-            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut.
-            if step.role == StepRole::Stage
+            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut. MOD-164 D11:
+            // but a `capture` row left `pending` or `running` is cancelled with its siblings.
+            if (step.role == StepRole::Stage
+                && step.node_key.as_deref() != Some(htui_core::model::CAPTURE_KEY))
                 || !matches!(
                     step.status,
                     StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
@@ -4563,6 +4798,38 @@ where
         }
         let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
         Ok(Resume::Walked(rest))
+    }
+
+    /// MOD-125 M3 D3: a `stopped` run of this box resumed and walked on (the `claim` shape): the
+    /// store's `stopped → running` CAS takes the lease ([`resume_run`]), then the run walks to
+    /// rest under the heartbeat, as [`Self::claim`] and [`Self::resume`] walk. The walk meets each
+    /// stopped step as [`Cursor::Resume`] and reopens it on its own row (D4).
+    ///
+    /// `None` when the CAS refused: the run is not `stopped`, runs on another box, its workspace
+    /// is stopped again, or a cancel of it is pending; nothing is written. `Some` carries the rest
+    /// the runtime publishes, as it does for [`Self::resume`].
+    ///
+    /// [`resume_run`]: htui_core::store::WorkerStore::resume_run
+    ///
+    /// # Errors
+    /// [`EngineError::LeaseLost`] when another orchestrator takes the lease mid-walk; every other
+    /// [`EngineError`] the walk raises.
+    pub async fn resume_stopped(&self, run: RunId) -> Result<Option<Rest>, EngineError> {
+        let sent = tokio::time::Instant::now();
+        let ttl = self.lease_times().ttl;
+        if !self
+            .parts
+            .store
+            .resume_run(run, self.parts.box_id, self.parts.owner, ttl)
+            .await?
+        {
+            return Ok(None);
+        }
+        tracing::info!(%run, "run {run} resumed");
+        Ok(Some(
+            self.walk_leased(run, self.lease_until(sent), self.run_to_rest(run))
+                .await?,
+        ))
     }
 
     /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and `Some` is
@@ -4980,9 +5247,7 @@ where
         }
         // `finish_run` no longer writes the item (MOD-144). The order (item, note, run) stays so
         // a crash leaves the refusal readable first.
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Rest {
@@ -5094,20 +5359,22 @@ where
 
         // -- stage 2: prepare, beginning with the move that makes the step live ---------------
         // Plan D144: another writer moved the row this walk read, so the walk stops (D125).
-        self.move_step(
-            run.id,
-            step.id,
-            StepStatus::Pending,
-            StepStatus::Running,
-            now,
-        )
-        .await?;
+        // MOD-125 M3 D4: a resumed stopped step moves `stopped -> running` on its own row (same
+        // row and attempt, so no retry budget is spent), and `now` restarts its deadline.
+        let from = step.status;
+        self.move_step(run.id, step.id, from, StepStatus::Running, now)
+            .await?;
         self.step_started(run, step.id);
 
         // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
         // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
         // was read before the move — and the step deadline would be measured from the settle.
-        match self.walk_live_step(run, snapshot, &step, phase, now).await {
+        let walked = if from == StepStatus::Stopped {
+            Box::pin(self.resume_live_step(run, snapshot, &step, phase, now)).await
+        } else {
+            self.walk_live_step(run, snapshot, &step, phase, now).await
+        };
+        match walked {
             Ok(rest) => Ok(rest),
             Err(err) => {
                 // MOD-42 I-6 (plan D10): a graceful cancel settles nothing; `cancel_leased` owns
@@ -5129,6 +5396,10 @@ where
     }
 
     /// Stages 2 to 6 of a step that is already `running`, so every error here is [`fail_hard`]'s.
+    ///
+    /// MOD-125 M3 D4: the prepare-and-prompt half (secrets, integrate's stage, `prepare`, the tree
+    /// rows, the pre-merge, the `before` commits, the prompt and `set_step_prompt`); the session
+    /// onward is [`Self::walk_live_session`], which a resumed stopped step enters directly.
     ///
     /// [`fail_hard`]: Self::fail_hard
     async fn walk_live_step(
@@ -5241,14 +5512,6 @@ where
                     .map(Some);
             }
         };
-        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
-        // and refuses rather than run un-narrowed.
-        let persona = snapshot
-            .persona_for(phase)
-            .map_err(|refusal| EngineError::Snapshot {
-                run: run.id,
-                reason: refusal.to_string(),
-            })?;
         // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
         // row that records which sections were dropped and why would silently become "there was
         // no record", which is the one thing `run_step.trim_record` exists to rule out. That is
@@ -5279,8 +5542,62 @@ where
             )
             .await?;
 
+        Box::pin(self.walk_live_session(
+            run,
+            snapshot,
+            step,
+            phase,
+            started_at,
+            LiveSession {
+                trees,
+                cwd: prepared.cwd,
+                extra_dirs: prepared.extra_dirs,
+                integrate,
+                live,
+                start: RecorderStart::Prompt(&prompt),
+                opening: SessionOpening::Fresh(&prompt.text),
+            },
+        ))
+        .await
+    }
+
+    /// MOD-125 M3 D4: stages 4 to 6 of a `running` step whose trees exist: the persona, the
+    /// session ([`Self::session`], opened as `live` says), `after_done`, verify, the capture and
+    /// its commits, integrate's post-check, the output, the settle, `finish_step` and the gate.
+    /// [`Self::walk_live_step`] enters it after its prompt; a resumed stopped step
+    /// ([`Self::resume_live_step`]) after reopening its trees, never preparing them again. Every
+    /// error is `walk_step`'s [`fail_hard`](Self::fail_hard), as the first half's are.
+    async fn walk_live_session(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+        live: LiveSession<'_>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let item = Self::item_of(run)?;
+        let LiveSession {
+            trees,
+            cwd,
+            extra_dirs,
+            integrate,
+            live,
+            start,
+            opening,
+        } = live;
+        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
+        // and refuses rather than run un-narrowed. A resumed step's stage 3 passed when it first
+        // ran, on the same snapshot.
+        let persona = snapshot
+            .persona_for(phase)
+            .map_err(|refusal| EngineError::Snapshot {
+                run: run.id,
+                reason: refusal.to_string(),
+            })?;
+
         // -- stage 4: session -----------------------------------------------------------------
-        let session_cwd = prepared.cwd.clone();
+        let session_cwd = cwd.clone();
         let (
             Driven {
                 result,
@@ -5290,15 +5607,7 @@ where
             cap_batch,
         ) = self
             .session(
-                run,
-                step,
-                phase,
-                persona,
-                &prompt,
-                prepared.cwd,
-                prepared.extra_dirs,
-                started_at,
-                live,
+                run, step, phase, persona, start, &opening, cwd, extra_dirs, started_at, live,
             )
             .await?;
         if let Ok(done) = &result {
@@ -5407,6 +5716,201 @@ where
                 Ok(Some(rest))
             }
         }
+    }
+
+    /// MOD-125 M3 D4: stages 2 to 6 of a stopped step the walk just moved `stopped -> running`
+    /// on its own row, chosen by what its log holds:
+    ///
+    /// 1. **No session row** (stopped before its recorder opened): [`Self::walk_live_step`], from
+    ///    stage 2 again. Its trees are still at their base, so `prepare` and integrate's
+    ///    pre-merge are safe to repeat.
+    /// 2. **Rows** (with no banner, or an agent without session caps) and 3. **a banner and
+    ///    `DriverCaps.resume`**: the trees reopened ([`Self::reopen_trees`], never prepared,
+    ///    pre-merged, or recorded again), the opening decided ([`Self::stopped_opening`]),
+    ///    integrate's stage and `live_siblings` read again, then [`Self::walk_live_session`] on a
+    ///    continuing recorder. The checks rerun after the session; the deadline counts from
+    ///    `started_at`, the resume.
+    async fn resume_live_step(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let events = self
+            .parts
+            .store
+            .step_events(step.id)
+            .await?
+            .unwrap_or_default();
+        if events.is_empty() {
+            return self
+                .walk_live_step(run, snapshot, step, phase, started_at)
+                .await;
+        }
+        let item = Self::item_of(run)?;
+        // MOD-10 D11, D13: the walk's secrets before anything of the session is written (the
+        // handoff assembles under the scrubber, `drive_once` reads the env from the cell).
+        Box::pin(self.secrets_ready(run))
+            .await?
+            .map_err(EngineError::Secrets)?;
+        let (trees, cwd, extra_dirs) = self.reopen_trees(run, step, phase).await?;
+        let opening =
+            Box::pin(self.stopped_opening(run, snapshot, step, phase, item, &events, &trees))
+                .await?;
+        // MOD-139 M3 D1: `integrate_stage` only reads, so a resume reads it again.
+        let integrate = if phase.role == NodeRole::Integrate {
+            Some(Box::pin(self.integrate_stage(run, snapshot, phase)).await?)
+        } else {
+            None
+        };
+        let live =
+            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+        Box::pin(self.walk_live_session(
+            run,
+            snapshot,
+            step,
+            phase,
+            started_at,
+            LiveSession {
+                trees,
+                cwd,
+                extra_dirs,
+                integrate,
+                live,
+                start: RecorderStart::Tail(events),
+                opening,
+            },
+        ))
+        .await
+    }
+
+    /// MOD-125 M3 D4, D5a: a stopped step's trees as stage 2 recorded them, its guards retaken
+    /// ([`Isolator::reacquire`], which refuses a `shared_serialized` checkout another walk moved),
+    /// and the session's `cwd` and extra directories rebuilt from them as a promotion's chat does
+    /// ([`chat_dirs`]). A step with no tree (an empty repo scope) has nothing to reset, so its
+    /// `cwd` is an empty-scope `prepare`'s. Nothing is reset, created or recorded.
+    ///
+    /// Every fallible read comes before the `reacquire` (MOD-125 M3 F1): the caller is handed the
+    /// trees only once this answers, so a read failing after the guard was retaken would leave
+    /// it held, and a `shared_serialized` sibling's `prepare` waiting on it forever. The
+    /// empty-scope `prepare` after it holds no guard: it has no repository to take one on.
+    async fn reopen_trees(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<(Vec<RunStepTree>, PathBuf, Vec<PathBuf>), EngineError> {
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let dirs = chat_dirs(&trees, &repos);
+        self.parts
+            .isolator
+            .reacquire(run.id, step.id, &trees)
+            .await?;
+        let (cwd, extra_dirs) = match dirs {
+            Some(dirs) => dirs,
+            None => {
+                let prepared = self
+                    .parts
+                    .isolator
+                    .prepare(run.id, step.id, &[], phase.isolation, None)
+                    .await?;
+                (prepared.cwd, prepared.extra_dirs)
+            }
+        };
+        Ok((trees, cwd, extra_dirs))
+    }
+
+    /// MOD-125 M3 D4, D5, D7: how a stopped step with session rows reopens. The step's agent row
+    /// decides with [`promote::opening_kind`] over `events`: a banner and `DriverCaps.resume`
+    /// reopen the session with [`promote::STOP_RESUME_OPENING`], the handoff riding along as the
+    /// fallback (best effort: one that cannot be built is logged and the resume goes on without
+    /// it); otherwise a fresh session opens with the handoff, which then must build. The handoff
+    /// carries [`promote::STOP_REASON`]. An agent with no row has no caps, so it opens fresh.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's run, snapshot, row and phase, its item, and the log and trees the \
+                  resume already read, all handed to `handoff_opening`"
+    )]
+    async fn stopped_opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &[RunStepTree],
+    ) -> Result<SessionOpening<'static>, EngineError> {
+        let candidate = Self::candidate_of(step, phase)?;
+        let caps = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .map(|agent| htui_agent::registry::caps_for(&agent))
+            .unwrap_or_default();
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let handoff = Box::pin(self.handoff_opening(
+            run,
+            snapshot,
+            step,
+            phase,
+            item,
+            events,
+            trees,
+            &repos,
+            Some(promote::STOP_REASON.to_owned()),
+        ))
+        .await;
+        Ok(match promote::opening_kind(caps, events) {
+            OpeningKind::Resume(session_ref) => SessionOpening::Resume {
+                session_ref,
+                text: promote::STOP_RESUME_OPENING.to_owned(),
+                fallback: handoff
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            step = %step.id,
+                            %err,
+                            "the stopped step resumes with no handoff fallback"
+                        );
+                    })
+                    .ok()
+                    .map(|(text, _digest)| text),
+            },
+            OpeningKind::Handoff => SessionOpening::Continue { text: handoff?.0 },
+        })
+    }
+
+    /// MOD-125 M3 D4: a fan-out candidate or a part, moved `stopped -> running` by its round,
+    /// whose log holds session rows: its trees reopened ([`Self::reopen_trees`]: its guards
+    /// retaken, nothing prepared, recorded or reset) and handed to the caller's `trees` at once,
+    /// so a failure from here releases them as a prepared member's are; then its opening
+    /// ([`Self::stopped_opening`]). The member's prompt, `before` commits and tree rows stand as
+    /// its first run wrote them. Answers the trees, the session's `cwd` and extra directories,
+    /// and the opening.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the member's run, snapshot, row and phase, its item and log, all handed to \
+                  `stopped_opening`, and the caller's slot for the trees it must release"
+    )]
+    async fn resumed_member(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &mut Option<Vec<RunStepTree>>,
+    ) -> Result<ReopenedMember, EngineError> {
+        let (rows, cwd, extra_dirs) = self.reopen_trees(run, step, phase).await?;
+        *trees = Some(rows.clone());
+        let opening =
+            Box::pin(self.stopped_opening(run, snapshot, step, phase, item, events, &rows)).await?;
+        Ok((rows, cwd, extra_dirs, opening))
     }
 
     /// MOD-139 M3 D1: what one integrate attempt reads, read once and shared by its hooks: the
@@ -5761,9 +6265,7 @@ where
         {
             return Ok(false);
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(reason), now)
+        self.end_run(run.id, RunStatus::Failed, Some(reason), now)
             .await?;
         // Plan D36's rule is "after every terminal `finish_run`", and this is the one both of the
         // walk's hard failures pass through — stage 3's missing input and any error escaping the
@@ -5778,6 +6280,10 @@ where
     /// Plan D59's `Fan`: create the slot's missing candidates, then drive every `pending` one
     /// concurrently through stages 2 to 5 (plan D58). `Some(rest)` is a refusal that stopped the
     /// run; `None` means the next pass re-derives — normally `Select`.
+    ///
+    /// MOD-125 M3 D4: a `stopped` candidate of a resumed run is driven too, on its own row and
+    /// ahead of the `pending` ones (under `shared_serialized`, each to its end before any other
+    /// starts); [`Self::candidate_live`] reopens it when its log holds session rows.
     ///
     /// The prompt is assembled **once**, before any candidate is live (plan D58): every candidate
     /// records the same text and `prompt_digest`, and none reads `resolve_inputs` while a sibling
@@ -5834,12 +6340,45 @@ where
 
         let steps = self.parts.store.run_steps(run.id).await?;
         let slot = group_at(&steps, phase.position, attempt);
-        let pending: Vec<&RunStep> = slot
+        // MOD-125 M3 D4: the members this call drives, every `stopped` one (resumed on its own
+        // row) before every `pending` one.
+        let resumed = slot
+            .iter()
+            .filter(|step| step.status == StepStatus::Stopped)
+            .count();
+        let members: Vec<&RunStep> = slot
             .iter()
             .copied()
-            .filter(|step| step.status == StepStatus::Pending)
+            .filter(|step| step.status == StepStatus::Stopped)
+            .chain(
+                slot.iter()
+                    .copied()
+                    .filter(|step| step.status == StepStatus::Pending),
+            )
             .collect();
-        let Some(first) = pending.first() else {
+        // Only a member with no session row (a `pending` one, or one stopped before its recorder
+        // opened) sends the group's one prompt, which is the first such member's. A group whose
+        // every member reopens its session assembles none (MOD-125 M3 F1, review L6), so a
+        // prompt that can no longer be built fails none of them before a token.
+        let mut fresh = members
+            .iter()
+            .find(|step| step.status == StepStatus::Pending)
+            .copied();
+        if fresh.is_none() {
+            for step in members.iter().copied() {
+                let events = self.parts.store.step_events(step.id).await?;
+                if events.is_none_or(|events| events.is_empty()) {
+                    fresh = Some(step);
+                    break;
+                }
+            }
+        }
+        let Some(first) = members
+            .iter()
+            .find(|step| step.status == StepStatus::Pending)
+            .or_else(|| members.first())
+            .copied()
+        else {
             return Ok(None);
         };
         // MOD-10 D11, D13 (blueprint A-1, A-2): one resolution for the whole group, before its
@@ -5850,7 +6389,7 @@ where
                 .fail_group_before_a_token(
                     run,
                     phase,
-                    &pending,
+                    &members,
                     RunFailure::SecretsRefused { cause },
                     false,
                 )
@@ -5864,17 +6403,22 @@ where
         // MOD-139 M2 D13: once for the group, as its one prompt is; a compete group's siblings
         // are live, and `fan_out > 1` exposes it anyway.
         let live = crate::divide::live_siblings(&steps, first.id);
-        let prompt = match self
-            .assemble_prompt(run, snapshot, first, phase, item, None, live, None)
-            .await?
-        {
-            Ok(prompt) => prompt,
-            Err(StageThree::MissingInput(missing)) => {
+        let assembled = match fresh {
+            Some(fresh) => Some(
+                self.assemble_prompt(run, snapshot, fresh, phase, item, None, live, None)
+                    .await?,
+            ),
+            None => None,
+        };
+        let prompt = match assembled {
+            None => None,
+            Some(Ok(prompt)) => Some(prompt),
+            Some(Err(StageThree::MissingInput(missing))) => {
                 return self
                     .fail_group_before_a_token(
                         run,
                         phase,
-                        &pending,
+                        &members,
                         RunFailure::MissingInput(missing),
                         false,
                     )
@@ -5883,24 +6427,24 @@ where
             }
             // MOD-4 plan D162 at `drive_group` (blueprint D195): no candidate is live yet, so the
             // whole group fails before a token and the item is blocked.
-            Err(StageThree::Refused(err)) => {
+            Some(Err(StageThree::Refused(err))) => {
                 let failure = RunFailure::PromptRefused {
                     phase: phase.name.clone(),
                     reason: err.to_string(),
                 };
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .fail_group_before_a_token(run, phase, &members, failure, true)
                     .await
                     .map(Some);
             }
             // MOD-26 I-4 at `drive_group`: the whole group fails before a token, the item blocked.
-            Err(StageThree::NoPersona(refusal)) => {
+            Some(Err(StageThree::NoPersona(refusal))) => {
                 let failure = RunFailure::PromptRefused {
                     phase: phase.name.clone(),
                     reason: refusal.to_string(),
                 };
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .fail_group_before_a_token(run, phase, &members, failure, true)
                     .await
                     .map(Some);
             }
@@ -5914,19 +6458,43 @@ where
                 reason: refusal.to_string(),
             })?;
 
-        let settled = futures::future::join_all(pending.iter().map(|step| {
-            self.run_candidate(CandidateStage {
-                run,
-                phase,
-                step,
-                prompt: &prompt,
-                base: &base,
-                persona,
-                reads_verdict: snapshot.reads_verdict(&phase.name),
-                live_siblings: live,
-            })
-        }))
-        .await;
+        let stage = |step| CandidateStage {
+            run,
+            snapshot,
+            phase,
+            step,
+            prompt: prompt.as_ref(),
+            base: &base,
+            persona,
+            reads_verdict: snapshot.reads_verdict(&phase.name),
+            live_siblings: live,
+        };
+        // MOD-125 M3 D4: under `shared_serialized` the stopped members run to their end one at a
+        // time, before any other member starts: a sibling's `prepare` resets the shared checkout
+        // (and refuses on dirt), so a stopped member's tree must be captured first. Left to the
+        // `join_all`, tokio's FIFO guard and each future's awaits would pick who goes first. A
+        // member that answers an error ends the sequence, the rest left as they are, as a parts
+        // round stops pulling.
+        let (first_members, rest) = if phase.isolation == Isolation::SharedSerialized {
+            members.split_at(resumed)
+        } else {
+            members.split_at(0)
+        };
+        let mut settled = Vec::with_capacity(members.len());
+        for step in first_members {
+            let outcome = Box::pin(self.run_candidate(stage(*step))).await;
+            let failed = outcome.is_err();
+            settled.push(outcome);
+            if failed {
+                break;
+            }
+        }
+        if settled.iter().all(Result::is_ok) {
+            settled.extend(
+                futures::future::join_all(rest.iter().map(|step| self.run_candidate(stage(*step))))
+                    .await,
+            );
+        }
         let mut errors = Vec::new();
         let mut refusals = Vec::with_capacity(settled.len());
         for outcome in settled {
@@ -6057,23 +6625,16 @@ where
         let now = self.now();
         for step in pending {
             // Plan D125: a candidate another writer moved stops the walk before the run is failed.
-            self.move_step(
-                run.id,
-                step.id,
-                StepStatus::Pending,
-                StepStatus::Running,
-                now,
-            )
-            .await?;
+            // MOD-125 M3 D4: a stopped member moves from `stopped`.
+            self.move_step(run.id, step.id, step.status, StepStatus::Running, now)
+                .await?;
             self.fail_candidate(run, phase, step, &failure.to_string())
                 .await?;
         }
         if block {
             self.block_and_fail(run, &failure, None, now).await?;
         } else {
-            self.parts
-                .store
-                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                 .await?;
             self.cleanup_walk(run.id).await?;
         }
@@ -6093,15 +6654,13 @@ where
         phase: &SnapshotPhase,
         failure: RunFailure,
     ) -> Result<Rest, EngineError> {
-        self.parts
-            .store
-            .finish_run(
-                run.id,
-                RunStatus::Failed,
-                Some(&failure.to_string()),
-                self.now(),
-            )
-            .await?;
+        self.end_run(
+            run.id,
+            RunStatus::Failed,
+            Some(&failure.to_string()),
+            self.now(),
+        )
+        .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Rest {
             run: RunStatus::Failed,
@@ -6129,11 +6688,12 @@ where
     ) -> Result<Option<RunFailure>, EngineError> {
         let started_at = self.now();
         // Plan D144: a candidate another writer moved is `StaleWrite` (D125), raised once the
-        // group's `join_all` has settled every sibling.
+        // group's `join_all` has settled every sibling. MOD-125 M3 D4: a stopped candidate moves
+        // `stopped -> running` on its own row (same row and attempt, no retry spent).
         self.move_step(
             stage.run.id,
             stage.step.id,
-            StepStatus::Pending,
+            stage.step.status,
             StepStatus::Running,
             started_at,
         )
@@ -6208,6 +6768,7 @@ where
     ) -> Result<(), EngineError> {
         let CandidateStage {
             run,
+            snapshot,
             phase,
             step,
             prompt,
@@ -6218,71 +6779,115 @@ where
         } = *stage;
         let item = Self::item_of(run)?;
 
-        // -- stage 2: prepare, from the group's base (plan D54(a)) ----------------------------
-        let prepared = self
-            .parts
-            .isolator
-            .prepare(
-                run.id,
-                step.id,
-                &run.repo_scope,
-                phase.isolation,
-                Some(FanoutSlot {
-                    index: step.fanout_index,
-                    width: phase.fan_out,
-                    base,
-                }),
-            )
-            .await?;
-        // The candidate's own clock starts here, not at its `running` move: a `shared_serialized`
-        // `prepare` waits on the per-repo lock until the sibling before it is captured, and a
-        // deadline that counted that wait would charge the last sibling for every session ahead
-        // of it. `run_step.started_at` keeps the `running` instant.
-        let started_at = self.now();
-        let rows: Vec<_> = prepared
-            .trees
-            .iter()
-            .map(|tree| tree.tree.clone())
-            .collect();
-        *trees = Some(rows.clone());
-        self.parts
-            .store
-            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
-            .await?;
-        let before: Vec<RunStepCommit> = prepared
-            .trees
-            .iter()
-            .map(|tree| RunStepCommit {
-                run_step_id: step.id,
-                repo_id: tree.tree.repo_id,
-                before_hash: tree.before_hash.clone(),
-                after_hash: None,
-            })
-            .collect();
-        self.parts
-            .store
-            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
-            .await?;
+        // MOD-125 M3 D4: a candidate stopped with session rows reopens its trees and its log
+        // ([`Self::resumed_member`]); one stopped before its recorder opened walks from stage 2
+        // again, as a pending one does (its tree is still at the group's base).
+        let events = if step.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(step.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (rows, cwd, extra_dirs, started_at, start, opening) = if events.is_empty() {
+            // `drive_group` assembles the prompt whenever a member has no session row, and a
+            // log only grows, so this member's is there.
+            let prompt = prompt.ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "candidate {} has no session row, but its group assembled no prompt",
+                    step.id
+                ),
+            })?;
+            // -- stage 2: prepare, from the group's base (plan D54(a)) ------------------------
+            let prepared = self
+                .parts
+                .isolator
+                .prepare(
+                    run.id,
+                    step.id,
+                    &run.repo_scope,
+                    phase.isolation,
+                    Some(FanoutSlot {
+                        index: step.fanout_index,
+                        width: phase.fan_out,
+                        base,
+                    }),
+                )
+                .await?;
+            // The candidate's own clock starts here, not at its `running` move: a
+            // `shared_serialized` `prepare` waits on the per-repo lock until the sibling before it
+            // is captured, and a deadline that counted that wait would charge the last sibling
+            // for every session ahead of it. `run_step.started_at` keeps the `running` instant.
+            let started_at = self.now();
+            let rows: Vec<_> = prepared
+                .trees
+                .iter()
+                .map(|tree| tree.tree.clone())
+                .collect();
+            *trees = Some(rows.clone());
+            self.parts
+                .store
+                .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+                .await?;
+            let before: Vec<RunStepCommit> = prepared
+                .trees
+                .iter()
+                .map(|tree| RunStepCommit {
+                    run_step_id: step.id,
+                    repo_id: tree.tree.repo_id,
+                    before_hash: tree.before_hash.clone(),
+                    after_hash: None,
+                })
+                .collect();
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+                .await?;
 
-        // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
-        let trim = prompt
-            .trim
-            .to_value(self.parts.scrubber)
-            .map_err(htui_agent::RecordError::from)?;
-        self.parts
-            .store
-            .set_step_prompt(
-                StepFence::Lease(self.parts.owner),
-                step.id,
-                &prompt.digest,
-                &trim,
+            // -- stage 3: the group's one prompt (plan D58) ------------------------------------
+            let trim = prompt
+                .trim
+                .to_value(self.parts.scrubber)
+                .map_err(htui_agent::RecordError::from)?;
+            self.parts
+                .store
+                .set_step_prompt(
+                    StepFence::Lease(self.parts.owner),
+                    step.id,
+                    &prompt.digest,
+                    &trim,
+                )
+                .await?;
+            (
+                rows,
+                prepared.cwd,
+                prepared.extra_dirs,
+                started_at,
+                RecorderStart::Prompt(prompt),
+                SessionOpening::Fresh(&prompt.text),
             )
-            .await?;
+        } else {
+            let (rows, cwd, extra_dirs, opening) =
+                Box::pin(self.resumed_member(run, snapshot, step, phase, item, &events, trees))
+                    .await?;
+            (
+                rows,
+                cwd,
+                extra_dirs,
+                self.now(),
+                RecorderStart::Tail(events),
+                opening,
+            )
+        };
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
-        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
+        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48,
+        // or from its resume, MOD-125 M3 D4).
         let deadline = self.deadline_at(phase, started_at);
         let Driven {
             result,
@@ -6294,9 +6899,9 @@ where
                 phase,
                 persona,
                 &key,
-                &prompt.text,
-                prepared.cwd.clone(),
-                prepared.extra_dirs,
+                &opening,
+                cwd.clone(),
+                extra_dirs,
                 deadline,
                 live_siblings,
                 &mut recorder,
@@ -6323,7 +6928,7 @@ where
                 phase,
                 trees: &rows,
                 started_at,
-                session_cwd: &prepared.cwd,
+                session_cwd: &cwd,
                 result: &result,
                 deadline_cut,
             })
@@ -6444,10 +7049,12 @@ where
         node: &SnapshotPhase,
         planner: RunStep,
     ) -> Result<Option<Rest>, EngineError> {
+        // MOD-125 M3 D4: a stopped planner (admission never committed, so it has no part rows)
+        // moves `stopped -> running` and admits, as recovery does.
         self.move_step(
             run.id,
             planner.id,
-            StepStatus::Pending,
+            planner.status,
             StepStatus::Running,
             self.now(),
         )
@@ -6626,7 +7233,8 @@ where
     /// ([`part_retries`]: every latest part that failed with an attempt left gets its next
     /// attempt at its own position, unless some part is out of attempts, which is the divided
     /// step's failure and [`Self::settle_exhausted_part`]'s); its `pending` latest parts in
-    /// position order, and its admitted plan with the `base_refs` the parts branch from.
+    /// position order (MOD-125 M3 D4: after its `stopped` ones, each resumed on its own row by
+    /// [`Self::part_live`]), and its admitted plan with the `base_refs` the parts branch from.
     /// The run's secrets once, as `drive_group` reads them; a refusal fails every pending part and
     /// the run. Then every pending part through [`Self::run_part`], at most
     /// [`crate::divide::parts_width`] at once (`buffer_unordered`, so the run's session cap sees
@@ -6660,12 +7268,22 @@ where
             }
             steps = self.parts.store.run_steps(run.id).await?;
         }
-        let pending: Vec<RunStep> = crate::divide::latest_parts(&steps, planner.id)
-            .into_iter()
-            .filter(|part| part.status == StepStatus::Pending)
-            .cloned()
+        // MOD-125 M3 D4: the round's members, every `stopped` part (resumed on its own row) before
+        // every `pending` one, each in position order. A round runs at most `parts_width` at once,
+        // one under `shared_serialized`, so there a stopped part runs to its capture before a
+        // pending sibling's `prepare` resets the shared checkout.
+        let latest = crate::divide::latest_parts(&steps, planner.id);
+        let members: Vec<RunStep> = latest
+            .iter()
+            .filter(|part| part.status == StepStatus::Stopped)
+            .chain(
+                latest
+                    .iter()
+                    .filter(|part| part.status == StepStatus::Pending),
+            )
+            .map(|part| (*part).clone())
             .collect();
-        if pending.is_empty() {
+        if members.is_empty() {
             return Ok(None);
         }
         let plan = self
@@ -6689,21 +7307,14 @@ where
         if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
             let failure = RunFailure::SecretsRefused { cause };
             let now = self.now();
-            for step in &pending {
-                self.move_step(
-                    run.id,
-                    step.id,
-                    StepStatus::Pending,
-                    StepStatus::Running,
-                    now,
-                )
-                .await?;
+            for step in &members {
+                // MOD-125 M3 D4: a stopped part moves from `stopped`.
+                self.move_step(run.id, step.id, step.status, StepStatus::Running, now)
+                    .await?;
                 self.fail_part(run, node, step, &failure.to_string())
                     .await?;
             }
-            self.parts
-                .store
-                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                 .await?;
             self.cleanup_walk(run.id).await?;
             return Ok(Some(Rest {
@@ -6713,8 +7324,8 @@ where
             }));
         }
 
-        let mut stages = Vec::with_capacity(pending.len());
-        for step in &pending {
+        let mut stages = Vec::with_capacity(members.len());
+        for step in &members {
             let key = step
                 .node_key
                 .as_deref()
@@ -6756,7 +7367,7 @@ where
         for stage in queue.by_ref().take(width) {
             running.push(Box::pin(self.run_part(stage)));
         }
-        let mut settled = Vec::with_capacity(pending.len());
+        let mut settled = Vec::with_capacity(members.len());
         let mut stopped = false;
         while let Some(outcome) = futures::StreamExt::next(&mut running).await {
             stopped |= !matches!(outcome, Ok(PartOutcome::Settled));
@@ -6778,7 +7389,7 @@ where
                     failure,
                     block,
                 }) => {
-                    let position = pending
+                    let position = members
                         .iter()
                         .find(|part| part.id == step)
                         .map_or(i32::MAX, |part| part.position);
@@ -6800,9 +7411,7 @@ where
                     self.block_and_fail(run, failure, Some(step), now).await?;
                 }
                 _ => {
-                    self.parts
-                        .store
-                        .finish_run(run.id, RunStatus::Failed, Some(&text), now)
+                    self.end_run(run.id, RunStatus::Failed, Some(&text), now)
                         .await?;
                     self.cleanup_walk(run.id).await?;
                 }
@@ -6816,7 +7425,7 @@ where
 
         if node.isolation == Isolation::SharedSerialized {
             let mut last = None;
-            for step in pending.iter().rev() {
+            for step in members.iter().rev() {
                 let trees = self.parts.store.step_trees(step.id).await?;
                 if !trees.is_empty() {
                     last = Some((step.id, trees));
@@ -6851,10 +7460,11 @@ where
         if self.cancel_read(stage.run.id, &self.session_control(stage.run.id)) {
             return Err(EngineError::Cancelled { run: stage.run.id });
         }
+        // MOD-125 M3 D4: a stopped part moves `stopped -> running` on its own row.
         self.move_step(
             stage.run.id,
             stage.step.id,
-            StepStatus::Pending,
+            stage.step.status,
             StepStatus::Running,
             self.now(),
         )
@@ -6913,111 +7523,162 @@ where
         let item = Self::item_of(run)?;
         let name = step.phase_name.as_str();
 
-        // -- stage 2: prepare, from the plan's `base_refs` (D4) --------------------------------
-        let prepared = match self
-            .parts
-            .isolator
-            .prepare(run.id, step.id, &run.repo_scope, node.isolation, slot)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(err @ IsolateError::Refused(_)) => {
-                let text = failure_text(name, &EngineError::Isolate(err));
-                return self.refuse_part(run, node, step, text, None, false).await;
-            }
-            Err(err) => return Err(err.into()),
+        // MOD-125 M3 D4: a part stopped with session rows reopens its trees and its log
+        // ([`Self::resumed_member`]); one stopped before its recorder opened walks from stage 2
+        // again, as a pending one does (its tree is still at the plan's `base_refs`).
+        let events = if step.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(step.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        let started_at = self.now();
-        let rows: Vec<RunStepTree> = prepared
-            .trees
-            .iter()
-            .map(|tree| tree.tree.clone())
-            .collect();
-        *trees = Some(rows.clone());
-        self.parts
-            .store
-            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
-            .await?;
-        let before: Vec<RunStepCommit> = prepared
-            .trees
-            .iter()
-            .map(|tree| RunStepCommit {
-                run_step_id: step.id,
-                repo_id: tree.tree.repo_id,
-                before_hash: tree.before_hash.clone(),
-                after_hash: None,
-            })
-            .collect();
-        self.parts
-            .store
-            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
-            .await?;
+        let mut assembled = None;
+        let (rows, cwd, extra_dirs, started_at, live, persona, start, opening) = if events
+            .is_empty()
+        {
+            // -- stage 2: prepare, from the plan's `base_refs` (D4) --------------------------------
+            let prepared = match self
+                .parts
+                .isolator
+                .prepare(run.id, step.id, &run.repo_scope, node.isolation, slot)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(err @ IsolateError::Refused(_)) => {
+                    let text = failure_text(name, &EngineError::Isolate(err));
+                    return self.refuse_part(run, node, step, text, None, false).await;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let started_at = self.now();
+            let rows: Vec<RunStepTree> = prepared
+                .trees
+                .iter()
+                .map(|tree| tree.tree.clone())
+                .collect();
+            *trees = Some(rows.clone());
+            self.parts
+                .store
+                .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+                .await?;
+            let before: Vec<RunStepCommit> = prepared
+                .trees
+                .iter()
+                .map(|tree| RunStepCommit {
+                    run_step_id: step.id,
+                    repo_id: tree.tree.repo_id,
+                    before_hash: tree.before_hash.clone(),
+                    after_hash: None,
+                })
+                .collect();
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+                .await?;
 
-        // -- stage 3: the part's own prompt (D10, D13) ------------------------------------------
-        let live =
-            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
-        let prompt = match self
-            .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
-            .await?
-        {
-            Ok(prompt) => prompt,
-            Err(StageThree::MissingInput(kind)) => {
-                let failure = RunFailure::MissingInput(kind);
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), false)
-                    .await;
-            }
-            Err(StageThree::Refused(err)) => {
-                let failure = RunFailure::PromptRefused {
-                    phase: name.to_owned(),
-                    reason: err.to_string(),
-                };
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), true)
-                    .await;
-            }
-            Err(StageThree::NoPersona(refusal)) => {
-                let failure = RunFailure::PromptRefused {
-                    phase: name.to_owned(),
+            // -- stage 3: the part's own prompt (D10, D13) ------------------------------------------
+            let live =
+                crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+            let prompt = match self
+                .assemble_prompt(run, snapshot, step, node, item, Some(part), live, None)
+                .await?
+            {
+                Ok(prompt) => prompt,
+                Err(StageThree::MissingInput(kind)) => {
+                    let failure = RunFailure::MissingInput(kind);
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), false)
+                        .await;
+                }
+                Err(StageThree::Refused(err)) => {
+                    let failure = RunFailure::PromptRefused {
+                        phase: name.to_owned(),
+                        reason: err.to_string(),
+                    };
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), true)
+                        .await;
+                }
+                Err(StageThree::NoPersona(refusal)) => {
+                    let failure = RunFailure::PromptRefused {
+                        phase: name.to_owned(),
+                        reason: refusal.to_string(),
+                    };
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), true)
+                        .await;
+                }
+            };
+            let persona = snapshot
+                .persona_for(node)
+                .map_err(|refusal| EngineError::Snapshot {
+                    run: run.id,
                     reason: refusal.to_string(),
-                };
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), true)
-                    .await;
-            }
-        };
-        let persona = snapshot
-            .persona_for(node)
-            .map_err(|refusal| EngineError::Snapshot {
-                run: run.id,
-                reason: refusal.to_string(),
-            })?;
-        let trim = match prompt.trim.to_value(self.parts.scrubber) {
-            Ok(trim) => trim,
-            Err(unmasked) => {
-                let failure = RunFailure::scrub_refused(name, &unmasked);
-                let text = failure.to_string();
-                return self
-                    .refuse_part(run, node, step, text, Some(failure), false)
-                    .await;
-            }
-        };
-        self.parts
-            .store
-            .set_step_prompt(
-                StepFence::Lease(self.parts.owner),
-                step.id,
-                &prompt.digest,
-                &trim,
+                })?;
+            let trim = match prompt.trim.to_value(self.parts.scrubber) {
+                Ok(trim) => trim,
+                Err(unmasked) => {
+                    let failure = RunFailure::scrub_refused(name, &unmasked);
+                    let text = failure.to_string();
+                    return self
+                        .refuse_part(run, node, step, text, Some(failure), false)
+                        .await;
+                }
+            };
+            self.parts
+                .store
+                .set_step_prompt(
+                    StepFence::Lease(self.parts.owner),
+                    step.id,
+                    &prompt.digest,
+                    &trim,
+                )
+                .await?;
+            let prompt: &AssembledPrompt = assembled.insert(prompt);
+            (
+                rows,
+                prepared.cwd,
+                prepared.extra_dirs,
+                started_at,
+                live,
+                persona,
+                RecorderStart::Prompt(prompt),
+                SessionOpening::Fresh(&prompt.text),
             )
-            .await?;
+        } else {
+            let (rows, cwd, extra_dirs, opening) =
+                Box::pin(self.resumed_member(run, snapshot, step, node, item, &events, trees))
+                    .await?;
+            let live =
+                crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+            // MOD-26 D12: the part's stage 3 passed when it first ran, on the same snapshot.
+            let persona = snapshot
+                .persona_for(node)
+                .map_err(|refusal| EngineError::Snapshot {
+                    run: run.id,
+                    reason: refusal.to_string(),
+                })?;
+            (
+                rows,
+                cwd,
+                extra_dirs,
+                self.now(),
+                live,
+                persona,
+                RecorderStart::Tail(events),
+                opening,
+            )
+        };
 
         // -- stage 4: the part's own session (D4: `<divided>/<key>` keys it) -------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, &prompt).await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
         let deadline = self.deadline_at(node, started_at);
         let Driven {
             result,
@@ -7029,9 +7690,9 @@ where
                 node,
                 persona,
                 &key,
-                &prompt.text,
-                prepared.cwd.clone(),
-                prepared.extra_dirs,
+                &opening,
+                cwd.clone(),
+                extra_dirs,
                 deadline,
                 live,
                 &mut recorder,
@@ -7253,14 +7914,14 @@ where
                         .await
                         .map(Some);
                 }
-                StepStatus::Pending => {
+                // MOD-125 M3 D4: a stopped judge re-runs fresh on its own row, as a pending one runs.
+                StepStatus::Pending | StepStatus::Stopped => {
                     let passing = pre.passing.iter().map(|view| view.step).collect();
                     return self
                         .run_judge(run, snapshot, phase, attempt, passing, Some(judge.clone()))
                         .await;
                 }
                 StepStatus::Running
-                | StepStatus::Stopped
                 | StepStatus::Done
                 | StepStatus::Superseded
                 | StepStatus::Cancelled => {}
@@ -7285,9 +7946,7 @@ where
                 let failure = RunFailure::NoSurvivingCandidate {
                     phase: phase.name.clone(),
                 };
-                self.parts
-                    .store
-                    .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                     .await?;
                 self.cleanup_walk(run.id).await?;
                 Ok(Some(Rest {
@@ -7507,15 +8166,10 @@ where
             .judge_row(run, snapshot, phase, attempt, existing)
             .await?;
         let now = self.now();
-        // Plan D144: a judge another writer moved is `StaleWrite` (D125).
-        self.move_step(
-            run.id,
-            judge.id,
-            StepStatus::Pending,
-            StepStatus::Running,
-            now,
-        )
-        .await?;
+        // Plan D144: a judge another writer moved is `StaleWrite` (D125). MOD-125 M3 D4: a
+        // stopped judge moves `stopped -> running` on its own row.
+        self.move_step(run.id, judge.id, judge.status, StepStatus::Running, now)
+            .await?;
         self.step_started(run, judge.id);
         let prompts = match prompts {
             Ok(prompts) => prompts,
@@ -7965,9 +8619,43 @@ where
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
-        let (mut recorder, cap_batch) = self.open_recorder(run, judge, &prompts.forward).await?;
+        // MOD-125 M3 D4: a stopped judge with session rows re-runs fresh, both calls, on its
+        // continuing log: no second prompt row, and each call's text a follow-up. Its prompts are
+        // rebuilt from the same rows, so the digest and trim above are its first run's again.
+        let events = if judge.status == StepStatus::Stopped {
+            self.parts
+                .store
+                .step_events(judge.id)
+                .await?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let rerun = !events.is_empty();
+        // The judge document the stopped attempt left newest, which no re-run call may read as
+        // its own (`output_of` is newest-by-version).
+        let stale = self
+            .output_of(Self::item_of(run)?, &jp, judge.id)
+            .await?
+            .map(|document| document.id);
+        let start = if rerun {
+            RecorderStart::Tail(events)
+        } else {
+            RecorderStart::Prompt(&prompts.forward)
+        };
+        let (mut recorder, cap_batch) = self.open_recorder(run, judge, start).await?;
         let calls = self
-            .judge_calls(run, &jp, attempt, judge, prompts, &prepared, &mut recorder)
+            .judge_calls(
+                run,
+                &jp,
+                attempt,
+                judge,
+                prompts,
+                &prepared,
+                &mut recorder,
+                rerun,
+                stale,
+            )
             .await;
         let finished = recorder.finish().await;
         let documents = match calls? {
@@ -7986,10 +8674,16 @@ where
     /// Call 0 and call 1 of [`judge_sessions`](Self::judge_sessions): each drives a fresh session
     /// keyed `(<phase>:judge, attempt, -1, call)`, hands its `done` to the sink, and reads the
     /// newest `judge` document the judge step wrote — which must be **new** after each call.
+    ///
+    /// MOD-125 M3 D4: on a stopped judge's re-run (`rerun`), call 0's text is a follow-up too (the
+    /// log's prompt row is the first run's), and `stale`, the newest document before the calls,
+    /// is never new: a re-run call that writes nothing is `MissingDocument`, not the stopped
+    /// attempt's verdict read again.
     #[expect(
         clippy::too_many_arguments,
         reason = "the judge's row and phase, its two prompts, its tree and the recorder both calls \
-                  share; bundling them would name a struct used here only"
+                  share, and a re-run's two facts (MOD-125 M3 D4); bundling them would name a \
+                  struct used here only"
     )]
     async fn judge_calls(
         &self,
@@ -8000,11 +8694,13 @@ where
         prompts: &JudgePrompts,
         prepared: &crate::isolate::Prepared,
         recorder: &mut Recorder<'a, S>,
+        rerun: bool,
+        stale: Option<DocumentId>,
     ) -> Result<Result<[Document; 2], JudgeFailure>, EngineError> {
         let item = Self::item_of(run)?;
         let mut documents: Vec<Document> = Vec::with_capacity(2);
         for (call, text) in [(0, &prompts.forward.text), (1, &prompts.reversed.text)] {
-            if call > 0 {
+            if call > 0 || rerun {
                 recorder.record_follow_up(text, self.now()).await?;
             }
             let key = SessionKey {
@@ -8022,7 +8718,7 @@ where
                     // candidate's prompt, frame included.
                     None,
                     &key,
-                    text,
+                    &SessionOpening::Fresh(text),
                     prepared.cwd.clone(),
                     prepared.extra_dirs.clone(),
                     // The maintainer's M4 scope: judge calls stay untimed (no `started_at` of
@@ -8046,7 +8742,10 @@ where
                 .await?;
             let document = self.output_of(item, jp, judge.id).await?;
             match document {
-                Some(document) if !documents.iter().any(|seen| seen.id == document.id) => {
+                Some(document)
+                    if Some(document.id) != stale
+                        && !documents.iter().any(|seen| seen.id == document.id) =>
+                {
                     documents.push(document);
                 }
                 _ => return Ok(Err(JudgeFailure::MissingDocument { call })),
@@ -8089,8 +8788,9 @@ where
     }
 
     /// MOD-10 D13 on the judge path (blueprint A-2): the run fails with the refusal, not the
-    /// selection. A crash's `pending` judge row (`existing`) is moved `pending -> running` and
-    /// settled by [`fail_hard`](Self::fail_hard) (`pending -> failed` is illegal); with no row, the
+    /// selection. A crash's `pending` judge row, or a `stopped` one (MOD-125 M3 D4) (`existing`),
+    /// is moved from its own status to `running` and settled by [`fail_hard`](Self::fail_hard)
+    /// (neither `pending -> failed` nor `stopped -> failed` is a move it makes); with no row, the
     /// run is failed and cleaned up directly, as `Route::GroupFailed`'s terminal arm does.
     async fn refuse_judge_secrets(
         &self,
@@ -8103,11 +8803,12 @@ where
         let reason = failure.to_string();
         match existing {
             Some(judge) => {
-                // Plan D144: a judge another writer moved is `StaleWrite` (D125).
+                // Plan D144: a judge another writer moved is `StaleWrite` (D125). MOD-125 M3 D4:
+                // a stopped judge moves from `stopped`.
                 self.move_step(
                     run.id,
                     judge.id,
-                    StepStatus::Pending,
+                    judge.status,
                     StepStatus::Running,
                     self.now(),
                 )
@@ -8115,9 +8816,7 @@ where
                 self.fail_hard(run, judge, &reason).await?;
             }
             None => {
-                self.parts
-                    .store
-                    .finish_run(run.id, RunStatus::Failed, Some(&reason), self.now())
+                self.end_run(run.id, RunStatus::Failed, Some(&reason), self.now())
                     .await?;
                 self.cleanup_walk(run.id).await?;
             }
@@ -8383,9 +9082,7 @@ where
                 .await?;
             self.note(item, failure.to_string(), via, now).await?;
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await
     }
@@ -8896,8 +9593,9 @@ where
     /// between, under the one recorder.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
-                  and stage 2's two directories, all handed straight to `drive_once`, the step's \
+        reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), how the \
+                  recorder and the session open (MOD-125 M3 D5) and stage 2's two directories, all \
+                  handed straight to `drive_once`, the step's \
                   `started_at` its deadline is measured from (MOD-37 M4 D1), and MOD-139 M2 D13's \
                   `live_siblings`"
     )]
@@ -8907,7 +9605,8 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
-        prompt: &AssembledPrompt,
+        start: RecorderStart<'_>,
+        opening: &SessionOpening<'_>,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         started_at: DateTime<Utc>,
@@ -8920,7 +9619,7 @@ where
         ),
         EngineError,
     > {
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
         // MOD-37 M4 D1: what is left of the step deadline as the session starts.
         let deadline = self.deadline_at(phase, started_at);
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
@@ -8937,7 +9636,7 @@ where
                 phase,
                 persona,
                 &SessionKey::of(step),
-                &prompt.text,
+                opening,
                 cwd,
                 extra_dirs,
                 deadline,
@@ -8957,7 +9656,9 @@ where
     }
 
     /// A step's [`Recorder`], with D6's allowance applied (MOD-12 M2), and the batch when its
-    /// remainder bound it, and `prompt` recorded as its seq-0 row.
+    /// remainder bound it, and a
+    /// [`RecorderStart::Prompt`] recorded as its seq-0 row (a [`RecorderStart::Tail`], MOD-125 M3
+    /// D5, continues the step's log instead and writes no prompt row).
     ///
     /// `record_prompt_digesting` also writes `run_step.prompt_digest`, so every session a step
     /// opens — a candidate's one, the judge's two (plan D52) — is recorded against the digest of
@@ -8968,20 +9669,38 @@ where
         &self,
         run: &Run,
         step: &RunStep,
-        prompt: &AssembledPrompt,
+        start: RecorderStart<'_>,
     ) -> Result<(Recorder<'a, S>, Option<BatchId>), EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
-        let mut recorder = Recorder::new(
-            self.parts.store,
-            self.parts.scrubber,
-            step.id,
-            settings.keep_raw_events,
-            None,
-        )
+        // MOD-125 M3 D5: a resumed step's log is continued (seq, turn and usage carry on), and no
+        // second prompt row or digest is written.
+        let (mut recorder, prompt) = match start {
+            RecorderStart::Prompt(prompt) => (
+                Recorder::new(
+                    self.parts.store,
+                    self.parts.scrubber,
+                    step.id,
+                    settings.keep_raw_events,
+                    None,
+                ),
+                Some(prompt),
+            ),
+            RecorderStart::Tail(events) => (
+                Recorder::continuing(
+                    self.parts.store,
+                    self.parts.scrubber,
+                    step.id,
+                    settings.keep_raw_events,
+                    None,
+                    &events,
+                ),
+                None,
+            ),
+        };
         // MOD-40 plan D2: the walk's lease rides every row, usage and digest write, so a walk
         // that sleeps through its lease writes nothing once another process has adopted it.
-        .with_fence(StepFence::Lease(self.parts.owner));
+        recorder = recorder.with_fence(StepFence::Lease(self.parts.owner));
         // MOD-12 M2 D6: the run's remainder and, for a batch run, the batch's, whichever is less.
         let allowance = self.allowance(run).await?;
         if let Some(allowance) = allowance {
@@ -8993,14 +9712,16 @@ where
                 grace: std::time::Duration::ZERO,
             });
         }
-        recorder
-            .record_prompt_digesting(
-                &prompt.text,
-                &prompt.digest_text,
-                prompt.payload_sections_value(),
-                self.now(),
-            )
-            .await?;
+        if let Some(prompt) = prompt {
+            recorder
+                .record_prompt_digesting(
+                    &prompt.text,
+                    &prompt.digest_text,
+                    prompt.payload_sections_value(),
+                    self.now(),
+                )
+                .await?;
+        }
         Ok((recorder, allowance.and_then(|allowance| allowance.batch)))
     }
 
@@ -9141,7 +9862,8 @@ where
         Ok(())
     }
 
-    /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and
+    /// One driver session under `recorder`: the driver for `key`, `start` as `opening` says
+    /// (MOD-125 M3 D5, [`Self::start_session`]), and
     /// `drive` to its `done` (MOD-42 plan D6), with the agent's own policy (D9), the permission
     /// relay and the run's control (D10).
     ///
@@ -9164,7 +9886,7 @@ where
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
         key: &SessionKey<'_>,
-        text: &str,
+        opening: &SessionOpening<'_>,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         deadline: Option<tokio::time::Instant>,
@@ -9176,8 +9898,13 @@ where
         let candidate = Self::candidate_of(step, phase)?;
         // MOD-42 D10, B-17: a cancel that reached the walk between sessions spawns nothing.
         // MOD-138 M3 D3: under an open walk the session drives on the walk's control, which also
-        // carries the walk's cut.
-        let mut control = self.session_control(run.id);
+        // carries the walk's cut. MOD-164 F1 (review H1): the capture is the run's end, not a
+        // sibling of the walk, so it drives on the run's own control, which no cut reaches.
+        let mut control = if capture::is_capture_row(step) {
+            (self.parts.control)(run.id)
+        } else {
+            self.session_control(run.id)
+        };
         if self.cancel_read(run.id, &control) {
             return Err(EngineError::Cancelled { run: run.id });
         }
@@ -9255,13 +9982,14 @@ where
                     &candidate,
                     &project,
                     &cwd,
+                    &extra_dirs,
                     tools.command_run,
                 ))
                 .await?,
             ),
             None => None,
         };
-        // MOD-11 R1 M2: htui's own advertised tools (but `command_run` and `permission_prompt`)
+        // MOD-11 R1 M2: htui's own advertised tools (but the `ASKING_TOOLS`)
         // are pre-approved after every rule above, so they only replace the default `ask`.
         if let Some(lease) = &lease {
             crate::tools::pre_approve(&mut policy, lease);
@@ -9284,7 +10012,11 @@ where
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
-            resume: None,
+            // MOD-125 M3 D5: a resumed stopped step reopens its own session.
+            resume: match opening {
+                SessionOpening::Resume { session_ref, .. } => Some(session_ref.clone()),
+                SessionOpening::Fresh(_) | SessionOpening::Continue { .. } => None,
+            },
             // MOD-12 M2 D6: the recorder's cap, so the two read one number (D83).
             budget_micros: recorder.run_cap().map(|cap| cap.micros),
             prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
@@ -9293,10 +10025,10 @@ where
         // against it; the start itself is not under it - a hung start is bounded by the driver's
         // own handshake timeout. MOD-10 R1 H1: a start error's text (an agent's stderr tail) is
         // masked with the walk's scrubber before any caller writes it.
-        let mut session = driver
-            .start(spec, text.to_owned())
-            .await
-            .map_err(|err| remasked_driver(self.parts.scrubber, err))?;
+        // MOD-125 M3 D5: a resumed step's opening (and its fallback) is written here, after the
+        // start and before the pump. Boxed: this frame sits in every walk's.
+        let mut session =
+            Box::pin(self.start_session(driver.as_ref(), spec, step.id, opening, recorder)).await?;
         let now = || self.now();
         let relay = Relay {
             store: self.parts.store,
@@ -9375,6 +10107,88 @@ where
         }
     }
 
+    /// MOD-125 M3 D5: `driver`'s session started as `opening` says, its follow-up written once
+    /// it started (before the pump).
+    ///
+    /// - `Fresh`: the start, as before M3; the caller's recorder holds the prompt row.
+    /// - `Continue`: the start with the handoff, then the handoff as a `follow_up` row.
+    /// - `Resume`: the start with `spec.resume` set; on `Ok` the opening is `resumed` and the
+    ///   resume text a `follow_up` row. On a failure [`promote::falls_back`] admits with a
+    ///   fallback: the opening is `resume_failed`, the `resume_failed` notice is written (a failed
+    ///   write is logged, and the walk goes on), and a second start with no `resume` opens with
+    ///   the fallback, which is then the `follow_up` row. Any other failure, or none to fall back
+    ///   to, is the start's error, as a first run's is.
+    ///
+    /// A start error's text (an agent's stderr tail) is masked with the walk's scrubber (MOD-10
+    /// R1 H1) before anything writes it.
+    async fn start_session(
+        &self,
+        driver: &dyn AgentDriver,
+        spec: SessionSpec,
+        step: StepId,
+        opening: &SessionOpening<'_>,
+        recorder: &mut Recorder<'a, S>,
+    ) -> Result<Box<dyn htui_agent::driver::AgentSession>, EngineError> {
+        let masked = |err| remasked_driver(self.parts.scrubber, err);
+        let fresh = match opening {
+            SessionOpening::Resume {
+                fallback: Some(_), ..
+            } => Some(SessionSpec {
+                resume: None,
+                ..spec.clone()
+            }),
+            SessionOpening::Fresh(_)
+            | SessionOpening::Continue { .. }
+            | SessionOpening::Resume { fallback: None, .. } => None,
+        };
+        let first = driver.start(spec, opening.text().to_owned()).await;
+        match (first, opening, fresh) {
+            (Ok(session), SessionOpening::Fresh(_), _) => Ok(session),
+            (Ok(session), SessionOpening::Continue { text }, _) => {
+                recorder.record_follow_up(text, self.now()).await?;
+                Ok(session)
+            }
+            (Ok(session), SessionOpening::Resume { text, .. }, _) => {
+                self.note_opening(step, StepOpening::Resumed).await;
+                recorder.record_follow_up(text, self.now()).await?;
+                Ok(session)
+            }
+            (
+                Err(err),
+                SessionOpening::Resume {
+                    session_ref,
+                    fallback: Some(fallback),
+                    ..
+                },
+                Some(fresh),
+            ) if promote::falls_back(&err) => {
+                let err = masked(err);
+                tracing::warn!(%step, %err, "the stopped step's session did not reopen; it opens fresh");
+                // The column first, so the Runs pane is truthful even if the row write fails.
+                self.note_opening(step, StepOpening::ResumeFailed).await;
+                let notice = promote::resume_failed_notice(session_ref, &err.to_string());
+                if let Err(record_err) = recorder.record_notice(&notice, self.now()).await {
+                    tracing::warn!(%step, %record_err, "the resume_failed row could not be written");
+                }
+                let session = driver
+                    .start(fresh, fallback.clone())
+                    .await
+                    .map_err(masked)?;
+                recorder.record_follow_up(fallback, self.now()).await?;
+                Ok(session)
+            }
+            (Err(err), _, _) => Err(EngineError::Driver(masked(err))),
+        }
+    }
+
+    /// MOD-125 M3 D5: `run_step.opening` of a resumed stopped step. A failed write is logged and
+    /// never fails the walk: the column is a label, and the session is what the step needs.
+    async fn note_opening(&self, step: StepId, opening: StepOpening) {
+        if let Err(err) = self.parts.store.record_opening(step, opening).await {
+            tracing::warn!(%err, %step, %opening, "the resumed step's opening could not be recorded");
+        }
+    }
+
     /// MOD-11 D10: the session's [`ToolScope`](crate::tools::ToolScope), built from what the walk
     /// holds (never from tool arguments, I-1), opened on `host`. A refusal fails the step as a
     /// spawn failure (never silently drops the server).
@@ -9391,6 +10205,7 @@ where
         candidate: &SnapshotCandidate,
         project: &Project,
         cwd: &Path,
+        extra_dirs: &[PathBuf],
         command_queue: bool,
     ) -> Result<crate::tools::ToolLease, EngineError> {
         // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
@@ -9421,6 +10236,8 @@ where
             // MOD-11 D16: the exposure `drive_once` resolved, after the persona's narrowing.
             command_queue,
             cwd: cwd.to_path_buf(),
+            // MOD-152 D11: the trees `command_run`'s `repo` argument names.
+            extra_dirs: extra_dirs.to_vec(),
             transport,
         };
         let lease = host
@@ -9466,12 +10283,84 @@ where
         sent.checked_add(ttl).unwrap_or(sent)
     }
 
+    /// MOD-164 D11: the one way the walk ends a run (every terminal `finish_run` the walk and the
+    /// gate write). A run that is not ending `cancelled`, is still live (`running` or
+    /// `awaiting_approval`, re-read), whose snapshot froze a capture and that has an item runs its
+    /// capture step first ([`Self::capture`]), and `finish_run` stays the run's last write. The
+    /// capture never moves `to`: whatever it meets settles its own row.
+    ///
+    /// MOD-164 F1 (review H2): the run's outcome is decided here. One end of a run is in progress
+    /// in this engine at a time ([`WalkScopes::end`]): a second, a sibling's terminal path met
+    /// during the capture, waits for the first to return and then finds the run finished, so it
+    /// runs no capture and its `finish_run` is refused, as a second end's always was. A run
+    /// ending `cancelled` waits for nothing: its cancel reaches the capture's session first, and
+    /// an end that waited and then reads the run's cancel returns `Cancelled` without writing.
+    ///
+    /// # Errors
+    /// The capture's fence and lease errors and the run's own cancel, before `finish_run` is
+    /// written (a cancel's run is ended by the cancel path); `finish_run`'s own. Any other
+    /// capture error, and a failed read of the run (review L6), is warned and the run still ends.
+    pub(crate) async fn end_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        let mut at = at;
+        let _end = if to == RunStatus::Cancelled {
+            None
+        } else {
+            let end = self.walks.end(run).await;
+            // An earlier end of this run that returned on the run's own cancel left the run, and
+            // its capture row, to the cancel path: a waiting end must not take the row for a
+            // crash leftover and end the run `failed` under the cancel (F1 verifier, low).
+            if (self.parts.control)(run).signal().is_cancel() {
+                return Err(EngineError::Cancelled { run });
+            }
+            match self.run(run).await {
+                Ok(row) => {
+                    // A snapshot that does not decode was refused by the walk long before its
+                    // end; here it is only "no capture".
+                    let capture = Self::snapshot_of(&row)
+                        .ok()
+                        .and_then(|snapshot| snapshot.capture);
+                    if let Some(capture) = capture
+                        && row.item_id.is_some()
+                        && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                    {
+                        // Boxed: the run end sits at the bottom of the walk's frames, near the
+                        // 2 MiB debug stack (MOD-10 M3).
+                        match Box::pin(self.capture(&row, &capture)).await {
+                            Ok(()) => {}
+                            Err(err) if self.passes_through(run, &err) => return Err(err),
+                            // A store error before the capture row settled (its read, its
+                            // insert): the capture never moves the run's end, so the run still
+                            // ends.
+                            Err(err) => {
+                                tracing::warn!(%run, %err, "the capture step did not settle; the run ends without it");
+                            }
+                        }
+                        at = at.max(self.now());
+                    }
+                }
+                // Review L6: the capture is skipped, never the run's end.
+                Err(err) => {
+                    tracing::warn!(%run, %err, "the run could not be read for its capture; the run ends without it");
+                }
+            }
+            Some(end)
+        };
+        self.parts.store.finish_run(run, to, failure, at).await?;
+        Ok(())
+    }
+
     /// The `GateContext` stage 6 and the review loop share.
     const fn gate_context<'r>(
         &'r self,
         run: &'r Run,
         snapshot: &'r GraphSnapshot,
-    ) -> GateContext<'r, S, C> {
+    ) -> GateContext<'r, S, C, Self> {
         GateContext {
             store: self.parts.store,
             clock: self.parts.clock,
@@ -9481,6 +10370,8 @@ where
             box_id: self.parts.box_id,
             fence: StepFence::Lease(self.parts.owner),
             walk: Some(&self.walks),
+            // MOD-164 D11: a run the gate ends is ended by `end_run`, so it captures first.
+            end: Some(self),
         }
     }
 
@@ -9827,12 +10718,15 @@ enum StageThree {
 struct CandidateStage<'s> {
     /// The run, re-read by the group's pass.
     run: &'s Run,
+    /// The run's snapshot (MOD-125 M3 D7: a resumed candidate's handoff reads it).
+    snapshot: &'s GraphSnapshot,
     /// The fanned-out phase.
     phase: &'s SnapshotPhase,
-    /// The candidate, still `pending`.
+    /// The candidate, still `pending`, or `stopped` (MOD-125 M3 D4) as the group read it.
     step: &'s RunStep,
-    /// The group's one assembled prompt.
-    prompt: &'s AssembledPrompt,
+    /// The group's one assembled prompt; `None` when every member reopens its session (MOD-125
+    /// M3 F1), so none sends it.
+    prompt: Option<&'s AssembledPrompt>,
     /// The group's base per repo (plan D54(a)).
     base: &'s BTreeMap<RepoId, String>,
     /// MOD-26 D12: the phase's frozen persona.
@@ -10600,6 +11494,22 @@ pub async fn resume_fake(
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
+}
+
+/// [`Engine::resume_stopped`] over the same parts (MOD-125 M3 D3).
+///
+/// # Errors
+/// As [`Engine::resume_stopped`].
+#[cfg(feature = "test-support")]
+pub async fn resume_stopped_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: RunId,
+) -> Result<Option<Rest>, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.resume_stopped(run).await
 }
 
 /// [`Engine::sweep`] over the same parts (plan D98): the second process's sweep in every
@@ -11794,7 +12704,12 @@ mod tests {
                 .iter()
                 .map(|step| (step.phase_name.as_str(), step.status))
                 .collect::<Vec<_>>(),
-            [("prd", StepStatus::Done), ("plan", StepStatus::Failed)]
+            // MOD-164 D11: the failed run ends with its capture row, skipped (no light model).
+            [
+                ("capture", StepStatus::Done),
+                ("prd", StepStatus::Done),
+                ("plan", StepStatus::Failed)
+            ]
         );
         let notes = harness
             .orch
@@ -12024,6 +12939,15 @@ mod tests {
         assert_eq!(after[0].status, StepStatus::AwaitingApproval);
     }
 
+    /// MOD-164 D11: `steps` less the run's capture row, which a run that failed a step ends with
+    /// (skipped here: these harnesses set no light model).
+    fn without_capture(steps: Vec<htui_core::model::RunStep>) -> Vec<htui_core::model::RunStep> {
+        steps
+            .into_iter()
+            .filter(|step| step.node_key.as_deref() != Some(htui_core::model::CAPTURE_KEY))
+            .collect()
+    }
+
     /// `docs/ANA-2.md:412-414`: a required input that resolves to nothing fails the run before a
     /// token is spent, and the step's `prompt_digest` proves no prompt was assembled.
     #[tokio::test]
@@ -12078,7 +13002,7 @@ mod tests {
             harness.orch.state(ids::HTUI_FEAT_3).await,
             ItemState::Failed
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps[0].status, StepStatus::Failed);
         assert!(
             steps[0].prompt_digest.is_none(),
@@ -12177,7 +13101,7 @@ mod tests {
             harness.orch.run(run).await.failure.as_deref(),
             Some("missing_output")
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps.len(), 2, "plan D3: `retry_limit = 1` permits two");
         assert_eq!(
             steps
@@ -13853,9 +14777,10 @@ mod tests {
         let refused = engine
             .run_candidate(super::CandidateStage {
                 run: &row,
+                snapshot: &snapshot,
                 phase,
                 step: &stale,
-                prompt: &prompt,
+                prompt: Some(&prompt),
                 base: &BTreeMap::new(),
                 persona: None,
                 reads_verdict: false,
@@ -14810,7 +15735,11 @@ mod tests {
             other.orch.run(run).await.failure.as_deref(),
             Some("rejected: plan")
         );
-        assert_eq!(other.orch.steps(run).await.len(), 2, "nothing was admitted");
+        assert_eq!(
+            without_capture(other.orch.steps(run).await).len(),
+            2,
+            "nothing was admitted"
+        );
     }
 
     /// Plan D131 in `run_to_rest`: the walk meets the same crash (here through `resume`, in the
@@ -15802,7 +16731,7 @@ mod tests {
         };
         assert_eq!(rest.run, RunStatus::Failed);
 
-        let before = harness.orch.steps(run).await;
+        let before = without_capture(harness.orch.steps(run).await);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].status, StepStatus::Failed);
         assert_eq!((before[0].position, before[0].attempt), (0, 1));
@@ -15826,7 +16755,7 @@ mod tests {
             "{refused}"
         );
 
-        let after = harness.orch.steps(run).await;
+        let after = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             after
                 .iter()
@@ -16385,7 +17314,7 @@ mod tests {
                 reason: M1_SENTENCE.to_owned(),
             })
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps.len(), 1, "the walk stopped at the refused step");
         assert_eq!(
             (steps[0].status, steps[0].prompt_digest.as_deref()),
@@ -16494,7 +17423,7 @@ mod tests {
                 reason: M1_SENTENCE.to_owned(),
             })
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             steps
                 .iter()
@@ -17651,7 +18580,7 @@ mod tests {
             ItemState::Failed,
             "the item reads the run's `failed` after the unpark (MOD-144)"
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             steps.len(),
             1,
@@ -18808,6 +19737,155 @@ mod tests {
                 .expect("MemStore refreshes"),
             "the lease the stop took went back"
         );
+    }
+
+    /// [`preempted_in_plan`] with the stop settled: the run `stopped` over its `stopped` `plan`
+    /// row, which recorded its trees. Answers the run row and the `plan` row.
+    async fn stopped_in_plan(
+        harness: &Harness,
+    ) -> (htui_core::model::Run, htui_core::model::RunStep) {
+        let run = preempted_in_plan(harness).await;
+        {
+            harness_engine!(harness.orch, engine);
+            assert!(
+                engine.settle_stop(run).await.expect("the stop settles"),
+                "the stop is this process's to write"
+            );
+        }
+        let plan = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.status == StepStatus::Stopped)
+            .expect("`plan` stopped");
+        (harness.orch.run(run).await, plan)
+    }
+
+    /// MOD-125 M3 F1 (review M1): every fallible read of [`super::Engine::reopen_trees`] runs
+    /// before its `reacquire`. A read that fails after the guard was retaken would leak it: the
+    /// member's caller releases only the trees `reopen_trees` handed back, so under
+    /// `shared_serialized` the sibling's `prepare` would wait on the guard forever.
+    #[tokio::test]
+    async fn a_read_failing_while_trees_reopen_retakes_no_guard() {
+        use htui_core::store::mem::MemFault;
+
+        let harness = Harness::new().await;
+        let (run, plan) = stopped_in_plan(&harness).await;
+        let snapshot: GraphSnapshot = serde_json::from_value(
+            run.graph_snapshot
+                .clone()
+                .expect("a graph run carries its snapshot"),
+        )
+        .expect("a v2 snapshot decodes");
+        let phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == plan.phase_name)
+            .expect("the snapshot holds `plan`");
+        let reacquires = harness.orch.isolator.reacquires();
+        harness_engine!(harness.orch, engine);
+
+        harness.orch.store.set_fault(MemFault::Repos, true);
+        let reopened = engine.reopen_trees(&run, &plan, phase).await;
+        harness.orch.store.set_fault(MemFault::Repos, false);
+
+        assert!(
+            matches!(
+                reopened,
+                Err(EngineError::Store(
+                    htui_core::store::StoreError::Unreachable(_)
+                ))
+            ),
+            "{reopened:?}"
+        );
+        assert_eq!(
+            harness.orch.isolator.reacquires(),
+            reacquires,
+            "the failed read came before any guard was retaken"
+        );
+        engine
+            .reopen_trees(&run, &plan, phase)
+            .await
+            .expect("the trees reopen once the read answers");
+        assert_eq!(harness.orch.isolator.reacquires(), reacquires + 1);
+    }
+
+    /// MOD-125 M3 F1 (review L5): `cancel_stopped` read the run `stopped`, but another process's
+    /// resume won the CAS before it: the run is read again, `running` under that process's live
+    /// lease, and takes the leased path, which refuses with `LeaseHeld` and writes nothing.
+    #[tokio::test]
+    async fn a_cancel_of_a_stopped_run_another_process_resumed_meanwhile_is_lease_held() {
+        let harness = Harness::new().await;
+        let (stale, _plan) = stopped_in_plan(&harness).await;
+        let stranger = uuid::Uuid::now_v7();
+        assert!(
+            harness
+                .orch
+                .store
+                .resume_run(stale.id, ids::BOX, stranger, TimeDelta::days(1))
+                .await
+                .expect("MemStore resumes"),
+            "another process resumes the run"
+        );
+        let (before, steps) = (
+            harness.orch.run(stale.id).await,
+            harness.orch.steps(stale.id).await,
+        );
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine.cancel_stopped(&stale).await;
+
+        assert!(
+            matches!(refused, Err(EngineError::LeaseHeld { run }) if run == stale.id),
+            "{refused:?}"
+        );
+        assert_eq!(
+            harness.orch.run(stale.id).await,
+            before,
+            "the run is untouched"
+        );
+        assert_eq!(harness.orch.steps(stale.id).await, steps, "and its steps");
+        assert_eq!(harness.orch.isolator.cleanups(), 0, "no cleanup");
+    }
+
+    /// MOD-125 M3 F1 (review L5): a run stopped on another box is that box's to cancel (its
+    /// trees and sessions are its own): `RunStatus { Stopped }`, nothing written.
+    #[tokio::test]
+    async fn a_cancel_of_a_run_stopped_on_another_box_is_refused_and_writes_nothing() {
+        let harness = Harness::new().await;
+        let (stopped, _plan) = stopped_in_plan(&harness).await;
+        let steps = harness.orch.steps(stopped.id).await;
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
+        let mut parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        parts.box_id = htui_core::model::BoxId::new();
+        let elsewhere = super::Engine::new(parts);
+
+        let refused = elsewhere.cancel_run(stopped.id).await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::RunStatus {
+                    run,
+                    status: RunStatus::Stopped,
+                    ..
+                }) if run == stopped.id
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            harness.orch.run(stopped.id).await,
+            stopped,
+            "the run is untouched"
+        );
+        assert_eq!(harness.orch.steps(stopped.id).await, steps, "and its steps");
+        assert_eq!(harness.orch.isolator.cleanups(), 0, "no cleanup");
     }
 
     /// How long a case waits on a walk or a `prepare` that must not queue behind a stale
@@ -23770,8 +24848,36 @@ mod tests {
                     hostname,
                     command_queue: false,
                     cwd: spec.cwd.clone(),
+                    extra_dirs: Vec::new(),
                     transport: Transport::Acp,
                 }]
+            );
+        }
+
+        /// MOD-152 D11: the scope carries the isolator's `extra_dirs`, the same list the session
+        /// itself is started with, so `command_run`'s `repo` argument names what the agent can read.
+        #[tokio::test(start_paused = true)]
+        async fn a_phase_session_s_scope_carries_the_isolator_s_extra_dirs() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .isolator
+                .script_extra_dirs(vec![std::path::PathBuf::from("/fake/elsewhere/docs")]);
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let elsewhere = std::path::PathBuf::from("/fake/elsewhere/docs");
+            assert_eq!(spec.extra_dirs, vec![elsewhere.clone()]);
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.extra_dirs.clone())
+                    .collect::<Vec<_>>(),
+                [vec![elsewhere]],
             );
         }
 

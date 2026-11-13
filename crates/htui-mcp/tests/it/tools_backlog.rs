@@ -63,6 +63,7 @@ fn snapshot() -> GraphSnapshot {
         scope: None,
         personas: Vec::new(),
         memory: None,
+        capture: None,
         source: None,
         edges: Vec::new(),
     }
@@ -158,6 +159,7 @@ impl Leased {
             hostname: HostnameLine::Omitted,
             command_queue: false,
             cwd: std::env::temp_dir(),
+            extra_dirs: Vec::new(),
             transport: Transport::Acp,
         }
     }

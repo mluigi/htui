@@ -349,8 +349,8 @@ pub const fn exhausted(part: &RunStep, retry_limit: i32) -> bool {
 
 /// D4: the parts a round may run at once: 1 under `shared_serialized` or `local`, else
 /// `min(live, max_parallel_sessions.max(1)).max(1)`, `live` = the latest-attempt parts under the
-/// node's latest planner row that are `pending`, or `failed | cancelled | superseded` with an
-/// attempt left.
+/// node's latest planner row that are `pending`, `stopped` (resumed in the round, MOD-125 M3 F1),
+/// or `failed | cancelled | superseded` with an attempt left.
 #[must_use]
 pub fn parts_width(snapshot: &GraphSnapshot, steps: &[RunStep], node: &SnapshotPhase) -> u32 {
     if matches!(
@@ -365,7 +365,7 @@ pub fn parts_width(snapshot: &GraphSnapshot, steps: &[RunStep], node: &SnapshotP
             latest_parts(steps, planner.id)
                 .into_iter()
                 .filter(|part| {
-                    part.status == StepStatus::Pending
+                    matches!(part.status, StepStatus::Pending | StepStatus::Stopped)
                         || (failed_part(part.status) && !exhausted(part, node.retry_limit))
                 })
                 .count()
@@ -376,14 +376,19 @@ pub fn parts_width(snapshot: &GraphSnapshot, steps: &[RunStep], node: &SnapshotP
 }
 
 /// D13: another row of the run than `step`, not a stage row (`role == Stage`) and not a judge
-/// (`fanout_index == -1`), at `pending` or `running`.
+/// (`fanout_index == -1`), at `pending`, `running` or `stopped` (a stopped row of a running run
+/// resumes beside this one, so two stopped siblings resumed in one pass read alike, MOD-125 M3
+/// F1).
 #[must_use]
 pub fn live_siblings(steps: &[RunStep], step: StepId) -> bool {
     steps.iter().any(|row| {
         row.id != step
             && row.role != StepRole::Stage
             && row.fanout_index != -1
-            && matches!(row.status, StepStatus::Pending | StepStatus::Running)
+            && matches!(
+                row.status,
+                StepStatus::Pending | StepStatus::Running | StepStatus::Stopped
+            )
     })
 }
 
@@ -803,6 +808,24 @@ mod tests {
         one[1].status = StepStatus::Running;
         assert_eq!(parts_width(&wide, &one, &node), 1, "one part pending");
         assert_eq!(parts_width(&wide, &[planner], &node), 1, "never zero");
+        // MOD-125 M3 F1 (review L1): a stopped part resumes in the round, so it is live too.
+        let mut stopped = steps.clone();
+        stopped[0].status = StepStatus::Stopped;
+        stopped[1].status = StepStatus::Stopped;
+        stopped[2].status = StepStatus::Done;
+        assert_eq!(
+            parts_width(&wide, &stopped, &node),
+            2,
+            "two stopped parts run at once"
+        );
+    }
+
+    /// MOD-125 M3 F1 (review L2): a `stopped` sibling resumes beside this row, so it is live.
+    #[test]
+    fn live_siblings_count_a_stopped_sibling() {
+        let this = step_at(5, StepRole::Part, None, StepStatus::Running);
+        let stopped = step_at(6, StepRole::Part, None, StepStatus::Stopped);
+        assert!(live_siblings(&[this.clone(), stopped], this.id));
     }
 
     /// The latest attempt per position, in position order; `exhausted` reads the budget.

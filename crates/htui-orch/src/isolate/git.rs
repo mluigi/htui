@@ -20,7 +20,7 @@
 //! refuses locked entries, so the verb's only reachable effect is on worktrees this orchestrator
 //! did not create. A stale entry is reported instead.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1894,6 +1894,110 @@ pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateE
     Ok(Some(id.detach().to_hex().to_string()))
 }
 
+/// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on the first-parent line of
+/// `base..head` — followed from `head` while not reachable from `base` — in name order (MOD-125
+/// M3 D5a).
+///
+/// `reacquire`'s second check: a `shared_serialized` checkout carrying another step's label above
+/// the stopped step's base was walked by that step while this one was stopped. A label at `base`
+/// itself is not on the range, so the previous step's own label never counts. A label on a
+/// merge's second parent does not count either: integrate's pre-merge takes each part tip in
+/// that way, labelled by its part, and a walk's capture labels its first-parent line. Nor does a
+/// `worktree` step's branch point that nothing moved ([`unmoved_branch_point`], MOD-125 M3 F1):
+/// `worktree add -b` makes `htui/<W>` at the checkout's `HEAD` whoever's work that is. A `gix`
+/// read: the walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
+///
+/// # Errors
+/// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, the walk
+/// cannot read a commit, or a label cannot be read or peeled.
+pub fn labels_between(path: &Path, base: &str, head: &str) -> Result<Vec<String>, IsolateError> {
+    let (hidden, tip) = (parse_oid(base)?, parse_oid(head)?);
+    if hidden == tip {
+        return Ok(Vec::new());
+    }
+    let repo = open(path)?;
+    let fail =
+        |err: &dyn std::fmt::Display| IsolateError::Git(format!("cannot walk from {head}: {err}"));
+    let mut walk = repo.rev_walk([tip]);
+    // A base this repository does not hold is not hidden (`ancestor_walk`'s own check first);
+    // `reacquire` refuses such a row on its first check anyway.
+    if has_commit_in(&repo, base)? {
+        walk = walk.with_hidden([hidden]);
+    }
+    let mut reachable = BTreeSet::new();
+    for info in walk.all().map_err(|err| fail(&err))? {
+        reachable.insert(info.map_err(|err| fail(&err))?.id);
+    }
+    // Only the first-parent line of the range counts: a merge's second parent (a part tip
+    // integrate's pre-merge took in, labelled by that part) is merged-in work, not a walk.
+    let mut range = BTreeSet::new();
+    let mut at = Some(tip);
+    while let Some(id) = at.filter(|id| reachable.contains(id)) {
+        range.insert(id);
+        at = repo
+            .find_commit(id)
+            .map_err(|err| IsolateError::Git(format!("cannot find commit {id}: {err}")))?
+            .parent_ids()
+            .next()
+            .map(gix::Id::detach);
+    }
+
+    let refs = repo.references().map_err(|err| {
+        IsolateError::Git(format!("cannot read the refs of {}: {err}", path.display()))
+    })?;
+    let branches = refs.local_branches().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot list the branches of {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut labels = Vec::new();
+    for branch in branches {
+        let mut branch = branch.map_err(|err| {
+            IsolateError::Git(format!("cannot read a branch of {}: {err}", path.display()))
+        })?;
+        let name = branch.name().as_bstr().to_string();
+        let Some(step) = name.strip_prefix("refs/heads/htui/") else {
+            continue;
+        };
+        let step = step.to_owned();
+        let target = branch
+            .peel_to_id()
+            .map_err(|err| IsolateError::Git(format!("cannot peel {name}: {err}")))?
+            .detach();
+        if range.contains(&target) && !unmoved_branch_point(&branch, target)? {
+            labels.push(step);
+        }
+    }
+    labels.sort();
+    Ok(labels)
+}
+
+/// Whether `branch`, pointing at `target`, is a `worktree` step's branch point nothing moved
+/// (MOD-125 M3 F1): its newest reflog line is the `branch: Created from` one `worktree add -b`
+/// wrote, and it still points where that line put it. Such a branch is made at the checkout's
+/// `HEAD` and kept after a tree that committed nothing is removed, so it marks where that step
+/// started, not a walk of the checkout. A branch with no reflog, or one `htui`'s own label writer
+/// made ([`create_branch`], `htui: label`), is not one.
+fn unmoved_branch_point(
+    branch: &gix::Reference<'_>,
+    target: gix::ObjectId,
+) -> Result<bool, IsolateError> {
+    let name = branch.name().as_bstr().to_string();
+    let fail = |err: &dyn std::fmt::Display| {
+        IsolateError::Git(format!("cannot read the reflog of {name}: {err}"))
+    };
+    let mut log = branch.log_iter();
+    let Some(mut newest_first) = log.rev().map_err(|err| fail(&err))? else {
+        return Ok(false);
+    };
+    let Some(newest) = newest_first.next() else {
+        return Ok(false);
+    };
+    let newest = newest.map_err(|err| fail(&err))?;
+    Ok(newest.new_oid == target && newest.message.starts_with(b"branch: Created from"))
+}
+
 /// One entry of `worktrees()`, flattened so it can outlive the `Repository` that read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
@@ -2873,6 +2977,116 @@ mod tests {
             super::branch_target(dir.path(), "htui/step").expect("the read succeeds"),
             Some(base),
             "and the label did not move"
+        );
+    }
+
+    /// MOD-125 M3 D5a: the `htui/<s>` labels on `base..head` — reachable from `head`, not from
+    /// `base` — by `s`, in name order; a label at `base` itself, one off the line, and a branch
+    /// outside `htui/` are not on it.
+    #[test]
+    fn labels_between_reads_the_htui_labels_on_the_range() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        let middle = commit_file(dir.path(), "g", "second\n", "two");
+        let tip = commit_file(dir.path(), "h", "third\n", "three");
+        for (name, target) in [
+            ("htui/at-base", &base),
+            ("htui/middle", &middle),
+            ("htui/tip", &tip),
+            ("other", &middle),
+            ("htuix", &tip),
+        ] {
+            super::create_branch(dir.path(), name, target).expect("the branch is written");
+        }
+
+        assert_eq!(
+            super::labels_between(dir.path(), &base, &tip).expect("the labels read"),
+            vec!["middle".to_owned(), "tip".to_owned()]
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &middle, &tip).expect("the labels read"),
+            vec!["tip".to_owned()],
+            "a label at the base is not above it"
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &tip, &tip).expect("the labels read"),
+            Vec::<String>::new(),
+            "an empty range holds no label"
+        );
+        assert_eq!(
+            super::labels_between(dir.path(), &tip, &middle).expect("the labels read"),
+            Vec::<String>::new(),
+            "a head below the base has nothing above the base"
+        );
+    }
+
+    /// MOD-125 M3 D5a: a label on a merge's second parent — a part tip integrate's pre-merge took
+    /// in — is not on the first-parent line of the range, and does not count; a label on the
+    /// merge itself does.
+    #[test]
+    fn labels_between_skips_a_label_on_a_merged_in_second_parent() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        let part = commit_at(dir.path(), &[&base], 5);
+        let merge = commit_on_head(dir.path(), &[&base, &part], "htui: premerge part");
+        for (name, target) in [("htui/part", &part), ("htui/merge", &merge)] {
+            super::create_branch(dir.path(), name, target).expect("the branch is written");
+        }
+
+        assert_eq!(
+            super::labels_between(dir.path(), &base, &merge).expect("the labels read"),
+            vec!["merge".to_owned()]
+        );
+    }
+
+    /// MOD-125 M3 F1 (review M2): a worktree step's `htui/<W>` branch that `worktree add -b`
+    /// made at the checkout's `HEAD` and nothing moved since marks only where that tree branched
+    /// off, so it does not count. A label `htui` wrote ([`super::create_branch`]) does, and so
+    /// does a branch moved after it was made.
+    #[tokio::test]
+    async fn labels_between_skips_an_unmoved_worktree_branch_point() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let middle = commit_file(&repo, "g", "second\n", "two");
+        let tip = commit_file(&repo, "h", "third\n", "three");
+        git.add_worktree(
+            &repo,
+            &dir.path().join("tree"),
+            htui_core::model::StepId::new(),
+            htui_core::model::RunId::new(),
+            &middle,
+        )
+        .await
+        .expect("the worktree step's tree is added");
+        super::create_branch(&repo, "htui/label", &middle).expect("the label is written");
+        git_in(
+            &git,
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("htui/moved"),
+                OsStr::new(&base),
+            ],
+        );
+        git_in(
+            &git,
+            &repo,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("-f"),
+                OsStr::new("htui/moved"),
+                OsStr::new(&tip),
+            ],
+        );
+
+        assert_eq!(
+            super::labels_between(&repo, &base, &tip).expect("the labels read"),
+            vec!["label".to_owned(), "moved".to_owned()]
         );
     }
 

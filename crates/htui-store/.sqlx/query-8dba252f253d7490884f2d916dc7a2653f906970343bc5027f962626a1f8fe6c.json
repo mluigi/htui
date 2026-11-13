@@ -1,0 +1,209 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT c.id          AS \"id: CommandRunId\",\n                   c.run_step_id AS \"run_step_id: StepId\",\n                   c.box_id      AS \"box_id: BoxId\",\n                   c.class,\n                   c.command,\n                   c.cwd,\n                   c.status      AS \"status: CommandRunStatus\",\n                   c.exit_code,\n                   c.output,\n                   c.queued_at,\n                   c.started_at,\n                   c.finished_at,\n                   l.text        AS \"log_text?\",\n                   l.truncated   AS \"log_truncated?\",\n                   l.total_bytes AS \"log_total_bytes?\",\n                   l.written_at  AS \"log_written_at?\"\n              FROM command_run c\n              JOIN run_step s ON s.id = c.run_step_id\n              LEFT JOIN command_log l ON l.command_run_id = c.id\n             WHERE s.run_id = $1 AND ($2::uuid IS NULL OR c.id = $2)\n             ORDER BY c.queued_at DESC, c.id DESC\n             LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CommandRunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "command",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "command"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "cwd",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "cwd"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "status: CommandRunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "exit_code",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "exit_code"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "output",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "output"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "queued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "queued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "log_text?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "command_log",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "log_truncated?",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "command_log",
+            "name": "truncated"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "log_total_bytes?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "command_log",
+            "name": "total_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "log_written_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "command_log",
+            "name": "written_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8dba252f253d7490884f2d916dc7a2653f906970343bc5027f962626a1f8fe6c"
+}

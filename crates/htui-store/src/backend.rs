@@ -586,6 +586,30 @@ impl Backend {
         }
     }
 
+    /// This user's `worker_log` rows (MOD-122 M2 plan D1, blueprint F5): `id > after`, oldest
+    /// first, at most `limit`; `after: None` is the newest `limit`, still oldest first. Offline
+    /// there is no worker log to read, so the answer is empty, never an error: a caller merges
+    /// it (adds nothing) rather than replacing what it holds.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports.
+    pub async fn worker_logs(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<htui_core::model::WorkerLogLine>> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::WorkerLogStore::worker_logs(store, after, limit).await
+            }
+            Self::Online { pg, .. } => {
+                htui_core::store::WorkerLogStore::worker_logs(pg, after, limit).await
+            }
+            Self::Offline { .. } => Ok(Vec::new()),
+        }
+    }
+
     /// One whole `box` row, unlike [`Backend::box_info`]'s top-bar projection.
     ///
     /// # Errors

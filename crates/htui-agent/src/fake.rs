@@ -10,7 +10,9 @@
 //!
 //! 1. **A session banner.** The first event of every session is
 //!    `other { update: "session_started" }` carrying the agent-side session id (`docs/ANA-4.md`
-//!    §4.4, `docs/ANA-2.md` §4.8: resuming a promoted step is a query for that row).
+//!    §4.4, `docs/ANA-2.md` §4.8: resuming a promoted step is a query for that row). A resumed
+//!    session (`SessionSpec.resume`) reports the id it was resumed from, as a real agent's
+//!    restored session does (MOD-125 M3).
 //! 2. **Permission requests park.** After a [`ScriptEvent::ParkPermission`] the session emits
 //!    nothing further until [`AgentSession::answer_permission`] or [`AgentSession::cancel`]. A
 //!    real transport *awaits* at that point; the fake returns [`DriverError::Transport`] instead,
@@ -48,10 +50,16 @@
 //!    would write a row claiming a policy settled something nobody ever asked.
 //!
 //! **Deterministic by construction.** The capture time of the *n*-th envelope is
-//! [`crate::conformance::epoch`] plus *n* milliseconds and the agent-side session id is derived
-//! from `SessionSpec.step_id`, so replaying one script twice produces one byte-identical row set -
-//! the property `docs/ANA-4.md` §11 criterion 2 asks for. A wall-clock reading anywhere in here
-//! would silently cost that criterion.
+//! [`crate::conformance::epoch`] plus *n* milliseconds and the agent-side session id is
+//! `SessionSpec.resume` when the spec resumes, else derived from `SessionSpec.step_id`, so
+//! replaying one script twice produces one byte-identical row set - the property
+//! `docs/ANA-4.md` §11 criterion 2 asks for. A wall-clock reading anywhere in here would silently
+//! cost that criterion.
+//!
+//! **Scripted start failures.** [`FakeDriver::failing_starts`] (and
+//! [`FakeAdapter::fail_next_starts`] for a driver the registry builds) answers the next `start`s
+//! with queued errors, without consuming the script, so a test can drive a resume that fails on
+//! the wire and the fresh start that follows on the same driver (MOD-125 M3).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -130,6 +138,8 @@ pub struct FakeDriver {
     script: Mutex<Option<Script>>,
     /// What [`AgentDriver::start`] was handed (MOD-11 D9).
     spec: SpecSlot,
+    /// Start failures still to answer, one per [`AgentDriver::start`], in order (MOD-125 M3 D9).
+    start_failures: Mutex<VecDeque<DriverError>>,
 }
 
 impl FakeDriver {
@@ -150,7 +160,21 @@ impl FakeDriver {
             caps,
             script: Mutex::new(Some(script)),
             spec: SpecSlot::default(),
+            start_failures: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// This driver, answering its next `start`s with `errors`, one each and in order, before it
+    /// plays its script (MOD-125 M3 D9). A refused `start` still records its spec and leaves the
+    /// script in place, so the next `start` on the same driver plays it: the shape of a resume
+    /// that fails on the wire and falls back to a fresh session.
+    #[must_use]
+    pub fn failing_starts(self, errors: impl IntoIterator<Item = DriverError>) -> Self {
+        self.start_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(errors);
+        self
     }
 
     /// The handle on the spec this driver's [`AgentDriver::start`] records. Take it before the
@@ -210,6 +234,15 @@ impl AgentDriver for FakeDriver {
         // "never hold a lock across an await" rule is enforced here by the type system. The spec
         // slot follows the same rule: recorded, and its guard dropped, before the future.
         self.spec.set(spec.clone());
+        // A queued failure answers before the script is touched, so it stays for the next start.
+        let failure = self
+            .start_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        if let Some(err) = failure {
+            return Box::pin(async move { Err(err) });
+        }
         let taken =
             self.script.lock().map(|mut slot| slot.take()).map_err(|_| {
                 DriverError::Transport("the fake's script slot is poisoned".to_owned())
@@ -277,9 +310,13 @@ pub struct FakeSession {
 impl FakeSession {
     /// Opens a session on turn 0 of the script, with the banner already queued.
     fn open(name: &str, caps: DriverCaps, spec: &SessionSpec, script: Script) -> Self {
-        // Derived from the step, never minted: two replays of one script must agree on every
+        // The resumed session's own id, as a real agent reports it (MOD-125 M3 D9); otherwise
+        // derived from the step, never minted: two replays of one script must agree on every
         // persisted byte, and the banner carries this id into a row (§11 criterion 2).
-        let session_ref = AgentSessionRef::new(format!("fake-{}", spec.step_id));
+        let session_ref = spec
+            .resume
+            .clone()
+            .unwrap_or_else(|| AgentSessionRef::new(format!("fake-{}", spec.step_id)));
         let mut turns: VecDeque<Turn> = script.turns.into();
         let queue: VecDeque<ScriptEvent> = turns
             .pop_front()
@@ -691,6 +728,9 @@ pub struct FakeAdapter {
     script: Arc<Mutex<Option<Script>>>,
     /// Handed to every driver [`TransportBuilder::build`] produces (MOD-11 D9).
     spec: SpecSlot,
+    /// Start failures the next driver [`TransportBuilder::build`] produces answers first
+    /// ([`FakeDriver::failing_starts`]); the build drains them (MOD-125 M3 D9).
+    start_failures: Arc<Mutex<VecDeque<DriverError>>>,
 }
 
 impl FakeAdapter {
@@ -707,6 +747,16 @@ impl FakeAdapter {
     /// holding it — reporting that here beats reporting an empty script three assertions later.
     pub fn load(&self, script: Script) {
         *self.script.lock().expect("the script slot is not poisoned") = Some(script);
+    }
+
+    /// Queues `errors` for the next driver [`TransportBuilder::build`] produces: its `start`s
+    /// answer them one each, in order, before it plays its script ([`FakeDriver::failing_starts`],
+    /// MOD-125 M3 D9). The build drains the queue, so a later driver starts clean.
+    pub fn fail_next_starts(&self, errors: impl IntoIterator<Item = DriverError>) {
+        self.start_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(errors);
     }
 
     /// The handle on the spec the latest driver this adapter built was started with.
@@ -736,8 +786,16 @@ impl TransportBuilder for FakeAdapter {
         // constant in this file. (This comment deliberately does not name the agent that test
         // uses: `tests/extensibility.rs` sweeps the tree for it, and a mention here would make the
         // proof circular.)
+        let failures = std::mem::take(
+            &mut *self
+                .start_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         Ok(Box::new(
-            FakeDriver::new(agent.name.clone(), caps, script).with_spec_slot(self.spec.clone()),
+            FakeDriver::new(agent.name.clone(), caps, script)
+                .with_spec_slot(self.spec.clone())
+                .failing_starts(failures),
         ))
     }
 }
@@ -768,9 +826,13 @@ mod tests {
     use htui_core::model::{Agent, AgentId, Billing, StepId, Transport};
     use serde_json::json;
 
-    use super::{FakeAdapter, FakeDriver};
+    use super::{FakeAdapter, FakeDriver, SESSION_STARTED};
     use crate::conformance::Script;
-    use crate::driver::{AgentDriver, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure};
+    use crate::driver::{
+        AgentDriver, AgentSessionRef, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
+    };
+    use crate::error::DriverError;
+    use crate::event::DriverEvent;
     use crate::registry::TransportBuilder;
 
     /// A spec carrying one MCP server, so "the recorded spec" is visibly the one that was started.
@@ -859,5 +921,112 @@ mod tests {
             .await
             .expect("the fake starts");
         assert_eq!(handle.get(), Some(spec));
+    }
+
+    /// The banner's `session_id` of a started session, and the session's own ref.
+    async fn banner_id(driver: &FakeDriver, spec: SessionSpec) -> (String, String) {
+        let mut session = driver
+            .start(spec, "hi".to_owned())
+            .await
+            .expect("the fake starts");
+        let session_ref = session
+            .session_ref()
+            .expect("the fake names its session")
+            .as_str()
+            .to_owned();
+        let banner = session
+            .next_event()
+            .await
+            .expect("the banner is a well-formed event")
+            .expect("the banner comes first");
+        let DriverEvent::Other(other) = banner.event else {
+            panic!("the first event is the banner: {:?}", banner.event);
+        };
+        assert_eq!(other.update, SESSION_STARTED);
+        let id = other.body["session_id"]
+            .as_str()
+            .expect("the banner carries a string session id")
+            .to_owned();
+        (id, session_ref)
+    }
+
+    /// MOD-125 M3 (D9): a resumed session keeps the id it was resumed from, as a real agent does;
+    /// a fresh one derives its id from the step.
+    #[tokio::test]
+    async fn the_banner_carries_the_resumed_session_id() {
+        let fresh = spec();
+        let derived = format!("fake-{}", fresh.step_id);
+        let driver = FakeDriver::scripted(Script::one_turn(Vec::new()));
+        assert_eq!(
+            banner_id(&driver, fresh.clone()).await,
+            (derived.clone(), derived)
+        );
+
+        let resumed = SessionSpec {
+            resume: Some(AgentSessionRef::new("sess_7")),
+            ..fresh
+        };
+        let driver = FakeDriver::scripted(Script::one_turn(Vec::new()));
+        assert_eq!(
+            banner_id(&driver, resumed).await,
+            ("sess_7".to_owned(), "sess_7".to_owned())
+        );
+    }
+
+    /// MOD-125 M3 (D9): a queued start failure is answered after the spec is recorded and without
+    /// taking the script, so the next `start` on the same driver plays it. Failures answer in
+    /// order, one per `start`.
+    #[tokio::test]
+    async fn a_queued_start_failure_answers_once_and_keeps_the_script() {
+        let driver = FakeDriver::scripted(Script::one_turn(Vec::new())).failing_starts([
+            DriverError::Closed,
+            DriverError::Transport("refused".to_owned()),
+        ]);
+        let handle = driver.spec_handle();
+
+        let first = spec();
+        let refused = driver.start(first.clone(), "hi".to_owned()).await;
+        assert_eq!(refused.err(), Some(DriverError::Closed));
+        assert_eq!(handle.get(), Some(first), "the spec is recorded first");
+
+        let refused = driver.start(spec(), "hi".to_owned()).await;
+        assert_eq!(
+            refused.err(),
+            Some(DriverError::Transport("refused".to_owned()))
+        );
+
+        let second = spec();
+        let _session = driver
+            .start(second.clone(), "hi".to_owned())
+            .await
+            .expect("the script survives the refused starts");
+        assert_eq!(handle.get(), Some(second));
+    }
+
+    /// MOD-125 M3 (D9): the adapter queues start failures for the next driver it builds, which
+    /// drains them; a later build starts clean.
+    #[tokio::test]
+    async fn the_adapter_hands_its_queued_failures_to_the_next_driver() {
+        let adapter = FakeAdapter::new();
+        adapter.fail_next_starts([DriverError::Closed]);
+        adapter.load(Script::one_turn(Vec::new()));
+        let driver = adapter
+            .build(&row(), None, FakeDriver::full_caps())
+            .expect("a loaded script builds");
+        let refused = driver.start(spec(), "hi".to_owned()).await;
+        assert_eq!(refused.err(), Some(DriverError::Closed));
+        let _session = driver
+            .start(spec(), "hi".to_owned())
+            .await
+            .expect("the same driver plays its script on the next start");
+
+        adapter.load(Script::one_turn(Vec::new()));
+        let driver = adapter
+            .build(&row(), None, FakeDriver::full_caps())
+            .expect("a loaded script builds");
+        let _session = driver
+            .start(spec(), "hi".to_owned())
+            .await
+            .expect("the queue was drained into the first driver");
     }
 }
