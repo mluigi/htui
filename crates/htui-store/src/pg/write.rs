@@ -7238,8 +7238,7 @@ impl WriteStore for PgStore {
         }
         // MOD-125 M2 R1 (review M-1): a pending cancel wins (D4). `request_cancel` share-locks
         // the run, so its row is either committed before the lock above was granted (and read
-        // here) or refused once this commits; a stopped run would strand it, since no
-        // executor's poll lists a stopped run's cancel.
+        // here) or written once this commits, on the stopped run (MOD-125 M3 D6).
         let cancel_pending = sqlx::query_scalar!(
             r#"SELECT EXISTS (SELECT 1 FROM run_command
                                WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending')
@@ -7268,6 +7267,192 @@ impl WriteStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
+    }
+
+    /// MOD-125 M3 D1: the box's stopped runs with no `workspace_stop` row for their workspace;
+    /// `NOT EXISTS` over a `NULL` workspace matches nothing, so a run without one is listed. No
+    /// index serves it (`idx_run_lease` is partial on `queued|running`): a scan of the box's runs
+    /// is accepted, as `claim_run`'s stopped count already scans. Read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT r.id AS "id: RunId"
+              FROM run r
+             WHERE r.status = 'stopped' AND r.executing_box_id = $1
+               AND NOT EXISTS (SELECT 1 FROM workspace_stop ws
+                                WHERE ws.workspace_id = r.workspace_id)
+             ORDER BY r.queued_at, r.id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-125 M3 D2: the compare-and-set `stopped -> running` that takes the lease, in one
+    /// `READ COMMITTED` transaction in `claim_run`'s order: the run `FOR NO KEY UPDATE` (status and
+    /// box), then the stop row `FOR SHARE`, so a racing `resume_workspace` (`DELETE`) or
+    /// escalation waits for this decision and a stop inserted after the read is ordered after the
+    /// resume (the run is then `running` under `owner`'s lease, and `pending_stops` lists it);
+    /// then the pending-cancel read, which sees a `request_cancel` that committed while this
+    /// waited on the run (its `FOR SHARE` of the run conflicts with this lock). No step moves.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read;
+    /// [`StoreError::NotFound`] `{ entity: "run" }`, the first read.
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        let ttl = lease_ttl_micros(ttl)?;
+        let mut tx = super::relay::begin_read_committed(&self.pool).await?;
+        let locked = sqlx::query!(
+            r#"SELECT status           AS "status: RunStatus",
+                      executing_box_id AS "executing_box_id: BoxId",
+                      workspace_id     AS "workspace_id: WorkspaceId"
+                 FROM run WHERE id = $1 FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+        // An early return drops `tx`, which rolls back: nothing was written.
+        if locked.status != RunStatus::Stopped || locked.executing_box_id != Some(box_id) {
+            return Ok(false);
+        }
+        if let Some(workspace) = locked.workspace_id {
+            let stopped = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM workspace_stop WHERE workspace_id = $1 FOR SHARE"#,
+                workspace.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+            if stopped {
+                return Ok(false);
+            }
+        }
+        let cancel_pending = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM run_command
+                               WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending')
+                      AS "pending!""#,
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if cancel_pending {
+            return Ok(false);
+        }
+        sqlx::query!(
+            "UPDATE run \
+                SET status           = 'running', \
+                    lease_owner      = $2, \
+                    lease_box_id     = $3, \
+                    lease_expires_at = clock_timestamp() + $4::bigint * interval '1 microsecond' \
+              WHERE id = $1",
+            run.as_uuid(),
+            owner,
+            box_id.as_uuid(),
+            ttl,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
+    }
+
+    /// MOD-125 M3 D2, D6: the compare-and-set `stopped -> cancelled` in one `READ COMMITTED`
+    /// transaction, in `stop_run`'s order: an unlocked read decides `NotFound` and the early exit;
+    /// the run's unsettled steps are locked `FOR NO KEY UPDATE` before the run; the run is
+    /// re-checked under its own lock (a racing `resume_run` that committed first is seen as
+    /// `running`, and answers `false`); then the steps and the run move, the run's pending cancel
+    /// is applied, its open windows close and its pending follow-ups are refused with
+    /// [`FOLLOW_UP_RUN_CANCELLED`](htui_core::model::FOLLOW_UP_RUN_CANCELLED).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`, read first.
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut tx = super::relay::begin_read_committed(&self.pool).await?;
+        let seen = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", executing_box_id AS "executing_box_id: BoxId" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+        if seen.status != RunStatus::Stopped || seen.executing_box_id != box_id {
+            return Ok(false);
+        }
+
+        let steps = sqlx::query_scalar!(
+            r#"SELECT id AS "id: StepId" FROM run_step
+                WHERE run_id = $1 AND status NOT IN ('done', 'cancelled', 'superseded')
+                ORDER BY id FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let locked = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", executing_box_id AS "executing_box_id: BoxId" FROM run WHERE id = $1 FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if locked.status != RunStatus::Stopped || locked.executing_box_id != box_id {
+            return Ok(false);
+        }
+
+        let steps: Vec<Uuid> = steps.into_iter().map(|id| id.as_uuid()).collect();
+        sqlx::query!(
+            "UPDATE run_step SET status = 'cancelled', finished_at = COALESCE(finished_at, $2) \
+              WHERE id = ANY($1::uuid[]) AND status NOT IN ('done', 'cancelled', 'superseded')",
+            &steps,
+            at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query!(
+            "UPDATE run SET status = 'cancelled', finished_at = COALESCE(finished_at, $2) \
+              WHERE id = $1",
+            run.as_uuid(),
+            at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        super::relay::close_cancelled_run_relay(&mut tx, run).await?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(true)
     }
@@ -7746,7 +7931,7 @@ impl WriteStore for PgStore {
         sqlx::query!(
             "UPDATE run_step \
                 SET selected = false, \
-                    status   = CASE WHEN status IN ('pending','awaiting_approval','done') \
+                    status   = CASE WHEN status IN ('pending','awaiting_approval','done','stopped') \
                                     THEN 'superseded' ELSE status END \
               WHERE run_id = $1 AND position = $2 AND attempt = $3 \
                 AND fanout_index >= 0 AND id <> $4",
@@ -7760,9 +7945,11 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
 
         sqlx::query!(
-            "UPDATE run_step SET status = 'done', gate_note = $4 \
+            "UPDATE run_step \
+                SET status    = CASE WHEN status = 'stopped' THEN 'superseded' ELSE 'done' END, \
+                    gate_note = $4 \
               WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index < 0 \
-                AND status IN ('pending','running','awaiting_approval')",
+                AND status IN ('pending','running','awaiting_approval','stopped')",
             run.as_uuid(),
             position,
             attempt,

@@ -20,8 +20,8 @@ use htui_core::model::{
     PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath,
     RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome,
-    StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
+    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOpening,
+    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
     WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
@@ -246,6 +246,29 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::stop_run(self, run, owner).await
+    }
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        WriteStore::pending_resumes(self, box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        WriteStore::resume_run(self, run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::cancel_stopped_run(self, run, box_id, at).await
+    }
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        WriteStore::record_opening(self, step, opening).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await
@@ -669,6 +692,29 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::stop_run(self, run, owner).await
+    }
+    async fn pending_resumes(&self, box_id: BoxId) -> Result<Vec<RunId>> {
+        WriteStore::pending_resumes(self, box_id).await
+    }
+    async fn resume_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        WriteStore::resume_run(self, run, box_id, owner, ttl).await
+    }
+    async fn cancel_stopped_run(
+        &self,
+        run: RunId,
+        box_id: Option<BoxId>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::cancel_stopped_run(self, run, box_id, at).await
+    }
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        WriteStore::record_opening(self, step, opening).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await

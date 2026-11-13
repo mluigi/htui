@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_command SET status = 'applied', resolution = NULL, text = NULL, resolved_at = clock_timestamp() WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8fc88b839f5f73280ffb978d6500001230ad3b4d0da3ac2733e9fc11249adb37"
+}
