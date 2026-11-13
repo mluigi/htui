@@ -16,7 +16,9 @@ use htui::ui::tabs::settings::memory::{
 };
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
-use htui_core::model::{MemoryEntry, MemoryEntryId, MemoryKind, MemoryState, ProjectId};
+use htui_core::model::{
+    MemoryEntry, MemoryEntryId, MemoryKind, MemorySource, MemoryState, ProjectId, RunProvenance,
+};
 use htui_core::store::{MemStore, ReadStore as _};
 use htui_store::Backend;
 use uuid::Uuid;
@@ -51,7 +53,7 @@ fn entry(
         created_by: ids::USER,
         created_at: at(1),
         updated_at: at(day),
-        source: htui_core::model::MemorySource::Person,
+        source: MemorySource::Person,
         provenance: None,
         evidence: None,
         usage: htui_core::model::MemoryUsage::default(),
@@ -294,9 +296,34 @@ async fn m_on_the_workspace_or_a_repo_row_says_pick_a_project() {
 }
 
 #[tokio::test]
-async fn the_list_shows_kind_subject_state_and_date() {
+async fn the_list_shows_kind_subject_state_source_and_date() {
     let (bench, section) = opened(Some(live())).await;
     insta::assert_snapshot!("list", frame(&bench, &section));
+}
+
+/// `e` as a run's capture step wrote it (MOD-164): `source` run, provenance present.
+fn by_run(mut e: MemoryEntry) -> MemoryEntry {
+    e.source = MemorySource::Run;
+    e.provenance = Some(RunProvenance::default());
+    e
+}
+
+#[tokio::test]
+async fn the_source_column_names_a_person_or_a_run() {
+    let mut entries = live();
+    entries[1] = by_run(entries[1].clone());
+    entries[2] = by_run(entries[2].clone());
+    let (bench, section) = opened(Some(entries)).await;
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("active      person  2026-11-07"),
+        "a person's entry says person after its state: {shown}"
+    );
+    assert!(
+        shown.contains("active      run     2026-11-05"),
+        "a run's entry says run after its state: {shown}"
+    );
+    insta::assert_snapshot!("source", shown);
 }
 
 #[tokio::test]
