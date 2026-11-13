@@ -1,0 +1,24 @@
+# TOOL-17: cargo-nextest configuration.
+#
+# Every case that reaches the test Qdrant shares one single-thread group, so
+# two such cases never overlap under nextest's process-per-test model. The
+# rule for a new live Qdrant test: it lives in `qdrant_live`/`qdrant_worker`,
+# or its name starts with `live_qdrant_`. `cargo nextest show-config
+# test-groups` lists what the group holds.
+
+[test-groups]
+live-qdrant = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^qdrant_live::|^qdrant_worker::|live_qdrant/)'
+test-group = 'live-qdrant'
+
+# The gate's profile: run everything, retry once (a pass on retry shows as
+# FLAKY in the summary), and write per-test times to
+# target/nextest/gate/junit.xml.
+[profile.gate]
+fail-fast = false
+retries = 1
+
+[profile.gate.junit]
+path = "junit.xml"

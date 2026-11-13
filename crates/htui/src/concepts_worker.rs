@@ -2463,7 +2463,8 @@ mod tests {
     /// MOD-160 D2 (live): a TUI search of a collection that does not exist answers no hits, creates
     /// nothing and loads no model.
     #[tokio::test]
-    async fn a_tui_search_against_an_empty_qdrant_creates_no_collection_and_loads_nothing() {
+    async fn live_qdrant_a_tui_search_against_an_empty_qdrant_creates_no_collection_and_loads_nothing()
+     {
         let Some((_turn, url)) = test_qdrant().await else {
             return;
         };
@@ -2488,7 +2489,8 @@ mod tests {
 
     /// MOD-160 D3 (live): a collection another embedder wrote is refused before the model loads.
     #[tokio::test]
-    async fn a_tui_search_of_another_embedders_collection_is_refused_before_the_model() {
+    async fn live_qdrant_a_tui_search_of_another_embedders_collection_is_refused_before_the_model()
+    {
         let Some((_turn, url)) = test_qdrant().await else {
             return;
         };
