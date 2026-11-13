@@ -20,7 +20,7 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
-    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
+    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
     GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemState,
     MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject,
     MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject,
@@ -8026,13 +8026,25 @@ async fn wait_blocked_on(db: &common::TestDb, holder_pid: i32, what: &str) {
 /// in flight waits on the stop's run lock (`request_cancel` reads the run `FOR SHARE`) and, once
 /// the stop commits, writes its row on the `stopped` run, which the box's poll lists (the run
 /// holds no lease) and `cancel_stopped_run` applies. A raw transaction holds the run as
-/// `stop_run` does (`FOR NO KEY UPDATE`, then the move), uncommitted.
+/// `stop_run` does (`FOR NO KEY UPDATE`, then the move), uncommitted. MOD-125 M3 F2: the step's
+/// open follow-up window closes and its pending follow-up is refused with
+/// [`FOLLOW_UP_RUN_CANCELLED`], in the cancel's transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_racing_a_stop_waits_for_it_and_lands_for_the_box() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    let (run, _step, _owner) = leased_running_step(&db).await;
+    let (run, step, _owner, _session) = follow_up_window(&db).await;
+    let follow_up = follow_up_from(&db.store, step, "use the smaller fixture");
+    let follow_up_id = follow_up.id;
+    assert_eq!(
+        db.store
+            .request_follow_up(follow_up)
+            .await
+            .expect("the enqueue is answered"),
+        FollowUpRequest::Queued(follow_up_id),
+        "a follow-up is pending on the running step"
+    );
     let mut holder = db.pool.begin().await.expect("begin holder");
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *holder)
@@ -8085,6 +8097,28 @@ async fn a_cancel_racing_a_stop_waits_for_it_and_lands_for_the_box() {
         .await
         .expect("read the cancel row");
     assert_eq!(status, "applied", "the cancel row is applied with the run");
+    let (windows, open): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL) \
+           FROM follow_up_window WHERE run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the run's follow-up windows");
+    assert_eq!(
+        (windows, open),
+        (1, 0),
+        "the cancel closes the run's follow-up window"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![(
+            "refused".to_owned(),
+            Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+            true
+        )],
+        "the pending follow-up is refused as the run was cancelled, and keeps no text"
+    );
     db.drop_db().await;
 }
 
