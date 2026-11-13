@@ -23,9 +23,10 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize as _, Serialize};
 use serde_json::Value;
 
+use crate::model::AgentId;
 use crate::prompt::excerpt::ExcerptCaps;
 
 /// ANA-5 §5.3's ten reserved `app_setting` keys, with the defaults migration `0002` seeds
@@ -58,6 +59,9 @@ pub const MEMORY_CAPTURE_DEFAULT: bool = true;
 /// MOD-141 M2 D5: `compete_fan_out`'s compiled default, off. An App key with no seeded row, like
 /// `memory_capture`; only the graph editor reads it (`R-LATER-13`).
 pub const COMPETE_FAN_OUT_DEFAULT: bool = false;
+
+/// MOD-164 D7: the longest model name a `light_model` value may carry, in characters.
+pub const LIGHT_MODEL_MAX_CHARS: usize = 200;
 
 /// `project.settings.allow_env_files`'s compiled default: a provider project whose session trees
 /// hold env files is refused (MOD-89 D3, D4). Not a field of [`Defaults`]: no App rung.
@@ -95,8 +99,9 @@ pub struct Defaults {
 }
 
 impl Defaults {
-    /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture` and MOD-141's unseeded
-    /// `compete_fan_out`, as `(key, value)` in **key byte order**, which is the order migration
+    /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded
+    /// `compete_fan_out` and MOD-164's unseeded `light_model` (`null`, not configured), as
+    /// `(key, value)` in **key byte order**, which is the order migration
     /// `0002`'s `INSERT` is compared against and the order a seeder must write them in.
     ///
     /// Iterated out of [`SettingKey::app_keys`] rather than spelled a second time (MOD-15 plan D7):
@@ -126,6 +131,8 @@ impl Defaults {
             SettingKey::ExcerptMaxFiles => Value::from(self.excerpt_max_files),
             SettingKey::ExcerptMaxScanFiles => Value::from(self.excerpt_max_scan_files),
             SettingKey::ExcerptProviderDeadlineMs => Value::from(self.excerpt_provider_deadline_ms),
+            // MOD-164 D7: not configured; capture is skipped until someone picks one.
+            SettingKey::LightModel => Value::Null,
             SettingKey::MaxSkillTokens => Value::from(self.max_skill_tokens),
             SettingKey::MemoryCapture => Value::Bool(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => {
@@ -157,6 +164,8 @@ impl Defaults {
             SettingKey::ExcerptProviderDeadlineMs => {
                 i64::try_from(self.excerpt_provider_deadline_ms).unwrap_or(i64::MAX)
             }
+            // No number at all; nothing is `not_above` it, so the zero is never compared.
+            SettingKey::LightModel => 0,
             SettingKey::MaxSkillTokens => self.max_skill_tokens,
             SettingKey::MemoryCapture => i64::from(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => i64::from(self.prompt_reserve_fraction_bp),
@@ -166,11 +175,12 @@ impl Defaults {
     }
 }
 
-/// The fourteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
+/// The fifteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
 /// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, MOD-163's
-/// `memory_capture`, a switch both the App and the Project rung hold, and MOD-141's
-/// `compete_fan_out`, a switch only the App rung holds — declared in **key byte order**: the
-/// discriminant indexes [`SPECS`].
+/// `memory_capture`, a switch both the App and the Project rung hold, MOD-141's
+/// `compete_fan_out`, a switch only the App rung holds, and MOD-164's `light_model`, an agent
+/// and model only the App rung holds — declared in **key byte order**: the discriminant indexes
+/// [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
 /// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
@@ -197,21 +207,24 @@ pub enum SettingKey {
     ExcerptMaxScanFiles = 7,
     /// `excerpt_provider_deadline_ms`.
     ExcerptProviderDeadlineMs = 8,
+    /// `light_model`, MOD-164 D7: the agent and model the run-end memory capture runs on; App
+    /// only, the one [`SettingKind::AgentModel`].
+    LightModel = 9,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 9,
+    MaxSkillTokens = 10,
     /// `memory_capture`, MOD-163 D19: automatic memory capture at run end; read by MOD-164.
-    MemoryCapture = 10,
+    MemoryCapture = 11,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 11,
+    PromptReserveFraction = 12,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 12,
+    UpstreamHops = 13,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 13,
+    TokenBudget = 14,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::AllowEnvFiles,
         Self::BoxHostname,
         Self::CompeteFanOut,
@@ -221,6 +234,7 @@ impl SettingKey {
         Self::ExcerptMaxFiles,
         Self::ExcerptMaxScanFiles,
         Self::ExcerptProviderDeadlineMs,
+        Self::LightModel,
         Self::MaxSkillTokens,
         Self::MemoryCapture,
         Self::PromptReserveFraction,
@@ -229,8 +243,8 @@ impl SettingKey {
     ];
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
-    /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture` and MOD-141's
-    /// unseeded `compete_fan_out`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
+    /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded
+    /// `compete_fan_out` and MOD-164's unseeded `light_model`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
     /// and the `app` group of `Settings > Prompt` iterate this, never `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
@@ -250,7 +264,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the fourteen.
+    /// The reverse of [`Self::key`], `None` for a string outside the fifteen.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -324,8 +338,9 @@ impl core::fmt::Display for Rungs {
 }
 
 /// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
-/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the four switches,
-/// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans.
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points, the four switches,
+/// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans, and
+/// `light_model` is an agent and one of its models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
@@ -335,6 +350,10 @@ pub enum SettingKind {
     /// A JSON `true`/`false` (MOD-33 D267, MOD-89 D4). `min` 0 and `max` 1 are nominal: the reader takes the
     /// boolean and nothing else, so a number, a string or `null` is refused rather than coerced.
     Boolean,
+    /// `null` or `{"agent_id": <uuid>, "model": <1..=200 chars>}` and no other field (MOD-164
+    /// D7). `min` and `max` bound the model's length in characters; the agent is not checked
+    /// against the registry, because ACP agents list no models until their first handshake.
+    AgentModel,
 }
 
 /// One row of the registry (plan D7): the single source `DEFAULTS`, the migration pin, the
@@ -374,7 +393,7 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 14] = [
+pub const SPECS: [SettingSpec; 15] = [
     SettingSpec {
         key: "allow_env_files",
         project_key: Some("allow_env_files"),
@@ -473,6 +492,17 @@ pub const SPECS: [SettingSpec; 14] = [
         not_above: None,
         unit: "ms",
         doc: "Wall clock the excerpt provider gets; read as an i64 (F2).",
+    },
+    SettingSpec {
+        key: "light_model",
+        project_key: None,
+        kind: SettingKind::AgentModel,
+        min: 1,
+        max: LIGHT_MODEL_MAX_CHARS as i64,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "chars",
+        doc: "The agent and model the run-end memory capture runs on; unset skips the capture.",
     },
     SettingSpec {
         key: "max_skill_tokens",
@@ -579,6 +609,8 @@ pub fn rung_refusal(key: SettingKey, at: Rungs) -> Option<String> {
 /// - `` `{key}` = {n} is above `{other}` = {m}; the reader would clamp it ``
 /// - `` `{key}` must be a JSON boolean, got {value} `` — for a [`SettingKind::Boolean`], whose
 ///   only other check is the rung
+/// - `` `{key}` must be null or {"agent_id": a UUID, "model": 1..=200 characters}, got {value} ``
+///   — for a [`SettingKind::AgentModel`], whose only other check is the rung
 pub fn validate(
     key: SettingKey,
     at: Rungs,
@@ -632,6 +664,18 @@ pub fn validate(
                 return Err(format!("`{key}` must be a JSON boolean, got {value}"));
             };
             i64::from(on)
+        }
+        // Shape only (MOD-164 D7): `null` is "not configured", and an agent that does not exist
+        // is the capture's to skip, not the writer's to refuse.
+        SettingKind::AgentModel => {
+            if value.is_null() || light_model_of(value).is_some() {
+                return Ok(());
+            }
+            return Err(format!(
+                "`{key}` must be null or {{\"agent_id\": a UUID, \"model\": {}..={} characters}}, \
+                 got {value}",
+                spec.min, spec.max
+            ));
         }
     };
 
@@ -860,6 +904,45 @@ pub fn resolve_compete_fan_out(app: &BTreeMap<String, Value>) -> bool {
         .unwrap_or(COMPETE_FAN_OUT_DEFAULT)
 }
 
+/// The agent and model the run-end memory capture runs on (MOD-164 D7): the resolved
+/// `light_model` App setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightModel {
+    /// `agent.id` of the agent to run the capture turn on.
+    pub agent_id: AgentId,
+    /// The model to ask that agent for, 1..=200 characters.
+    pub model: String,
+}
+
+/// The JSON shape of a `light_model` value, and nothing more: two fields, no third.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LightModelValue {
+    agent_id: AgentId,
+    model: String,
+}
+
+/// `value` as a [`LightModel`] when it has exactly the two fields, a UUID and a model of
+/// 1..=[`LIGHT_MODEL_MAX_CHARS`] characters; `None` for anything else, `null` included.
+fn light_model_of(value: &Value) -> Option<LightModel> {
+    let parsed = LightModelValue::deserialize(value).ok()?;
+    let chars = parsed.model.chars().count();
+    (1..=LIGHT_MODEL_MAX_CHARS)
+        .contains(&chars)
+        .then_some(LightModel {
+            agent_id: parsed.agent_id,
+            model: parsed.model,
+        })
+}
+
+/// `light_model` (MOD-164 D7): the `app_setting` row's agent and model, or `None` when it is
+/// unset, `null` or malformed — a hand-written row the writer never validated is "not
+/// configured", never an error. App rung only; there is no compiled default.
+#[must_use]
+pub fn resolve_light_model(app: &BTreeMap<String, Value>) -> Option<LightModel> {
+    app.get("light_model").and_then(light_model_of)
+}
+
 /// `project.settings.allow_env_files` (MOD-89 D4): whether a provider project whose session trees
 /// hold env files warns instead of refusing.
 ///
@@ -969,20 +1052,25 @@ mod tests {
         assert_eq!(rows.len(), 10, "ANA-5 §5.3 reserves ten keys, got {rows:?}");
         let mut expected = rows.clone();
         expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        // MOD-163 D19 and MOD-141 M2 D5: `memory_capture` and `compete_fan_out` are App keys
-        // 0002 does not seed; their resolvers fall through to the compiled defaults, so the
-        // seeded ten are the rows without them.
+        // MOD-163 D19, MOD-141 M2 D5 and MOD-164 D7: `memory_capture`, `compete_fan_out` and
+        // `light_model` are App keys 0002 does not seed; their resolvers fall through to the
+        // compiled defaults, so the seeded ten are the rows without them.
         let rows = DEFAULTS.as_rows();
         assert_eq!(
             rows.len(),
-            12,
-            "0002's ten rows plus the unseeded `memory_capture` and `compete_fan_out`"
+            13,
+            "0002's ten rows plus the unseeded `memory_capture`, `compete_fan_out` and \
+             `light_model`"
         );
         assert!(rows.contains(&("memory_capture", Value::Bool(true))));
         assert!(rows.contains(&("compete_fan_out", Value::Bool(false))));
+        assert!(rows.contains(&("light_model", Value::Null)));
         assert_eq!(
             rows.into_iter()
-                .filter(|(key, _)| !matches!(*key, "memory_capture" | "compete_fan_out"))
+                .filter(|(key, _)| !matches!(
+                    *key,
+                    "memory_capture" | "compete_fan_out" | "light_model"
+                ))
                 .collect::<Vec<_>>(),
             expected
                 .iter()
@@ -1182,7 +1270,7 @@ mod tests {
         );
         assert!(rung_refusal(SettingKey::MemoryCapture, Rungs::PHASE).is_some());
         assert_eq!(
-            SettingKey::ALL[10],
+            SettingKey::ALL[11],
             SettingKey::MemoryCapture,
             "`memory_capture` sorts between `max_skill_tokens` and `prompt_reserve_fraction`"
         );
@@ -1280,20 +1368,142 @@ mod tests {
         }
     }
 
+    /// A `light_model` value naming `agent` and `model`, the one shape the key takes.
+    fn light(agent: &str, model: &str) -> Value {
+        json!({ "agent_id": agent, "model": model })
+    }
+
+    /// A well-formed agent id for the `light_model` cases.
+    const AGENT: &str = "0192f0c4-7b3a-7c1e-9a51-3c0d2f6e8a10";
+
+    /// MOD-164 D7: the first [`SettingKind::AgentModel`], App only, unset by default. `null` (the
+    /// compiled default) and `{agent_id, model}` are the two values it takes.
+    #[test]
+    fn light_model_accepts_null_and_an_agent_model_object() {
+        let key = SettingKey::LightModel;
+        let spec = key.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "light_model",
+                project_key: None,
+                kind: SettingKind::AgentModel,
+                min: 1,
+                max: LIGHT_MODEL_MAX_CHARS as i64,
+                rungs: Rungs::APP,
+                not_above: None,
+                unit: "chars",
+                doc: spec.doc,
+            }
+        );
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert_eq!(
+            SettingKey::ALL[9],
+            key,
+            "`light_model` sorts between `excerpt_provider_deadline_ms` and `max_skill_tokens`"
+        );
+        assert_eq!(DEFAULTS.value_of(key), Value::Null, "unset: not configured");
+        assert_eq!(DEFAULTS.integer(key), 0);
+        assert_eq!(rung_refusal(key, Rungs::APP), None);
+        assert!(rung_refusal(key, Rungs::PROJECT).is_some());
+        assert!(rung_refusal(key, Rungs::PHASE).is_some());
+
+        assert_eq!(validate(key, Rungs::APP, &Value::Null, None), Ok(()));
+        assert_eq!(
+            validate(key, Rungs::APP, &light(AGENT, "opus"), None),
+            Ok(())
+        );
+        // Characters, not bytes: two hundred two-byte characters are the ceiling.
+        let widest = "\u{e9}".repeat(LIGHT_MODEL_MAX_CHARS);
+        assert_eq!(
+            validate(key, Rungs::APP, &light(AGENT, &widest), None),
+            Ok(())
+        );
+        assert_eq!(
+            validate(key, Rungs::PROJECT, &light(AGENT, "opus"), None),
+            Err(rung_refusal(key, Rungs::PROJECT).expect("no project rung")),
+            "the rung is checked before the shape"
+        );
+    }
+
+    /// MOD-164 D7: `validate` checks the shape only — exactly two fields, a UUID and a model of
+    /// 1..=200 characters. Agent membership is not checked (ACP agents list no models until
+    /// their first handshake).
+    #[test]
+    fn light_model_refuses_extra_fields_a_bad_uuid_and_an_empty_model() {
+        let key = SettingKey::LightModel;
+        let too_wide = "m".repeat(LIGHT_MODEL_MAX_CHARS + 1);
+        for (label, value) in [
+            (
+                "an extra field",
+                json!({ "agent_id": AGENT, "model": "opus", "effort": "high" }),
+            ),
+            ("a bad uuid", light("not-a-uuid", "opus")),
+            ("an empty model", light(AGENT, "")),
+            ("a model of 201 characters", light(AGENT, &too_wide)),
+            ("no model", json!({ "agent_id": AGENT })),
+            ("no agent", json!({ "model": "opus" })),
+            ("a numeric model", json!({ "agent_id": AGENT, "model": 7 })),
+            ("a string", json!("opus")),
+            ("a boolean", json!(true)),
+            ("a number", json!(1)),
+        ] {
+            let refused = validate(key, Rungs::APP, &value, None)
+                .expect_err("only null or {agent_id, model} is a light model");
+            assert!(
+                refused.starts_with("`light_model` must be null or "),
+                "the refusal of {label} names the key and the shape, got `{refused}`"
+            );
+            assert!(
+                refused.ends_with(&value.to_string()),
+                "…and the value it refused ({label}), got `{refused}`"
+            );
+        }
+    }
+
+    /// MOD-164 D7: the resolver answers `Some` only for a well-formed value; unset, `null` and
+    /// anything malformed are "not configured".
+    #[test]
+    fn resolve_light_model_is_none_when_unset_or_malformed() {
+        assert_eq!(resolve_light_model(&BTreeMap::new()), None, "unset");
+        for dud in [
+            Value::Null,
+            json!("opus"),
+            light("not-a-uuid", "opus"),
+            light(AGENT, ""),
+            json!({ "agent_id": AGENT, "model": "opus", "extra": 1 }),
+        ] {
+            assert_eq!(
+                resolve_light_model(&app(&[("light_model", dud.clone())])),
+                None,
+                "{dud} is not a light model"
+            );
+        }
+        assert_eq!(
+            resolve_light_model(&app(&[("light_model", light(AGENT, "haiku"))])),
+            Some(LightModel {
+                agent_id: AGENT.parse().expect("a uuid"),
+                model: "haiku".to_owned(),
+            })
+        );
+    }
+
     /// D276: the App group and `as_rows` are the `app_setting` keys, never a project-only one:
-    /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19) and MOD-141's unseeded
-    /// `compete_fan_out` (M2 D5).
+    /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19), MOD-141's unseeded
+    /// `compete_fan_out` (M2 D5) and MOD-164's unseeded `light_model` (D7).
     #[test]
     fn app_keys_are_0002s_ten_plus_memory_capture_in_byte_order() {
         let app: Vec<SettingKey> = SettingKey::app_keys().collect();
         assert_eq!(
             app.len(),
-            12,
-            "migration 0002 seeds ten rows, and `memory_capture` and `compete_fan_out`, unseeded"
+            13,
+            "migration 0002 seeds ten rows, and `memory_capture`, `compete_fan_out` and \
+             `light_model`, unseeded"
         );
-        assert_eq!(SettingKey::app_keys().count(), 12);
+        assert_eq!(SettingKey::app_keys().count(), 13);
         assert!(app.contains(&SettingKey::MemoryCapture));
         assert!(app.contains(&SettingKey::CompeteFanOut));
+        assert!(app.contains(&SettingKey::LightModel));
         assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
         assert_eq!(
@@ -1412,7 +1622,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "fourteen distinct keys, strictly ascending as bytes"
+            "fifteen distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),
