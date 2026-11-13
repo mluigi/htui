@@ -51,7 +51,8 @@ Overview: `.claude/skills/handoff-docs.md`.
   test; a test that passes on its retry is named `FLAKY`), then
   `cargo test --workspace --all-features --doc`, since nextest runs no doctests. Both runners work
   for item runs, at default threads:
-  `cargo nextest run -p <crate> --all-features -E 'test(/^<module>::/)'` or
+  `cargo nextest run -p <crate> --all-features -E 'binary(it) and test(/^<module>::/)'` (without
+  `binary(it)` the filter also runs the crate's unit tests in a same-named `src/` module) or
   `cargo test -p <crate> --all-features --test it <module>::`. Under `cargo test` a crate's tests
   share one process and run side by side (TOOL-16), so the rules below are written for that case.
 - A test of the live Qdrant lives in `qdrant_live`/`qdrant_worker` or its name starts with
@@ -64,6 +65,10 @@ Overview: `.claude/skills/handoff-docs.md`.
   (included through `#[path]`), never `fs::write` plus `chmod` (`ETXTBSY`).
   `testkit::fresh_db`/`demo_db` copy a template database, so `migrations_at_connect` is
   `UpToDate`; a test about pending migrations starts from `bare_db`.
+- The `#[ignore]`d live agent cases in `htui-agent`'s `agy_live`, `auth_live`, `cli_live` and
+  `isolation_live` take their module's `ONE_AT_A_TIME` lock, which serialises them under
+  `cargo test`; under nextest the `live-agent` group in `.config/nextest.toml` does, and a new
+  `*_live` module with such a lock joins that group's filter.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.

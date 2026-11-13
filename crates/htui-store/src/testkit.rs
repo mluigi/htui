@@ -513,7 +513,9 @@ pub async fn qdrant_connect_to<E: crate::embed::DenseEmbedder + Clone>(
     }
 }
 
-/// Serialises the tests that touch the fake keyring: it is one process-wide slot.
+/// Serialises the tests that touch the fake keyring: it is one process-wide slot. Under
+/// cargo-nextest each test process has its own fake slot, so the lock only matters under
+/// `cargo test` (TOOL-17).
 static KEYRING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Holds the fake keyring installed and empty until dropped (MOD-15 M6 D18).
@@ -540,7 +542,9 @@ impl Drop for KeyringGuard {
 /// `get_dsn` (blueprint flag L).
 ///
 /// The returned guard also holds a process-wide lock, so two `#[tokio::test]`s that both install
-/// the slot run one after the other rather than overwriting each other's DSN.
+/// the slot run one after the other rather than overwriting each other's DSN. Under cargo-nextest
+/// each test process has its own fake slot, so the lock only matters under `cargo test`
+/// (TOOL-17).
 pub async fn mock_keyring() -> KeyringGuard {
     let lock = KEYRING.lock().await;
     *crate::secret::fake() = Some(crate::secret::Fake::Slot(
