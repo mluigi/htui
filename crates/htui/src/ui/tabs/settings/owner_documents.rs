@@ -21,7 +21,8 @@
 //! the write saved when the kind's newest version is newer than before it, else keeps the draft.
 //! While a draft is kept, `Enter`, `n` and `v` reopen `$EDITOR` on its text, and closing it
 //! untouched is the retry. A list read offline says no write is taken (`writable`), and `n`/`v`
-//! refuse before `$EDITOR` opens.
+//! refuse before `$EDITOR` opens, except on a kept draft: it reopens, and its write is refused and
+//! kept again.
 //!
 //! Every hint and every sentence that names a key reads it from the stack in force, and every act
 //! resolves from [`Ctx::pressed`].
@@ -475,13 +476,19 @@ impl OwnerDocumentsPane {
 
     /// Why a write key is refused now, if it is.
     fn write_refusal(&self) -> Option<String> {
+        self.refusal(true)
+    }
+
+    /// `write_refusal`, with the offline refusal only when `offline_refuses`: a kept
+    /// draft reopens offline, and its write is refused afterwards and kept again.
+    fn refusal(&self, offline_refuses: bool) -> Option<String> {
         if let Some(why) = &self.refused {
             return Some(format!("{UNAVAILABLE}: {why}"));
         }
         if self.documents.is_none() {
             return Some(NOT_READ.to_owned());
         }
-        if !self.writable {
+        if offline_refuses && !self.writable {
             return Some(format!("not saved: {}", offline_refusal()));
         }
         if self.busy() {
@@ -559,9 +566,10 @@ impl OwnerDocumentsPane {
         self.notice = None;
     }
 
-    /// Review M2: `$EDITOR` again on the kept draft's text, refused in place as `n` is.
+    /// Review M2: `$EDITOR` again on the kept draft's text, refused in place as `n` is, except
+    /// offline: the kept sentence names this key, and an offline write is refused and kept again.
     fn reopen(&mut self, ctx: &Ctx<'_>) {
-        if let Some(why) = self.write_refusal() {
+        if let Some(why) = self.refusal(false) {
             self.notice = Some(Notice::Error(why));
             return;
         }

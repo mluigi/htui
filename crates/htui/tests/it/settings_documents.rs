@@ -766,7 +766,7 @@ async fn offline_the_write_keys_refuse_before_the_editor_opens() {
 
 /// Review M2: after an `Unreachable` failure the re-read is the mirror's, which cannot hold a
 /// write whose answer was lost: nothing new there says it could not be checked, and keeps the
-/// draft.
+/// draft, which `n` reopens though that list says the box is offline.
 #[tokio::test]
 async fn an_unreachable_failure_cannot_be_settled_by_the_mirror() {
     let (bench, mut section) = writing_a_new_goals_version().await;
@@ -792,4 +792,12 @@ async fn an_unreachable_failure_cannot_be_settled_by_the_mirror() {
     );
     assert!(shows(&shown, "your text is kept"), "{shown}");
     assert!(!shows(&shown, "it was not written"), "{shown}");
+
+    // The list said offline, yet the kept draft still reopens: the sentence names the key.
+    bench.key(&mut section, "n");
+    let handed = edits(&bench);
+    assert!(
+        matches!(handed.as_slice(), [edit] if edit.text == "Draft."),
+        "`n` reopens $EDITOR on the kept text offline: {handed:?}"
+    );
 }
