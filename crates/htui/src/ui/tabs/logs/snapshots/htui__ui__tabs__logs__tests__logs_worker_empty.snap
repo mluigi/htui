@@ -1,0 +1,16 @@
+---
+source: crates/htui/src/ui/tabs/logs/mod.rs
+expression: frame
+---
+╭─ Sources ──────────────────╮╭─ worker · 00006b02 · min trace · following ────────────────────────╮
+│▌all              7 · ⚠ 3   ││                                                                    │
+│ ui               2 · ⚠ 0   ││                                                                    │
+│ store            2 · ⚠ 1   ││                                                                    │
+│ orchestrator     0 · ⚠ 0   ││                                                                    │
+│ agents           2 · ⚠ 1   ││                No lines from worker · 00006b02 yet.                │
+│ mcp              0 · ⚠ 0   ││       Settings › Boxes › Worker log level sets what it ships       │
+│ worker           0 · ⚠ 0   ││                                                                    │
+│ secrets          0 · ⚠ 0   ││                                                                    │
+│ other            1 · ⚠ 1   ││                                                                    │
+│                            ││                                                                    │
+╰─v level · F follow …───────╯╰────────────────────────────────────────────────────────────────────╯

@@ -1,0 +1,24 @@
+---
+source: crates/htui/src/ui/tabs/logs/mod.rs
+expression: frame
+---
+no workspace   ¹Logs        0 waiting ·  F9  about   ?  keys
+╭─ Sources ──────────────────╮╭─ following · min trace · …─╮
+│ all              7 · ⚠ 3   ││INFO  walk started run=7    │
+│ ui               2 · ⚠ 0   ││DEBUG cache refreshed rows=3│
+│ store            2 · ⚠ 1   ││WARN  slow statement ms=812 │
+│ orchestrator     0 · ⚠ 0   ││ERROR adapter exited code=1 │
+│ agents           2 · ⚠ 1   ││INFO  connection reused     │
+│ mcp              0 · ⚠ 0   ││                            │
+│ worker           0 · ⚠ 0   ││                            │
+│ secrets          0 · ⚠ 0   ││                            │
+│ other            1 · ⚠ 1   ││                            │
+│▌worker · BUILD-01   5 · ⚠ 2││                            │
+│ worker · GPU-02     2 · ⚠ 1││                            │
+│                            ││                            │
+│                            ││                            │
+│                            ││                            │
+│                            ││                            │
+│                            ││                            │
+│                            ││                            │
+╰─v level · F follow …───────╯╰────────────────────────────╯
