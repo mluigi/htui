@@ -285,6 +285,10 @@ pub trait Orchestrate {
     /// MOD-125 M3 D9: the next session of `(phase, attempt)` (or of one session's `slot`) fails
     /// its first `start` on the wire with `reason`, and plays its script on the next.
     fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str);
+
+    /// MOD-125 M3 F1 (review L4): the next session of `(phase, attempt)` (or of one session's
+    /// `slot`) reports `id` in its banner, where the fake derives `fake-<step>`.
+    fn rename_banner(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, id: &str);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -439,6 +443,10 @@ impl Orchestrate for FakeOrchestrator {
 
     fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str) {
         Self::refuse_resume(self, phase, attempt, slot, reason);
+    }
+
+    fn rename_banner(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, id: &str) {
+        Self::rename_banner(self, phase, attempt, slot, id);
     }
 }
 
@@ -17262,6 +17270,36 @@ fn prepares_of<O: Orchestrate>(orch: &O, step: StepId) -> usize {
         .count()
 }
 
+/// MOD-125 M3 F1 (review L4): the id a stopped session's first banner reports
+/// ([`Orchestrate::rename_banner`]), which the fake's derived `fake-<step>` is not, so a
+/// `spec.resume` naming it can only have come from that banner.
+const PRE_STOP_BANNER: &str = "pre-stop-session";
+
+/// `step`'s session at `key` reopened [`PRE_STOP_BANNER`]: the stop left it as the step's
+/// banner (`before`, the log as the stop left it), `spec.resume` names it, and the step's latest
+/// banner, the resumed session's own, reports it again.
+async fn assert_reopened_pre_stop_banner<O: Orchestrate>(
+    orch: &O,
+    key: &SessionKey<'_>,
+    step: StepId,
+    before: &[htui_core::model::SessionEvent],
+) {
+    let expected = Some(AgentSessionRef::new(PRE_STOP_BANNER));
+    assert_eq!(promote::banner(before), expected, "the stop's banner");
+    assert_eq!(
+        orch.spec_for(key)
+            .expect("the resumed session started")
+            .resume,
+        expected,
+        "the session reopened from the stop's banner"
+    );
+    assert_eq!(
+        promote::banner(&events_of(orch, step).await),
+        expected,
+        "the resumed session's own banner"
+    );
+}
+
 /// An ungated `FEAT-3` over a primary repo, its walk dropped once `stalled` fires (a forced
 /// stop), then the stop settled: the run is `stopped` over its `prd` row.
 async fn stopped_feat_3<O: Orchestrate>(orch: &O, stalled: &Notify) -> (RunId, RunStep) {
@@ -17310,7 +17348,9 @@ async fn resumed_to_done<O: Orchestrate>(orch: &O, run: RunId, prd: &RunStep) ->
 /// and trees, with its guard reacquired and no second `prepare`.
 async fn a_stopped_step_resumes_its_own_session_on_its_row<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
+    orch.rename_banner("prd", 1, None, PRE_STOP_BANNER);
     let (run, prd) = stopped_after_prd_session(&orch).await;
+    let before = events_of(&orch, prd.id).await;
     let trees = orch
         .store()
         .step_trees(prd.id)
@@ -17324,13 +17364,7 @@ async fn a_stopped_step_resumes_its_own_session_on_its_row<H: CaseHarness>(harne
         opening_of(&orch, run, prd.id).await,
         Some(htui_core::model::StepOpening::Resumed)
     );
-    assert_eq!(
-        orch.spec_for(&session("prd", 0))
-            .expect("the resumed session started")
-            .resume,
-        Some(AgentSessionRef::new(format!("fake-{}", prd.id))),
-        "the session reopened from its banner"
-    );
+    assert_reopened_pre_stop_banner(&orch, &session("prd", 0), prd.id, &before).await;
     let events = events_of(&orch, prd.id).await;
     assert_eq!(
         follow_ups_in(&events),
@@ -17600,11 +17634,13 @@ async fn a_stop_during_the_pre_merge_resumes_by_walking_integrate_again<H: CaseH
 async fn a_stopped_integrate_step_resumes_its_session<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    orch.rename_banner("implement", 1, None, PRE_STOP_BANNER);
     let stalled = orch.stall_after_done("implement", 1, None, false);
     let run = crash_divided(&orch, &[stalled]).await;
     settled_stopped(&orch, run).await;
     let integrate = integrate_of(&steps_of(&orch, run).await);
     assert_eq!(integrate.status, StepStatus::Stopped);
+    let before = events_of(&orch, integrate.id).await;
     let premerges = orch.isolator().premerge_requests().len();
 
     let resumed = orch.resume_stopped(run).await;
@@ -17625,12 +17661,7 @@ async fn a_stopped_integrate_step_resumes_its_session<H: CaseHarness>(harness: &
             Some(htui_core::model::StepOpening::Resumed)
         )
     );
-    assert_eq!(
-        orch.spec_for(&session("implement", 0))
-            .expect("the integrate session reopened")
-            .resume,
-        Some(AgentSessionRef::new(format!("fake-{}", integrate.id)))
-    );
+    assert_reopened_pre_stop_banner(&orch, &session("implement", 0), integrate.id, &before).await;
     assert_eq!(
         orch.isolator().premerge_requests().len(),
         premerges,
@@ -17819,6 +17850,7 @@ async fn a_stopped_shared_serialized_candidate_is_reacquired_not_reset<H: CaseHa
     set_judge(&orch, ids::HTUI_ANA_2).await;
     research_candidates(&orch, 1);
     judge_both(&orch, "research", 1, 0, "complete");
+    orch.rename_banner("research", 1, Some((1, 0)), PRE_STOP_BANNER);
     let stalled = orch.stall_after_done("research", 1, Some((1, 0)), false);
     let run = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
     settled_stopped(&orch, run).await;
@@ -17837,6 +17869,7 @@ async fn a_stopped_shared_serialized_candidate_is_reacquired_not_reset<H: CaseHa
     );
     let stopped = candidate(&steps, 0, 1, 1).clone();
     let queued = candidate(&steps, 0, 1, 2).clone();
+    let before = events_of(&orch, stopped.id).await;
     assert!(
         events_of(&orch, queued.id).await.is_empty(),
         "the queued candidate never opened a session"
@@ -17866,17 +17899,18 @@ async fn a_stopped_shared_serialized_candidate_is_reacquired_not_reset<H: CaseHa
         opening_of(&orch, run, stopped.id).await,
         Some(htui_core::model::StepOpening::Resumed)
     );
-    assert_eq!(
-        orch.spec_for(&SessionKey {
+    assert_reopened_pre_stop_banner(
+        &orch,
+        &SessionKey {
             phase: "research",
             attempt: 1,
             fanout_index: 1,
             call: 0,
-        })
-        .expect("the stopped candidate's session reopened")
-        .resume,
-        Some(AgentSessionRef::new(format!("fake-{}", stopped.id)))
-    );
+        },
+        stopped.id,
+        &before,
+    )
+    .await;
     assert_eq!(
         prompts_in(&events_of(&orch, stopped.id).await),
         1,

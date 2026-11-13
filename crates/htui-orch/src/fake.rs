@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex};
 use chrono::TimeDelta;
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
 use htui_agent::driver::{
-    AgentDriver, AgentSession, DriverCaps, DriverFuture, McpServerSpec, PermissionPolicy,
-    SessionSpec,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
+    PermissionPolicy, SessionSpec,
 };
 use htui_agent::error::DriverError;
 use htui_agent::event::{
-    DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, StopReason, ToolCallEvent,
-    ToolKind, UsageEvent,
+    DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, SESSION_STARTED, StopReason,
+    ToolCallEvent, ToolKind, UsageEvent,
 };
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver, SpecSlot};
 use htui_agent::record::{Control, Signal};
@@ -2275,6 +2275,11 @@ pub struct FakeOrchestrator {
     /// ([`refuse_resume`](Self::refuse_resume)), keyed like `scripts` and taken by that driver.
     /// Never carried by [`restarted`](Self::restarted).
     resume_refusals: Mutex<BTreeMap<ScriptKey, Vec<DriverError>>>,
+    /// MOD-125 M3 F1 (review L4): the session id the next driver of a key reports in its banner
+    /// in place of the fake's derived `fake-<step>` ([`rename_banner`](Self::rename_banner)),
+    /// keyed like `scripts` and taken by that driver. Never carried by
+    /// [`restarted`](Self::restarted).
+    banners: Mutex<BTreeMap<ScriptKey, String>>,
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
@@ -2387,6 +2392,8 @@ struct Counted {
     inner: Box<dyn AgentDriver>,
     sessions: Arc<Sessions>,
     hold: Option<Arc<HoldState>>,
+    /// MOD-125 M3 F1: the session id its session reports in place of the fake's own.
+    banner: Option<AgentSessionRef>,
 }
 
 impl AgentDriver for Counted {
@@ -2411,6 +2418,7 @@ impl AgentDriver for Counted {
                 inner,
                 sessions: Arc::clone(&self.sessions),
                 hold: self.hold.clone(),
+                banner: self.banner.clone(),
                 first: true,
                 arrived: false,
                 cancelled: false,
@@ -2425,6 +2433,8 @@ struct CountedSession {
     inner: Box<dyn AgentSession>,
     sessions: Arc<Sessions>,
     hold: Option<Arc<HoldState>>,
+    /// MOD-125 M3 F1: the id its banner and `session_ref` report in place of the inner one's.
+    banner: Option<AgentSessionRef>,
     /// Before the first event: the interleaving yield and the hold still apply.
     first: bool,
     /// The hold counted this session live.
@@ -2440,8 +2450,8 @@ impl Drop for CountedSession {
 }
 
 impl AgentSession for CountedSession {
-    fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
-        self.inner.session_ref()
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.banner.as_ref().or_else(|| self.inner.session_ref())
     }
 
     fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>> {
@@ -2465,7 +2475,14 @@ impl AgentSession for CountedSession {
                 }
                 self.first = false;
             }
-            self.inner.next_event().await
+            let mut envelope = self.inner.next_event().await?;
+            if let (Some(banner), Some(envelope)) = (&self.banner, envelope.as_mut())
+                && let DriverEvent::Other(other) = &mut envelope.event
+                && other.update == SESSION_STARTED
+            {
+                other.body["session_id"] = serde_json::Value::from(banner.as_str());
+            }
+            Ok(envelope)
         })
     }
 
@@ -2525,6 +2542,7 @@ impl FakeOrchestrator {
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
             resume_refusals: Mutex::new(BTreeMap::new()),
+            banners: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
             missing_templates: Mutex::new(BTreeSet::new()),
             tails: Mutex::new(Tails::Walk),
@@ -2585,6 +2603,7 @@ impl FakeOrchestrator {
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
             resume_refusals: Mutex::new(BTreeMap::new()),
+            banners: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(
                 self.refused_prompts
                     .lock()
@@ -2849,6 +2868,38 @@ impl FakeOrchestrator {
             .unwrap_or_default()
     }
 
+    /// MOD-125 M3 F1 (review L4): the next session of `(phase, attempt)` (or of one session's
+    /// `slot`, as [`script_candidate`](Self::script_candidate) keys it) reports `id` as its
+    /// banner's `session_id` and its `session_ref`, where the fake would derive `fake-<step>`. A
+    /// resume of it then reopens `id`, which the fake's derived id cannot pass for. One-shot: the
+    /// driver takes it.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn rename_banner(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, id: &str) {
+        self.banners
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert((phase.to_owned(), attempt, slot), id.to_owned());
+    }
+
+    /// The banner id [`rename_banner`](Self::rename_banner) queued for `key`, the exact
+    /// session's before its `(phase, attempt)`'s, taken.
+    fn take_banner(&self, key: &SessionKey<'_>) -> Option<AgentSessionRef> {
+        let mut banners = self
+            .banners
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock");
+        banners
+            .remove(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| banners.remove(&(key.phase.to_owned(), key.attempt, None)))
+            .map(AgentSessionRef::new)
+    }
+
     /// Replace the driver capabilities every session is built with.
     ///
     /// The CLI-shaped profile — `permission_requests` and `edit_proposals` both false — is what
@@ -3067,6 +3118,7 @@ impl FakeOrchestrator {
             inner: self.scripted_driver(key),
             sessions: Arc::clone(&self.sessions),
             hold: self.hold_for(key),
+            banner: self.take_banner(key),
         })
     }
 
