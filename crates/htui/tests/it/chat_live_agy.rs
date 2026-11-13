@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! HTUI_KEEP_RAW_EVENTS=1 HTUI_AGY_FIXTURE_OUT=/tmp/agy_acp_turn.jsonl \
-//!   cargo test -p htui --features testkit --test chat_live_agy -- --ignored --nocapture
+//!   cargo test -p htui --features testkit --test it chat_live_agy:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! `testkit` is `htui`'s only test feature; `HTUI_KEEP_RAW_EVENTS` has to arrive on the command

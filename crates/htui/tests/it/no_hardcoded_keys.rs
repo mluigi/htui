@@ -9,9 +9,7 @@
 //! brace group, or its `;`); an inner `#![cfg(test)]` skips the file. `#[cfg(any(test, feature =
 //! "testkit"))]` is **not** skipped: it is compiled in testkit builds.
 
-mod token_scan;
-
-use token_scan::{relative, sites, sources, src_root};
+use crate::token_scan::{relative, sites, sources, src_root};
 
 /// Files that may name `KeyCode::`, each with why. Every entry must still name one (a stale
 /// entry fails too).

@@ -4,7 +4,7 @@
 //! the maintainer's subscription. Run it by hand:
 //!
 //! ```text
-//! cargo test -p htui --features testkit --test chat_live -- --ignored --nocapture
+//! cargo test -p htui --features testkit --test it chat_live:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! What it proves is the milestone's own claim, minus the terminal: the seeded `claude` row, the

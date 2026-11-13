@@ -8,11 +8,9 @@
 //! items are skipped, an import, a comment or a string is no site. It reads sources only, so it
 //! runs without the testkit feature.
 
-mod token_scan;
-
 use std::path::Path;
 
-use token_scan::{aliases, relative, sites, sites_except, sources, src_root};
+use crate::token_scan::{aliases, relative, sites, sites_except, sources, src_root};
 
 /// The idents that build a frame by hand.
 const NEEDLES: &[&str] = &["Block", "Borders"];

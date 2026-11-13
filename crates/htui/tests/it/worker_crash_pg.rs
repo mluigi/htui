@@ -1,7 +1,7 @@
 //! MOD-24 D2 against live Postgres: a worker process killed mid-walk, and the one that follows.
 //!
 //! Each case re-executes **this test binary** as the worker: `std::env::current_exe()` with
-//! `--exact crash_child --nocapture --test-threads=1` and the case's `HTUI_TEST_CRASH_*`
+//! `--exact worker_crash_pg::crash_child --nocapture --test-threads=1` and the case's `HTUI_TEST_CRASH_*`
 //! variables, which turn [`crash_child`] (a no-op without them) into `htui worker`'s loop
 //! (`htui_worker::worker::run`) over the case's throwaway database, registered as the fixture box
 //! `ids::BOX` (`testkit::fixture_box_store`). Its parts are the real `GixIsolator` over a
@@ -83,8 +83,12 @@ const CONFIG: WorkerConfig = WorkerConfig {
 /// not two: a beat stalled for a second on a loaded box must not fence a live walk.
 const TTL_SECONDS: i32 = 5;
 
-/// The child entry's name; `--exact` matches a top-level fn's bare name only (blueprint H-14).
-const CHILD: &str = "crash_child";
+/// The child entry's name; `--exact` matches the libtest path, which is the module path without
+/// the crate name, then the fn (blueprint H-14).
+fn child_name() -> String {
+    let module = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+    format!("{module}::crash_child")
+}
 /// `TestDb.url`: the database the child connects to, and the child entry's switch.
 const DSN_VAR: &str = "HTUI_TEST_CRASH_DSN";
 /// The seeded primary repo's `RepoId`.
@@ -743,7 +747,9 @@ impl Reaped {
             let why = match status.code() {
                 Some(MISCONFIGURED_EXIT) => "kill-point spec malformed or marker write failed",
                 Some(PARK_EXPIRED_EXIT) => "a parked kill point was never killed",
-                Some(0) => "the child returned: did `--exact crash_child` match a test? (H-14)",
+                Some(0) => {
+                    "the child returned: did `--exact worker_crash_pg::crash_child` match a test? (H-14)"
+                }
                 _ => "the child failed",
             };
             panic!(
@@ -864,7 +870,7 @@ impl Case {
         let err = out.try_clone().expect("share the log");
         let mut command = Process::new(std::env::current_exe().expect("this test binary"));
         command
-            .args(["--exact", CHILD, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &child_name(), "--nocapture", "--test-threads=1"])
             .env(DSN_VAR, &self.stack.db.url)
             .env(REPO_VAR, self.stack.repo.to_string())
             .env(CHECKOUT_VAR, self.checkout())

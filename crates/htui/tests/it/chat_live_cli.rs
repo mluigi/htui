@@ -9,7 +9,7 @@
 //! `Esc Esc` does, and leaves nothing running.
 //!
 //! ```text
-//! cargo test -p htui --features testkit --test chat_live_cli -- --ignored --nocapture
+//! cargo test -p htui --features testkit --test it chat_live_cli:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! `testkit` is `htui`'s only test feature (`crates/htui/Cargo.toml:19-23`, blueprint E-6 — the

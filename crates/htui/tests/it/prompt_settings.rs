@@ -1154,7 +1154,7 @@ async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
 /// name is spelled in the section at all.
 #[test]
 fn no_key_name_is_spelled_in_the_section() {
-    let source = include_str!("../src/ui/tabs/settings/prompt.rs");
+    let source = include_str!("../../src/ui/tabs/settings/prompt.rs");
 
     for key in SettingKey::ALL {
         let literal = format!("\"{}\"", key.key());

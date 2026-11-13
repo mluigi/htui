@@ -36,7 +36,7 @@
 /// guard reads the code, which is the only half where a call can live. `terminal.rs` holds no
 /// string literal containing `//`, so a first-match cut per line is the whole of it.
 fn code() -> String {
-    include_str!("../src/terminal.rs")
+    include_str!("../../src/terminal.rs")
         .lines()
         .map(|line| match line.find("//") {
             Some(at) => &line[..at],
