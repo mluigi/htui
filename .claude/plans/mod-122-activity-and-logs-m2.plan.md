@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-122-activity-and-logs.prd.md`
 **Selected Milestone**: 2 — Worker logs in the main instance
 **Complexity**: Large (four tasks, new table and store trait, worker shipper, Logs tab and Boxes settings)
-**Status**: confirmed by the maintainer 2026-11-12; implementing
+**Status**: complete 2026-11-13 (`hr/MOD-122` `8574d4a7`): T1–T4 landed, review fix round R1 applied (both instances, all medium findings; deferred lows: data L6 L8 L9 L10, TUI L1 L7 L8, and the catalogue description "worker log level")
 **Routing**: PRD path by `/handoff-run MOD-122` (3 criteria fired; resumed at `plan`); ultracode accepted for the implement phase.
 **Grounded at**: `a05deeac` (branch `hr/MOD-122`). **Blueprint**: `.claude/plans/mod-122-activity-and-logs-m2.blueprint.md` (its F1–F14 amend this plan; the blueprint wins where they differ). Requirements: `R-TUI-15`; PRD milestone 2. Touches `R-ID-7` / `R-SEC-3` (nothing off the box unscrubbed).
 

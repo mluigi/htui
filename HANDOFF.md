@@ -1029,6 +1029,13 @@ MOD-159, MOD-164 and MOD-171. Pins: store conformance `CASES` 277 (`htui-core/te
   `v`, follow `F`, `G`, scrolling up pauses, reads on activation); Settings › Logging sets the filter and the
   log file live, saved in `ui-state.toml` `[logging]`, flag/env override for the session; Sentry keeps its
   startup-only `--log` gate and its own fixed filter (MOD-99). Live-Qdrant tests owed on the host. M2, M3 open.
+  **Phase M2 landed (`hr/MOD-122` `8574d4a7`, 2026-11-13):** each `htui worker` ships its log to Postgres
+  (migration 0031 `worker_log`; a per-layer filter at the box's level, default `warn`, set from Settings ›
+  Boxes `worker level`, key `v`; every line scrubbed on the worker; 20 000-line buffer, 200 lines or 2 s per
+  flush, measured at 10 000 lines/s with no drops; 14-day retention plus 100 000 rows per box; a deleted box's
+  rows go with it, errors kept). The Logs tab lists each worker's lines by box under a `workers` heading.
+  Live-Qdrant tests and the Postgres gate on the merged tree owed on the host; migration 0031 renumbers at
+  collect if a sibling run adds one. M3 open.
 - [ ] **MOD-123 - Settings redesign** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.5). `R-TUI-8`,
   `R-ORCH-15`, `R-ORCH-1`, `R-ENT-17`. Fields edit on their row with help beneath; `←`/`→` change a
   choice or toggle, saved at once; Connection renamed **Postgres**; Backlog › Hierarchy removed (its
