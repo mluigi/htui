@@ -87,8 +87,8 @@ later runs better is MOD-169's measurement.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Run write path | Run-written entries can be stored safely: validated, evidenced, scrubbed, capped, stamped and counted. They supersede only run entries, show in prompts and in the pane as model-written, and are exercised by conformance tests through a store-level writer. | pending | — |
-| 2 | Extraction turn | Runs with failures or retries end with a recorded capture step that writes entries through the M1 path. It uses the light-model setting, is skipped with a reason otherwise, stays under the token cap and never changes the run's outcome. | pending | — |
+| 1 | Run write path | Run-written entries can be stored safely: validated, evidenced, scrubbed, capped, stamped and counted. They supersede only run entries, show in prompts and in the pane as model-written, and are exercised by conformance tests through a store-level writer. | in-progress | `.claude/plans/mod-164-capture.plan.md` |
+| 2 | Extraction turn | Runs with failures or retries end with a recorded capture step that writes entries through the M1 path. It uses the light-model setting, is skipped with a reason otherwise, stays under the token cap and never changes the run's outcome. | in-progress | `.claude/plans/mod-164-capture.plan.md` |
 
 ## Open Questions
 Answered at the PRD gate (maintainer, 2026-11-13):
