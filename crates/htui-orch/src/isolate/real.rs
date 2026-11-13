@@ -647,8 +647,9 @@ impl GixIsolator {
 
     /// MOD-125 M3 D5a: each `shared_serialized` row of a stopped step, read under its guard, is
     /// where the step left it: `HEAD` is `base_ref` or descends from it, and no other step's
-    /// `htui/<s>` label lies on `base_ref..HEAD`; the step's own label may, since it names the
-    /// step's own work. Reads only, through `gix`.
+    /// `htui/<s>` label lies on the first-parent line of `base_ref..HEAD`; the step's own label
+    /// may, since it names the step's own work, and so may a part tip integrate's own pre-merge
+    /// took in as a merge's second parent. Reads only, through `gix`.
     async fn refuse_moved(&self, step: StepId, rows: &[&RunStepTree]) -> Result<(), IsolateError> {
         let own = step.to_string();
         for tree in rows {
@@ -6274,6 +6275,68 @@ mod tests {
             (4, 0),
             "held at each part's HEAD read and after each merge"
         );
+    }
+
+    /// D5a, D9 "integrate (resumed)": an in-place integrate stopped after its own pre-merge is
+    /// reacquired. Each part tip it merged carries that part's `htui/<part>` label, but as a merge's
+    /// second parent it is integrate's own work, not a sibling that walked the checkout; a sibling's
+    /// capture labels the first-parent line.
+    #[tokio::test]
+    async fn reacquire_admits_an_integrate_stopped_after_its_own_premerge() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, base, run) = premerge_fixture(dir.path());
+        let scope = [core];
+        let mode = Isolation::SharedSerialized;
+        let api = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            0,
+            "api",
+            &[(core, "api.rs", "api\n")],
+        )
+        .await;
+        let ui = part_tip(
+            &isolator,
+            run,
+            &scope,
+            mode,
+            &base,
+            1,
+            "ui",
+            &[(core, "ui.rs", "ui\n")],
+        )
+        .await;
+        let (integrate, trees) = integrate_tree(&isolator, run, &scope, mode, &base).await;
+        let report = isolator
+            .premerge(integrate, &trees, &[api, ui])
+            .await
+            .expect("the pre-merge runs");
+        let merge = merged(&report.repos[0].parts[1].merge);
+        // `settle_stop`'s release.
+        isolator.release(run).await.expect("release answers");
+        assert_free(&isolator, core, "after the stop").await;
+
+        isolator
+            .reacquire(run, integrate, &trees)
+            .await
+            .expect("integrate's own pre-merged part tips do not refuse it");
+        assert_held(&isolator, core, "after reacquire").await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("HEAD reads"),
+            merge,
+            "never reset"
+        );
+        isolator
+            .capture(integrate, &trees)
+            .await
+            .expect("integrate captures");
+        assert_free(&isolator, core, "after capture").await;
     }
 
     /// D2's `local` row: the one part ran on the checked-out branch and integrate prepared on its

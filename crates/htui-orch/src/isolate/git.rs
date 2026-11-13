@@ -1894,13 +1894,16 @@ pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateE
     Ok(Some(id.detach().to_hex().to_string()))
 }
 
-/// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on `base..head` — reachable
-/// from `head` and not from `base` — in name order (MOD-125 M3 D5a).
+/// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on the first-parent line of
+/// `base..head` — followed from `head` while not reachable from `base` — in name order (MOD-125
+/// M3 D5a).
 ///
 /// `reacquire`'s second check: a `shared_serialized` checkout carrying another step's label above
 /// the stopped step's base was walked by that step while this one was stopped. A label at `base`
-/// itself is not on the range, so the previous step's own label never counts. A `gix` read: the
-/// walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
+/// itself is not on the range, so the previous step's own label never counts. A label on a
+/// merge's second parent does not count either: integrate's pre-merge takes each part tip in
+/// that way, labelled by its part, and a walk's capture labels its first-parent line. A `gix`
+/// read: the walk hides `base`, as [`is_ancestor`]'s does, and the label set is read once.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, the walk
@@ -1919,9 +1922,22 @@ pub fn labels_between(path: &Path, base: &str, head: &str) -> Result<Vec<String>
     if has_commit_in(&repo, base)? {
         walk = walk.with_hidden([hidden]);
     }
-    let mut range = BTreeSet::new();
+    let mut reachable = BTreeSet::new();
     for info in walk.all().map_err(|err| fail(&err))? {
-        range.insert(info.map_err(|err| fail(&err))?.id);
+        reachable.insert(info.map_err(|err| fail(&err))?.id);
+    }
+    // Only the first-parent line of the range counts: a merge's second parent (a part tip
+    // integrate's pre-merge took in, labelled by that part) is merged-in work, not a walk.
+    let mut range = BTreeSet::new();
+    let mut at = Some(tip);
+    while let Some(id) = at.filter(|id| reachable.contains(id)) {
+        range.insert(id);
+        at = repo
+            .find_commit(id)
+            .map_err(|err| IsolateError::Git(format!("cannot find commit {id}: {err}")))?
+            .parent_ids()
+            .next()
+            .map(gix::Id::detach);
     }
 
     let refs = repo.references().map_err(|err| {
@@ -2974,6 +2990,25 @@ mod tests {
             super::labels_between(dir.path(), &tip, &middle).expect("the labels read"),
             Vec::<String>::new(),
             "a head below the base has nothing above the base"
+        );
+    }
+
+    /// MOD-125 M3 D5a: a label on a merge's second parent — a part tip integrate's pre-merge took
+    /// in — is not on the first-parent line of the range, and does not count; a label on the
+    /// merge itself does.
+    #[test]
+    fn labels_between_skips_a_label_on_a_merged_in_second_parent() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        let part = commit_at(dir.path(), &[&base], 5);
+        let merge = commit_on_head(dir.path(), &[&base, &part], "htui: premerge part");
+        for (name, target) in [("htui/part", &part), ("htui/merge", &merge)] {
+            super::create_branch(dir.path(), name, target).expect("the branch is written");
+        }
+
+        assert_eq!(
+            super::labels_between(dir.path(), &base, &merge).expect("the labels read"),
+            vec!["merge".to_owned()]
         );
     }
 
