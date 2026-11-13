@@ -44,7 +44,7 @@ fn trailer(kind: &str) -> String {
 /// The accepted golden's body: everything after the snapshot header's second `---` line.
 fn golden(name: &str) -> String {
     let path = format!(
-        "{}/tests/snapshots/prompt_golden__{name}.snap",
+        "{}/tests/it/snapshots/it__prompt_golden__{name}.snap",
         env!("CARGO_MANIFEST_DIR")
     );
     let file = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));

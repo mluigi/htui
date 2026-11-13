@@ -109,15 +109,15 @@ fn the_prompt_module_reads_no_clock() {
     // §4.7 rule 7, as a source-level fact rather than a behavioural one: a clock read that only
     // fires on one branch would pass every behavioural test and still break reproducibility.
     const SOURCES: [(&str, &str); 9] = [
-        ("mod.rs", include_str!("../src/prompt/mod.rs")),
-        ("template.rs", include_str!("../src/prompt/template.rs")),
-        ("estimate.rs", include_str!("../src/prompt/estimate.rs")),
-        ("render.rs", include_str!("../src/prompt/render.rs")),
-        ("digest.rs", include_str!("../src/prompt/digest.rs")),
-        ("trim.rs", include_str!("../src/prompt/trim.rs")),
-        ("settings.rs", include_str!("../src/prompt/settings.rs")),
-        ("excerpt.rs", include_str!("../src/prompt/excerpt.rs")),
-        ("defaults.rs", include_str!("../src/prompt/defaults.rs")),
+        ("mod.rs", include_str!("../../src/prompt/mod.rs")),
+        ("template.rs", include_str!("../../src/prompt/template.rs")),
+        ("estimate.rs", include_str!("../../src/prompt/estimate.rs")),
+        ("render.rs", include_str!("../../src/prompt/render.rs")),
+        ("digest.rs", include_str!("../../src/prompt/digest.rs")),
+        ("trim.rs", include_str!("../../src/prompt/trim.rs")),
+        ("settings.rs", include_str!("../../src/prompt/settings.rs")),
+        ("excerpt.rs", include_str!("../../src/prompt/excerpt.rs")),
+        ("defaults.rs", include_str!("../../src/prompt/defaults.rs")),
     ];
     for (name, source) in SOURCES {
         // A clock read is forbidden everywhere, tests included: there is no legitimate `now()` in
@@ -242,7 +242,7 @@ fn the_only_section_entry_constructor_is_the_records_projection() {
                 let source = std::fs::read_to_string(&path).expect("a readable source file");
                 if source.contains("SectionEntry {")
                     && !path.ends_with("prompt/trim.rs")
-                    && !path.ends_with("tests/prompt_digest.rs")
+                    && !path.ends_with("tests/it/prompt_digest.rs")
                 {
                     offenders.push(path.display().to_string());
                 }
@@ -1728,9 +1728,9 @@ fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
     // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
     // clock" and "serialises to an object" are different invariants with different blast radii.
     const GRAPH: [(&str, &str); 3] = [
-        ("prompt/trim.rs", include_str!("../src/prompt/trim.rs")),
-        ("model/skill.rs", include_str!("../src/model/skill.rs")),
-        ("model/ids.rs", include_str!("../src/model/ids.rs")),
+        ("prompt/trim.rs", include_str!("../../src/prompt/trim.rs")),
+        ("model/skill.rs", include_str!("../../src/model/skill.rs")),
+        ("model/ids.rs", include_str!("../../src/model/ids.rs")),
     ];
     for (name, source) in GRAPH {
         // Comments excluded, and the shipped/test cut is deliberately **not** borrowed from the
