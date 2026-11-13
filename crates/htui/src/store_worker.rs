@@ -1923,7 +1923,7 @@ pub enum StoreReply {
         /// The project.
         project: ProjectId,
         /// The entry as it is now (a closed one is not in a live list).
-        head: MemoryEntry,
+        head: Box<MemoryEntry>,
         /// The entries as they are now.
         entries: Vec<MemoryEntry>,
     },
@@ -1933,7 +1933,7 @@ pub enum StoreReply {
         /// The project.
         project: ProjectId,
         /// The live entry that holds the subject.
-        existing: MemoryEntry,
+        existing: Box<MemoryEntry>,
     },
     /// Answer to [`StoreRequest::ItemForm`]; boxed, it carries a whole `Item`.
     ItemForm(Box<ItemFormContext>),

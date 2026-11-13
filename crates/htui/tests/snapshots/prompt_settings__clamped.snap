@@ -13,6 +13,7 @@ expression: frame
    excerpt_max_files              unset | 12 (default) files
    excerpt_max_scan_files         unset | 20000 (default) files
    excerpt_provider_deadline_ms   unset | 1500 (default) ms
+   light_model                    not set
    max_skill_tokens               unset | 20000 (default) tokens
    memory_capture                 unset | on (default) on/off
    prompt_reserve_fraction        unset | 10% (0.1) (default) fraction

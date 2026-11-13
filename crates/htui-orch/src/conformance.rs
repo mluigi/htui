@@ -1101,6 +1101,25 @@ pub const CASES: &[&str] = &[
     // MOD-125 M3 F1 (review L6): a group whose every member reopens its session assembles no
     // prompt, so a prompt that can no longer be built fails none of them.
     "a_group_of_reopened_members_assembles_no_prompt",
+    // MOD-164 T6: the run-end capture step (plan D8, D9, D11): no trigger, a capture with
+    // provenance, no light model, the switch off, a failed capture, a failed run, a cancelled
+    // run, a cancel during the capture, an uncited quote, a person's entry kept, a crash during
+    // the capture, and a pre-MOD-164 snapshot.
+    "a_clean_run_writes_no_capture_row",
+    "a_retried_run_captures_an_entry_with_provenance",
+    "a_capture_without_a_light_model_is_skipped_on_its_row",
+    "capture_off_writes_no_row",
+    "a_failed_capture_leaves_the_run_done",
+    "a_failed_run_still_captures_and_stays_failed",
+    "a_cancelled_run_never_captures",
+    "a_cancel_during_capture_cancels_the_capture_row",
+    "a_capture_citing_text_not_in_the_pack_writes_nothing",
+    "a_person_entry_on_the_subject_is_kept_and_noted",
+    "a_crash_during_capture_interrupts_it_and_finishes_the_run",
+    "an_older_snapshot_without_capture_never_captures",
+    "a_capture_after_a_walk_cut_still_finishes_the_run",
+    "a_sibling_ending_during_a_live_capture_leaves_it_be",
+    "a_live_capture_admits_nothing_new",
 ];
 
 /// Run one case by name.
@@ -1126,6 +1145,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
     hand_back_case(name, harness)
         .or_else(|| persona_case(name, harness))
         .or_else(|| memory_case(name, harness))
+        .or_else(|| capture_case(name, harness))
         .or_else(|| hardening_case(name, harness))
         .or_else(|| input_case(name, harness))
         .or_else(|| command_queue_case(name, harness))
@@ -1465,6 +1485,53 @@ fn memory_case<'a, H: CaseHarness>(
         "a_project_without_memory_writes_no_memory_row" => {
             Box::pin(a_project_without_memory_writes_no_memory_row(harness))
         }
+        _ => return None,
+    })
+}
+
+/// MOD-164 T6's cases, in a frame of their own for [`hand_back_case`]'s reason.
+fn capture_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_clean_run_writes_no_capture_row" => Box::pin(a_clean_run_writes_no_capture_row(harness)),
+        "a_retried_run_captures_an_entry_with_provenance" => {
+            Box::pin(a_retried_run_captures_an_entry_with_provenance(harness))
+        }
+        "a_capture_without_a_light_model_is_skipped_on_its_row" => Box::pin(
+            a_capture_without_a_light_model_is_skipped_on_its_row(harness),
+        ),
+        "capture_off_writes_no_row" => Box::pin(capture_off_writes_no_row(harness)),
+        "a_failed_capture_leaves_the_run_done" => {
+            Box::pin(a_failed_capture_leaves_the_run_done(harness))
+        }
+        "a_failed_run_still_captures_and_stays_failed" => {
+            Box::pin(a_failed_run_still_captures_and_stays_failed(harness))
+        }
+        "a_cancelled_run_never_captures" => Box::pin(a_cancelled_run_never_captures(harness)),
+        "a_cancel_during_capture_cancels_the_capture_row" => {
+            Box::pin(a_cancel_during_capture_cancels_the_capture_row(harness))
+        }
+        "a_capture_citing_text_not_in_the_pack_writes_nothing" => Box::pin(
+            a_capture_citing_text_not_in_the_pack_writes_nothing(harness),
+        ),
+        "a_person_entry_on_the_subject_is_kept_and_noted" => {
+            Box::pin(a_person_entry_on_the_subject_is_kept_and_noted(harness))
+        }
+        "a_crash_during_capture_interrupts_it_and_finishes_the_run" => Box::pin(
+            a_crash_during_capture_interrupts_it_and_finishes_the_run(harness),
+        ),
+        "an_older_snapshot_without_capture_never_captures" => {
+            Box::pin(an_older_snapshot_without_capture_never_captures(harness))
+        }
+        "a_capture_after_a_walk_cut_still_finishes_the_run" => {
+            Box::pin(a_capture_after_a_walk_cut_still_finishes_the_run(harness))
+        }
+        "a_sibling_ending_during_a_live_capture_leaves_it_be" => {
+            Box::pin(a_sibling_ending_during_a_live_capture_leaves_it_be(harness))
+        }
+        "a_live_capture_admits_nothing_new" => Box::pin(a_live_capture_admits_nothing_new(harness)),
         _ => return None,
     })
 }
@@ -3048,7 +3115,8 @@ async fn missing_input_fails_before_a_token<H: CaseHarness>(harness: &H) {
     assert!(row.finished_at.is_some(), "a failed run is a finished run");
     assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Failed);
 
-    let steps = steps_of(&orch, run).await;
+    // MOD-164 D11: the failed run also ends with its capture row, skipped (no light model).
+    let steps = without_capture(steps_of(&orch, run).await);
     assert_eq!(steps.len(), 1, "stage 3 fails the one step it reached");
     assert_eq!(steps[0].status, StepStatus::Failed);
     assert!(
@@ -3092,7 +3160,12 @@ async fn missing_output_settles_failed<H: CaseHarness>(harness: &H) {
             .iter()
             .map(|step| (step.position, step.attempt, step.status))
             .collect::<Vec<_>>(),
-        [(0, 1, StepStatus::Failed), (0, 2, StepStatus::Failed)],
+        // MOD-164 D11: the failed run ends with its capture row, skipped (no light model).
+        [
+            (-4, 1, StepStatus::Done),
+            (0, 1, StepStatus::Failed),
+            (0, 2, StepStatus::Failed)
+        ],
         "plan D3: `retry_limit = 1` permits two attempts and no more"
     );
     assert!(
@@ -3579,6 +3652,8 @@ async fn an_intermediate_position_is_retired_by_the_loop<H: CaseHarness>(harness
             .map(|step| (step.position, step.attempt, step.status))
             .collect::<Vec<_>>(),
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Done),
             (2, 1, StepStatus::Superseded),
@@ -6263,7 +6338,8 @@ async fn a_prompt_refusal_blocks_the_item_and_starts_no_session<H: CaseHarness>(
         "ANA-5 criterion 3: the item is blocked"
     );
 
-    let steps = steps_of(&orch, run).await;
+    // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+    let steps = without_capture(steps_of(&orch, run).await);
     assert_eq!(steps.len(), 1, "stage 3 fails the one step it reached");
     assert_eq!(steps[0].status, StepStatus::Failed);
     assert_eq!(
@@ -8751,6 +8827,801 @@ async fn a_project_without_memory_writes_no_memory_row<H: CaseHarness>(harness: 
     assert!(blob.get("memory").is_none(), "{blob}");
 }
 
+// -- MOD-164: the run-end capture step (plan D8, D9, D11) ------------------------------------
+
+/// MOD-164: the model the capture cases' `light_model` names, on `agy`.
+const LIGHT_MODEL: &str = "light-1";
+
+/// MOD-164: the verify output attempt 1 of `prd` fails with, which the capture's pack shows.
+const FAILING_OUTPUT: &str = "test engine::walks ... FAILED: the sqlx offline data is stale";
+
+/// MOD-164 D7: the `light_model` App row naming `agy` and [`LIGHT_MODEL`].
+fn set_light_model<O: Orchestrate>(orch: &O) {
+    orch.store().set_app_setting(
+        "light_model",
+        serde_json::json!({ "agent_id": ids::AGENT_AGY, "model": LIGHT_MODEL }),
+    );
+}
+
+/// `FEAT-3` ungated, `prd` verified with `retry_limit`: attempt 1's verify fails with
+/// [`FAILING_OUTPUT`], so the run either retries and walks to `done` (a budget of one or more)
+/// or ends `failed` (none).
+async fn feat_3_retried<O: Orchestrate>(
+    orch: &O,
+    retry_limit: i32,
+    mutate: impl Fn(&mut StepGraphPhase),
+) {
+    feat_3_gated(orch, Gate::Never, |phase| {
+        if phase.name == "prd" {
+            phase.retry_limit = retry_limit;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+        mutate(phase);
+    })
+    .await;
+    let mut report = FakeVerifier::fail(1);
+    report.output = FAILING_OUTPUT.to_owned();
+    orch.verifier().script_report(report);
+}
+
+/// A capture answer of one `gotcha` entry on `subject`, citing block `S1` with `quote`.
+fn capture_answer(subject: &str, quote: &str) -> String {
+    serde_json::json!({
+        "entries": [{
+            "kind": "gotcha",
+            "subject": subject,
+            "body": "Run `cargo sqlx prepare` when the offline data goes stale.",
+            "evidence": [{ "block": "S1", "quote": quote }],
+        }]
+    })
+    .to_string()
+}
+
+/// Scripts the capture session's answer (phase `capture`, attempt 1).
+fn script_capture<O: Orchestrate>(orch: &O, answer: &str) {
+    orch.script(
+        htui_core::model::CAPTURE_KEY,
+        1,
+        ScriptedStep::done_with_output(answer),
+    );
+}
+
+/// MOD-164 D11: `steps` less the run's capture row, which a run that failed a step ends with
+/// (skipped, in a case that sets no light model).
+fn without_capture(steps: Vec<RunStep>) -> Vec<RunStep> {
+    steps
+        .into_iter()
+        .filter(|step| step.node_key.as_deref() != Some(htui_core::model::CAPTURE_KEY))
+        .collect()
+}
+
+/// The run's capture rows (D3: role `stage`, `node_key` `capture`).
+fn capture_rows(steps: &[RunStep]) -> Vec<&RunStep> {
+    steps
+        .iter()
+        .filter(|step| step.node_key.as_deref() == Some(htui_core::model::CAPTURE_KEY))
+        .collect()
+}
+
+/// The run's one capture row.
+///
+/// # Panics
+/// When the run has none, or more than one.
+fn capture_row(steps: &[RunStep]) -> RunStep {
+    let rows = capture_rows(steps);
+    let [row] = rows.as_slice() else {
+        panic!("one capture row: {steps:?}");
+    };
+    (*row).clone()
+}
+
+/// Every memory entry of `HTUI`, any state.
+async fn htui_memory<O: Orchestrate>(orch: &O) -> Vec<MemoryEntry> {
+    orch.store()
+        .memory_entries(ids::PROJECT_HTUI, None)
+        .await
+        .expect("MemStore never fails a read")
+        .unwrap_or_default()
+}
+
+/// The item notes the capture step wrote (`memory capture…`).
+async fn capture_notes<O: Orchestrate>(orch: &O, item: ItemId) -> Vec<String> {
+    notes_of(orch, item)
+        .await
+        .into_iter()
+        .filter(|note| note.starts_with("memory capture"))
+        .collect()
+}
+
+/// MOD-164 D9: a run with no failed step, no retry, no failed verify and no rejection owes no
+/// capture: no row and no note, though the switch is on and a light model is set.
+async fn a_clean_run_writes_no_capture_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    set_light_model(&orch);
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let capture = snapshot_of(&orch, run)
+        .await
+        .capture
+        .expect("the switch defaults on, so the snapshot freezes a capture");
+    assert_eq!(
+        capture.model.map(|model| (model.agent_id, model.model)),
+        Some((ids::AGENT_AGY, LIGHT_MODEL.to_owned())),
+        "D8: the light model frozen at `StartRun`"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert!(capture_rows(&steps).is_empty(), "{steps:?}");
+    assert!(capture_notes(&orch, ids::HTUI_FEAT_3).await.is_empty());
+}
+
+/// MOD-164 D11: verify fails, the retry passes, and the capture writes one entry citing the
+/// failing attempt's block, stamped with the run's provenance, the light model its row ran on.
+async fn a_retried_run_captures_an_entry_with_provenance<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done, "the retry passed");
+    assert_eq!(run_of(&orch, run).await.failure, None);
+
+    let steps = steps_of(&orch, run).await;
+    let failing = at(&steps, 0, 1).clone();
+    assert_eq!(failing.verify_outcome, Some(VerifyOutcome::Fail));
+    let capture = capture_row(&steps);
+    assert_eq!(
+        (
+            capture.role,
+            capture.position,
+            capture.attempt,
+            capture.phase_name.as_str(),
+            capture.status,
+            capture.agent_id,
+            capture.model.as_deref(),
+        ),
+        (
+            StepRole::Stage,
+            htui_core::model::CAPTURE_POSITION,
+            1,
+            htui_core::model::CAPTURE_KEY,
+            StepStatus::Done,
+            Some(ids::AGENT_AGY),
+            Some(LIGHT_MODEL),
+        ),
+        "D11 step 4: the capture row runs on the frozen light model"
+    );
+    let prompt = prompt_text(&orch, capture.id).await;
+    assert!(
+        prompt.contains(FAILING_OUTPUT),
+        "the pack shows the failing output:\n{prompt}"
+    );
+
+    let entries = htui_memory(&orch).await;
+    let [entry] = entries.as_slice() else {
+        panic!("one entry: {entries:?}");
+    };
+    assert_eq!(
+        (entry.source, entry.kind, entry.subject.as_str()),
+        (
+            htui_core::model::MemorySource::Run,
+            MemoryKind::Gotcha,
+            "Stale offline data"
+        )
+    );
+    let provenance = entry
+        .provenance
+        .as_ref()
+        .expect("a run's entry has provenance");
+    assert_eq!(
+        (
+            provenance.run_id,
+            provenance.step_id,
+            provenance.item_id,
+            provenance.agent_id,
+            provenance.model.as_deref(),
+        ),
+        (
+            Some(run),
+            Some(capture.id),
+            Some(ids::HTUI_FEAT_3),
+            Some(ids::AGENT_AGY),
+            Some(LIGHT_MODEL),
+        )
+    );
+    let evidence = entry.evidence.as_ref().expect("a run's entry has evidence");
+    assert_eq!(
+        evidence
+            .citations
+            .iter()
+            .map(|citation| (citation.step_id, citation.quote.as_str()))
+            .collect::<Vec<_>>(),
+        [(failing.id, FAILING_OUTPUT)],
+        "the document cites the failing block"
+    );
+    assert_eq!(
+        capture_notes(&orch, ids::HTUI_FEAT_3).await,
+        ["memory capture: wrote 1 (superseded 0), kept a person's entry 0, dropped 0"]
+    );
+}
+
+/// MOD-164 D11 step 3: no light model, so the capture row is created and passed `skipped` with
+/// its reason, no session runs and no item note is written.
+async fn a_capture_without_a_light_model_is_skipped_on_its_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    assert_eq!(
+        snapshot_of(&orch, run)
+            .await
+            .capture
+            .map(|capture| capture.model),
+        Some(None),
+        "on, with no model"
+    );
+    let capture = capture_row(&steps_of(&orch, run).await);
+    assert_eq!(
+        (
+            capture.status,
+            capture.gate_outcome,
+            capture.gate_note.as_deref(),
+            capture.agent_id,
+        ),
+        (
+            StepStatus::Done,
+            Some(GateOutcome::Skipped),
+            Some("skipped: no light model configured"),
+            None,
+        )
+    );
+    assert!(
+        orch.spec_for(&session(htui_core::model::CAPTURE_KEY, 0))
+            .is_none(),
+        "no capture session"
+    );
+    assert!(htui_memory(&orch).await.is_empty());
+    assert!(capture_notes(&orch, ids::HTUI_FEAT_3).await.is_empty());
+}
+
+/// MOD-164 D8: the project's switch off freezes no capture, and the retried run writes no row.
+async fn capture_off_writes_no_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    let mut settings = orch
+        .store()
+        .project_settings(ids::PROJECT_HTUI)
+        .await
+        .expect("MemStore never fails a read")
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    settings["memory_capture"] = serde_json::json!(false);
+    orch.store()
+        .set_project_settings(ids::PROJECT_HTUI, settings);
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    assert_eq!(snapshot_of(&orch, run).await.capture, None);
+    let steps = steps_of(&orch, run).await;
+    assert!(capture_rows(&steps).is_empty(), "{steps:?}");
+    assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 D11 step 6: an answer that is not the expected JSON (the fake's unscripted
+/// `scripted output`) fails the capture row with its reason and an item note; the run stays
+/// `done`.
+async fn a_failed_capture_leaves_the_run_done<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let row = run_of(&orch, run).await;
+    assert_eq!((row.status, row.failure), (RunStatus::Done, None));
+    let capture = capture_row(&steps_of(&orch, run).await);
+    assert_eq!(capture.status, StepStatus::Failed);
+    let reason = capture
+        .gate_note
+        .expect("a failed capture names its reason");
+    assert!(reason.contains("not the expected JSON"), "{reason}");
+    assert_eq!(
+        capture_notes(&orch, ids::HTUI_FEAT_3).await,
+        [format!("memory capture failed: {reason}")]
+    );
+    assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 D11: a run that fails (no retry budget) still captures, through the gate's own end,
+/// and its status and failure are not moved.
+async fn a_failed_run_still_captures_and_stays_failed<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 0, |_| {}).await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Failed);
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("verify_outcome: fail"))
+    );
+    let capture = capture_row(&steps_of(&orch, run).await);
+    assert_eq!(capture.status, StepStatus::Done);
+    let entries = htui_memory(&orch).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(
+        capture
+            .finished_at
+            .zip(row.finished_at)
+            .is_some_and(|(step, run)| step <= run),
+        "the run's finish is its last write"
+    );
+}
+
+/// MOD-164 D11: a cancelled run never captures, whatever its steps owe.
+async fn a_cancelled_run_never_captures<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1))
+    );
+    orch.dispatch(Command::CancelRun { run })
+        .await
+        .expect("a parked run is cancellable");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Cancelled);
+    let steps = steps_of(&orch, run).await;
+    assert!(capture_rows(&steps).is_empty(), "{steps:?}");
+    assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 D11 (cancel during capture): a cancel that reaches the live capture session ends the
+/// walk `Cancelled` with nothing written; the cancel path then cancels the capture row with the
+/// run.
+async fn a_cancel_during_capture_cancels_the_capture_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let hold = orch.hold_sessions(&[(htui_core::model::CAPTURE_KEY, 1)]);
+    let run = orch
+        .enqueue(ids::HTUI_FEAT_3)
+        .await
+        .expect("the graph resolves");
+    let cancel = async {
+        within(hold.live(1), "the capture session held").await;
+        orch.cancel_walks(std::time::Duration::from_millis(10));
+    };
+    let (result, ()) = tokio::join!(orch.claim(run), cancel);
+    assert!(
+        matches!(&result, Err(EngineError::Cancelled { run: cancelled }) if *cancelled == run),
+        "{result:?}"
+    );
+    assert_eq!(
+        capture_row(&steps_of(&orch, run).await).status,
+        StepStatus::Running,
+        "the cancelled walk settles nothing"
+    );
+    orch.dispatch(Command::CancelRun { run })
+        .await
+        .expect("the run is cancellable");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Cancelled);
+    assert_eq!(
+        capture_row(&steps_of(&orch, run).await).status,
+        StepStatus::Cancelled
+    );
+    assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 D10: a citation whose quote is not in the block it names drops its entry; the
+/// capture still succeeds, writes nothing and says why.
+async fn a_capture_citing_text_not_in_the_pack_writes_nothing<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    script_capture(
+        &orch,
+        &capture_answer("Stale offline data", "a sentence the pack never showed"),
+    );
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    assert_eq!(
+        capture_row(&steps_of(&orch, run).await).status,
+        StepStatus::Done
+    );
+    assert!(htui_memory(&orch).await.is_empty());
+    assert_eq!(
+        capture_notes(&orch, ids::HTUI_FEAT_3).await,
+        [
+            "memory capture: wrote 0 (superseded 0), kept a person's entry 0, dropped 1 \
+             (quote_not_found)"
+        ]
+    );
+}
+
+/// MOD-164 D4: a person's live entry on the subject is never replaced; the capture keeps it and
+/// says so.
+async fn a_person_entry_on_the_subject_is_kept_and_noted<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    let person = remember(
+        &orch,
+        ids::PROJECT_HTUI,
+        MemoryKind::Fact,
+        "Stale offline data",
+        "A person wrote this first.",
+    )
+    .await;
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    assert_eq!(
+        capture_row(&steps_of(&orch, run).await).status,
+        StepStatus::Done
+    );
+    assert_eq!(
+        htui_memory(&orch)
+            .await
+            .iter()
+            .map(|entry| (entry.id, entry.source, entry.state, entry.version))
+            .collect::<Vec<_>>(),
+        [(person.id, person.source, person.state, person.version)],
+        "the person's entry stands, alone and unedited"
+    );
+    assert_eq!(
+        capture_notes(&orch, ids::HTUI_FEAT_3).await,
+        ["memory capture: wrote 0 (superseded 0), kept a person's entry 1, dropped 0"]
+    );
+}
+
+/// MOD-164 D11 step 1 and recovery: a crash during the capture session leaves its row
+/// `running`; the adopter's walk interrupts it, never re-runs it, and finishes the run.
+async fn a_crash_during_capture_interrupts_it_and_finishes_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |_| {}).await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let stalled = orch.stall_after_done(htui_core::model::CAPTURE_KEY, 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    assert_eq!(
+        capture_row(&steps_of(&orch, run).await).status,
+        StepStatus::Running
+    );
+
+    let other = orch.restarted();
+    assert_eq!(
+        other.sweep().await.expect("the sweep adopts"),
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let resumed = other.resume(run).await.expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::Done,
+                ..
+            })
+        ),
+        "{resumed:?}"
+    );
+    let capture = capture_row(&steps_of(&other, run).await);
+    assert_eq!(
+        capture.status,
+        StepStatus::Failed,
+        "interrupted, not re-run"
+    );
+    assert!(
+        capture
+            .gate_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("interrupted")),
+        "{capture:?}"
+    );
+    assert!(htui_memory(&other).await.is_empty(), "never re-run");
+}
+
+/// MOD-164 D8: a snapshot written before MOD-164 has no `capture` key: the run resumes and ends
+/// without a capture row, though its steps owe one and the switch is on now.
+async fn an_older_snapshot_without_capture_never_captures<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_retried(&orch, 1, |phase| {
+        if phase.name == "plan" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1))
+    );
+    let mut blob = run_of(&orch, run)
+        .await
+        .graph_snapshot
+        .expect("the walk created the run with a snapshot");
+    assert!(
+        blob.as_object_mut()
+            .expect("a snapshot is an object")
+            .remove("capture")
+            .is_some(),
+        "the run froze a capture: {blob}"
+    );
+    assert!(orch.store().set_run_snapshot(run, blob), "the run exists");
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let steps = steps_of(&orch, run).await;
+    assert!(capture_rows(&steps).is_empty(), "{steps:?}");
+    assert!(htui_memory(&orch).await.is_empty());
+}
+
+/// MOD-164 F1: FEAT-3 on the diamond with `plan` and `implement` out of retries: `plan`'s
+/// session writes no output, and `implement`'s verify fails with [`FAILING_OUTPUT`] (`prd`'s
+/// passes). Either fails the run; a light model is set and the capture's answer cites the
+/// failing verify.
+async fn diamond_failing_both_branches<O: Orchestrate>(orch: &O) {
+    feat_3_graph(orch, DIAMOND, |phase| match phase.name.as_str() {
+        "plan" => phase.retry_limit = 0,
+        "implement" => {
+            phase.retry_limit = 0;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+        _ => {}
+    })
+    .await;
+    orch.script("plan", 1, ScriptedStep::done_without_output());
+    // `prd`'s verify (FEAT-3 seeds one) passes; `implement`'s is the next.
+    orch.verifier().script_report(FakeVerifier::pass());
+    let mut report = FakeVerifier::fail(1);
+    report.output = FAILING_OUTPUT.to_owned();
+    orch.verifier().script_report(report);
+    set_light_model(orch);
+    script_capture(orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+}
+
+/// Yields long enough for every live node future of a walk to run until it next waits.
+async fn settle_down() {
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// MOD-164 F1 (review H1): a capture under an already-cut walk still finishes the run. On the
+/// diamond, `plan`'s failing settle meets a store fault and raises, which cuts the walk while
+/// `implement` is suspended past its session. Woken with no output, `implement` fails the run,
+/// and its capture drives on the run's own control, not the cut walk's: the capture row settles,
+/// the run ends `failed`, and the cut `plan` row is cancelled.
+async fn a_capture_after_a_walk_cut_still_finishes_the_run<H: CaseHarness>(harness: &H) {
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    diamond_failing_both_branches(&orch).await;
+    let plan = orch.hold_sessions(&[("plan", 1)]);
+    let (suspended, wake) = orch.suspend_after_done("implement", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(plan.live(1), suspended.notified()) },
+            "`plan` live and `implement` suspended",
+        )
+        .await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        let row = latest_row(&steps_of(&orch, run).await, 1)
+            .expect("`plan` runs")
+            .id;
+        orch.store().set_fault(MemFault::TransitionStep(row), true);
+        plan.release();
+        // `plan`'s failing settle raises on the fault, and the walk is cut.
+        settle_down().await;
+        orch.store().set_fault(MemFault::TransitionStep(row), false);
+        wake.notify_one();
+    };
+    let (outcome, ()) = within(
+        async {
+            tokio::join!(
+                orch.dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace: None,
+                }),
+                meddle
+            )
+        },
+        "the end",
+    )
+    .await;
+    let run = feat_3_run(&orch).await.expect("the run exists");
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("missing_output")),
+        "the run is finished: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            &outcome,
+            Ok(CommandOutcome::Started { rest, .. })
+                if rest.run == RunStatus::Failed && rest.position == Some(2)
+        ),
+        "the terminal rest wins over `plan`'s error: {outcome:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let capture = capture_row(&steps);
+    assert_eq!(capture.status, StepStatus::Done, "{capture:?}");
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Cancelled),
+        "the cut `plan` row is cancelled"
+    );
+}
+
+/// MOD-164 F1 (review H2): a live capture is the run's end. `implement`'s verify fails the run
+/// while `plan` is suspended past its session; the capture's session is held, and `plan`, woken,
+/// fails meanwhile. It neither interrupts the live capture nor finishes the run under it: the run
+/// stays `running` until the capture is released, which then settles `done` on its one row with
+/// its entry written, and the run is finished once, with `implement`'s failure.
+async fn a_sibling_ending_during_a_live_capture_leaves_it_be<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    diamond_failing_both_branches(&orch).await;
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    let capture = orch.hold_sessions(&[(htui_core::model::CAPTURE_KEY, 1)]);
+    let (suspended, wake) = orch.suspend_after_done("plan", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(implement.live(1), suspended.notified()) },
+            "`implement` live and `plan` suspended",
+        )
+        .await;
+        implement.release();
+        within(capture.live(1), "the capture session held").await;
+        wake.notify_one();
+        settle_down().await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        assert_eq!(
+            run_of(&orch, run).await.status,
+            RunStatus::Running,
+            "nothing finishes the run under its live capture"
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            capture_row(&steps).status,
+            StepStatus::Running,
+            "the live capture is not interrupted"
+        );
+        capture.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(2)),
+        "{rest:?}"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("verify_outcome: fail")),
+        "finished once, by `implement`"
+    );
+    let capture = capture_row(&steps_of(&orch, run).await);
+    assert_eq!(capture.status, StepStatus::Done, "{capture:?}");
+    assert_eq!(htui_memory(&orch).await.len(), 1);
+    assert!(
+        capture
+            .finished_at
+            .zip(row.finished_at)
+            .is_some_and(|(step, run)| step <= run),
+        "the run's finish is its last write"
+    );
+}
+
+/// MOD-164 F1 (review: the capture's cut admits nothing): a live capture ends the walk's
+/// admission. On `prd → plan → review` beside `implement`, `implement`'s verify fails the run
+/// while `plan` is suspended past its session; the capture's session is held, and `plan`, woken
+/// with its document written, settles `done` meanwhile. Its successor `review` is never admitted:
+/// no row is created for it, during the capture or after, and the run ends `failed` once.
+async fn a_live_capture_admits_nothing_new<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_graph(&orch, CHAIN_AND_SINK, |phase| match phase.name.as_str() {
+        "plan" => phase.output_kind = "plan".to_owned(),
+        "implement" => {
+            phase.retry_limit = 0;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+        _ => {}
+    })
+    .await;
+    // `prd`'s verify (FEAT-3 seeds one) passes; `implement`'s is the next.
+    orch.verifier().script_report(FakeVerifier::pass());
+    let mut report = FakeVerifier::fail(1);
+    report.output = FAILING_OUTPUT.to_owned();
+    orch.verifier().script_report(report);
+    set_light_model(&orch);
+    script_capture(&orch, &capture_answer("Stale offline data", FAILING_OUTPUT));
+    let implement = orch.hold_sessions(&[("implement", 1)]);
+    let capture = orch.hold_sessions(&[(htui_core::model::CAPTURE_KEY, 1)]);
+    let (suspended, wake) = orch.suspend_after_done("plan", 1, None);
+
+    let meddle = async {
+        within(
+            async { tokio::join!(implement.live(1), suspended.notified()) },
+            "`implement` live and `plan` suspended",
+        )
+        .await;
+        implement.release();
+        within(capture.live(1), "the capture session held").await;
+        let run = feat_3_run(&orch).await.expect("the run exists");
+        let plan = latest_row(&steps_of(&orch, run).await, 1)
+            .expect("`plan` runs")
+            .clone();
+        orch.author(ids::HTUI_FEAT_3, &plan, "plan", "the plan, written")
+            .await
+            .expect("the document is written");
+        wake.notify_one();
+        within(
+            until_steps(&orch, run, |steps| {
+                latest_row(steps, 1).is_some_and(|step| step.status == StepStatus::Done)
+            }),
+            "`plan` settled done",
+        )
+        .await;
+        settle_down().await;
+        let steps = steps_of(&orch, run).await;
+        assert!(
+            latest_row(&steps, 3).is_none(),
+            "the capture's cut admits nothing: {steps:?}"
+        );
+        capture.release();
+    };
+    let ((run, rest), ()) = within(
+        async { tokio::join!(start(&orch, ids::HTUI_FEAT_3), meddle) },
+        "the end",
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(2)),
+        "{rest:?}"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure.as_deref()),
+        (RunStatus::Failed, Some("verify_outcome: fail")),
+        "finished once, by `implement`"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        latest_row(&steps, 3).is_none(),
+        "`review` was never admitted: {steps:?}"
+    );
+    assert_eq!(
+        latest_row(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Done),
+        "`plan` kept its own settle"
+    );
+    assert_eq!(capture_row(&steps).status, StepStatus::Done);
+    assert_eq!(htui_memory(&orch).await.len(), 1);
+}
+
 // -- MOD-11 T8: the command queue's exposure and the R-MCP-4 denials (plan D16, D17) --------
 
 /// The session key of `phase`'s first attempt, candidate `fanout_index`, first call.
@@ -9348,7 +10219,7 @@ async fn a_batch_run_session_is_capped_at_the_batch_remainder<H: CaseHarness>(ha
         "{detail}"
     );
     assert_eq!(
-        steps_of(&orch, run).await.len(),
+        without_capture(steps_of(&orch, run).await).len(),
         2,
         "no second `verdict` attempt was written"
     );
@@ -10006,6 +10877,8 @@ async fn a_changes_requested_edge_loops_a_node_not_named_review<H: CaseHarness>(
     assert_eq!(
         sorted_shape(&orch, run).await,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Done),
             (2, 1, StepStatus::Superseded),
@@ -10094,6 +10967,8 @@ async fn a_fails_edge_loops_and_retires_its_region<H: CaseHarness>(harness: &H) 
     assert_eq!(
         sorted_shape(&orch, run).await,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Superseded),
             (1, 2, StepStatus::Done),
@@ -10354,6 +11229,8 @@ async fn a_loop_on_a_diamond_retires_only_its_region<H: CaseHarness>(harness: &H
     assert_eq!(
         sorted_shape(&orch, run).await,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Superseded),
             (1, 2, StepStatus::Done),
@@ -11327,9 +12204,14 @@ async fn a_reject_of_a_failed_park_on_an_asks_you_node_ends_the_run<H: CaseHarne
         ),
         "{rest:?}"
     );
+    // MOD-164 D11: the run ends with its capture row, skipped (no light model).
     assert_eq!(
         sorted_shape(&orch, run).await,
-        [(0, 1, StepStatus::Done), (1, 1, StepStatus::Failed)]
+        [
+            (-4, 1, StepStatus::Done),
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Failed)
+        ]
     );
     let plan = step_at(&orch, run, 1, 1).await;
     assert_eq!(
@@ -12294,6 +13176,8 @@ async fn a_terminal_end_cancels_a_sibling_row_created_beside_it<H: CaseHarness>(
     assert_eq!(
         shape,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Failed),
             (2, 1, StepStatus::Cancelled),
@@ -12361,6 +13245,8 @@ async fn a_rejection_ending_the_run_cancels_the_other_parked_step<H: CaseHarness
     assert_eq!(
         sorted_shape(&orch, run).await,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Failed),
             (2, 1, StepStatus::Cancelled),
@@ -13118,6 +14004,8 @@ async fn a_rejection_handed_back_cancels_the_other_parked_step<H: CaseHarness>(h
     assert_eq!(
         sorted_shape(&b, run).await,
         [
+            // MOD-164 D11: the run ends with its capture row, skipped (no light model).
+            (-4, 1, StepStatus::Done),
             (0, 1, StepStatus::Done),
             (1, 1, StepStatus::Failed),
             (2, 1, StepStatus::Cancelled),
@@ -18186,8 +19074,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            249,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            264,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10 + 3 + 2 + 12 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -18284,7 +19172,13 @@ mod tests {
              this box and on none), and MOD-125 M3 T4's three (plan D4, D9: a stopped part before \
              its queued sibling, a `shared_serialized` candidate reacquired, the judge re-run), and MOD-125 M3 F1's two (review L3: a \
              stopped step beside a park resumed before the run parks again; review L6: a group of \
-             reopened members assembling no prompt) 249"
+             reopened members assembling no prompt), and MOD-164 T6's twelve capture cases \
+             (plan D8, D9, D11: no trigger, a capture with provenance, no light model, the switch \
+             off, a failed capture, a failed run, a cancelled run, a cancel during the capture, \
+             an uncited quote, a person's entry kept, a crash during the capture, and a \
+             pre-MOD-164 snapshot), and MOD-164 F1's three (a capture after a walk cut still \
+             finishing the run, a sibling ending during a live capture leaving it be, and a live \
+             capture admitting nothing new) 264"
         );
     }
 
@@ -18600,7 +19494,7 @@ mod fanout_paths {
         );
         assert_eq!(orch.isolator().prepares(), 0, "no tree was prepared");
         let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
-        let phase = &steps[0].phase_name;
+        let phase = &super::without_capture(steps.clone())[0].phase_name;
         for index in 0..3 {
             let note = format!(
                 "fan-out candidate {index} of `{phase}` attempt 1: missing input document: spec"

@@ -386,9 +386,10 @@ pub struct RunStep {
     /// planner step; `None` on every other row today. Written once.
     #[serde(default)]
     pub parent_step_id: Option<StepId>,
-    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11): a part's `<divided>/<part_key>`, or a
-    /// stage's `pick` | `prepare` | `collect` ([`STAGE_KEYS`]); `None` on a node of the frozen
-    /// snapshot, which `position` names. Written once.
+    /// `run_step.node_key` (MOD-139 D3, ANA-33 §7.4, §7.11; MOD-164 D3): a part's
+    /// `<divided>/<part_key>`, or a stage's `capture` | `pick` | `prepare` | `collect`
+    /// ([`STAGE_KEYS`]); `None` on a node of the frozen snapshot, which `position` names. Written
+    /// once.
     #[serde(default)]
     pub node_key: Option<String>,
     /// `run_step.updated_at`.
@@ -730,6 +731,33 @@ pub struct GraphSnapshot {
     /// snapshot written before MOD-163, which renders no memory section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::model::memory::SnapshotMemory>,
+    /// MOD-164 D8: the run-end memory capture, frozen at `StartRun`: `Some` iff the project's
+    /// `memory_capture` switch resolved on, with the light model it resolved to. `None` means
+    /// capture is off: the switch is off, or the snapshot was written before MOD-164. **Not**
+    /// hashed by `topology` and [`GraphSnapshot::V`] not bumped; absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<SnapshotCapture>,
+}
+
+/// MOD-164 D8: [`GraphSnapshot::capture`], what the run's capture step runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCapture {
+    /// The `light_model` App setting at `StartRun`, its agent's name frozen beside it. `None`
+    /// when the setting is unset, malformed, or names an agent that is missing or disabled: the
+    /// capture step is then skipped on its row.
+    #[serde(default)]
+    pub model: Option<SnapshotCaptureModel>,
+}
+
+/// MOD-164 D8: the light model a capture step runs on, as frozen at `StartRun`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCaptureModel {
+    /// `agent.id`.
+    pub agent_id: AgentId,
+    /// `agent.name` at `StartRun`.
+    pub agent_name: String,
+    /// The model the agent is asked for.
+    pub model: String,
 }
 
 impl GraphSnapshot {
@@ -1104,16 +1132,26 @@ str_enum!(
         Subgraph => "subgraph",
         /// A read-only consult-mode subagent (MOD-27).
         Consult => "consult",
-        /// One of htui's own stages at positions -3..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
-        /// `chk_run_step_stage`); MOD-126 and MOD-132 write them.
+        /// One of htui's own stages at positions -4..-1, keyed by [`STAGE_KEYS`] (ANA-33 §7.11,
+        /// `chk_run_step_stage`); MOD-126 and MOD-132 write pick, prepare and collect, MOD-164
+        /// writes capture.
         Stage => "stage",
     }
 );
 
-/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `pick` at -3,
-/// `prepare` at -2, `collect` at -1 (ANA-33 §7.11). `chk_run_step_stage` lists the same three; the
-/// CHECK does not bind a key to its position (blueprint F-1).
-pub const STAGE_KEYS: [&str; 3] = ["pick", "prepare", "collect"];
+/// The `node_key`s a [`StepRole::Stage`] row may carry, in reserved-position order: `capture` at -4
+/// (MOD-164 D3), `pick` at -3, `prepare` at -2, `collect` at -1 (ANA-33 §7.11).
+/// `chk_run_step_stage` lists the same four (`0033_memory_capture.sql`); the CHECK does not bind a
+/// key to its position (blueprint F-1), so neither does [`run_step_refusal`].
+///
+/// [`run_step_refusal`]: crate::store::run_step_refusal
+pub const STAGE_KEYS: [&str; 4] = ["capture", "pick", "prepare", "collect"];
+
+/// The capture stage's `node_key` and `phase_name` (MOD-164 D3): the run-end memory capture turn.
+pub const CAPTURE_KEY: &str = "capture";
+
+/// The capture stage row's reserved position (MOD-164 D3), the first of [`STAGE_KEYS`]'s.
+pub const CAPTURE_POSITION: i32 = -4;
 
 /// The suffix of an expanded `divide` node's planner key, `<name>:plan` (MOD-138 D11). A phase may
 /// not be named with it (MOD-139 D6, [`phase_name_refusal`](crate::store::phase_name_refusal)), so a
@@ -2270,6 +2308,7 @@ mod tests {
             scope: None,
             personas,
             memory: None,
+            capture: None,
         }
     }
 
@@ -2338,6 +2377,36 @@ mod tests {
             (&back.phases, &back.edges),
             (&snapshot.phases, &snapshot.edges)
         );
+    }
+
+    /// MOD-164 D8: a pre-MOD-164 snapshot has no `capture` key and decodes as `None` (capture
+    /// off); a `None` snapshot writes no key; a frozen capture round-trips, its model or not.
+    #[test]
+    fn a_snapshot_without_capture_decodes_as_none_and_writes_no_key() {
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let value = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(value.get("capture").is_none(), "{value}");
+        let back: super::GraphSnapshot = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(back.capture, None);
+
+        for model in [
+            None,
+            Some(super::SnapshotCaptureModel {
+                agent_id: crate::model::AgentId::from_uuid(Uuid::from_u128(7)),
+                agent_name: "agy".to_owned(),
+                model: "light-1".to_owned(),
+            }),
+        ] {
+            let mut with = snapshot.clone();
+            with.capture = Some(super::SnapshotCapture { model });
+            let value = serde_json::to_value(&with).expect("encodes");
+            assert!(value["capture"].is_object(), "{value}");
+            let back: super::GraphSnapshot = serde_json::from_value(value).expect("decodes");
+            assert_eq!(back, with);
+        }
+        let off: super::SnapshotCapture =
+            serde_json::from_value(serde_json::json!({})).expect("a model-less capture decodes");
+        assert_eq!(off.model, None);
     }
 
     #[test]
@@ -3025,5 +3094,15 @@ mod tests {
             },
             step
         );
+    }
+
+    /// MOD-164 D3: `capture` is the fourth stage key, at the reserved position -4, ahead of the
+    /// other three in reserved-position order.
+    #[test]
+    fn capture_is_a_stage_key_at_minus_four() {
+        assert_eq!(super::STAGE_KEYS, ["capture", "pick", "prepare", "collect"]);
+        assert_eq!(super::CAPTURE_KEY, "capture");
+        assert_eq!(super::CAPTURE_POSITION, -4);
+        assert!(super::STAGE_KEYS.contains(&super::CAPTURE_KEY));
     }
 }

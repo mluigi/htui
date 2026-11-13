@@ -1703,6 +1703,16 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             .await
     }
 
+    // MOD-164: forwarded, never logged.
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: htui_core::model::NewRunMemory,
+    ) -> StoreResult<htui_core::model::RunMemoryWrite> {
+        self.inner.write_run_memory(fence, step, new).await
+    }
+
     // MOD-70: forwarded, never logged (as MOD-42's relay methods).
     async fn request_follow_up(&self, new: NewFollowUp) -> StoreResult<FollowUpRequest> {
         self.inner.request_follow_up(new).await

@@ -105,7 +105,13 @@ use uuid::Uuid;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
-use crate::pg::rows::PersonaRow;
+use crate::pg::rows::{MemoryEntryRow, PersonaRow};
+use htui_core::model::{
+    CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemoryEvidence, MemorySource, NewRunMemory, RunMemoryWrite,
+};
+use htui_core::store::traits::{
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
+};
 
 /// The refusal text for a kind that is unknown or belongs to another project.
 ///
@@ -757,7 +763,7 @@ async fn memory_cas_head(
     expected_version: i32,
 ) -> Result<core::result::Result<MemoryEntry, (MemoryEntry, MemoryRevision)>> {
     let Some(head) = sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         SELECT id            AS "id: MemoryEntryId",
                project_id    AS "project_id: ProjectId",
@@ -770,7 +776,18 @@ async fn memory_cas_head(
                superseded_by AS "superseded_by: MemoryEntryId",
                created_by    AS "created_by: UserId",
                created_at,
-               updated_at
+               updated_at,
+               source        AS "source: MemorySource",
+               run_id        AS "run_id: RunId",
+               step_id       AS "step_id: StepId",
+               item_id       AS "item_id: ItemId",
+               agent_id      AS "agent_id: AgentId",
+               model,
+               commit_hash,
+               evidence      AS "evidence: Json<MemoryEvidence>",
+               shown_steps,
+               shown_done,
+               shown_failed
           FROM memory_entry WHERE id = $1 FOR UPDATE
         "#,
         id.as_uuid(),
@@ -778,7 +795,7 @@ async fn memory_cas_head(
     .fetch_optional(&mut *conn)
     .await
     .map_err(map_sqlx)?
-    else {
+    .map(MemoryEntry::from) else {
         return Err(StoreError::NotFound {
             entity: "memory_entry",
             id: id.to_string(),
@@ -828,7 +845,7 @@ async fn apply_memory_edit(
     edit: MemoryEdit,
 ) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
     sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         WITH u AS (
             UPDATE memory_entry SET
@@ -841,7 +858,9 @@ async fn apply_memory_edit(
                 version       = version + 1
              WHERE id = $1
             RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
-                      superseded_by, created_by, created_at, updated_at
+                      superseded_by, created_by, created_at, updated_at, source, run_id,
+                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,
+                      shown_done, shown_failed
         ), v AS (
             INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
                                                author_id, box_id, reason)
@@ -859,7 +878,18 @@ async fn apply_memory_edit(
                u.superseded_by AS "superseded_by: MemoryEntryId",
                u.created_by    AS "created_by!: UserId",
                u.created_at    AS "created_at!",
-               u.updated_at    AS "updated_at!"
+               u.updated_at    AS "updated_at!",
+               u.source        AS "source!: MemorySource",
+               u.run_id        AS "run_id: RunId",
+               u.step_id       AS "step_id: StepId",
+               u.item_id       AS "item_id: ItemId",
+               u.agent_id      AS "agent_id: AgentId",
+               u.model         AS "model",
+               u.commit_hash   AS "commit_hash",
+               u.evidence      AS "evidence: Json<MemoryEvidence>",
+               u.shown_steps   AS "shown_steps!",
+               u.shown_done    AS "shown_done!",
+               u.shown_failed  AS "shown_failed!"
           FROM u, v
         "#,
         id.as_uuid(),
@@ -875,6 +905,7 @@ async fn apply_memory_edit(
     )
     .fetch_optional(&mut *conn)
     .await
+    .map(|row| row.map(MemoryEntry::from))
 }
 
 /// One statement: the row and its revision 1, `reason = 'created'` (`mint_requirement`'s shape).
@@ -886,14 +917,16 @@ async fn insert_memory_entry(
     new: &NewMemoryEntry,
 ) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
     sqlx::query_as!(
-        MemoryEntry,
+        MemoryEntryRow,
         r#"
         WITH p AS (SELECT id FROM project WHERE id = $1),
              e AS (
-            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by)
-            SELECT $2, p.id, $3, $4, $5, $6 FROM p
+            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by, source)
+            SELECT $2, p.id, $3, $4, $5, $6, 'person' FROM p
             RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
-                      superseded_by, created_by, created_at, updated_at
+                      superseded_by, created_by, created_at, updated_at, source, run_id,
+                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,
+                      shown_done, shown_failed
         ), v AS (
             INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
                                                author_id, box_id, reason)
@@ -911,7 +944,18 @@ async fn insert_memory_entry(
                e.superseded_by AS "superseded_by: MemoryEntryId",
                e.created_by    AS "created_by!: UserId",
                e.created_at    AS "created_at!",
-               e.updated_at    AS "updated_at!"
+               e.updated_at    AS "updated_at!",
+               e.source        AS "source!: MemorySource",
+               e.run_id        AS "run_id: RunId",
+               e.step_id       AS "step_id: StepId",
+               e.item_id       AS "item_id: ItemId",
+               e.agent_id      AS "agent_id: AgentId",
+               e.model         AS "model",
+               e.commit_hash   AS "commit_hash",
+               e.evidence      AS "evidence: Json<MemoryEvidence>",
+               e.shown_steps   AS "shown_steps!",
+               e.shown_done    AS "shown_done!",
+               e.shown_failed  AS "shown_failed!"
           FROM e, v
         "#,
         project.as_uuid(),
@@ -924,6 +968,7 @@ async fn insert_memory_entry(
     )
     .fetch_optional(&mut *conn)
     .await
+    .map(|row| row.map(MemoryEntry::from))
 }
 
 /// A memory write's refusal in `MemStore`'s sentences (`persona_name_taken`'s rule, plus one
@@ -980,6 +1025,164 @@ async fn memory_write_refused(
         }
         _ => map_sqlx(err),
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-164 helpers (plan D4, D5).
+// ------------------------------------------------------------------------------------------------
+
+/// The rows a capture write stamps its entry from (MOD-164 D4): the step's role, key, agent and
+/// model, the run's starter and lease box, and how many entries already name the step.
+struct CaptureFacts {
+    role: StepRole,
+    node_key: Option<String>,
+    agent_id: Option<AgentId>,
+    model: Option<String>,
+    started_by: UserId,
+    lease_box_id: Option<BoxId>,
+    written: i64,
+}
+
+/// [`CaptureFacts`] of `step`, on the caller's transaction after [`step_scope`] locked the step
+/// and its run. `idx_memory_entry_step` serves the count.
+async fn capture_facts(conn: &mut PgConnection, step: StepId) -> Result<CaptureFacts> {
+    sqlx::query_as!(
+        CaptureFacts,
+        r#"
+        SELECT s.role         AS "role: StepRole",
+               s.node_key,
+               s.agent_id     AS "agent_id: AgentId",
+               s.model,
+               r.started_by   AS "started_by: UserId",
+               r.lease_box_id AS "lease_box_id: BoxId",
+               (SELECT count(*) FROM memory_entry m WHERE m.step_id = s.id) AS "written!"
+          FROM run_step s JOIN run r ON r.id = s.run_id
+         WHERE s.id = $1
+        "#,
+        step.as_uuid(),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// One statement: a run's entry (`source = 'run'`, its provenance stamped from `facts` and
+/// `scope`) and its revision 1, `reason = 'created'`, by the run's starter on its lease box
+/// (MOD-164 D4; [`insert_memory_entry`]'s shape).
+async fn insert_run_memory_entry(
+    conn: &mut PgConnection,
+    scope: &StepScope,
+    step: StepId,
+    facts: &CaptureFacts,
+    new: &NewRunMemory,
+    evidence: &Value,
+) -> core::result::Result<MemoryEntry, sqlx::Error> {
+    sqlx::query_as!(
+        MemoryEntryRow,
+        r#"
+        WITH e AS (
+            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by, source,
+                                      run_id, step_id, item_id, agent_id, model, commit_hash,
+                                      evidence)
+            VALUES ($1, $2, $3, $4, $5, $6, 'run', $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
+                      superseded_by, created_by, created_at, updated_at, source, run_id,
+                      step_id, item_id, agent_id, model, commit_hash, evidence, shown_steps,
+                      shown_done, shown_failed
+        ), v AS (
+            INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
+                                               author_id, box_id, reason)
+            SELECT id, version, kind, subject, body, state, $6, $14, 'created' FROM e
+            RETURNING entry_id
+        )
+        SELECT e.id            AS "id!: MemoryEntryId",
+               e.project_id    AS "project_id!: ProjectId",
+               e.kind          AS "kind!: MemoryKind",
+               e.subject       AS "subject!",
+               e.body          AS "body!",
+               e.state         AS "state!: MemoryState",
+               e.version       AS "version!",
+               e.confirmed_at  AS "confirmed_at!",
+               e.superseded_by AS "superseded_by: MemoryEntryId",
+               e.created_by    AS "created_by!: UserId",
+               e.created_at    AS "created_at!",
+               e.updated_at    AS "updated_at!",
+               e.source        AS "source!: MemorySource",
+               e.run_id        AS "run_id: RunId",
+               e.step_id       AS "step_id: StepId",
+               e.item_id       AS "item_id: ItemId",
+               e.agent_id      AS "agent_id: AgentId",
+               e.model         AS "model",
+               e.commit_hash   AS "commit_hash",
+               e.evidence      AS "evidence: Json<MemoryEvidence>",
+               e.shown_steps   AS "shown_steps!",
+               e.shown_done    AS "shown_done!",
+               e.shown_failed  AS "shown_failed!"
+          FROM e, v
+        "#,
+        new.id.as_uuid(),
+        scope.project.as_uuid(),
+        new.kind.as_str(),
+        new.subject.as_str(),
+        new.body.as_str(),
+        facts.started_by.as_uuid(),
+        scope.run.as_uuid(),
+        step.as_uuid(),
+        scope.item.map(ItemId::as_uuid),
+        facts.agent_id.map(AgentId::as_uuid),
+        facts.model.as_deref(),
+        new.commit.as_deref(),
+        evidence,
+        facts.lease_box_id.map(BoxId::as_uuid),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map(MemoryEntry::from)
+}
+
+/// MOD-164 D5: `finish_run`'s usage tally, on [`finish_run_on`]'s transaction right after the
+/// run's terminal move. For every step of `run` whose `trim_record.memory.shown` is an array,
+/// each distinct listed `id` that is a UUID's text and names an entry gains one showing, and one
+/// done or one failed by the step's status. A non-array `shown` or a non-UUID `id` counts
+/// nothing and refuses nothing. The entries are locked in id order, so two runs ending at once
+/// over the same entries queue rather than deadlock.
+async fn tally_memory_usage(conn: &mut PgConnection, run: RunId) -> Result<()> {
+    sqlx::query!(
+        r#"
+        WITH listed AS (
+            SELECT DISTINCT s.id AS step_id, s.status, e.value ->> 'id' AS entry
+              FROM run_step s
+             CROSS JOIN LATERAL jsonb_array_elements(
+                   CASE WHEN jsonb_typeof(s.trim_record -> 'memory' -> 'shown') = 'array'
+                        THEN s.trim_record -> 'memory' -> 'shown'
+                        ELSE '[]'::jsonb END) AS e(value)
+             WHERE s.run_id = $1
+        ), tally AS (
+            SELECT CASE WHEN entry ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN entry::uuid END                         AS entry_id,
+                   count(*)::int                                     AS steps,
+                   (count(*) FILTER (WHERE status = 'done'))::int    AS done,
+                   (count(*) FILTER (WHERE status = 'failed'))::int  AS failed
+              FROM listed
+             GROUP BY 1
+        ), locked AS (
+            SELECT m.id FROM memory_entry m JOIN tally t ON t.entry_id = m.id
+             ORDER BY m.id
+               FOR UPDATE OF m
+        )
+        UPDATE memory_entry m
+           SET shown_steps  = m.shown_steps + t.steps,
+               shown_done   = m.shown_done + t.done,
+               shown_failed = m.shown_failed + t.failed
+          FROM tally t, locked l
+         WHERE m.id = t.entry_id AND l.id = m.id
+        "#,
+        run.as_uuid(),
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1820,6 +2023,9 @@ async fn finish_run_on(
     // A terminal row reaches nothing, so `legal_move` is the whole refusal: `run_is_terminal`
     // would only say the same thing in a second sentence.
     legal_move(status, to)?;
+    // MOD-164 D5: the terminal move happens once (the run is held `FOR UPDATE`), so the usage
+    // tally does too.
+    tally_memory_usage(conn, run).await?;
 
     sqlx::query!(
         "UPDATE run \
@@ -10720,6 +10926,148 @@ impl WriteStore for PgStore {
         Ok(MemorySupersede::Superseded {
             old: moved,
             new: created,
+        })
+    }
+
+    /// One transaction (MOD-164 D4): the step `FOR NO KEY UPDATE`, then [`step_scope`] (`FOR
+    /// SHARE` on the step and its run), the capture-stage check, the evidence check, the cap, then
+    /// the folded subject's live holder `FOR UPDATE`. The first lock serializes two writes on one
+    /// step, so the cap's count cannot be read twice before either inserts (review L2); it is taken
+    /// before `step_scope`, never as an upgrade after it: two transactions both holding `FOR
+    /// SHARE` would deadlock upgrading. `FOR NO KEY UPDATE` leaves the step's `FOR KEY SHARE`
+    /// (the foreign keys' lock) free. A holder [`run_memory_held_by_a_person`] answers
+    /// `PersonHolds`; any other is superseded by [`apply_memory_edit`] before the new entry is
+    /// inserted (`superseded_by`'s FK is deferred to `COMMIT`). Any refusal rolls back, then
+    /// [`memory_write_refused`] names it.
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        let evidence = serde_json::to_value(&new.evidence).map_err(|err| {
+            StoreError::Backend(format!("memory evidence did not serialise: {err}"))
+        })?;
+        let cited: Vec<Uuid> = new
+            .evidence
+            .citations
+            .iter()
+            .map(|citation| citation.step_id.as_uuid())
+            .collect();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query!(
+            "SELECT 1 AS one FROM run_step WHERE id = $1 FOR NO KEY UPDATE",
+            step.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, step, fence).await?;
+        let facts = capture_facts(&mut tx, step).await?;
+        if facts.role != StepRole::Stage || facts.node_key.as_deref() != Some(CAPTURE_KEY) {
+            return Err(StoreError::Constraint(
+                MEMORY_NEEDS_A_CAPTURE_STEP.to_owned(),
+            ));
+        }
+        let inside = sqlx::query_scalar!(
+            r#"
+            SELECT cardinality($2::uuid[]) > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM unnest($2::uuid[]) AS c(id)
+                    WHERE NOT EXISTS (
+                          SELECT 1 FROM run_step s WHERE s.id = c.id AND s.run_id = $1))
+                AS "inside!"
+            "#,
+            scope.run.as_uuid(),
+            &cited,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if !inside {
+            return Err(StoreError::Constraint(
+                MEMORY_EVIDENCE_OUTSIDE_THE_RUN.to_owned(),
+            ));
+        }
+        if facts.written >= i64::from(MEMORY_RUN_WRITE_CAP) {
+            return Ok(RunMemoryWrite::CapReached {
+                cap: MEMORY_RUN_WRITE_CAP,
+            });
+        }
+        let holder = sqlx::query!(
+            r#"
+            SELECT id      AS "id: MemoryEntryId",
+                   source  AS "source: MemorySource",
+                   version
+              FROM memory_entry
+             WHERE project_id = $1 AND state IN ('active','suspect')
+               AND lower(btrim(subject)) = lower(btrim($2::text))
+             ORDER BY id LIMIT 1
+               FOR UPDATE
+            "#,
+            scope.project.as_uuid(),
+            new.subject.as_str(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let old = match holder {
+            Some(holder) if run_memory_held_by_a_person(holder.source, holder.version) => {
+                return Ok(RunMemoryWrite::PersonHolds {
+                    existing: holder.id,
+                });
+            }
+            Some(holder) => {
+                let edit = MemoryEdit {
+                    kind: None,
+                    subject: None,
+                    body: None,
+                    state: Some(MemoryState::Superseded),
+                    superseded_by: Some(new.id),
+                    restamp: false,
+                    author_id: facts.started_by,
+                    box_id: facts.lease_box_id,
+                    reason: "superseded",
+                };
+                match apply_memory_edit(&mut tx, holder.id, edit).await {
+                    Ok(Some(moved)) => Ok(Some(moved)),
+                    Ok(None) => {
+                        return Err(StoreError::Backend(format!(
+                            "memory entry `{}` vanished under the row lock this transaction holds",
+                            holder.id
+                        )));
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            None => Ok(None),
+        };
+        let written = match old {
+            Ok(old) => insert_run_memory_entry(&mut tx, &scope, step, &facts, &new, &evidence)
+                .await
+                .map(|created| (old, created)),
+            Err(err) => Err(err),
+        };
+        let (old, created) = match written {
+            Ok(pair) => pair,
+            Err(err) => {
+                tx.rollback().await.map_err(map_sqlx)?;
+                return Err(memory_write_refused(
+                    &self.pool,
+                    err,
+                    scope.project,
+                    new.subject.as_str(),
+                    new.id,
+                    Some(new.id),
+                )
+                .await);
+            }
+        };
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(match old {
+            Some(old) => RunMemoryWrite::Superseded { old, new: created },
+            None => RunMemoryWrite::Created(created),
         })
     }
 }

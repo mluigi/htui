@@ -711,3 +711,67 @@ fn a_v4_record_still_answers_prompt_summary() {
     );
     assert!(!trimmed);
 }
+
+// -- MOD-164 D6: run-written entries share the section --------------------------------------------
+
+/// `entry` written by a run's capture step: `source` run, provenance present (every field may
+/// be `None` once its row is gone, so the default is a valid run provenance).
+fn run_entry(n: u128, subject: &str, body: &str, hour: i64) -> MemoryEntry {
+    let mut e = entry(n, subject, body, hour);
+    e.source = htui_core::model::MemorySource::Run;
+    e.provenance = Some(htui_core::model::RunProvenance::default());
+    e
+}
+
+#[test]
+fn a_run_entry_renders_run_source_and_model_written_trust() {
+    let entries = [run_entry(1, "Build cache", "Clear target/ when stale.", 1)];
+    let memory = select(&entries, MEMORY_TOKEN_CAP, TokenEstimator::DEFAULT).expect("active");
+    assert_eq!(
+        memory.entries[0].source,
+        htui_core::model::MemorySource::Run,
+        "select freezes the entry's own source, not a constant"
+    );
+    assert_eq!(
+        memory_entry_block(&memory.entries[0]),
+        "<entry kind=\"fact\" subject=\"Build cache\" source=\"run\" \
+         trust=\"model-written\">\nClear target/ when stale.\n</entry>"
+    );
+}
+
+#[test]
+fn mixed_person_and_run_entries_keep_newest_first_under_one_cap() {
+    let entries = [
+        entry(1, "person old", "Run the gate.", 1),
+        run_entry(2, "run newest", "Use cargo nextest.", 4),
+        entry(3, "person new", "Keep keys configurable.", 3),
+        run_entry(4, "run old", &"A long note about the build. ".repeat(40), 2),
+    ];
+    let cost = |e: &MemoryEntry| {
+        let frozen = htui_core::model::SnapshotMemoryEntry::freeze(e, e.source);
+        TokenEstimator::DEFAULT.estimate(&memory_entry_block(&frozen))
+    };
+    assert_eq!(
+        kept(&entries, MEMORY_TOKEN_CAP),
+        [id(2), id(3), id(4), id(1)],
+        "one newest-first walk over both sources"
+    );
+    // One cap over both sources: the long run entry no longer fits behind the two newer ones,
+    // is skipped, and the walk goes on to the older person entry.
+    let cap = cost(&entries[1]) + cost(&entries[2]) + cost(&entries[0]);
+    assert!(cost(&entries[3]) > cost(&entries[0]), "the test can fail");
+    let memory = select(&entries, cap, TokenEstimator::DEFAULT).expect("active entries");
+    assert_eq!(
+        memory.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+        [id(2), id(3), id(1)]
+    );
+    assert_eq!(
+        memory.entries.iter().map(|e| e.source).collect::<Vec<_>>(),
+        [
+            htui_core::model::MemorySource::Run,
+            htui_core::model::MemorySource::Person,
+            htui_core::model::MemorySource::Person,
+        ]
+    );
+    assert_eq!(memory.total, 4);
+}

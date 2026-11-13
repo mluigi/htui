@@ -38,19 +38,19 @@ use htui_core::model::{
     ItemPatch, ItemRequirement, ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch,
     MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
     NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PendingStop, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource, RelaySessionId, RelayView,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
-    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    normalize,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
@@ -1427,6 +1427,15 @@ impl WriteStore for SpyStore {
         self.inner
             .supersede_memory_entry(old, expected_version, new)
             .await
+    }
+
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> StoreResult<RunMemoryWrite> {
+        self.inner.write_run_memory(fence, step, new).await
     }
 
     async fn request_follow_up(&self, new: NewFollowUp) -> StoreResult<FollowUpRequest> {

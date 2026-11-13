@@ -1081,7 +1081,7 @@ impl MemoryPane {
                     // A replace met another holder: the question names that one now.
                     Mode::Body(editor) | Mode::Clash { editor, .. } => {
                         self.mode = Mode::Clash {
-                            existing: Box::new(existing.clone()),
+                            existing: existing.clone(),
                             editor,
                         };
                         self.notice = None;
@@ -1390,16 +1390,18 @@ fn rebase(target: &mut Target, head: &MemoryEntry) {
     }
 }
 
-/// One list row: `{kind:<8} {subject:<column}  {state:<10}  {confirmed_at:%Y-%m-%d}` (D20), the
-/// subject padded in display cells; one wider than `column` pushes its own row's tail only.
+/// One list row: `{kind:<8} {subject:<column}  {state:<10}  {source:<6}  {confirmed_at:%Y-%m-%d}`
+/// (D20; MOD-164 D12 adds the source, `person` or `run`), the subject padded in display cells;
+/// one wider than `column` pushes its own row's tail only.
 fn row_line(entry: &MemoryEntry, column: usize) -> String {
     let pad = column.saturating_sub(cell_width(&entry.subject));
     format!(
-        "{:<8} {}{}  {:<10}  {}",
+        "{:<8} {}{}  {:<10}  {:<6}  {}",
         entry.kind.as_str(),
         entry.subject,
         " ".repeat(pad),
         entry.state.as_str(),
+        entry.source.as_str(),
         entry.confirmed_at.format("%Y-%m-%d")
     )
 }

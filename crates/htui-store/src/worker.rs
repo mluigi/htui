@@ -15,14 +15,14 @@ use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
     GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry, MemoryState, NewCommandRun,
-    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PendingStop, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope,
-    PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath,
-    RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId, StepOpening,
-    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId, WorkspaceStop,
-    WorkspaceSummary,
+    NewDocument, NewNote, NewRun, NewRunMemory, NewRunStep, Note, OpenPermission, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
+    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo,
+    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId,
+    WorkspaceStop, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -429,6 +429,14 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
         WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        WriteStore::write_run_memory(self, fence, step, new).await
     }
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
         WriteStore::propose_link(self, fence, link).await
@@ -944,6 +952,14 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
         WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        WriteStore::write_run_memory(self, fence, step, new).await
     }
     async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
         WriteStore::propose_link(self, fence, link).await

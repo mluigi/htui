@@ -12,6 +12,7 @@ Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9 
 │   excerpt_max_files              unset | 12 (default) files                                      │
 │   excerpt_max_scan_files         unset | 20000 (default) files                                   │
 │   excerpt_provider_deadline_ms   unset | 1500 (default) ms                                       │
+│   light_model                    not set                                                         │
 │   max_skill_tokens               unset | 20000 (default) tokens                                  │
 │   memory_capture                 unset | on (default) on/off                                     │
 │   prompt_reserve_fraction        unset | 10% (0.1) (default) fraction                            │
@@ -23,7 +24,6 @@ Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9 
 │   memory_capture                 unset | on (default) on/off                                     │
 │   prompt_upstream_hops           unset | 2 (default) hops                                        │
 │   token_budget                   120000 | 120000 (project) tokens                                │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

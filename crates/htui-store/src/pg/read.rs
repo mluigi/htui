@@ -48,8 +48,11 @@ use uuid::Uuid;
 use crate::backend::ScopeKeys;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
-use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
+use crate::pg::rows::{
+    LinkNodeRow, MemoryEntryRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow,
+};
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
+use htui_core::model::{MemoryEvidence, MemorySource};
 
 /// The `status IN (...)` list of a live run (MOD-125 D2, MOD-144 Δ2) that `waiting_candidates`,
 /// `create_run`, `close_out`, `delete_workspace_once` (MOD-147 A1) and 0024's `uq_run_item_live`
@@ -1117,7 +1120,7 @@ impl ReadStore for PgStore {
                 .collect::<Vec<_>>()
         });
         sqlx::query_as!(
-            MemoryEntry,
+            MemoryEntryRow,
             r#"
             SELECT id            AS "id: MemoryEntryId",
                    project_id    AS "project_id: ProjectId",
@@ -1130,7 +1133,18 @@ impl ReadStore for PgStore {
                    superseded_by AS "superseded_by: MemoryEntryId",
                    created_by    AS "created_by: UserId",
                    created_at,
-                   updated_at
+                   updated_at,
+                   source        AS "source: MemorySource",
+                   run_id        AS "run_id: RunId",
+                   step_id       AS "step_id: StepId",
+                   item_id       AS "item_id: ItemId",
+                   agent_id      AS "agent_id: AgentId",
+                   model,
+                   commit_hash,
+                   evidence      AS "evidence: Json<MemoryEvidence>",
+                   shown_steps,
+                   shown_done,
+                   shown_failed
               FROM memory_entry
              WHERE project_id = $1
                AND ($2::text[] IS NULL OR state = ANY($2))
@@ -1141,7 +1155,7 @@ impl ReadStore for PgStore {
         )
         .fetch_all(&self.pool)
         .await
-        .map(Some)
+        .map(|rows| Some(rows.into_iter().map(MemoryEntry::from).collect()))
         .map_err(map_sqlx)
     }
 

@@ -30,19 +30,19 @@ use htui_core::model::{
     ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState,
     MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
     NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
-    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
+    NewWorkspace, Note, OpenPermission, PendingStop, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
@@ -1829,6 +1829,18 @@ impl WriteStore for Writer {
                     .await
             }
             Self::Online(pg) => pg.supersede_memory_entry(old, expected_version, new).await,
+        }
+    }
+
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        match self {
+            Self::Memory(store) => store.write_run_memory(fence, step, new).await,
+            Self::Online(pg) => pg.write_run_memory(fence, step, new).await,
         }
     }
 

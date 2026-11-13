@@ -633,6 +633,27 @@ struct WalkScopes {
     /// still owed (a walk `heartbeaten` abandoned, or one that raised before it drained), each
     /// warned with the manual `Cleanup` retry (R-25) named.
     owed_dropped: std::sync::atomic::AtomicU32,
+    /// MOD-164 F1 (review H2): the runs [`Engine::end_run`] is ending in this engine, its capture
+    /// and its `finish_run` included. Each sender is dropped when that end returns, which wakes
+    /// every later end of the run waiting on it ([`Self::end`]).
+    ends: std::sync::Mutex<BTreeMap<RunId, watch::Sender<()>>>,
+}
+
+/// MOD-164 F1 (review H2): one run end in progress in this engine ([`WalkScopes::end`]); removes
+/// it on drop, which wakes the ends waiting on it.
+struct EndGuard<'e> {
+    scopes: &'e WalkScopes,
+    run: RunId,
+}
+
+impl Drop for EndGuard<'_> {
+    fn drop(&mut self) {
+        self.scopes
+            .ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run);
+    }
 }
 
 /// One open walk (blueprint §3.1).
@@ -646,6 +667,9 @@ struct WalkScope {
     cleanup_owed: bool,
     /// A node future of the walk parked the run (D3).
     parked: bool,
+    /// The walk's cut was sent ([`WalkScopes::cut`]), by the scheduler or by a node future's
+    /// run-end capture (MOD-164 F1): the scheduler admits nothing more ([`WalkScopes::is_cut`]).
+    cut: bool,
 }
 
 /// Removes its run's [`WalkScope`] on drop, the drop of a walk `heartbeaten` abandons included.
@@ -682,6 +706,30 @@ impl WalkScopes {
         Self {
             scopes: std::sync::Mutex::new(BTreeMap::new()),
             owed_dropped: std::sync::atomic::AtomicU32::new(0),
+            ends: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// MOD-164 F1 (review H2): `run`'s end, once no other end of it is in progress in this
+    /// engine: a later end waits for the earlier one (its capture and its `finish_run`) to
+    /// return, so it never interrupts a live capture nor finishes the run under it.
+    async fn end(&self, run: RunId) -> EndGuard<'_> {
+        loop {
+            let mut earlier = {
+                let mut ends = self
+                    .ends
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match ends.get(&run) {
+                    Some(end) => end.subscribe(),
+                    None => {
+                        ends.insert(run, watch::channel(()).0);
+                        return EndGuard { scopes: self, run };
+                    }
+                }
+            };
+            // Only a closed channel answers: the earlier end's guard dropped its sender.
+            while earlier.changed().await.is_ok() {}
         }
     }
 
@@ -742,6 +790,7 @@ impl WalkScopes {
                     in_flight: 0,
                     cleanup_owed: false,
                     parked: false,
+                    cut: false,
                 },
             );
         }
@@ -767,9 +816,21 @@ impl WalkScopes {
         }
     }
 
-    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once.
+    /// The walk's cut (blueprint A5): `Cancel { grace: RELAY_GRACE }` on its channel, once, and
+    /// the walk marked cut, so its scheduler admits nothing more ([`Self::is_cut`]).
     fn cut(&self, run: RunId) {
+        if let Some(scope) = self.lock().get_mut(&run) {
+            scope.cut = true;
+        }
         self.send_cancel(run, Signal::Cancel { grace: RELAY_GRACE });
+    }
+
+    /// MOD-164 F1 (review: the capture's cut admits nothing): whether `run`'s walk was cut. A
+    /// node future's run-end capture cuts the walk from inside it, where the scheduler's own
+    /// [`WalkEnd`] cannot see it; the scheduler reads this before it admits. A run cancel
+    /// forwarded into the walk's channel is not a cut.
+    fn is_cut(&self, run: RunId) -> bool {
+        self.lock().get(&run).is_some_and(|scope| scope.cut)
     }
 
     fn send_cancel(&self, run: RunId, signal: Signal) {
@@ -830,6 +891,9 @@ impl WalkScopes {
     }
 }
 
+/// MOD-164 D11: the run-end capture step, [`Engine::capture`].
+mod capture;
+
 #[cfg(test)]
 mod walk_scopes {
     use htui_agent::record::{Control, RELAY_GRACE, Signal, control_channel};
@@ -847,6 +911,28 @@ mod walk_scopes {
         assert!(scopes.control(run).is_some());
         drop(guard);
         assert!(scopes.control(run).is_none());
+    }
+
+    /// MOD-164 F1 (review H2): a second end of a run waits until the first returns; another
+    /// run's end waits for nothing.
+    #[tokio::test]
+    async fn a_second_end_of_a_run_waits_for_the_first() {
+        let scopes = WalkScopes::new();
+        let run = RunId::new();
+        let first = scopes.end(run).await;
+        let other = scopes.end(RunId::new()).await;
+        let mut second = Box::pin(scopes.end(run));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "the first end is in progress"
+        );
+        drop(first);
+        let second = second.await;
+        let mut third = Box::pin(scopes.end(run));
+        assert!(futures::poll!(third.as_mut()).is_pending());
+        drop(second);
+        drop(third.await);
+        drop(other);
     }
 
     /// A run cancel is forwarded once, its grace kept; the cut then changes nothing. A cut alone
@@ -985,7 +1071,8 @@ struct WalkEnd {
     ender: Option<i32>,
     /// The walk's cut was sent.
     cut: bool,
-    /// The run was read away from `running` with futures in flight (F21): admit nothing more.
+    /// The run was read away from `running` with futures in flight (F21), or a node future's
+    /// run-end capture cut the walk (MOD-164 F1, [`WalkScopes::is_cut`]): admit nothing more.
     drained: bool,
     /// More than one future was ever in flight at once, or the walk drained (T3 repair 1): a
     /// terminal end may leave a sibling's unsettled row behind with nothing in flight to cut. A
@@ -1164,6 +1251,28 @@ pub enum Next {
     /// mid-recovery (plan D145), where another writer moved one of the run's rows, has no note
     /// either, and its lease was given back by the leased walk's own `Err` release (plan D139).
     Error(String),
+}
+
+/// MOD-164 D11: the gate's terminal `finish_run` goes through [`Engine::end_run`].
+impl<S, G, I, V, C, A, K> gate::RunEnd for Engine<'_, S, G, I, V, C, A, K>
+where
+    S: htui_core::store::WorkerStore,
+    G: GraphSource,
+    I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
+    C: Clock + ?Sized,
+    A: AgentSelector + ?Sized,
+    K: SessionSink + ?Sized,
+{
+    fn end(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), EngineError>> {
+        self.end_run(run, to, failure, at)
+    }
 }
 
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
@@ -1698,20 +1807,18 @@ where
                 .cloned()
         };
         let Some(edge) = edge else {
-            self.parts
-                .store
-                .finish_run(
-                    run.id,
-                    RunStatus::Failed,
-                    Some(
-                        &RunFailure::Rejected {
-                            phase: phase.name.clone(),
-                        }
-                        .to_string(),
-                    ),
-                    now,
-                )
-                .await?;
+            self.end_run(
+                run.id,
+                RunStatus::Failed,
+                Some(
+                    &RunFailure::Rejected {
+                        phase: phase.name.clone(),
+                    }
+                    .to_string(),
+                ),
+                now,
+            )
+            .await?;
             self.cleanup_walk(run.id).await?;
             return Ok(Some(Rest {
                 run: RunStatus::Failed,
@@ -2820,10 +2927,7 @@ where
             }
             // `finish_run` ends the live run, which frees the item for a second run; `failure`
             // stays NULL because a cancel is a human's decision and not a failure.
-            self.parts
-                .store
-                .finish_run(run, RunStatus::Cancelled, None, now)
-                .await?;
+            self.end_run(run, RunStatus::Cancelled, None, now).await?;
             self.cleanup_walk(run).await
         };
         self.leased_window(run, window).await?;
@@ -4128,9 +4232,7 @@ where
             phase: phase.name.clone(),
             attempt: step.attempt,
         };
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Some(Rest {
@@ -4179,15 +4281,13 @@ where
                 .to_owned(),
             attempts: part.attempt,
         };
-        self.parts
-            .store
-            .finish_run(
-                run.id,
-                RunStatus::Failed,
-                Some(&failure.to_string()),
-                self.now(),
-            )
-            .await?;
+        self.end_run(
+            run.id,
+            RunStatus::Failed,
+            Some(&failure.to_string()),
+            self.now(),
+        )
+        .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Some(Rest {
             run: RunStatus::Failed,
@@ -4256,6 +4356,11 @@ where
         loop {
             self.walks.forward(run, &watched);
             self.walks.forward(run, &(self.parts.control)(run));
+            // MOD-164 F1: a capture cut the walk from inside a node future (the run's outcome is
+            // decided); the futures in flight drain, and nothing more is admitted.
+            if self.walks.is_cut(run) {
+                end.drained = true;
+            }
             if end.admits() {
                 passes += 1;
                 let siblings = !flights.is_empty();
@@ -4274,10 +4379,7 @@ where
                     match Box::pin(self.pass(run, &flights, &mut end)).await {
                         Ok(Pass::Finished) => {
                             let now = self.now();
-                            self.parts
-                                .store
-                                .finish_run(run, RunStatus::Done, None, now)
-                                .await?;
+                            self.end_run(run, RunStatus::Done, None, now).await?;
                             self.cleanup_walk(run).await?;
                             return Ok(Rest {
                                 run: RunStatus::Done,
@@ -4596,8 +4698,10 @@ where
         let now = self.now();
         let mut failed: Option<EngineError> = None;
         for step in self.parts.store.run_steps(run.id).await? {
-            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut.
-            if step.role == StepRole::Stage
+            // MOD-139 M2 (P-19): htui's own stage rows are not the walk's to cut. MOD-164 D11:
+            // but a `capture` row left `pending` or `running` is cancelled with its siblings.
+            if (step.role == StepRole::Stage
+                && step.node_key.as_deref() != Some(htui_core::model::CAPTURE_KEY))
                 || !matches!(
                     step.status,
                     StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
@@ -5143,9 +5247,7 @@ where
         }
         // `finish_run` no longer writes the item (MOD-144). The order (item, note, run) stays so
         // a crash leaves the refusal readable first.
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Rest {
@@ -6163,9 +6265,7 @@ where
         {
             return Ok(false);
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(reason), now)
+        self.end_run(run.id, RunStatus::Failed, Some(reason), now)
             .await?;
         // Plan D36's rule is "after every terminal `finish_run`", and this is the one both of the
         // walk's hard failures pass through — stage 3's missing input and any error escaping the
@@ -6534,9 +6634,7 @@ where
         if block {
             self.block_and_fail(run, &failure, None, now).await?;
         } else {
-            self.parts
-                .store
-                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                 .await?;
             self.cleanup_walk(run.id).await?;
         }
@@ -6556,15 +6654,13 @@ where
         phase: &SnapshotPhase,
         failure: RunFailure,
     ) -> Result<Rest, EngineError> {
-        self.parts
-            .store
-            .finish_run(
-                run.id,
-                RunStatus::Failed,
-                Some(&failure.to_string()),
-                self.now(),
-            )
-            .await?;
+        self.end_run(
+            run.id,
+            RunStatus::Failed,
+            Some(&failure.to_string()),
+            self.now(),
+        )
+        .await?;
         self.cleanup_walk(run.id).await?;
         Ok(Rest {
             run: RunStatus::Failed,
@@ -7218,9 +7314,7 @@ where
                 self.fail_part(run, node, step, &failure.to_string())
                     .await?;
             }
-            self.parts
-                .store
-                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                 .await?;
             self.cleanup_walk(run.id).await?;
             return Ok(Some(Rest {
@@ -7317,9 +7411,7 @@ where
                     self.block_and_fail(run, failure, Some(step), now).await?;
                 }
                 _ => {
-                    self.parts
-                        .store
-                        .finish_run(run.id, RunStatus::Failed, Some(&text), now)
+                    self.end_run(run.id, RunStatus::Failed, Some(&text), now)
                         .await?;
                     self.cleanup_walk(run.id).await?;
                 }
@@ -7854,9 +7946,7 @@ where
                 let failure = RunFailure::NoSurvivingCandidate {
                     phase: phase.name.clone(),
                 };
-                self.parts
-                    .store
-                    .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
                     .await?;
                 self.cleanup_walk(run.id).await?;
                 Ok(Some(Rest {
@@ -8726,9 +8816,7 @@ where
                 self.fail_hard(run, judge, &reason).await?;
             }
             None => {
-                self.parts
-                    .store
-                    .finish_run(run.id, RunStatus::Failed, Some(&reason), self.now())
+                self.end_run(run.id, RunStatus::Failed, Some(&reason), self.now())
                     .await?;
                 self.cleanup_walk(run.id).await?;
             }
@@ -8994,9 +9082,7 @@ where
                 .await?;
             self.note(item, failure.to_string(), via, now).await?;
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+        self.end_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_walk(run.id).await
     }
@@ -9812,8 +9898,13 @@ where
         let candidate = Self::candidate_of(step, phase)?;
         // MOD-42 D10, B-17: a cancel that reached the walk between sessions spawns nothing.
         // MOD-138 M3 D3: under an open walk the session drives on the walk's control, which also
-        // carries the walk's cut.
-        let mut control = self.session_control(run.id);
+        // carries the walk's cut. MOD-164 F1 (review H1): the capture is the run's end, not a
+        // sibling of the walk, so it drives on the run's own control, which no cut reaches.
+        let mut control = if capture::is_capture_row(step) {
+            (self.parts.control)(run.id)
+        } else {
+            self.session_control(run.id)
+        };
         if self.cancel_read(run.id, &control) {
             return Err(EngineError::Cancelled { run: run.id });
         }
@@ -10192,12 +10283,84 @@ where
         sent.checked_add(ttl).unwrap_or(sent)
     }
 
+    /// MOD-164 D11: the one way the walk ends a run (every terminal `finish_run` the walk and the
+    /// gate write). A run that is not ending `cancelled`, is still live (`running` or
+    /// `awaiting_approval`, re-read), whose snapshot froze a capture and that has an item runs its
+    /// capture step first ([`Self::capture`]), and `finish_run` stays the run's last write. The
+    /// capture never moves `to`: whatever it meets settles its own row.
+    ///
+    /// MOD-164 F1 (review H2): the run's outcome is decided here. One end of a run is in progress
+    /// in this engine at a time ([`WalkScopes::end`]): a second, a sibling's terminal path met
+    /// during the capture, waits for the first to return and then finds the run finished, so it
+    /// runs no capture and its `finish_run` is refused, as a second end's always was. A run
+    /// ending `cancelled` waits for nothing: its cancel reaches the capture's session first, and
+    /// an end that waited and then reads the run's cancel returns `Cancelled` without writing.
+    ///
+    /// # Errors
+    /// The capture's fence and lease errors and the run's own cancel, before `finish_run` is
+    /// written (a cancel's run is ended by the cancel path); `finish_run`'s own. Any other
+    /// capture error, and a failed read of the run (review L6), is warned and the run still ends.
+    pub(crate) async fn end_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        let mut at = at;
+        let _end = if to == RunStatus::Cancelled {
+            None
+        } else {
+            let end = self.walks.end(run).await;
+            // An earlier end of this run that returned on the run's own cancel left the run, and
+            // its capture row, to the cancel path: a waiting end must not take the row for a
+            // crash leftover and end the run `failed` under the cancel (F1 verifier, low).
+            if (self.parts.control)(run).signal().is_cancel() {
+                return Err(EngineError::Cancelled { run });
+            }
+            match self.run(run).await {
+                Ok(row) => {
+                    // A snapshot that does not decode was refused by the walk long before its
+                    // end; here it is only "no capture".
+                    let capture = Self::snapshot_of(&row)
+                        .ok()
+                        .and_then(|snapshot| snapshot.capture);
+                    if let Some(capture) = capture
+                        && row.item_id.is_some()
+                        && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                    {
+                        // Boxed: the run end sits at the bottom of the walk's frames, near the
+                        // 2 MiB debug stack (MOD-10 M3).
+                        match Box::pin(self.capture(&row, &capture)).await {
+                            Ok(()) => {}
+                            Err(err) if self.passes_through(run, &err) => return Err(err),
+                            // A store error before the capture row settled (its read, its
+                            // insert): the capture never moves the run's end, so the run still
+                            // ends.
+                            Err(err) => {
+                                tracing::warn!(%run, %err, "the capture step did not settle; the run ends without it");
+                            }
+                        }
+                        at = at.max(self.now());
+                    }
+                }
+                // Review L6: the capture is skipped, never the run's end.
+                Err(err) => {
+                    tracing::warn!(%run, %err, "the run could not be read for its capture; the run ends without it");
+                }
+            }
+            Some(end)
+        };
+        self.parts.store.finish_run(run, to, failure, at).await?;
+        Ok(())
+    }
+
     /// The `GateContext` stage 6 and the review loop share.
     const fn gate_context<'r>(
         &'r self,
         run: &'r Run,
         snapshot: &'r GraphSnapshot,
-    ) -> GateContext<'r, S, C> {
+    ) -> GateContext<'r, S, C, Self> {
         GateContext {
             store: self.parts.store,
             clock: self.parts.clock,
@@ -10207,6 +10370,8 @@ where
             box_id: self.parts.box_id,
             fence: StepFence::Lease(self.parts.owner),
             walk: Some(&self.walks),
+            // MOD-164 D11: a run the gate ends is ended by `end_run`, so it captures first.
+            end: Some(self),
         }
     }
 
@@ -12539,7 +12704,12 @@ mod tests {
                 .iter()
                 .map(|step| (step.phase_name.as_str(), step.status))
                 .collect::<Vec<_>>(),
-            [("prd", StepStatus::Done), ("plan", StepStatus::Failed)]
+            // MOD-164 D11: the failed run ends with its capture row, skipped (no light model).
+            [
+                ("capture", StepStatus::Done),
+                ("prd", StepStatus::Done),
+                ("plan", StepStatus::Failed)
+            ]
         );
         let notes = harness
             .orch
@@ -12769,6 +12939,15 @@ mod tests {
         assert_eq!(after[0].status, StepStatus::AwaitingApproval);
     }
 
+    /// MOD-164 D11: `steps` less the run's capture row, which a run that failed a step ends with
+    /// (skipped here: these harnesses set no light model).
+    fn without_capture(steps: Vec<htui_core::model::RunStep>) -> Vec<htui_core::model::RunStep> {
+        steps
+            .into_iter()
+            .filter(|step| step.node_key.as_deref() != Some(htui_core::model::CAPTURE_KEY))
+            .collect()
+    }
+
     /// `docs/ANA-2.md:412-414`: a required input that resolves to nothing fails the run before a
     /// token is spent, and the step's `prompt_digest` proves no prompt was assembled.
     #[tokio::test]
@@ -12823,7 +13002,7 @@ mod tests {
             harness.orch.state(ids::HTUI_FEAT_3).await,
             ItemState::Failed
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps[0].status, StepStatus::Failed);
         assert!(
             steps[0].prompt_digest.is_none(),
@@ -12922,7 +13101,7 @@ mod tests {
             harness.orch.run(run).await.failure.as_deref(),
             Some("missing_output")
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps.len(), 2, "plan D3: `retry_limit = 1` permits two");
         assert_eq!(
             steps
@@ -15556,7 +15735,11 @@ mod tests {
             other.orch.run(run).await.failure.as_deref(),
             Some("rejected: plan")
         );
-        assert_eq!(other.orch.steps(run).await.len(), 2, "nothing was admitted");
+        assert_eq!(
+            without_capture(other.orch.steps(run).await).len(),
+            2,
+            "nothing was admitted"
+        );
     }
 
     /// Plan D131 in `run_to_rest`: the walk meets the same crash (here through `resume`, in the
@@ -16548,7 +16731,7 @@ mod tests {
         };
         assert_eq!(rest.run, RunStatus::Failed);
 
-        let before = harness.orch.steps(run).await;
+        let before = without_capture(harness.orch.steps(run).await);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].status, StepStatus::Failed);
         assert_eq!((before[0].position, before[0].attempt), (0, 1));
@@ -16572,7 +16755,7 @@ mod tests {
             "{refused}"
         );
 
-        let after = harness.orch.steps(run).await;
+        let after = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             after
                 .iter()
@@ -17131,7 +17314,7 @@ mod tests {
                 reason: M1_SENTENCE.to_owned(),
             })
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(steps.len(), 1, "the walk stopped at the refused step");
         assert_eq!(
             (steps[0].status, steps[0].prompt_digest.as_deref()),
@@ -17240,7 +17423,7 @@ mod tests {
                 reason: M1_SENTENCE.to_owned(),
             })
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             steps
                 .iter()
@@ -18397,7 +18580,7 @@ mod tests {
             ItemState::Failed,
             "the item reads the run's `failed` after the unpark (MOD-144)"
         );
-        let steps = harness.orch.steps(run).await;
+        let steps = without_capture(harness.orch.steps(run).await);
         assert_eq!(
             steps.len(),
             1,

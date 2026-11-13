@@ -54,6 +54,10 @@ use crate::model::{
     WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
     moved_order, overlaps, prompt_summary, scope_of,
 };
+use crate::model::{
+    CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
+    RunProvenance,
+};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
@@ -91,6 +95,9 @@ use crate::store::traits::{
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -6083,6 +6090,39 @@ impl State {
             row.superseded_by = None;
             row.updated_at = now;
         }
+        // MOD-164 D1: a surviving run's entry naming a gone run, step or item loses that pointer
+        // (`ON DELETE SET NULL`), and the trigger stamps it. The capture step writes into its
+        // run's own project, so today such an entry went with the project above.
+        for row in self.memory_entries.values_mut() {
+            let Some(provenance) = row.provenance.as_mut() else {
+                continue;
+            };
+            let mut cleared = false;
+            if provenance
+                .run_id
+                .is_some_and(|run| gone.runs.contains(&run))
+            {
+                provenance.run_id = None;
+                cleared = true;
+            }
+            if provenance
+                .step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                provenance.step_id = None;
+                cleared = true;
+            }
+            if provenance
+                .item_id
+                .is_some_and(|item| gone.items.contains(&item))
+            {
+                provenance.item_id = None;
+                cleared = true;
+            }
+            if cleared {
+                row.updated_at = now;
+            }
+        }
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
@@ -8306,6 +8346,8 @@ impl State {
         // A terminal row reaches nothing, so `run_is_terminal` would only say the same thing in a
         // second sentence: the law already refuses `done -> done`.
         legal_move(from, to)?;
+        // MOD-164 D5: the terminal move happens once, so the usage tally does too.
+        self.tally_memory_usage(run);
 
         if let Some(row) = self.runs.get_mut(&run) {
             row.status = to;
@@ -9401,6 +9443,10 @@ impl State {
             created_by: new.created_by,
             created_at: now,
             updated_at: now,
+            source: MemorySource::Person,
+            provenance: None,
+            evidence: None,
+            usage: MemoryUsage::default(),
         };
         self.memory_revisions.push(MemoryRevision {
             entry_id: row.id,
@@ -9554,6 +9600,150 @@ impl State {
             .create_memory_entry(head.project_id, new, now)
             .expect("every check of the create passed above under the same lock");
         Ok(MemorySupersede::Superseded { old, new })
+    }
+
+    /// [`WriteStore::write_run_memory`] (MOD-164 D4), in Postgres's order: the fence, the capture
+    /// stage, the cap, then the folded subject's live holder. Every refusal is decided before the
+    /// first write; then at most one supersede and one insert, the supersede first.
+    fn write_run_memory(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+        now: DateTime<Utc>,
+    ) -> Result<RunMemoryWrite> {
+        let (run, item, project) = self.step_scope(step, fence)?;
+        let row = self.require_step(step)?;
+        if row.role != StepRole::Stage || row.node_key.as_deref() != Some(CAPTURE_KEY) {
+            return Err(StoreError::Constraint(
+                MEMORY_NEEDS_A_CAPTURE_STEP.to_owned(),
+            ));
+        }
+        let (agent_id, model) = (row.agent_id, row.model.clone());
+        let cites_the_run = |cited: &crate::model::MemoryCitation| {
+            self.steps
+                .get(&cited.step_id)
+                .is_some_and(|cited| cited.run_id == run)
+        };
+        if new.evidence.citations.is_empty() || !new.evidence.citations.iter().all(cites_the_run) {
+            return Err(StoreError::Constraint(
+                MEMORY_EVIDENCE_OUTSIDE_THE_RUN.to_owned(),
+            ));
+        }
+        let written = self
+            .memory_entries
+            .values()
+            .filter(|entry| entry.provenance.as_ref().and_then(|stamp| stamp.step_id) == Some(step))
+            .count();
+        if u32::try_from(written).unwrap_or(u32::MAX) >= MEMORY_RUN_WRITE_CAP {
+            return Ok(RunMemoryWrite::CapReached {
+                cap: MEMORY_RUN_WRITE_CAP,
+            });
+        }
+        let run_row = self.require_run(run)?;
+        let (author, box_id) = (run_row.started_by, run_row.lease_box_id);
+
+        let key = memory_subject_key(new.subject.as_str());
+        let holder = self
+            .memory_entries
+            .values()
+            .filter(|entry| {
+                entry.project_id == project
+                    && entry.state.is_live()
+                    && memory_subject_key(&entry.subject) == key
+            })
+            .min_by_key(|entry| entry.id)
+            .map(|entry| {
+                (
+                    entry.id,
+                    run_memory_held_by_a_person(entry.source, entry.version),
+                )
+            });
+        if let Some((existing, true)) = holder {
+            return Ok(RunMemoryWrite::PersonHolds { existing });
+        }
+        if self.memory_entries.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "memory_entry",
+                new.id,
+            )));
+        }
+        self.require_user(author, "memory_entry.created_by")?;
+        self.require_memory_box(box_id)?;
+
+        let entry = NewMemoryEntry {
+            id: new.id,
+            kind: new.kind,
+            subject: new.subject,
+            body: new.body,
+            created_by: author,
+            box_id,
+        };
+        let old = holder
+            .map(|(old, _)| self.apply_memory_edit(old, MemoryEdit::superseded_by(&entry), now));
+        let id = self
+            .create_memory_entry(project, entry, now)
+            .expect("every check of the create passed above under the same lock")
+            .id;
+        let created = self
+            .memory_entries
+            .get_mut(&id)
+            .expect("the create inserted the row under the same lock");
+        created.source = MemorySource::Run;
+        created.provenance = Some(RunProvenance {
+            run_id: Some(run),
+            step_id: Some(step),
+            item_id: item,
+            agent_id,
+            model,
+            commit: new.commit,
+        });
+        created.evidence = Some(new.evidence);
+        let created = created.clone();
+        Ok(match old {
+            Some(old) => RunMemoryWrite::Superseded { old, new: created },
+            None => RunMemoryWrite::Created(created),
+        })
+    }
+
+    /// MOD-164 D5: [`WriteStore::finish_run`]'s usage tally. For every step of `run` whose
+    /// `trim_record.memory.shown` is an array, each distinct listed `id` naming an entry (the
+    /// text equal to the entry id's, as Postgres compares `id::text`) gains one showing, and one
+    /// done or one failed by the step's status. `updated_at` stays, as 0033's trigger keeps it in
+    /// Postgres: memory is walked newest first by it (D6), and a count is not an edit.
+    fn tally_memory_usage(&mut self, run: RunId) {
+        let mut shown: Vec<(MemoryEntryId, StepStatus)> = Vec::new();
+        for step in self.steps.values().filter(|row| row.run_id == run) {
+            let Some(rows) = step
+                .trim_record
+                .as_ref()
+                .and_then(|record| record.get("memory"))
+                .and_then(|memory| memory.get("shown"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let listed: BTreeSet<MemoryEntryId> = rows
+                .iter()
+                .filter_map(|row| row.get("id")?.as_str())
+                .filter_map(|text| {
+                    let id = Uuid::parse_str(text).ok()?;
+                    (id.to_string() == text).then(|| MemoryEntryId::from_uuid(id))
+                })
+                .collect();
+            shown.extend(listed.into_iter().map(|id| (id, step.status)));
+        }
+        for (id, status) in shown {
+            let Some(entry) = self.memory_entries.get_mut(&id) else {
+                continue;
+            };
+            entry.usage.shown += 1;
+            match status {
+                StepStatus::Done => entry.usage.done += 1,
+                StepStatus::Failed => entry.usage.failed += 1,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -11569,6 +11759,15 @@ impl WriteStore for MemStore {
     ) -> Result<MemorySupersede> {
         let now = self.now();
         self.write(|state| state.supersede_memory_entry(old, expected_version, new, now))
+    }
+    async fn write_run_memory(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        new: NewRunMemory,
+    ) -> Result<RunMemoryWrite> {
+        let now = self.now();
+        self.write(|state| state.write_run_memory(fence, step, new, now))
     }
 
     // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
@@ -15199,6 +15398,7 @@ mod tests {
             scope: None,
             personas: Vec::new(),
             memory: None,
+            capture: None,
             source: None,
             edges: Vec::new(),
         }

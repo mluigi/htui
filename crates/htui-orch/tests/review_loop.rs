@@ -188,6 +188,7 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
         walk: None,
+        end: None::<&htui_orch::gate::NoEnd>,
     };
     let outcome = edge_loop(
         &ctx,
@@ -252,6 +253,7 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
         walk: None,
+        end: None::<&htui_orch::gate::NoEnd>,
     };
     let outcome = edge_loop(
         &ctx,
@@ -312,6 +314,7 @@ async fn a_sparse_snapshot_loops_to_the_phase_before_it_in_order() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
         walk: None,
+        end: None::<&htui_orch::gate::NoEnd>,
     };
     let edge = review_edge(&snapshot);
     assert_eq!(
@@ -364,6 +367,7 @@ async fn a_loop_to_a_target_that_never_ran_is_no_loop_target() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
         walk: None,
+        end: None::<&htui_orch::gate::NoEnd>,
     };
     let outcome = edge_loop(
         &ctx,
@@ -419,6 +423,7 @@ async fn an_escalation_on_a_run_another_writer_moved_is_a_stale_write() {
         box_id: ids::BOX,
         fence: StepFence::Unleased,
         walk: None,
+        end: None::<&htui_orch::gate::NoEnd>,
     };
     let refused = edge_loop(
         &ctx,

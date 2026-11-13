@@ -22,16 +22,19 @@
 //!   `project.slug` into the `qualified_key` the render and the sort both key on.
 //! - [`PersonaRow`] keeps `persona`'s two `JSONB` columns wrapped in [`Json`], which `query_as!`
 //!   can decode where the model's blob types have no `sqlx::Type` (MOD-26 B-15).
+//! - [`MemoryEntryRow`] is `memory_entry` flat (MOD-164 D2): [`MemoryEntry`] nests the run's
+//!   provenance, its evidence (`JSONB`, wrapped in [`Json`]) and its usage counters.
 //!
 //! Field order is load-bearing: `query_as!` binds result columns to fields positionally, so the
 //! `SELECT` list in `read.rs` is written in the order declared here.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, Persona, PersonaId,
-    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunMode, RunStatus,
-    RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId, StepOpening,
-    StepStatus, UpstreamEntry, VerifyOutcome,
+    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, MemoryEntry, MemoryEntryId,
+    MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona, PersonaId,
+    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunMode, RunProvenance,
+    RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId,
+    StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -353,6 +356,96 @@ impl From<PersonaRow> for Persona {
             permission: row.permission.0,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+/// One `memory_entry` row, flat (MOD-164 D2): the four memory reads decode into it, and
+/// [`MemoryEntry`] nests its provenance, evidence and usage. The `evidence` `JSONB` stays wrapped
+/// in [`Json`]; one that does not decode is the driver's decode error, a backend failure.
+#[derive(Debug)]
+pub(crate) struct MemoryEntryRow {
+    /// `memory_entry.id`.
+    pub(crate) id: MemoryEntryId,
+    /// `memory_entry.project_id`.
+    pub(crate) project_id: ProjectId,
+    /// `memory_entry.kind`.
+    pub(crate) kind: MemoryKind,
+    /// `memory_entry.subject`.
+    pub(crate) subject: String,
+    /// `memory_entry.body`.
+    pub(crate) body: String,
+    /// `memory_entry.state`.
+    pub(crate) state: MemoryState,
+    /// `memory_entry.version`.
+    pub(crate) version: i32,
+    /// `memory_entry.confirmed_at`.
+    pub(crate) confirmed_at: DateTime<Utc>,
+    /// `memory_entry.superseded_by`.
+    pub(crate) superseded_by: Option<MemoryEntryId>,
+    /// `memory_entry.created_by`.
+    pub(crate) created_by: UserId,
+    /// `memory_entry.created_at`.
+    pub(crate) created_at: DateTime<Utc>,
+    /// `memory_entry.updated_at`.
+    pub(crate) updated_at: DateTime<Utc>,
+    /// `memory_entry.source`.
+    pub(crate) source: MemorySource,
+    /// `memory_entry.run_id`.
+    pub(crate) run_id: Option<RunId>,
+    /// `memory_entry.step_id`.
+    pub(crate) step_id: Option<StepId>,
+    /// `memory_entry.item_id`.
+    pub(crate) item_id: Option<ItemId>,
+    /// `memory_entry.agent_id`.
+    pub(crate) agent_id: Option<AgentId>,
+    /// `memory_entry.model`.
+    pub(crate) model: Option<String>,
+    /// `memory_entry.commit_hash`.
+    pub(crate) commit_hash: Option<String>,
+    /// `memory_entry.evidence`.
+    pub(crate) evidence: Option<Json<MemoryEvidence>>,
+    /// `memory_entry.shown_steps`.
+    pub(crate) shown_steps: i32,
+    /// `memory_entry.shown_done`.
+    pub(crate) shown_done: i32,
+    /// `memory_entry.shown_failed`.
+    pub(crate) shown_failed: i32,
+}
+
+impl From<MemoryEntryRow> for MemoryEntry {
+    /// `provenance` is `Some` iff the entry is a run's (`chk_memory_entry_person_has_no_run` keeps
+    /// a person's columns NULL, and its `item_id` is not read as provenance).
+    fn from(row: MemoryEntryRow) -> Self {
+        let provenance = (row.source == MemorySource::Run).then_some(RunProvenance {
+            run_id: row.run_id,
+            step_id: row.step_id,
+            item_id: row.item_id,
+            agent_id: row.agent_id,
+            model: row.model,
+            commit: row.commit_hash,
+        });
+        Self {
+            id: row.id,
+            project_id: row.project_id,
+            kind: row.kind,
+            subject: row.subject,
+            body: row.body,
+            state: row.state,
+            version: row.version,
+            confirmed_at: row.confirmed_at,
+            superseded_by: row.superseded_by,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            source: row.source,
+            provenance,
+            evidence: row.evidence.map(|json| json.0),
+            usage: MemoryUsage {
+                shown: row.shown_steps,
+                done: row.shown_done,
+                failed: row.shown_failed,
+            },
         }
     }
 }
