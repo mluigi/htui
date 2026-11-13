@@ -363,7 +363,9 @@ Every command row, blocking or started, keeps a log of its merged output (stdout
 order they arrived), apart from the 64 KiB tail on the row itself:
 
 - **Size.** The log keeps the last 2 MiB. A cut log opens with the line
-  `[… earlier output truncated]` and starts on a whole line; `log_truncated` says so.
+  `[… earlier output truncated] (lines 1-N)`, standing for the N lines it dropped, and starts on
+  a whole line; `log_truncated` says so. A single line longer than 2 MiB is dropped whole, never
+  kept from its middle.
 - **Scrubbed, fail closed.** The log is scrubbed as one text before it is stored. A log that cannot
   be masked is stored as `[log withheld: it matched credential rule <rule>]`, and every slice a
   read answers is scrubbed again the same way. A NUL byte is stored as U+FFFD.
@@ -374,13 +376,19 @@ order they arrived), apart from the 64 KiB tail on the row itself:
   earlier step's build log. Without `command_run_id`, the read is the run's latest row.
 
 A read answers one slice, at most `max_bytes`: the last `tail_lines` lines (the default, 200), the
-lines `from_line` to `to_line` (counted from 1, both included), or the lines matching `pattern`
-(a Rust regular expression, matched per line) numbered `N:`, with `context` lines around each
-numbered `N-` and groups separated by `--`. `capped` is `true` when `max_bytes` cut the slice.
+lines `from_line` to `to_line` (both included), or the lines matching `pattern` (a Rust regular
+expression, matched per line) numbered `N:`, with `context` lines around each numbered `N-` and
+groups separated by `--`. `capped` is `true` when `max_bytes` cut the slice.
+
+**Line numbers** are those of the command's output, counted from the first line it printed, in
+`from_line`/`to_line`, `first_line`/`last_line`, `total_lines` and every `N:`. A cut log keeps
+them: its truncation line takes the number N of the last line it stands for, and the first line
+kept is N+1. A line keeps its number while the live log slides past 2 MiB and once the log is
+stored. A log that cannot be masked is the one withheld line, numbered 1.
 
 A command this session started with `command_start` and that still runs is read from its live
 log: complete lines only (a line still being written is held back), scrubbed as one text before
-`pattern` sees it.
+`pattern` sees it. A command that ended while the read looked is read from the store.
 
 ## Started commands: `command_start`, `command_wait`, `command_cancel`
 
@@ -403,14 +411,17 @@ checks, class limits, lease checks, scrubbing and log, but answers `{"command_ru
     the last line read;
   - `total_lines` and `deadline_reached`.
 
-  Lines are those of the log, counted from 1. While a command runs, only complete lines count. The
-  lines are scrubbed before `pattern` sees them: a masked secret never matches, and lines that
-  cannot be masked match nothing and their tail is withheld. Any command row of the session's run
+  Lines are numbered as the command printed them, counted from its first line, also once the log
+  passed 2 MiB (see [line numbers](#command-logs-command_output_read)). While a command runs,
+  only complete lines count. The whole log is scrubbed as one text before its `tail`, its `line`
+  or `pattern` sees it: a masked secret never matches nor shows in part, and a log that cannot be
+  masked matches nothing and its tail is withheld. Any command row of the session's run
   can be waited on; a row another session runs is read from the store about once a second.
   An agent that asked for progress gets a notification every 5 seconds while it waits.
 - **`command_cancel`** stops a command this session started: a queued row is `cancelled` and
   never runs, a running one has its process group killed. It answers the row's settled status; a
-  command that had already ended answers how it ended. Any other row, of another session or
+  command that had already ended answers how it ended, read from the store once the session has
+  ended more than 64 started commands since. Any other row, of another session or
   another run, answers `not found: command_run <id>`.
 - **Ends.** A cancelled row's output opens with `[stopped: cancelled by command_cancel]`; one the
   end of the session stopped (the step settles or is cancelled, the chat ends, htui quits) with
