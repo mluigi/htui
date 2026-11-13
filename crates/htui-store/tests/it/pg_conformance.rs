@@ -84,13 +84,19 @@ fn case_list_matches_mem_store() {
     );
 }
 
+/// How many tests `CASES` is dealt across (TOOL-16). One test running all 290 cases was the
+/// longest test of the crate, so it set the wall time of every parallel run; dealt round-robin
+/// across four, the cases run side by side, each still on its own database.
 #[cfg(feature = "demo")]
-#[tokio::test(flavor = "multi_thread")]
-async fn pg_store_conformance() {
+const SHARDS: usize = 4;
+
+/// Runs every `SHARDS`-th case of `CASES`, starting at `shard`.
+#[cfg(feature = "demo")]
+async fn pg_store_conformance_shard(shard: usize) {
     use htui_core::store::conformance;
 
-    for name in conformance::CASES {
-        // Boxed (MOD-137): `demo_db`'s connect, migrate and `load_demo` future is otherwise inline
+    for name in conformance::CASES.iter().skip(shard).step_by(SHARDS) {
+        // Boxed (MOD-137): `demo_db`'s create, connect and `load_demo` future is otherwise inline
         // in this test's future, on the 2 MiB test thread's stack, under every case's poll.
         let Some(db) = Box::pin(common::demo_db()).await else {
             return; // `common` printed the skip line already (plan D13).
@@ -101,6 +107,30 @@ async fn pg_store_conformance() {
     }
 }
 
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_conformance_shard_0() {
+    pg_store_conformance_shard(0).await;
+}
+
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_conformance_shard_1() {
+    pg_store_conformance_shard(1).await;
+}
+
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_conformance_shard_2() {
+    pg_store_conformance_shard(2).await;
+}
+
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_conformance_shard_3() {
+    pg_store_conformance_shard(3).await;
+}
+
 /// MOD-2 milestone 9's read suite (plan D96's `READ_CASES`) run against `PgStore`.
 ///
 /// A second loop rather than six more entries in `CASES`: `run_case` is bound to `WriteStore` and
@@ -109,7 +139,7 @@ async fn pg_store_conformance() {
 /// criterion 7's "the same diamond read through `PgStore` and through `CacheStore` renders
 /// byte-identically" a test — `cache.rs::the_mirror_passes_the_read_cases` is the other.
 ///
-/// One database per case for `pg_store_conformance`'s reason, even though no read case writes:
+/// One database per case for the write cases' reason, even though no read case writes:
 /// the loop is the same shape and a read case that grew a write later would not need this file
 /// reopened.
 #[cfg(feature = "demo")]

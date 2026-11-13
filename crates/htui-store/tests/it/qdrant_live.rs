@@ -16,6 +16,7 @@ use htui_core::store::StoreError;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::testkit::{QdrantTurn, qdrant_turn};
 use htui_store::vector::{
     DENSE, EMBEDDER_KEY, ExistingCollection, Hit, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY,
     PointType, Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _,
@@ -30,13 +31,14 @@ use qdrant_client::qdrant::{
 
 const ENV_URL: &str = "HTUI_TEST_QDRANT_URL";
 
-/// The test Qdrant's URL, or the skip line.
-fn qdrant_url() -> Option<String> {
-    let url = std::env::var(ENV_URL).ok();
-    if url.is_none() {
+/// The test Qdrant's URL and this case's turn at it (TOOL-16: one live case at a time), or the
+/// skip line. Bind the turn to a named variable so it lives to the end of the case.
+async fn qdrant_url() -> Option<(QdrantTurn, String)> {
+    let Some(url) = std::env::var(ENV_URL).ok() else {
         eprintln!("skipped: {ENV_URL} not set");
-    }
-    url
+        return None;
+    };
+    Some((qdrant_turn().await, url))
 }
 
 fn fresh_name() -> String {
@@ -55,13 +57,14 @@ async fn connect<E: DenseEmbedder>(
     QdrantStore::connect_to(&settings, embedder, name).await
 }
 
-async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
-    let url = qdrant_url()?;
-    Some(
+async fn throwaway() -> Option<(QdrantTurn, QdrantStore<HashEmbedder>)> {
+    let (turn, url) = qdrant_url().await?;
+    Some((
+        turn,
         connect(&url, HashEmbedder::new(DENSE_DIM), &fresh_name())
             .await
             .expect("Qdrant answers"),
-    )
+    ))
 }
 
 fn scope() -> Scope {
@@ -84,7 +87,7 @@ fn query(text: &str) -> SearchQuery {
 
 #[tokio::test]
 async fn sync_then_search_finds_an_item_by_its_exact_key() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let read = MemStore::demo();
@@ -123,7 +126,7 @@ async fn sync_then_search_finds_an_item_by_its_exact_key() {
 
 #[tokio::test]
 async fn searches_are_scoped_to_projects_and_filtered_by_type_and_status() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let read = MemStore::demo();
@@ -198,7 +201,7 @@ async fn searches_are_scoped_to_projects_and_filtered_by_type_and_status() {
 
 #[tokio::test]
 async fn deleted_points_leave_the_index() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let read = MemStore::demo();
@@ -230,7 +233,7 @@ async fn deleted_points_leave_the_index() {
 
 #[tokio::test]
 async fn a_requirement_is_found_by_its_exact_key() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let read = MemStore::demo();
@@ -278,7 +281,7 @@ async fn a_requirement_is_found_by_its_exact_key() {
 
 #[tokio::test]
 async fn a_resolution_filter_keeps_decisions_and_leaves_requirements_out() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let read = MemStore::demo();
@@ -407,7 +410,7 @@ impl DenseEmbedder for Renamed {
 
 #[tokio::test]
 async fn a_new_collection_records_the_embedder() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -425,7 +428,7 @@ async fn a_new_collection_records_the_embedder() {
 /// under this layout, keeping the embedder.
 #[tokio::test]
 async fn an_unrecorded_collection_is_stamped_once() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -454,7 +457,7 @@ async fn an_unrecorded_collection_is_stamped_once() {
 /// and over REST): the stamp adds its key and leaves the others.
 #[tokio::test]
 async fn stamping_keeps_the_collections_other_metadata() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -483,7 +486,7 @@ async fn stamping_keeps_the_collections_other_metadata() {
 
 #[tokio::test]
 async fn another_identity_is_refused_naming_both() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -518,7 +521,7 @@ async fn another_identity_is_refused_naming_both() {
 
 #[tokio::test]
 async fn another_dense_width_is_refused_and_not_stamped() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -551,7 +554,7 @@ async fn open_existing<E: DenseEmbedder>(
 
 #[tokio::test]
 async fn open_existing_on_a_missing_collection_is_none_and_creates_nothing() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -571,7 +574,7 @@ async fn open_existing_on_a_missing_collection_is_none_and_creates_nothing() {
 
 #[tokio::test]
 async fn open_existing_searches_what_connect_built() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -610,7 +613,7 @@ async fn open_existing_searches_what_connect_built() {
 
 #[tokio::test]
 async fn open_existing_refuses_another_identity() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -632,7 +635,7 @@ async fn open_existing_refuses_another_identity() {
 
 #[tokio::test]
 async fn open_existing_refuses_another_width() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -649,7 +652,7 @@ async fn open_existing_refuses_another_width() {
 /// `open`, as `open_existing` runs it.
 #[tokio::test]
 async fn an_existing_collection_is_found_before_the_embedder_and_checked_after() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let settings = QdrantSettings::new(
@@ -680,7 +683,7 @@ async fn an_existing_collection_is_found_before_the_embedder_and_checked_after()
 /// writes neither.
 #[tokio::test]
 async fn open_existing_leaves_an_unstamped_collection_unstamped() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -749,7 +752,7 @@ async fn stamp_payload_schema(client: &Qdrant, name: &str, version: u64) {
 
 #[tokio::test]
 async fn a_new_collection_records_the_payload_schema() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -769,7 +772,7 @@ async fn a_new_collection_records_the_payload_schema() {
 /// the next `Indexer::sync` refills it.
 #[tokio::test]
 async fn an_old_payload_schema_drops_and_recreates_the_collection() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -825,7 +828,7 @@ async fn an_old_payload_schema_drops_and_recreates_the_collection() {
 /// refuses it as an `embedder mismatch` naming both versions, and neither drops nor stamps it.
 #[tokio::test]
 async fn a_newer_payload_schema_is_refused_and_kept() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -868,7 +871,7 @@ async fn a_newer_payload_schema_is_refused_and_kept() {
 /// as it is, and neither drops it nor stamps it.
 #[tokio::test]
 async fn open_existing_never_drops_an_old_payload_schema() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -926,7 +929,7 @@ async fn check(
 
 #[tokio::test]
 async fn check_refuses_another_width_before_any_embedder() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -946,7 +949,7 @@ async fn check_refuses_another_width_before_any_embedder() {
 
 #[tokio::test]
 async fn check_refuses_another_embedder() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -978,7 +981,7 @@ async fn check_refuses_another_embedder() {
 /// `connect` would stamp it and build its payload indexes; `check` reads only.
 #[tokio::test]
 async fn check_passes_an_unstamped_collection_and_writes_nothing() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -1017,7 +1020,7 @@ async fn check_passes_an_unstamped_collection_and_writes_nothing() {
 /// `connect` would drop and recreate it (MOD-144 Decision B); `check` passes it and drops nothing.
 #[tokio::test]
 async fn check_passes_an_older_payload_stamp_and_drops_nothing() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -1052,7 +1055,7 @@ async fn check_passes_an_older_payload_stamp_and_drops_nothing() {
 
 #[tokio::test]
 async fn probe_of_a_missing_collection_is_no_collection_and_creates_none() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -1076,7 +1079,7 @@ async fn probe_of_a_missing_collection_is_no_collection_and_creates_none() {
 
 #[tokio::test]
 async fn probe_of_a_matching_collection_is_ready() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -1098,7 +1101,7 @@ async fn probe_of_a_matching_collection_is_ready() {
 /// would echo it ("Malformed API key or token: <the key>"); the probe refuses it unechoed.
 #[tokio::test]
 async fn probe_with_a_malformed_key_is_refused_and_never_echoes_it() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let settings = QdrantSettings::new(
@@ -1123,7 +1126,7 @@ async fn probe_with_a_malformed_key_is_refused_and_never_echoes_it() {
 #[cfg(feature = "local-embed")]
 #[tokio::test]
 async fn probe_of_another_embedders_collection_is_mismatch() {
-    let Some(url) = qdrant_url() else {
+    let Some((_turn, url)) = qdrant_url().await else {
         return;
     };
     let name = fresh_name();
@@ -1163,7 +1166,7 @@ async fn synced_item(store: &QdrantStore<HashEmbedder>) -> String {
 
 #[tokio::test]
 async fn each_search_arm_finds_an_exact_key() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let key = synced_item(&store).await;
@@ -1214,7 +1217,7 @@ fn assert_same_up_to_ties(a: &[Hit], b: &[Hit], what: &str) {
 
 #[tokio::test]
 async fn the_hybrid_arms_are_the_vector_store_search() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let key = synced_item(&store).await;
@@ -1232,7 +1235,7 @@ async fn the_hybrid_arms_are_the_vector_store_search() {
 
 #[tokio::test]
 async fn a_sparse_search_without_terms_finds_nothing() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     synced_item(&store).await;
@@ -1253,7 +1256,7 @@ async fn a_sparse_search_without_terms_finds_nothing() {
 
 #[tokio::test]
 async fn every_arm_is_scoped() {
-    let Some(store) = throwaway().await else {
+    let Some((_turn, store)) = throwaway().await else {
         return;
     };
     let key = synced_item(&store).await;
