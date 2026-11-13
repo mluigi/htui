@@ -9567,7 +9567,8 @@ where
     /// in this engine at a time ([`WalkScopes::end`]): a second, a sibling's terminal path met
     /// during the capture, waits for the first to return and then finds the run finished, so it
     /// runs no capture and its `finish_run` is refused, as a second end's always was. A run
-    /// ending `cancelled` waits for nothing: its cancel reaches the capture's session first.
+    /// ending `cancelled` waits for nothing: its cancel reaches the capture's session first, and
+    /// an end that waited and then reads the run's cancel returns `Cancelled` without writing.
     ///
     /// # Errors
     /// The capture's fence and lease errors and the run's own cancel, before `finish_run` is
@@ -9585,6 +9586,12 @@ where
             None
         } else {
             let end = self.walks.end(run).await;
+            // An earlier end of this run that returned on the run's own cancel left the run, and
+            // its capture row, to the cancel path: a waiting end must not take the row for a
+            // crash leftover and end the run `failed` under the cancel (F1 verifier, low).
+            if (self.parts.control)(run).signal().is_cancel() {
+                return Err(EngineError::Cancelled { run });
+            }
             match self.run(run).await {
                 Ok(row) => {
                     // A snapshot that does not decode was refused by the walk long before its
