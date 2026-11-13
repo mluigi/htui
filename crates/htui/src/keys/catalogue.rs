@@ -47,9 +47,9 @@ use Context::{
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
     Field, Form, Global, GraphEditor, GraphEditorLinks, History, Layout, Leave, List, Logs,
     Overlay, Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes,
-    SettingsConnection, SettingsHierarchy, SettingsKinds, SettingsMemory, SettingsPersonas,
-    SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
-    SkillsTemplates, Switcher, Waiting,
+    SettingsConnection, SettingsDocuments, SettingsHierarchy, SettingsKinds, SettingsMemory,
+    SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp,
+    SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -106,6 +106,9 @@ pub enum Context {
     /// `[settings.memory]`: the memory pane a project row opens in Settings › Hierarchy (MOD-163
     /// D22).
     SettingsMemory,
+    /// `[settings.documents]`: the owner documents pane a workspace or project row opens in
+    /// Settings › Hierarchy (MOD-147 M3 D9).
+    SettingsDocuments,
     /// `[graph_editor]`: the graph editor's canvas, its connect mode and its forms (MOD-141 D12).
     GraphEditor,
     /// `[graph_editor.links]`: the graph editor's links list (MOD-141 D12).
@@ -206,6 +209,7 @@ impl Context {
         Self::SettingsProjectTypes,
         Self::SettingsLogging,
         Self::SettingsMemory,
+        Self::SettingsDocuments,
         Self::GraphEditor,
         Self::GraphEditorLinks,
         Self::Concepts,
@@ -266,6 +270,7 @@ impl Context {
             Self::SettingsProjectTypes => "settings.project_types",
             Self::SettingsLogging => "settings.logging",
             Self::SettingsMemory => "settings.memory",
+            Self::SettingsDocuments => "settings.documents",
             Self::GraphEditor => "graph_editor",
             Self::GraphEditorLinks => "graph_editor.links",
             Self::Concepts => "concepts",
@@ -328,6 +333,7 @@ impl Context {
             Self::SettingsProjectTypes => "Project types",
             Self::SettingsLogging => "Logging",
             Self::SettingsMemory => "Memory",
+            Self::SettingsDocuments => "Documents",
             Self::GraphEditor => "Graph editor",
             Self::GraphEditorLinks => "Links",
             Self::Concepts => "Search concepts",
@@ -385,6 +391,7 @@ impl Context {
                 | Self::SettingsProjectTypes
                 | Self::SettingsLogging
                 | Self::SettingsMemory
+                | Self::SettingsDocuments
                 | Self::GraphEditor
                 | Self::GraphEditorLinks
                 | Self::Concepts
@@ -882,6 +889,14 @@ pub enum Act {
     MemoryClashEdit,
     /// `settings.memory.clash_replace`: the subject question's "replace it" (M1 D4).
     MemoryClashReplace,
+    /// `settings.hierarchy.documents`: open the selected workspace's or project's owner documents
+    /// (MOD-147 M3 D9).
+    HierarchyDocuments,
+    /// `settings.documents.view`: show the selected document version's body (MOD-147 M3 D9).
+    DocumentsView,
+    /// `settings.documents.new_version`: write a new version of the selected document through
+    /// `$EDITOR` (MOD-147 M3 D9).
+    DocumentsNewVersion,
     /// `graph_editor.add`: add a step after the selected one (MOD-141 D12).
     GraphEditorAdd,
     /// `graph_editor.edit`: edit the selected step; while connecting, connect to it (MOD-141 D12).
@@ -1423,6 +1438,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["m"],
         "memory",
     ),
+    // MOD-147 M3 D9: a workspace or project row opens its owner documents.
+    row(
+        Act::HierarchyDocuments,
+        SettingsHierarchy,
+        "documents",
+        &["o"],
+        "documents",
+    ),
     // [settings.kinds]
     // kinds.rs:1460.
     row(
@@ -1562,6 +1585,22 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "clash_replace",
         &["r"],
         "replace it",
+    ),
+    // [settings.documents]: the Hierarchy owner documents pane's own acts (MOD-147 M3 D9); its
+    // new and back are the common ones, as the memory pane's are.
+    row(
+        Act::DocumentsView,
+        SettingsDocuments,
+        "view",
+        &["enter"],
+        "view",
+    ),
+    row(
+        Act::DocumentsNewVersion,
+        SettingsDocuments,
+        "new_version",
+        &["v"],
+        "new version",
     ),
     // [graph_editor]: the graph editor's canvas, connect mode and forms (MOD-141 D12).
     row(Act::GraphEditorAdd, GraphEditor, "add", &["a"], "add step"),
@@ -2535,6 +2574,12 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // MOD-163 D22: the memory form moves on `Down`/`Up`, as every Settings form does.
     (SettingsMemory, Act::FormNextField, &["down"]),
     (SettingsMemory, Act::FormPrevField, &["up"]),
+    // MOD-147 M3 D9: the documents body view scrolls on `j`/`k` (the Runs document view's
+    // keys), and its form moves on `Down`/`Up`, as every Settings form does.
+    (SettingsDocuments, Act::PaneScrollDown, &["j"]),
+    (SettingsDocuments, Act::PaneScrollUp, &["k"]),
+    (SettingsDocuments, Act::FormNextField, &["down"]),
+    (SettingsDocuments, Act::FormPrevField, &["up"]),
     // MOD-141 D12: the graph editor's forms move on `Down`/`Up`, as every Settings form does.
     (GraphEditor, Act::FormNextField, &["down"]),
     (GraphEditor, Act::FormPrevField, &["up"]),
@@ -2682,44 +2727,46 @@ mod tests {
             Context::SettingsProjectTypes => 19,
             Context::SettingsLogging => 20,
             Context::SettingsMemory => 21,
-            Context::GraphEditor => 22,
-            Context::GraphEditorLinks => 23,
-            Context::Concepts => 24,
-            Context::Switcher => 25,
-            Context::Migration => 26,
-            Context::Waiting => 27,
-            Context::Skills => 28,
-            Context::SkillsLibrary => 29,
-            Context::SkillsTemplates => 30,
-            Context::SkillsAttach => 31,
-            Context::SkillsHelp => 32,
-            Context::Requirements => 33,
-            Context::Backlog => 34,
-            Context::BacklogBody => 35,
-            Context::BacklogRuns => 36,
-            Context::BacklogGraph => 37,
-            Context::BacklogDocs => 38,
-            Context::BacklogNotes => 39,
-            Context::BacklogPrompt => 40,
-            Context::BacklogReqs => 41,
-            Context::BacklogFilter => 42,
-            Context::BacklogItem => 43,
-            Context::Chat => 44,
-            Context::Logs => 45,
-            Context::Queue => 46,
-            Context::Picker => 47,
-            Context::Layout => 48,
-            Context::History => 49,
-            Context::Leave => 50,
-            Context::Field => 51,
-            Context::Choice => 52,
-            Context::Answer => 53,
+            Context::SettingsDocuments => 22,
+            Context::GraphEditor => 23,
+            Context::GraphEditorLinks => 24,
+            Context::Concepts => 25,
+            Context::Switcher => 26,
+            Context::Migration => 27,
+            Context::Waiting => 28,
+            Context::Skills => 29,
+            Context::SkillsLibrary => 30,
+            Context::SkillsTemplates => 31,
+            Context::SkillsAttach => 32,
+            Context::SkillsHelp => 33,
+            Context::Requirements => 34,
+            Context::Backlog => 35,
+            Context::BacklogBody => 36,
+            Context::BacklogRuns => 37,
+            Context::BacklogGraph => 38,
+            Context::BacklogDocs => 39,
+            Context::BacklogNotes => 40,
+            Context::BacklogPrompt => 41,
+            Context::BacklogReqs => 42,
+            Context::BacklogFilter => 43,
+            Context::BacklogItem => 44,
+            Context::Chat => 45,
+            Context::Logs => 46,
+            Context::Queue => 47,
+            Context::Picker => 48,
+            Context::Layout => 49,
+            Context::History => 50,
+            Context::Leave => 51,
+            Context::Field => 52,
+            Context::Choice => 53,
+            Context::Answer => 54,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 54);
+        // MOD-147 M3 D9: `settings.documents`, 55.
+        assert_eq!(Context::ALL.len(), 55);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -3006,6 +3053,9 @@ mod tests {
         Act::KindsEditor,
         Act::GraphEditorOpenPart,
         Act::BoxesLogLevel,
+        Act::HierarchyDocuments,
+        Act::DocumentsView,
+        Act::DocumentsNewVersion,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3259,6 +3309,9 @@ mod tests {
             Act::KindsEditor => 244,
             Act::GraphEditorOpenPart => 245,
             Act::BoxesLogLevel => 246,
+            Act::HierarchyDocuments => 247,
+            Act::DocumentsView => 248,
+            Act::DocumentsNewVersion => 249,
         }
     }
 
@@ -3293,7 +3346,8 @@ mod tests {
     #[test]
     fn every_act_has_exactly_one_row() {
         // MOD-122 M2 D11: `settings.boxes.log_level`, 247.
-        assert_eq!(CATALOGUE.len(), 247);
+        // MOD-147 M3 D9: `settings.hierarchy.documents` and the documents pane's two, 250.
+        assert_eq!(CATALOGUE.len(), 250);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3606,6 +3660,11 @@ mod tests {
             ),
             (Context::SettingsLogging, "settings.logging", "Logging"),
             (Context::SettingsMemory, "settings.memory", "Memory"),
+            (
+                Context::SettingsDocuments,
+                "settings.documents",
+                "Documents",
+            ),
             (Context::GraphEditor, "graph_editor", "Graph editor"),
             (Context::GraphEditorLinks, "graph_editor.links", "Links"),
             (Context::Concepts, "concepts", "Search concepts"),
@@ -3659,6 +3718,8 @@ mod tests {
         assert!(Context::SettingsLogging.is_view() && !Context::SettingsLogging.is_shared());
         // MOD-163 D22: the Hierarchy memory pane is a view.
         assert!(Context::SettingsMemory.is_view() && !Context::SettingsMemory.is_shared());
+        // MOD-147 M3 D9: the Hierarchy owner documents pane is a view.
+        assert!(Context::SettingsDocuments.is_view() && !Context::SettingsDocuments.is_shared());
         // MOD-141 D12: the graph editor and its links list are views.
         assert!(Context::GraphEditor.is_view() && !Context::GraphEditor.is_shared());
         assert!(Context::GraphEditorLinks.is_view() && !Context::GraphEditorLinks.is_shared());

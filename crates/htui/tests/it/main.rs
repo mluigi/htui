@@ -55,6 +55,7 @@ mod reveal;
 mod runs_pg;
 mod secrets_settings;
 mod settings;
+mod settings_documents;
 mod settings_memory;
 mod shell;
 mod skills;

@@ -7,8 +7,10 @@
 //! on screen is always the last snapshot the worker assembled — no row is ever patched in locally,
 //! so there is exactly one source of truth.
 //!
-//! Five modes — browsing, an editor, a delete confirmation, a directory picker (MOD-49), or a
-//! project's memory pane (MOD-163 D20, [`MemoryPane`], delegated as the picker is) — and
+//! Six modes — browsing, an editor, a delete confirmation, a directory picker (MOD-49), a
+//! project's memory pane (MOD-163 D20, [`MemoryPane`], delegated as the picker is), or a
+//! workspace's or project's owner documents pane (MOD-147 M3 D9, [`OwnerDocumentsPane`],
+//! delegated the same way) — and
 //! the mode is what [`captures_input`](SettingsSection::captures_input) is derived from rather than
 //! a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the global table still
 //! owns `q`, `?`, `Tab` and the digits; while an editor, a delete confirmation or the picker is
@@ -41,12 +43,14 @@ use ratatui::widgets::Paragraph;
 use htui_core::store::{DeleteReach, DeleteTarget};
 
 use crate::app::{Action, Ctx, Handled};
+use crate::editor::ExternalEditOutcome;
 use crate::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
     RepoEntry, reach_parts, reach_totals, workspace_root,
 };
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::memory::REQUEST_NAMES as MEMORY_REQUEST_NAMES;
+use crate::owner_documents::{DocumentOwner, REQUEST_NAMES as DOCUMENT_REQUEST_NAMES};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::kit::empty::{self, NextStep};
@@ -58,6 +62,7 @@ use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
 use crate::ui::tabs::settings::memory::{MemoryPane, PaneKey};
+use crate::ui::tabs::settings::owner_documents::OwnerDocumentsPane;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, changed_elsewhere};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -109,6 +114,8 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::HierarchyPrimary, "primary"),
     Hint::One(Act::HierarchyChoosePath, "path"),
     Hint::One(Act::HierarchyInfer, "infer"),
+    // MOD-147 M3 D9: before `memory`, so it shows in the cut-off hint line.
+    Hint::One(Act::HierarchyDocuments, "documents"),
     Hint::One(Act::HierarchyMemory, "memory"),
     Hint::One(Act::Delete, "delete"),
     Hint::One(Act::Reload, "reload"),
@@ -176,6 +183,14 @@ pub const PICK_A_PROJECT: &str = "memory belongs to a project: put the cursor on
 
 /// The memory pane closed because its project left the tree.
 const MEMORY_PROJECT_GONE: &str = "the project is gone; its memory pane closed";
+
+/// `settings.hierarchy.documents` on a row that is neither the workspace's nor a project's
+/// (MOD-147 M3 D9).
+pub const PICK_AN_OWNER: &str =
+    "documents belong to the workspace or a project: put the cursor on one of their rows";
+
+/// The documents pane closed because its owner left the tree.
+const DOCUMENTS_OWNER_GONE: &str = "the owner is gone; its documents pane closed";
 
 /// What a CAS miss says with no editor open — `p` is the one write that has none (D12). `primary`
 /// is the label of `settings.hierarchy.primary` (MOD-67 M6 D4): `reloaded; press p again` under
@@ -358,6 +373,14 @@ enum Mode {
         project: ProjectId,
         /// The pane. Boxed: it is the largest thing a mode holds.
         pane: Box<MemoryPane>,
+    },
+    /// MOD-147 M3 D9: a workspace's or a project's owner documents pane, delegated as `Memory`
+    /// is.
+    Documents {
+        /// Whose documents the pane lists.
+        owner: DocumentOwner,
+        /// The pane. Boxed, as the memory pane is.
+        pane: Box<OwnerDocumentsPane>,
     },
 }
 
@@ -573,7 +596,7 @@ impl HierarchySection {
             }
             // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty;
             // the memory pane draws over the whole section too (MOD-163 D20).
-            Mode::Picking { .. } | Mode::Memory { .. } => Vec::new(),
+            Mode::Picking { .. } | Mode::Memory { .. } | Mode::Documents { .. } => Vec::new(),
             Mode::Deleting {
                 target,
                 slug,
@@ -605,6 +628,9 @@ impl HierarchySection {
         if let Mode::Memory { pane, .. } = &self.mode {
             return pane.hint_text(keys);
         }
+        if let Mode::Documents { pane, .. } = &self.mode {
+            return pane.hint_text(keys);
+        }
         let spec = match &self.mode {
             Mode::Browse => {
                 if self.unavailable.is_some() {
@@ -618,7 +644,7 @@ impl HierarchySection {
             Mode::Editing(_) => HINT_EDITING,
             Mode::Picking { .. } => HINT_PICKING,
             // Answered above; the pane names its own keys.
-            Mode::Memory { .. } => HINT_BROWSE,
+            Mode::Memory { .. } | Mode::Documents { .. } => HINT_BROWSE,
             Mode::Deleting { stage, .. } => match stage {
                 DeleteStage::Counting => HINT_COUNTING,
                 DeleteStage::Warn(_) => HINT_WARN,
@@ -649,6 +675,7 @@ impl HierarchySection {
             Mode::Picking { picker, .. } if picker.goto_open() => views::CAPTURE,
             Mode::Picking { .. } => views::HIERARCHY_PICKER,
             Mode::Memory { pane, .. } => pane.stack(),
+            Mode::Documents { pane, .. } => pane.stack(),
             Mode::Deleting { stage, .. } => match stage {
                 DeleteStage::Counting => views::HIERARCHY_DELETE_COUNTING,
                 DeleteStage::Warn(_) => views::HIERARCHY_DELETE_WARN,
@@ -737,6 +764,18 @@ impl HierarchySection {
                         }
                     }
                 }
+                // MOD-147 M3 D9: the workspace row or a project row opens its owner documents; a
+                // read, so refused only as the memory pane's key is.
+                Act::HierarchyDocuments => {
+                    if !self.refuse(act, ctx.keys()) {
+                        match self.selected() {
+                            Some(row @ (Row::Workspace | Row::Project { .. })) => {
+                                self.open_documents(row, ctx);
+                            }
+                            _ => self.notice = Some(PICK_AN_OWNER.to_owned()),
+                        }
+                    }
+                }
                 // Allowed while `busy`: re-reading is how a section that lost a reply recovers,
                 // and a read cannot lose a write's reply — the staleness index is keyed by request
                 // kind.
@@ -805,6 +844,35 @@ impl HierarchySection {
         self.notice = None;
         self.mode = Mode::Memory {
             project,
+            pane: Box::new(pane),
+        };
+    }
+
+    /// `settings.hierarchy.documents` on the workspace row or a project row: the pane opens on
+    /// its owner and its read goes out (MOD-147 M3 D9).
+    fn open_documents(&mut self, row: Row, ctx: &Ctx<'_>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let (owner, slug) = match row {
+            Row::Workspace => (
+                DocumentOwner::Workspace(snapshot.workspace.id),
+                snapshot.workspace.slug.clone(),
+            ),
+            Row::Project { index } => match snapshot.projects.get(index) {
+                Some(entry) => (
+                    DocumentOwner::Project(entry.project.id),
+                    entry.project.slug.clone(),
+                ),
+                None => return,
+            },
+            Row::Repo { .. } => return,
+        };
+        let (pane, read) = OwnerDocumentsPane::open(owner, slug);
+        ctx.request(read);
+        self.notice = None;
+        self.mode = Mode::Documents {
+            owner,
             pane: Box::new(pane),
         };
     }
@@ -1145,7 +1213,11 @@ impl HierarchySection {
     fn deleting_slug(&self) -> Option<String> {
         match &self.mode {
             Mode::Deleting { slug, .. } => Some(slug.clone()),
-            Mode::Browse | Mode::Editing(_) | Mode::Picking { .. } | Mode::Memory { .. } => None,
+            Mode::Browse
+            | Mode::Editing(_)
+            | Mode::Picking { .. }
+            | Mode::Memory { .. }
+            | Mode::Documents { .. } => None,
         }
     }
 
@@ -1169,7 +1241,11 @@ impl HierarchySection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse | Mode::Deleting { .. } | Mode::Picking { .. } | Mode::Memory { .. } => {
+            Mode::Browse
+            | Mode::Deleting { .. }
+            | Mode::Picking { .. }
+            | Mode::Memory { .. }
+            | Mode::Documents { .. } => {
                 return Handled::Pass;
             }
         };
@@ -1373,7 +1449,9 @@ impl HierarchySection {
                 )
             }
             Mode::Picking { target, .. } => matches!(target, PathTarget::WorkspaceRoot(_)),
-            Mode::Browse | Mode::Deleting { .. } | Mode::Memory { .. } => false,
+            Mode::Browse | Mode::Deleting { .. } | Mode::Memory { .. } | Mode::Documents { .. } => {
+                false
+            }
         };
         if let Some(name) = write {
             self.notice = self.written(name, snapshot);
@@ -1397,6 +1475,20 @@ impl HierarchySection {
         {
             self.mode = Mode::Browse;
             self.notice = Some(MEMORY_PROJECT_GONE.to_owned());
+        }
+        // MOD-147 M3 D9: a documents pane whose owner left the tree closes.
+        if let Mode::Documents { owner, .. } = &self.mode {
+            let present = match owner {
+                DocumentOwner::Workspace(id) => snapshot.workspace.id == *id,
+                DocumentOwner::Project(id) => snapshot
+                    .projects
+                    .iter()
+                    .any(|entry| entry.project.id == *id),
+            };
+            if !present {
+                self.mode = Mode::Browse;
+                self.notice = Some(DOCUMENTS_OWNER_GONE.to_owned());
+            }
         }
 
         // D11: the tree the section reads is what decides the scope, so a project created or
@@ -1470,8 +1562,10 @@ impl HierarchySection {
             // `HierarchyStale` — and harmless if it ever were: the picker keeps its place.
             Mode::Picking { .. } => Some(Reload::Keep),
             // `p` is the one write with no editor behind it, and a delete has no CAS token at all.
-            // The memory pane writes no tree, so a tree's CAS miss is never its.
-            Mode::Browse | Mode::Deleting { .. } | Mode::Memory { .. } => None,
+            // The memory and documents panes write no tree, so a tree's CAS miss is never theirs.
+            Mode::Browse | Mode::Deleting { .. } | Mode::Memory { .. } | Mode::Documents { .. } => {
+                None
+            }
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -1509,6 +1603,10 @@ impl SettingsSection for HierarchySection {
         let mut out = vec![StoreRequest::Hierarchy(scope.workspace_id)];
         // MOD-163 D20: an open memory pane reads its list again on activation.
         if let Mode::Memory { pane, .. } = &self.mode {
+            out.push(pane.read_request());
+        }
+        // MOD-147 M3 D9: so does an open documents pane.
+        if let Mode::Documents { pane, .. } = &self.mode {
             out.push(pane.read_request());
         }
         out
@@ -1557,6 +1655,7 @@ impl SettingsSection for HierarchySection {
                 Handled::Consumed
             }
             Mode::Memory { pane, .. } => pane.on_paste(text),
+            Mode::Documents { pane, .. } => pane.on_paste(text),
             Mode::Browse | Mode::Deleting { .. } => Handled::Pass,
         }
     }
@@ -1564,6 +1663,16 @@ impl SettingsSection for HierarchySection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // MOD-163 D20: the memory pane takes every key while it is open; its `back` closes it.
         if let Mode::Memory { pane, .. } = &mut self.mode {
+            return match pane.on_key(key, ctx) {
+                PaneKey::Handled(handled) => handled,
+                PaneKey::Close => {
+                    self.mode = Mode::Browse;
+                    Handled::Consumed
+                }
+            };
+        }
+        // MOD-147 M3 D9: so does the documents pane.
+        if let Mode::Documents { pane, .. } = &mut self.mode {
             return match pane.on_key(key, ctx) {
                 PaneKey::Handled(handled) => handled,
                 PaneKey::Close => {
@@ -1598,6 +1707,17 @@ impl SettingsSection for HierarchySection {
             }
             StoreReply::Failed { request, .. } if MEMORY_REQUEST_NAMES.contains(request) => {
                 if let Mode::Memory { pane, .. } = &mut self.mode {
+                    pane.on_reply(reply, ctx);
+                }
+            }
+            // MOD-147 M3 D9: the documents pane's, likewise.
+            StoreReply::OwnerDocuments { .. } | StoreReply::OwnerDocumentWritten { .. } => {
+                if let Mode::Documents { pane, .. } = &mut self.mode {
+                    pane.on_reply(reply, ctx);
+                }
+            }
+            StoreReply::Failed { request, .. } if DOCUMENT_REQUEST_NAMES.contains(request) => {
+                if let Mode::Documents { pane, .. } = &mut self.mode {
                     pane.on_reply(reply, ctx);
                 }
             }
@@ -1753,8 +1873,20 @@ impl SettingsSection for HierarchySection {
         key_line(self.hint_text(keys), theme)
     }
 
+    /// MOD-147 M3 D10: the documents pane asked for the edit; with no pane open the outcome
+    /// lands nowhere.
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
+        match &mut self.mode {
+            Mode::Documents { pane, .. } => pane.on_external_edit(outcome, ctx),
+            _ => tracing::debug!("no documents pane to take the $EDITOR outcome"),
+        }
+    }
+
     fn scroll(&self) -> Option<ScrollSpan> {
         if let Mode::Memory { pane, .. } = &self.mode {
+            return pane.scroll();
+        }
+        if let Mode::Documents { pane, .. } = &self.mode {
             return pane.scroll();
         }
         self.scroll.get()
@@ -1763,6 +1895,11 @@ impl SettingsSection for HierarchySection {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-163 D20: the memory pane draws over the whole section.
         if let Mode::Memory { pane, .. } = &self.mode {
+            pane.render(frame, area, ctx);
+            return;
+        }
+        // MOD-147 M3 D9: so does the documents pane.
+        if let Mode::Documents { pane, .. } = &self.mode {
             pane.render(frame, area, ctx);
             return;
         }

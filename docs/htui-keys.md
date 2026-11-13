@@ -119,6 +119,7 @@ primary       = ["p"]              # make primary
 choose_path   = ["b"]              # choose path
 infer         = ["i"]              # infer paths
 memory        = ["m"]              # memory
+documents     = ["o"]              # documents
 next_field    = ["tab", "down"]    # next field
 prev_field    = ["backtab", "up"]  # previous field
 
@@ -167,6 +168,14 @@ clash_edit    = ["e"]              # edit it
 clash_replace = ["r"]              # replace it
 next_field    = ["tab", "down"]    # next field
 prev_field    = ["backtab", "up"]  # previous field
+
+[settings.documents]
+view        = ["enter"]          # view
+new_version = ["v"]              # new version
+scroll_down = ["J", "j"]         # scroll down
+scroll_up   = ["K", "k"]         # scroll up
+next_field  = ["tab", "down"]    # next field
+prev_field  = ["backtab", "up"]  # previous field
 
 [graph_editor]
 add              = ["a"]              # add step

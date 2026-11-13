@@ -540,7 +540,8 @@ mod tests {
                           settings, settings.agents, settings.hierarchy, settings.kinds, \
                           settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
                           settings.personas, settings.secrets, settings.queue, \
-                          settings.project_types, settings.logging, settings.memory, graph_editor, \
+                          settings.project_types, settings.logging, settings.memory, \
+                          settings.documents, graph_editor, \
                           graph_editor.links, concepts, switcher, migration, \
                           waiting, skills, skills.library, \
                           skills.templates, skills.attach, skills.help, requirements, backlog, \

@@ -3534,9 +3534,10 @@ async fn a_rebound_infer_acts_on_its_new_chord_and_the_hint_follows() {
     };
     let mut harness = hierarchy_over(MemStore::demo()).await.with_keys(keys());
     let frame = harness.render();
-    // MOD-163 D20: `m memory` follows `infer` in the hint.
+    // MOD-163 D20: `m memory` followed `infer` in the hint; MOD-147 M3 D9 puts `o documents`
+    // between them.
     assert!(
-        frame.contains("b path \u{b7} I infer \u{b7} m memory"),
+        frame.contains("b path \u{b7} I infer \u{b7} o documents"),
         "{frame}"
     );
 

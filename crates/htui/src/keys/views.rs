@@ -271,6 +271,7 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
             Act::HierarchyChoosePath,
             Act::HierarchyInfer,
             Act::HierarchyMemory,
+            Act::HierarchyDocuments,
         ],
     ),
     SETTINGS,
@@ -351,6 +352,35 @@ pub const MEMORY_CLASH: Stack<'static> = Stack::new(&[
 pub const MEMORY_CLASH_AMEND: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsMemory, &[Act::MemoryClashEdit]),
     BACK,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Documents, the list (MOD-147 M3 D9). The pane captures input, as the
+/// memory pane does, so no `SETTINGS` layer.
+pub const DOCUMENTS_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::SettingsDocuments,
+        &[Act::DocumentsView, Act::DocumentsNewVersion],
+    ),
+    Layer::only(Context::Common, &[Act::New, Act::Back]),
+    LIST,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Documents, one version's body, read-only (`j`/`k` scroll too:
+/// `VIEW_DEFAULTS`).
+pub const DOCUMENTS_VIEW: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsDocuments, &[]),
+    PANE_SCROLL,
+    BACK,
+    MODAL,
+]);
+
+/// Settings > Hierarchy > Documents, the form: kind and title (text fields), then `$EDITOR`.
+pub const DOCUMENTS_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsDocuments, &[]),
+    FIELD,
+    FORM_FIELDS,
     MODAL,
 ]);
 
@@ -1280,6 +1310,7 @@ mod tests {
         source!("ui/tabs/settings/connection.rs"),
         source!("ui/tabs/settings/hierarchy.rs"),
         source!("ui/tabs/settings/memory.rs"),
+        source!("ui/tabs/settings/owner_documents.rs"),
         source!("ui/tabs/settings/kinds.rs"),
         source!("ui/graph_editor/mod.rs"),
         source!("ui/tabs/settings/personas.rs"),
@@ -1390,6 +1421,9 @@ mod tests {
         MEMORY_RETIRE,
         MEMORY_CLASH,
         MEMORY_CLASH_AMEND,
+        DOCUMENTS_BROWSE,
+        DOCUMENTS_VIEW,
+        DOCUMENTS_FORM,
         KINDS_BROWSE,
         KINDS_EDITOR,
         KINDS_CONFIRM,
@@ -1678,6 +1712,24 @@ mod tests {
             [Act::FormNextField, Act::FieldLineDown]
         );
         assert_eq!(resolve(MEMORY_RETIRE, "y"), [Act::ConfirmYes]);
+        // MOD-147 M3 D9: the Hierarchy owner documents pane; `o` opens it, and it captures input
+        // so `h` cycles no section.
+        assert_eq!(resolve(HIERARCHY_BROWSE, "o"), [Act::HierarchyDocuments]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "enter"), [Act::DocumentsView]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "v"), [Act::DocumentsNewVersion]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "n"), [Act::New]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "esc"), [Act::Back]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "h"), []);
+        assert_eq!(resolve(DOCUMENTS_BROWSE, "q"), []);
+        assert_eq!(resolve(DOCUMENTS_VIEW, "j"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(DOCUMENTS_VIEW, "k"), [Act::PaneScrollUp]);
+        assert_eq!(resolve(DOCUMENTS_VIEW, "esc"), [Act::Back]);
+        assert_eq!(
+            resolve(DOCUMENTS_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(DOCUMENTS_FORM, "enter"), [Act::FieldSubmit]);
         // MOD-115 M2 D6: the leave dialog (it replaced the quit question).
         assert_eq!(resolve(LEAVE, "enter"), [Act::LeaveConfirm]);
         assert_eq!(resolve(LEAVE, "ctrl-c"), [Act::LeaveConfirm]);
@@ -2053,6 +2105,7 @@ mod tests {
                 "HIERARCHY_EDITOR",
                 "MEMORY_EDIT",
                 "MEMORY_BODY",
+                "DOCUMENTS_FORM",
                 "KINDS_EDITOR",
                 "GRAPH_EDITOR_NODE_FORM",
                 "GRAPH_EDITOR_EDGE_FORM",
@@ -2155,8 +2208,8 @@ mod tests {
         // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
-        // D14: the part form's, 91.
-        assert_eq!(views.len(), 91);
+        // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94.
+        assert_eq!(views.len(), 94);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

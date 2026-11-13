@@ -22,6 +22,9 @@ pub mod kinds;
 pub mod logging;
 /// A project's memory pane, opened from Settings › Hierarchy (MOD-163 D20).
 pub mod memory;
+/// A workspace's or a project's owner documents pane, opened from Settings › Hierarchy (MOD-147
+/// M3 D9).
+pub mod owner_documents;
 pub mod personas;
 pub mod project_types;
 pub mod prompt;
@@ -37,6 +40,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::app::{Ctx, Handled};
+use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -180,6 +184,9 @@ pub trait SettingsSection {
     }
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
+    /// The `$EDITOR` handoff this section asked for came back (MOD-147 M3 D10), forwarded by
+    /// [`SettingsTab`]'s [`Tab::on_external_edit`] to the active section. Defaulted to nothing.
+    fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
     /// Whether this section's pane says a refused `request` itself, so the shell keeps it off the
     /// status line ([`Tab::absorbs_failure`], MOD-146 R1 L4). Defaulted to `false`.
     fn absorbs_failure(&self, _request: &str) -> bool {
@@ -453,6 +460,14 @@ impl Tab for SettingsTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         for section in &mut self.sections.sections {
             section.on_reply(reply, ctx);
+        }
+    }
+
+    /// MOD-147 M3 D10: an `$EDITOR` outcome goes to the active section, the one whose key asked
+    /// for the edit (a section's emits are stamped with this tab's origin).
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
+        if let Some(section) = self.sections.sections.get_mut(self.sections.active) {
+            section.on_external_edit(outcome, ctx);
         }
     }
 
