@@ -274,6 +274,17 @@ pub trait Orchestrate {
     /// # Errors
     /// As `Engine::settle_stop`.
     async fn settle_stop(&self, run: RunId) -> Result<bool, EngineError>;
+
+    /// MOD-125 M3 D3: `Engine::resume_stopped`, the executor's resume of a `stopped` run of its
+    /// box (a case stops it with M2's preempt and `settle_stop` first).
+    ///
+    /// # Errors
+    /// As `Engine::resume_stopped`.
+    async fn resume_stopped(&self, run: RunId) -> Result<Option<Rest>, EngineError>;
+
+    /// MOD-125 M3 D9: the next session of `(phase, attempt)` (or of one session's `slot`) fails
+    /// its first `start` on the wire with `reason`, and plays its script on the next.
+    fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -420,6 +431,14 @@ impl Orchestrate for FakeOrchestrator {
 
     async fn settle_stop(&self, run: RunId) -> Result<bool, EngineError> {
         Box::pin(crate::engine::settle_stop_fake(self, run)).await
+    }
+
+    async fn resume_stopped(&self, run: RunId) -> Result<Option<Rest>, EngineError> {
+        Box::pin(crate::engine::resume_stopped_fake(self, run)).await
+    }
+
+    fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str) {
+        Self::refuse_resume(self, phase, attempt, slot, reason);
     }
 }
 
@@ -1049,6 +1068,19 @@ pub const CASES: &[&str] = &[
     "a_stop_during_a_part_stops_it_and_leaves_the_queued_part_pending",
     "a_stop_during_the_pre_merge_stops_the_integrate_step",
     "a_stop_during_integrate_stops_the_integrate_step",
+    // MOD-125 M3 T3: a stopped run resumed on its own rows (plan D3, D4, D5, D7, D9): the saved
+    // session reopened, its failure's fallback, no caps, no rows, no banner, the planner, the
+    // pre-merge and integrate; and a stopped run's cancel on this box and on none (D6).
+    "a_stopped_step_resumes_its_own_session_on_its_row",
+    "a_failed_resume_opens_a_fresh_session_on_the_same_row",
+    "a_stopped_step_without_session_caps_opens_fresh_with_the_handoff",
+    "a_stopped_step_with_no_session_rows_is_walked_again",
+    "a_stopped_step_with_no_banner_opens_fresh_on_its_rows",
+    "a_stopped_planner_resumes_into_admission",
+    "a_stop_during_the_pre_merge_resumes_by_walking_integrate_again",
+    "a_stopped_integrate_step_resumes_its_session",
+    "a_cancel_of_a_stopped_run_on_this_box_cancels_and_cleans_up",
+    "a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup",
 ];
 
 /// Run one case by name.
@@ -1090,6 +1122,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| divided_recovery_case(name, harness))
         .or_else(|| integrate_case(name, harness))
         .or_else(|| stop_case(name, harness))
+        .or_else(|| resume_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -3700,7 +3733,7 @@ async fn cancel_cleans_up_once<H: CaseHarness>(harness: &H) {
             &refused,
             EngineError::RunStatus {
                 status: RunStatus::Cancelled,
-                expected: "queued | running | awaiting_approval",
+                expected: "queued | running | awaiting_approval | stopped",
                 ..
             }
         ),
@@ -17113,6 +17146,552 @@ async fn a_stop_during_integrate_stops_the_integrate_step<H: CaseHarness>(harnes
     }
 }
 
+// -- MOD-125 M3 T3: a stopped run resumes on its own rows; a stopped run's cancel (D3-D7, D9) ----
+
+/// MOD-125 M3 T3's cases, in a frame of their own (each arm boxed, the stack rule of [`case`]).
+fn resume_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_stopped_step_resumes_its_own_session_on_its_row" => {
+            Box::pin(a_stopped_step_resumes_its_own_session_on_its_row(harness))
+        }
+        "a_failed_resume_opens_a_fresh_session_on_the_same_row" => Box::pin(
+            a_failed_resume_opens_a_fresh_session_on_the_same_row(harness),
+        ),
+        "a_stopped_step_without_session_caps_opens_fresh_with_the_handoff" => {
+            Box::pin(a_stopped_step_without_session_caps_opens_fresh_with_the_handoff(harness))
+        }
+        "a_stopped_step_with_no_session_rows_is_walked_again" => {
+            Box::pin(a_stopped_step_with_no_session_rows_is_walked_again(harness))
+        }
+        "a_stopped_step_with_no_banner_opens_fresh_on_its_rows" => Box::pin(
+            a_stopped_step_with_no_banner_opens_fresh_on_its_rows(harness),
+        ),
+        "a_stopped_planner_resumes_into_admission" => {
+            Box::pin(a_stopped_planner_resumes_into_admission(harness))
+        }
+        "a_stop_during_the_pre_merge_resumes_by_walking_integrate_again" => {
+            Box::pin(a_stop_during_the_pre_merge_resumes_by_walking_integrate_again(harness))
+        }
+        "a_stopped_integrate_step_resumes_its_session" => {
+            Box::pin(a_stopped_integrate_step_resumes_its_session(harness))
+        }
+        "a_cancel_of_a_stopped_run_on_this_box_cancels_and_cleans_up" => Box::pin(
+            a_cancel_of_a_stopped_run_on_this_box_cancels_and_cleans_up(harness),
+        ),
+        "a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup" => Box::pin(
+            a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup(harness),
+        ),
+        _ => return None,
+    })
+}
+
+/// A step's session log as the store has it.
+async fn events_of<O: Orchestrate>(orch: &O, step: StepId) -> Vec<htui_core::model::SessionEvent> {
+    orch.store()
+        .step_events(step)
+        .await
+        .expect("MemStore never fails a read")
+        .unwrap_or_default()
+}
+
+/// `run_step.opening` of `step`, as the run's summary carries it.
+async fn opening_of<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    step: StepId,
+) -> Option<htui_core::model::StepOpening> {
+    let item = run_of(orch, run)
+        .await
+        .item_id
+        .expect("a graph run names its item");
+    orch.store()
+        .runs(item)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|row| row.id == run)
+        .expect("the item lists its run")
+        .steps
+        .into_iter()
+        .find(|row| row.id == step)
+        .expect("the run lists its step")
+        .opening
+}
+
+/// The texts of a log's `follow_up` rows, in order.
+fn follow_ups_in(events: &[htui_core::model::SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .map(|row| row.payload["text"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// How many `prompt` rows a log holds.
+fn prompts_in(events: &[htui_core::model::SessionEvent]) -> usize {
+    events
+        .iter()
+        .filter(|row| row.kind == EventKind::Prompt)
+        .count()
+}
+
+/// How many times the isolator prepared `step`.
+fn prepares_of<O: Orchestrate>(orch: &O, step: StepId) -> usize {
+    orch.isolator()
+        .call_log()
+        .iter()
+        .filter(|call| **call == IsolatorCall::Prepare(step))
+        .count()
+}
+
+/// An ungated `FEAT-3` over a primary repo, its walk dropped once `stalled` fires (a forced
+/// stop), then the stop settled: the run is `stopped` over its `prd` row.
+async fn stopped_feat_3<O: Orchestrate>(orch: &O, stalled: &Notify) -> (RunId, RunStep) {
+    let run = crash(orch, ids::HTUI_FEAT_3, stalled).await;
+    settled_stopped(orch, run).await;
+    let prd = step_at(orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Stopped, "the prd row stopped");
+    (run, prd)
+}
+
+/// [`stopped_feat_3`] with `prd`'s session finished and its walk dropped before the settle: the
+/// log holds the session's banner.
+async fn stopped_after_prd_session<O: Orchestrate>(orch: &O) -> (RunId, RunStep) {
+    feat_3_gated(orch, Gate::Never, |_| {}).await;
+    primary_repo(orch).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    stopped_feat_3(orch, &stalled).await
+}
+
+/// `resume_stopped` walked the run to `done`, and the `prd` row is the same row and attempt,
+/// `done` once.
+async fn resumed_to_done<O: Orchestrate>(orch: &O, run: RunId, prd: &RunStep) -> RunStep {
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "the resumed run walks to done: {resumed:?}"
+    );
+    let steps = steps_of(orch, run).await;
+    assert_eq!(
+        steps.iter().filter(|step| step.position == 0).count(),
+        1,
+        "the stopped row resumed; no new row: {steps:?}"
+    );
+    let after = at(&steps, 0, 1).clone();
+    assert_eq!(
+        (after.id, after.attempt, after.status),
+        (prd.id, 1, StepStatus::Done),
+        "the same row and attempt, done"
+    );
+    after
+}
+
+/// MOD-125 M3 D4 branch 3, D5: a stopped step whose log holds a banner and whose agent can
+/// resume reopens its own session: opening `resumed`, `spec.resume` its banner's id, one
+/// follow-up row with the stop's resume text and no second prompt row, on the same row, attempt
+/// and trees, with its guard reacquired and no second `prepare`.
+async fn a_stopped_step_resumes_its_own_session_on_its_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (run, prd) = stopped_after_prd_session(&orch).await;
+    let trees = orch
+        .store()
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(!trees.is_empty(), "stage 2 recorded the prd tree");
+
+    resumed_to_done(&orch, run, &prd).await;
+
+    assert_eq!(
+        opening_of(&orch, run, prd.id).await,
+        Some(htui_core::model::StepOpening::Resumed)
+    );
+    assert_eq!(
+        orch.spec_for(&session("prd", 0))
+            .expect("the resumed session started")
+            .resume,
+        Some(AgentSessionRef::new(format!("fake-{}", prd.id))),
+        "the session reopened from its banner"
+    );
+    let events = events_of(&orch, prd.id).await;
+    assert_eq!(
+        follow_ups_in(&events),
+        vec![promote::STOP_RESUME_OPENING.to_owned()]
+    );
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(prepares_of(&orch, prd.id), 1, "no second `prepare`");
+    assert!(
+        orch.isolator()
+            .call_log()
+            .contains(&IsolatorCall::Reacquire(prd.id)),
+        "the step's guards were reacquired"
+    );
+    assert_eq!(
+        orch.store()
+            .step_trees(prd.id)
+            .await
+            .expect("MemStore never fails a read"),
+        trees,
+        "the same trees"
+    );
+}
+
+/// MOD-125 M3 D5: a resume that fails on the wire records `resume_failed` (the column and the
+/// notice row), then a fresh session on the same row opens with the handoff, and the step ends
+/// `done`.
+async fn a_failed_resume_opens_a_fresh_session_on_the_same_row<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (run, prd) = stopped_after_prd_session(&orch).await;
+    orch.refuse_resume("prd", 1, None, "no conversation found");
+
+    let after = resumed_to_done(&orch, run, &prd).await;
+
+    assert_eq!(
+        opening_of(&orch, run, after.id).await,
+        Some(htui_core::model::StepOpening::ResumeFailed)
+    );
+    assert_eq!(
+        orch.spec_for(&session("prd", 0))
+            .expect("the fallback session started")
+            .resume,
+        None,
+        "the second start is fresh"
+    );
+    let events = events_of(&orch, prd.id).await;
+    let notice = events
+        .iter()
+        .find(|row| {
+            row.kind == EventKind::Other
+                && row.payload["update"] == htui_agent::event::RESUME_FAILED
+        })
+        .expect("the resume_failed notice was recorded");
+    assert_eq!(
+        notice.payload["body"]["session_id"],
+        format!("fake-{}", prd.id)
+    );
+    let follow_ups = follow_ups_in(&events);
+    assert_eq!(follow_ups.len(), 1, "one follow-up: the fallback");
+    assert!(
+        follow_ups[0].contains(promote::STOP_REASON),
+        "the fallback is the handoff with the stop's reason: {follow_ups:?}"
+    );
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(prepares_of(&orch, prd.id), 1, "no second `prepare`");
+}
+
+/// MOD-125 M3 D4 branch 2, D7: an agent whose row cannot resume opens a fresh session on the
+/// continuing recorder with the handoff (the stop's reason in it) as a follow-up, records no
+/// opening, and runs the step to `done` on the same row.
+async fn a_stopped_step_without_session_caps_opens_fresh_with_the_handoff<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    let (run, prd) = stopped_after_prd_session(&orch).await;
+    // The caps `caps_for` reads are the agent row's: neither ACP restore route stays on.
+    let mut agent = orch
+        .store()
+        .agents()
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .map(|summary| summary.agent)
+        .find(|agent| agent.id == ids::AGENT_CLAUDE)
+        .expect("the demo seeds `claude`");
+    agent.settings["acp"]["session"] = serde_json::json!({ "resume": false, "load": false });
+    let expected = agent.updated_at;
+    assert!(
+        matches!(
+            orch.store().upsert_agent(&agent, Some(expected)).await,
+            Ok(CasOutcome::Applied(_))
+        ),
+        "the agent row takes the edit"
+    );
+
+    let after = resumed_to_done(&orch, run, &prd).await;
+
+    assert_eq!(
+        opening_of(&orch, run, after.id).await,
+        None,
+        "a fresh session records no opening"
+    );
+    assert_eq!(
+        orch.spec_for(&session("prd", 0))
+            .expect("the fresh session started")
+            .resume,
+        None
+    );
+    let events = events_of(&orch, prd.id).await;
+    let follow_ups = follow_ups_in(&events);
+    assert_eq!(follow_ups.len(), 1, "{follow_ups:?}");
+    assert!(
+        follow_ups[0].contains(promote::STOP_REASON),
+        "{follow_ups:?}"
+    );
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(prepares_of(&orch, prd.id), 1, "no second `prepare`");
+}
+
+/// MOD-125 M3 D4 branch 1: a step stopped before its session's recorder opened (its log is
+/// empty) is walked again from stage 2 on the same row: prepared again, one prompt row, a fresh
+/// session, no opening.
+async fn a_stopped_step_with_no_session_rows_is_walked_again<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    primary_repo(&orch).await;
+    let stalled = orch.isolator().stall_nth_prepare(1);
+    let (run, prd) = stopped_feat_3(&orch, &stalled).await;
+    assert!(events_of(&orch, prd.id).await.is_empty(), "no session row");
+
+    let after = resumed_to_done(&orch, run, &prd).await;
+
+    assert_eq!(opening_of(&orch, run, after.id).await, None);
+    assert_eq!(prepares_of(&orch, prd.id), 2, "stage 2 ran again");
+    let events = events_of(&orch, prd.id).await;
+    assert_eq!(prompts_in(&events), 1, "the re-walk's prompt row");
+    assert!(follow_ups_in(&events).is_empty(), "no follow-up");
+    assert_eq!(
+        orch.spec_for(&session("prd", 0))
+            .expect("the session started")
+            .resume,
+        None
+    );
+}
+
+/// MOD-125 M3 D4 branch 2: a step stopped after its prompt row but before its banner (the
+/// session never answered) opens a fresh session on the continuing recorder with the handoff,
+/// and is never prepared again.
+async fn a_stopped_step_with_no_banner_opens_fresh_on_its_rows<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    primary_repo(&orch).await;
+    let hold = orch.hold_sessions(&[("prd", 1)]);
+    let walk = orch.dispatch(Command::StartRun {
+        item: ids::HTUI_FEAT_3,
+        mode: RunMode::Manual,
+        repo_scope: None,
+        workspace: None,
+    });
+    match futures::future::select(Box::pin(walk), Box::pin(hold.live(1))).await {
+        Either::Left((outcome, _)) => panic!("the walk finished instead of holding: {outcome:?}"),
+        Either::Right(((), walk)) => drop(walk),
+    }
+    hold.release();
+    let run = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the drop left the run `running`")
+        .id;
+    settled_stopped(&orch, run).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let before = events_of(&orch, prd.id).await;
+    assert_eq!(prompts_in(&before), 1, "the prompt row was written");
+    assert!(promote::banner(&before).is_none(), "no banner");
+
+    let after = resumed_to_done(&orch, run, &prd).await;
+
+    assert_eq!(opening_of(&orch, run, after.id).await, None);
+    let events = events_of(&orch, prd.id).await;
+    let follow_ups = follow_ups_in(&events);
+    assert_eq!(follow_ups.len(), 1, "{follow_ups:?}");
+    assert!(
+        follow_ups[0].contains(promote::STOP_REASON),
+        "{follow_ups:?}"
+    );
+    assert_eq!(prompts_in(&events), 1, "no second prompt row");
+    assert_eq!(prepares_of(&orch, prd.id), 1, "no second `prepare`");
+}
+
+/// MOD-125 M3 D4: a stopped planner (no part rows: admission never committed) goes `stopped →
+/// running` on its own row and admits its parts, and the run walks on to `done`.
+async fn a_stopped_planner_resumes_into_admission<H: CaseHarness>(harness: &H) {
+    use htui_core::store::mem::MemFault;
+
+    let orch = harness.fresh();
+    divided_width_one(&orch).await;
+    orch.store().set_fault(MemFault::AdmitPlan, true);
+    let (run, result) = start_divided(&orch).await;
+    assert!(result.is_err(), "{result:?}");
+    orch.store().set_fault(MemFault::AdmitPlan, false);
+    settled_stopped(&orch, run).await;
+    let planner = planner_of(&steps_of(&orch, run).await);
+    assert_eq!(planner.status, StepStatus::Stopped);
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let steps = steps_of(&orch, run).await;
+    let after = planner_of(&steps);
+    assert_eq!(
+        (after.id, after.attempt, after.status),
+        (planner.id, 1, StepStatus::Done),
+        "the same planner row admitted"
+    );
+    assert_eq!(plans_of(&orch, run).await.len(), 1, "one plan admitted");
+    for part in ["implement/api", "implement/ui"] {
+        assert_eq!(part_named(&steps, part).status, StepStatus::Done, "{part}");
+    }
+}
+
+/// MOD-125 M3 D4 branch 1: an integrate step stopped in its pre-merge (no session row) is walked
+/// again on its row: prepared and pre-merged again, a fresh session, and the run ends `done`.
+async fn a_stop_during_the_pre_merge_resumes_by_walking_integrate_again<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    primary_repo(&orch).await;
+    let stall = orch.isolator().stall_nth_premerge(1);
+    let run = crash_divided(&orch, &[stall]).await;
+    settled_stopped(&orch, run).await;
+    let integrate = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(integrate.status, StepStatus::Stopped);
+    assert!(events_of(&orch, integrate.id).await.is_empty());
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let after = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(
+        (
+            after.id,
+            after.status,
+            opening_of(&orch, run, after.id).await
+        ),
+        (integrate.id, StepStatus::Done, None),
+        "the same integrate row, walked again"
+    );
+    assert_eq!(
+        orch.isolator().premerge_requests().len(),
+        2,
+        "the pre-merge ran again"
+    );
+    assert_eq!(prompts_in(&events_of(&orch, integrate.id).await), 1);
+}
+
+/// MOD-125 M3 D4 branch 3: an integrate step stopped after its session (its banner logged)
+/// reopens that session on its row, with its stage recomputed and no second pre-merge; the
+/// post-check runs on the resumed capture and the run ends `done`.
+async fn a_stopped_integrate_step_resumes_its_session<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    divided_feat_3(&orch, &[("api", None), ("ui", None)], |_| {}).await;
+    let stalled = orch.stall_after_done("implement", 1, None, false);
+    let run = crash_divided(&orch, &[stalled]).await;
+    settled_stopped(&orch, run).await;
+    let integrate = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(integrate.status, StepStatus::Stopped);
+    let premerges = orch.isolator().premerge_requests().len();
+
+    let resumed = orch.resume_stopped(run).await;
+    assert!(
+        matches!(&resumed, Ok(Some(rest)) if rest.run == RunStatus::Done),
+        "{resumed:?}"
+    );
+    let after = integrate_of(&steps_of(&orch, run).await);
+    assert_eq!(
+        (
+            after.id,
+            after.status,
+            opening_of(&orch, run, after.id).await
+        ),
+        (
+            integrate.id,
+            StepStatus::Done,
+            Some(htui_core::model::StepOpening::Resumed)
+        )
+    );
+    assert_eq!(
+        orch.spec_for(&session("implement", 0))
+            .expect("the integrate session reopened")
+            .resume,
+        Some(AgentSessionRef::new(format!("fake-{}", integrate.id)))
+    );
+    assert_eq!(
+        orch.isolator().premerge_requests().len(),
+        premerges,
+        "no second pre-merge"
+    );
+    assert_eq!(
+        orch.isolator().unmerged_requests().len(),
+        1,
+        "the post-check ran on the resumed capture"
+    );
+    assert_eq!(
+        follow_ups_in(&events_of(&orch, integrate.id).await),
+        vec![promote::STOP_RESUME_OPENING.to_owned()]
+    );
+}
+
+/// MOD-125 M3 D6: `CancelRun` of a run stopped on this box cancels it and every unsettled step,
+/// then cleans its trees up, with no lease taken; a resume afterwards writes nothing.
+async fn a_cancel_of_a_stopped_run_on_this_box_cancels_and_cleans_up<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (run, prd) = stopped_after_prd_session(&orch).await;
+
+    let outcome = orch.dispatch(Command::CancelRun { run }).await;
+    assert!(
+        matches!(
+            &outcome,
+            Ok(CommandOutcome::Cancelled { rest }) if rest.run == RunStatus::Cancelled
+                && rest.position == Some(0)
+        ),
+        "{outcome:?}"
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::Cancelled);
+    assert!(row.finished_at.is_some(), "the run finished");
+    assert_eq!(
+        step_at(&orch, run, 0, 1).await.status,
+        StepStatus::Cancelled
+    );
+    assert_eq!(orch.isolator().cleanups(), 1, "the trees are cleaned up");
+    let again = orch.resume_stopped(run).await;
+    assert!(
+        matches!(again, Ok(None)),
+        "a cancelled run resumes nothing: {again:?}"
+    );
+    assert_eq!(
+        step_at(&orch, run, 0, 1).await.id,
+        prd.id,
+        "and no row was created"
+    );
+}
+
+/// MOD-125 M3 D6: `CancelRun` of a stopped run with no executing box (the demo's `RUN_8`)
+/// cancels it with no cleanup: no tree of this box's is its.
+async fn a_cancel_of_a_box_less_stopped_run_cancels_with_no_cleanup<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let before = run_of(&orch, ids::RUN_8).await;
+    assert_eq!(
+        (before.status, before.executing_box_id),
+        (RunStatus::Stopped, None),
+        "the demo's box-less stopped run"
+    );
+
+    let outcome = orch.dispatch(Command::CancelRun { run: ids::RUN_8 }).await;
+    assert!(
+        matches!(
+            &outcome,
+            Ok(CommandOutcome::Cancelled { rest }) if rest.run == RunStatus::Cancelled
+        ),
+        "{outcome:?}"
+    );
+    let row = run_of(&orch, ids::RUN_8).await;
+    assert_eq!(row.status, RunStatus::Cancelled);
+    assert!(row.finished_at.is_some());
+    assert_eq!(orch.isolator().cleanups(), 0, "no cleanup");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -17137,8 +17716,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            234,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            244,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3 + 9 + 13 + 17 + 2 + 1 + 10 + 1 + 2 + 1 + 5 + 1 + 6 + 13 + 9 + 6 + 14 + 2 + 4 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -17229,7 +17808,10 @@ mod tests {
              skip refused over a park that outranks the post-check), and MOD-139 M3 R1's two \
              (rulings R-5, R-6: an exhausted `integrate_incomplete` park rejected, not retried, \
              and a read error in integrate's recovery failing the run as the walk does), and \
-             MOD-125 M2's four divided-step stops (plan D6) 234"
+             MOD-125 M2's four divided-step stops (plan D6), and MOD-125 M3 T3's ten (plan D3-D7, \
+             D9: a stopped step's saved session reopened, a failed resume's fallback, no caps, no \
+             rows, no banner, the planner, the pre-merge, integrate, and a stopped run's cancel on \
+             this box and on none) 244"
         );
     }
 

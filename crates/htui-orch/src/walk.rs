@@ -32,7 +32,7 @@ pub enum NodeState<'s> {
     /// `fan_out = 1`: the latest attempt at `fanout_index 0` is `done`. `fan_out > 1`: the slot
     /// holds a `selected` `done` candidate, which is the winner carried here.
     Done(&'s RunStep),
-    /// [`Cursor::Run`], [`Cursor::Rest`], [`Cursor::Fan`], [`Cursor::Select`] or (MOD-139 M2 D3,
+    /// [`Cursor::Run`], [`Cursor::Resume`], [`Cursor::Rest`], [`Cursor::Fan`], [`Cursor::Select`] or (MOD-139 M2 D3,
     /// a divided node's parts) [`Cursor::Parts`]: a live row or slot the engine drives or waits
     /// on.
     Live(Cursor),
@@ -95,13 +95,14 @@ pub fn node_state<'s>(phase: &SnapshotPhase, steps: &'s [RunStep]) -> NodeState<
     match step.status {
         StepStatus::Done => NodeState::Done(step),
         StepStatus::Pending => NodeState::Live(Cursor::Run(step.id)),
-        StepStatus::Running
-        | StepStatus::AwaitingApproval
-        | StepStatus::Stopped
-        | StepStatus::Failed => NodeState::Live(Cursor::Rest {
-            step: step.id,
-            status: step.status,
-        }),
+        // MOD-125 M3 D4: a stopped step walks on its own row once its run was resumed.
+        StepStatus::Stopped => NodeState::Live(Cursor::Resume(step.id)),
+        StepStatus::Running | StepStatus::AwaitingApproval | StepStatus::Failed => {
+            NodeState::Live(Cursor::Rest {
+                step: step.id,
+                status: step.status,
+            })
+        }
         StepStatus::Superseded | StepStatus::Cancelled => NodeState::Retired {
             attempt: next_attempt(steps, position),
         },

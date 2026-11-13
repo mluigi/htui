@@ -207,7 +207,8 @@ fn candidate(
         .find(|phase| phase.position == position)?;
     let fan_out = u32::try_from(phase.fan_out.max(1)).unwrap_or(1);
     let (weight, touches) = match cursor {
-        Cursor::Run(_) | Cursor::Fan { .. } => (fan_out, true),
+        // MOD-125 M3 D4: a stopped step resumed weighs and touches as the run it was.
+        Cursor::Run(_) | Cursor::Resume(_) | Cursor::Fan { .. } => (fan_out, true),
         Cursor::Create { .. } => (fan_out, false),
         Cursor::Select { .. } => (u32::from(phase.judge.is_some()), true),
         // MOD-139 M2 D4: a divided node's parts round, weighed at the parts it runs at once.
@@ -220,7 +221,7 @@ fn candidate(
         } => (0, false),
         Cursor::Rest { .. } | Cursor::Finished => return None,
     };
-    let admits = matches!(cursor, Cursor::Run(id) if steps
+    let admits = matches!(cursor, Cursor::Run(id) | Cursor::Resume(id) if steps
         .iter()
         .any(|step| step.id == *id && step.role == StepRole::Planner));
     Some((

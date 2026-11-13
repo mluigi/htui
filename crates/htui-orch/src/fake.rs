@@ -190,6 +190,9 @@ pub struct FakeIsolator {
     unmerged_requests: Mutex<Vec<(StepId, Vec<StepId>)>>,
     /// 1-based `reset` calls that never return (counted by `resets`), with their signal.
     reset_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
+    /// MOD-125 M3 D4: 1-based `prepare` calls that never return (counted by `prepares`), with
+    /// their signal (one-shot each): a stop before the step's session opened.
+    prepare_stall: Mutex<Vec<(u32, Arc<Notify>)>>,
     /// MOD-125 M3 D5a: how many times [`reacquire`](Isolator::reacquire) has been called,
     /// refusals included.
     reacquires: Mutex<u32>,
@@ -634,6 +637,22 @@ impl FakeIsolator {
         notify
     }
 
+    /// MOD-125 M3 D4: the `n`-th [`prepare`](Isolator::prepare) call (1-based, as
+    /// [`prepares`](Self::prepares) counts) logs itself, is counted, signals the returned
+    /// [`Notify`] and then **never returns**: a stop before the step's session opened, so its log
+    /// holds no row.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn stall_nth_prepare(&self, n: u32) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.prepare_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push((n, Arc::clone(&notify)));
+        notify
+    }
+
     /// MOD-139 M3 T1: the next [`unmerged`](Isolator::unmerged) answers the steps of the parts
     /// keyed `keys`, in the order the parts were handed (an unknown key is ignored). Unscripted,
     /// it answers nothing. FIFO with [`fail_unmerged`](Self::fail_unmerged).
@@ -878,10 +897,18 @@ impl Isolator for FakeIsolator {
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
             self.log(IsolatorCall::Prepare(step));
-            *self
-                .prepares
-                .lock()
-                .expect("no panic holds the fake isolator's lock") += 1;
+            let call = {
+                let mut prepares = self
+                    .prepares
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                *prepares += 1;
+                *prepares
+            };
+            if let Some(stalled) = stall_at(&self.prepare_stall, call) {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
             if let Some(reason) = self
                 .refusals
                 .lock()
@@ -2244,6 +2271,10 @@ pub struct FakeOrchestrator {
     /// ([`suspend_after_done`](Self::suspend_after_done)), the signal that wakes it. Never carried
     /// by [`restarted`](Self::restarted).
     stalls: Mutex<BTreeMap<ScriptKey, Stall>>,
+    /// MOD-125 M3 D9: the start failures the next driver of a key answers first
+    /// ([`refuse_resume`](Self::refuse_resume)), keyed like `scripts` and taken by that driver.
+    /// Never carried by [`restarted`](Self::restarted).
+    resume_refusals: Mutex<BTreeMap<ScriptKey, Vec<DriverError>>>,
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
@@ -2493,6 +2524,7 @@ impl FakeOrchestrator {
             candidates: Mutex::new(BTreeMap::new()),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            resume_refusals: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
             missing_templates: Mutex::new(BTreeSet::new()),
             tails: Mutex::new(Tails::Walk),
@@ -2552,6 +2584,7 @@ impl FakeOrchestrator {
             candidates: Mutex::new(candidates),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            resume_refusals: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(
                 self.refused_prompts
                     .lock()
@@ -2780,6 +2813,40 @@ impl FakeOrchestrator {
                 (phase.to_owned(), attempt, Some((fanout_index, call))),
                 step,
             );
+    }
+
+    /// MOD-125 M3 D9: the next driver of `(phase, attempt)` (or of one session's `slot`, as
+    /// [`script_candidate`](Self::script_candidate) keys it) answers its first `start` with
+    /// `DriverError::Transport(reason)` and plays its script on the next: a resume that fails on
+    /// the wire, then the fresh start that falls back. One-shot: the driver takes it.
+    ///
+    /// # Panics
+    /// When the lock is poisoned, which no case does.
+    pub fn refuse_resume(&self, phase: &str, attempt: i32, slot: Option<(i32, u32)>, reason: &str) {
+        self.resume_refusals
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                (phase.to_owned(), attempt, slot),
+                vec![DriverError::Transport(reason.to_owned())],
+            );
+    }
+
+    /// The start failures [`refuse_resume`](Self::refuse_resume) queued for `key`, the exact
+    /// session's before its `(phase, attempt)`'s, taken.
+    fn take_resume_refusals(&self, key: &SessionKey<'_>) -> Vec<DriverError> {
+        let mut refusals = self
+            .resume_refusals
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock");
+        refusals
+            .remove(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| refusals.remove(&(key.phase.to_owned(), key.attempt, None)))
+            .unwrap_or_default()
     }
 
     /// Replace the driver capabilities every session is built with.
@@ -3013,7 +3080,9 @@ impl FakeOrchestrator {
                 reason,
             }),
             None => {
-                let driver = FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script);
+                // MOD-125 M3 D9: a refused resume answers the first start, the script the next.
+                let driver = FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script)
+                    .failing_starts(self.take_resume_refusals(key));
                 // MOD-11 D9: the handle is taken before the driver is boxed.
                 self.specs
                     .lock()

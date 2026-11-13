@@ -40,9 +40,9 @@ use htui_core::model::{
     PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunPlanId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
-    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, WorkspaceId,
-    min_budget_micros, missing_tags_failure,
+    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOpening,
+    StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome,
+    WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -282,6 +282,71 @@ type SessionResult = Result<DoneEvent, DriverError>;
 struct Driven {
     result: SessionResult,
     cut: bool,
+}
+
+/// MOD-125 M3 D5: what [`Engine::drive_once`] starts its session with.
+#[derive(Debug)]
+pub(crate) enum SessionOpening<'t> {
+    /// A first run: the session starts with the step's prompt, which the caller's recorder
+    /// already wrote as its seq-0 row.
+    Fresh(&'t str),
+    /// A fresh session on a continuing recorder (D4 branch 2): it starts with `text`, which
+    /// `drive_once` records as a `follow_up` once the session started. No opening is recorded.
+    Continue {
+        /// The handoff (D7).
+        text: String,
+    },
+    /// The step's own session reopened (D4 branch 3): `spec.resume` is `session_ref`, `text` the
+    /// follow-up it is sent. A resume that fails on the wire (`promote::falls_back`) opens a
+    /// fresh session with `fallback` instead; with none, the failure is the start's.
+    Resume {
+        /// The banner's agent-side id.
+        session_ref: htui_agent::driver::AgentSessionRef,
+        /// [`promote::STOP_RESUME_OPENING`].
+        text: String,
+        /// The handoff, best effort (D7).
+        fallback: Option<String>,
+    },
+}
+
+impl SessionOpening<'_> {
+    /// The text the first `start` is sent.
+    fn text(&self) -> &str {
+        match self {
+            Self::Fresh(text) => text,
+            Self::Continue { text } | Self::Resume { text, .. } => text,
+        }
+    }
+}
+
+/// MOD-125 M3 D5: what [`Engine::open_recorder`] opens on.
+#[derive(Debug)]
+pub(crate) enum RecorderStart<'p> {
+    /// A new log: the prompt is its seq-0 row (and its digest the step's).
+    Prompt(&'p AssembledPrompt),
+    /// A step's existing log, continued (`Recorder::continuing`): no prompt row is written.
+    Tail(Vec<SessionEvent>),
+}
+
+/// MOD-125 M3 D4: what [`Engine::walk_live_session`] runs a step's session on, from the session
+/// onward: stage 2's trees and directories, integrate's inputs, MOD-139 M2 D13's `live_siblings`,
+/// and how the recorder and the session open.
+#[derive(Debug)]
+pub(crate) struct LiveSession<'p> {
+    /// The step's trees, as `upsert_step_tree` recorded them.
+    trees: Vec<RunStepTree>,
+    /// The session's working directory.
+    cwd: PathBuf,
+    /// Every tree not under `cwd`.
+    extra_dirs: Vec<PathBuf>,
+    /// Integrate's inputs, read once; `None` for any other node.
+    integrate: Option<IntegrateStage>,
+    /// Whether a sibling of the step is live.
+    live: bool,
+    /// How the recorder opens.
+    start: RecorderStart<'p>,
+    /// How the session opens.
+    opening: SessionOpening<'p>,
 }
 
 /// How the walk gets a driver for one session.
@@ -2196,9 +2261,9 @@ where
         // MOD-37 M5: the handoff is built for both openings. A `Resume` carries it as the fallback
         // the worker opens with when the resume fails. Boxed: this future sits in every dispatch
         // future (`every_case_name_dispatches`, H-9).
-        let handoff = Box::pin(
-            self.handoff_opening(run, snapshot, step, phase, item, &events, &trees, &repos),
-        )
+        let handoff = Box::pin(self.handoff_opening(
+            run, snapshot, step, phase, item, &events, &trees, &repos, None,
+        ))
         .await;
         let path = match promote::opening_kind(caps, &events) {
             // Review M-1: best effort. Whatever refused the handoff (a template, the assembler, a
@@ -2235,10 +2300,14 @@ where
 
     /// §4.6(c)'s handoff text and digest for a promoted `step` (MOD-4 D193): what a `Handoff`
     /// opening sends, and what a `Resume` opening falls back to (MOD-37 M5). Nothing here writes.
+    ///
+    /// MOD-125 M3 D7: a resumed stopped step's fallback is this text too, with `reason`
+    /// ([`promote::STOP_REASON`]); `None` reads the run's failure, else the gate's note.
     #[expect(
         clippy::too_many_arguments,
         reason = "the step's run, snapshot, row and phase, its item, and the three reads `opening` \
-                  already made; re-reading them here would double the promotion's store round trips"
+                  already made; re-reading them here would double the promotion's store round \
+                  trips; and the stop's reason (MOD-125 M3 D7)"
     )]
     async fn handoff_opening(
         &self,
@@ -2250,6 +2319,7 @@ where
         events: &[SessionEvent],
         trees: &[RunStepTree],
         repos: &[Repo],
+        reason: Option<String>,
     ) -> Result<(String, String), EngineError> {
         let spec = match self
             // MOD-139 M2 D13: a handoff opens a chat, no session beside a live sibling.
@@ -2310,11 +2380,14 @@ where
                 None
             }
         };
-        let failure_reason = run
-            .failure
-            .clone()
-            .or_else(|| step.gate_note.clone())
-            .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
+        // MOD-125 M3 D7: a resumed stopped step names its own reason (`run.failure` is NULL
+        // while the run is stopped); a promotion reads the run's failure or the gate's note.
+        let failure_reason = reason.unwrap_or_else(|| {
+            run.failure
+                .clone()
+                .or_else(|| step.gate_note.clone())
+                .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned())
+        });
         let spec =
             promote::handoff_spec(spec, &template, events, &roots, diff_so_far, failure_reason);
         let assembled = assemble(&spec, self.parts.scrubber)?;
@@ -2626,10 +2699,57 @@ where
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
-        if row.status == RunStatus::Queued {
-            return self.cancel_from_queued(&row).await;
+        match row.status {
+            RunStatus::Queued => self.cancel_from_queued(&row).await,
+            RunStatus::Stopped => Box::pin(self.cancel_stopped(&row)).await,
+            _ => self.cancel_leased(&row).await,
         }
-        self.cancel_leased(&row).await
+    }
+
+    /// MOD-125 M3 D6: [`Self::cancel_run`] of a run read `stopped`, by its executing box: with
+    /// none, the store's CAS alone (`cancel_stopped_run(None)`: no tree is this box's); on this
+    /// box, the CAS then plan D36's cleanup, lease-less, as [`Self::cancel_queued`]; on another
+    /// box, [`EngineError::RunStatus`] with nothing written (that box's trees and sessions are
+    /// its own). The CAS cancels every unsettled step, refuses the pending follow-ups and
+    /// resolves a pending cancel row in one transaction (D2). A `false` CAS means a resume or
+    /// another cancel won: the run is read again and takes the guard and the leased path, as
+    /// [`Self::cancel_from_queued`] does.
+    async fn cancel_stopped(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        let position = self.resting(row).await?.position;
+        let on_another_box = |run: RunId| EngineError::RunStatus {
+            run,
+            status: RunStatus::Stopped,
+            expected: "stopped on this box or on none",
+        };
+        let on = match row.executing_box_id {
+            None => None,
+            Some(box_id) if box_id == self.parts.box_id => Some(box_id),
+            Some(_) => return Err(on_another_box(row.id)),
+        };
+        if !self
+            .parts
+            .store
+            .cancel_stopped_run(row.id, on, self.now())
+            .await?
+        {
+            let row = self.run(row.id).await?;
+            crate::command::cancel_enabled(&row)?;
+            // Still stopped yet refused: its box moved under this call, and nothing was written.
+            if row.status == RunStatus::Stopped {
+                return Err(on_another_box(row.id));
+            }
+            return self.cancel_leased(&row).await;
+        }
+        if on.is_some() {
+            self.cleanup_walk(row.id).await?;
+        }
+        Ok(CommandOutcome::Cancelled {
+            rest: Rest {
+                run: RunStatus::Cancelled,
+                position,
+                failure: None,
+            },
+        })
     }
 
     /// [`Self::cancel_run`] of a run read `queued` (OQ-4): the compare-and-set first. When a
@@ -4329,7 +4449,9 @@ where
                 let phase = Self::phase_at(run, snapshot, position)?;
                 self.select_stage(row, snapshot, &phase, attempt).await
             }
-            Cursor::Run(step) => match find(step) {
+            // MOD-125 M3 D4: a stopped step resumes as a pending one runs; `walk_step` and
+            // `admit_planner` move it from the status it holds.
+            Cursor::Run(step) | Cursor::Resume(step) => match find(step) {
                 // MOD-139 M2 D1, D2: a row maps to its node by role; a planner node runs admission,
                 // not a session (boxed, the stack rule).
                 Some(step) => {
@@ -4563,6 +4685,38 @@ where
         }
         let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
         Ok(Resume::Walked(rest))
+    }
+
+    /// MOD-125 M3 D3: a `stopped` run of this box resumed and walked on (the `claim` shape): the
+    /// store's `stopped → running` CAS takes the lease ([`resume_run`]), then the run walks to
+    /// rest under the heartbeat, as [`Self::claim`] and [`Self::resume`] walk. The walk meets each
+    /// stopped step as [`Cursor::Resume`] and reopens it on its own row (D4).
+    ///
+    /// `None` when the CAS refused: the run is not `stopped`, runs on another box, its workspace
+    /// is stopped again, or a cancel of it is pending; nothing is written. `Some` carries the rest
+    /// the runtime publishes, as it does for [`Self::resume`].
+    ///
+    /// [`resume_run`]: htui_core::store::WorkerStore::resume_run
+    ///
+    /// # Errors
+    /// [`EngineError::LeaseLost`] when another orchestrator takes the lease mid-walk; every other
+    /// [`EngineError`] the walk raises.
+    pub async fn resume_stopped(&self, run: RunId) -> Result<Option<Rest>, EngineError> {
+        let sent = tokio::time::Instant::now();
+        let ttl = self.lease_times().ttl;
+        if !self
+            .parts
+            .store
+            .resume_run(run, self.parts.box_id, self.parts.owner, ttl)
+            .await?
+        {
+            return Ok(None);
+        }
+        tracing::info!(%run, "run {run} resumed");
+        Ok(Some(
+            self.walk_leased(run, self.lease_until(sent), self.run_to_rest(run))
+                .await?,
+        ))
     }
 
     /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and `Some` is
@@ -5094,20 +5248,22 @@ where
 
         // -- stage 2: prepare, beginning with the move that makes the step live ---------------
         // Plan D144: another writer moved the row this walk read, so the walk stops (D125).
-        self.move_step(
-            run.id,
-            step.id,
-            StepStatus::Pending,
-            StepStatus::Running,
-            now,
-        )
-        .await?;
+        // MOD-125 M3 D4: a resumed stopped step moves `stopped -> running` on its own row (same
+        // row and attempt, so no retry budget is spent), and `now` restarts its deadline.
+        let from = step.status;
+        self.move_step(run.id, step.id, from, StepStatus::Running, now)
+            .await?;
         self.step_started(run, step.id);
 
         // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
         // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
         // was read before the move — and the step deadline would be measured from the settle.
-        match self.walk_live_step(run, snapshot, &step, phase, now).await {
+        let walked = if from == StepStatus::Stopped {
+            Box::pin(self.resume_live_step(run, snapshot, &step, phase, now)).await
+        } else {
+            self.walk_live_step(run, snapshot, &step, phase, now).await
+        };
+        match walked {
             Ok(rest) => Ok(rest),
             Err(err) => {
                 // MOD-42 I-6 (plan D10): a graceful cancel settles nothing; `cancel_leased` owns
@@ -5129,6 +5285,10 @@ where
     }
 
     /// Stages 2 to 6 of a step that is already `running`, so every error here is [`fail_hard`]'s.
+    ///
+    /// MOD-125 M3 D4: the prepare-and-prompt half (secrets, integrate's stage, `prepare`, the tree
+    /// rows, the pre-merge, the `before` commits, the prompt and `set_step_prompt`); the session
+    /// onward is [`Self::walk_live_session`], which a resumed stopped step enters directly.
     ///
     /// [`fail_hard`]: Self::fail_hard
     async fn walk_live_step(
@@ -5241,14 +5401,6 @@ where
                     .map(Some);
             }
         };
-        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
-        // and refuses rather than run un-narrowed.
-        let persona = snapshot
-            .persona_for(phase)
-            .map_err(|refusal| EngineError::Snapshot {
-                run: run.id,
-                reason: refusal.to_string(),
-            })?;
         // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
         // row that records which sections were dropped and why would silently become "there was
         // no record", which is the one thing `run_step.trim_record` exists to rule out. That is
@@ -5279,8 +5431,62 @@ where
             )
             .await?;
 
+        Box::pin(self.walk_live_session(
+            run,
+            snapshot,
+            step,
+            phase,
+            started_at,
+            LiveSession {
+                trees,
+                cwd: prepared.cwd,
+                extra_dirs: prepared.extra_dirs,
+                integrate,
+                live,
+                start: RecorderStart::Prompt(&prompt),
+                opening: SessionOpening::Fresh(&prompt.text),
+            },
+        ))
+        .await
+    }
+
+    /// MOD-125 M3 D4: stages 4 to 6 of a `running` step whose trees exist: the persona, the
+    /// session ([`Self::session`], opened as `live` says), `after_done`, verify, the capture and
+    /// its commits, integrate's post-check, the output, the settle, `finish_step` and the gate.
+    /// [`Self::walk_live_step`] enters it after its prompt; a resumed stopped step
+    /// ([`Self::resume_live_step`]) after reopening its trees, never preparing them again. Every
+    /// error is `walk_step`'s [`fail_hard`](Self::fail_hard), as the first half's are.
+    async fn walk_live_session(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+        live: LiveSession<'_>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let item = Self::item_of(run)?;
+        let LiveSession {
+            trees,
+            cwd,
+            extra_dirs,
+            integrate,
+            live,
+            start,
+            opening,
+        } = live;
+        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
+        // and refuses rather than run un-narrowed. A resumed step's stage 3 passed when it first
+        // ran, on the same snapshot.
+        let persona = snapshot
+            .persona_for(phase)
+            .map_err(|refusal| EngineError::Snapshot {
+                run: run.id,
+                reason: refusal.to_string(),
+            })?;
+
         // -- stage 4: session -----------------------------------------------------------------
-        let session_cwd = prepared.cwd.clone();
+        let session_cwd = cwd.clone();
         let (
             Driven {
                 result,
@@ -5290,15 +5496,7 @@ where
             cap_batch,
         ) = self
             .session(
-                run,
-                step,
-                phase,
-                persona,
-                &prompt,
-                prepared.cwd,
-                prepared.extra_dirs,
-                started_at,
-                live,
+                run, step, phase, persona, start, &opening, cwd, extra_dirs, started_at, live,
             )
             .await?;
         if let Ok(done) = &result {
@@ -5407,6 +5605,166 @@ where
                 Ok(Some(rest))
             }
         }
+    }
+
+    /// MOD-125 M3 D4: stages 2 to 6 of a stopped step the walk just moved `stopped -> running`
+    /// on its own row, chosen by what its log holds:
+    ///
+    /// 1. **No session row** (stopped before its recorder opened): [`Self::walk_live_step`], from
+    ///    stage 2 again. Its trees are still at their base, so `prepare` and integrate's
+    ///    pre-merge are safe to repeat.
+    /// 2. **Rows** (with no banner, or an agent without session caps) and 3. **a banner and
+    ///    `DriverCaps.resume`**: the trees reopened ([`Self::reopen_trees`], never prepared,
+    ///    pre-merged, or recorded again), the opening decided ([`Self::stopped_opening`]),
+    ///    integrate's stage and `live_siblings` read again, then [`Self::walk_live_session`] on a
+    ///    continuing recorder. The checks rerun after the session; the deadline counts from
+    ///    `started_at`, the resume.
+    async fn resume_live_step(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let events = self
+            .parts
+            .store
+            .step_events(step.id)
+            .await?
+            .unwrap_or_default();
+        if events.is_empty() {
+            return self
+                .walk_live_step(run, snapshot, step, phase, started_at)
+                .await;
+        }
+        let item = Self::item_of(run)?;
+        // MOD-10 D11, D13: the walk's secrets before anything of the session is written (the
+        // handoff assembles under the scrubber, `drive_once` reads the env from the cell).
+        Box::pin(self.secrets_ready(run))
+            .await?
+            .map_err(EngineError::Secrets)?;
+        let (trees, cwd, extra_dirs) = self.reopen_trees(run, step, phase).await?;
+        let opening =
+            Box::pin(self.stopped_opening(run, snapshot, step, phase, item, &events, &trees))
+                .await?;
+        // MOD-139 M3 D1: `integrate_stage` only reads, so a resume reads it again.
+        let integrate = if phase.role == NodeRole::Integrate {
+            Some(Box::pin(self.integrate_stage(run, snapshot, phase)).await?)
+        } else {
+            None
+        };
+        let live =
+            crate::divide::live_siblings(&self.parts.store.run_steps(run.id).await?, step.id);
+        Box::pin(self.walk_live_session(
+            run,
+            snapshot,
+            step,
+            phase,
+            started_at,
+            LiveSession {
+                trees,
+                cwd,
+                extra_dirs,
+                integrate,
+                live,
+                start: RecorderStart::Tail(events),
+                opening,
+            },
+        ))
+        .await
+    }
+
+    /// MOD-125 M3 D4, D5a: a stopped step's trees as stage 2 recorded them, its guards retaken
+    /// ([`Isolator::reacquire`], which refuses a `shared_serialized` checkout another walk moved),
+    /// and the session's `cwd` and extra directories rebuilt from them as a promotion's chat does
+    /// ([`chat_dirs`]). A step with no tree (an empty repo scope) has nothing to reset, so its
+    /// `cwd` is an empty-scope `prepare`'s. Nothing is reset, created or recorded.
+    async fn reopen_trees(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<(Vec<RunStepTree>, PathBuf, Vec<PathBuf>), EngineError> {
+        let trees = self.parts.store.step_trees(step.id).await?;
+        self.parts
+            .isolator
+            .reacquire(run.id, step.id, &trees)
+            .await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let (cwd, extra_dirs) = match chat_dirs(&trees, &repos) {
+            Some(dirs) => dirs,
+            None => {
+                let prepared = self
+                    .parts
+                    .isolator
+                    .prepare(run.id, step.id, &[], phase.isolation, None)
+                    .await?;
+                (prepared.cwd, prepared.extra_dirs)
+            }
+        };
+        Ok((trees, cwd, extra_dirs))
+    }
+
+    /// MOD-125 M3 D4, D5, D7: how a stopped step with session rows reopens. The step's agent row
+    /// decides with [`promote::opening_kind`] over `events`: a banner and `DriverCaps.resume`
+    /// reopen the session with [`promote::STOP_RESUME_OPENING`], the handoff riding along as the
+    /// fallback (best effort: one that cannot be built is logged and the resume goes on without
+    /// it); otherwise a fresh session opens with the handoff, which then must build. The handoff
+    /// carries [`promote::STOP_REASON`]. An agent with no row has no caps, so it opens fresh.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's run, snapshot, row and phase, its item, and the log and trees the \
+                  resume already read, all handed to `handoff_opening`"
+    )]
+    async fn stopped_opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &[RunStepTree],
+    ) -> Result<SessionOpening<'static>, EngineError> {
+        let candidate = Self::candidate_of(step, phase)?;
+        let caps = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .map(|agent| htui_agent::registry::caps_for(&agent))
+            .unwrap_or_default();
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let handoff = Box::pin(self.handoff_opening(
+            run,
+            snapshot,
+            step,
+            phase,
+            item,
+            events,
+            trees,
+            &repos,
+            Some(promote::STOP_REASON.to_owned()),
+        ))
+        .await;
+        Ok(match promote::opening_kind(caps, events) {
+            OpeningKind::Resume(session_ref) => SessionOpening::Resume {
+                session_ref,
+                text: promote::STOP_RESUME_OPENING.to_owned(),
+                fallback: handoff
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            step = %step.id,
+                            %err,
+                            "the stopped step resumes with no handoff fallback"
+                        );
+                    })
+                    .ok()
+                    .map(|(text, _digest)| text),
+            },
+            OpeningKind::Handoff => SessionOpening::Continue { text: handoff?.0 },
+        })
     }
 
     /// MOD-139 M3 D1: what one integrate attempt reads, read once and shared by its hooks: the
@@ -6281,7 +6639,9 @@ where
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
+        let (mut recorder, cap_batch) = self
+            .open_recorder(run, step, RecorderStart::Prompt(prompt))
+            .await?;
         // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
         let deadline = self.deadline_at(phase, started_at);
         let Driven {
@@ -6294,7 +6654,7 @@ where
                 phase,
                 persona,
                 &key,
-                &prompt.text,
+                &SessionOpening::Fresh(&prompt.text),
                 prepared.cwd.clone(),
                 prepared.extra_dirs,
                 deadline,
@@ -6444,10 +6804,12 @@ where
         node: &SnapshotPhase,
         planner: RunStep,
     ) -> Result<Option<Rest>, EngineError> {
+        // MOD-125 M3 D4: a stopped planner (admission never committed, so it has no part rows)
+        // moves `stopped -> running` and admits, as recovery does.
         self.move_step(
             run.id,
             planner.id,
-            StepStatus::Pending,
+            planner.status,
             StepStatus::Running,
             self.now(),
         )
@@ -7017,7 +7379,9 @@ where
 
         // -- stage 4: the part's own session (D4: `<divided>/<key>` keys it) -------------------
         let key = SessionKey::of(step);
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, &prompt).await?;
+        let (mut recorder, cap_batch) = self
+            .open_recorder(run, step, RecorderStart::Prompt(&prompt))
+            .await?;
         let deadline = self.deadline_at(node, started_at);
         let Driven {
             result,
@@ -7029,7 +7393,7 @@ where
                 node,
                 persona,
                 &key,
-                &prompt.text,
+                &SessionOpening::Fresh(&prompt.text),
                 prepared.cwd.clone(),
                 prepared.extra_dirs,
                 deadline,
@@ -7965,7 +8329,9 @@ where
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
-        let (mut recorder, cap_batch) = self.open_recorder(run, judge, &prompts.forward).await?;
+        let (mut recorder, cap_batch) = self
+            .open_recorder(run, judge, RecorderStart::Prompt(&prompts.forward))
+            .await?;
         let calls = self
             .judge_calls(run, &jp, attempt, judge, prompts, &prepared, &mut recorder)
             .await;
@@ -8022,7 +8388,7 @@ where
                     // candidate's prompt, frame included.
                     None,
                     &key,
-                    text,
+                    &SessionOpening::Fresh(text),
                     prepared.cwd.clone(),
                     prepared.extra_dirs.clone(),
                     // The maintainer's M4 scope: judge calls stay untimed (no `started_at` of
@@ -8896,8 +9262,9 @@ where
     /// between, under the one recorder.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
-                  and stage 2's two directories, all handed straight to `drive_once`, the step's \
+        reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), how the \
+                  recorder and the session open (MOD-125 M3 D5) and stage 2's two directories, all \
+                  handed straight to `drive_once`, the step's \
                   `started_at` its deadline is measured from (MOD-37 M4 D1), and MOD-139 M2 D13's \
                   `live_siblings`"
     )]
@@ -8907,7 +9274,8 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
-        prompt: &AssembledPrompt,
+        start: RecorderStart<'_>,
+        opening: &SessionOpening<'_>,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         started_at: DateTime<Utc>,
@@ -8920,7 +9288,7 @@ where
         ),
         EngineError,
     > {
-        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, start).await?;
         // MOD-37 M4 D1: what is left of the step deadline as the session starts.
         let deadline = self.deadline_at(phase, started_at);
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
@@ -8937,7 +9305,7 @@ where
                 phase,
                 persona,
                 &SessionKey::of(step),
-                &prompt.text,
+                opening,
                 cwd,
                 extra_dirs,
                 deadline,
@@ -8957,7 +9325,9 @@ where
     }
 
     /// A step's [`Recorder`], with D6's allowance applied (MOD-12 M2), and the batch when its
-    /// remainder bound it, and `prompt` recorded as its seq-0 row.
+    /// remainder bound it, and a
+    /// [`RecorderStart::Prompt`] recorded as its seq-0 row (a [`RecorderStart::Tail`], MOD-125 M3
+    /// D5, continues the step's log instead and writes no prompt row).
     ///
     /// `record_prompt_digesting` also writes `run_step.prompt_digest`, so every session a step
     /// opens — a candidate's one, the judge's two (plan D52) — is recorded against the digest of
@@ -8968,20 +9338,38 @@ where
         &self,
         run: &Run,
         step: &RunStep,
-        prompt: &AssembledPrompt,
+        start: RecorderStart<'_>,
     ) -> Result<(Recorder<'a, S>, Option<BatchId>), EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
-        let mut recorder = Recorder::new(
-            self.parts.store,
-            self.parts.scrubber,
-            step.id,
-            settings.keep_raw_events,
-            None,
-        )
+        // MOD-125 M3 D5: a resumed step's log is continued (seq, turn and usage carry on), and no
+        // second prompt row or digest is written.
+        let (mut recorder, prompt) = match start {
+            RecorderStart::Prompt(prompt) => (
+                Recorder::new(
+                    self.parts.store,
+                    self.parts.scrubber,
+                    step.id,
+                    settings.keep_raw_events,
+                    None,
+                ),
+                Some(prompt),
+            ),
+            RecorderStart::Tail(events) => (
+                Recorder::continuing(
+                    self.parts.store,
+                    self.parts.scrubber,
+                    step.id,
+                    settings.keep_raw_events,
+                    None,
+                    &events,
+                ),
+                None,
+            ),
+        };
         // MOD-40 plan D2: the walk's lease rides every row, usage and digest write, so a walk
         // that sleeps through its lease writes nothing once another process has adopted it.
-        .with_fence(StepFence::Lease(self.parts.owner));
+        recorder = recorder.with_fence(StepFence::Lease(self.parts.owner));
         // MOD-12 M2 D6: the run's remainder and, for a batch run, the batch's, whichever is less.
         let allowance = self.allowance(run).await?;
         if let Some(allowance) = allowance {
@@ -8993,14 +9381,16 @@ where
                 grace: std::time::Duration::ZERO,
             });
         }
-        recorder
-            .record_prompt_digesting(
-                &prompt.text,
-                &prompt.digest_text,
-                prompt.payload_sections_value(),
-                self.now(),
-            )
-            .await?;
+        if let Some(prompt) = prompt {
+            recorder
+                .record_prompt_digesting(
+                    &prompt.text,
+                    &prompt.digest_text,
+                    prompt.payload_sections_value(),
+                    self.now(),
+                )
+                .await?;
+        }
         Ok((recorder, allowance.and_then(|allowance| allowance.batch)))
     }
 
@@ -9141,7 +9531,8 @@ where
         Ok(())
     }
 
-    /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and
+    /// One driver session under `recorder`: the driver for `key`, `start` as `opening` says
+    /// (MOD-125 M3 D5, [`Self::start_session`]), and
     /// `drive` to its `done` (MOD-42 plan D6), with the agent's own policy (D9), the permission
     /// relay and the run's control (D10).
     ///
@@ -9164,7 +9555,7 @@ where
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
         key: &SessionKey<'_>,
-        text: &str,
+        opening: &SessionOpening<'_>,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         deadline: Option<tokio::time::Instant>,
@@ -9284,7 +9675,11 @@ where
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
-            resume: None,
+            // MOD-125 M3 D5: a resumed stopped step reopens its own session.
+            resume: match opening {
+                SessionOpening::Resume { session_ref, .. } => Some(session_ref.clone()),
+                SessionOpening::Fresh(_) | SessionOpening::Continue { .. } => None,
+            },
             // MOD-12 M2 D6: the recorder's cap, so the two read one number (D83).
             budget_micros: recorder.run_cap().map(|cap| cap.micros),
             prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
@@ -9293,10 +9688,10 @@ where
         // against it; the start itself is not under it - a hung start is bounded by the driver's
         // own handshake timeout. MOD-10 R1 H1: a start error's text (an agent's stderr tail) is
         // masked with the walk's scrubber before any caller writes it.
-        let mut session = driver
-            .start(spec, text.to_owned())
-            .await
-            .map_err(|err| remasked_driver(self.parts.scrubber, err))?;
+        // MOD-125 M3 D5: a resumed step's opening (and its fallback) is written here, after the
+        // start and before the pump. Boxed: this frame sits in every walk's.
+        let mut session =
+            Box::pin(self.start_session(driver.as_ref(), spec, step.id, opening, recorder)).await?;
         let now = || self.now();
         let relay = Relay {
             store: self.parts.store,
@@ -9372,6 +9767,88 @@ where
                 result: result.map_err(|err| remasked_driver(self.parts.scrubber, err)),
                 cut: false,
             }),
+        }
+    }
+
+    /// MOD-125 M3 D5: `driver`'s session started as `opening` says, its follow-up written once
+    /// it started (before the pump).
+    ///
+    /// - `Fresh`: the start, as before M3; the caller's recorder holds the prompt row.
+    /// - `Continue`: the start with the handoff, then the handoff as a `follow_up` row.
+    /// - `Resume`: the start with `spec.resume` set; on `Ok` the opening is `resumed` and the
+    ///   resume text a `follow_up` row. On a failure [`promote::falls_back`] admits with a
+    ///   fallback: the opening is `resume_failed`, the `resume_failed` notice is written (a failed
+    ///   write is logged, and the walk goes on), and a second start with no `resume` opens with
+    ///   the fallback, which is then the `follow_up` row. Any other failure, or none to fall back
+    ///   to, is the start's error, as a first run's is.
+    ///
+    /// A start error's text (an agent's stderr tail) is masked with the walk's scrubber (MOD-10
+    /// R1 H1) before anything writes it.
+    async fn start_session(
+        &self,
+        driver: &dyn AgentDriver,
+        spec: SessionSpec,
+        step: StepId,
+        opening: &SessionOpening<'_>,
+        recorder: &mut Recorder<'a, S>,
+    ) -> Result<Box<dyn htui_agent::driver::AgentSession>, EngineError> {
+        let masked = |err| remasked_driver(self.parts.scrubber, err);
+        let fresh = match opening {
+            SessionOpening::Resume {
+                fallback: Some(_), ..
+            } => Some(SessionSpec {
+                resume: None,
+                ..spec.clone()
+            }),
+            SessionOpening::Fresh(_)
+            | SessionOpening::Continue { .. }
+            | SessionOpening::Resume { fallback: None, .. } => None,
+        };
+        let first = driver.start(spec, opening.text().to_owned()).await;
+        match (first, opening, fresh) {
+            (Ok(session), SessionOpening::Fresh(_), _) => Ok(session),
+            (Ok(session), SessionOpening::Continue { text }, _) => {
+                recorder.record_follow_up(text, self.now()).await?;
+                Ok(session)
+            }
+            (Ok(session), SessionOpening::Resume { text, .. }, _) => {
+                self.note_opening(step, StepOpening::Resumed).await;
+                recorder.record_follow_up(text, self.now()).await?;
+                Ok(session)
+            }
+            (
+                Err(err),
+                SessionOpening::Resume {
+                    session_ref,
+                    fallback: Some(fallback),
+                    ..
+                },
+                Some(fresh),
+            ) if promote::falls_back(&err) => {
+                let err = masked(err);
+                tracing::warn!(%step, %err, "the stopped step's session did not reopen; it opens fresh");
+                // The column first, so the Runs pane is truthful even if the row write fails.
+                self.note_opening(step, StepOpening::ResumeFailed).await;
+                let notice = promote::resume_failed_notice(session_ref, &err.to_string());
+                if let Err(record_err) = recorder.record_notice(&notice, self.now()).await {
+                    tracing::warn!(%step, %record_err, "the resume_failed row could not be written");
+                }
+                let session = driver
+                    .start(fresh, fallback.clone())
+                    .await
+                    .map_err(masked)?;
+                recorder.record_follow_up(fallback, self.now()).await?;
+                Ok(session)
+            }
+            (Err(err), _, _) => Err(EngineError::Driver(masked(err))),
+        }
+    }
+
+    /// MOD-125 M3 D5: `run_step.opening` of a resumed stopped step. A failed write is logged and
+    /// never fails the walk: the column is a label, and the session is what the step needs.
+    async fn note_opening(&self, step: StepId, opening: StepOpening) {
+        if let Err(err) = self.parts.store.record_opening(step, opening).await {
+            tracing::warn!(%err, %step, %opening, "the resumed step's opening could not be recorded");
         }
     }
 
@@ -10600,6 +11077,22 @@ pub async fn resume_fake(
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
+}
+
+/// [`Engine::resume_stopped`] over the same parts (MOD-125 M3 D3).
+///
+/// # Errors
+/// As [`Engine::resume_stopped`].
+#[cfg(feature = "test-support")]
+pub async fn resume_stopped_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: RunId,
+) -> Result<Option<Rest>, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.resume_stopped(run).await
 }
 
 /// [`Engine::sweep`] over the same parts (plan D98): the second process's sweep in every
