@@ -53,3 +53,15 @@ existing project NotFound shape) so the sentence names what is missing; adjust i
 `crates/htui/src/ui/tabs/settings/{hierarchy.rs,owner_documents.rs}`, `crates/htui/src/owner_documents.rs`,
 `crates/htui/src/store_worker.rs` (only for `writable`), `crates/htui/tests/it/{hierarchy.rs,settings_documents.rs}`,
 their snapshots.
+
+## Gate — the `doc` step is red (rustdoc deny-level intra-doc links)
+`cargo doc --workspace --all-features --no-deps` (the gate's `doc` step; `cargo doc -p htui --all-features --no-deps`
+is enough to check) fails on six unresolved links in T3's new docs:
+- `crates/htui/src/owner_documents.rs:23` `[`HandText`]`;
+- in `crates/htui/src/ui/tabs/settings/owner_documents.rs` (module/type docs): `[`super::memory`]`,
+  `[`OwnerDocumentsPane`]`, `[`GOALS_KIND`]`, `[`GOALS_NONE_YET`]`, `[`NO_CHANGES`]`.
+Fix with full crate paths (e.g. `[`HandText`](crate::hand_written::HandText)`,
+`crate::ui::tabs::settings::memory`, `htui_core::model::document::GOALS_KIND`, `crate::editor::NO_CHANGES`), or
+plain code spans where a link is not needed. The memory note on mixed module docs: when a `pub mod` carries an outer
+`///` **and** the file an inner `//!`, inner links resolve in the parent module. Use crate-path reference
+definitions there. `cargo doc -p htui --all-features --no-deps` must end clean.
