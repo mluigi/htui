@@ -42,14 +42,14 @@ issues a stop or a resume until M4's verbs; M3 is exercised through the store ve
     workspace_stop` for its `workspace_id`. No index serves it (`idx_run_lease` is partial on
     `queued|running`, `0003:50-51`); a scan is accepted, as `claim_run`'s box + `stopped` count already does
     (`pg/write.rs:6605`). An index would need a migration.
-  - `resume_run(run, box, owner, ttl) -> Option<Lease>`: one CAS `stopped → running` that takes the lease.
-    Refused (`None`) when the run is not `stopped`, executes on another box, its workspace is stopped again, or a
+  - `resume_run(run, box, owner, ttl) -> Result<bool>` (`take_lease`'s shape; there is no `Lease` type — blueprint): one CAS `stopped → running` that takes the lease.
+    Refused (`false`) when the run is not `stopped`, executes on another box, its workspace is stopped again, or a
     cancel of it is pending (the hold-off `stop_run` already has). **Pg order, as `claim_run` (`:6495-6506`),
     READ COMMITTED:** the run `FOR NO KEY UPDATE` (check status and box), then `workspace_stop FOR SHARE`
     (refuse if present), then the `run_command` cancel check, then the update. A stop committed after the gate
     read leaves a `running` run leased to `owner`, which `pending_stops` lists and M2 stops again. Steps are not
     touched (the engine moves them, D4).
-  - `cancel_stopped_run(run, box: Option<BoxId>) -> bool`: one CAS `stopped → cancelled` with `finished_at`;
+  - `cancel_stopped_run(run, box: Option<BoxId>, at) -> Result<bool>` (the caller's clock, as `finish_run`): one CAS `stopped → cancelled` with `finished_at`;
     every step with `!status.is_terminal()` (`stopped`, `pending`, `awaiting_approval`, `failed`) `→ cancelled`
     (all legal, `run.rs:192-219`; `cancel_leased`'s rule, `engine.rs:2684-2692`); pending follow-ups refused
     `FOLLOW_UP_RUN_CANCELLED` and their `follow_up_window` rows closed **in the same transaction** (the store's
@@ -68,10 +68,10 @@ issues a stop or a resume until M4's verbs; M3 is exercised through the store ve
     stopped siblings first): losers gain `stopped` (`→ superseded`, legal `run.rs:207`); a stopped judge goes to
     **`superseded`**, not `done` (`Stopped → Done` is illegal, `run.rs:205-208`). Mem `mem.rs:7498-7519`, Pg
     `pg/write.rs:7743-7771`.
-- **D3 — Engine entry `Engine::resume_stopped(run) -> Result<bool>`, the `claim` shape (`engine.rs:1366`).**
+- **D3 — Engine entry `Engine::resume_stopped(run) -> Result<Option<Rest>>` (the rest frame is published as `resumed` does), the `claim` shape (`engine.rs:1366`).**
   `let sent = Instant::now()`; `resume_run(run, box, owner, ttl)`; on a lease,
   `walk_leased(run, self.lease_until(sent), self.run_to_rest(run))` (heartbeat and `release_after_walk`, as
-  `claim` and `Engine::resume :4564`). `None` writes nothing and answers `false`. One `info!` line
+  `claim` and `Engine::resume :4564`). A refused CAS writes nothing and answers `None`. One `info!` line
   `run {run} resumed`. Without a resume path a `running` run whose open step is `stopped` rests forever and is
   adopted as a crash in a loop (`pass :4250`, `recover_run :3437`), so D4 is required, not optional.
 - **D4 — Stopped steps resume on their own row; three branches by what the row holds.** `stopped → running`
@@ -99,8 +99,10 @@ issues a stop or a resume until M4's verbs; M3 is exercised through the store ve
     transaction, `:6469`) goes `stopped → running` and `admit_parts`, as recovery does (`:3448-3453`).
   - **Parts and candidates** resume inside `drive_parts` (`:6665-6671`) and `drive_group` (`:5838`), whose member
     filters admit `Stopped` beside `Pending`, so pending siblings run alongside and the round-end reset of the
-    primary checkout still happens; `group_cursor` (`status.rs:736-749`) treats a stopped candidate like a
-    running one (no fall-through to `Fan`/`Select` today's hazard), and `select_stage` (`:7247-7265`) admits a
+    primary checkout still happens; `group_cursor` (`status.rs:736-749`) maps a stopped candidate to `Fan`
+    (blueprint: "like a running one" would rest forever), and `parts_state` rule 1 (`walk.rs:~127-138`) stops
+    resting the node on a stopped part so rule 5 yields `Cursor::Parts`; under `shared_serialized` stopped members
+    run to completion before pending siblings start (a sibling's `prepare` resets the shared checkout), and `select_stage` (`:7247-7265`) admits a
     stopped judge beside a pending one.
   - **The judge** re-runs fresh on its own row, both calls, on a continuing recorder, no resume: its two calls
     are two `drive_once`s on one recorder (`judge_calls :7994`) and the latest banner may be call 1's. The
@@ -126,7 +128,7 @@ issues a stop or a resume until M4's verbs; M3 is exercised through the store ve
     `StepOpening` (`run.rs:257-268`) and `StepStatus::Stopped` (`run.rs:169-170`, "superseded by a fresh rerun")
     are widened to the same-row fallback.
 - **D5a — `Isolator::reacquire(run, step, trees) -> IsolatorFuture<()>`.** Takes the guards `prepare` would hold
-  for those trees (a `shared_serialized` slot, a `local` tree's lock) and never resets, creates or labels; refuses
+  for those trees (only `shared_serialized` takes one, `isolate/real.rs:684-686`; `local` has none — blueprint) and never resets, creates or labels; refuses
   a `shared_serialized` checkout whose `HEAD` is not the step's (another walk moved it) so the step fails rather
   than working on someone else's tree. `worktree`/`copy` hold no guard: `Ok`. Implementors: `isolate/real.rs`,
   htui-orch `fake.rs` (records the call), and any test isolator in `tests/gix_isolator.rs`.
@@ -194,8 +196,10 @@ issues a stop or a resume until M4's verbs; M3 is exercised through the store ve
 ## Tasks
 
 Every task leaves `cargo check --workspace --all-targets --all-features` green. Order:
-**(T1 ∥ T2 ∥ T6) → T3 → T4 → T5 → T7.** T1, T2 and T6 run in separate worktrees on named branches off
-`hr/MOD-125` (file sets disjoint, fact-checked). Between T1 and T5 the runtime resolves a listed stopped-run cancel
+**(T1 ∥ T2 ∥ T3a ∥ T6) → T3 → T4 → T5 → T7.** The blueprint `.claude/plans/mod-125-m3-resume.blueprint.md`
+(architect, 2026-11-13) carries each task's signatures and seams; its cross-task contract and the task's section are
+part of that task's brief. Orch `CASES` 234 → 244 (T3) → 247 (T4); store 290 → 295 (T1). T1, T2, T3a and T6 run in separate worktrees on named branches off
+`hr/MOD-125` (file sets disjoint, fact-checked; T3a split out of T3 on 2026-11-13 to keep T3's brief under ~300 lines). Between T1 and T5 the runtime resolves a listed stopped-run cancel
 as refused (`runtime.rs:3311-3323`); T5 removes that arm.
 
 ### T1: Store — `pending_resumes`, `resume_run`, `cancel_stopped_run`, cancel listing, `select_fanout`, forward
@@ -235,20 +239,30 @@ as refused (`runtime.rs:3311-3323`); T5 removes that arm.
   `resume_fake`): D9's plain, failed-resume, no-caps, no-rows, no-banner, planner, pre-merge, integrate and both
   cancel rows. Then D3; `Cursor::Resume` with its arms; `SessionOpening` through all four `drive_once` callers
   (`Fresh` everywhere but the new paths, compile-forced); `walk_live_step` split into a prepare-and-prompt half
-  and a session-onward half that takes existing trees; D5a on `Isolator` and its implementors; D6's engine half
+  and a session-onward half that takes existing trees, calling T3a's `Isolator::reacquire`; D6's engine half
   and `views.rs`; D7.
-- **Files**: `crates/htui-orch/src/{engine,walk,schedule,status,command,conformance,isolate,fake}.rs`,
-  `crates/htui-orch/src/isolate/real.rs`, `crates/htui-orch/tests/{fake_conformance,gix_isolator}.rs` (pin 234 → N
+- **Files**: `crates/htui-orch/src/{engine,walk,schedule,status,command,conformance,fake}.rs`,
+  `crates/htui-orch/tests/fake_conformance.rs` (pin 234 → N
   at `conformance.rs:17139`, its message `:17231`, `fake_conformance.rs:18` and `:79`),
   `crates/htui-worker/src/views.rs`.
 - **Validate**: `cargo test -p htui-orch --all-features --no-fail-fast` (grep SIGABRT; memory: stack headroom);
   `cargo test -p htui-worker --all-features --lib views`.
 
+### T3a: `Isolator::reacquire` (D5a; independent, wave 1)
+- **Action** (tests first): the trait method, the real isolator (retake the `shared_serialized` slot guard, check
+  `HEAD` against the step's base and foreign `htui/*` labels, refuse `moved_while_stopped` and release; `Ok` for
+  `local`, `worktree`, `copy`), the gix label reader, the fake isolator's `Reacquire` call record, `reacquires()`
+  and `refuse_reacquire(reason)` queue, and `StallAfterReconcile`'s forward. Real-isolator tests over a scratch
+  repo (moved by a foreign label → refused and released; at base or own commits → guard held, `capture` releases).
+- **Files**: `crates/htui-orch/src/isolate.rs`, `crates/htui-orch/src/isolate/{real,git}.rs`,
+  `crates/htui-orch/src/fake.rs` (the fake isolator only), `crates/htui-orch/tests/gix_isolator.rs`.
+- **Validate**: `cargo test -p htui-orch --all-features --lib isolate`; `cargo test -p htui-orch --all-features --test gix_isolator`.
+
 ### T4: Engine — parts, candidates, judge (after T3, same files)
 - **Action** (tests first): D9's part-with-queued-sibling, `shared_serialized` candidate and judge rows; the
   `drive_parts`/`drive_group` member filters, `run_part`/`run_candidate` entries, `group_cursor`, `select_stage`,
   `part_live`/`candidate_live` openings with `reacquire`, the judge's fresh re-run.
-- **Files**: `crates/htui-orch/src/{engine,status,conformance}.rs`, `crates/htui-orch/tests/fake_conformance.rs`.
+- **Files**: `crates/htui-orch/src/{engine,status,walk,conformance}.rs`, `crates/htui-orch/tests/fake_conformance.rs`.
 - **Validate**: as T3.
 
 ### T5: Runtime — resume in the poll, the cancel way out (after T4)
