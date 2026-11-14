@@ -656,29 +656,40 @@ pub fn render(
         .form(kinds, theme)
         .map(|form| form.layout(width, ctx.accent(), theme))
         .unwrap_or_default();
-    // The item form's notice rule: wrapped here, so the layout sizes it from the same count;
-    // it grows into the body's rows, and one longer than all of them loses its first rows (the
-    // D10 hedge ends the sentence).
+    // The item form's notice rule (review H1): wrapped here, so the layout sizes it from the
+    // same count; it grows into the body's rows, then into the form's, down to the focused
+    // part's and one more (a focused body keeps a row and its label), the form scrolled to show
+    // the focused part. One longer than that loses its first rows: the D10 hedge ends the
+    // sentence, so only the store's own message before it is cut.
     let mut notice_lines = compose
         .notice
         .as_deref()
         .map(|sentence| wrapped(sentence, usize::from(width)))
         .unwrap_or_default();
     let fixed = u16::try_from(rows.lines.len()).unwrap_or(u16::MAX);
-    let room = inner.height.saturating_sub(fixed);
+    let spare = inner.height.saturating_sub(fixed);
+    let focused = match compose.focus {
+        Part::Body => 1 + u16::from(fixed > 0),
+        Part::Kind | Part::Title => 1,
+    };
+    let room = inner.height.saturating_sub(focused + 1);
     let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
     let notice_height = wanted.min(room);
-    let body_min = BODY_MIN.min(room.saturating_sub(notice_height));
+    let body_min = match compose.focus {
+        Part::Body => BODY_MIN.min(spare.saturating_sub(notice_height)).max(1),
+        Part::Kind | Part::Title => BODY_MIN.min(spare.saturating_sub(notice_height)),
+    };
     if wanted > notice_height {
         notice_lines.drain(..usize::from(wanted - notice_height));
     }
+    let form_height = fixed.min(inner.height.saturating_sub(notice_height + body_min));
     let [form, body, below] = Layout::vertical([
-        Constraint::Length(fixed),
+        Constraint::Length(form_height),
         Constraint::Min(body_min),
         Constraint::Length(notice_height),
     ])
     .areas(inner);
-    rows.render(frame, form, 0);
+    rows.render(frame, form, rows.offset(form.height));
     frame.render_widget(
         Paragraph::new(compose.body.lines(
             body.width,
@@ -1506,6 +1517,90 @@ mod tests {
             );
         });
         assert!(text.contains("re-read to check"), "{text}");
+    }
+
+    /// The compose area's rect in the detail pane of an 80x24 terminal under the Backlog's
+    /// default layout (`ide_activity`, MOD-122 M3 D11).
+    fn default_80_by_24() -> (u16, u16) {
+        use crate::ui::kit::pane::Pane;
+        use crate::ui::layout::chrome;
+        use crate::ui::shell::{PaneId, layout::areas};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let detail = areas(
+            chrome(Rect::new(0, 0, 80, 24)).body,
+            &BACKLOG_LAYOUT,
+            PaneId::List,
+        )
+        .detail;
+        let inner = Pane::inner(detail);
+        (inner.width, inner.height)
+    }
+
+    /// Review H1: the D10 hedges keep their clause whole on the default 80x24 Backlog; past the
+    /// body's rows they take the form's, which scrolls the focused part into view, and a focused
+    /// body keeps a row. Only the store's own message before the clause is cut.
+    #[test]
+    fn the_hedges_keep_their_clause_on_a_short_pane() {
+        let shell = Shell::new();
+        let why = "store backend error: connection reset ".repeat(8);
+        let (width, height) = default_80_by_24();
+        let sentences = [
+            may_have_landed(why.trim_end(), "thread"),
+            could_not_check(why.trim_end(), "thread", Some("Ctrl+s")),
+        ];
+        for (size, sentence) in [(width, height), (43, 8)]
+            .into_iter()
+            .flat_map(|size| sentences.iter().map(move |sentence| (size, sentence)))
+        {
+            let clause = &sentence[sentence.find('\u{2014}').expect("a hedge")..];
+            let mut compose = typed("FEAT-1");
+            let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+            let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+            assert_eq!(compose.focus(), Part::Body);
+            compose.on_paste("First line.");
+            compose.settle(Some(sentence.clone()));
+            let text = drawn(size.0, size.1, |frame, area| {
+                render(
+                    frame,
+                    area,
+                    &compose,
+                    " New document ",
+                    Some("plan, prd, summary"),
+                    None,
+                    &shell.ctx(),
+                );
+            });
+            let flowed = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+            assert!(flowed.contains(clause), "{size:?}: {clause:?} in\n{text}");
+            assert!(
+                text.contains("First line."),
+                "{size:?}: the body keeps a row\n{text}"
+            );
+
+            let mut compose = typed("FEAT-1");
+            let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+            assert_eq!(compose.focus(), Part::Title);
+            compose.on_paste("Plan title");
+            compose.settle(Some(sentence.clone()));
+            let text = drawn(size.0, size.1, |frame, area| {
+                render(
+                    frame,
+                    area,
+                    &compose,
+                    " New document ",
+                    Some("plan, prd, summary"),
+                    None,
+                    &shell.ctx(),
+                );
+            });
+            let flowed = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+            assert!(flowed.contains(clause), "{size:?}: {clause:?} in\n{text}");
+            assert!(
+                text.contains("Plan title"),
+                "{size:?}: the title stays\n{text}"
+            );
+        }
     }
 
     /// The maintainer's answer to blueprint §6 Q1: `v` with nothing changed is `unchanged`, in
