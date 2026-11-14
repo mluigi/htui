@@ -2186,8 +2186,10 @@ fn requirements() -> Vec<Requirement> {
                     project_id: ids::PROJECT_HTUI,
                     area_id,
                     area_code: code.to_owned(),
-                    number,
-                    key: format!("R-{code}-{number}"),
+                    number: Some(number),
+                    key: Requirement::top_level_key(false, code, number),
+                    refines_id: None,
+                    child_number: None,
                     body: body.to_owned(),
                     rationale: rationale.to_owned(),
                     priority,
@@ -2503,11 +2505,13 @@ mod tests {
                 .get(&requirement.area_id)
                 .copied()
                 .unwrap_or(0);
+            let number = requirement
+                .number
+                .expect("every fixture requirement is top-level");
             assert!(
-                last >= requirement.number,
-                "counter for {} is {last}, below {}",
+                last >= number,
+                "counter for {} is {last}, below {number}",
                 requirement.area_code,
-                requirement.number
             );
         }
         assert_eq!(

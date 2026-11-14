@@ -46,6 +46,8 @@
 //! `memory_entry` and `memory_entry_revision`. Neither table is mirrored, so `CacheStore` answers both
 //! reads `None` ("not available here"), as it answers `requirement_revisions`.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
@@ -59,26 +61,27 @@ use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
     BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandLog,
-    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
-    FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState,
-    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
-    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope,
-    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
-    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry,
-    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState, Document, DocumentHead,
+    DocumentId, FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
+    ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource,
+    MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunMemory,
+    NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note,
+    OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId, PermissionStatus,
+    Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
@@ -252,8 +255,9 @@ pub trait ReadStore: Send + Sync {
     /// The backend's own failures only.
     async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>>;
 
-    /// The project's requirements matching `filter` (plan D14), in `(area_code, number)` order,
-    /// area_code by bytes. The text filter is a literal substring of `key` or `body`, case-folded
+    /// The project's requirements matching `filter` (plan D14), in MOD-149 D6's list order
+    /// ([`Requirement::list_cmp`](crate::model::Requirement::list_cmp): area_code by bytes, the
+    /// key's number path, key by bytes), so a nested child follows its parent. The text filter is a literal substring of `key` or `body`, case-folded
     /// per backend as [`items`](Self::items)' is ([`RequirementFilter::text`]).
     ///
     /// # Errors
@@ -280,9 +284,9 @@ pub trait ReadStore: Send + Sync {
         id: RequirementId,
     ) -> Result<Option<Vec<RequirementRevision>>>;
 
-    /// The item's live citations with `suspect` derived (plan D11), in
-    /// `(requirement.area_code, requirement.number, kind)` order, all by bytes; empty for an
-    /// unknown item.
+    /// The item's live citations with `suspect` derived (plan D11), in the requirement's list
+    /// order ([`requirements`](Self::requirements)), then `kind` by bytes; empty for an unknown
+    /// item.
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -295,6 +299,14 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>>;
+
+    /// MOD-149 D7: every requirement whose `refines_id` is `id`, nested children and cross-owner
+    /// refinements alike, from any project, in [`requirements`](Self::requirements)' list order
+    /// then `id`; empty for an unknown id. On the mirror, only rows of mirrored projects.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement_refinements(&self, id: RequirementId) -> Result<Vec<Requirement>>;
 
     // ---- MOD-72: per-step tool-call counts (ANA-12 §3.2) ------------------------------------
 
@@ -3998,6 +4010,66 @@ pub fn requirement_withdrawn(key: &str) -> String {
     format!("requirement {key} is withdrawn")
 }
 
+/// MOD-149 D4: a nested child is minted in its parent's area, never another.
+#[must_use]
+pub fn requirement_child_area(parent_key: &str, parent_area: &str) -> String {
+    format!("a requirement nested under {parent_key} is minted in its area {parent_area}")
+}
+
+/// MOD-149 D4: a refinement reaches its own project, or a project's workspace; nothing else.
+#[must_use]
+pub fn requirement_refines_outside_reach(parent_key: &str) -> String {
+    format!(
+        "{parent_key} cannot be refined here: a project requirement refines its own project's or \
+         one of its workspaces', a workspace requirement only its own workspace's"
+    )
+}
+
+/// MOD-149 D8: a requirement's coverage. Its active refinements decide when it has any, each by
+/// this same rule ([`CoverageState::of_splits`]); otherwise its own citations
+/// ([`CoverageState::of_citations`]). An unknown id has no citations and reads `Open`.
+///
+/// The walk is iterative: refinement is acyclic by construction, since `refines_id` is set only
+/// at mint and only to a row that already exists.
+///
+/// # Errors
+/// The backend's own failures only.
+pub async fn requirement_coverage_state<S: ReadStore + ?Sized>(
+    store: &S,
+    id: RequirementId,
+) -> Result<CoverageState> {
+    // Depth-first post-order without recursion: a node is decided once its active refinements
+    // are, which the second visit (`expanded`) finds in `decided`.
+    let mut decided: HashMap<RequirementId, CoverageState> = HashMap::new();
+    let mut children: HashMap<RequirementId, Vec<RequirementId>> = HashMap::new();
+    let mut stack = vec![(id, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if decided.contains_key(&node) {
+            continue;
+        }
+        if expanded {
+            let kids = children.remove(&node).unwrap_or_default();
+            let state = match CoverageState::of_splits(kids.iter().map(|kid| decided[kid])) {
+                Some(state) => state,
+                None => CoverageState::of_citations(&store.requirement_coverage(node).await?),
+            };
+            decided.insert(node, state);
+            continue;
+        }
+        let kids: Vec<RequirementId> = store
+            .requirement_refinements(node)
+            .await?
+            .into_iter()
+            .filter(|row| row.state == RequirementState::Active)
+            .map(|row| row.id)
+            .collect();
+        stack.push((node, true));
+        stack.extend(kids.iter().map(|kid| (*kid, false)));
+        children.insert(node, kids);
+    }
+    Ok(decided[&id])
+}
+
 /// Plan D10: a withdrawn requirement takes no new `addresses` / `reserves` citation (T6).
 #[must_use]
 pub fn withdrawn_requirement_cited(key: &str, kind: CitationKind) -> String {
@@ -4408,7 +4480,8 @@ pub enum DeleteTarget {
 /// field ([`Add`](std::ops::Add), MOD-147 A1). `phase_agents` is counted on both stores
 /// since MOD-37 R-6 gave `MemStore` the table, and is `0` on the demo fixture, which seeds none;
 /// `run_step_commits`, `run_step_trees` and `command_runs` are counted on both since MOD-4.
-/// MOD-38's six requirement fields are counted on both stores. MOD-163's two memory fields are
+/// MOD-38's six requirement fields, and MOD-149's `requirement_child_counters`, are counted on
+/// both stores. MOD-163's two memory fields are
 /// counted on both stores (plan D8). MOD-139's `run_plans` is counted on both stores (plan D5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
@@ -4467,6 +4540,9 @@ pub struct DeleteReach {
     pub requirement_areas: u64,
     /// `requirement_key_counter` rows, which cascade from `requirement_area`.
     pub requirement_key_counters: u64,
+    /// `requirement_child_counter` rows of the project's requirements, which cascade from
+    /// `requirement` (MOD-149).
+    pub requirement_child_counters: u64,
     /// `requirement` rows.
     pub requirements: u64,
     /// `requirement_revision` rows of the project's requirements.
@@ -4514,6 +4590,7 @@ impl std::ops::Add for DeleteReach {
             requirement_specs,
             requirement_areas,
             requirement_key_counters,
+            requirement_child_counters,
             requirements,
             requirement_revisions,
             item_requirements,
@@ -4547,6 +4624,8 @@ impl std::ops::Add for DeleteReach {
             requirement_specs: requirement_specs + other.requirement_specs,
             requirement_areas: requirement_areas + other.requirement_areas,
             requirement_key_counters: requirement_key_counters + other.requirement_key_counters,
+            requirement_child_counters: requirement_child_counters
+                + other.requirement_child_counters,
             requirements: requirements + other.requirements,
             requirement_revisions: requirement_revisions + other.requirement_revisions,
             item_requirements: item_requirements + other.item_requirements,

@@ -16501,6 +16501,7 @@ fn new_requirement(body: &str) -> NewRequirement {
         priority: Priority::Must,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
+        refines_id: None,
     }
 }
 
@@ -16624,7 +16625,7 @@ async fn requirement_mint_is_per_area_and_never_reused<S: WriteStore>(store: &S)
             ids::PROJECT_HTUI,
             ids::AREA_ENT,
             "ENT",
-            3,
+            Some(3),
             "R-ENT-3"
         ),
         "{CASE}: the fixture minted R-ENT-1 and R-ENT-2, so the next ENT number is 3"
@@ -16663,7 +16664,7 @@ async fn requirement_mint_is_per_area_and_never_reused<S: WriteStore>(store: &S)
         .expect(CASE);
     assert_eq!(
         (sto.key.as_str(), sto.number),
-        ("R-STO-2", 2),
+        ("R-STO-2", Some(2)),
         "{CASE}: STO counts on its own"
     );
 

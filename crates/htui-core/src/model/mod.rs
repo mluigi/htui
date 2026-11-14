@@ -191,9 +191,9 @@ pub use relay::{
     RunCommandKind, RunCommandStatus, SettleOutcome, StepPermission, executor_scrub_refusal,
 };
 pub use requirement::{
-    CitationKind, CoverageRow, ItemCitation, ItemRequirement, NewRequirement, NewRequirementArea,
-    Priority, Requirement, RequirementArea, RequirementFilter, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    CitationKind, CoverageRow, CoverageState, ItemCitation, ItemRequirement, NewRequirement,
+    NewRequirementArea, Priority, Requirement, RequirementArea, RequirementFilter,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
 };
 pub use run::{
     CAPTURE_KEY, CAPTURE_POSITION, COMMAND_LOG_CAP, COMMAND_LOG_STORE_MAX, ChatRunSpec, CommandLog,
