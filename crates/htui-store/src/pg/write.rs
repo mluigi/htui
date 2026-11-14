@@ -77,13 +77,12 @@ use htui_core::store::{
     item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal,
     not_a_fanout_candidate, not_a_terminal_status, persona_is_bound, persona_patch_refusal,
     phase_name_refusal, prompt_template_key, prompt_template_refusal, queue_target_refusal,
-    queue_token_refusal, references_no_row, requirement_withdrawn, resolution_not_closable,
+    queue_token_refusal, references_no_row, requirement_child_area,
+    requirement_refines_outside_reach, requirement_withdrawn, resolution_not_closable,
     row_names_another_phase, row_names_another_step, run_is_terminal, run_step_refusal,
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
-// MOD-149's two refusals, not (yet) re-exported at `htui_core::store`.
-use htui_core::store::traits::{requirement_child_area, requirement_refines_outside_reach};
 use htui_core::store::{
     body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,

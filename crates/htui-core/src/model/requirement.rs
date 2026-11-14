@@ -190,21 +190,26 @@ impl Requirement {
     /// that does not parse reads as `i32::MAX`, which a stored key (the CHECK) never holds.
     #[must_use]
     pub fn key_path(&self) -> Vec<i32> {
+        self.key_parts().collect()
+    }
+
+    /// [`key_path`](Self::key_path), lazily: what [`list_cmp`](Self::list_cmp) compares, so a
+    /// sort allocates nothing.
+    fn key_parts(&self) -> impl Iterator<Item = i32> + '_ {
         self.key
             .rsplit_once('-')
             .map_or("", |(_, path)| path)
             .split('.')
             .map(|part| part.parse().unwrap_or(i32::MAX))
-            .collect()
     }
 
     /// MOD-149 D6: the list order, `(area_code bytes, key_path, key bytes)`, so a child follows
-    /// its parent and `R-ENT-10` follows `R-ENT-9`.
+    /// its parent and `R-ENT-10` follows `R-ENT-9`. The paths compare part by part as they parse.
     #[must_use]
     pub fn list_cmp(&self, other: &Self) -> Ordering {
         self.area_code
             .cmp(&other.area_code)
-            .then_with(|| self.key_path().cmp(&other.key_path()))
+            .then_with(|| self.key_parts().cmp(other.key_parts()))
             .then_with(|| self.key.cmp(&other.key))
     }
 
@@ -219,11 +224,16 @@ impl Requirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageState {
-    /// Nothing addresses it.
+    /// Neither of the others: no live `addresses` citation, or only ones whose items closed as
+    /// neither `done` nor `concluded` (`rejected`, `duplicate`, …), which count as nothing. A
+    /// split requirement whose every live refinement is `Open`.
     Open,
-    /// Something addresses it, nothing has finished it.
+    /// Not covered, but a live `addresses` citation's item is open or blocked, or closed `done` /
+    /// `concluded` at an older version (the citation is suspect). A split requirement with a
+    /// live refinement `Covered` or `InProgress` and not every one `Covered`.
     InProgress,
-    /// A closed `done` or `concluded` item addresses it at its current version.
+    /// A live, non-suspect `addresses` citation's item is closed `done` or `concluded`. A split
+    /// requirement whose every live refinement is `Covered`.
     Covered,
 }
 

@@ -2246,14 +2246,29 @@ pub trait WriteStore: ReadStore {
     /// duplicate id or an unknown project.
     async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea>;
 
-    /// Mints the area's next number, the requirement and its revision 1 (`reason = "created"`)
-    /// in one statement; a refused mint consumes no number (plan D8).
+    /// Mints a requirement and its revision 1 (`reason = "created"`) atomically (MOD-149 D5).
+    ///
+    /// Without `refines_id` the row is top-level: it takes the area's next `number`, and its key
+    /// is `W-{area}-{n}` in a workspace's scope row, `R-{area}-{n}` in any other project
+    /// ([`Requirement::top_level_key`](crate::model::Requirement::top_level_key)). With
+    /// `refines_id` naming a requirement of the same project, the row is nested: it takes its
+    /// parent's next `child_number` and no `number`, and its key is
+    /// `{parent_key}.{child_number}` ([`Requirement::child_key`](crate::model::Requirement::child_key)).
+    /// Naming a workspace requirement the project's workspace holds, it refines it across owners
+    /// and is top-level in its own project.
+    ///
+    /// Every refusal is decided before a number is taken, in MOD-149 D4's order (the area, then
+    /// the parent: found, in reach, in its own area when nested, not withdrawn), and a refused
+    /// mint consumes no number.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
-    /// `{ entity: "requirement_area" }` for an unknown area;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a duplicate id or a
-    /// `created_by` / `box_id` that names no row.
+    /// `{ entity: "requirement_area" }` for an unknown area and `{ entity: "requirement" }` for
+    /// an unknown parent;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a parent out of reach
+    /// ([`requirement_refines_outside_reach`]), a nested child in another area
+    /// ([`requirement_child_area`]), a withdrawn parent ([`requirement_withdrawn`]), a duplicate
+    /// id or a `created_by` / `box_id` that names no row.
     async fn mint_requirement(
         &self,
         area: RequirementAreaId,
@@ -4031,6 +4046,10 @@ pub fn requirement_refines_outside_reach(parent_key: &str) -> String {
 ///
 /// The walk is iterative: refinement is acyclic by construction, since `refines_id` is set only
 /// at mint and only to a row that already exists.
+///
+/// On an offline (mirror) backend the walk sees only the refinements of the mirrored projects:
+/// a workspace requirement refined by a member project that is not mirrored reads differently
+/// than on Postgres, so a caller must not present an offline result as authoritative.
 ///
 /// # Errors
 /// The backend's own failures only.

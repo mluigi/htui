@@ -113,9 +113,9 @@ use crate::store::traits::{
     project_slug_refusal, scope_row_is_deleted_with_its_workspace, scope_row_joins_no_workspace,
     scope_row_slug_is_fixed, workspace_gone, workspace_has_live_run, workspace_has_stopped_run,
 };
-use crate::store::traits::{requirement_child_area, requirement_refines_outside_reach};
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use crate::store::worker_log::WorkerLogStore;
+use crate::store::{requirement_child_area, requirement_refines_outside_reach};
 use uuid::Uuid;
 
 /// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
