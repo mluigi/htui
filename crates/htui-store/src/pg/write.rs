@@ -706,9 +706,9 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
     )
 }
 
-/// MOD-122 M3 review R1 L1: locks, `FOR UPDATE`, every row whose status move writes an activity
-/// event that names a project of `projects` or the workspace `workspace`, before the delete
-/// path's `DELETE` takes the parent row.
+/// MOD-122 M3 review R1 L1: locks, `FOR NO KEY UPDATE`, every row whose status move writes an
+/// activity event that names a project of `projects` or the workspace `workspace`, before the
+/// delete path's `DELETE` takes the parent row.
 ///
 /// The activity triggers are deferred: a transition holds its `run_step`, `run` or `item` row
 /// until commit, and only then does the trigger's `INSERT INTO activity_event` take
@@ -716,8 +716,14 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
 /// would hold it while its cascade (or `run.workspace_id`'s `SET NULL`) waited on that child: a
 /// cycle. Locked first, the delete waits for the transition instead; at `REPEATABLE READ` a row
 /// the transition moved then raises `40001`, which [`DELETE_ATTEMPTS`] retries, and the next
-/// attempt counts the event too. A `step_permission` insert holds `FOR KEY SHARE` on its step,
-/// which the step's lock waits for.
+/// attempt counts the event too.
+///
+/// `FOR NO KEY UPDATE`, not `FOR UPDATE`: it still waits for a transition's `UPDATE` or its
+/// `SELECT ... FOR UPDATE`, and it lets the trigger's foreign-key checks take `FOR KEY SHARE` on
+/// rows this delete already holds but the transition never locked: the live run an `unblock`
+/// names, the older step a `run_failed` names. Under `FOR UPDATE` the transition's commit waited
+/// on the delete that waited on it (review R1, second round). A `step_permission` insert
+/// locks its step first (`lock_step_fence`), so the step's lock still waits for it.
 ///
 /// The order is `park_step`'s, step, then run, then item (MOD-77 plan D1), so a transition that
 /// takes them in that order cannot close a cycle with this one.
@@ -729,7 +735,7 @@ async fn lock_activity_sources(
     sqlx::query!(
         "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
           WHERE r.project_id = ANY($1) OR r.workspace_id = $2 \
-          ORDER BY s.id FOR UPDATE OF s",
+          ORDER BY s.id FOR NO KEY UPDATE OF s",
         projects,
         workspace,
     )
@@ -737,14 +743,14 @@ async fn lock_activity_sources(
     .await?;
     sqlx::query!(
         "SELECT id FROM run WHERE project_id = ANY($1) OR workspace_id = $2 \
-          ORDER BY id FOR UPDATE",
+          ORDER BY id FOR NO KEY UPDATE",
         projects,
         workspace,
     )
     .fetch_all(&mut *conn)
     .await?;
     sqlx::query!(
-        "SELECT id FROM item WHERE project_id = ANY($1) ORDER BY id FOR UPDATE",
+        "SELECT id FROM item WHERE project_id = ANY($1) ORDER BY id FOR NO KEY UPDATE",
         projects,
     )
     .fetch_all(&mut *conn)

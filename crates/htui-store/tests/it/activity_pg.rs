@@ -1026,3 +1026,86 @@ async fn a_workspace_delete_beside_a_run_transition_does_not_deadlock() {
 
     db.drop_db().await;
 }
+
+/// Review R1 L1, second round: an item blocked in an open transaction while it has a live run.
+/// The unblock event names that run, so the trigger's foreign-key check needs `FOR KEY SHARE` on
+/// the run at commit: a delete that held the run `FOR UPDATE` while it waited on the item closed a
+/// cycle there.
+#[tokio::test]
+async fn a_project_delete_beside_an_item_transition_with_a_live_run_does_not_deadlock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let me = db.store.this_user();
+    let item = plant_item(
+        &db.pool,
+        me,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA, "ANA"),
+        13,
+    )
+    .await;
+    plant_run(&db.pool, &RunSpec::graph(item, me), "awaiting_approval").await;
+
+    commit_beside(
+        &db.pool,
+        "UPDATE item SET status = 'blocked' WHERE id = $1",
+        item.as_uuid(),
+        db.store.delete_project(ids::PROJECT_HTUI),
+    )
+    .await;
+
+    assert_eq!(
+        kinds(&db.pool).await,
+        Vec::<String>::new(),
+        "the unblock went with its item and its run"
+    );
+
+    db.drop_db().await;
+}
+
+/// Review R1 L1, second round: a run failed in an open transaction over a step an earlier
+/// transaction wrote. The `run_failed` event names that step, which the transition never locked,
+/// so the trigger's foreign-key check needs `FOR KEY SHARE` on it at commit: a delete that held the
+/// step `FOR UPDATE` while it waited on the run closed a cycle there.
+#[tokio::test]
+async fn a_project_delete_beside_a_run_failed_over_an_older_step_does_not_deadlock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let me = db.store.this_user();
+    let item = plant_item(
+        &db.pool,
+        me,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA, "ANA"),
+        14,
+    )
+    .await;
+    let run = plant_run(&db.pool, &RunSpec::graph(item, me), "running").await;
+    plant_step(&db.pool, run, 0, "implement", "done").await;
+
+    commit_beside(
+        &db.pool,
+        "UPDATE run SET status = 'failed' WHERE id = $1",
+        run.as_uuid(),
+        db.store.delete_project(ids::PROJECT_HTUI),
+    )
+    .await;
+
+    assert_eq!(
+        every_row(&db.pool)
+            .await
+            .iter()
+            .map(|row| (
+                row.kind.as_str(),
+                row.project,
+                row.run,
+                row.step,
+                row.step_name.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [("run_failed", None, None, None, Some("implement"))],
+        "the failure stays, named by its copies, its sources gone with the project"
+    );
+
+    db.drop_db().await;
+}
