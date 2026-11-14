@@ -3838,37 +3838,75 @@ async fn a_compose_opened_with_the_list_zoomed_is_on_screen() {
     );
 }
 
-/// MOD-115 M2 §7 (T7 repair): the filter form takes every key, so with the activity pane zoomed
-/// `f` draws it at the bottom of the zoomed pane, not into the detail's empty rect.
+/// The activity pane's title row: `─ Activity · <filter>`.
+fn activity_title(frame: &str) -> String {
+    frame
+        .lines()
+        .find(|line| line.contains("\u{2500} Activity \u{b7}"))
+        .unwrap_or_else(|| panic!("the activity pane:\n{frame}"))
+        .to_owned()
+}
+
+/// A left click on the activity pane's first row inside its border, which focuses it (the
+/// shell's mouse, MOD-115 M2 §7) whatever holds the keys.
+async fn click_activity(harness: &mut Harness) {
+    let frame = harness.render();
+    let row = frame
+        .lines()
+        .position(|line| line.contains("\u{2500} Activity \u{b7}"))
+        .unwrap_or_else(|| panic!("the activity pane:\n{frame}"));
+    let row = u16::try_from(row + 1).expect("on screen");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 4, row);
+    harness.drive_to_end().await;
+    harness.render();
+}
+
+/// MOD-115 M2 §7 (T7 repair), MOD-122 M3 D10: the filter form takes every key, so it stays on
+/// screen when a click moves the focus to the activity pane, and `Esc` still closes it there.
+///
+/// It once opened the form with `f` while the activity pane was zoomed. That state is no longer
+/// reachable: the focused activity pane holds the keys, so `f` is the panel's filter (pinned
+/// below), and once the form is open it takes the zoom key too. The nearest reachable state is
+/// this one: the form open, the focus on the activity pane beside it.
 #[tokio::test]
-async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
+async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "tab", "tab", "z"]).await;
-    let zoomed = harness.render();
+    press(&mut harness, &["p", "f"]).await;
+    let open = harness.render();
     assert!(
-        zoomed.contains("Activity") && !zoomed.contains("htui"),
-        "the activity pane is zoomed:\n{zoomed}"
+        open.contains("\u{256d}\u{2500} Filter "),
+        "the form is open:\n{open}"
     );
-    press(&mut harness, &["f"]).await;
+    click_activity(&mut harness).await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{256d}\u{2500} Filter "),
-        "the form is drawn:\n{frame}"
+        frame.contains("\u{256d}\u{2500} Filter ") && frame.contains("\u{2500} Activity \u{b7}"),
+        "the form is drawn beside the activity pane:\n{frame}"
+    );
+    press(&mut harness, &["esc"]).await;
+    let closed = harness.render();
+    assert!(
+        !closed.contains("\u{256d}\u{2500} Filter "),
+        "the form took `Esc`:\n{closed}"
+    );
+    assert!(
+        closed.contains("Enter open \u{b7} f filter"),
+        "the click had focused the activity pane, which has the keys once the form closes:\n{closed}"
     );
 }
 
-/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, the filter form takes the
-/// bottom of the zoomed pane and the list it filters is drawn above it, not a blank body.
+/// MOD-115 M2 §7, RV3 (review M3): the filter form takes the bottom of the list it filters, and
+/// that list is drawn above it, not a blank body, while the activity pane has the focus.
+///
+/// It once pinned this with the activity pane zoomed; with the form open the zoom key is the
+/// form's, so it pins the nearest reachable state: the focus moved to the activity pane by a
+/// click.
 #[tokio::test]
-async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+async fn the_list_is_drawn_above_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "tab", "tab", "z"]).await;
-    let zoomed = harness.render();
-    assert!(
-        zoomed.contains("Activity") && !zoomed.contains("htui"),
-        "the activity pane is zoomed:\n{zoomed}"
-    );
-    press(&mut harness, &["f"]).await;
+    press(&mut harness, &["p", "f"]).await;
+    click_activity(&mut harness).await;
     let frame = harness.render();
     let lines: Vec<&str> = frame.lines().collect();
     let form = lines
@@ -3880,4 +3918,37 @@ async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
         .position(|line| line.contains("htui"))
         .unwrap_or_else(|| panic!("the list is drawn:\n{frame}"));
     assert!(list < form, "the list is above the form:\n{frame}");
+    assert!(
+        frame.contains("\u{2500} Activity \u{b7}"),
+        "the activity pane is shown:\n{frame}"
+    );
+}
+
+/// MOD-122 M3 D10 (blueprint F8): with the activity pane focused, the Backlog's filter key is the
+/// panel's: `f` cycles the panel's filter (`activity.filter`), and the tab's filter form does not
+/// open.
+#[tokio::test]
+async fn f_in_the_focused_activity_pane_cycles_its_filter_not_the_backlogs() {
+    let mut harness = backlog().await;
+    press(&mut harness, &["p", "tab", "tab"]).await;
+    let focused = harness.render();
+    assert!(
+        focused.contains("Enter open \u{b7} f filter"),
+        "the activity pane is focused:\n{focused}"
+    );
+    assert!(
+        activity_title(&focused).contains("all workspaces"),
+        "{focused}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    let title = activity_title(&frame);
+    assert!(
+        title.contains("Activity \u{b7} needs you"),
+        "the panel's filter moved: {title}"
+    );
+    assert!(
+        !frame.contains("\u{256d}\u{2500} Filter "),
+        "the Backlog's filter form did not open:\n{frame}"
+    );
 }
