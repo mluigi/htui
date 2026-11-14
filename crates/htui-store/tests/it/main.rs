@@ -1,3 +1,4 @@
+mod activity_pg;
 mod box_identity;
 mod cache;
 mod connect;
