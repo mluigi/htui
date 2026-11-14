@@ -11,8 +11,8 @@
 use htui_core::fixtures::ids;
 use htui_core::model::document::GOALS_KIND;
 use htui_core::model::{
-    DocumentId, ItemFilter, NewOwnerDocument, RequirementFilter, RequirementState, Resolution,
-    Scope, Status,
+    DocumentId, IndexedCollection, ItemFilter, NewOwnerDocument, RequirementFilter,
+    RequirementState, Resolution, Scope, Status, WorkspaceId,
 };
 use htui_core::store::StoreError;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -22,9 +22,9 @@ use htui_store::testkit::{QdrantTurn, qdrant_turn};
 use htui_store::vector::{
     DENSE, EMBEDDER_KEY, ExistingCollection, Hit, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY,
     PointType, Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _,
-    is_embedder_mismatch, probe_with,
+    drop_collection_named, is_embedder_mismatch, probe_with, workspace_collections,
 };
-use htui_store::vector_sync::{Indexer, workspace_search_scope};
+use htui_store::vector_sync::{Indexer, Unguarded, workspace_search_scope};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     CountPointsBuilder, CreateCollectionBuilder, Distance, Modifier, SparseVectorParamsBuilder,
@@ -93,10 +93,12 @@ async fn sync_then_search_finds_an_item_by_its_exact_key() {
         return;
     };
     let read = MemStore::demo();
-    let first = Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    let first = Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
     assert!(first.points_upserted > 0);
 
-    let second = Indexer::sync(&read, &scope(), &store)
+    let second = Indexer::sync(&read, &scope(), &store, &Unguarded)
         .await
         .expect("resync");
     assert_eq!(
@@ -132,7 +134,9 @@ async fn searches_are_scoped_to_projects_and_filtered_by_type_and_status() {
         return;
     };
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
 
     let agy = store.indexed(ids::PROJECT_AGY).await.expect("indexed");
     assert!(!agy.is_empty());
@@ -207,7 +211,9 @@ async fn deleted_points_leave_the_index() {
         return;
     };
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
     let before = store.indexed(ids::PROJECT_HTUI).await.expect("indexed");
     let gone = before
         .iter()
@@ -220,7 +226,9 @@ async fn deleted_points_leave_the_index() {
     assert!(after.iter().all(|p| p.id != gone));
 
     // The next sync puts it back.
-    let report = Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    let report = Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
     assert_eq!(report.items_rebuilt, 1);
     assert_eq!(
         store
@@ -239,7 +247,9 @@ async fn a_requirement_is_found_by_its_exact_key() {
         return;
     };
     let read = MemStore::demo();
-    let report = Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    let report = Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
     let rows = read
         .requirements(ids::PROJECT_HTUI, &RequirementFilter::default())
         .await
@@ -269,7 +279,7 @@ async fn a_requirement_is_found_by_its_exact_key() {
     )
     .await
     .expect("withdraw");
-    let again = Indexer::sync(&read, &scope(), &store)
+    let again = Indexer::sync(&read, &scope(), &store, &Unguarded)
         .await
         .expect("resync");
     assert_eq!(again.requirements_rebuilt, 1);
@@ -287,7 +297,9 @@ async fn a_resolution_filter_keeps_decisions_and_leaves_requirements_out() {
         return;
     };
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), &store).await.expect("sync");
+    Indexer::sync(&read, &scope(), &store, &Unguarded)
+        .await
+        .expect("sync");
     let fix = read
         .item(ids::HTUI_FIX_1)
         .await
@@ -352,7 +364,9 @@ async fn a_workspace_goals_document_is_found_by_a_workspace_search() {
     let members = scope();
     let wide = workspace_search_scope(&read, &members).await;
     assert_eq!(wide.project_ids[0], ids::PROJECT_SCOPE_PLATFORM);
-    Indexer::sync(&read, &wide, &store).await.expect("sync");
+    Indexer::sync(&read, &wide, &store, &Unguarded)
+        .await
+        .expect("sync");
 
     let search = |projects: Vec<_>| SearchQuery {
         projects,
@@ -381,7 +395,9 @@ async fn a_workspace_goals_document_is_found_by_a_workspace_search() {
     assert!(own(&hits).is_none(), "{hits:?}");
 
     // In step: a second sync of the widened scope writes nothing.
-    let again = Indexer::sync(&read, &wide, &store).await.expect("resync");
+    let again = Indexer::sync(&read, &wide, &store, &Unguarded)
+        .await
+        .expect("resync");
     assert_eq!(again.points_upserted, 0);
     assert_eq!(again.points_deleted, 0);
     store.drop_collection().await.expect("drop");
@@ -667,7 +683,9 @@ async fn open_existing_searches_what_connect_built() {
         .await
         .expect("Qdrant answers");
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), &built).await.expect("sync");
+    Indexer::sync(&read, &scope(), &built, &Unguarded)
+        .await
+        .expect("sync");
     let item = read
         .items(
             &Scope {
@@ -866,7 +884,9 @@ async fn an_old_payload_schema_drops_and_recreates_the_collection() {
         .await
         .expect("Qdrant answers");
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), &first).await.expect("sync");
+    Indexer::sync(&read, &scope(), &first, &Unguarded)
+        .await
+        .expect("sync");
     let filled = point_count(&client, &name).await;
     stamp_payload_schema(&client, &name, PAYLOAD_SCHEMA - 1).await;
     let old = stored_payload_schema(&client, &name).await;
@@ -884,7 +904,7 @@ async fn an_old_payload_schema_drops_and_recreates_the_collection() {
         .payload_schema
         .len();
     let refilled = match &second {
-        Ok(store) => Some(Indexer::sync(&read, &scope(), store).await),
+        Ok(store) => Some(Indexer::sync(&read, &scope(), store, &Unguarded).await),
         Err(_) => None,
     };
     let after = point_count(&client, &name).await;
@@ -921,7 +941,7 @@ async fn a_newer_payload_schema_is_refused_and_kept() {
     let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
         .await
         .expect("Qdrant answers");
-    Indexer::sync(&MemStore::demo(), &scope(), &built)
+    Indexer::sync(&MemStore::demo(), &scope(), &built, &Unguarded)
         .await
         .expect("sync");
     let filled = point_count(&client, &name).await;
@@ -964,7 +984,7 @@ async fn open_existing_never_drops_an_old_payload_schema() {
     let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
         .await
         .expect("Qdrant answers");
-    Indexer::sync(&MemStore::demo(), &scope(), &built)
+    Indexer::sync(&MemStore::demo(), &scope(), &built, &Unguarded)
         .await
         .expect("sync");
     let filled = point_count(&client, &name).await;
@@ -1113,7 +1133,7 @@ async fn check_passes_an_older_payload_stamp_and_drops_nothing() {
     let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
         .await
         .expect("Qdrant answers");
-    Indexer::sync(&MemStore::demo(), &scope(), &built)
+    Indexer::sync(&MemStore::demo(), &scope(), &built, &Unguarded)
         .await
         .expect("sync");
     let filled = point_count(&client, &name).await;
@@ -1235,7 +1255,9 @@ async fn probe_of_another_embedders_collection_is_mismatch() {
 /// The first htui item of the demo store, synced into `store`.
 async fn synced_item(store: &QdrantStore<HashEmbedder>) -> String {
     let read = MemStore::demo();
-    Indexer::sync(&read, &scope(), store).await.expect("sync");
+    Indexer::sync(&read, &scope(), store, &Unguarded)
+        .await
+        .expect("sync");
     read.items(
         &Scope {
             workspace_id: ids::WORKSPACE_PLATFORM,
@@ -1357,4 +1379,43 @@ async fn every_arm_is_scoped() {
         );
     }
     store.drop_collection().await.expect("drop");
+}
+
+// MOD-159 D1: one collection per workspace, listed back by name.
+
+#[tokio::test]
+async fn live_qdrant_workspace_collections_lists_only_workspace_collections() {
+    let Some((_turn, url)) = qdrant_url().await else {
+        return;
+    };
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url).expect("valid URL"),
+        None,
+    );
+    let workspace = IndexedCollection::Workspace(WorkspaceId::new());
+    let other = fresh_name();
+    let ws_store = connect(&url, HashEmbedder::new(DENSE_DIM), &workspace.name())
+        .await
+        .expect("Qdrant answers");
+    let other_store = connect(&url, HashEmbedder::new(DENSE_DIM), &other)
+        .await
+        .expect("Qdrant answers");
+
+    let listed = workspace_collections(&settings).await;
+    let dropped = drop_collection_named(&settings, &other).await;
+    let dropped_again = drop_collection_named(&settings, &other).await;
+    ws_store.drop_collection().await.expect("drop");
+    drop(other_store);
+
+    let listed = listed.expect("list collections");
+    assert!(listed.contains(&workspace), "{listed:?}");
+    assert!(
+        listed
+            .iter()
+            .all(|c| matches!(c, IndexedCollection::Workspace(_))),
+        "{listed:?}"
+    );
+    assert!(listed.windows(2).all(|w| w[0].name() < w[1].name()));
+    assert!(dropped.expect("drop by name"), "it existed");
+    assert!(!dropped_again.expect("drop by name"), "it is gone");
 }
