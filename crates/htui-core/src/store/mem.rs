@@ -12561,6 +12561,7 @@ mod tests {
     use super::{FollowUpPayload, MemStore};
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
+    use crate::model::{ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind};
     use crate::model::{
         AgentBox, AgentId, AnswerOutcome, BatchClose, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
         CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, FOLLOW_UP_SESSION_ENDED,
@@ -12578,6 +12579,7 @@ mod tests {
     use crate::model::{EdgeId, EdgeKind, GraphScope, PhasePart, StepGraphEdge};
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
+    use crate::store::ActivityStore as _;
     use crate::store::error::StoreError;
     use crate::store::{
         CasOutcome, DeleteTarget, ReadStore as _, SettingRung, StepFence, WriteStore as _,
@@ -15139,6 +15141,170 @@ mod tests {
         );
     }
 
+    /// MOD-122 M3 plan D5: the feed reads this user's events only, and an event belongs to its
+    /// row's user (`item.created_by` here), never to whoever wrote. The generic half is the
+    /// conformance case `paging`.
+    #[tokio::test]
+    async fn activity_reads_only_this_users_events() {
+        let store = MemStore::demo();
+        let other = UserId::new();
+        store.write(|state| {
+            let mut row = state.users[&ids::USER].clone();
+            row.id = other;
+            row.name = "someone-else".to_owned();
+            row.created_at += TimeDelta::days(1);
+            state.users.insert(other, row);
+            state
+                .items
+                .get_mut(&ids::HTUI_ANA_2)
+                .expect("the fixture item")
+                .created_by = other;
+        });
+        for item in [ids::HTUI_ANA_2, ids::HTUI_FEAT_3] {
+            assert!(
+                store
+                    .transition(item, Status::Open, Status::Blocked)
+                    .await
+                    .expect("open -> blocked")
+            );
+        }
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .activity
+                    .iter()
+                    .map(|row| (row.user_id, row.event.item))
+                    .collect::<Vec<_>>()
+            }),
+            [
+                (other, Some(ids::HTUI_ANA_2)),
+                (ids::USER, Some(ids::HTUI_FEAT_3))
+            ],
+            "each event is its item creator's"
+        );
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.item)
+                .collect::<Vec<_>>(),
+            [Some(ids::HTUI_FEAT_3)],
+            "another user's event is not read"
+        );
+        assert_eq!(page.pinned, page.events, "nor pinned");
+    }
+
+    /// MOD-122 M3 plan D3: a graph run done over a `closed` item is `run_finished`. No product
+    /// write reaches it (close-out refuses an item with a live run), so the item is closed by hand.
+    #[tokio::test]
+    async fn a_graph_run_done_over_a_closed_item_is_run_finished() {
+        let store = MemStore::demo();
+        store.write(|state| {
+            state
+                .items
+                .get_mut(&ids::HTUI_FEAT_1)
+                .expect("the fixture item")
+                .status = Status::Closed;
+        });
+        store
+            .finish_run(ids::RUN_4, RunStatus::Done, None, Utc::now())
+            .await
+            .expect("the running run finishes");
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| (event.kind, event.run, event.item))
+                .collect::<Vec<_>>(),
+            [(
+                ActivityKind::RunFinished,
+                Some(ids::RUN_4),
+                Some(ids::HTUI_FEAT_1)
+            )]
+        );
+    }
+
+    /// MOD-122 M3 plan D7: a workspace delete clears `workspace` on every event of that workspace,
+    /// whatever its kind, and leaves its other references.
+    #[tokio::test]
+    async fn delete_workspace_clears_the_workspace_of_every_event() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        assert!(
+            store
+                .transition(ids::VULKAN_FEAT_1, Status::Open, Status::Blocked)
+                .await
+                .expect("open -> blocked")
+        );
+        store
+            .fail_run(ids::RUN_8, "verify failed", at)
+            .await
+            .expect("the stopped run fails");
+        let before = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            before
+                .events
+                .iter()
+                .map(|event| (event.kind, event.workspace))
+                .collect::<Vec<_>>(),
+            [
+                (ActivityKind::Unblock, Some(ids::WORKSPACE_GRAPHICS)),
+                (ActivityKind::RunFailed, Some(ids::WORKSPACE_GRAPHICS)),
+            ],
+            "plan D5: the run's recorded workspace"
+        );
+        store
+            .delete_workspace(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect("the workspace goes");
+        let after = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        let cleared: Vec<ActivityEvent> = before
+            .events
+            .iter()
+            .map(|event| ActivityEvent {
+                workspace: None,
+                ..event.clone()
+            })
+            .collect();
+        assert_eq!(after.events, cleared);
+    }
+
+    /// MOD-122 M3 plan D1: `push_activity` seeds a row with the next id and this handle's clock,
+    /// on this store's user, through no transition.
+    #[tokio::test]
+    async fn push_activity_assigns_the_id_and_the_clock() {
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let store = MemStore::demo().with_clock(Arc::new(TestClock::at(at)));
+        let event = ActivityEvent {
+            id: 0,
+            at: at - TimeDelta::days(1),
+            kind: ActivityKind::RunStarted,
+            workspace: Some(ids::WORKSPACE_PLATFORM),
+            project: Some(ids::PROJECT_HTUI),
+            project_slug: "htui".to_owned(),
+            item: Some(ids::HTUI_FEAT_3),
+            item_key: Some("FEAT-3".to_owned()),
+            run: Some(ids::RUN_2),
+            chat: false,
+            step: None,
+            step_name: None,
+            permission: None,
+            text: String::new(),
+        };
+        assert_eq!(store.push_activity(event.clone()), 1);
+        assert_eq!(store.push_activity(event.clone()), 2);
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events,
+            [1, 2].map(|id| ActivityEvent {
+                id,
+                at,
+                ..event.clone()
+            })
+        );
+        assert_eq!(page.pinned, Vec::new(), "a plain event is never pinned");
+    }
+
     /// PRD D13's cascade with no ghost left behind, read straight out of `State`.
     ///
     /// `project_delete_takes_everything_and_says_so` asserts the counts, which is all §6.1 can
@@ -15359,10 +15525,51 @@ mod tests {
             1,
             "precondition: one run plan"
         );
+        // MOD-122 M3 plan D7 (blueprint F5): the staged request above wrote a `permission`; a
+        // failed run adds a failure, on the run's step.
+        store
+            .fail_run(ids::RUN_2, "verify failed", Utc::now())
+            .await
+            .expect("the queued run fails");
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .activity
+                    .iter()
+                    .map(|row| row.event.kind)
+                    .collect::<Vec<_>>()
+            }),
+            [ActivityKind::Permission, ActivityKind::RunFailed],
+            "precondition: one needs-you event and one failure of the project"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
             assert!(!state.projects.contains_key(&gone), "the project itself");
+            assert_eq!(
+                state.activity.len(),
+                1,
+                "only the failure survives: {:?}",
+                state.activity
+            );
+            assert!(
+                state.activity.iter().all(|row| {
+                    let event = &row.event;
+                    event.kind.class() == ActivityClass::Failure
+                        && (
+                            event.project,
+                            event.item,
+                            event.run,
+                            event.step,
+                            event.permission,
+                        ) == (None, None, None, None, None)
+                        && event.project_slug == "htui"
+                        && event.item_key.as_deref() == Some("FEAT-3")
+                }),
+                "every surviving event is a failure with every reference cleared and its copies \
+                 kept (MOD-122 M3 plan D7): {:?}",
+                state.activity
+            );
             assert!(
                 state
                     .edges
