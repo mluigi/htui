@@ -68,7 +68,8 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-149, MOD-150, MOD-164, MOD-152 and MOD-122 M2 (2026-11-14): migrations run through `0035_requirement_keys` (MOD-149: stored `requirement.key`, `refines_id`, `child_number`,
+Live coordinates after MOD-159 M1, MOD-149, MOD-150, MOD-164, MOD-152 and MOD-122 M2 (2026-11-14): migrations run through `0036_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection;
+not mirrored), before it `0035_requirement_keys` (MOD-149: stored `requirement.key`, `refines_id`, `child_number`,
 nullable `number`, `requirement_child_counter`; mirrored by cache `0012_requirement_keys`), before it `0034_item_artifact_link` (MOD-150 M3:
 `item_artifact_link`, item → document version, `to_attachment_id` without its FK until MOD-114 (3); mirrored by cache `0011`), before it `0033_memory_capture` (MOD-164: `memory_entry` `source`, run provenance, `evidence`, usage counters,
 a counter-blind `updated_at` trigger; `chk_run_step_stage` widened to -4 `capture`; no new table; not mirrored), before it `0032_worker_log` (MOD-122 M2: `worker_log`, per-box
@@ -86,16 +87,16 @@ nullable `item_id`, `workspace_box_path.folder_path`; no new table; mirrored by 
 (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0036`** (the concepts payload schema is 3 since MOD-147 M4; a payload change bumps it) (cache: through `0012_requirement_keys`, next `0013`;
+`workspace_stop`), so **the next migration is `0037`** (the concepts payload schema is 3 since MOD-147 M4; a payload change bumps it) (cache: through `0012_requirement_keys`, next `0013`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges, and MOD-144's `0023` became `0024` behind MOD-138's (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
 `htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. `0027`'s column
 comment keeps its own bytes ("written before 0026") and `MOD163_M2_COLUMN_COMMENTS` pins them (`8d69db61`); an applied
-migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143,
-MOD-159 and MOD-171. Pins: store conformance `CASES` 324 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 265 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 56
+migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143
+and MOD-171. Pins: store conformance `CASES` 324 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15, `INDEXER_LEASE_CASES` 10 (MOD-159),
+`htui-orch` `CASES` 265 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 57
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
@@ -870,6 +871,13 @@ items it follows are done.
   MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. MOD-158 is
   done, MOD-147 is (`docs/decisions/mod/mod-147.md`: owner documents index through `sync_owner_documents`),
   and MOD-149 is (`docs/decisions/mod/mod-149.md`: stored `W-` keys, `requirement_refinements`), so nothing blocks it.
+  **Phase 1 landed (`cd65d461..a61f879b` on `hr/MOD-159`, 2026-11-14):** M1 lease and collections. Migration `0036_indexer_lease`
+  (not mirrored) and `IndexerLeaseStore`. Collections `htui_ws_<uuid>` and `htui_global` replace `htui_concepts_v2`, which the global holder
+  drops. The worker and TUI index job reconciles under each collection's lease and renews before each delete batch,
+  confirming orphans by re-listing. Searches read the workspace collections plus global. `Ctrl+R`/`--index-items` defer to
+  a live holder. PRD `.claude/prds/mod-159-knowledge-indexer.prd.md`, plan
+  `.claude/plans/mod-159-m1-lease-and-collections.plan.md`. M2 (60 s incremental cycle) and M3 (pass requests, holder
+  visibility) remain. Owed on the host: the live-Qdrant suites.
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
   `R-STO-8`, `R-ID-6`, `R-ENT-9`, `R-MCP-2`. The top 5 nearest items across the workspace (open and
   closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's
