@@ -68,7 +68,8 @@ impl Default for RefreshSettings {
 pub struct PassReport {
     /// Rows upserted, per mirrored table, in pass order.
     pub tables: Vec<(&'static str, u64)>,
-    /// `item_link` and `item_requirement` tombstones removed from the mirror.
+    /// `item_link`, `item_artifact_link` and `item_requirement` tombstones removed from the
+    /// mirror.
     pub tombstones: u64,
     /// `session_event` rows copied.
     pub events: u64,
@@ -191,7 +192,7 @@ impl Refresher {
     }
 }
 
-/// The fifteen cursor-driven tables of §6.2, in foreign-key order. The last four are MOD-38's
+/// The seventeen cursor-driven tables of §6.2, in foreign-key order. The last four are MOD-38's
 /// (plan D12, `docs/ANA-11.md` §5.2).
 const PROJECT: &str = "project";
 const REPO: &str = "repo";
@@ -200,6 +201,7 @@ const ITEM: &str = "item";
 const ITEM_LINK: &str = "item_link";
 const ITEM_NOTE: &str = "item_note";
 const DOCUMENT: &str = "document";
+const ITEM_ARTIFACT_LINK: &str = "item_artifact_link";
 const RUN: &str = "run";
 const RUN_STEP: &str = "run_step";
 const RUN_STEP_COMMIT: &str = "run_step_commit";
@@ -221,9 +223,9 @@ const ITEM_REQUIREMENT: &str = "item_requirement";
 /// 3. per project, per table in foreign-key order, `ts_col > high_water - overlap`, primary-key
 ///    upsert, cursor set to `max(ts_col)` of the fetched rows - server time, so clock skew between
 ///    boxes is irrelevant. `run_step_commit` has no timestamp of its own and rides its parent
-///    step's `updated_at` (H.3). An `item_link` or `item_requirement` row with `deleted_at` set is
-///    *deleted* from the mirror instead of upserted and still advances the cursor (§4.4, MOD-38
-///    plan D12);
+///    step's `updated_at` (H.3). An `item_link`, `item_artifact_link` or `item_requirement` row
+///    with `deleted_at` set is *deleted* from the mirror instead of upserted and still advances
+///    the cursor (§4.4, MOD-38 plan D12, MOD-150 M3 plan D9);
 /// 4. the last-N **finished** transcripts per project, copied for steps not already mirrored, then
 ///    trimmed scoped to that project so another project's cached steps survive;
 /// 5. `cache_meta.last_full_refresh_at`, set only when every cursor was `0` at the top of the pass.
@@ -260,6 +262,7 @@ pub async fn run_pass(
             ITEM_LINK,
             ITEM_NOTE,
             DOCUMENT,
+            ITEM_ARTIFACT_LINK,
             RUN,
             RUN_STEP,
             RUN_STEP_COMMIT,
@@ -283,6 +286,9 @@ pub async fn run_pass(
                 ITEM_LINK => refresh_item_link(pool, sqlite, project, since, hw).await?,
                 ITEM_NOTE => refresh_item_note(pool, sqlite, project, since, hw).await?,
                 DOCUMENT => refresh_document(pool, sqlite, project, since, hw).await?,
+                ITEM_ARTIFACT_LINK => {
+                    refresh_item_artifact_link(pool, sqlite, project, since, hw).await?
+                }
                 RUN => refresh_run(pool, sqlite, project, since, hw).await?,
                 RUN_STEP => refresh_run_step(pool, sqlite, project, since, hw).await?,
                 // Explicit arms, and no `_` fallback: until MOD-4 milestone 1 this match ended
@@ -333,7 +339,8 @@ pub async fn run_pass(
 struct Batch {
     /// Rows upserted.
     rows: u64,
-    /// Tombstoned rows deleted from the mirror (`item_link` and `item_requirement` only).
+    /// Tombstoned rows deleted from the mirror (`item_link`, `item_artifact_link` and
+    /// `item_requirement` only).
     tombstones: u64,
 }
 
@@ -1106,6 +1113,78 @@ async fn refresh_document(
     Ok(Batch {
         rows: rows.len() as u64,
         tombstones: 0,
+    })
+}
+
+const ITEM_ARTIFACT_LINK_COLUMNS: &[&str] = &[
+    "id",
+    "from_item_id",
+    "kind",
+    "to_document_id",
+    "to_attachment_id",
+    "proposed_by_step_id",
+    "created_at",
+    "updated_at",
+];
+
+/// Document links (MOD-150 M3 plan D9): [`refresh_item_link`]'s twin, keyed on `id`. A row is in
+/// the project's batch when its from-item **or** its document is in the project, so a link that
+/// crosses projects reaches the mirror from either side; a tombstone is a delete by `id`.
+async fn refresh_item_artifact_link(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT id, from_item_id, kind, to_document_id, to_attachment_id, proposed_by_step_id, \
+                created_at, updated_at, deleted_at \
+           FROM item_artifact_link \
+          WHERE (from_item_id IN (SELECT id FROM item WHERE project_id = $1) \
+                 OR to_document_id IN (SELECT id FROM document WHERE project_id = $1)) \
+            AND updated_at > $2 \
+          ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(ITEM_ARTIFACT_LINK, ITEM_ARTIFACT_LINK_COLUMNS, 1);
+    let mut upserted = 0u64;
+    let mut tombstones = 0u64;
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        if row.deleted_at.is_some() {
+            sqlx::query("DELETE FROM item_artifact_link WHERE id = ?")
+                .bind(row.id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            tombstones += 1;
+            continue;
+        }
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(row.from_item_id.to_string())
+            .bind(&row.kind)
+            .bind(row.to_document_id.map(|id| id.to_string()))
+            .bind(row.to_attachment_id.map(|id| id.to_string()))
+            .bind(row.proposed_by_step_id.map(|id| id.to_string()))
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        upserted += 1;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, ITEM_ARTIFACT_LINK, high_water).await?;
+    Ok(Batch {
+        rows: upserted,
+        tombstones,
     })
 }
 

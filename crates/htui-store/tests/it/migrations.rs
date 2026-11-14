@@ -7601,6 +7601,100 @@ async fn cache_0010_applies_over_a_populated_0009_mirror() {
     pool.close().await;
 }
 
+/// MOD-150 M3 T2 (plan D9): cache 0011 applies over a populated 0010 mirror, since
+/// `CACHE_MIGRATOR` runs before the `schema_version` check. An existing `item_link` row survives,
+/// and `item_artifact_link` exists with its columns, keyed on `id`, without `deleted_at` (a
+/// tombstone is a delete in the mirror). Needs no server and therefore never skips.
+#[tokio::test]
+async fn cache_0011_applies_over_a_populated_0010_mirror() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().expect("a temp cache dir");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("cache.sqlite"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open the cache file");
+    htui_store::CACHE_MIGRATOR
+        .run_to(10, &pool)
+        .await
+        .expect("apply cache 0001 through 0010");
+    sqlx::query(
+        "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+         VALUES ('i1', 'i2', 'relates', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a 0010 item_link");
+    htui_store::CACHE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("cache 0011 applies over a populated 0010 file");
+
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM item_link WHERE from_item_id = 'i1'")
+        .fetch_one(&pool)
+        .await
+        .expect("count the kept link");
+    assert_eq!(kept, 1, "the 0010 row is kept");
+
+    sqlx::query(
+        "INSERT INTO item_artifact_link (id, from_item_id, kind, to_document_id, \
+         to_attachment_id, proposed_by_step_id, created_at, updated_at) \
+         VALUES ('l1', 'i1', 'implements', 'd1', NULL, 's1', 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert an item_artifact_link row");
+    let row: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT kind, to_document_id, to_attachment_id, proposed_by_step_id, updated_at \
+           FROM item_artifact_link WHERE id = 'l1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the link back");
+    assert_eq!(
+        row,
+        (
+            "implements".to_owned(),
+            "d1".to_owned(),
+            None,
+            Some("s1".to_owned()),
+            2
+        )
+    );
+    let duplicate = sqlx::query(
+        "INSERT INTO item_artifact_link (id, from_item_id, kind, to_document_id, created_at, \
+         updated_at) VALUES ('l1', 'i2', 'relates', 'd2', 1, 1)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(duplicate.is_err(), "id is the primary key");
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('item_artifact_link') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .expect("list the columns");
+    assert_eq!(
+        columns,
+        [
+            "id",
+            "from_item_id",
+            "kind",
+            "to_document_id",
+            "to_attachment_id",
+            "proposed_by_step_id",
+            "created_at",
+            "updated_at",
+        ],
+        "the Postgres columns less deleted_at"
+    );
+
+    pool.close().await;
+}
+
 /// Inserts `from --kind--> to` straight into `item_link`, live.
 async fn insert_link(
     pool: &sqlx::PgPool,
