@@ -2244,8 +2244,8 @@ impl GixIsolator {
 
     /// MOD-133 F2 L3: whether the remote's `remote_tip` is a commit this checkout holds and
     /// `tip` is its ancestor, so the remote already holds the run's work and moved past it. Read
-    /// under the repo's admin lock, as [`GixIsolator::landing_tip`]; a commit this checkout lacks
-    /// answers `false`, and the push then decides.
+    /// under the repo's admin lock, as [`GixIsolator::landing_tip`]; a commit this checkout lacks,
+    /// or a read that fails, answers `false`, and the push then decides.
     async fn holds_past(
         &self,
         repo: RepoId,
@@ -2257,7 +2257,8 @@ impl GixIsolator {
         let path = checkout.local_path.clone();
         let tip = tip.to_owned();
         blocking(move || {
-            Ok(git::has_commit(&path, &remote_tip)? && git::is_ancestor(&path, &tip, &remote_tip)?)
+            Ok(git::has_commit(&path, &remote_tip).unwrap_or(false)
+                && git::is_ancestor(&path, &tip, &remote_tip).unwrap_or(false))
         })
         .await
     }
