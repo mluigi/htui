@@ -180,8 +180,8 @@ Inside, start the lifecycle as usual:
 ```
 
 In a sandbox `/handoff-run` always works on the run's item: `next` resolves to it, and naming a
-different item makes it ask you first. Every gate still waits for you — route confirm, CONFIRM, PRD
-questions and the reviewer. Instead of pushing, the run ends with
+different item makes it ask you first. The run still asks you its questions — PRD
+questions and the reviewer's key; it no longer waits on a route or plan confirm. Instead of pushing, the run ends with
 `branch hr/<ITEM> ready — on host: scripts/hr collect <ITEM>`.
 
 The clone sits at the same path as your checkout (`~/projects/htui`), so absolute paths in docs,

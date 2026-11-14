@@ -16,18 +16,18 @@ have Cline copies under `.clinerules/` (see *Enforcement* below).
 | `/handoff-add <description>` | A new `HANDOFF.md` checklist item, ID minted | Yes — `HANDOFF.md` only |
 | `/handoff-run <ITEM-ID>\|next` | The whole lifecycle: select → route → artifacts → implementation → close-out | Yes — this is the only command with full authority |
 
-Both are interactive: a maintainer is present, and every gate below is a decision they make. Nothing
-in this surface runs unattended.
+Both run with a maintainer present, who is asked only when there is a real question. There are no
+confirm gates; nothing in this surface runs unattended, and nothing pushes without being asked.
 
 ## The normal path
 
 ```
 /handoff-add "..."      ->  HANDOFF.md item
         |
-/handoff-run <ID>|next  ->  `next`: selection block          [maintainer confirms / breaks ties]
-        |                   route verdict (ANA | PRD | plan)  [maintainer confirms]
+/handoff-run <ID>|next  ->  `next`: selection block          [shown; maintainer breaks ties]
+        |                   route verdict (ANA | PRD | plan)  [shown, taken as printed]
         |                   artifacts: docs/ANA-N.md  or  .claude/prds/*.prd.md + .claude/plans/*.plan.md
-        |                   CONFIRM gate on the plan
+        |                   plan fact-check (no CONFIRM gate)
         |                   implementation: code-architect -> implementer fan-out -> reviewer gate
         |                   close-out: HANDOFF line deleted, write-up file + index line, validator
         v
@@ -71,8 +71,8 @@ One command per item lifecycle. Five things about it matter in daily use:
    unresolved design questions in the item text, breadth over ~10 files — and **two or more fired
    means PRD path**, otherwise plan path. An `ANA-N` item that is really implementation work is a
    *prefix mismatch*: it gets re-minted as `MOD-N` rather than routed as research.
-3. **The gates never disappear.** Selection confirm (`next` only), route confirm, `plan` CONFIRM, PRD open
-   questions, and deliberate push are maintainer decisions in every run.
+3. **The run stops only for questions.** No confirm on the selection, the route or the plan. A tie, a PRD open
+   question, a plan claim that cannot be amended, and a deliberate push are put to the maintainer.
 4. **The reviewer gate always runs last**, over the changes, resolved from the repo's
    `.claude/workflow-config.json` key `reviewer`.
 5. **Close-out is bookkeeping, then proof.** Phase note for a milestone of multi-phase work, full

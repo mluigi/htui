@@ -9,8 +9,8 @@ self-contained, no external artifact needed.
 | Path | Chain | Produces |
 |---|---|---|
 | **ANA** | research → `docs/ANA-N.md` (survey of prior art, options, verdict, phasing) | Analysis doc only. **Never implementation** — a concluding verdict may spawn a `MOD-N`, which is a new item routed on its own. |
-| **PRD** | `plan-prd` → `.claude/prds/<name>.prd.md` → `plan` → `.claude/plans/<name>.plan.md` → CONFIRM → implementation | Full artifact chain for big/underspecified work |
-| **plan** | `plan` → `.claude/plans/<name>.plan.md` → CONFIRM → implementation | Direct plan for small/well-specified work |
+| **PRD** | `plan-prd` → `.claude/prds/<name>.prd.md` → `plan` → `.claude/plans/<name>.plan.md` → fact-check → implementation | Full artifact chain for big/underspecified work |
+| **plan** | `plan` → `.claude/plans/<name>.plan.md` → fact-check → implementation | Direct plan for small/well-specified work |
 
 ## Decision table
 
@@ -19,7 +19,7 @@ self-contained, no external artifact needed.
    "implement"; no open question to conclude), that is a **prefix mismatch**: flag it in
    the verdict, recommend re-minting as `MOD-N` per `lifecycle.md` P0 (noting "from
    ANA-N", old line dropped — IDs never reused), and route the re-minted item by the
-   table below. Maintainer confirms the re-mint like any other verdict. (Example: an item
+   table below. The run takes the re-mint without asking. (Example: an item
    `ANA-N - Migrate <file> to <module>` is implementation wearing an ANA prefix — re-mint
    as MOD.)
 2. Any other prefix (`MOD`/`NEXT`/`VAL`/`TOOL`/`CLEAN`): evaluate four criteria **from the
@@ -63,21 +63,21 @@ trigger. Phase triggers:
 No phase qualifies → `not needed`. A phase qualifies only when a scripted workflow is
 actually cheaper and safer than driving the same agents by hand — a handful of sequential
 tasks is not a workflow, and orchestration is never permission to skip tests or gates.
-The maintainer's route-accept covers the recommendation; they can strike it ("no
+The accepted verdict covers the recommendation; the maintainer can strike it ("no
 ultracode"), force it ("with ultracode"), or scope it ("ultracode for implement only") on
 any item regardless of triggers.
 
 - `--dry-run`: stop here. Print verdict, nothing executes.
-- Otherwise: **wait for the maintainer.** Accept = proceed. Override = maintainer replies
-  with the path to use (e.g. "route as plan") — the override is taken without argument and
-  noted in the eventual plan/PRD artifact ("routed as X by maintainer override").
+- Otherwise: **do not wait.** The printed path is accepted and execution starts. The maintainer
+  can interrupt with another path (e.g. "route as plan"); that override is taken without
+  argument and noted in the eventual plan/PRD artifact ("routed as X by maintainer override").
 - Low-confidence verdicts (criteria count exactly at threshold, or item text too thin to
-  judge C2/C4) must say so explicitly and lean on the maintainer's call.
+  judge C2/C4) must say so explicitly in `Reasoning`, and the run still proceeds on the best path.
 
 ## Guardrails
 
-- Routing never skips downstream gates: `plan` CONFIRM, PRD open questions, deliberate
-  push policy all remain (maintainer present at every gate, per PRD).
+- Routing never skips the plan fact-check, PRD open questions, the review gate or the
+  deliberate push policy; it has no confirm of its own and the plan has none either.
 - A misroute discovered mid-path is not sunk cost: stop, re-route, keep any artifact that
   is still valid (a PRD produced for what turns out to be a plan-path item is just extra
   context, not waste).
