@@ -2222,6 +2222,7 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
 /// adoption's short-circuit must not skip them). Between the adoption and the claim scan, the
+/// land arm lands this box's pending integration records (MOD-133 D10, [`land`]), then the
 /// queue runner admits this box's queued ready items (MOD-12 D6, [`admit`]).
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
@@ -2273,11 +2274,73 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     {
         adopt(&ctx).await;
     }
+    // MOD-133 D10: unconditionally, for both roles; it builds nothing when nothing is pending.
+    land(&ctx, box_id).await;
     if claims {
         // MOD-12 D6: admission first, under the same guard, so the claim scan below claims and
         // walks what it created; there is no second admission path.
         Box::pin(admit(&ctx, box_id, &settings)).await;
         claim_scan(&ctx, box_id).await;
+    }
+}
+
+/// MOD-133 D10: the sweep's land arm, once per sweep of the box's executing process (I-1 is
+/// `sweep_once`'s early return), for either role. First the cheap step: the box's `pending`
+/// integration records are taken (`take_integrations`) under this process's lease owner, the
+/// same `Uuid` every [`Kit::engine`] is built with (`Kit::owner` is `Shared::owner`), so the
+/// engine's settle is the taker's own, with the TTL the engine's own pass uses
+/// ([`LeaseTimes::from_app`] over the app settings). Only when that answers records is the
+/// `Kit` read and an engine built, which lands them ([`Engine::land_taken`]). A record whose run a
+/// task of this process still walks is left to that walk, which lands it itself right after the
+/// run ends `done` (D9) under the same owner, so the two never push the same record at once.
+/// A failure is logged and never fatal to the sweep: a record taken but not landed stays
+/// `pending`, and its lease lapses for the next sweep (or this owner takes it again).
+async fn land<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>, box_id: BoxId) {
+    let host = &ctx.host;
+    let Some(writer) = host.writer() else {
+        return;
+    };
+    let ttl = match host.app_settings().await {
+        Ok(app) => LeaseTimes::from_app(&app).ttl,
+        Err(err) => {
+            tracing::debug!(%err, "the sweep could not read the lease times to land");
+            return;
+        }
+    };
+    let records = match htui_core::store::WorkerStore::take_integrations(
+        &writer,
+        box_id,
+        ctx.shared.owner,
+        ttl,
+        None,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(err) => {
+            tracing::warn!(%err, "the sweep could not take this box's integration records");
+            return;
+        }
+    };
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|record| !ctx.shared.walks.is_live(record.run_id))
+        .collect();
+    if records.is_empty() {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, host, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%message, "the sweep could not build its engine to land");
+            return;
+        }
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match Box::pin(engine.land_taken(records)).await {
+        Ok(settled) => tracing::debug!(settled, "the sweep landed this box's integration records"),
+        Err(err) => tracing::warn!(%err, "the sweep's land pass failed"),
     }
 }
 
