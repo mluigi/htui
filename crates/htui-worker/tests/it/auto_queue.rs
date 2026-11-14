@@ -204,6 +204,7 @@ async fn mint_in<S: WriteStore>(
             touched_paths: Vec::new(),
             priority,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

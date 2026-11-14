@@ -82,6 +82,7 @@ fn race_item(kind_id: ItemKindId, title: &str) -> NewItem {
         touched_paths: Vec::new(),
         priority: 0,
         step_graph_id: None,
+        target_id: None,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     }
@@ -11673,6 +11674,7 @@ async fn queue_feat<S: htui_core::store::WriteStore>(store: &S, id: ItemId, prio
             touched_paths: Vec::new(),
             priority,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -13714,6 +13716,7 @@ async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         };
@@ -14012,6 +14015,7 @@ async fn queue_item_fills_a_scope_rows_workspace_on_both_stores() {
         touched_paths: Vec::new(),
         priority: 0,
         step_graph_id: None,
+        target_id: None,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     };

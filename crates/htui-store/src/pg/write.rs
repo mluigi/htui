@@ -2773,9 +2773,13 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for an unknown or cross-project kind, for a duplicate `item.id`
-    /// (`23505`) and for a `created_by` that names no `app_user` row (`23503`, which is what the
-    /// nil UUID does).
+    /// MOD-130 M1 D11 (blueprint B3): a target that names no row, or a retired one, is a second
+    /// conjunct of the same guard, so a refused target burns no key number either; the zero-row
+    /// answer reads the kind first, then the target, `MemStore`'s order.
+    ///
+    /// [`StoreError::Constraint`] for an unknown or cross-project kind, for a target that names no
+    /// row or is retired, for a duplicate `item.id` (`23505`) and for a `created_by` that names no
+    /// `app_user` row (`23503`, which is what the nil UUID does).
     async fn mint_item(&self, new: NewItem) -> Result<Item> {
         let minted = sqlx::query_as!(
             Item,
@@ -2783,16 +2787,19 @@ impl WriteStore for PgStore {
             WITH c AS (
                 INSERT INTO item_key_counter (project_id, prefix, last_value)
                 SELECT $2, k.prefix, 1 FROM item_kind k WHERE k.id = $3 AND k.project_id = $2
+                   AND ($12::uuid IS NULL OR EXISTS (
+                           SELECT 1 FROM target t WHERE t.id = $12 AND t.retired_at IS NULL))
                 ON CONFLICT (project_id, prefix)
                 DO UPDATE SET last_value = item_key_counter.last_value + 1
                 RETURNING prefix, last_value
             ), i AS (
                 INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, body,
-                                  priority, required_tags, touched_paths, step_graph_id, created_by)
-                SELECT $1, $2, $3, c.prefix, c.last_value, $4, $5, $6, $7, $8, $9, $10 FROM c
+                                  priority, required_tags, touched_paths, step_graph_id, created_by,
+                                  target_id)
+                SELECT $1, $2, $3, c.prefix, c.last_value, $4, $5, $6, $7, $8, $9, $10, $12 FROM c
                 RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,
-                          priority, required_tags, touched_paths, step_graph_id, version,
-                          created_by, created_at, updated_at, closed_at, resolution
+                          priority, required_tags, touched_paths, step_graph_id, target_id,
+                          version, created_by, created_at, updated_at, closed_at, resolution
             ), r AS (
                 INSERT INTO item_revision (item_id, version, title, body, required_tags,
                                            author_id, box_id, reason)
@@ -2812,6 +2819,7 @@ impl WriteStore for PgStore {
                    i.required_tags AS "required_tags!",
                    i.touched_paths AS "touched_paths!",
                    i.step_graph_id AS "step_graph_id?: htui_core::model::StepGraphId",
+                   i.target_id     AS "target_id?: htui_core::model::TargetId",
                    i.version       AS "version!",
                    i.created_by    AS "created_by!: htui_core::model::UserId",
                    i.created_at    AS "created_at!",
@@ -2831,35 +2839,54 @@ impl WriteStore for PgStore {
             new.step_graph_id.map(|id| id.as_uuid()),
             new.created_by.as_uuid(),
             new.box_id.map(|id| id.as_uuid()),
+            new.target_id.map(|id| id.as_uuid()),
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
 
-        minted
-            .ok_or_else(|| StoreError::Constraint(kind_not_in_project(new.kind_id, new.project_id)))
+        if let Some(item) = minted {
+            return Ok(item);
+        }
+        let kind_held = self
+            .item_kind(new.kind_id)
+            .await?
+            .is_some_and(|kind| kind.project_id == new.project_id);
+        if kind_held
+            && let Some(target) = new.target_id
+            && let Some(refusal) = self.item_target_refusal(target).await?
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        Err(StoreError::Constraint(kind_not_in_project(
+            new.kind_id,
+            new.project_id,
+        )))
     }
 
-    /// Compare-and-set edit over the seven spec columns of ANA-9 §4.2, with `COALESCE` patch
-    /// semantics (ANA-9 §7.2).
+    /// Compare-and-set edit over the eight spec columns of ANA-9 §4.2 (the eighth, `target_id`, is
+    /// MOD-130 M1 D11), with `COALESCE` patch semantics (ANA-9 §7.2).
     ///
     /// `step_graph_id` needs **two** parameters rather than a `COALESCE`: the field is a
     /// double-[`Option`], and `None` ("leave it") and `Some(None)` ("clear the override back to the
     /// kind default") would both arrive as SQL `NULL`. `CASE WHEN $9 THEN $10 END` splits them.
+    /// `target_id` is split the same way, by `$14` and `$15`, and a target that names no row or is
+    /// retired is a second guard beside the kind's (blueprint B3).
     ///
     /// `key_prefix`, `key_number` and `key` are never in the `SET` list, even across a kind change
     /// (§4.1), and `updated_at` is left to the trigger.
     ///
-    /// Zero rows means one of three things, disambiguated by one follow-up read rather than by
-    /// three statements up front: no such item, a lost race, or the kind guard. The version still
-    /// matching after a zero-row compare-and-set can only be the guard, which is also `MemStore`'s
-    /// order of judgements (compare-and-set first, kind check second).
+    /// Zero rows means one of four things, disambiguated by follow-up reads rather than by
+    /// statements up front: no such item, a lost race, the kind guard or the target guard. The
+    /// version still matching after a zero-row compare-and-set can only be a guard, read in
+    /// `MemStore`'s order of judgements (compare-and-set first, kind check second, target third).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] when the item does not exist, or when the ancestor revision a
     /// divergence needs is missing; [`StoreError::Constraint`] when the patched kind belongs to
-    /// another project, or when `author_id` names no `app_user` row.
+    /// another project, when the patched target names no row or is retired, or when `author_id`
+    /// names no `app_user` row.
     async fn update_item(
         &self,
         id: ItemId,
@@ -2878,15 +2905,18 @@ impl WriteStore for PgStore {
                     priority      = COALESCE($7, priority),
                     touched_paths = COALESCE($8, touched_paths),
                     step_graph_id = CASE WHEN $9 THEN $10 ELSE step_graph_id END,
+                    target_id     = CASE WHEN $14 THEN $15 ELSE target_id END,
                     version       = version + 1
                  WHERE id = $1
                    AND version = $2
                    AND ($5::uuid IS NULL OR EXISTS (
                            SELECT 1 FROM item_kind k
                             WHERE k.id = $5 AND k.project_id = item.project_id))
+                   AND ($15::uuid IS NULL OR EXISTS (
+                           SELECT 1 FROM target t WHERE t.id = $15 AND t.retired_at IS NULL))
                 RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,
-                          priority, required_tags, touched_paths, step_graph_id, version,
-                          created_by, created_at, updated_at, closed_at, resolution
+                          priority, required_tags, touched_paths, step_graph_id, target_id,
+                          version, created_by, created_at, updated_at, closed_at, resolution
             ), r AS (
                 INSERT INTO item_revision (item_id, version, title, body, required_tags,
                                            author_id, box_id, reason)
@@ -2906,6 +2936,7 @@ impl WriteStore for PgStore {
                    u.required_tags AS "required_tags!",
                    u.touched_paths AS "touched_paths!",
                    u.step_graph_id AS "step_graph_id?: htui_core::model::StepGraphId",
+                   u.target_id     AS "target_id?: htui_core::model::TargetId",
                    u.version       AS "version!",
                    u.created_by    AS "created_by!: htui_core::model::UserId",
                    u.created_at    AS "created_at!",
@@ -2927,6 +2958,8 @@ impl WriteStore for PgStore {
             patch.author_id.as_uuid(),
             patch.box_id.map(|id| id.as_uuid()),
             patch.reason,
+            patch.target_id.is_some(),
+            patch.target_id.flatten().map(|id| id.as_uuid()),
         )
         .fetch_optional(&self.pool)
         .await
@@ -2943,17 +2976,30 @@ impl WriteStore for PgStore {
             });
         };
         if head.version == expected_version {
-            // The compare-and-set matched, so the only other conjunct of the `WHERE` - the kind
-            // guard - is what refused the row. It cannot have fired without a patched kind, and
-            // `version` never decreases, so the `None` arm is unreachable rather than a second
-            // rule: it is reported as a backend fault instead of being dressed up as a kind error.
-            return Err(match patch.kind_id {
-                Some(kind) => StoreError::Constraint(kind_not_in_project(kind, head.project_id)),
-                None => StoreError::Backend(format!(
-                    "item `{id}` refused a compare-and-set at version {expected_version} that \
-                     matched: no rule of §4.2 can produce this"
-                )),
-            });
+            // The compare-and-set matched, so a guard of the `WHERE` refused the row: the kind's,
+            // read first, then the target's (MOD-130 M1 D11). Neither fires without its patched
+            // field, and `version` never decreases, so a guard that reads clean is reported as a
+            // backend fault instead of being dressed up as a rule.
+            if let Some(kind) = patch.kind_id
+                && self
+                    .item_kind(kind)
+                    .await?
+                    .is_none_or(|row| row.project_id != head.project_id)
+            {
+                return Err(StoreError::Constraint(kind_not_in_project(
+                    kind,
+                    head.project_id,
+                )));
+            }
+            if let Some(Some(target)) = patch.target_id
+                && let Some(refusal) = self.item_target_refusal(target).await?
+            {
+                return Err(StoreError::Constraint(refusal));
+            }
+            return Err(StoreError::Backend(format!(
+                "item `{id}` refused a compare-and-set at version {expected_version} that \
+                 matched: no rule of §4.2 can produce this"
+            )));
         }
 
         let ancestor = self.revision(id, expected_version).await?;
@@ -12361,6 +12407,25 @@ fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> St
         "{entity} {id} is being written to: {DELETE_ATTEMPTS} attempts each found {what} committed \
          after the count, and the delete took nothing"
     )
+}
+
+/// MOD-130 M1 D11 (blueprint B3): the item writers' target refusal, read after their guard fired.
+impl PgStore {
+    /// Why `item.target_id = target` is refused: [`references_no_row`] when no row has that id,
+    /// [`target_retired`] when the row is retired, and `None` when the row is live.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn item_target_refusal(&self, target: TargetId) -> Result<Option<String>> {
+        match self.target(target).await {
+            Ok(row) => Ok(row.retired_at.map(|_| target_retired(&row.name))),
+            Err(StoreError::NotFound { .. }) => {
+                Ok(Some(references_no_row("item.target_id", target, "target")))
+            }
+            Err(other) => Err(other),
+        }
+    }
 }
 
 /// MOD-158 D1: the database-wide Qdrant URL's writes, inherent like [`PgStore::app_settings`] and

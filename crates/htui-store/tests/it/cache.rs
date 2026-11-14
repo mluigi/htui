@@ -782,6 +782,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -830,6 +831,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -2590,6 +2592,7 @@ async fn the_mirror_counts_the_scope_row_in_upstream_scope() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -3976,6 +3979,7 @@ async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

@@ -103,6 +103,7 @@ async fn the_worker_job_indexes_a_new_item() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

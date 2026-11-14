@@ -342,6 +342,7 @@ mod tests {
             required_tags: Vec::new(),
             touched_paths: Vec::new(),
             step_graph_id: None,
+            target_id: None,
             version: 1,
             created_by: UserId::default(),
             created_at: at(),

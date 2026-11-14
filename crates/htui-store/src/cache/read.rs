@@ -178,6 +178,8 @@ fn item_of(row: &SqliteRow) -> Result<Item> {
             "item.step_graph_id",
             opt_text(row, "step_graph_id")?.as_deref(),
         )?,
+        // MOD-130 M1 T5 reads the mirror
+        target_id: None,
         version: get(row, "version")?,
         created_by: uuid_col::<UserId>("item.created_by", &text(row, "created_by")?)?,
         created_at: ts_col("item.created_at", get(row, "created_at")?)?,

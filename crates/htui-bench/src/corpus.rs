@@ -495,6 +495,7 @@ impl Rows {
             required_tags: Vec::new(),
             touched_paths: Vec::new(),
             step_graph_id: None,
+            target_id: None,
             version: 1,
             created_by: self.user,
             created_at: self.time,

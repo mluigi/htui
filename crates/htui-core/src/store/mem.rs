@@ -2455,6 +2455,9 @@ impl State {
                 kind.prefix, kind.project_id, new.project_id
             )));
         }
+        // MOD-130 M1 D11: after the kind, before the id and the author, as `PgStore`'s guard
+        // (folded into the counter CTE) refuses before its insert can.
+        item_target_refusal(&self.targets, new.target_id)?;
         if self.items.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
                 "item `{}` already exists",
@@ -2463,7 +2466,6 @@ impl State {
         }
         // Before the counter moves: a §4.1 key number a refused mint consumed is never given back.
         require_author(new.created_by, "item.created_by")?;
-        item_target_refusal(&self.targets, new.target_id)?;
 
         let prefix = kind.prefix.clone();
         let counter = self

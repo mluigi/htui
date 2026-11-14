@@ -24,7 +24,7 @@ use core::cell::Cell;
 
 use htui_core::model::item_merge::{self, FieldState, Side, SpecField, SpecMerge};
 use htui_core::model::item_spec;
-use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId};
+use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId, TargetId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -418,6 +418,20 @@ fn pane_diffs(merge: &SpecMerge, pane: DiffPane, ancestor: i32, head: i32) -> (S
     )
 }
 
+/// MOD-130 M1 D11: the Target row's words, `inherit` for `None`, otherwise the id's first eight
+/// hex digits. The form's catalogue holds no targets in M1 (D16); MOD-119 replaces this with the
+/// target's name.
+fn target_text(id: Option<TargetId>) -> String {
+    id.map_or_else(
+        || "inherit".to_owned(),
+        |id| {
+            let mut hex = id.as_uuid().simple().to_string();
+            hex.truncate(8);
+            hex
+        },
+    )
+}
+
 /// The two catalogues a kind or graph label is read through: the reply's fresh one first (D7),
 /// then the form's own.
 struct Labels<'a> {
@@ -435,6 +449,7 @@ impl Labels<'_> {
             SpecField::Tags if spec.required_tags.is_empty() => "(none)".to_owned(),
             SpecField::Tags => item_spec::tags_text(&spec.required_tags),
             SpecField::Graph => self.graph(spec.step_graph_id),
+            SpecField::Target => target_text(spec.target_id),
             SpecField::Paths => count(spec.touched_paths.len(), "path"),
             SpecField::Body => count(spec.body.lines().count(), "line"),
         }
@@ -664,7 +679,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        EditReason, GraphScope, ItemPatch, NewStepGraph, SpecChanges, WorkspaceProject,
+        EditReason, GraphScope, ItemPatch, NewStepGraph, NewTarget, SpecChanges, TargetKind,
+        WorkspaceProject,
     };
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
@@ -870,6 +886,44 @@ mod tests {
         assert_eq!(row(SpecField::Graph).ancestor, "kind default");
         assert_eq!(row(SpecField::Graph).mine, "kind default");
         assert_eq!(row(SpecField::Graph).theirs, graph.name);
+    }
+
+    /// MOD-130 M1 D11: the Target row reads `inherit` for `None` and the first eight hex digits
+    /// of the id otherwise (MOD-119 names it).
+    #[tokio::test]
+    async fn a_target_row_reads_inherit_or_the_short_id() {
+        let store = MemStore::demo();
+        let theirs = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: "builder".to_owned(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("a target")
+            .id;
+        let mine = TargetId::new();
+        let (context, divergence) = diverged(&store, |_| ItemPatch {
+            target_id: Some(Some(theirs)),
+            ..patch()
+        })
+        .await;
+        let ancestor = context.item.clone().expect("an edit context");
+        let mut spec = ItemSpec::of(&ancestor);
+        spec.target_id = Some(mine);
+        let view = Divergence::open(&ancestor, &context, spec, &divergence);
+        let row = view
+            .rows()
+            .iter()
+            .find(|row| row.field == SpecField::Target)
+            .expect("a Target row");
+        let short = |id: TargetId| id.as_uuid().simple().to_string()[..8].to_owned();
+        assert_eq!(row.state, FieldState::Conflict);
+        assert_eq!(row.ancestor, "inherit");
+        assert_eq!(row.theirs, short(theirs));
+        assert_eq!(row.mine, short(mine));
+        assert_eq!(row.theirs.len(), 8, "eight hex digits");
     }
 
     /// A workspace graph `wsflow` of the demo's platform workspace, which holds htui.
