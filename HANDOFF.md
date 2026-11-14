@@ -537,6 +537,17 @@ items it follows are done.
   missing one (D3, edge 9); the Postgres kind refusal sentence may name the other rule under a concurrent write
   (D5); waiting read cost was MOD-170 (done, `docs/decisions/mod/mod-170.md`). Plan `.claude/plans/mod-147-m2-keys-and-links.plan.md`. Owed on the host:
   merged-tree Postgres gate, live-Qdrant suites.
+  **Milestone 3 landed (hr/MOD-147, `0dc19385..00c7c66b`, 2026-11-13):** the Backlog lists the scope row's items
+  as a first group titled with the workspace (`StoreReply::Items { scope_row }`, drawn even when empty), `N` on it
+  creates a `WS` item, and the waiting overlay reveals workspace items instead of M2's notice; a failed scope-row
+  lookup falls back to the members-only list. Settings › Hierarchy `o` opens an owner documents pane on a project
+  or workspace row (`owner_documents.rs`, `StoreRequest::OwnerDocuments`/`WriteOwnerDocument`, context
+  `settings.documents`): list per version, view, new document or version through `$EDITOR` (Settings forwards
+  `on_external_edit`), `goals` listed first on a workspace; a refused or ambiguous write keeps the draft. Settings ›
+  Secrets has a workspace row binding the scope row's secret scope; the workspace row and editor show the folder
+  on this box (`dirs::home_dir()`, `~/workspaces/<slug> (default)`). Review R1 fixed the folder home source, the
+  draft keeping and four test gaps. Plan `.claude/plans/mod-147-m3-tui-surfaces.plan.md`. Owed on the host:
+  merged-tree Postgres gate, live-Qdrant suites.
 - [ ] **MOD-148 - Per-type seeds and the type picker** (from ANA-35, `docs/ANA-35.md` §7.4, §7.2).
   `R-ENT-3`, `R-ENT-6`, `R-ORCH-8`, `R-TUI-8`. Per-type kinds, graphs, phases, `needs_repo`, default
   isolation (`settings.default_isolation`: `worktree` for software, `local` otherwise) and templates,
