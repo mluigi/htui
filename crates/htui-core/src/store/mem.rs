@@ -120,6 +120,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{run_workspace_for, scope_row_run_workspace, workspace_prefix_taken};
 use crate::store::worker_log::WorkerLogStore;
+use crate::store::{requirement_child_area, requirement_refines_outside_reach};
 use uuid::Uuid;
 
 /// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
@@ -389,6 +390,8 @@ struct State {
     requirement_areas: HashMap<RequirementAreaId, RequirementArea>,
     /// `requirement_key_counter`: the highest number minted per area (MOD-38 plan D8).
     requirement_key_counter: HashMap<RequirementAreaId, i32>,
+    /// `requirement_child_counter`: the highest `child_number` minted per parent (MOD-149 D5).
+    requirement_child_counter: HashMap<RequirementId, i32>,
     /// `requirement`.
     requirements: HashMap<RequirementId, Requirement>,
     /// `requirement_revision`, append-only.
@@ -530,6 +533,7 @@ impl MemStore {
                 .map(|row| (row.id, row))
                 .collect(),
             requirement_key_counter: data.requirement_key_counter,
+            requirement_child_counter: HashMap::new(),
             requirements: data
                 .requirements
                 .into_iter()
@@ -5949,6 +5953,12 @@ impl State {
                     .filter(|area| requirement_areas.contains(area))
                     .count(),
             ),
+            requirement_child_counters: rows(
+                self.requirement_child_counter
+                    .keys()
+                    .filter(|parent| requirements.contains(parent))
+                    .count(),
+            ),
             requirements: rows(requirements.len()),
             requirement_revisions: rows(
                 self.requirement_revisions
@@ -6223,6 +6233,19 @@ impl State {
         }
         self.requirements
             .retain(|id, _| !gone.requirements.contains(id));
+        // MOD-149 D9: a surviving refinement of a gone requirement (a member project's, when a
+        // workspace's scope row goes) loses the pointer (`refines_id ... ON DELETE SET NULL`,
+        // whose UPDATE fires `trg_requirement_updated_at`) and keeps its key and number. A nested
+        // child is always in its parent's project, so it is gone with it.
+        for row in self.requirements.values_mut().filter(|row| {
+            row.refines_id
+                .is_some_and(|parent| gone.requirements.contains(&parent))
+        }) {
+            row.refines_id = None;
+            row.updated_at = now;
+        }
+        self.requirement_child_counter
+            .retain(|parent, _| !gone.requirements.contains(parent));
         self.requirement_key_counter
             .retain(|area, _| !gone.requirement_areas.contains(area));
         self.requirement_areas
@@ -8871,7 +8894,23 @@ impl State {
         true
     }
 
-    /// A project's matching requirements in `(area_code, number)` order.
+    /// MOD-149 D4's cross-owner reach: `child` is a plain project, and `parent` is the scope row
+    /// of a workspace `child` is a member of. A scope row reaches only itself (the nested case).
+    fn refinement_reaches(&self, parent: ProjectId, child: ProjectId) -> bool {
+        let is_scope_row = |id: ProjectId| {
+            self.projects
+                .get(&id)
+                .and_then(|row| row.owner_workspace_id)
+        };
+        is_scope_row(child).is_none()
+            && is_scope_row(parent).is_some_and(|workspace| {
+                self.workspace_projects
+                    .iter()
+                    .any(|link| link.workspace_id == workspace && link.project_id == child)
+            })
+    }
+
+    /// A project's matching requirements in MOD-149 D6's list order ([`Requirement::list_cmp`]).
     fn requirement_rows(&self, project: ProjectId, filter: &RequirementFilter) -> Vec<Requirement> {
         let mut rows: Vec<Requirement> = self
             .requirements
@@ -8879,11 +8918,19 @@ impl State {
             .filter(|row| row.project_id == project && Self::requirement_matches(row, filter))
             .cloned()
             .collect();
-        rows.sort_by(|left, right| {
-            left.area_code
-                .cmp(&right.area_code)
-                .then_with(|| left.number.cmp(&right.number))
-        });
+        rows.sort_by(Requirement::list_cmp);
+        rows
+    }
+
+    /// Every requirement refining `id`, from any project, in list order then `id` (MOD-149 D7).
+    fn refinement_rows(&self, id: RequirementId) -> Vec<Requirement> {
+        let mut rows: Vec<Requirement> = self
+            .requirements
+            .values()
+            .filter(|row| row.refines_id == Some(id))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| left.list_cmp(right).then_with(|| left.id.cmp(&right.id)));
         rows
     }
 
@@ -8899,8 +8946,8 @@ impl State {
         rows
     }
 
-    /// An item's live citations, each joined to its requirement as it is now, in
-    /// `(area_code, number, kind)` order.
+    /// An item's live citations, each joined to its requirement as it is now, in the
+    /// requirement's list order ([`Requirement::list_cmp`]), then `kind`.
     fn item_citations(&self, item: ItemId) -> Vec<ItemCitation> {
         let mut rows: Vec<ItemCitation> = self
             .item_requirements
@@ -8919,9 +8966,7 @@ impl State {
             .collect();
         rows.sort_by(|left, right| {
             left.requirement
-                .area_code
-                .cmp(&right.requirement.area_code)
-                .then_with(|| left.requirement.number.cmp(&right.requirement.number))
+                .list_cmp(&right.requirement)
                 .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
         });
         rows
@@ -9066,7 +9111,9 @@ impl State {
     }
 
     /// Mints a requirement: counter upsert, key assembly and revision 1 in one lock (plan D8), as
-    /// [`State::mint`] does for an item. Every refusal runs before the counter moves.
+    /// [`State::mint`] does for an item. Every refusal runs before a counter moves, in MOD-149
+    /// D4's order: the area, then the refined parent (found, in reach, same area when nested, not
+    /// withdrawn), then the row's own references.
     fn mint_requirement(
         &mut self,
         area: RequirementAreaId,
@@ -9080,6 +9127,37 @@ impl State {
                 entity: "requirement_area",
                 id: area.to_string(),
             })?;
+        let project_id = area_row.project_id;
+        let area_code = area_row.code.clone();
+        // `Some(parent key)` nests the row under its parent; `None` keeps it top-level.
+        let nested_under = match new.refines_id {
+            None => None,
+            Some(parent_id) => {
+                let parent =
+                    self.requirements
+                        .get(&parent_id)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "requirement",
+                            id: parent_id.to_string(),
+                        })?;
+                let nested = parent.project_id == project_id;
+                if !nested && !self.refinement_reaches(parent.project_id, project_id) {
+                    return Err(StoreError::Constraint(requirement_refines_outside_reach(
+                        &parent.key,
+                    )));
+                }
+                if nested && parent.area_id != area {
+                    return Err(StoreError::Constraint(requirement_child_area(
+                        &parent.key,
+                        &parent.area_code,
+                    )));
+                }
+                if parent.state == RequirementState::Withdrawn {
+                    return Err(StoreError::Constraint(requirement_withdrawn(&parent.key)));
+                }
+                nested.then(|| parent.key.clone())
+            }
+        };
         if self.requirements.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists(
                 "requirement",
@@ -9089,19 +9167,42 @@ impl State {
         self.require_user(new.created_by, "requirement.created_by")?;
         self.require_revision_box(new.box_id)?;
 
-        let project_id = area_row.project_id;
-        let area_code = area_row.code.clone();
-        let counter = self.requirement_key_counter.entry(area).or_insert(0);
-        *counter += 1;
-        let number = *counter;
+        let (number, child_number, key) = match (nested_under, new.refines_id) {
+            (Some(parent_key), Some(parent_id)) => {
+                let counter = self.requirement_child_counter.entry(parent_id).or_insert(0);
+                *counter += 1;
+                let child = *counter;
+                (
+                    None,
+                    Some(child),
+                    Requirement::child_key(&parent_key, child),
+                )
+            }
+            _ => {
+                let scope_row = self
+                    .projects
+                    .get(&project_id)
+                    .is_some_and(|row| row.owner_workspace_id.is_some());
+                let counter = self.requirement_key_counter.entry(area).or_insert(0);
+                *counter += 1;
+                let number = *counter;
+                (
+                    Some(number),
+                    None,
+                    Requirement::top_level_key(scope_row, &area_code, number),
+                )
+            }
+        };
 
         let row = Requirement {
             id: new.id,
             project_id,
             area_id: area,
-            key: format!("R-{area_code}-{number}"),
+            key,
             area_code,
             number,
+            refines_id: new.refines_id,
+            child_number,
             body: new.body,
             rationale: new.rationale,
             priority: new.priority,
@@ -11017,6 +11118,10 @@ impl ReadStore for MemStore {
 
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
         Ok(self.read(|state| state.coverage_rows(requirement)))
+    }
+
+    async fn requirement_refinements(&self, id: RequirementId) -> Result<Vec<Requirement>> {
+        Ok(self.read(|state| state.refinement_rows(id)))
     }
 
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
@@ -15489,6 +15594,7 @@ mod tests {
                     priority: Priority::Must,
                     created_by: ids::USER,
                     box_id: None,
+                    refines_id: None,
                 },
             )
             .await
@@ -15577,6 +15683,7 @@ mod tests {
                     priority: Priority::Must,
                     created_by: ids::USER,
                     box_id: None,
+                    refines_id: None,
                 },
             )
             .await

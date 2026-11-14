@@ -276,8 +276,7 @@ pub fn htui_filter(
         .iter()
         .filter(|requirement| has(&requirement.key) || has(&requirement.body))
         .collect();
-    found_requirements
-        .sort_by(|a, b| by_bytes_then_number(&a.area_code, a.number, &b.area_code, b.number));
+    found_requirements.sort_by(|a, b| a.list_cmp(b));
 
     found_items
         .into_iter()
@@ -358,8 +357,10 @@ mod tests {
             project_id: ProjectId::default(),
             area_id: RequirementAreaId::default(),
             area_code: area.to_owned(),
-            number,
+            number: Some(number),
             key: format!("R-{area}-{number}"),
+            refines_id: None,
+            child_number: None,
             body: body.to_owned(),
             rationale: String::new(),
             priority: Priority::Must,

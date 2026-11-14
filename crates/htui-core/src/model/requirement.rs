@@ -1,12 +1,14 @@
 //! Requirements, their areas, the spec header and citations (`docs/ANA-11.md` §4, §5).
 
+use std::cmp::Ordering;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{
     BoxId, ItemId, ProjectId, RequirementAreaId, RequirementId, StepId, UserId,
 };
-use crate::model::item::{ItemSummary, Resolution};
+use crate::model::item::{ItemSummary, Resolution, Status};
 use crate::model::kind::ItemKind;
 
 str_enum!(
@@ -113,10 +115,18 @@ pub struct Requirement {
     pub area_id: RequirementAreaId,
     /// `requirement.area_code`, copied at mint.
     pub area_code: String,
-    /// `requirement.number`, per area, never reused.
-    pub number: i32,
-    /// `requirement.key`, generated: `R-<area_code>-<number>`.
+    /// `requirement.number`, per area, never reused; `None` on a nested child (MOD-149), which
+    /// takes [`child_number`](Self::child_number) instead.
+    pub number: Option<i32>,
+    /// `requirement.key`, stored at mint (MOD-149 D2): [`Requirement::top_level_key`] for a
+    /// top-level row, [`Requirement::child_key`] for a nested one.
     pub key: String,
+    /// `requirement.refines_id`: the requirement this one refines (MOD-149), nested under it or
+    /// across owners; `None` on a plain top-level row, and after the parent is deleted.
+    pub refines_id: Option<RequirementId>,
+    /// `requirement.child_number`: the `.n` of a nested child, per parent, never reused; `None`
+    /// on a top-level row.
+    pub child_number: Option<i32>,
     /// `requirement.body`.
     pub body: String,
     /// `requirement.rationale`.
@@ -141,6 +151,142 @@ impl Requirement {
     pub const fn makes_suspect(&self, stamp: i32) -> bool {
         self.version > stamp
     }
+
+    /// MOD-149 D2: a top-level key, `W-` in a workspace's scope row, `R-` in a project.
+    #[must_use]
+    pub fn top_level_key(scope_row: bool, area_code: &str, number: i32) -> String {
+        let letter = if scope_row { 'W' } else { 'R' };
+        format!("{letter}-{area_code}-{number}")
+    }
+
+    /// MOD-149 D2: a nested child's key, `{parent_key}.{child_number}`, at any depth.
+    #[must_use]
+    pub fn child_key(parent_key: &str, child_number: i32) -> String {
+        format!("{parent_key}.{child_number}")
+    }
+
+    /// The `chk_requirement_key_shape` CHECK,
+    /// `^[RW]-[A-Z][A-Z0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*$`, without a regex.
+    #[must_use]
+    pub fn key_is_valid(key: &str) -> bool {
+        let Some(rest) = key.strip_prefix("R-").or_else(|| key.strip_prefix("W-")) else {
+            return false;
+        };
+        let Some((code, path)) = rest.split_once('-') else {
+            return false;
+        };
+        let mut code_bytes = code.bytes();
+        let code_ok = code_bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+            && code_bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        code_ok
+            && path.split('.').all(|part| {
+                let mut digits = part.bytes();
+                digits.next().is_some_and(|b| matches!(b, b'1'..=b'9'))
+                    && digits.all(|b| b.is_ascii_digit())
+            })
+    }
+
+    /// The numbers of the key after its last `-`, split on `.`: `[1, 2]` for `R-ENT-1.2`. A part
+    /// that does not parse reads as `i32::MAX`, which a stored key (the CHECK) never holds.
+    #[must_use]
+    pub fn key_path(&self) -> Vec<i32> {
+        self.key_parts().collect()
+    }
+
+    /// [`key_path`](Self::key_path), lazily: what [`list_cmp`](Self::list_cmp) compares, so a
+    /// sort allocates nothing.
+    fn key_parts(&self) -> impl Iterator<Item = i32> + '_ {
+        self.key
+            .rsplit_once('-')
+            .map_or("", |(_, path)| path)
+            .split('.')
+            .map(|part| part.parse().unwrap_or(i32::MAX))
+    }
+
+    /// MOD-149 D6: the list order, `(area_code bytes, key_path, key bytes)`, so a child follows
+    /// its parent and `R-ENT-10` follows `R-ENT-9`. The paths compare part by part as they parse.
+    #[must_use]
+    pub fn list_cmp(&self, other: &Self) -> Ordering {
+        self.area_code
+            .cmp(&other.area_code)
+            .then_with(|| self.key_parts().cmp(other.key_parts()))
+            .then_with(|| self.key.cmp(&other.key))
+    }
+
+    /// Nested under another requirement (MOD-149): it has a `child_number`.
+    #[must_use]
+    pub const fn is_nested(&self) -> bool {
+        self.child_number.is_some()
+    }
+}
+
+/// A requirement's coverage (MOD-149 D8), derived on read, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageState {
+    /// Neither of the others: no live `addresses` citation, or only ones whose items closed as
+    /// neither `done` nor `concluded` (`rejected`, `duplicate`, …), which count as nothing. A
+    /// split requirement whose every live refinement is `Open`.
+    Open,
+    /// Not covered, but a live `addresses` citation's item is open or blocked, or closed `done` /
+    /// `concluded` at an older version (the citation is suspect). A split requirement with a
+    /// live refinement `Covered` or `InProgress` and not every one `Covered`.
+    InProgress,
+    /// A live, non-suspect `addresses` citation's item is closed `done` or `concluded`. A split
+    /// requirement whose every live refinement is `Covered`.
+    Covered,
+}
+
+impl CoverageState {
+    /// The leaf rule: `Covered` when a live `addresses` citation is not suspect and its item is
+    /// closed as `done` or `concluded`; else `InProgress` when an `addresses` citation's item is
+    /// still open or blocked, or finished it at an older version (suspect); else `Open`. An item
+    /// closed any other way (`rejected`, `withdrawn`, …) gave the work up, and other kinds never
+    /// count.
+    #[must_use]
+    pub fn of_citations(rows: &[CoverageRow]) -> Self {
+        let addresses = || {
+            rows.iter()
+                .filter(|row| row.kind == CitationKind::Addresses)
+        };
+        let finished = |row: &CoverageRow| {
+            row.item.status == Status::Closed
+                && matches!(
+                    row.resolution,
+                    Some(Resolution::Done | Resolution::Concluded)
+                )
+        };
+        if addresses().any(|row| !row.suspect && finished(row)) {
+            Self::Covered
+        } else if addresses().any(|row| row.item.status != Status::Closed || finished(row)) {
+            Self::InProgress
+        } else {
+            Self::Open
+        }
+    }
+
+    /// The split rule: `None` with no children; `Covered` when every child is; `InProgress`
+    /// when any is covered or in progress; else `Open`.
+    #[must_use]
+    pub fn of_splits(children: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut any = false;
+        let mut all_covered = true;
+        let mut any_started = false;
+        for child in children {
+            any = true;
+            all_covered &= child == Self::Covered;
+            any_started |= child != Self::Open;
+        }
+        if !any {
+            None
+        } else if all_covered {
+            Some(Self::Covered)
+        } else if any_started {
+            Some(Self::InProgress)
+        } else {
+            Some(Self::Open)
+        }
+    }
 }
 
 /// Arguments of [`WriteStore::mint_requirement`](crate::store::WriteStore::mint_requirement).
@@ -159,6 +305,10 @@ pub struct NewRequirement {
     pub created_by: UserId,
     /// `box_id` of revision 1.
     pub box_id: Option<BoxId>,
+    /// `requirement.refines_id` (MOD-149 D4): `Some` nests the new row under that requirement
+    /// when it is in the same project (the area must then be the parent's), or refines it across
+    /// owners when it is a workspace requirement the project's workspace holds.
+    pub refines_id: Option<RequirementId>,
 }
 
 /// The edit of [`WriteStore::amend_requirement`](crate::store::WriteStore::amend_requirement):
@@ -288,4 +438,198 @@ pub enum RequirementUpdate {
         /// The revision at the version the caller edited from.
         ancestor: RequirementRevision,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ids::ItemKindId;
+
+    fn requirement(key: &str) -> Requirement {
+        let (area_code, path) = key[2..].split_once('-').expect("a key has an area code");
+        let nested = path.contains('.');
+        Requirement {
+            id: RequirementId::new(),
+            project_id: ProjectId::new(),
+            area_id: RequirementAreaId::new(),
+            area_code: area_code.to_owned(),
+            number: (!nested).then(|| path.parse().expect("a top-level number")),
+            key: key.to_owned(),
+            refines_id: None,
+            child_number: nested.then(|| {
+                path.rsplit('.')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .expect("a child number")
+            }),
+            body: String::new(),
+            rationale: String::new(),
+            priority: Priority::Must,
+            state: RequirementState::Active,
+            version: 1,
+            created_by: UserId::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn row(
+        kind: CitationKind,
+        status: Status,
+        resolution: Option<Resolution>,
+        suspect: bool,
+    ) -> CoverageRow {
+        CoverageRow {
+            item: ItemSummary {
+                id: ItemId::new(),
+                project_id: ProjectId::new(),
+                kind_id: ItemKindId::new(),
+                key: "MOD-1".to_owned(),
+                key_prefix: "MOD".to_owned(),
+                key_number: 1,
+                title: String::new(),
+                status,
+                priority: 0,
+                required_tags: Vec::new(),
+                updated_at: Utc::now(),
+                touched_paths: Vec::new(),
+                latest_run_status: None,
+            },
+            kind,
+            resolution,
+            requirement_version: 1,
+            suspect,
+        }
+    }
+
+    #[test]
+    fn keys_follow_the_owner_and_nest() {
+        assert_eq!(Requirement::top_level_key(false, "ENT", 3), "R-ENT-3");
+        assert_eq!(Requirement::top_level_key(true, "ORCH", 1), "W-ORCH-1");
+        assert_eq!(Requirement::child_key("W-ORCH-1", 2), "W-ORCH-1.2");
+        assert_eq!(Requirement::child_key("R-ENT-1.1", 1), "R-ENT-1.1.1");
+    }
+
+    #[test]
+    fn key_is_valid_mirrors_the_check() {
+        for key in ["R-ENT-1", "W-A1-10.2.3", "R-E-1", "W-ORCH-1.1.1"] {
+            assert!(Requirement::key_is_valid(key), "{key} is valid");
+        }
+        for key in [
+            "X-ENT-1",
+            "R-ent-1",
+            "R-ENT-0",
+            "R-ENT-1.0",
+            "R-ENT-1.",
+            "R-ENT-01",
+            "R-1E-1",
+            "R--1",
+            "R-ENT-",
+            "R-ENT",
+            "R-ENT-1..2",
+            "R-ENT-1a",
+            "",
+        ] {
+            assert!(!Requirement::key_is_valid(key), "{key} is refused");
+        }
+    }
+
+    #[test]
+    fn list_cmp_orders_children_under_their_parent() {
+        let sorted = ["R-ENT-1", "R-ENT-1.1", "R-ENT-1.2", "R-ENT-2", "R-ENT-10"];
+        for pair in sorted.windows(2) {
+            assert_eq!(
+                requirement(pair[0]).list_cmp(&requirement(pair[1])),
+                Ordering::Less,
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            requirement("R-ENT-1.10").list_cmp(&requirement("R-ENT-1.9")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            requirement("R-ENT-9").list_cmp(&requirement("R-STO-1")),
+            Ordering::Less,
+            "the area decides first"
+        );
+        assert_eq!(requirement("R-ENT-1.2").key_path(), vec![1, 2]);
+        assert!(requirement("R-ENT-1.2").is_nested());
+        assert!(!requirement("R-ENT-1").is_nested());
+    }
+
+    #[test]
+    fn leaf_coverage_reads_addresses() {
+        use CitationKind::{Addresses, Reserves};
+        assert_eq!(CoverageState::of_citations(&[]), CoverageState::Open);
+        assert_eq!(
+            CoverageState::of_citations(&[row(Addresses, Status::Open, None, false)]),
+            CoverageState::InProgress
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(
+                Addresses,
+                Status::Closed,
+                Some(Resolution::Done),
+                false
+            )]),
+            CoverageState::Covered
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(
+                Addresses,
+                Status::Closed,
+                Some(Resolution::Concluded),
+                false
+            )]),
+            CoverageState::Covered
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(
+                Addresses,
+                Status::Closed,
+                Some(Resolution::Rejected),
+                false
+            )]),
+            CoverageState::Open,
+            "an item closed as rejected gave the work up"
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(Addresses, Status::Blocked, None, false)]),
+            CoverageState::InProgress
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(
+                Addresses,
+                Status::Closed,
+                Some(Resolution::Done),
+                true
+            )]),
+            CoverageState::InProgress
+        );
+        assert_eq!(
+            CoverageState::of_citations(&[row(
+                Reserves,
+                Status::Closed,
+                Some(Resolution::Done),
+                false
+            )]),
+            CoverageState::Open
+        );
+    }
+
+    #[test]
+    fn split_coverage_is_all_any_or_open() {
+        use CoverageState::{Covered, InProgress, Open};
+        assert_eq!(CoverageState::of_splits([]), None);
+        assert_eq!(CoverageState::of_splits([Covered, Covered]), Some(Covered));
+        assert_eq!(CoverageState::of_splits([Covered, Open]), Some(InProgress));
+        assert_eq!(
+            CoverageState::of_splits([InProgress, Open]),
+            Some(InProgress)
+        );
+        assert_eq!(CoverageState::of_splits([Open, Open]), Some(Open));
+    }
 }

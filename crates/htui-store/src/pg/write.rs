@@ -84,7 +84,8 @@ use htui_core::store::{
     item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal,
     not_a_fanout_candidate, not_a_terminal_status, persona_is_bound, persona_patch_refusal,
     phase_name_refusal, prompt_template_key, prompt_template_refusal, queue_target_refusal,
-    queue_token_refusal, references_no_row, requirement_withdrawn, resolution_not_closable,
+    queue_token_refusal, references_no_row, requirement_child_area,
+    requirement_refines_outside_reach, requirement_withdrawn, resolution_not_closable,
     row_names_another_phase, row_names_another_step, run_is_terminal, run_step_refusal,
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_is_not_promotable,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
@@ -1227,6 +1228,8 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                (SELECT count(*) FROM ra)                                      AS "requirement_areas!",
                (SELECT count(*) FROM requirement_key_counter
                  WHERE area_id IN (SELECT id FROM ra))                        AS "requirement_key_counters!",
+               (SELECT count(*) FROM requirement_child_counter
+                 WHERE parent_id IN (SELECT id FROM rq))                      AS "requirement_child_counters!",
                (SELECT count(*) FROM rq)                                      AS "requirements!",
                (SELECT count(*) FROM requirement_revision
                  WHERE requirement_id IN (SELECT id FROM rq))                 AS "requirement_revisions!",
@@ -1273,6 +1276,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         requirement_specs: rows(row.requirement_specs),
         requirement_areas: rows(row.requirement_areas),
         requirement_key_counters: rows(row.requirement_key_counters),
+        requirement_child_counters: rows(row.requirement_child_counters),
         requirements: rows(row.requirements),
         requirement_revisions: rows(row.requirement_revisions),
         item_requirements: rows(row.item_requirements),
@@ -1803,6 +1807,8 @@ async fn revise_requirement(
                area_code,
                number,
                key        AS "key!",
+               refines_id AS "refines_id: RequirementId",
+               child_number,
                body,
                rationale,
                priority   AS "priority: Priority",
@@ -1869,8 +1875,9 @@ async fn revise_requirement(
                 state     = COALESCE($5, state),
                 version   = version + 1
              WHERE id = $1
-            RETURNING id, project_id, area_id, area_code, number, key, body, rationale, priority,
-                      state, version, created_by, created_at, updated_at
+            RETURNING id, project_id, area_id, area_code, number, key, refines_id, child_number,
+                      body, rationale, priority, state, version, created_by, created_at,
+                      updated_at
         ), v AS (
             INSERT INTO requirement_revision (requirement_id, version, body, rationale, priority,
                                               state, author_id, box_id, reason,
@@ -1888,8 +1895,10 @@ async fn revise_requirement(
                u.project_id AS "project_id!: ProjectId",
                u.area_id    AS "area_id!: RequirementAreaId",
                u.area_code  AS "area_code!",
-               u.number     AS "number!",
-               u.key        AS "key!",
+               u.number       AS "number?",
+               u.key          AS "key!",
+               u.refines_id   AS "refines_id?: RequirementId",
+               u.child_number AS "child_number?",
                u.body       AS "body!",
                u.rationale  AS "rationale!",
                u.priority   AS "priority!: Priority",
@@ -10133,80 +10142,209 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// Mints a requirement: counter upsert, row insert and revision 1 in one statement, the
-    /// shape of [`mint_item`](WriteStore::mint_item) (plan D8).
+    /// Mints a requirement: the refusals, the counter upsert, the row and revision 1 in one
+    /// transaction (MOD-149 D5; MOD-38 plan D8's single statement before it).
     ///
-    /// `a` is the area row, and every later CTE selects from it, so an unknown area makes the
-    /// whole statement insert nothing and return zero rows - which is exactly the `NotFound`.
-    /// A refusal inside the statement (`23503` on `created_by` / `box_id`, `23505` on the id)
-    /// rolls the counter upsert back with it, so no number is burned. The project, the code and
-    /// the number all come from the area and its counter, never from the caller.
+    /// Every refusal is decided before a counter moves, in MOD-149 D4's order: the area (joined
+    /// to its project, which says whether the key is `W-`), then with `refines_id` the parent
+    /// (found; in reach, nested in its own project or across owners from a workspace's scope row
+    /// the project is a member of; in its own area when nested; not withdrawn). The parent is
+    /// read `FOR SHARE`, so a withdraw cannot slip between that check and the insert. A nested
+    /// row takes its `child_number` from `requirement_child_counter` and no `number`; any other
+    /// takes its `number` from `requirement_key_counter`. The key is assembled here with
+    /// [`Requirement::top_level_key`] / [`Requirement::child_key`] and written explicitly.
+    ///
+    /// A refusal from an insert (`23503` on `created_by` / `box_id`, `23505` on the id) drops the
+    /// transaction, counter upsert included, so no number is burned.
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "requirement_area" }` for an unknown area;
-    /// [`StoreError::Constraint`] for a duplicate id or a `created_by` / `box_id` that names no
-    /// row.
+    /// [`StoreError::NotFound`] `{ entity: "requirement_area" }` for an unknown area and
+    /// `{ entity: "requirement" }` for an unknown parent; [`StoreError::Constraint`] for a parent
+    /// out of reach ([`requirement_refines_outside_reach`]), a nested child in another area
+    /// ([`requirement_child_area`]), a withdrawn parent ([`requirement_withdrawn`]), a duplicate
+    /// id or a `created_by` / `box_id` that names no row.
     async fn mint_requirement(
         &self,
         area: RequirementAreaId,
         new: NewRequirement,
     ) -> Result<Requirement> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(area_row) = sqlx::query!(
+            r#"
+            SELECT a.project_id AS "project_id: ProjectId",
+                   a.code,
+                   p.owner_workspace_id IS NOT NULL AS "scope_row!"
+              FROM requirement_area a
+              JOIN project p ON p.id = a.project_id
+             WHERE a.id = $1
+            "#,
+            area.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "requirement_area",
+                id: area.to_string(),
+            });
+        };
+
+        // `Some((parent id, parent key))` nests the row; `None` keeps it top-level, with or
+        // without a cross-owner `refines_id`.
+        let mut nested_under = None;
+        if let Some(parent_id) = new.refines_id {
+            let Some(parent) = sqlx::query!(
+                r#"
+                SELECT project_id AS "project_id: ProjectId",
+                       area_id    AS "area_id: RequirementAreaId",
+                       area_code,
+                       key        AS "key!",
+                       state      AS "state: RequirementState"
+                  FROM requirement WHERE id = $1 FOR SHARE
+                "#,
+                parent_id.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            else {
+                return Err(StoreError::NotFound {
+                    entity: "requirement",
+                    id: parent_id.to_string(),
+                });
+            };
+            let nested = parent.project_id == area_row.project_id;
+            let reaches = nested
+                || (!area_row.scope_row
+                    && sqlx::query_scalar!(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM project t
+                              JOIN workspace_project wp ON wp.workspace_id = t.owner_workspace_id
+                             WHERE t.id = $1 AND wp.project_id = $2
+                        ) AS "reaches!"
+                        "#,
+                        parent.project_id.as_uuid(),
+                        area_row.project_id.as_uuid(),
+                    )
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?);
+            if !reaches {
+                return Err(StoreError::Constraint(requirement_refines_outside_reach(
+                    &parent.key,
+                )));
+            }
+            if nested && parent.area_id != area {
+                return Err(StoreError::Constraint(requirement_child_area(
+                    &parent.key,
+                    &parent.area_code,
+                )));
+            }
+            if parent.state == RequirementState::Withdrawn {
+                return Err(StoreError::Constraint(requirement_withdrawn(&parent.key)));
+            }
+            if nested {
+                nested_under = Some((parent_id, parent.key));
+            }
+        }
+
+        let (number, child_number, key) = if let Some((parent_id, parent_key)) = nested_under {
+            let child = sqlx::query_scalar!(
+                "INSERT INTO requirement_child_counter (parent_id, last_value) VALUES ($1, 1)
+                 ON CONFLICT (parent_id)
+                 DO UPDATE SET last_value = requirement_child_counter.last_value + 1
+                 RETURNING last_value",
+                parent_id.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            (
+                None,
+                Some(child),
+                Requirement::child_key(&parent_key, child),
+            )
+        } else {
+            let number = sqlx::query_scalar!(
+                "INSERT INTO requirement_key_counter (area_id, last_value) VALUES ($1, 1)
+                 ON CONFLICT (area_id)
+                 DO UPDATE SET last_value = requirement_key_counter.last_value + 1
+                 RETURNING last_value",
+                area.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            (
+                Some(number),
+                None,
+                Requirement::top_level_key(area_row.scope_row, &area_row.code, number),
+            )
+        };
+
         let minted = sqlx::query_as!(
             Requirement,
             r#"
-            WITH a AS (
-                SELECT id, project_id, code FROM requirement_area WHERE id = $1
-            ), c AS (
-                INSERT INTO requirement_key_counter (area_id, last_value)
-                SELECT id, 1 FROM a
-                ON CONFLICT (area_id)
-                DO UPDATE SET last_value = requirement_key_counter.last_value + 1
-                RETURNING last_value
-            ), r AS (
-                INSERT INTO requirement (id, project_id, area_id, area_code, number, body,
-                                         rationale, priority, created_by)
-                SELECT $2, a.project_id, a.id, a.code, c.last_value, $3, $4, $5, $6 FROM a, c
-                RETURNING id, project_id, area_id, area_code, number, key, body, rationale,
-                          priority, state, version, created_by, created_at, updated_at
-            ), v AS (
-                INSERT INTO requirement_revision (requirement_id, version, body, rationale,
-                                                  priority, state, author_id, box_id, reason)
-                SELECT id, version, body, rationale, priority, state, $6, $7, 'created' FROM r
-                RETURNING requirement_id
-            )
-            SELECT r.id         AS "id!: RequirementId",
-                   r.project_id AS "project_id!: ProjectId",
-                   r.area_id    AS "area_id!: RequirementAreaId",
-                   r.area_code  AS "area_code!",
-                   r.number     AS "number!",
-                   r.key        AS "key!",
-                   r.body       AS "body!",
-                   r.rationale  AS "rationale!",
-                   r.priority   AS "priority!: Priority",
-                   r.state      AS "state!: RequirementState",
-                   r.version    AS "version!",
-                   r.created_by AS "created_by!: UserId",
-                   r.created_at AS "created_at!",
-                   r.updated_at AS "updated_at!"
-              FROM r, v
+            INSERT INTO requirement (id, project_id, area_id, area_code, number, key, refines_id,
+                                     child_number, body, rationale, priority, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id         AS "id: RequirementId",
+                      project_id AS "project_id: ProjectId",
+                      area_id    AS "area_id: RequirementAreaId",
+                      area_code,
+                      number,
+                      key        AS "key!",
+                      refines_id AS "refines_id: RequirementId",
+                      child_number,
+                      body,
+                      rationale,
+                      priority   AS "priority: Priority",
+                      state      AS "state: RequirementState",
+                      version,
+                      created_by AS "created_by: UserId",
+                      created_at,
+                      updated_at
             "#,
-            area.as_uuid(),
             new.id.as_uuid(),
+            area_row.project_id.as_uuid(),
+            area.as_uuid(),
+            area_row.code,
+            number,
+            key,
+            new.refines_id.map(RequirementId::as_uuid),
+            child_number,
             new.body,
             new.rationale,
             new.priority.as_str(),
             new.created_by.as_uuid(),
-            new.box_id.map(BoxId::as_uuid),
         )
-        .fetch_optional(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_sqlx)?;
 
-        minted.ok_or_else(|| StoreError::NotFound {
-            entity: "requirement_area",
-            id: area.to_string(),
-        })
+        sqlx::query!(
+            "INSERT INTO requirement_revision (requirement_id, version, body, rationale, priority,
+                                               state, author_id, box_id, reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'created')",
+            minted.id.as_uuid(),
+            minted.version,
+            minted.body,
+            minted.rationale,
+            minted.priority.as_str(),
+            minted.state.as_str(),
+            new.created_by.as_uuid(),
+            new.box_id.map(BoxId::as_uuid),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(minted)
     }
 
     /// `revise_requirement` with the patch's columns and reason, and an `amends` citation.

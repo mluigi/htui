@@ -514,8 +514,10 @@ impl Rows {
                 bullet.area_code
             ))),
             area_code: bullet.area_code.clone(),
-            number: bullet.number,
+            number: Some(bullet.number),
             key: bullet.key.clone(),
+            refines_id: None,
+            child_number: None,
             body: bullet.body.clone(),
             rationale: String::new(),
             priority: bullet.priority,
@@ -1110,7 +1112,7 @@ not a continuation
         let sto = &corpus.requirements[0];
         assert_eq!(sto.id.0, bench_uuid("requirement:R-STO-8"));
         assert_eq!(sto.area_id.0, bench_uuid("area:STO"));
-        assert_eq!((sto.area_code.as_str(), sto.number), ("STO", 8));
+        assert_eq!((sto.area_code.as_str(), sto.number), ("STO", Some(8)));
         assert_eq!(sto.priority, Priority::Must);
         assert_eq!(corpus.requirements[1].priority, Priority::Later);
         assert_eq!(corpus.docs[3].source, "docs/REQUIREMENTS.md:2");
@@ -1452,7 +1454,7 @@ not a continuation
             corpus
                 .requirements
                 .iter()
-                .filter(|r| r.area_code == "LATER" && r.number != 3 && r.number != 7)
+                .filter(|r| r.area_code == "LATER" && r.number != Some(3) && r.number != Some(7))
                 .all(|r| r.priority == Priority::Later)
         );
 

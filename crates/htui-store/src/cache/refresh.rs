@@ -1535,8 +1535,8 @@ async fn refresh_run_plan(
 
 // ---- MOD-38: ANA-11 §5.2's requirement tables (plan D12) ----------------------------------------
 //
-// `requirement_revision` and `requirement_key_counter` are deliberately absent: the mirror answers
-// `requirement_revisions` with `None` and never mints.
+// `requirement_revision`, `requirement_key_counter` and `requirement_child_counter` (MOD-149) are
+// deliberately absent: the mirror answers `requirement_revisions` with `None` and never mints.
 
 const REQUIREMENT_SPEC_COLUMNS: &[&str] = &[
     "project_id",
@@ -1643,6 +1643,8 @@ const REQUIREMENT_COLUMNS: &[&str] = &[
     "area_code",
     "number",
     "key",
+    "refines_id",
+    "child_number",
     "body",
     "rationale",
     "priority",
@@ -1653,8 +1655,9 @@ const REQUIREMENT_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 
-/// `requirement`, generated `key` included: the mirror stores the value Postgres computed, so the
-/// key rule lives in one place (`cache_migrations/0004_requirements.sql`).
+/// `requirement`, `key` included: the mirror stores the value Postgres stored at mint, so the key
+/// rule lives in one place (`Requirement::top_level_key` / `child_key`, MOD-149 D2), with
+/// `refines_id` and `child_number` beside it (`cache_migrations/0012_requirement_keys.sql`).
 async fn refresh_requirement(
     pool: &PgPool,
     sqlite: &SqlitePool,
@@ -1663,8 +1666,9 @@ async fn refresh_requirement(
     hw: i64,
 ) -> Result<Batch> {
     let rows = sqlx::query!(
-        r#"SELECT id, project_id, area_id, area_code, number, key as "key!", body, rationale,
-                  priority, state, version, created_by, created_at, updated_at
+        r#"SELECT id, project_id, area_id, area_code, number, key as "key!", refines_id,
+                  child_number, body, rationale, priority, state, version, created_by,
+                  created_at, updated_at
              FROM requirement WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at"#,
         project.as_uuid(),
         since,
@@ -1681,8 +1685,10 @@ async fn refresh_requirement(
             .bind(row.project_id.to_string())
             .bind(row.area_id.to_string())
             .bind(&row.area_code)
-            .bind(i64::from(row.number))
+            .bind(row.number.map(i64::from))
             .bind(&row.key)
+            .bind(row.refines_id.map(|id| id.to_string()))
+            .bind(row.child_number.map(i64::from))
             .bind(&row.body)
             .bind(&row.rationale)
             .bind(&row.priority)

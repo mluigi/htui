@@ -18,7 +18,7 @@ use crate::model::link::{ArtifactLinkKind, ProposeLink, WithdrawLink};
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
-    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason, EventKind, EventRole, Executor,
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
@@ -73,7 +73,8 @@ use crate::store::traits::{
     document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
     kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_reach,
     memory_entry_closed, memory_subject_taken, not_a_tool_name, note_needs_a_step,
-    queue_target_refusal, queue_token_refusal, references_no_row, requirement_withdrawn,
+    queue_target_refusal, queue_token_refusal, references_no_row, requirement_child_area,
+    requirement_coverage_state, requirement_refines_outside_reach, requirement_withdrawn,
     resolution_not_closable, rule_kind_unknown, self_link, step_writes_own_item,
     withdrawn_requirement_cited,
 };
@@ -453,6 +454,14 @@ pub const CASES: &[&str] = &[
     "document_link_refusals",
     "document_link_withdraw_tombstones_and_revives",
     "document_links_are_leaves_of_the_walk",
+    // MOD-149: requirement keys, nesting and cross-owner refinement (plan D2-D9)
+    "requirement_mint_in_a_scope_row_keys_w",
+    "requirement_nested_child_keys_parent_dot_n",
+    "requirement_cross_owner_refinement_keeps_its_own_key",
+    "requirement_refinement_outside_reach_is_refused",
+    "requirement_refinements_list_every_owner",
+    "requirement_coverage_derives_from_splits",
+    "workspace_delete_detaches_refining_requirements",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1484,6 +1493,27 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "document_links_are_leaves_of_the_walk" => {
             boxed(document_links_are_leaves_of_the_walk, store).await;
+        }
+        "requirement_mint_in_a_scope_row_keys_w" => {
+            boxed(requirement_mint_in_a_scope_row_keys_w, store).await;
+        }
+        "requirement_nested_child_keys_parent_dot_n" => {
+            boxed(requirement_nested_child_keys_parent_dot_n, store).await;
+        }
+        "requirement_cross_owner_refinement_keeps_its_own_key" => {
+            boxed(requirement_cross_owner_refinement_keeps_its_own_key, store).await;
+        }
+        "requirement_refinement_outside_reach_is_refused" => {
+            boxed(requirement_refinement_outside_reach_is_refused, store).await;
+        }
+        "requirement_refinements_list_every_owner" => {
+            boxed(requirement_refinements_list_every_owner, store).await;
+        }
+        "requirement_coverage_derives_from_splits" => {
+            boxed(requirement_coverage_derives_from_splits, store).await;
+        }
+        "workspace_delete_detaches_refining_requirements" => {
+            boxed(workspace_delete_detaches_refining_requirements, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -16566,6 +16596,7 @@ fn new_requirement(body: &str) -> NewRequirement {
         priority: Priority::Must,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
+        refines_id: None,
     }
 }
 
@@ -16689,7 +16720,7 @@ async fn requirement_mint_is_per_area_and_never_reused<S: WriteStore>(store: &S)
             ids::PROJECT_HTUI,
             ids::AREA_ENT,
             "ENT",
-            3,
+            Some(3),
             "R-ENT-3"
         ),
         "{CASE}: the fixture minted R-ENT-1 and R-ENT-2, so the next ENT number is 3"
@@ -16728,7 +16759,7 @@ async fn requirement_mint_is_per_area_and_never_reused<S: WriteStore>(store: &S)
         .expect(CASE);
     assert_eq!(
         (sto.key.as_str(), sto.number),
-        ("R-STO-2", 2),
+        ("R-STO-2", Some(2)),
         "{CASE}: STO counts on its own"
     );
 
@@ -17633,12 +17664,707 @@ async fn spec_is_cas<S: WriteStore>(store: &S) {
     );
 }
 
+// ---- MOD-149: requirement keys, nesting and cross-owner refinement (plan D2-D9) -------------
+
+/// A refining request: [`new_requirement`] with `refines_id` set.
+fn refining(body: &str, parent: Option<RequirementId>) -> NewRequirement {
+    NewRequirement {
+        refines_id: parent,
+        ..new_requirement(body)
+    }
+}
+
+/// A `Constraint` carrying exactly `sentence`, or a panic naming the case and what was tried.
+fn refused_with<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    sentence: &str,
+    what: &str,
+) {
+    match outcome {
+        Err(StoreError::Constraint(message)) => {
+            assert_eq!(message, sentence, "{case}: {what}: the refusal's sentence")
+        }
+        other => panic!("{case}: {what} is Constraint, got {other:?}"),
+    }
+}
+
+/// The project's requirement keys in list order.
+async fn requirement_keys<S: WriteStore>(store: &S, project: ProjectId, case: &str) -> Vec<String> {
+    store
+        .requirements(project, &RequirementFilter::default())
+        .await
+        .expect(case)
+        .into_iter()
+        .map(|row| row.key)
+        .collect()
+}
+
+/// An area `ORCH` in Platform's scope row and its first requirement, `W-ORCH-1`.
+async fn platform_orch<S: WriteStore>(store: &S, case: &str) -> (RequirementAreaId, Requirement) {
+    let area = store
+        .create_requirement_area(new_area(ids::PROJECT_SCOPE_PLATFORM, "ORCH", 1))
+        .await
+        .expect(case);
+    let first = store
+        .mint_requirement(area.id, new_requirement("The workspace runs every member."))
+        .await
+        .expect(case);
+    (area.id, first)
+}
+
+/// An area in `project` with `code`, at position 1.
+async fn area_in<S: WriteStore>(
+    store: &S,
+    project: ProjectId,
+    code: &str,
+    case: &str,
+) -> RequirementAreaId {
+    store
+        .create_requirement_area(new_area(project, code, 1))
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-149 D2: a requirement minted in a workspace's scope row is keyed `W-`, numbered by its
+/// area's counter like any other.
+async fn requirement_mint_in_a_scope_row_keys_w<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_mint_in_a_scope_row_keys_w";
+
+    let (area, first) = platform_orch(store, CASE).await;
+    assert_eq!(
+        (
+            first.key.as_str(),
+            first.number,
+            first.refines_id,
+            first.child_number,
+            first.project_id,
+            first.area_id,
+            first.area_code.as_str(),
+        ),
+        (
+            "W-ORCH-1",
+            Some(1),
+            None,
+            None,
+            ids::PROJECT_SCOPE_PLATFORM,
+            area,
+            "ORCH"
+        ),
+        "{CASE}: a scope row's requirement is W-, top-level"
+    );
+    assert!(
+        Requirement::key_is_valid(&first.key),
+        "{CASE}: the key matches the CHECK"
+    );
+    assert_eq!(
+        store.requirement(first.id).await.expect(CASE),
+        Some(first.clone()),
+        "{CASE}: the mint reads back as it was returned"
+    );
+    let second = store
+        .mint_requirement(area, new_requirement("A second one."))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (second.key.as_str(), second.number),
+        ("W-ORCH-2", Some(2)),
+        "{CASE}: the area counter moves on"
+    );
+}
+
+/// MOD-149 D2, D4, D5: a child nested under a requirement of its own project is
+/// `{parent.key}.{n}`, numbered per parent and never from the area counter; a child asked in
+/// another area is refused before any counter moves.
+async fn requirement_nested_child_keys_parent_dot_n<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_nested_child_keys_parent_dot_n";
+
+    let first = store
+        .mint_requirement(
+            ids::AREA_ENT,
+            refining("The first split.", Some(ids::REQ_ENT_1)),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            first.key.as_str(),
+            first.number,
+            first.child_number,
+            first.area_code.as_str(),
+            first.area_id,
+            first.project_id,
+            first.refines_id,
+        ),
+        (
+            "R-ENT-1.1",
+            None,
+            Some(1),
+            "ENT",
+            ids::AREA_ENT,
+            ids::PROJECT_HTUI,
+            Some(ids::REQ_ENT_1)
+        ),
+        "{CASE}: the first child of R-ENT-1"
+    );
+    assert!(first.is_nested(), "{CASE}: a child is nested");
+    assert_eq!(
+        store.requirement(first.id).await.expect(CASE),
+        Some(first.clone()),
+        "{CASE}: the child reads back as it was returned"
+    );
+    let second = store
+        .mint_requirement(
+            ids::AREA_ENT,
+            refining("The second split.", Some(ids::REQ_ENT_1)),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (second.key.as_str(), second.child_number),
+        ("R-ENT-1.2", Some(2)),
+        "{CASE}: the parent's counter moves on"
+    );
+    let grandchild = store
+        .mint_requirement(ids::AREA_ENT, refining("Split again.", Some(first.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            grandchild.key.as_str(),
+            grandchild.number,
+            grandchild.child_number,
+            grandchild.refines_id,
+        ),
+        ("R-ENT-1.1.1", None, Some(1), Some(first.id)),
+        "{CASE}: nesting goes to any depth"
+    );
+    let top = store
+        .mint_requirement(ids::AREA_ENT, new_requirement("Top-level again."))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (top.key.as_str(), top.number),
+        ("R-ENT-3", Some(3)),
+        "{CASE}: nesting left the area counter alone"
+    );
+
+    refused_with(
+        CASE,
+        store
+            .mint_requirement(
+                ids::AREA_STO,
+                refining("In the wrong area.", Some(ids::REQ_ENT_1)),
+            )
+            .await,
+        &requirement_child_area("R-ENT-1", "ENT"),
+        "a child of R-ENT-1 asked in STO",
+    );
+    let third = store
+        .mint_requirement(
+            ids::AREA_ENT,
+            refining("After the refusal.", Some(ids::REQ_ENT_1)),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        third.key, "R-ENT-1.3",
+        "{CASE}: the refused child burned no number"
+    );
+    let sto = store
+        .mint_requirement(ids::AREA_STO, new_requirement("STO is untouched."))
+        .await
+        .expect(CASE);
+    assert_eq!(sto.key, "R-STO-2", "{CASE}: nor did it move STO's counter");
+
+    let (orch, workspace) = platform_orch(store, CASE).await;
+    let scoped = store
+        .mint_requirement(orch, refining("A workspace split.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (scoped.key.as_str(), scoped.number, scoped.child_number),
+        ("W-ORCH-1.1", None, Some(1)),
+        "{CASE}: a scope row nests the same way"
+    );
+}
+
+/// MOD-149 D4: a project requirement refining its workspace's is a top-level row of its own
+/// project, keyed and numbered there, with `refines_id` pointing across.
+async fn requirement_cross_owner_refinement_keeps_its_own_key<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_cross_owner_refinement_keeps_its_own_key";
+
+    let (_, workspace) = platform_orch(store, CASE).await;
+    let htui = store
+        .mint_requirement(ids::AREA_ENT, refining("htui's share.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            htui.key.as_str(),
+            htui.number,
+            htui.child_number,
+            htui.refines_id,
+            htui.project_id,
+            htui.area_id,
+        ),
+        (
+            "R-ENT-3",
+            Some(3),
+            None,
+            Some(workspace.id),
+            ids::PROJECT_HTUI,
+            ids::AREA_ENT
+        ),
+        "{CASE}: a cross-owner refinement keeps its project's key"
+    );
+    assert!(!htui.is_nested(), "{CASE}: and is not nested");
+    assert_eq!(
+        store.requirement(htui.id).await.expect(CASE),
+        Some(htui.clone()),
+        "{CASE}: it reads back as it was returned"
+    );
+
+    let cli = area_in(store, ids::PROJECT_AGY, "CLI", CASE).await;
+    let agy = store
+        .mint_requirement(cli, refining("agy's share.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            agy.key.as_str(),
+            agy.number,
+            agy.child_number,
+            agy.refines_id
+        ),
+        ("R-CLI-1", Some(1), None, Some(workspace.id)),
+        "{CASE}: every member refines its workspace's requirement"
+    );
+}
+
+/// MOD-149 D4: a refinement outside its reach, of an unknown requirement, or of a withdrawn one
+/// is refused, and nothing is written: no row, no number.
+async fn requirement_refinement_outside_reach_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_refinement_outside_reach_is_refused";
+
+    let (orch, workspace) = platform_orch(store, CASE).await;
+    let gfx = area_in(store, ids::PROJECT_VULKAN, "GFX", CASE).await;
+    let cli = area_in(store, ids::PROJECT_AGY, "CLI", CASE).await;
+    let art = area_in(store, ids::PROJECT_SCOPE_GRAPHICS, "ART", CASE).await;
+    let agy = store
+        .mint_requirement(cli, new_requirement("An agy requirement."))
+        .await
+        .expect(CASE);
+    store
+        .withdraw_requirement(
+            ids::REQ_ENT_2,
+            1,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+
+    let projects = [
+        ids::PROJECT_HTUI,
+        ids::PROJECT_AGY,
+        ids::PROJECT_VULKAN,
+        ids::PROJECT_SCOPE_PLATFORM,
+        ids::PROJECT_SCOPE_GRAPHICS,
+    ];
+    let mut before = Vec::new();
+    for project in projects {
+        before.push(requirement_keys(store, project, CASE).await);
+    }
+
+    let outside = [
+        (
+            gfx,
+            workspace.id,
+            "W-ORCH-1",
+            "vulkan-tutorials refining Platform's",
+        ),
+        (
+            ids::AREA_ENT,
+            agy.id,
+            "R-CLI-1",
+            "htui refining a sibling project's",
+        ),
+        (
+            orch,
+            ids::REQ_ENT_1,
+            "R-ENT-1",
+            "Platform refining a member's",
+        ),
+        (
+            art,
+            workspace.id,
+            "W-ORCH-1",
+            "Graphics refining Platform's",
+        ),
+    ];
+    for (area, parent, key, what) in outside {
+        refused_with(
+            CASE,
+            store
+                .mint_requirement(area, refining("Out of reach.", Some(parent)))
+                .await,
+            &requirement_refines_outside_reach(key),
+            what,
+        );
+    }
+    not_found_on(
+        CASE,
+        store
+            .mint_requirement(
+                ids::AREA_ENT,
+                refining("Of nothing.", Some(RequirementId::new())),
+            )
+            .await,
+        "requirement",
+        "an unknown parent",
+    );
+    refused_with(
+        CASE,
+        store
+            .mint_requirement(
+                ids::AREA_ENT,
+                refining("Of a withdrawn one.", Some(ids::REQ_ENT_2)),
+            )
+            .await,
+        &requirement_withdrawn("R-ENT-2"),
+        "a withdrawn parent",
+    );
+
+    let mut after = Vec::new();
+    for project in projects {
+        after.push(requirement_keys(store, project, CASE).await);
+    }
+    assert_eq!(after, before, "{CASE}: no refusal wrote a row");
+
+    let mut next = Vec::new();
+    for (area, parent) in [
+        (gfx, None),
+        (ids::AREA_ENT, None),
+        (cli, None),
+        (orch, None),
+        (art, None),
+        (orch, Some(workspace.id)),
+        (ids::AREA_ENT, Some(ids::REQ_ENT_1)),
+    ] {
+        next.push(
+            store
+                .mint_requirement(area, refining("Next.", parent))
+                .await
+                .expect(CASE)
+                .key,
+        );
+    }
+    assert_eq!(
+        next,
+        [
+            "R-GFX-1",
+            "R-ENT-3",
+            "R-CLI-2",
+            "W-ORCH-2",
+            "W-ART-1",
+            "W-ORCH-1.1",
+            "R-ENT-1.1"
+        ],
+        "{CASE}: no refusal burned a number"
+    );
+}
+
+/// MOD-149 D6, D7: `requirement_refinements` lists every refining row, nested and cross-owner,
+/// in list order; `requirements` puts a child right after its parent.
+async fn requirement_refinements_list_every_owner<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_refinements_list_every_owner";
+
+    let first = store
+        .mint_requirement(ids::AREA_ENT, refining("Split one.", Some(ids::REQ_ENT_1)))
+        .await
+        .expect(CASE);
+    let second = store
+        .mint_requirement(ids::AREA_ENT, refining("Split two.", Some(ids::REQ_ENT_1)))
+        .await
+        .expect(CASE);
+    let (orch, workspace) = platform_orch(store, CASE).await;
+    let nested = store
+        .mint_requirement(orch, refining("Nested.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    let htui = store
+        .mint_requirement(ids::AREA_ENT, refining("Across.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (nested.key.as_str(), htui.key.as_str()),
+        ("W-ORCH-1.1", "R-ENT-3"),
+        "{CASE}: the setup"
+    );
+
+    assert_eq!(
+        store
+            .requirement_refinements(workspace.id)
+            .await
+            .expect(CASE),
+        vec![htui.clone(), nested.clone()],
+        "{CASE}: both owners' refinements, ENT before ORCH"
+    );
+    assert_eq!(
+        store
+            .requirement_refinements(ids::REQ_ENT_1)
+            .await
+            .expect(CASE),
+        vec![first, second],
+        "{CASE}: the nested children in order"
+    );
+    assert_eq!(
+        store
+            .requirement_refinements(RequirementId::new())
+            .await
+            .expect(CASE),
+        Vec::new(),
+        "{CASE}: an unknown id has none"
+    );
+    assert_eq!(
+        requirement_keys(store, ids::PROJECT_HTUI, CASE).await,
+        [
+            "R-ENT-1",
+            "R-ENT-1.1",
+            "R-ENT-1.2",
+            "R-ENT-2",
+            "R-ENT-3",
+            "R-STO-1"
+        ],
+        "{CASE}: a child follows its parent"
+    );
+}
+
+/// MOD-149 D8: a refined requirement's coverage is its refinements', all or any; a leaf's is its
+/// own `addresses` citations'. The split rule recurses (`W-ORCH-1 -> R-ENT-3 -> R-ENT-3.1`), a
+/// withdrawn refinement is ignored, and a requirement whose every refinement is withdrawn falls
+/// back to its own citations.
+async fn requirement_coverage_derives_from_splits<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_coverage_derives_from_splits";
+
+    let (_, workspace) = platform_orch(store, CASE).await;
+    let ent = store
+        .mint_requirement(ids::AREA_ENT, refining("ENT's share.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    let sto = store
+        .mint_requirement(ids::AREA_STO, refining("STO's share.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (ent.key.as_str(), sto.key.as_str()),
+        ("R-ENT-3", "R-STO-2"),
+        "{CASE}: the setup"
+    );
+
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Open,
+        "{CASE}: no refinement is cited"
+    );
+    store
+        .cite(ids::HTUI_FEAT_1, ent.id, CitationKind::Addresses, None)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::InProgress,
+        "{CASE}: an open item addresses one refinement"
+    );
+    for refinement in [ent.id, sto.id] {
+        store
+            .cite(ids::HTUI_FIX_1, refinement, CitationKind::Addresses, None)
+            .await
+            .expect(CASE);
+    }
+    assert_eq!(
+        requirement_coverage_state(store, ent.id).await.expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: a closed `done` item covers a leaf"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: every refinement is covered"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, ids::REQ_STO_1)
+            .await
+            .expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: the fixture leaf R-STO-1 (FEAT-1 open, FIX-1 done)"
+    );
+
+    // Recursion: R-ENT-3's own citations still read Covered, but once split it follows its
+    // uncited child, and the root follows R-ENT-3's walk, not its citations.
+    let grandchild = store
+        .mint_requirement(ids::AREA_ENT, refining("ENT's share, split.", Some(ent.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(grandchild.key, "R-ENT-3.1", "{CASE}: the nested child");
+    assert_eq!(
+        requirement_coverage_state(store, ent.id).await.expect(CASE),
+        CoverageState::Open,
+        "{CASE}: a split R-ENT-3 follows its uncited child, not its own `done` citation"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::InProgress,
+        "{CASE}: the root walks down to R-ENT-3.1 (R-ENT-3 by its citations would read Covered)"
+    );
+
+    // One refinement withdrawn: the root follows only the others.
+    store
+        .withdraw_requirement(
+            sto.id,
+            sto.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Open,
+        "{CASE}: the withdrawn R-STO-2 (still cited `done`) no longer counts; R-ENT-3 alone is Open"
+    );
+
+    // Every refinement withdrawn: R-ENT-3 falls back to its own citations.
+    store
+        .withdraw_requirement(
+            grandchild.id,
+            grandchild.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, ent.id).await.expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: R-ENT-3's only refinement is withdrawn; its own `done` citation decides"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: the root follows R-ENT-3 alone"
+    );
+
+    // The root's every refinement withdrawn: its own citations, an open item's, decide.
+    store
+        .cite(
+            ids::HTUI_FEAT_1,
+            workspace.id,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    store
+        .withdraw_requirement(
+            ent.id,
+            ent.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::InProgress,
+        "{CASE}: W-ORCH-1 has no live refinement; an open item addresses it"
+    );
+}
+
+/// MOD-149 D9: a workspace delete takes its scope row's requirements; a member's refinement of
+/// one survives as a plain top-level requirement (`ON DELETE SET NULL`), stamped.
+async fn workspace_delete_detaches_refining_requirements<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_detaches_refining_requirements";
+
+    let (_, workspace) = platform_orch(store, CASE).await;
+    let htui = store
+        .mint_requirement(ids::AREA_ENT, refining("htui's share.", Some(workspace.id)))
+        .await
+        .expect(CASE);
+    store
+        .delete_workspace(ids::WORKSPACE_PLATFORM)
+        .await
+        .expect(CASE);
+
+    assert_eq!(
+        store.requirement(workspace.id).await.expect(CASE),
+        None,
+        "{CASE}: the scope row's requirement went with it"
+    );
+    let survivor = store
+        .requirement(htui.id)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the member's refinement survives"));
+    assert!(
+        survivor.updated_at > htui.updated_at,
+        "{CASE}: the detach stamped the row ({} after {})",
+        survivor.updated_at,
+        htui.updated_at
+    );
+    assert_eq!(
+        survivor,
+        Requirement {
+            refines_id: None,
+            updated_at: survivor.updated_at,
+            ..htui
+        },
+        "{CASE}: it keeps its key and number, and refines nothing"
+    );
+    assert_eq!(
+        (survivor.key.as_str(), survivor.number),
+        ("R-ENT-3", Some(3)),
+        "{CASE}: R-ENT-3 stays R-ENT-3"
+    );
+}
+
 /// Blueprint F1: a project delete takes six requirement tables, and [`DeleteReach`] counts every
 /// one of them - a citation from another project's item included, which goes with the
-/// requirement it cites, as a cross-project link goes with either end.
+/// requirement it cites, as a cross-project link goes with either end. MOD-149: a nested child
+/// planted under `R-ENT-1` adds one `requirement_child_counter` row, which goes with its parent.
 async fn project_delete_counts_requirements<S: WriteStore>(store: &S) {
     const CASE: &str = "project_delete_counts_requirements";
 
+    store
+        .mint_requirement(
+            ids::AREA_ENT,
+            NewRequirement {
+                refines_id: Some(ids::REQ_ENT_1),
+                ..new_requirement("A nested child, so a child counter row exists.")
+            },
+        )
+        .await
+        .expect(CASE);
     store
         .cite(
             ids::AGY_FEAT_1,
@@ -17663,12 +18389,14 @@ async fn project_delete_counts_requirements<S: WriteStore>(store: &S) {
             report.requirement_specs,
             report.requirement_areas,
             report.requirement_key_counters,
+            report.requirement_child_counters,
             report.requirements,
             report.requirement_revisions,
             report.item_requirements,
         ),
-        (1, 2, 2, 3, 4, 6),
-        "{CASE}: the fixture's requirement set, plus agy's citation of R-STO-1"
+        (1, 2, 2, 1, 4, 5, 6),
+        "{CASE}: the fixture's requirement set and the nested R-ENT-1.1, plus agy's citation of \
+         R-STO-1"
     );
 
     assert_eq!(

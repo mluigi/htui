@@ -571,6 +571,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                         priority: *priority,
                         created_by: me,
                         box_id,
+                        refines_id: None,
                     },
                 )
                 .await?;
@@ -1654,6 +1655,7 @@ mod tests {
                     priority: Priority::Must,
                     created_by: ids::USER,
                     box_id: None,
+                    refines_id: None,
                 },
             )
             .await

@@ -431,6 +431,9 @@ impl ReadStore for SpyStore {
     ) -> StoreResult<Vec<CoverageRow>> {
         self.inner.requirement_coverage(requirement).await
     }
+    async fn requirement_refinements(&self, id: RequirementId) -> StoreResult<Vec<Requirement>> {
+        self.inner.requirement_refinements(id).await
+    }
     async fn tool_call_counts(&self, item: ItemId) -> StoreResult<Vec<ToolCallCount>> {
         self.inner.tool_call_counts(item).await
     }

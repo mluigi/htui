@@ -2223,7 +2223,7 @@ mod tests {
             .expect("R-ENT-1")
             .clone();
         row.id = RequirementId::new();
-        row.number = 3;
+        row.number = Some(3);
         "R-ENT-3".clone_into(&mut row.key);
         "Twice is too many.".clone_into(&mut row.body);
         row.version = 1;

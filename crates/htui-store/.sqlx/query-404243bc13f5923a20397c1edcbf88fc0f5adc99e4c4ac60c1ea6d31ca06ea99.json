@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id         AS \"id: RequirementId\",\n                   project_id AS \"project_id: ProjectId\",\n                   area_id    AS \"area_id: RequirementAreaId\",\n                   area_code,\n                   number,\n                   key        AS \"key!\",\n                   body,\n                   rationale,\n                   priority   AS \"priority: Priority\",\n                   state      AS \"state: RequirementState\",\n                   version,\n                   created_by AS \"created_by: UserId\",\n                   created_at,\n                   updated_at\n              FROM requirement WHERE id = $1\n            ",
+  "query": "\n            SELECT r.id         AS \"id: RequirementId\",\n                   r.project_id AS \"project_id: ProjectId\",\n                   r.area_id    AS \"area_id: RequirementAreaId\",\n                   r.area_code,\n                   r.number,\n                   r.key        AS \"key!\",\n                   r.refines_id AS \"refines_id: RequirementId\",\n                   r.child_number,\n                   r.body,\n                   r.rationale,\n                   r.priority   AS \"priority: Priority\",\n                   r.state      AS \"state: RequirementState\",\n                   r.version,\n                   r.created_by AS \"created_by: UserId\",\n                   r.created_at,\n                   r.updated_at\n              FROM requirement r\n             WHERE r.project_id = $1\n               AND ($2::text[] IS NULL OR r.area_code = ANY($2))\n               AND ($3::text[] IS NULL OR r.state = ANY($3))\n               AND ($4::text[] IS NULL OR r.priority = ANY($4))\n               -- A literal substring, as in `items`: `position`, not ILIKE.\n               AND ($5::text IS NULL\n                    OR position(lower($5::text) in lower(r.key)) > 0\n                    OR position(lower($5::text) in lower(r.body)) > 0)\n             ORDER BY r.area_code COLLATE \"C\",\n                      string_to_array(split_part(r.key, '-', 3), '.')::int[],\n                      r.key COLLATE \"C\"\n            ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,28 @@
       },
       {
         "ordinal": 6,
+        "name": "refines_id: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "refines_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "child_number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "child_number"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "body",
         "type_info": "Text",
         "origin": {
@@ -81,7 +103,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "rationale",
         "type_info": "Text",
         "origin": {
@@ -92,7 +114,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "priority: Priority",
         "type_info": "Text",
         "origin": {
@@ -103,7 +125,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "state: RequirementState",
         "type_info": "Text",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "created_by: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -136,7 +158,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -147,7 +169,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -160,7 +182,11 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Text"
       ]
     },
     "nullable": [
@@ -168,7 +194,9 @@
       false,
       false,
       false,
+      true,
       false,
+      true,
       true,
       false,
       false,
@@ -180,5 +208,5 @@
       false
     ]
   },
-  "hash": "a711a5016f05812cce3d5b0868fa821ca8daad1e72086b2ff457a8ef7c936666"
+  "hash": "404243bc13f5923a20397c1edcbf88fc0f5adc99e4c4ac60c1ea6d31ca06ea99"
 }

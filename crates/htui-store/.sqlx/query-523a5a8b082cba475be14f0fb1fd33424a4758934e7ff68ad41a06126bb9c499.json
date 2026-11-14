@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO requirement_key_counter (area_id, last_value) VALUES ($1, 1)\n                 ON CONFLICT (area_id)\n                 DO UPDATE SET last_value = requirement_key_counter.last_value + 1\n                 RETURNING last_value",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_value",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement_key_counter",
+            "name": "last_value"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "523a5a8b082cba475be14f0fb1fd33424a4758934e7ff68ad41a06126bb9c499"
+}

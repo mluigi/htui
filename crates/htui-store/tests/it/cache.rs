@@ -4098,3 +4098,109 @@ async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
 
     teardown(db, &[&cache]).await;
 }
+
+/// MOD-149 plan D10: `cache_migrations/0012_requirement_keys.sql` mirrors the stored key, the
+/// nullable `number`, `refines_id` and `child_number`, so the mirror's requirement reads equal
+/// Postgres's: a workspace's `W-ORCH-1`, its nested `W-ORCH-1.1` (no number) and `htui`'s
+/// cross-owner `R-ENT-3`, in D6's list order. `all_projects` lists no scope row, so the pass adds
+/// Platform's.
+#[tokio::test]
+async fn the_0012_requirement_refinements_reach_the_mirror() {
+    use htui_core::model::{NewRequirement, NewRequirementArea, Priority, RequirementAreaId};
+    use htui_core::model::{RequirementFilter, RequirementId};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let new = |body: &str, refines_id: Option<RequirementId>| NewRequirement {
+        id: RequirementId::new(),
+        body: body.to_owned(),
+        rationale: String::new(),
+        priority: Priority::Must,
+        created_by: ids::USER,
+        box_id: None,
+        refines_id,
+    };
+    let area = db
+        .store
+        .create_requirement_area(NewRequirementArea {
+            id: RequirementAreaId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            code: "ORCH".to_owned(),
+            title: "Orchestration".to_owned(),
+            description: String::new(),
+            position: 1,
+        })
+        .await
+        .expect("an area in Platform's scope row");
+    let workspace = db
+        .store
+        .mint_requirement(area.id, new("The workspace runs every member.", None))
+        .await
+        .expect("mint W-ORCH-1");
+    let nested = db
+        .store
+        .mint_requirement(area.id, new("One member at a time.", Some(workspace.id)))
+        .await
+        .expect("mint W-ORCH-1.1");
+    let cross = db
+        .store
+        .mint_requirement(
+            ids::AREA_ENT,
+            new("htui runs its share.", Some(workspace.id)),
+        )
+        .await
+        .expect("mint htui's R-ENT-3");
+    assert_eq!(
+        (
+            workspace.key.as_str(),
+            nested.key.as_str(),
+            cross.key.as_str()
+        ),
+        ("W-ORCH-1", "W-ORCH-1.1", "R-ENT-3"),
+        "the keys Postgres stored"
+    );
+
+    let cache = open_cache(&db).await;
+    let mut projects = all_projects();
+    projects.push(ids::PROJECT_SCOPE_PLATFORM);
+    run_pass(&db.pool, &cache, &projects, &settings(&db, 20))
+        .await
+        .expect("the pass");
+
+    for project in [ids::PROJECT_HTUI, ids::PROJECT_SCOPE_PLATFORM] {
+        assert_eq!(
+            cache
+                .requirements(project, &RequirementFilter::default())
+                .await
+                .expect("cache requirements"),
+            db.store
+                .requirements(project, &RequirementFilter::default())
+                .await
+                .expect("pg requirements"),
+            "the mirror lists {project}'s requirements as Postgres does"
+        );
+    }
+    let refinements = cache
+        .requirement_refinements(workspace.id)
+        .await
+        .expect("cache requirement_refinements");
+    assert_eq!(
+        refinements,
+        db.store
+            .requirement_refinements(workspace.id)
+            .await
+            .expect("pg requirement_refinements"),
+        "the mirror answers W-ORCH-1's refinements as Postgres does"
+    );
+    assert_eq!(
+        refinements
+            .iter()
+            .map(|row| (row.key.as_str(), row.number, row.child_number))
+            .collect::<Vec<_>>(),
+        vec![("R-ENT-3", Some(3), None), ("W-ORCH-1.1", None, Some(1))],
+        "both refinements, in list order; the nested row has no number"
+    );
+
+    teardown(db, &[&cache]).await;
+}

@@ -65,15 +65,16 @@ use htui_store::testkit as common;
 /// and MOD-164's six capture-write and two usage-tally cases (plan D4, D5) make it 306,
 /// and MOD-164 F2's person-amended run entry (M1) and evidence (L4) cases make it 308,
 /// and MOD-150 M2's four close-out link cases (plan D2, D3) make it 312,
-/// and MOD-150 M3's five document link cases (plan D1-D8) make it 317.
-const EXPECTED_CASES: usize = 317;
+/// and MOD-150 M3's five document link cases (plan D1-D8) make it 317,
+/// and MOD-149's seven key, nesting, refinement and coverage cases (plan D2-D9) make it 324.
+const EXPECTED_CASES: usize = 324;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (317 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (324 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -89,7 +90,8 @@ fn case_list_matches_mem_store() {
          three judge and deadline cases, and MOD-150 M1's seven link-kind cases, and MOD-125 M2's \
          three `pending_stops` cases, its M-3 case and its L-3 case and its R1 cancel-and-stop \
          case, and MOD-152 T1's three command-log cases, and MOD-125 M3's five resume and \
-         stopped-run cancel cases, and MOD-164's six capture-write and two usage-tally cases and its F2 person-amended and evidence cases, and MOD-150 M2's four close-out link cases, and MOD-150 M3's five document link cases)"
+         stopped-run cancel cases, and MOD-164's six capture-write and two usage-tally cases and its F2 person-amended and evidence cases, and MOD-150 M2's four close-out link cases, and MOD-150 M3's five document link cases, and MOD-149's seven key, nesting, \
+             refinement and coverage cases)"
     );
 }
 
