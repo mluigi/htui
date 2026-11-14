@@ -484,9 +484,10 @@ pub enum StoreRequest {
     },
     /// This user's activity feed (MOD-122 M3 plan D1, D8): events with `id > after`, oldest
     /// first, at most [`ACTIVITY_LIMIT`]; `after: None` is the newest page; and every needs-you
-    /// event still waiting. Served in `try_serve` through `Backend::activity`, so offline it is
-    /// answered with an empty page rather than refused, and an `Unreachable` from the read still
-    /// drops an `Online` backend onto the mirror. Answered with [`StoreReply::Activity`].
+    /// event still waiting. Served in `try_serve` through `Backend::activity`, so an
+    /// `Unreachable` from the read still drops an `Online` backend onto the mirror. Offline or
+    /// connecting it is refused (`Failed`, review R1 M1), so the panel keeps its last rows.
+    /// Answered with [`StoreReply::Activity`].
     Activity {
         /// The highest id the panel already holds, less its re-read margin; `None` at first.
         after: Option<i64>,
@@ -1920,9 +1921,9 @@ pub enum StoreReply {
     /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
     /// offline.
     WorkerLogs(Vec<WorkerLogLine>),
-    /// The answer to [`StoreRequest::Activity`] (MOD-122 M3 plan D8): one page of the feed, empty
-    /// offline, and the workspaces [`StoreRequest::Workspaces`] answers, for the panel's `@slug`
-    /// and its filter.
+    /// The answer to [`StoreRequest::Activity`] (MOD-122 M3 plan D8): one page of the feed (never
+    /// offline: the read is refused there), and the workspaces [`StoreRequest::Workspaces`]
+    /// answers, for the panel's `@slug` and its filter.
     Activity {
         /// The events past the cursor and the pinned set.
         page: ActivityPage,
@@ -2516,6 +2517,27 @@ impl WaitingKeysRead for PgStore {
     }
 }
 
+/// [`StoreRequest::SweepRetention`] (MOD-122 M3 plan D6, blueprint F6): both tables at one cut
+/// through the writer; offline there is none, so nothing is swept and nothing refused.
+///
+/// Review R1 L2: both prunes run whatever the other answers, as `ship.rs`'s sweep does, and the
+/// answer is then the first failure. `prune_logs` is the writer's worker-log prune; [`try_serve`]
+/// passes [`WorkerLogStore::prune_worker_logs`](htui_core::store::WorkerLogStore::prune_worker_logs),
+/// and it is a parameter only so a test can make it fail, which no [`Backend`] can be made to do
+/// (as `serve_waiting`'s permission read is).
+async fn sweep_retention(
+    backend: &Backend,
+    prune_logs: impl AsyncFnOnce(&Writer, DateTime<Utc>) -> StoreResult<u64>,
+) -> StoreResult<StoreReply> {
+    let Some(writer) = backend.writer() else {
+        return Ok(StoreReply::RetentionSwept(0));
+    };
+    let cut = retention_cut(&backend.app_settings().await?, Utc::now());
+    let logs = prune_logs(&writer, cut).await;
+    let events = writer.prune_activity(cut, PER_USER_CAP).await;
+    Ok(StoreReply::RetentionSwept(logs?.saturating_add(events?)))
+}
+
 /// The most rows one [`StoreRequest::WorkerLogs`] answers (MOD-122 M2 D10, blueprint F5).
 pub const WORKER_LOGS_LIMIT: u32 = 2_000;
 
@@ -2696,22 +2718,25 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             StoreReply::WorkerLogs(backend.worker_logs(*after, WORKER_LOGS_LIMIT).await?)
         }
         // MOD-122 M3 plan D8: the feed and the workspaces `Workspaces` reads, inline. Offline
-        // the page is empty and the workspaces come from the mirror; the `?` keeps `go_offline`
-        // working for an `Unreachable`.
+        // or connecting there is no feed, and the read is refused (review R1 M1): an empty page
+        // would replace the panel's pinned rows with nothing, a refusal keeps its last rows.
+        // Answered here rather than as an `Err`, so an already-offline backend never reaches
+        // `go_offline`; online, the `?` keeps `go_offline` working for an `Unreachable`.
+        StoreRequest::Activity { .. } if matches!(backend, Backend::Offline { .. }) => {
+            StoreReply::Failed {
+                request: request.name(),
+                message: DATABASE_UNREACHABLE.to_owned(),
+            }
+        }
         StoreRequest::Activity { after } => StoreReply::Activity {
             page: backend.activity(*after, ACTIVITY_LIMIT).await?,
             workspaces: backend.workspaces().await?,
         },
-        // MOD-122 M3 plan D6, blueprint F6: both tables at one cut through the writer; offline
-        // there is none, so nothing is swept and nothing refused.
         StoreRequest::SweepRetention => {
-            let Some(writer) = backend.writer() else {
-                return Ok(StoreReply::RetentionSwept(0));
-            };
-            let cut = retention_cut(&backend.app_settings().await?, Utc::now());
-            let logs = writer.prune_worker_logs(cut, PER_BOX_CAP).await?;
-            let events = writer.prune_activity(cut, PER_USER_CAP).await?;
-            StoreReply::RetentionSwept(logs.saturating_add(events))
+            sweep_retention(backend, async |writer, cut| {
+                writer.prune_worker_logs(cut, PER_BOX_CAP).await
+            })
+            .await?
         }
         // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
@@ -5745,28 +5770,33 @@ mod tests {
         assert_eq!(pinned, [unblock], "the pins whatever the cursor");
     }
 
-    /// MOD-122 M3 plan D8: offline there is no feed to read, so the answer is an empty page,
-    /// never a refusal.
+    /// MOD-122 M3 plan D8, review R1 M1: offline and while connecting there is no feed to read,
+    /// so the read is refused, named `activity`. An empty page would replace the panel's pinned
+    /// rows with nothing for the whole outage; a refusal keeps the last rows (`App::absorbed`).
     #[tokio::test]
-    async fn activity_offline_answers_an_empty_page() {
+    async fn activity_offline_or_connecting_answers_failed() {
         let _keyring = htui_store::testkit::mock_keyring().await;
         let root = tempfile::tempdir().expect("temp root");
         let cache = CacheStore::open(root.path(), "activity-offline", 1)
             .await
             .expect("open a throwaway mirror");
-        let backend = Backend::Offline {
-            cache: cache.clone(),
-            since: Some(Utc::now()),
-        };
-        let reply = serve(&backend, &StoreRequest::Activity { after: None }).await;
-        assert!(
-            matches!(
-                &reply,
-                StoreReply::Activity { page, .. }
-                    if page.events.is_empty() && page.pinned.is_empty()
-            ),
-            "{reply:?}"
-        );
+        for since in [Some(Utc::now()), None] {
+            let backend = Backend::Offline {
+                cache: cache.clone(),
+                since,
+            };
+            let reply = serve(&backend, &StoreRequest::Activity { after: None }).await;
+            assert!(
+                matches!(
+                    &reply,
+                    StoreReply::Failed {
+                        request: "activity",
+                        message,
+                    } if message == DATABASE_UNREACHABLE
+                ),
+                "since {since:?}: {reply:?}"
+            );
+        }
         cache.close().await;
     }
 
@@ -5858,6 +5888,33 @@ mod tests {
             "the 5-day event: {reply:?}"
         );
         assert_eq!(held().await, [newest]);
+    }
+
+    /// MOD-122 M3 review R1 L2: a worker-log prune that fails does not stop the activity prune
+    /// (`ship.rs`'s sweep runs both too); the sweep then answers the log prune's error.
+    #[tokio::test]
+    async fn sweep_retention_prunes_the_events_when_the_log_prune_fails() {
+        use htui_core::model::ActivityKind;
+
+        let now = Utc::now();
+        let clock = htui_core::clock::TestClock::at(now - chrono::TimeDelta::days(20));
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        store.push_activity(feat_2_event(ActivityKind::RunStarted));
+        clock.set(now);
+        let newest = store.push_activity(feat_2_event(ActivityKind::RunStarted));
+        let backend = Backend::memory(store.clone());
+
+        let swept = sweep_retention(&backend, async |_, _| {
+            Err(StoreError::Backend("worker_log gone".into()))
+        })
+        .await;
+        assert!(
+            matches!(&swept, Err(StoreError::Backend(why)) if why == "worker_log gone"),
+            "{swept:?}"
+        );
+        let page = store.activity(None, 500).await.expect("reads");
+        let held: Vec<i64> = page.events.iter().map(|event| event.id).collect();
+        assert_eq!(held, [newest], "the 20-day event went all the same");
     }
 
     /// MOD-122 M3 blueprint F6: offline there is no writer, so the sweep answers 0, never a
