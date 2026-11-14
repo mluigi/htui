@@ -4090,16 +4090,18 @@ async fn index_changes_list_a_requirement_minted_or_amended_after_since<
             .await
             .expect(CASE),
     );
-    // Only the requirements are pinned: the amend's citation is the item's business, not this
-    // case's.
-    let changes = index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await;
+    // The amend's citation of `HTUI_FEAT_3` does not stamp the item, so only the requirement is
+    // listed.
     assert_eq!(
-        changes
-            .projects
-            .get(&ids::PROJECT_HTUI)
-            .map(|project| project.requirements.clone()),
-        Some([minted.id].into()),
-        "{CASE}: the amended requirement: {changes:?}"
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(
+            ids::PROJECT_HTUI,
+            ProjectChanges {
+                requirements: [minted.id].into(),
+                ..ProjectChanges::default()
+            }
+        )]),
+        "{CASE}: the amended requirement"
     );
 }
 
@@ -4166,6 +4168,11 @@ async fn index_changes_leave_out_rows_before_since_and_projects_not_asked<
         .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "before"))
         .await
         .expect(CASE);
+    let agy_before = store
+        .mint_item(new_item(ids::PROJECT_AGY, ids::KIND_AGY_FEAT, "agy before"))
+        .await
+        .expect(CASE);
+    let agy_area = area_in(store, ids::PROJECT_AGY, "IDX", CASE).await;
     let since = index_since(CASE, store).await;
     store
         .write_document(NewDocument {
@@ -4192,6 +4199,19 @@ async fn index_changes_leave_out_rows_before_since_and_projects_not_asked<
         })
         .await
         .expect(CASE);
+    // The item-document and requirement arms filter by project too: an agy item minted before
+    // `since` gains a version after it, and an agy requirement is minted after it.
+    store
+        .write_document(NewDocument {
+            created_at: stamp_from(since, 1),
+            ..new_document(agy_before.id, "plan", None)
+        })
+        .await
+        .expect(CASE);
+    let elsewhere_requirement = store
+        .mint_requirement(agy_area, new_requirement("Agy reads what changed."))
+        .await
+        .expect(CASE);
 
     assert!(
         index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since)
@@ -4208,9 +4228,9 @@ async fn index_changes_leave_out_rows_before_since_and_projects_not_asked<
         index_changes_with([(
             ids::PROJECT_AGY,
             ProjectChanges {
-                items: [elsewhere.id].into(),
+                items: [elsewhere.id, agy_before.id].into(),
+                requirements: [elsewhere_requirement.id].into(),
                 owner_documents: [elsewhere_doc.id].into(),
-                ..ProjectChanges::default()
             }
         )]),
         "{CASE}: asked, agy answers; htui still has no entry"
