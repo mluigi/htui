@@ -47,6 +47,7 @@ pub mod secrets_settings;
 pub mod skill_import;
 pub mod skills;
 pub mod state_cmd;
+pub mod stop_cmd;
 pub mod store_worker;
 pub mod templates;
 pub mod terminal;
@@ -135,6 +136,16 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     }
     if let Some(cli::Command::Waiting(state)) = args.command.clone() {
         return state_cmd::run(state_cmd::Verb::Waiting, state)
+            .await
+            .map_err(anyhow::Error::from);
+    }
+    // MOD-125 M4: the workspace stop verbs, after `logging::init` and before the keyring flags,
+    // the key file and the cache; each connects headless, asks, writes and prints its report.
+    if let Some(cli::Command::Stop(stop)) = args.command.clone() {
+        return stop_cmd::run_stop(stop).await.map_err(anyhow::Error::from);
+    }
+    if let Some(cli::Command::Resume(resume)) = args.command.clone() {
+        return stop_cmd::run_resume(resume)
             .await
             .map_err(anyhow::Error::from);
     }

@@ -193,7 +193,7 @@ async fn stored(pg: &PgStore) -> Result<Option<StoredQdrantUrl>, StateExit> {
 /// headless connect: a pending schema or a build below the database's target is refused, never
 /// migrated. Every refusal is `state_cmd`'s sentence, but an unreadable keyring says so first
 /// ([`KEYRING_UNREADABLE`]).
-async fn connect() -> Result<PgStore, StateExit> {
+pub(crate) async fn connect() -> Result<PgStore, StateExit> {
     let dsn = state_cmd::read_dsn().map_err(dsn_exit)?;
     let identity = identity::config_root()
         .and_then(|root| identity::load_or_mint(&root))
@@ -205,7 +205,7 @@ async fn connect() -> Result<PgStore, StateExit> {
 
 /// [`state_cmd::read_dsn`]'s refusal as this command's ending: `NO_DSN` as it is, the keyring's
 /// own error after [`KEYRING_UNREADABLE`] (blueprint T5.2).
-fn dsn_exit(failure: Failure) -> StateExit {
+pub(crate) fn dsn_exit(failure: Failure) -> StateExit {
     match failure.error.code {
         ErrorCode::KeyringUnreadable => {
             StateExit::Refused(format!("{KEYRING_UNREADABLE}: {}", failure.error.message))
@@ -215,7 +215,7 @@ fn dsn_exit(failure: Failure) -> StateExit {
 }
 
 /// A state verb's [`Failure`] as this command's ending: offline 3, refused 2, anything else 1.
-fn failure_exit(failure: Failure) -> StateExit {
+pub(crate) fn failure_exit(failure: Failure) -> StateExit {
     let message = failure.error.message;
     match failure.store {
         StoreState::Offline => StateExit::Offline(message),
