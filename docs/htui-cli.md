@@ -548,8 +548,8 @@ that box's next command poll; a box that is down resumes its runs when it comes 
 can start again. A resume of a workspace that is not stopped writes nothing and asks nothing: it
 prints `workspace <slug> is not stopped` and the report, which still lists any stopped run.
 
-**The question.** Before it writes, each command prints the report as it stands on standard
-output and asks one question on standard error, such as:
+**The question.** Before it writes (not with `--yes`), each command prints the report as it
+stands on standard output and asks one question on standard error, such as:
 
 ```
 Stop workspace `graphics` gracefully? Each agent step stops at its turn boundary, checks stop at once; nothing new starts until `htui resume graphics`. [y/N]
@@ -557,7 +557,11 @@ Stop workspace `graphics` gracefully? Each agent step stops at its turn boundary
 
 `y` or `yes` (any case) confirms; anything else, an empty line or the end of input declines, and
 nothing is written. `--yes` (`-y`) answers it without asking. Without a terminal on standard input,
-a command that would write needs `--yes`: it is refused before anything is printed or written.
+a command that would write needs `--yes`: it is refused before the stop is written (or removed).
+If someone else stops or resumes the workspace while the question is open, the answer writes
+nothing: the command is refused with `the stop of workspace <slug> changed while asking; nothing
+was stopped; run htui stop <slug> again` (`… resumed; run htui resume <slug> again`), and you run
+it again to see the stop as it now stands.
 
 **The wait.** After writing a stop, `htui stop` waits up to 20 seconds for the workspace's running
 runs to stop, saying `waiting for <n> running runs to stop…` once on standard error. A graceful
@@ -599,7 +603,7 @@ once resumed, each box resumes its stopped runs at its next command poll
 | Ending | Exit |
 |---|---|
 | Stopped, resumed, or nothing to write and the state printed (the wait running out included) | 0 |
-| Refused: no DSN, the keyring, `box.toml`, the schema, an unknown slug, `not confirmed; nothing was stopped` (`… resumed`), `needs confirmation: pass --yes, or run it in a terminal; nothing was stopped` (`… resumed`), or `workspace <slug> no longer exists` | 2 |
+| Refused: no DSN, the keyring, `box.toml`, the schema, an unknown slug, `not confirmed; nothing was stopped` (`… resumed`), `needs confirmation: pass --yes, or run it in a terminal; nothing was stopped` (`… resumed`), `the stop of workspace <slug> changed while asking; …`, or `workspace <slug> no longer exists` | 2 |
 | Postgres did not answer: `cannot reach Postgres: ...` | 3 |
 | Anything else: `the workspace could not be stopped: ...` (`resumed`, `read`) | 1 |
 
