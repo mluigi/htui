@@ -4665,6 +4665,18 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
         vec![ids::AGY_FEAT_1],
         "{CASE}: the cross-project edge to htui:FEAT-2 went with the project it pointed at"
     );
+    // R1 L3: htui:ANA-2's link to agy:ANA-1's verdict went with its item, leaving no row the
+    // agy document would still count (tombstones included).
+    assert_eq!(
+        store
+            .delete_reach(DeleteTarget::Project(ids::PROJECT_AGY))
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: agy has a reach"))
+            .document_links,
+        0,
+        "{CASE}: no link from a deleted item survives into agy's document links"
+    );
 }
 
 /// D4's seed on a fresh project, read back through the trait: five graphs, fifteen phases, five
@@ -34625,9 +34637,11 @@ async fn document_link_resolves_an_owner_document<S: WriteStore>(store: &S) {
     );
 }
 
-/// MOD-150 M3 D4: the refusals in their order (own item, document, reach, single pin); the same
-/// version again is an upsert that keeps its proposer, and the same document under another kind
-/// is a link of its own.
+/// MOD-150 M3 D4: the refusals in their order (own item, owner and its reach, kind and version,
+/// single pin); the same version again is an upsert that keeps its proposer, and the same document
+/// under another kind is a link of its own. An owner that names nothing reads as one outside the
+/// reach, and a missing kind or version of an owner outside the reach does too, so a refusal never
+/// tells whether a document exists where the step cannot see (R1 M1).
 async fn document_link_refusals<S: WriteStore>(store: &S) {
     const CASE: &str = "document_link_refusals";
     const IMPLEMENTS: ArtifactLinkKind = ArtifactLinkKind::Implements;
@@ -34655,11 +34669,6 @@ async fn document_link_refusals<S: WriteStore>(store: &S) {
     );
     for (to, label, what) in [
         (
-            doc_ref("NOPE-9", "verdict", None),
-            "NOPE-9 verdict",
-            "an unknown owner",
-        ),
-        (
             doc_ref("ANA-2", "ruling", None),
             "ANA-2 ruling",
             "an unknown kind",
@@ -34683,21 +34692,48 @@ async fn document_link_refusals<S: WriteStore>(store: &S) {
             what,
         );
     }
-    for (to, label) in [
+    for (to, label, what) in [
         (
             doc_ref("vulkan-tutorials:FEAT-1", "spec", None),
             "vulkan-tutorials:FEAT-1 spec",
+            "an item's document of a project outside the run's reach",
         ),
         (
             doc_ref("vulkan-tutorials", "goals", None),
             "vulkan-tutorials goals",
+            "a project's own document outside the run's reach",
+        ),
+        (
+            doc_ref("vulkan-tutorials:FEAT-1", "ruling", None),
+            "vulkan-tutorials:FEAT-1 ruling",
+            "an unknown kind of an owner outside the run's reach",
+        ),
+        (
+            doc_ref("vulkan-tutorials", "goals", Some(9)),
+            "vulkan-tutorials goals v9",
+            "an unknown version of an owner outside the run's reach",
+        ),
+        (
+            doc_ref("NOPE-9", "verdict", None),
+            "NOPE-9 verdict",
+            "an owner that is neither an item key nor a project slug",
+        ),
+        (
+            doc_ref("no-such-project", "goals", None),
+            "no-such-project goals",
+            "an unknown project slug",
+        ),
+        (
+            doc_ref("vulkan-tutorials:NOPE-9", "spec", None),
+            "vulkan-tutorials:NOPE-9 spec",
+            "an unknown key of a project outside the run's reach",
         ),
     ] {
         constraint_exactly(
             CASE,
             propose_document(store, x, IMPLEMENTS, to, step).await,
             &document_outside_reach(label),
-            "a document of a project outside the run's reach",
+            what,
         );
     }
 
@@ -34775,7 +34811,9 @@ async fn document_link_refusals<S: WriteStore>(store: &S) {
 
 /// MOD-150 M3 D4: a withdraw tombstones the live link (to any version, or the named one if it is
 /// the pinned one), only for the run that proposed it; a re-proposal revives the row as the new
-/// step's.
+/// step's. A withdraw resolves only the owner (an unknown one reads as outside the reach), never
+/// the version: a version that does not exist is no live link (R1 M1). A tombstone revives only
+/// through the pin check, so a tombstoned v1 beside a live v2 is refused (R1 L3).
 async fn document_link_withdraw_tombstones_and_revives<S: WriteStore>(store: &S) {
     const CASE: &str = "document_link_withdraw_tombstones_and_revives";
     const IMPLEMENTS: ArtifactLinkKind = ArtifactLinkKind::Implements;
@@ -34811,6 +34849,39 @@ async fn document_link_withdraw_tombstones_and_revives<S: WriteStore>(store: &S)
         &link_not_proposed_by_run("ANA-2 verdict"),
         "a live document link another run proposed",
     );
+    constraint_exactly(
+        CASE,
+        withdraw_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("no-such-project", "verdict", None),
+            earlier,
+        )
+        .await,
+        &document_outside_reach("no-such-project verdict"),
+        "a withdraw naming an owner that resolves to nothing",
+    );
+    for (to, label, what) in [
+        (
+            doc_ref("ANA-2", "verdict", Some(9)),
+            "ANA-2 verdict v9",
+            "a withdraw naming a version that does not exist",
+        ),
+        (
+            doc_ref("ANA-2", "ruling", None),
+            "ANA-2 ruling",
+            "a withdraw naming a kind the owner has no document of",
+        ),
+    ] {
+        not_found_exactly(
+            CASE,
+            withdraw_document(store, x, IMPLEMENTS, to, earlier).await,
+            "item_artifact_link",
+            label,
+            what,
+        );
+    }
     not_found_exactly(
         CASE,
         withdraw_document(
@@ -34884,8 +34955,46 @@ async fn document_link_withdraw_tombstones_and_revives<S: WriteStore>(store: &S)
     );
     assert_eq!(
         linked_documents(CASE, store, x).await,
-        vec![revived.document],
+        vec![revived.document.clone()],
         "{CASE}: the revived link reads back"
+    );
+
+    // A tombstoned v1 beside a live v2: v2 out, v1 in and out, v2 revived, then v1 again.
+    for (op, version) in [
+        ("withdraw", 2),
+        ("propose", 1),
+        ("withdraw", 1),
+        ("propose", 2),
+    ] {
+        let to = doc_ref("ANA-2", "verdict", Some(version));
+        let written = if op == "propose" {
+            propose_document(store, x, IMPLEMENTS, to, step).await
+        } else {
+            withdraw_document(store, x, IMPLEMENTS, to, step).await
+        };
+        written.unwrap_or_else(|err| panic!("{CASE}: {op} v{version}: {err:?}"));
+    }
+    constraint_exactly(
+        CASE,
+        propose_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", Some(1)),
+            step,
+        )
+        .await,
+        &document_already_pinned(x, IMPLEMENTS, 2),
+        "a tombstoned v1 re-proposed while v2 is live under the same kind",
+    );
+    assert_eq!(
+        linked_documents(CASE, store, x)
+            .await
+            .iter()
+            .map(|doc| (doc.document_id, doc.version))
+            .collect::<Vec<_>>(),
+        vec![(revived.document.document_id, 2)],
+        "{CASE}: the refused revival leaves v2 the one live pin"
     );
 }
 

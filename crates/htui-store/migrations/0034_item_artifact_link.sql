@@ -13,7 +13,8 @@
 -- proposing step that goes (SET NULL). Removal by the store is a tombstone (deleted_at), so the
 -- cache cursor on updated_at sees it; trg_item_artifact_link_updated_at moves updated_at, as
 -- 0006_requirements.sql's triggers do. idx_item_artifact_link_document backs the read of a
--- document's live links.
+-- document's links and is not partial: the document foreign key's cascade and a delete's reach
+-- count read tombstones too. idx_item_artifact_link_step backs the proposing step's SET NULL.
 --
 -- Mirrored from MOD-150 M3 T2 (cache_migrations/0011_item_artifact_link.sql). cache_meta.
 -- schema_version moves to 34 through PgStore::schema_version(), so each box rebuilds its mirror
@@ -40,5 +41,5 @@ CREATE TRIGGER trg_item_artifact_link_updated_at BEFORE UPDATE ON item_artifact_
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE INDEX idx_item_artifact_link_updated_at ON item_artifact_link (updated_at);
-CREATE INDEX idx_item_artifact_link_document ON item_artifact_link (to_document_id)
-    WHERE deleted_at IS NULL;
+CREATE INDEX idx_item_artifact_link_document ON item_artifact_link (to_document_id);
+CREATE INDEX idx_item_artifact_link_step ON item_artifact_link (proposed_by_step_id);

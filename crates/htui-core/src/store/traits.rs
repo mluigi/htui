@@ -2594,11 +2594,12 @@ pub trait WriteStore: ReadStore {
     ///
     /// # Errors
     /// `NotFound { run_step }`; `Fenced`; `Constraint(step_writes_own_item(..))`;
-    /// `NotFound { entity: "document", id: document_ref_label(..) }` when the owner (an item key
-    /// first, then a project slug), the kind or the version names no document;
-    /// `Constraint(document_outside_reach(..))` when the document's project is outside the step's
-    /// reach (MOD-147 D3); `Constraint(document_already_pinned(..))` when a live link of the same
-    /// kind pins another version of the same owner's kind.
+    /// `Constraint(document_outside_reach(..))` when the owner (an item key first, then a project
+    /// slug) names nothing or its project is outside the step's reach (MOD-147 D3): one answer
+    /// for both, so a refusal never tells what exists outside the reach;
+    /// `NotFound { entity: "document", id: document_ref_label(..) }` when the owner, in reach, has
+    /// no document of the kind or no such version; `Constraint(document_already_pinned(..))` when
+    /// a live link of the same kind pins another version of the same owner's kind.
     async fn propose_document_link(
         &self,
         fence: StepFence,
@@ -2611,9 +2612,12 @@ pub trait WriteStore: ReadStore {
     ///
     /// # Errors
     /// `NotFound { run_step }`; `Fenced`; `Constraint(step_writes_own_item(..))`;
-    /// `NotFound { entity: "document" }` as for a proposal (the version is not resolved to the
-    /// latest); `NotFound { entity: "item_artifact_link", id: document_ref_label(..) }` when no
-    /// live link matches; `Constraint(link_not_proposed_by_run(..))` for another run's link.
+    /// `Constraint(document_outside_reach(..))` when the owner names nothing (no reach check, as
+    /// in [`withdraw_link`](Self::withdraw_link)); `NotFound { entity: "item_artifact_link", id:
+    /// document_ref_label(..) }` when no live link of the kind reaches a version of the owner's
+    /// kind, or the named version is not the pinned one (a version or kind that does not exist
+    /// included: neither is resolved); `Constraint(link_not_proposed_by_run(..))` for another
+    /// run's link.
     async fn withdraw_document_link(
         &self,
         fence: StepFence,

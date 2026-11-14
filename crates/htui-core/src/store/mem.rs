@@ -2011,40 +2011,39 @@ impl State {
         }
     }
 
-    /// MOD-150 M3 D3: the document `to` names from a step of `project`: its owner as an item key
-    /// first (`item_by_key`'s rules), else as an exact project slug; then the named version, or
-    /// the latest. `NotFound { entity: "document" }` when any part names nothing.
-    fn resolve_document(
-        &self,
-        project: ProjectId,
-        to: &DocumentRef,
-    ) -> Result<(DocOwner, DocumentId, i32)> {
-        let missing = || StoreError::NotFound {
-            entity: "document",
-            id: document_ref_label(to),
-        };
-        let owner = match self.item_by_key(project, &to.owner) {
-            Some(item) => DocOwner {
-                project: self.require_item(item)?.project_id,
+    /// MOD-150 M3 D3: whose documents `owner` names from a step of `project`: an item key first
+    /// (`item_by_key`'s rules), else an exact project slug. `None` when it names neither; the
+    /// callers answer that as [`document_outside_reach`], so it reads as an owner outside the
+    /// reach (R1 M1).
+    fn document_owner(&self, project: ProjectId, owner: &str) -> Option<DocOwner> {
+        match self.item_by_key(project, owner) {
+            Some(item) => Some(DocOwner {
+                project: self.items.get(&item)?.project_id,
                 item: Some(item),
-            },
-            None => DocOwner {
-                project: self
-                    .projects
-                    .values()
-                    .find(|row| row.slug == to.owner)
-                    .ok_or_else(missing)?
-                    .id,
-                item: None,
-            },
-        };
+            }),
+            None => self
+                .projects
+                .values()
+                .find(|row| row.slug == owner)
+                .map(|row| DocOwner {
+                    project: row.id,
+                    item: None,
+                }),
+        }
+    }
+
+    /// MOD-150 M3 D3: `owner`'s document of `to.kind`, the named version or the latest.
+    /// `NotFound { entity: "document" }` when it has none; asked only once the owner is in reach.
+    fn resolve_document(&self, owner: DocOwner, to: &DocumentRef) -> Result<DocumentId> {
         let versions = self.owner_versions(owner, &to.kind);
         let pick = match to.version {
             Some(named) => versions.into_iter().find(|(_, version)| *version == named),
             None => versions.into_iter().max_by_key(|(_, version)| *version),
         };
-        pick.map(|(id, version)| (owner, id, version))
-            .ok_or_else(missing)
+        pick.map(|(id, _)| id).ok_or_else(|| StoreError::NotFound {
+            entity: "document",
+            id: document_ref_label(to),
+        })
     }
 
     /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, walked in memory.
@@ -9419,10 +9418,11 @@ impl State {
     }
 
     /// MOD-150 M3 D4: the upsert of a document link. Refusals run step, fence, own item, the
-    /// document (D3, the latest version when none is named), its reach (D5,
-    /// [`Self::link_reaches`]) and the single pin, before the upsert, so a tombstone's revival is
-    /// checked like an insert; a live row keeps its proposer, a tombstone revives as the step's.
-    /// The state lock serialises the pin check (D6).
+    /// owner and its reach (D5, [`Self::link_reaches`]: an owner that names nothing reads as one
+    /// outside it, R1 M1), the kind and version (D3, the latest when none is named) and the
+    /// single pin, before the upsert, so a tombstone's revival is checked like an insert; a live
+    /// row keeps its proposer, a tombstone revives as the step's. The state lock serialises the
+    /// pin check (D6).
     fn propose_document_link(
         &mut self,
         fence: StepFence,
@@ -9435,11 +9435,14 @@ impl State {
                 link.step, link.from,
             )));
         }
-        let (owner, document, _) = self.resolve_document(project, &link.to)?;
         let label = document_ref_label(&link.to);
-        if !self.link_reaches(project, owner.project) {
+        let Some(owner) = self
+            .document_owner(project, &link.to.owner)
+            .filter(|owner| self.link_reaches(project, owner.project))
+        else {
             return Err(StoreError::Constraint(document_outside_reach(&label)));
-        }
+        };
+        let document = self.resolve_document(owner, &link.to)?;
         let versions = self.owner_versions(owner, &link.to.kind);
         let pinned = self
             .artifact_links
@@ -9491,9 +9494,10 @@ impl State {
 
     /// MOD-150 M3 D4: tombstones the live document link of `link.kind` from `link.from` to any
     /// version of the owner's kind (a named version must be the pinned one) when a step of
-    /// `link.step`'s run proposed it. Refusals run step, fence, own item, the document (D3, no
-    /// latest), then `NotFound` for no matching live row and [`link_not_proposed_by_run`] for a
-    /// live row of anyone else's.
+    /// `link.step`'s run proposed it. Refusals run step, fence, own item, the owner (one that
+    /// names nothing is [`document_outside_reach`]; no reach check, as in `withdraw_link`), then
+    /// `NotFound` for no matching live row (a version that does not exist included: it is never
+    /// resolved, R1 M1) and [`link_not_proposed_by_run`] for a live row of anyone else's.
     fn withdraw_document_link(
         &mut self,
         fence: StepFence,
@@ -9506,8 +9510,10 @@ impl State {
                 link.step, link.from,
             )));
         }
-        let (owner, _, _) = self.resolve_document(project, &link.to)?;
         let label = document_ref_label(&link.to);
+        let Some(owner) = self.document_owner(project, &link.to.owner) else {
+            return Err(StoreError::Constraint(document_outside_reach(&label)));
+        };
         let versions = self.owner_versions(owner, &link.to.kind);
         let steps = &self.steps;
         let Some(row) = self.artifact_links.iter_mut().find(|row| {

@@ -390,34 +390,30 @@ async fn project_reaches(
     .map_err(map_sqlx)
 }
 
-/// MOD-150 M3 D3: whose documents a [`DocumentRef`] names, and the version it resolved to.
-struct ResolvedDocument {
-    /// `document.id` of the named version, or of the latest.
-    id: DocumentId,
+/// MOD-150 M3 D3: whose documents a [`DocumentRef`] names: an item's (`item` set), or a
+/// project's own (`item` `None`). `project` is the document rows' `project_id` either way.
+#[derive(Debug, Clone, Copy)]
+struct DocOwner {
     /// `document.project_id`.
     project: ProjectId,
-    /// `document.item_id`; `None` for an owner document.
+    /// `document.item_id`.
     item: Option<ItemId>,
 }
 
-/// MOD-150 M3 D3, in the caller's transaction so "latest" is read at write time: `to.owner` as an
-/// item key first (`item_by_key`'s rules: bare in `project`, a qualified key by its slug), else as
-/// an exact project slug (scope rows included); then the named version of `to.kind`, or the
-/// latest. `NotFound { entity: "document" }` when any part names nothing; a NUL in either text
-/// names nothing before a query sees it (Postgres would fail the parameter, `22021`).
-async fn resolve_document(
+/// MOD-150 M3 D3, in the caller's transaction: `owner` as an item key first (`item_by_key`'s
+/// rules: bare in `project`, a qualified key by its slug), else as an exact project slug (scope
+/// rows included). `None` when it names neither; the callers answer that as
+/// [`document_outside_reach`], so it reads as an owner outside the reach (R1 M1). A NUL names
+/// nothing before a query sees it (Postgres would fail the parameter, `22021`).
+async fn resolve_owner(
     conn: &mut PgConnection,
     project: ProjectId,
-    to: &DocumentRef,
-) -> Result<ResolvedDocument> {
-    let missing = || StoreError::NotFound {
-        entity: "document",
-        id: document_ref_label(to),
-    };
-    if to.owner.contains('\0') || to.kind.contains('\0') {
-        return Err(missing());
+    owner: &str,
+) -> Result<Option<DocOwner>> {
+    if owner.contains('\0') {
+        return Ok(None);
     }
-    let item = match split_qualified(&to.owner) {
+    let item = match split_qualified(owner) {
         (None, key) => sqlx::query_scalar!(
             r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
             project.as_uuid(),
@@ -425,10 +421,12 @@ async fn resolve_document(
         )
         .fetch_optional(&mut *conn)
         .await
-        .map_err(map_sqlx)?,
-        (Some(slug), key) => sqlx::query_scalar!(
+        .map_err(map_sqlx)?
+        .map(|id| (id, project)),
+        (Some(slug), key) => sqlx::query!(
             r#"
-                SELECT i.id AS "id: ItemId"
+                SELECT i.id         AS "id: ItemId",
+                       i.project_id AS "project_id: ProjectId"
                   FROM item i JOIN project p ON p.id = i.project_id
                  WHERE p.slug = $1 AND i.key = $2
                 "#,
@@ -437,21 +435,44 @@ async fn resolve_document(
         )
         .fetch_optional(&mut *conn)
         .await
-        .map_err(map_sqlx)?,
+        .map_err(map_sqlx)?
+        .map(|row| (row.id, row.project_id)),
     };
-    let owner_project = match item {
-        Some(_) => None,
-        None => Some(
-            sqlx::query_scalar!(
-                r#"SELECT id AS "id: ProjectId" FROM project WHERE slug = $1"#,
-                to.owner,
-            )
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(map_sqlx)?
-            .ok_or_else(missing)?,
-        ),
+    if let Some((item, project)) = item {
+        return Ok(Some(DocOwner {
+            project,
+            item: Some(item),
+        }));
+    }
+    Ok(sqlx::query_scalar!(
+        r#"SELECT id AS "id: ProjectId" FROM project WHERE slug = $1"#,
+        owner,
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    .map(|project| DocOwner {
+        project,
+        item: None,
+    }))
+}
+
+/// MOD-150 M3 D3, in the caller's transaction so "latest" is read at write time: `owner`'s
+/// document of `to.kind`, the named version or the latest. `NotFound { entity: "document" }`
+/// when it has none, a kind holding a NUL included; asked only once the owner is in reach.
+async fn resolve_document(
+    conn: &mut PgConnection,
+    owner: DocOwner,
+    to: &DocumentRef,
+) -> Result<DocumentId> {
+    let missing = || StoreError::NotFound {
+        entity: "document",
+        id: document_ref_label(to),
     };
+    if to.kind.contains('\0') {
+        return Err(missing());
+    }
+    let owner_project = owner.item.is_none().then_some(owner.project);
     let row = sqlx::query!(
         r#"
         SELECT id         AS "id: DocumentId",
@@ -466,7 +487,7 @@ async fn resolve_document(
          LIMIT 1
         "#,
         owner_project.map(ProjectId::as_uuid),
-        item.map(ItemId::as_uuid),
+        owner.item.map(ItemId::as_uuid),
         to.kind,
         to.version,
     )
@@ -474,11 +495,7 @@ async fn resolve_document(
     .await
     .map_err(map_sqlx)?
     .ok_or_else(missing)?;
-    Ok(ResolvedDocument {
-        id: row.id,
-        project: row.project_id,
-        item: row.item_id,
-    })
+    Ok(row.id)
 }
 
 /// MOD-150 M3 D2: the read shape of the document `item_artifact_link` row `link` pins, the
@@ -518,17 +535,20 @@ async fn linked_document_of(
 }
 
 /// MOD-150 M3 D4: [`WriteStore::propose_document_link`]'s refusals and upsert, in `conn`'s
-/// transaction after `step_scope`. Boxed by its caller for `propose_link`'s stack reason.
+/// transaction after `step_scope`: the owner and its reach (one answer for an owner that names
+/// nothing, R1 M1), then the kind and version. Boxed by its caller for `propose_link`'s stack
+/// reason.
 async fn propose_document_link_in(
     conn: &mut PgConnection,
     scope: &StepScope,
     link: &ProposeDocumentLink,
 ) -> Result<DocumentLink> {
-    let resolved = resolve_document(conn, scope.project, &link.to).await?;
     let label = document_ref_label(&link.to);
-    if !project_reaches(conn, resolved.project, scope.project).await? {
-        return Err(StoreError::Constraint(document_outside_reach(&label)));
-    }
+    let owner = match resolve_owner(conn, scope.project, &link.to.owner).await? {
+        Some(owner) if project_reaches(conn, owner.project, scope.project).await? => owner,
+        _ => return Err(StoreError::Constraint(document_outside_reach(&label))),
+    };
+    let document = resolve_document(conn, owner, &link.to).await?;
     // D6: proposals and withdrawals from one item are serialised, so two versions proposed at
     // once cannot both pass the pin check (they differ in `to_document_id`, so the unique would
     // not stop the second). `claim_command`'s statement text, as `propose_link`'s locks.
@@ -546,10 +566,10 @@ async fn propose_document_link_in(
         "#,
         link.from.as_uuid(),
         link.kind.as_str(),
-        resolved.project.as_uuid(),
-        resolved.item.map(ItemId::as_uuid),
+        owner.project.as_uuid(),
+        owner.item.map(ItemId::as_uuid),
         link.to.kind,
-        resolved.id.as_uuid(),
+        document.as_uuid(),
     )
     .fetch_optional(&mut *conn)
     .await
@@ -581,7 +601,7 @@ async fn propose_document_link_in(
         "#,
         link.from.as_uuid(),
         link.kind.as_str(),
-        resolved.id.as_uuid(),
+        document.as_uuid(),
         link.step.as_uuid(),
     )
     .fetch_one(&mut *conn)
@@ -595,14 +615,26 @@ async fn propose_document_link_in(
 }
 
 /// MOD-150 M3 D4: [`WriteStore::withdraw_document_link`] after `step_scope`, in `conn`'s
-/// transaction. Boxed by its caller, as [`propose_document_link_in`] is.
+/// transaction: the owner only (no reach check, as in `withdraw_link`; neither the kind nor the
+/// version is resolved, so one that does not exist is no live link, R1 M1). Boxed by its caller,
+/// as [`propose_document_link_in`] is.
 async fn withdraw_document_link_in(
     conn: &mut PgConnection,
     scope: &StepScope,
     link: &WithdrawDocumentLink,
 ) -> Result<DocumentLink> {
-    let resolved = resolve_document(conn, scope.project, &link.to).await?;
     let label = document_ref_label(&link.to);
+    let Some(owner) = resolve_owner(conn, scope.project, &link.to.owner).await? else {
+        return Err(StoreError::Constraint(document_outside_reach(&label)));
+    };
+    let no_live_link = || StoreError::NotFound {
+        entity: "item_artifact_link",
+        id: label.clone(),
+    };
+    if link.to.kind.contains('\0') {
+        // No kind holds one, and Postgres would fail the parameter (`22021`).
+        return Err(no_live_link());
+    }
     advisory_xact_lock(conn, format!("item_artifact_link:{}", link.from)).await?;
     // At most one live link of this kind to the owner's kind: the single pin (D4).
     let live = sqlx::query!(
@@ -620,8 +652,8 @@ async fn withdraw_document_link_in(
         "#,
         link.from.as_uuid(),
         link.kind.as_str(),
-        resolved.project.as_uuid(),
-        resolved.item.map(ItemId::as_uuid),
+        owner.project.as_uuid(),
+        owner.item.map(ItemId::as_uuid),
         link.to.kind,
         scope.run.as_uuid(),
     )
@@ -629,10 +661,7 @@ async fn withdraw_document_link_in(
     .await
     .map_err(map_sqlx)?;
     let Some(live) = live.filter(|live| link.to.version.is_none_or(|v| v == live.version)) else {
-        return Err(StoreError::NotFound {
-            entity: "item_artifact_link",
-            id: label,
-        });
+        return Err(no_live_link());
     };
     if !live.ours {
         return Err(StoreError::Constraint(link_not_proposed_by_run(&label)));
@@ -10844,8 +10873,8 @@ impl WriteStore for PgStore {
     }
 
     /// MOD-150 M3 D4: one transaction: `step_scope`, the own item, then
-    /// [`propose_document_link_in`] (resolution, reach, the item's advisory lock, the pin check,
-    /// the upsert on `uq_item_artifact_link`).
+    /// `propose_document_link_in` (the owner and its reach, the kind and version, the item's
+    /// advisory lock, the pin check, the upsert on `uq_item_artifact_link`).
     ///
     /// # Errors
     ///
@@ -10868,8 +10897,8 @@ impl WriteStore for PgStore {
     }
 
     /// MOD-150 M3 D4: one transaction: `step_scope`, the own item, then
-    /// [`withdraw_document_link_in`] (resolution without the latest, the item's advisory lock,
-    /// the live link, its proposer, the tombstone).
+    /// `withdraw_document_link_in` (the owner, the item's advisory lock, the live link, its
+    /// proposer, the tombstone).
     ///
     /// # Errors
     ///

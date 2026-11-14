@@ -7898,7 +7898,12 @@ async fn migration_0034_creates_item_artifact_link() {
         (
             "idx_item_artifact_link_document",
             "CREATE INDEX idx_item_artifact_link_document ON public.item_artifact_link \
-             USING btree (to_document_id) WHERE (deleted_at IS NULL)",
+             USING btree (to_document_id)",
+        ),
+        (
+            "idx_item_artifact_link_step",
+            "CREATE INDEX idx_item_artifact_link_step ON public.item_artifact_link \
+             USING btree (proposed_by_step_id)",
         ),
     ] {
         let actual: String = sqlx::query_scalar(
