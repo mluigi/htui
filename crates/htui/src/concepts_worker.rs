@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
-use htui_core::model::Scope;
+use htui_core::model::{Scope, WorkspaceId};
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
 use htui_core::store::{MemStore, StoreError};
 use htui_store::embed::{DENSE_DIM, RtenEmbedder};
@@ -44,11 +44,14 @@ pub const REQUEST_NAMES: [&str; 3] = ["search_concepts", "index_concepts", "prob
 /// to show and never becomes `StoreReply::Failed`, which the shell also puts on the status line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConceptsReply {
-    /// Answer to `SearchConcepts`. `query` is the request's own, so a list is matched to the
-    /// search it answers.
+    /// Answer to `SearchConcepts`. `query` and `scope_row_of` are the request's own, so a list is
+    /// matched to the search it answers.
     Hits {
         /// The search this answers.
         query: SearchQuery,
+        /// The request's `scope_row_of` (MOD-147 M4 R1 M1): a one-member workspace's "all
+        /// projects" search and its member's alone send the same query and differ only here.
+        scope_row_of: Option<WorkspaceId>,
         /// The hits, best first, or why there are none.
         outcome: Result<Vec<Hit>, String>,
     },
@@ -1242,6 +1245,7 @@ impl ConceptsRuntime {
                     return ConceptsServed::Reply(StoreReply::Concepts(Box::new(
                         ConceptsReply::Hits {
                             query: query.clone(),
+                            scope_row_of: *scope_row_of,
                             outcome: Ok(Vec::new()),
                         },
                     )));
@@ -1250,7 +1254,7 @@ impl ConceptsRuntime {
                     (backend.clone(), query.clone(), *scope_row_of);
                 tokio::spawn(async move {
                     // MOD-147 M4 D8: widened here, off the loop; the reply keeps the request's
-                    // own query, so the overlay's match on it is unchanged.
+                    // own query and scope row (R1 M1), so the overlay matches it to its search.
                     let searched = match scope_row_of {
                         Some(workspace_id) => {
                             let members = Scope {
@@ -1267,7 +1271,11 @@ impl ConceptsRuntime {
                         None => query.clone(),
                     };
                     let outcome = index.search(searched).await;
-                    let reply = ConceptsReply::Hits { query, outcome };
+                    let reply = ConceptsReply::Hits {
+                        query,
+                        scope_row_of,
+                        outcome,
+                    };
                     let _ = replies.send(ReplyEnvelope {
                         seq,
                         origin,
@@ -1437,7 +1445,15 @@ mod tests {
 
     fn hits(reply: &StoreReply) -> (&SearchQuery, &Result<Vec<Hit>, String>) {
         match concepts_reply(reply) {
-            ConceptsReply::Hits { query, outcome } => (query, outcome),
+            ConceptsReply::Hits { query, outcome, .. } => (query, outcome),
+            other @ ConceptsReply::Indexed(_) => panic!("expected hits, got {other:?}"),
+        }
+    }
+
+    /// The `scope_row_of` a search's reply echoes (MOD-147 M4 R1 M1).
+    fn echoed_scope_row(reply: &StoreReply) -> Option<WorkspaceId> {
+        match concepts_reply(reply) {
+            ConceptsReply::Hits { scope_row_of, .. } => *scope_row_of,
             other @ ConceptsReply::Indexed(_) => panic!("expected hits, got {other:?}"),
         }
     }
@@ -1745,6 +1761,11 @@ mod tests {
             .await;
             assert_eq!(replies.len(), 1);
             assert_eq!(hits(&replies[0].reply).0, &query, "the request's own query");
+            assert_eq!(
+                echoed_scope_row(&replies[0].reply),
+                Some(scope.workspace_id),
+                "and its own scope row (MOD-147 M4 R1 M1)"
+            );
             assert!(finds_goals(&replies[0].reply), "{:?}", replies[0].reply);
         }
 
@@ -1762,7 +1783,27 @@ mod tests {
         )
         .await;
         assert_eq!(hits(&replies[0].reply).0, &query);
+        assert_eq!(echoed_scope_row(&replies[0].reply), None);
         assert!(!finds_goals(&replies[0].reply), "{:?}", replies[0].reply);
+
+        // MOD-147 M4 R1 M1: a search answered without a task echoes its scope row too.
+        let none = concepts::query("zircon", scope.project_ids.clone(), false, 0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime.serve(
+            &backend,
+            &tx,
+            &envelope(
+                4,
+                StoreRequest::SearchConcepts {
+                    query: none,
+                    scope_row_of: Some(scope.workspace_id),
+                },
+            ),
+        );
+        let ConceptsServed::Reply(reply) = served else {
+            panic!("a limit of 0 is answered at once: {served:?}")
+        };
+        assert_eq!(echoed_scope_row(&reply), Some(scope.workspace_id));
     }
 
     /// MOD-147 M4 D8: an index run with `scope_row_of` indexes the scope row's points too, and one
@@ -1862,6 +1903,16 @@ mod tests {
         let (echoed, outcome) = hits(&reply);
         assert_eq!(echoed, &query);
         assert_eq!(outcome, &Err(NOT_AVAILABLE.to_owned()));
+        // MOD-147 M4 R1 M1: the scope row is echoed as asked.
+        let reply = store_worker::serve(
+            &backend,
+            &StoreRequest::SearchConcepts {
+                query: query.clone(),
+                scope_row_of: Some(scope.workspace_id),
+            },
+        )
+        .await;
+        assert_eq!(echoed_scope_row(&reply), Some(scope.workspace_id));
 
         let reply = store_worker::serve(
             &backend,

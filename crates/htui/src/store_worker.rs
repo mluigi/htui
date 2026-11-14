@@ -2742,12 +2742,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
         // belongs to a caller with none (the harness default), and is answered in the overlay's
         // own reply (D232).
-        StoreRequest::SearchConcepts { query, .. } => {
-            StoreReply::Concepts(Box::new(ConceptsReply::Hits {
-                query: query.clone(),
-                outcome: Err(concepts_worker::NOT_AVAILABLE.to_owned()),
-            }))
-        }
+        StoreRequest::SearchConcepts {
+            query,
+            scope_row_of,
+        } => StoreReply::Concepts(Box::new(ConceptsReply::Hits {
+            query: query.clone(),
+            scope_row_of: *scope_row_of,
+            outcome: Err(concepts_worker::NOT_AVAILABLE.to_owned()),
+        })),
         StoreRequest::IndexConcepts { .. } => StoreReply::Concepts(Box::new(
             ConceptsReply::Indexed(Err(concepts_worker::NOT_AVAILABLE.to_owned())),
         )),
@@ -4233,6 +4235,7 @@ mod tests {
         };
         let ConceptsReply::Hits {
             query: echoed,
+            scope_row_of: None,
             outcome: Err(error),
         } = concepts.as_ref()
         else {

@@ -450,22 +450,20 @@ impl Overlay for ConceptsSearch {
         Handled::Consumed
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
         let StoreReply::Concepts(reply) = reply else {
             return;
         };
         match &**reply {
-            ConceptsReply::Hits { query, outcome } => {
-                // A list answers the search it echoes; any other is an older one's.
-                if self.sent.as_ref() != Some(query) {
-                    return;
-                }
-                // MOD-147 M4 R1 M1: the reply echoes the query alone, not the scope row. Sent
-                // with another scope row than the overlay's now (`Ctrl+P` since), it answers a
-                // scope no longer shown: its hits go, nothing is in flight, and `Enter` searches.
-                if self.sent_scope_row != self.scope_row_of(ctx.scope) {
-                    self.searching = false;
-                    self.sent = None;
+            ConceptsReply::Hits {
+                query,
+                scope_row_of,
+                outcome,
+            } => {
+                // A list answers the search it echoes, query and scope row (MOD-147 M4 R1 M1);
+                // any other is an older one's, such as a one-member workspace's "all projects"
+                // search answered after `Ctrl+P` sent the same query for its member alone.
+                if self.sent.as_ref() != Some(query) || self.sent_scope_row != *scope_row_of {
                     return;
                 }
                 self.searching = false;
@@ -926,19 +924,42 @@ mod tests {
             .collect()
     }
 
+    /// Every `SearchConcepts` the overlay emitted since the last call, with its `scope_row_of`:
+    /// what a reply to it echoes (MOD-147 M4 R1 M1).
+    fn sent_searches(bench: &Bench) -> Vec<(SearchQuery, Option<WorkspaceId>)> {
+        bench
+            .emit
+            .take()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::SearchConcepts {
+                    query,
+                    scope_row_of,
+                }) => Some((query, scope_row_of)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reply to `sent` with `outcome`, echoing its query and scope row.
+    fn answer(
+        sent: &(SearchQuery, Option<WorkspaceId>),
+        outcome: Result<Vec<Hit>, String>,
+    ) -> ConceptsReply {
+        ConceptsReply::Hits {
+            query: sent.0.clone(),
+            scope_row_of: sent.1,
+            outcome,
+        }
+    }
+
     /// Types `text`, presses `Enter` and answers the one search it sent with `hits`.
     fn searched(bench: &Bench, search: &mut ConceptsSearch, text: &str, hits: Vec<Hit>) {
         bench.typed(search, text);
         bench.code(search, KeyCode::Enter);
-        let sent = searches(bench);
+        let sent = sent_searches(bench);
         assert_eq!(sent.len(), 1, "one search per Enter: {sent:?}");
-        bench.reply(
-            search,
-            ConceptsReply::Hits {
-                query: sent[0].clone(),
-                outcome: Ok(hits),
-            },
-        );
+        bench.reply(search, answer(&sent[0], Ok(hits)));
     }
 
     /// Types `text`, presses `Enter` and fails the one search it sent with `error`; the search
@@ -951,16 +972,10 @@ mod tests {
     ) -> Vec<SearchQuery> {
         bench.typed(search, text);
         bench.code(search, KeyCode::Enter);
-        let sent = searches(bench);
+        let sent = sent_searches(bench);
         assert_eq!(sent.len(), 1, "one search per Enter: {sent:?}");
-        bench.reply(
-            search,
-            ConceptsReply::Hits {
-                query: sent[0].clone(),
-                outcome: Err(error.to_owned()),
-            },
-        );
-        sent
+        bench.reply(search, answer(&sent[0], Err(error.to_owned())));
+        sent.into_iter().map(|(query, _)| query).collect()
     }
 
     /// The row of `frame` that draws `text`.
@@ -1056,35 +1071,85 @@ mod tests {
         assert_eq!(sent, [(vec![ids::PROJECT_HTUI], None)]);
     }
 
-    /// MOD-147 M4 R1 M1: the reply to an "all projects" search that lands after `Ctrl+P` dropped
-    /// the scope row answers a scope the overlay no longer shows: its hits are dropped and `Enter`
-    /// searches the member alone.
+    /// MOD-147 M4 R1 M1: the reply to an "all projects" search that lands after `Ctrl+P` alone
+    /// answers the search the overlay last sent: its hits are shown as stale, and `Enter`
+    /// searches the member without the scope row rather than opening one of them.
     #[test]
-    fn a_reply_to_the_all_projects_search_after_a_cycle_is_dropped() {
+    fn a_reply_to_the_all_projects_search_after_a_cycle_reads_as_changed() {
         let bench = one_member();
         let mut search = ConceptsSearch::new();
         bench.typed(&mut search, "goals");
         bench.code(&mut search, KeyCode::Enter);
-        let sent = searches(&bench);
-        assert_eq!(sent.len(), 1);
+        let all = sent_searches(&bench);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1, Some(ids::WORKSPACE_PLATFORM));
 
         bench.ctrl(&mut search, 'p');
-        bench.reply(
-            &mut search,
-            ConceptsReply::Hits {
-                query: sent[0].clone(),
-                outcome: Ok(vec![item_hit()]),
-            },
+        bench.reply(&mut search, answer(&all[0], Ok(vec![item_hit()])));
+        assert_eq!(search.hits, [item_hit()], "its own search's answer");
+        assert!(
+            bench.render(&search).contains(&changed(Some("Enter"))),
+            "the list is stale"
         );
-        assert!(search.hits.is_empty(), "the hits of another scope");
-        assert!(!search.searching, "nothing left in flight for this scope");
 
         bench.code(&mut search, KeyCode::Enter);
-        assert_eq!(
-            scope_rows(&bench),
-            [(vec![ids::PROJECT_HTUI], None)],
-            "Enter searched rather than opened"
+        let emitted = bench.emit.take();
+        assert!(
+            !emitted
+                .iter()
+                .any(|action| matches!(action, Action::Reveal(_))),
+            "nothing revealed: {emitted:?}"
         );
+        assert!(
+            emitted.iter().any(|action| matches!(
+                action,
+                Action::Store(StoreRequest::SearchConcepts {
+                    scope_row_of: None,
+                    ..
+                })
+            )),
+            "Enter searched the member alone: {emitted:?}"
+        );
+    }
+
+    /// MOD-147 M4 R1 M1: "all projects" sent, then `Ctrl+P` and `Enter` send the same query
+    /// without the scope row. The late "all projects" reply lands first and is dropped, as the
+    /// reply echoes the scope row it searched; the member's own reply is then taken.
+    #[test]
+    fn a_late_all_projects_reply_does_not_answer_the_members_search() {
+        let bench = one_member();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "goals");
+        bench.code(&mut search, KeyCode::Enter);
+        let all = sent_searches(&bench);
+        bench.ctrl(&mut search, 'p');
+        bench.code(&mut search, KeyCode::Enter);
+        let member = sent_searches(&bench);
+        assert_eq!(member.len(), 1);
+        assert_eq!(member[0].0, all[0].0, "the same query");
+        assert_eq!(
+            (all[0].1, member[0].1),
+            (Some(ids::WORKSPACE_PLATFORM), None)
+        );
+
+        let goals = htui_core::model::DocumentId::new();
+        let owned = Hit {
+            point_type: PointType::Document,
+            owner: Owner::Document(goals),
+            key: "@platform".to_owned(),
+            document: Some((goals, "goals".to_owned())),
+            ..item_hit()
+        };
+        bench.reply(&mut search, answer(&all[0], Ok(vec![owned])));
+        assert!(
+            search.hits.is_empty(),
+            "the workspace's hits are not the member's"
+        );
+        assert!(search.searching, "still waiting for its own answer");
+
+        bench.reply(&mut search, answer(&member[0], Ok(vec![item_hit()])));
+        assert_eq!(search.hits, [item_hit()]);
+        assert!(!search.searching);
     }
 
     /// MOD-147 M4 D9: a workspace with no member projects still has its scope row to search and
@@ -1153,6 +1218,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Ok(vec![item_hit()]),
             },
         );
@@ -1349,6 +1415,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: concepts::query("other", vec![ids::PROJECT_HTUI], false, 10),
+                scope_row_of: None,
                 outcome: Ok(vec![item_hit()]),
             },
         );
@@ -1487,6 +1554,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Err("qdrant: refused".to_owned()),
             },
         );
@@ -1504,6 +1572,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Ok(vec![item_hit()]),
             },
         );
@@ -1531,6 +1600,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Ok(vec![item_hit()]),
             },
         );
@@ -1588,6 +1658,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Ok(Vec::new()),
             },
         );
@@ -1977,6 +2048,7 @@ mod tests {
             &mut search,
             ConceptsReply::Hits {
                 query: sent[0].clone(),
+                scope_row_of: None,
                 outcome: Err("cannot reach Qdrant: refused".to_owned()),
             },
         );
