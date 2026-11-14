@@ -834,7 +834,7 @@ pub const REQUEST_NAMES: [&str; 13] = [
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 32] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -861,6 +861,7 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
+        requirement_child_counters,
         requirements,
         requirement_revisions,
         item_requirements,
@@ -897,6 +898,11 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
             requirement_key_counters,
             "requirement key counter",
             "requirement key counters",
+        ),
+        (
+            requirement_child_counters,
+            "requirement child counter",
+            "requirement child counters",
         ),
         (requirements, "requirement", "requirements"),
         (
@@ -1099,7 +1105,7 @@ mod tests {
 
     /// MOD-38 (blueprint F1): the six requirement tables a project delete cascades are named in
     /// the warning, after `documents` and in field order, with `item_requirement` read as
-    /// citations.
+    /// citations. MOD-149's `requirement_child_counter` follows the key counters.
     #[test]
     fn reach_parts_names_the_requirement_tables() {
         let reach = DeleteReach {
@@ -1108,6 +1114,7 @@ mod tests {
             requirement_specs: 1,
             requirement_areas: 2,
             requirement_key_counters: 2,
+            requirement_child_counters: 1,
             requirements: 3,
             requirement_revisions: 4,
             item_requirements: 6,
@@ -1121,12 +1128,13 @@ mod tests {
                 "1 requirement spec".to_owned(),
                 "2 requirement areas".to_owned(),
                 "2 requirement key counters".to_owned(),
+                "1 requirement child counter".to_owned(),
                 "3 requirements".to_owned(),
                 "4 requirement revisions".to_owned(),
                 "6 citations".to_owned(),
             ]
         );
-        assert_eq!(reach_totals(&reach), (32, 8));
+        assert_eq!(reach_totals(&reach), (33, 9));
     }
 
     /// MOD-115 M3 RV2 (MOD-83): one of a thing reads singular (`1 workspace link`, `1 link`),
