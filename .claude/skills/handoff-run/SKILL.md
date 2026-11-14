@@ -1,16 +1,17 @@
 ---
 name: handoff-run
-description: "Run a HANDOFF.md item through its full lifecycle from one command: select (explicit ID, or `next` to resolve the logically next item and ask the maintainer on a tie), route (PRD/plan/ANA), confirm with maintainer, execute the chain (plan-prd, plan, task briefs, implementers, configured reviewer), then apply HANDOFF/DECISIONS bookkeeping per workflow-docs.md and validate it. Trigger: /handoff-run <ITEM-ID>|next [--dry-run]."
+description: "Run a HANDOFF.md item through its full lifecycle from one command: select (explicit ID, or `next` to resolve the logically next item and ask the maintainer on a tie), route (PRD/plan/ANA) and take the recommended path without a confirm, execute the chain (plan-prd, plan, task briefs, implementers, configured reviewer), then apply HANDOFF/DECISIONS bookkeeping per workflow-docs.md and validate it. Trigger: /handoff-run <ITEM-ID>|next [--dry-run]."
 ---
 
 # /handoff-run
 
-One command per HANDOFF item lifecycle. Auto-chain with the maintainer present — every gate below stays interactive.
+One command per HANDOFF item lifecycle. Auto-chain with the maintainer present — the run stops only to ask a question (listed under Hard rules); it never
+waits for a plain confirm of the selection, the route or the plan.
 
 ## Usage
 
 ```
-/handoff-run MOD-4            # route + confirm + execute full lifecycle
+/handoff-run MOD-4            # route + execute full lifecycle, no confirms (stops only on questions)
 /handoff-run next             # pick the logically next item, then the same lifecycle
 /handoff-run ANA-5 --dry-run  # routing verdict only, nothing executes
 /handoff-run next --dry-run   # selection block + routing verdict only, nothing executes
@@ -33,7 +34,7 @@ fact-check), `architect`, `implementer` (implementers and repairs), `verifier`, 
 
 An unknown stage or model name is a usage error: stop and say so, never guess. Print the resolved table in the
 routing verdict (step 2) on a line `Models: implementer=sonnet (--model), others inherit`, so the maintainer
-confirms it with the route. Apply it by passing `model` on that stage's `Agent` call, and `args.models` to
+sees what each stage runs on. Apply it by passing `model` on that stage's `Agent` call, and `args.models` to
 `scripts/task-lane.js`; a stage that inherits gets no `model` at all. The selection subagent of step 1.5 is not a
 stage and keeps its own rule. A stage that fails on its model (quota, 402) is reported and re-run on the session
 model only after the maintainer agrees: a silent fallback would spoil the comparison the override was for.
@@ -105,7 +106,7 @@ this one `Agent` call is overridden.
 The subagent has **no authority**: it never asks the maintainer, never routes, never writes files, never picks a
 winner across a §4 ambiguity.
 
-**Session model resumes here.** Print the returned selection block. `Ask: yes` → put the tied candidates to the
+**Session model resumes here.** Print the returned selection block. `Ask: no` → go straight on to step 2: the block is shown, not confirmed. `Ask: yes` → put the tied candidates to the
 maintainer — **ties that only file order would break are asked, never guessed**. Subagent unavailable, or its block
 malformed / contradicting the script output → redo the step inline on the session model; the override is an
 optimization, never a dependency.
@@ -118,19 +119,25 @@ explicit ID; the selected item is what step 2 routes.
 Apply `references/routing.md`. Print the verdict block (path, criteria fired, reasoning) — format per `references/routing.md`.
 
 - `--dry-run` → stop here.
-- Otherwise **wait for the maintainer**: accept, or override the path. Never start executing on an unconfirmed verdict.
+- Otherwise **do not wait**: the verdict's path is accepted and step 3 starts at once, with its `Ultracode` and `Models`
+  lines applied as printed. Every path is accepted as recommended (ANA, PRD or plan), a recommended `Ultracode` included, a
+  low-confidence verdict and an ANA prefix-mismatch re-mint too; the verdict's `Reasoning` says so when it is a close call.
+  The maintainer can still interrupt and name another path.
 
 ### 3. Execute the path
 
 | Path     | Chain                                                                                                                                                                                                                                                                                        |
 |----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **ANA**  | Research the question (graphify first for codebase questions; web where relevant) → write `docs/ANA-N.md` (prior art, options, verdict, phasing — mirror existing ANA docs) → no implementation. A concluding verdict that spawns `MOD-N` items opens them per `references/lifecycle.md` P0. Verdict recommended the **research** phase for ultracode (and the maintainer accepted) → run the survey as one Workflow-tool script (multi-modal sweep: per-repo/per-backend readers + web survey in parallel, every code-exploration prompt carrying the graphify-first rule); one agent still writes the ANA doc from the sweep's returns. |
-| **PRD**  | `plan-prd` (open questions surfaced to maintainer) → `plan` on the PRD → plan fact-check → CONFIRM gate → implementation phase below.                                                                                                                                                |
-| **plan** | `plan` with the HANDOFF item text as input → plan fact-check → CONFIRM gate → implementation phase below.                                                                                                                                                                                |
+| **PRD**  | `plan-prd` (open questions surfaced to maintainer) → `plan` on the PRD → plan fact-check → implementation phase below.                                                                                                                                                |
+| **plan** | `plan` with the HANDOFF item text as input → plan fact-check → implementation phase below.                                                                                                                                                                                |
 
-### 3.5 Plan fact-check (PRD/plan paths, before CONFIRM)
+The `plan` skill's own "WAIT for CONFIRM" is waived when it runs from here: say so in its prompt. A plan that raises
+open questions of its own is the one reason for it to stop and ask the maintainer (as `plan-prd` already does).
 
-A plan asserts facts about the world; the CONFIRM gate must be offered over checked facts, not prose. Before CONFIRM,
+### 3.5 Plan fact-check (PRD/plan paths, before implementation)
+
+A plan asserts facts about the world; implementation must start from checked facts, not prose. Before it,
 extract every verifiable claim the plan makes and verify each against the tree:
 
 - **Tree facts** (compile flags present, call-site counts, existing guards/attributes) — grep/read; seconds each.
@@ -139,18 +146,18 @@ extract every verifiable claim the plan makes and verify each against the tree:
 - **Task independence** — tasks the plan marks independent must each list their touched files; verify by intersecting
   the sets. A task marked independent without a file list **fails** the check.
 
-Falsified claims amend the plan before the maintainer sees it; record all verdicts in a "verified claims" table inside
+Falsified claims amend the plan before implementation starts; one that cannot be amended is a question for the maintainer; record all verdicts in a "verified claims" table inside
 the plan artifact (columns: claim | verdict | evidence). The step is unconditional — only its execution shape
 varies: claim checks are independent of each other, so when numerous they may run as one Workflow-tool fan-out (no
 routing trigger needed).
 
-### 4. Implementation phase (PRD/plan paths, after CONFIRM)
+### 4. Implementation phase (PRD/plan paths, after the fact-check)
 
 Cost rule behind every step here: an agent pays for its whole context on every turn, so each agent gets the smallest
 text that specifies its job, runs the smallest check that proves it, and is spawned only where it is the one that
 catches the defect. Review authority sits in one place, the review gate.
 
-1. **Plan carries the design.** The confirmed plan's task sections must each stand alone: files owned, the types and
+1. **Plan carries the design.** The fact-checked plan's task sections must each stand alone: files owned, the types and
    signatures to add or change, the tests to write, and the task's own check command (crate-scoped, never the
    workspace gate). Shared decisions sit in one short section. A plan that lacks this is amended before sub-step 2, not
    patched by an architect.
@@ -165,10 +172,10 @@ catches the defect. Review authority sits in one place, the review gate.
    serial (or in isolated worktrees when the split is worth it).
    - **Light shape** (the plan has at most two tasks, or touches about five files or fewer): one implementer per
      task as a plain `Agent` call from its brief. No workflow.
-   - **Lane shape** (everything else, and whenever the confirmed verdict recommends ultracode for **implement**):
+   - **Lane shape** (everything else, and whenever the accepted verdict recommends ultracode for **implement**):
      run `scripts/task-lane.js` through the Workflow tool with `scriptPath` and `args` (the header of the script
      documents them). One run takes one lane of serial tasks on one checkout; parallel lanes are concurrent runs in
-     separate worktrees. The confirmed verdict is the orchestration opt-in; one implementer per task, never more
+     separate worktrees. The accepted verdict is the orchestration opt-in; one implementer per task, never more
      agents than the plan has tasks plus the verifiers below.
    - **Verifier, by exception.** A task gets one read-only verifier (conformance and breakage in one agent, over
      the task's own commit range) only when it is a **foundation** task that later tasks build on, or a
@@ -216,8 +223,8 @@ catches the defect. Review authority sits in one place, the review gate.
 
 Set by `scripts/hr` (TOOL-7; user guide `docs/hr-sandbox.md`). The session runs in a private clone on
 branch `hr/$HR_ITEM`, with its own Postgres and Qdrant on the usual `localhost` ports, no Docker and no
-git credentials. These overrides apply; everything else in this file — every maintainer gate and the
-reviewer gate included — is unchanged.
+git credentials. These overrides apply; everything else in this file — every question stop and the
+review gate included — is unchanged.
 
 - **Steps 1 / 1.5 — the item is `$HR_ITEM`.** `next`, or a bare `/handoff-run`, resolves to it with no
   selection subagent. A different ID is asked, never followed silently: the item was chosen on the host
@@ -244,16 +251,17 @@ reviewer gate included — is unchanged.
 
 ## Hard rules
 
-- Maintainer gates that never disappear: routing confirm (step 2), `plan` CONFIRM, PRD open questions, deliberate
-  push.
-- CONFIRM is only offered over a fact-checked plan (step 3.5); implementer fan-out never trusts prose independence —
+- No confirm gates: the selection, the route and the plan are shown and acted on, never waited on. The run stops only
+  to ask a question: an unbreakable `next` tie, a PRD open question or one the plan raises, a falsified plan claim that cannot be amended, a missing `reviewer` key, a sandbox ID or
+  sibling-title question, a stage that fails on its model, and a deliberate push.
+- Implementation starts only from a fact-checked plan (step 3.5); implementer fan-out never trusts prose independence —
   file-set intersection decides.
 - Implementers and verifiers read their task brief, not the plan; no agent runs the workspace gate; the configured
   reviewer is the one review authority and runs once per item (step 4).
 - `next` selects, it never invents: only open checklist lines in the current repo are candidates, a blocked item is
-  never auto-selected, and a tie that only file order would break is asked. Selection is a separate confirm from
-  routing — printing the selection block does not consume the step-2 gate. The Sonnet 5 selection subagent drafts
-  the block only; asking, confirming, and every later gate stay on the session model's main thread.
+  never auto-selected, and a tie that only file order would break is asked. Selection is shown, not
+  confirmed, unless it is a tie. The Sonnet 5 selection subagent drafts the block only; asking and every later
+  decision stay on the session model's main thread.
 - ANA path never writes implementation code.
 - **Windows runs the `.ps1` variant of every script this skill names, and of every script git runs on
   its behalf** (see the References note). Never `bash …/*.sh` on this platform.

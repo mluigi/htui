@@ -4,7 +4,8 @@ How `next` resolves to exactly one item ID. Only used when the argument is the l
 explicit `<ITEM-ID>` skips this file entirely and goes straight to `routing.md`.
 
 Selection answers *which item*; routing answers *how to run it*. They are separate steps and the
-maintainer confirms both (selection block, then routing verdict — see `SKILL.md` steps 1.5 and 2).
+maintainer sees both (selection block, then routing verdict — see `SKILL.md` steps 1.5 and 2); neither is
+confirmed, and only a tie is asked.
 
 A maintainer is present, so an unresolved tie is a **question**, never a coin-flip. `next` never picks
 by file order when a real choice exists — step 4 is where that choice is put to the maintainer.
@@ -120,7 +121,7 @@ Work lives in: engine — MOD-10 and 5 others; reach it with `cd engine && /hand
 ```
 
 Then continue to step 2 of `SKILL.md` — routing runs on the selected item unchanged, and its
-verdict block is printed and confirmed as usual. The maintainer may reject the selection and name a
+verdict block is printed and acted on as usual. The maintainer may reject the selection and name a
 different ID; that override is taken without argument, exactly like a routing override.
 
 `--dry-run` with `next` prints the selection block **and** the routing verdict, then stops.
