@@ -161,7 +161,10 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
 
 /// MOD-160 D9: the worker's start check of `source`'s Qdrant, logged once by [`start_line`].
 async fn start_check(source: Arc<QdrantSource>) {
-    let check = concepts_worker::check_qdrant(&source, htui_store::vector::COLLECTION).await;
+    // MOD-159 M1 plan D11: the global collection, the one every box shares.
+    let check =
+        concepts_worker::check_qdrant(&source, &htui_core::model::IndexedCollection::Global.name())
+            .await;
     match start_line(check.as_ref()) {
         Some((tracing::Level::WARN, line)) => tracing::warn!("{line}"),
         Some((_, line)) => tracing::info!("{line}"),

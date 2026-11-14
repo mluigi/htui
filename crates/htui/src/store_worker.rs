@@ -1025,6 +1025,9 @@ pub enum StoreRequest {
         /// MOD-147 M4 D8: `Some(ws)` also searches that workspace's scope row, resolved off the
         /// loop (`vector_sync::workspace_search_scope`); `None` searches `query.projects` alone.
         scope_row_of: Option<WorkspaceId>,
+        /// MOD-159 M1 D9: the workspace whose collection is searched (with the global one); the
+        /// nil startup workspace searches nothing.
+        workspace: WorkspaceId,
     },
     /// MOD-64 D237: `Indexer::sync` over `scope`'s projects, on the runtime's task. Answered with
     /// [`StoreReply::Concepts`].
@@ -2745,6 +2748,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::SearchConcepts {
             query,
             scope_row_of,
+            ..
         } => StoreReply::Concepts(Box::new(ConceptsReply::Hits {
             query: query.clone(),
             scope_row_of: *scope_row_of,
@@ -4206,6 +4210,7 @@ mod tests {
                 StoreRequest::SearchConcepts {
                     query: query.clone(),
                     scope_row_of: None,
+                    workspace: scope.workspace_id,
                 },
             ),
             (2, StoreRequest::BoxInfo),
@@ -4311,6 +4316,7 @@ mod tests {
     impl concepts_worker::ConceptIndex for UrlChanges {
         fn search(
             &self,
+            _: concepts_worker::SearchIn,
             _: SearchQuery,
         ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
             Box::pin(async { Ok(Vec::new()) })
@@ -4318,7 +4324,9 @@ mod tests {
         fn sync(
             &self,
             _: Backend,
+            _: htui_core::model::IndexedCollection,
             _: Scope,
+            _: Box<dyn concepts_worker::DeleteGuardDyn>,
         ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
         {
             Box::pin(async { Ok(Default::default()) })
@@ -4424,6 +4432,7 @@ mod tests {
     impl concepts_worker::ConceptIndex for Publishes {
         fn search(
             &self,
+            _: concepts_worker::SearchIn,
             _: SearchQuery,
         ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
             Box::pin(async { Ok(Vec::new()) })
@@ -4431,7 +4440,9 @@ mod tests {
         fn sync(
             &self,
             _: Backend,
+            _: htui_core::model::IndexedCollection,
             _: Scope,
+            _: Box<dyn concepts_worker::DeleteGuardDyn>,
         ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
         {
             Box::pin(async { Ok(Default::default()) })

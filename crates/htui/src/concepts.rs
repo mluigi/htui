@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
+use htui_core::model::{IndexedCollection, ProjectId, RequirementState, Resolution, Scope};
 use htui_core::store::{MemStore, ReadStore, StoreError};
 use htui_store::embed::DenseEmbedder;
 use htui_store::embed::RtenEmbedder;
@@ -32,10 +32,10 @@ use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::secret::QdrantEnv;
 use htui_store::vector::{
-    COLLECTION, EMBEDDER_MISMATCH, ExistingCollection, Hit, PointType, QdrantStore, SearchQuery,
-    VectorStore, is_embedder_mismatch, is_qdrant_refused, is_query_embed_failure,
+    EMBEDDER_MISMATCH, ExistingCollection, Hit, PointType, QdrantStore, SearchQuery, VectorStore,
+    is_embedder_mismatch, is_qdrant_refused, is_query_embed_failure,
 };
-use htui_store::vector_sync::{Indexer, SyncReport, workspace_search_scope};
+use htui_store::vector_sync::{Indexer, SyncReport, Unguarded, workspace_search_scope};
 use htui_store::{HeadlessError, Identity, PgStore, identity, secret};
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -122,7 +122,8 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     .await
     .map_err(|why| anyhow::anyhow!("{why}"))?;
     let embedder = load_embedder().await?;
-    let store = QdrantStore::connect(&settings, embedder)
+    // MOD-159 M1: the global collection until T5 indexes each workspace's under its lease.
+    let store = QdrantStore::connect(&settings, embedder, &IndexedCollection::Global)
         .await
         .map_err(qdrant_refusal)?;
     Ok((pg, store))
@@ -262,7 +263,7 @@ pub async fn sync_all(
 ) -> Result<SyncReport, StoreError> {
     let mut report = SyncReport::default();
     for scope in scopes {
-        report += Indexer::sync(read, scope, vectors).await?;
+        report += Indexer::sync(read, scope, vectors, &Unguarded).await?;
     }
     Ok(report)
 }
@@ -488,7 +489,8 @@ pub(crate) fn spawn_index_job_over(
         let settings = Arc::clone(models.source());
         let open = |resolved: QdrantSettings| {
             let models = Arc::clone(&models);
-            async move { models.connect(resolved).await }
+            // MOD-159 M1: the global collection until T5's per-collection job (plan D7).
+            async move { models.connect(resolved, &IndexedCollection::Global).await }
         };
         let forget = |store: Option<&Arc<_>>| models.forget(store);
         match index_job(&pg, &settings, open, forget).await {}
@@ -542,10 +544,12 @@ pub async fn search_items(options: &SearchOptions) -> Result<(), StateExit> {
         },
         Ok((dsn, identity)) => {
             let env = QdrantEnv::from_process();
+            // MOD-159 M1: the global collection until T5 searches each workspace's (plan D9).
+            let global = IndexedCollection::Global.name();
             let ctx = SearchContext {
                 env: &env,
                 keyring_key: secret::get_qdrant_api_key,
-                collection: COLLECTION,
+                collection: &global,
                 dsn: &dsn,
                 identity: identity.as_ref(),
                 connect_timeout: CONNECT_TIMEOUT,
@@ -566,7 +570,7 @@ pub struct SearchContext<'a> {
     pub env: &'a QdrantEnv,
     /// The keyring read of the Qdrant API key: `secret::get_qdrant_api_key`, or a test's closure.
     pub keyring_key: concepts_worker::KeyringRead,
-    /// The collection searched: [`COLLECTION`], or a test's throwaway one.
+    /// The collection searched: `htui_global` until MOD-159 M1 T5, or a test's throwaway one.
     pub collection: &'a str,
     /// The Postgres DSN.
     pub dsn: &'a str,
@@ -1313,6 +1317,7 @@ mod tests {
             requirements_unchanged: 4,
             points_upserted: 5,
             points_deleted: 6,
+            abandoned: false,
         };
         assert_eq!(
             report_line(&report),
