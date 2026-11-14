@@ -65,6 +65,7 @@ use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
+use crate::worker_log::ship::retention_days;
 use chrono::{DateTime, Utc};
 use crossterm::event::KeyEvent;
 
@@ -1104,7 +1105,7 @@ impl SettingsSection for PromptSection {
                 theme,
             ),
             // There is no empty case below this one: the `App` group is always the registry's
-            // thirteen.
+            // fourteen.
             (None, Some(snapshot)) => {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
@@ -1225,6 +1226,18 @@ fn effective(
         SettingKey::MaxSkillTokens => {
             let tokens = resolve_max_skill_tokens(app);
             (tokens.to_string(), Some(tokens), present)
+        }
+        // MOD-122 M3 D6: the shipper's own reader, which every sweep re-reads; a stored value it
+        // ignores leaves the default answering, so the row names the default, not the App row.
+        SettingKey::LogRetentionDays => {
+            let days = retention_days(app);
+            let source = if app.get(key.key()).and_then(Value::as_u64) == Some(days) {
+                present
+            } else {
+                label::setting_source(BudgetSource::AppSettingDefault)
+            };
+            let number = i64::try_from(days).unwrap_or(i64::MAX);
+            (days.to_string(), Some(number), source)
         }
         // MOD-164 D7: the agent by name and the model, or `not set`; a stored value the resolver
         // does not read is named under the row rather than shown as a choice.
@@ -1840,6 +1853,39 @@ mod tests {
             row_error(key, typo.get(key.key()), &malformed).as_deref(),
             Some(NOT_A_LIGHT_MODEL)
         );
+    }
+
+    /// MOD-122 M3 D6: the retention row reads the shipper's own reader, so a stored day count it
+    /// would ignore shows the fourteen the sweep uses, named as the default, never the App row.
+    #[test]
+    fn the_retention_row_is_the_days_the_sweep_uses() {
+        let key = SettingKey::LogRetentionDays;
+        let unset = effective(key, None, None, &BTreeMap::new(), &[]);
+        assert_eq!(
+            (unset.text.as_str(), unset.number, unset.source),
+            ("14", Some(14), DEFAULT)
+        );
+
+        let thirty = BTreeMap::from([(key.key().to_owned(), json!(30))]);
+        let held = effective(key, None, None, &thirty, &[]);
+        assert_eq!(
+            (held.text.as_str(), held.number, held.source),
+            (
+                "30",
+                Some(30),
+                label::setting_source(BudgetSource::AppSetting)
+            )
+        );
+
+        for dud in [json!(0), json!(366), json!("30"), json!(1.5)] {
+            let stored = BTreeMap::from([(key.key().to_owned(), dud.clone())]);
+            let row = effective(key, None, None, &stored, &[]);
+            assert_eq!(
+                (row.text.as_str(), row.source),
+                ("14", DEFAULT),
+                "{dud} is not a day count the sweep reads"
+            );
+        }
     }
 
     /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the

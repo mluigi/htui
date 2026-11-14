@@ -63,6 +63,11 @@ pub const COMPETE_FAN_OUT_DEFAULT: bool = false;
 /// MOD-164 D7: the longest model name a `light_model` value may carry, in characters.
 pub const LIGHT_MODEL_MAX_CHARS: usize = 200;
 
+/// MOD-122 M3 D6: `log_retention_days`'s compiled default, fourteen days. An App key with no
+/// seeded row, like `memory_capture`; its reader is `htui`'s `worker_log::ship::retention_days`,
+/// which falls back to the same fourteen for anything outside `1..=365`.
+pub const LOG_RETENTION_DAYS_DEFAULT: u64 = 14;
+
 /// `project.settings.allow_env_files`'s compiled default: a provider project whose session trees
 /// hold env files is refused (MOD-89 D3, D4). Not a field of [`Defaults`]: no App rung.
 pub const ALLOW_ENV_FILES_DEFAULT: bool = false;
@@ -100,8 +105,8 @@ pub struct Defaults {
 
 impl Defaults {
     /// `0002`'s ten rows plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded
-    /// `compete_fan_out` and MOD-164's unseeded `light_model` (`null`, not configured), as
-    /// `(key, value)` in **key byte order**, which is the order migration
+    /// `compete_fan_out`, MOD-164's unseeded `light_model` (`null`, not configured) and MOD-122's
+    /// unseeded `log_retention_days`, as `(key, value)` in **key byte order**, which is the order migration
     /// `0002`'s `INSERT` is compared against and the order a seeder must write them in.
     ///
     /// Iterated out of [`SettingKey::app_keys`] rather than spelled a second time (MOD-15 plan D7):
@@ -133,6 +138,7 @@ impl Defaults {
             SettingKey::ExcerptProviderDeadlineMs => Value::from(self.excerpt_provider_deadline_ms),
             // MOD-164 D7: not configured; capture is skipped until someone picks one.
             SettingKey::LightModel => Value::Null,
+            SettingKey::LogRetentionDays => Value::from(LOG_RETENTION_DAYS_DEFAULT),
             SettingKey::MaxSkillTokens => Value::from(self.max_skill_tokens),
             SettingKey::MemoryCapture => Value::Bool(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => {
@@ -166,6 +172,7 @@ impl Defaults {
             }
             // No number at all; nothing is `not_above` it, so the zero is never compared.
             SettingKey::LightModel => 0,
+            SettingKey::LogRetentionDays => LOG_RETENTION_DAYS_DEFAULT.cast_signed(),
             SettingKey::MaxSkillTokens => self.max_skill_tokens,
             SettingKey::MemoryCapture => i64::from(MEMORY_CAPTURE_DEFAULT),
             SettingKey::PromptReserveFraction => i64::from(self.prompt_reserve_fraction_bp),
@@ -175,12 +182,12 @@ impl Defaults {
     }
 }
 
-/// The fifteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
+/// The sixteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
 /// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, MOD-163's
 /// `memory_capture`, a switch both the App and the Project rung hold, MOD-141's
-/// `compete_fan_out`, a switch only the App rung holds, and MOD-164's `light_model`, an agent
-/// and model only the App rung holds — declared in **key byte order**: the discriminant indexes
-/// [`SPECS`].
+/// `compete_fan_out`, a switch only the App rung holds, MOD-164's `light_model`, an agent and
+/// model only the App rung holds, and MOD-122's `log_retention_days`, a number of days only the
+/// App rung holds — declared in **key byte order**: the discriminant indexes [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
 /// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
@@ -210,21 +217,24 @@ pub enum SettingKey {
     /// `light_model`, MOD-164 D7: the agent and model the run-end memory capture runs on; App
     /// only, the one [`SettingKind::AgentModel`].
     LightModel = 9,
+    /// `log_retention_days`, MOD-122 M3 D6: the days stored worker logs and activity events are
+    /// kept, on every box; App only.
+    LogRetentionDays = 10,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 10,
+    MaxSkillTokens = 11,
     /// `memory_capture`, MOD-163 D19: automatic memory capture at run end; read by MOD-164.
-    MemoryCapture = 11,
+    MemoryCapture = 12,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 12,
+    PromptReserveFraction = 13,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 13,
+    UpstreamHops = 14,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 14,
+    TokenBudget = 15,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::AllowEnvFiles,
         Self::BoxHostname,
         Self::CompeteFanOut,
@@ -235,6 +245,7 @@ impl SettingKey {
         Self::ExcerptMaxScanFiles,
         Self::ExcerptProviderDeadlineMs,
         Self::LightModel,
+        Self::LogRetentionDays,
         Self::MaxSkillTokens,
         Self::MemoryCapture,
         Self::PromptReserveFraction,
@@ -244,8 +255,8 @@ impl SettingKey {
 
     /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
     /// keys migration `0002` seeds plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded
-    /// `compete_fan_out` and MOD-164's unseeded `light_model`, and no project-only key (MOD-33
-    /// D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate this, never
+    /// `compete_fan_out`, MOD-164's unseeded `light_model` and MOD-122's unseeded
+    /// `log_retention_days`, and no project-only key (MOD-33 D276). [`Defaults::as_rows`] and the `app` group of `Settings > Prompt` iterate this, never
     /// `ALL`.
     pub fn app_keys() -> impl Iterator<Item = Self> {
         Self::ALL
@@ -265,7 +276,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the fifteen.
+    /// The reverse of [`Self::key`], `None` for a string outside the sixteen.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -338,7 +349,7 @@ impl core::fmt::Display for Rungs {
     }
 }
 
-/// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
+/// How a key's JSON is read (PRD D7's `kind`): ten keys are integers,
 /// `prompt_reserve_fraction` is a float the reader rounds to basis points, the four switches,
 /// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans, and
 /// `light_model` is an agent and one of its models.
@@ -394,7 +405,7 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 15] = [
+pub const SPECS: [SettingSpec; 16] = [
     SettingSpec {
         key: "allow_env_files",
         project_key: Some("allow_env_files"),
@@ -504,6 +515,17 @@ pub const SPECS: [SettingSpec; 15] = [
         not_above: None,
         unit: "chars",
         doc: "The agent and model the run-end memory capture runs on; unset skips the capture.",
+    },
+    SettingSpec {
+        key: "log_retention_days",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: 365,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "days",
+        doc: "Days stored logs and activity events are kept; all boxes.",
     },
     SettingSpec {
         key: "max_skill_tokens",
@@ -1062,24 +1084,26 @@ mod tests {
         assert_eq!(rows.len(), 10, "ANA-5 §5.3 reserves ten keys, got {rows:?}");
         let mut expected = rows.clone();
         expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        // MOD-163 D19, MOD-141 M2 D5 and MOD-164 D7: `memory_capture`, `compete_fan_out` and
-        // `light_model` are App keys 0002 does not seed; their resolvers fall through to the
-        // compiled defaults, so the seeded ten are the rows without them.
+        // MOD-163 D19, MOD-141 M2 D5, MOD-164 D7 and MOD-122 M3 D6: `memory_capture`,
+        // `compete_fan_out`, `light_model` and `log_retention_days` are App keys 0002 does not
+        // seed; their readers fall through to the compiled defaults, so the seeded ten are the
+        // rows without them.
         let rows = DEFAULTS.as_rows();
         assert_eq!(
             rows.len(),
-            13,
-            "0002's ten rows plus the unseeded `memory_capture`, `compete_fan_out` and \
-             `light_model`"
+            14,
+            "0002's ten rows plus the unseeded `memory_capture`, `compete_fan_out`, \
+             `light_model` and `log_retention_days`"
         );
         assert!(rows.contains(&("memory_capture", Value::Bool(true))));
         assert!(rows.contains(&("compete_fan_out", Value::Bool(false))));
         assert!(rows.contains(&("light_model", Value::Null)));
+        assert!(rows.contains(&("log_retention_days", json!(14))));
         assert_eq!(
             rows.into_iter()
                 .filter(|(key, _)| !matches!(
                     *key,
-                    "memory_capture" | "compete_fan_out" | "light_model"
+                    "memory_capture" | "compete_fan_out" | "light_model" | "log_retention_days"
                 ))
                 .collect::<Vec<_>>(),
             expected
@@ -1280,7 +1304,7 @@ mod tests {
         );
         assert!(rung_refusal(SettingKey::MemoryCapture, Rungs::PHASE).is_some());
         assert_eq!(
-            SettingKey::ALL[11],
+            SettingKey::ALL[12],
             SettingKey::MemoryCapture,
             "`memory_capture` sorts between `max_skill_tokens` and `prompt_reserve_fraction`"
         );
@@ -1509,22 +1533,95 @@ mod tests {
         );
     }
 
+    /// MOD-122 M3 D6: the retention of stored logs and activity events, App only, a whole number
+    /// of days in `1..=365`, default 14 — the shipper's own key, range and default (`htui`'s
+    /// `worker_log::ship`, pinned there by `log_retention_days_is_the_shippers_key`).
+    #[test]
+    fn log_retention_days_is_an_app_only_whole_number_of_days() {
+        let key = SettingKey::LogRetentionDays;
+        let spec = key.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "log_retention_days",
+                project_key: None,
+                kind: SettingKind::Integer,
+                min: 1,
+                max: 365,
+                rungs: Rungs::APP,
+                not_above: None,
+                unit: "days",
+                doc: spec.doc,
+            }
+        );
+        assert!(
+            spec.doc
+                .contains("stored logs and activity events are kept; all boxes"),
+            "the editor's help line: {}",
+            spec.doc
+        );
+        assert_eq!(
+            SettingKey::ALL[10],
+            key,
+            "`log_retention_days` sorts between `light_model` and `max_skill_tokens`"
+        );
+        assert_eq!(SettingKey::from_key("log_retention_days"), Some(key));
+        assert_eq!(
+            DEFAULTS.value_of(key),
+            json!(LOG_RETENTION_DAYS_DEFAULT),
+            "a JSON number, the shape the shipper's `as_u64` reads"
+        );
+        assert_eq!(LOG_RETENTION_DAYS_DEFAULT, 14);
+        assert_eq!(DEFAULTS.integer(key), 14);
+        assert_eq!(rung_refusal(key, Rungs::APP), None);
+        assert!(rung_refusal(key, Rungs::PROJECT).is_some());
+        assert!(rung_refusal(key, Rungs::PHASE).is_some());
+
+        for days in [1, 30, 365] {
+            assert_eq!(validate(key, Rungs::APP, &json!(days), None), Ok(()));
+        }
+        assert_eq!(
+            validate(key, Rungs::APP, &json!(0), None),
+            Err("`log_retention_days` = 0 is outside 1..=365 days".to_owned())
+        );
+        assert_eq!(
+            validate(key, Rungs::APP, &json!(366), None),
+            Err("`log_retention_days` = 366 is outside 1..=365 days".to_owned())
+        );
+        assert_eq!(
+            validate(key, Rungs::APP, &json!("30"), None),
+            Err("`log_retention_days` must be a JSON integer, got \"30\"".to_owned()),
+            "a string is refused, never parsed: the shipper would ignore it"
+        );
+        assert!(
+            validate(key, Rungs::APP, &json!(1.5), None).is_err(),
+            "a fraction of a day is not a value"
+        );
+        assert_eq!(
+            validate(key, Rungs::PROJECT, &json!(30), None),
+            Err(rung_refusal(key, Rungs::PROJECT).expect("no project rung")),
+            "the rung is checked before the range"
+        );
+    }
+
     /// D276: the App group and `as_rows` are the `app_setting` keys, never a project-only one:
     /// `0002`'s ten plus MOD-163's unseeded `memory_capture` (D19), MOD-141's unseeded
-    /// `compete_fan_out` (M2 D5) and MOD-164's unseeded `light_model` (D7).
+    /// `compete_fan_out` (M2 D5), MOD-164's unseeded `light_model` (D7) and MOD-122's unseeded
+    /// `log_retention_days` (M3 D6).
     #[test]
     fn app_keys_are_0002s_ten_plus_memory_capture_in_byte_order() {
         let app: Vec<SettingKey> = SettingKey::app_keys().collect();
         assert_eq!(
             app.len(),
-            13,
-            "migration 0002 seeds ten rows, and `memory_capture`, `compete_fan_out` and \
-             `light_model`, unseeded"
+            14,
+            "migration 0002 seeds ten rows, and `memory_capture`, `compete_fan_out`, \
+             `light_model` and `log_retention_days`, unseeded"
         );
-        assert_eq!(SettingKey::app_keys().count(), 13);
+        assert_eq!(SettingKey::app_keys().count(), 14);
         assert!(app.contains(&SettingKey::MemoryCapture));
         assert!(app.contains(&SettingKey::CompeteFanOut));
         assert!(app.contains(&SettingKey::LightModel));
+        assert!(app.contains(&SettingKey::LogRetentionDays));
         assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
         assert_eq!(
@@ -1643,7 +1740,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "fifteen distinct keys, strictly ascending as bytes"
+            "sixteen distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),

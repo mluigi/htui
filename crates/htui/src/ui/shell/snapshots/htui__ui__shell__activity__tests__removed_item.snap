@@ -1,0 +1,10 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: frame
+---
+╭─ Activity · all workspaces ──────────────────────────────────────────────────╮
+│▌◐ started 09:02 chat research                                                │
+│ ✗ failed 09:01 MOD-1 (deleted) research step failed: exit 1                  │
+│                                                                              │
+│                                                                              │
+╰─Enter open · f filter · j/k move─────────────────────────────────────────────╯

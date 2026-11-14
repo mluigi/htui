@@ -180,6 +180,11 @@ close = []  # close; Esc always"#;
                        follow = [\"F\"]  # follow\n\
                        bottom = [\"G\"]  # newest\n\
                        \n\
+                       [activity]\n\
+                       open   = [\"enter\"]  # open the item or chat\n\
+                       filter = [\"f\"]      # all workspaces \u{b7} needs you \u{b7} failures \u{b7} \
+                       this workspace\n\
+                       \n\
                        [queue]\n\
                        move_down = [\"J\"]      # move down\n\
                        move_up   = [\"K\"]      # move up\n\

@@ -1227,6 +1227,21 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The shell's activity panel while it holds the keys (MOD-122 M3 D10): its own verbs, the
+/// list moves **with** `list.bottom` (blueprint F8: no layer here binds `G`), then the layout and
+/// history layers of a list + detail tab. No `list.fold` and no `backlog` layer, so `enter` and
+/// `f` are the panel's.
+pub const ACTIVITY_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Activity, &[Act::ActivityOpen, Act::ActivityFilter]),
+    Layer::only(
+        Context::List,
+        &[Act::ListDown, Act::ListUp, Act::ListTop, Act::ListBottom],
+    ),
+    LAYOUT,
+    HISTORY,
+    GLOBAL,
+]);
+
 /// The queue overlay (MOD-12 M3 D8; MOD-67 M6 D2): its own verbs, the list moves, then the
 /// overlay layers the other list overlays compose (`overlay.close`, `global.help`).
 pub const QUEUE_OVERLAY: Stack<'static> = Stack::new(&[
@@ -1348,6 +1363,7 @@ mod tests {
         source!("ui/tabs/backlog/detail/runs.rs"),
         source!("ui/tabs/chat/mod.rs"),
         source!("ui/tabs/logs/mod.rs"),
+        source!("ui/shell/activity.rs"),
     ];
 
     /// Act sites beside [`VIEWS`] (MOD-67 M6 D7): files that handle a view stack's acts without
@@ -1499,6 +1515,7 @@ mod tests {
         CHAT_LIVE,
         CHAT_REPLAY,
         LOGS_BROWSE,
+        ACTIVITY_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
         LEAVE,
@@ -1943,6 +1960,18 @@ mod tests {
         assert_eq!(resolve(LOGS_BROWSE, "end"), []);
         assert_eq!(resolve(LOGS_BROWSE, "k"), [Act::ListUp]);
         assert_eq!(resolve(LOGS_BROWSE, "K"), [Act::PaneScrollUp]);
+        // MOD-122 M3 D10: the activity panel's `enter` and `f` are its own (no `list.fold`, no
+        // `backlog` layer), its `G` is `list.bottom` (F8), and it has no pane scroll.
+        assert_eq!(resolve(ACTIVITY_BROWSE, "enter"), [Act::ActivityOpen]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "f"), [Act::ActivityFilter]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "k"), [Act::ListUp]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "g"), [Act::ListTop]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "G"), [Act::ListBottom]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "K"), []);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "tab"), [Act::NextPane]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "backspace"), [Act::HistoryBack]);
+        assert_eq!(resolve(ACTIVITY_BROWSE, "q"), [Act::Quit]);
     }
 
     /// MOD-67 M6 §4.3: the queue overlay's and the directory picker's stacks.
@@ -2208,8 +2237,9 @@ mod tests {
         // MOD-146 D8: Settings > Project types' browse stack is the 76th; MOD-122 D5:
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
-        // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94.
-        assert_eq!(views.len(), 94);
+        // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
+        // M3 D10: the activity panel's, 95.
+        assert_eq!(views.len(), 95);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
