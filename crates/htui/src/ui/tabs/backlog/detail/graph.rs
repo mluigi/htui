@@ -9,11 +9,17 @@
 //!
 //! MOD-115 M4: the rows are a `kit::list`, the cursor its gutter and band (MOD-85); an edge's kind
 //! reads as `label::link_kind`'s words and a node's status as its `kit::status` mark (MOD-83).
+//!
+//! MOD-150 M3 D12: an item's linked documents are leaf rows under its own expanded row, after its
+//! children: the kind, `[slug:]KEY doc_kind` (an owner document's `slug doc_kind`), the pinned
+//! version beside the latest, then the title. `Enter` on one reveals the owning item.
 
 use core::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use htui_core::model::{ItemId, ItemState, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef};
+use htui_core::model::{
+    ItemId, ItemState, LinkGraph, LinkKind, LinkNode, LinkedDocument, ProjectId, ProjectRef,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -100,6 +106,15 @@ struct Link {
     repeat: bool,
 }
 
+/// What a [`TreeRow`] names, as an index into the `LinkGraph` it was built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeTarget {
+    /// Index into `LinkGraph::nodes`.
+    Node(usize),
+    /// Index into `LinkGraph::documents` (MOD-150 M3 D12).
+    Document(usize),
+}
+
 /// One line of the tree, as an index into the `LinkGraph` it was built from.
 ///
 /// Stored rather than borrowed, so the tree is built once per reply and per depth change and never
@@ -110,8 +125,8 @@ struct TreeRow {
     level: u8,
     /// `None` on the root row.
     link: Option<Link>,
-    /// Index into `LinkGraph::nodes`.
-    node: usize,
+    /// The item or document this row names.
+    target: TreeTarget,
 }
 
 impl TreeRow {
@@ -120,9 +135,21 @@ impl TreeRow {
         GraphRow {
             level: self.level,
             link: self.link,
-            node: &graph.nodes[self.node],
+            target: match self.target {
+                TreeTarget::Node(at) => Target::Node(&graph.nodes[at]),
+                TreeTarget::Document(at) => Target::Document(&graph.documents[at]),
+            },
         }
     }
+}
+
+/// What a [`GraphRow`] names, borrowed from the `LinkGraph` it was built from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Target<'a> {
+    /// An item reached by the walk.
+    Node(&'a LinkNode),
+    /// A document an expanded item links (MOD-150 M3 D12): always a leaf.
+    Document(&'a LinkedDocument),
 }
 
 /// One line of the tree, borrowed from the `LinkGraph` it was built from.
@@ -132,14 +159,30 @@ struct GraphRow<'a> {
     level: u8,
     /// `None` on the root row.
     link: Option<Link>,
-    /// The item this row names.
-    node: &'a LinkNode,
+    /// The item or document this row names.
+    target: Target<'a>,
 }
 
-impl GraphRow<'_> {
+impl<'a> GraphRow<'a> {
     /// Whether this row is a `(*)` leaf rather than its item's own row.
     fn is_repeat(&self) -> bool {
         self.link.is_some_and(|link| link.repeat)
+    }
+
+    /// The item this row names; `None` on a document's row.
+    const fn node(&self) -> Option<&'a LinkNode> {
+        match self.target {
+            Target::Node(node) => Some(node),
+            Target::Document(_) => None,
+        }
+    }
+
+    /// The project of the item or document this row names: what dims it (D7 of MOD-147).
+    const fn project_id(&self) -> ProjectId {
+        match self.target {
+            Target::Node(node) => node.project_id,
+            Target::Document(document) => document.project_id,
+        }
     }
 }
 
@@ -232,20 +275,29 @@ impl GraphTab {
     /// The row index moves with the depth (preorder changes), so the cursor follows the item, not
     /// the index; an item the new depth hides sends it back to the root. A depth the clamp left
     /// where it was changes nothing, so the cursor stays even on a `(*)` row.
+    ///
+    /// A document's row keeps the cursor on that document while its item is still expanded.
     fn set_depth(&mut self, depth: u8) {
         if depth == self.depth {
             return;
         }
-        let item = self.row(self.cursor).map(|row| row.node.item_id);
+        let item = self
+            .row(self.cursor)
+            .and_then(|row| row.node())
+            .map(|node| node.item_id);
+        let at = self.rows.get(self.cursor).map(|row| row.target);
         self.depth = depth;
         self.rebuild();
-        self.cursor = item
-            .and_then(|id| {
-                self.visible()
-                    .iter()
-                    .position(|row| !row.is_repeat() && row.node.item_id == id)
-            })
-            .unwrap_or(0);
+        self.cursor = match (at, item) {
+            (Some(TreeTarget::Document(_)), _) => {
+                self.rows.iter().position(|row| Some(row.target) == at)
+            }
+            (_, Some(id)) => self.visible().iter().position(|row| {
+                !row.is_repeat() && row.node().is_some_and(|node| node.item_id == id)
+            }),
+            _ => None,
+        }
+        .unwrap_or(0);
     }
 
     /// `Enter`: re-root on the item under the cursor, or say why not (D6, D7). Nothing on the
@@ -257,17 +309,34 @@ impl GraphTab {
         if row.link.is_none() {
             return;
         }
-        let node = row.node;
-        if in_workspace(node, self.workspace_projects(ctx)) {
+        let (id, key, slug) = match row.target {
+            Target::Node(node) => (node.item_id, &node.key, &node.project_slug),
+            Target::Document(document) => {
+                // MOD-150 M3 D12: an item's document reveals its owner; an owner document has
+                // no item to reveal.
+                let (Some(id), Some(key)) = (document.owner_item, &document.owner_key) else {
+                    let owner = match document.project_slug.strip_prefix('@') {
+                        Some(workspace) => format!("workspace {workspace}"),
+                        None => format!("project {}", document.project_slug),
+                    };
+                    ctx.emit(Action::Error(format!(
+                        "{} is {owner}'s own document; open it in Settings",
+                        document_key(document),
+                    )));
+                    return;
+                };
+                (id, key, &document.project_slug)
+            }
+        };
+        if in_workspace(row.project_id(), self.workspace_projects(ctx)) {
             ctx.emit(Action::Reveal(RevealTarget::Item {
-                id: node.item_id,
-                key: node.key.clone(),
+                id,
+                key: key.clone(),
             }));
         } else {
             // D7: revealing it would only re-read the list to answer `not_in_this_backlog`.
             ctx.emit(Action::Error(format!(
-                "{}:{} is outside this workspace",
-                node.project_slug, node.key
+                "{slug}:{key} is outside this workspace"
             )));
         }
     }
@@ -304,7 +373,9 @@ struct Ranked {
 
 /// The tree of `graph` cut at view depth `depth` (D2, D3, D4), in preorder, the root first.
 ///
-/// Nodes are ranked by [`rank_nodes`] and edges by [`rank_edges`]; [`tree_parents`] picks each
+/// Each expanded item's documents follow its children, one level deeper (MOD-150 M3 D12); a
+/// `(*)` row has none, so a document is drawn once. Nodes are ranked by [`rank_nodes`] and edges
+/// by [`rank_edges`]; [`tree_parents`] picks each
 /// node's tree edge and [`hang_edges`] hangs every other edge as a `(*)` leaf. A node with no
 /// neighbour one level up is dropped with its edges. That is a malformed reply, or a legitimate
 /// offline one: the cache walks links through items whose project it does not mirror but cannot
@@ -320,13 +391,32 @@ fn tree(graph: &LinkGraph, depth: u8) -> Vec<TreeRow> {
     let depths: Vec<u8> = nodes.iter().map(|&at| graph.nodes[at].depth).collect();
     let parent = tree_parents(&depths, &edges);
     let under = hang_edges(graph, &nodes, &edges, &parent);
+    let documents = documents_by_item(graph);
     let mut out = vec![TreeRow {
         level: 0,
         link: None,
-        node: root,
+        target: TreeTarget::Node(root),
     }];
-    walk(0, 1, &nodes, &under, &mut out);
+    let walk = Walk {
+        graph,
+        nodes: &nodes,
+        under: &under,
+        documents: &documents,
+    };
+    walk.rows(0, 1, &mut out);
     out
+}
+
+/// Each item's documents, as indices into `LinkGraph::documents`, in the order they are drawn.
+/// That is the reply's order: every backend answers it sorted by
+/// [`LinkGraph::sort_documents`], whose order within one item, `(kind, project slug, owner key,
+/// doc kind, version)` by bytes, is the one drawn, so no re-sort here.
+fn documents_by_item(graph: &LinkGraph) -> HashMap<ItemId, Vec<usize>> {
+    let mut by_item: HashMap<ItemId, Vec<usize>> = HashMap::new();
+    for (at, document) in graph.documents.iter().enumerate() {
+        by_item.entry(document.from_item_id).or_default().push(at);
+    }
+    by_item
 }
 
 /// The nodes shown at view depth `depth`, as indices into `LinkGraph::nodes` in rank order: the
@@ -475,31 +565,55 @@ fn hang_edges(
     under
 }
 
-/// Preorder: the rows under rank `at`, each at `level`, a tree child followed by its own subtree.
-fn walk(
-    at: usize,
-    level: u8,
-    nodes: &[usize],
-    under: &[Vec<(usize, Link)>],
-    out: &mut Vec<TreeRow>,
-) {
-    for &(other, link) in &under[at] {
-        out.push(TreeRow {
-            level,
-            link: Some(link),
-            node: nodes[other],
-        });
-        if !link.repeat {
-            walk(other, level.saturating_add(1), nodes, under, out);
+/// What [`Walk::rows`] reads: the ranked nodes, what hangs under each and each item's documents.
+struct Walk<'g> {
+    /// The graph the tree is built from.
+    graph: &'g LinkGraph,
+    /// Ranked nodes, as indices into `LinkGraph::nodes`.
+    nodes: &'g [usize],
+    /// What hangs under each ranked node ([`hang_edges`]).
+    under: &'g [Vec<(usize, Link)>],
+    /// Each item's documents ([`documents_by_item`]).
+    documents: &'g HashMap<ItemId, Vec<usize>>,
+}
+
+impl Walk<'_> {
+    /// Preorder: the rows under rank `at`, each at `level`, a tree child followed by its own
+    /// subtree, then `at`'s own documents (MOD-150 M3 D12).
+    fn rows(&self, at: usize, level: u8, out: &mut Vec<TreeRow>) {
+        for &(other, link) in &self.under[at] {
+            out.push(TreeRow {
+                level,
+                link: Some(link),
+                target: TreeTarget::Node(self.nodes[other]),
+            });
+            if !link.repeat {
+                self.rows(other, level.saturating_add(1), out);
+            }
+        }
+        let item = self.graph.nodes[self.nodes[at]].item_id;
+        for &document in self.documents.get(&item).into_iter().flatten() {
+            out.push(TreeRow {
+                level,
+                link: Some(Link {
+                    arrow: Arrow::Out,
+                    kind: self.graph.documents[document].kind.as_link_kind(),
+                    repeat: false,
+                }),
+                target: TreeTarget::Document(document),
+            });
         }
     }
 }
 
-/// Whether `node`'s project is one of the workspace's (D7).
-fn in_workspace<'p>(node: &LinkNode, projects: impl IntoIterator<Item = &'p ProjectRef>) -> bool {
+/// Whether `project` is one of the workspace's (D7).
+fn in_workspace<'p>(
+    project: ProjectId,
+    projects: impl IntoIterator<Item = &'p ProjectRef>,
+) -> bool {
     projects
         .into_iter()
-        .any(|project| project.project_id == node.project_id)
+        .any(|member| member.project_id == project)
 }
 
 /// The cells the kind column is padded to: the widest of `label::link_kind`'s words (`blocked
@@ -534,13 +648,13 @@ fn lines<'p>(
     let Some(root) = rows.first() else {
         return Vec::new();
     };
-    let root_project = root.node.project_id;
+    let root_project = root.project_id();
     let kind_width = kind_width();
     let pad_kind = rows.iter().all(|row| match row.link {
         None => true,
         Some(link) => {
             let kind = cell_width(label::link_kind(link.kind)).max(kind_width);
-            fixed_cells(row, link) + kind + label_cells(row.node, root_project) <= width
+            fixed_cells(row, link) + kind + label_cells(row, root_project) <= width
         }
     });
     rows.iter()
@@ -548,7 +662,7 @@ fn lines<'p>(
             line(
                 row,
                 root_project,
-                in_workspace(row.node, projects.clone()),
+                in_workspace(row.project_id(), projects.clone()),
                 pad_kind.then_some(kind_width),
                 width,
                 theme,
@@ -574,15 +688,55 @@ fn lead_cells(row: &GraphRow<'_>, link: Link) -> usize {
 }
 
 /// Cells of a non-root row but its kind, label and title: [`lead_cells`], the separator before
-/// the status, the status and the repeat mark.
+/// the status, the status and the repeat mark; a document's version text in the status's place.
 fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
     let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
-    lead_cells(row, link) + 1 + cell_width(&status_text(row.node.state())) + repeat
+    let status = match row.target {
+        Target::Node(node) => cell_width(&status_text(node.state())),
+        Target::Document(document) => cell_width(&version_text(document)),
+    };
+    lead_cells(row, link) + 1 + status + repeat
 }
 
-/// Cells of `node`'s whole `[slug:]KEY` label.
-fn label_cells(node: &LinkNode, root_project: ProjectId) -> usize {
-    slug(node, root_project).map_or(0, |slug| cell_width(slug) + 1) + cell_width(&node.key)
+/// Cells of the row's whole label: `[slug:]KEY`, or a document's `[slug:]KEY doc_kind`.
+fn label_cells(row: &GraphRow<'_>, root_project: ProjectId) -> usize {
+    let (slug, key) = match row.target {
+        Target::Node(node) => (slug(node, root_project), cell_width(&node.key)),
+        Target::Document(document) => (
+            document_slug(document, root_project),
+            cell_width(&document_key(document)),
+        ),
+    };
+    slug.map_or(0, |slug| cell_width(slug) + 1) + key
+}
+
+/// A document's label but the slug (MOD-150 M3 D12): `KEY doc_kind` for an item's document,
+/// `slug doc_kind` for an owner document, whose owner is its project.
+fn document_key(document: &LinkedDocument) -> String {
+    let owner = document
+        .owner_key
+        .as_deref()
+        .unwrap_or(&document.project_slug);
+    format!("{owner} {}", document.doc_kind)
+}
+
+/// The slug an item's document is labelled with: its project's, unless that is the root's. An
+/// owner document's slug is its key already.
+fn document_slug(document: &LinkedDocument, root_project: ProjectId) -> Option<&str> {
+    (document.owner_key.is_some() && document.project_id != root_project)
+        .then_some(document.project_slug.as_str())
+}
+
+/// The pinned version, and the latest beside it when that is newer: `v2 (latest v4)`.
+fn version_text(document: &LinkedDocument) -> String {
+    if document.version == document.latest_version {
+        format!("v{}", document.version)
+    } else {
+        format!(
+            "v{} (latest v{})",
+            document.version, document.latest_version
+        )
+    }
 }
 
 /// One row as a line at most `width` cells wide (§1.5 of the blueprint), its kind padded to
@@ -595,7 +749,20 @@ fn line(
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
-    let node = row.node;
+    let node = match row.target {
+        Target::Node(node) => node,
+        Target::Document(document) => {
+            return document_line(
+                row,
+                document,
+                root_project,
+                in_workspace,
+                pad_kind,
+                width,
+                theme,
+            );
+        }
+    };
     // D7: a node outside the workspace is drawn, but dim, so it does not read as reachable.
     let (label_style, status_style, title_style) = if in_workspace {
         (theme.key, theme.status_style(node.state()), theme.base)
@@ -641,6 +808,57 @@ fn line(
     } else {
         push_title(&mut spans, &node.title, width, title_style);
     }
+    Line::from(cut(spans, width))
+}
+
+/// A document's row (MOD-150 M3 D12): the arrow, the kind padded as the items' are, the label,
+/// the version text and the title. The title gives way first, then the slug, then the version
+/// text at the pane edge, the label's key last, as on an item's row.
+fn document_line(
+    row: &GraphRow<'_>,
+    document: &LinkedDocument,
+    root_project: ProjectId,
+    in_workspace: bool,
+    pad_kind: Option<usize>,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let (label_style, version_style, title_style) = if in_workspace {
+        (theme.key, theme.base, theme.base)
+    } else {
+        (theme.dim, theme.dim, theme.dim)
+    };
+    let link = row.link.unwrap_or(Link {
+        arrow: Arrow::Out,
+        kind: document.kind.as_link_kind(),
+        repeat: false,
+    });
+    let kind = label::link_kind(link.kind);
+    let kind = match pad_kind {
+        Some(cells) => format!("{kind:<cells$}"),
+        None => kind.to_owned(),
+    };
+    let room = width.saturating_sub(fixed_cells(row, link) + cell_width(&kind));
+    let bare_room = width.saturating_sub(lead_cells(row, link) + cell_width(&kind));
+    let label = fit_label(
+        &document_key(document),
+        document_slug(document, root_project),
+        room,
+        bare_room,
+    );
+
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::raw(" ".repeat(indent(row.level))),
+        Span::styled(link.arrow.glyph(), theme.dim),
+        Span::raw(" "),
+        Span::styled(kind, theme.base),
+        Span::raw(" "),
+        Span::styled(label, label_style),
+        Span::raw(" "),
+        Span::styled(version_text(document), version_style),
+    ];
+    push_title(&mut spans, &document.title, width, title_style);
     Line::from(cut(spans, width))
 }
 
@@ -879,7 +1097,7 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::BacklogTab;
-    use htui_core::model::LinkEdge;
+    use htui_core::model::{ArtifactLinkKind, DocumentId, LinkEdge};
 
     /// The detail pane's inner width at `DEFAULT_SIZE` (100x30): the 45-column detail pane less
     /// its border, as `backlog::tests::render`'s
@@ -951,25 +1169,36 @@ mod tests {
             .collect()
     }
 
-    /// A tree as text: `{indent}{arrow} {kind} {slug:}KEY{ (*)}`, the root as its bare key.
+    impl<'a> GraphRow<'a> {
+        /// The item this row names; a panic on a document's row.
+        fn item(&self) -> &'a LinkNode {
+            self.node().expect("an item's row")
+        }
+    }
+
+    /// A tree as text: `{indent}{arrow} {kind} {slug:}KEY{ (*)}`, the root as its bare key; a
+    /// document as `{indent}{arrow} {kind} {slug:}KEY doc_kind v{n}`.
     fn shape(rows: &[GraphRow<'_>]) -> Vec<String> {
-        let root = rows.first().map(|row| row.node.project_id);
+        let root = rows.first().map(GraphRow::project_id);
         rows.iter()
             .map(|row| {
                 let Some(link) = row.link else {
-                    return row.node.key.clone();
+                    return row.item().key.clone();
                 };
-                let slug = if Some(row.node.project_id) == root {
-                    String::new()
-                } else {
-                    format!("{}:", row.node.project_slug)
+                let label = match row.target {
+                    Target::Node(node) if Some(node.project_id) == root => node.key.clone(),
+                    Target::Node(node) => format!("{}:{}", node.project_slug, node.key),
+                    Target::Document(document) => {
+                        let slug = root.and_then(|root| document_slug(document, root));
+                        let slug = slug.map_or_else(String::new, |slug| format!("{slug}:"));
+                        format!("{slug}{} v{}", document_key(document), document.version)
+                    }
                 };
                 format!(
-                    "{}{} {} {slug}{}{}",
+                    "{}{} {} {label}{}",
                     " ".repeat(2 * usize::from(row.level - 1)),
                     link.arrow.glyph(),
                     link.kind.as_str(),
-                    row.node.key,
                     if link.repeat { REPEAT } else { "" },
                 )
             })
@@ -1019,6 +1248,41 @@ mod tests {
         }
     }
 
+    /// MOD-150 M3: `from --kind--> v{version}` of `doc_kind` in project `p` (as [`node`]'s),
+    /// owned by item `owner` (its id `n + 1000`) or, with `None`, by the project; titled
+    /// `{doc_kind} title`.
+    fn document(
+        n: u128,
+        from: ItemId,
+        kind: ArtifactLinkKind,
+        owner: Option<&str>,
+        doc_kind: &str,
+        version: i32,
+        latest_version: i32,
+    ) -> LinkedDocument {
+        LinkedDocument {
+            from_item_id: from,
+            kind,
+            document_id: DocumentId::from_uuid(Uuid::from_u128(n)),
+            project_id: ProjectId::from_uuid(Uuid::from_u128(100)),
+            project_slug: "p".to_owned(),
+            owner_item: owner.map(|_| ItemId::from_uuid(Uuid::from_u128(n + 1000))),
+            owner_key: owner.map(str::to_owned),
+            doc_kind: doc_kind.to_owned(),
+            version,
+            latest_version,
+            title: format!("{doc_kind} title"),
+        }
+    }
+
+    /// The lines of `graph` at `width`, as text.
+    fn drawn(graph: &LinkGraph, shell: &Shell, width: usize) -> Vec<String> {
+        lines(&rows(graph, 3), &shell.projects, width, &shell.theme)
+            .iter()
+            .map(text)
+            .collect()
+    }
+
     #[tokio::test]
     async fn feat_1_at_depth_2_is_a_tree_of_every_live_edge_once() {
         let graph = demo(ids::HTUI_FEAT_1).await;
@@ -1045,13 +1309,13 @@ mod tests {
         let rows = rows(&graph, 3);
         let feat_3_repeats = rows
             .iter()
-            .filter(|row| row.is_repeat() && row.node.item_id == ids::HTUI_FEAT_3)
+            .filter(|row| row.is_repeat() && row.item().item_id == ids::HTUI_FEAT_3)
             .count();
         assert_eq!(feat_3_repeats, 1, "{:#?}", shape(&rows));
         for node in &graph.nodes {
             let own = rows
                 .iter()
-                .filter(|row| !row.is_repeat() && row.node.item_id == node.item_id)
+                .filter(|row| !row.is_repeat() && row.item().item_id == node.item_id)
                 .count();
             assert_eq!(own, 1, "{} is expanded once: {:#?}", node.key, shape(&rows));
         }
@@ -1067,14 +1331,14 @@ mod tests {
             assert!(
                 !rows
                     .iter()
-                    .any(|row| row.level == 1 && row.node.item_id == ids::HTUI_TOOL_1),
+                    .any(|row| row.level == 1 && row.item().item_id == ids::HTUI_TOOL_1),
                 "`TOOL-1 relates FEAT-1` is tombstoned: {:#?}",
                 shape(&rows)
             );
             let own: Vec<String> = shape(&rows)
                 .into_iter()
                 .zip(&rows)
-                .filter(|(_, row)| !row.is_repeat() && row.node.item_id == ids::HTUI_TOOL_1)
+                .filter(|(_, row)| !row.is_repeat() && row.item().item_id == ids::HTUI_TOOL_1)
                 .map(|(line, _)| line)
                 .collect();
             if depth >= 2 {
@@ -1094,7 +1358,7 @@ mod tests {
             .filter(|row| row.level == 1)
             .map(|row| {
                 let link = row.link.expect("a level-1 row has a link");
-                (link.arrow, link.kind, row.node.key.as_str())
+                (link.arrow, link.kind, row.item().key.as_str())
             })
             .collect();
         assert_eq!(
@@ -1207,6 +1471,7 @@ mod tests {
                 edge(&r, LinkKind::BlockedBy, &x),
             ],
             nodes: vec![x, r],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         assert_eq!(
@@ -1263,6 +1528,7 @@ mod tests {
                 edge(&r, LinkKind::Relates, &y),
             ],
             nodes: vec![x_again, y, r, x],
+            documents: vec![],
         };
         assert_eq!(rank_nodes(&graph, 3), [2, 3, 1], "R, X at depth 1, Y");
         assert_eq!(shape(&rows(&graph, 3)), ["R", "→ relates X", "→ relates Y"]);
@@ -1311,10 +1577,10 @@ mod tests {
         let graph = demo(ids::HTUI_FEAT_1).await;
         let root = rows(&graph, 2)[0];
         assert!(root.link.is_none(), "row 0 is the root");
-        let mut node = root.node.clone();
+        let mut node = root.item().clone();
         node.key = "FEAT\u{1}1".to_owned();
         let row = GraphRow {
-            node: &node,
+            target: Target::Node(&node),
             ..root
         };
         let drawn = line(&row, node.project_id, true, None, ROW, &shell.theme);
@@ -1418,11 +1684,11 @@ mod tests {
         for _ in 0..6 {
             tab.on_key(key(KeyCode::Char('J')), &mut ctx);
         }
-        assert_eq!(tab.visible()[tab.cursor].node.item_id, ids::AGY_FEAT_1);
+        assert_eq!(tab.visible()[tab.cursor].item().item_id, ids::AGY_FEAT_1);
         assert_eq!(tab.cursor, 6);
         tab.on_key(key(KeyCode::Char('+')), &mut ctx);
         assert_eq!(tab.cursor, 8);
-        assert_eq!(tab.visible()[tab.cursor].node.item_id, ids::AGY_FEAT_1);
+        assert_eq!(tab.visible()[tab.cursor].item().item_id, ids::AGY_FEAT_1);
         tab.on_key(key(KeyCode::Char('-')), &mut ctx);
         tab.on_key(key(KeyCode::Char('-')), &mut ctx);
         assert_eq!(tab.cursor, 0, "agy FEAT-1 is two hops out");
@@ -1610,7 +1876,7 @@ mod tests {
         }
         let on_repeat = |tab: &GraphTab| {
             let row = tab.visible()[tab.cursor];
-            row.is_repeat() && row.node.item_id == ids::HTUI_FEAT_3
+            row.is_repeat() && row.item().item_id == ids::HTUI_FEAT_3
         };
         assert!(on_repeat(&tab), "{:#?}", shape(&tab.visible()));
         tab.on_key(key(KeyCode::Char('+')), &mut ctx);
@@ -1637,12 +1903,12 @@ mod tests {
         let fix_1 = rows(&graph, 2);
         let vulkan = fix_1
             .iter()
-            .find(|row| row.node.item_id == ids::VULKAN_FEAT_1)
+            .find(|row| row.item().item_id == ids::VULKAN_FEAT_1)
             .expect("vulkan FEAT-1 is one hop from agy FIX-1");
         let at = |width| {
             let drawn = line(
                 vulkan,
-                fix_1[0].node.project_id,
+                fix_1[0].item().project_id,
                 false,
                 None,
                 width,
@@ -1665,7 +1931,7 @@ mod tests {
         let feat_1 = rows(&graph, 2);
         let drawn = line(
             &feat_1[1],
-            feat_1[0].node.project_id,
+            feat_1[0].item().project_id,
             true,
             None,
             17,
@@ -1769,6 +2035,7 @@ mod tests {
             root: r.item_id,
             edges: vec![edge(&r, LinkKind::Relates, &x)],
             nodes: vec![r, x],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         for width in 0..=ROW {
@@ -1794,12 +2061,35 @@ mod tests {
         );
     }
 
-    /// L7: no width, down to nothing, panics or draws a line wider than the pane.
+    /// L7: no width, down to nothing, panics or draws a line wider than the pane; MOD-150 M3 D12:
+    /// nor does a document's row, an item's document from the root and an owner document of
+    /// another project from the first node one hop out.
     #[tokio::test]
     async fn every_width_up_to_the_pane_fits_and_draws() {
         let shell = Shell::platform().await;
         for root in [ids::HTUI_FEAT_1, ids::AGY_FIX_1, ids::HTUI_ANA_1] {
-            let graph = demo(root).await;
+            let mut graph = demo(root).await;
+            let hop = graph
+                .nodes
+                .iter()
+                .find(|node| node.depth == 1)
+                .expect("every root has a neighbour")
+                .item_id;
+            let mut owner = document(91, hop, ArtifactLinkKind::Relates, None, "verdict", 1, 1);
+            owner.project_id = ids::PROJECT_VULKAN;
+            "vulkan-tutorials".clone_into(&mut owner.project_slug);
+            graph.documents = vec![
+                document(
+                    90,
+                    root,
+                    ArtifactLinkKind::Implements,
+                    Some("ANA-1"),
+                    "research",
+                    2,
+                    3,
+                ),
+                owner,
+            ];
             for depth in 1..=GraphTab::MAX_HOPS {
                 let rows = rows(&graph, depth);
                 for width in 0..=ROW {
@@ -1810,7 +2100,11 @@ mod tests {
                         // The key is the last thing to go: whole whenever the row's lead, its
                         // unpadded kind and the key itself fit.
                         let Some(link) = row.link else { continue };
-                        let key = row.node.key.as_str();
+                        let key = match row.target {
+                            Target::Node(node) => node.key.clone(),
+                            Target::Document(document) => document_key(document),
+                        };
+                        let key = key.as_str();
                         let needs = 1
                             + indent(row.level)
                             + 2
@@ -1824,6 +2118,14 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(
+                rows(&graph, GraphTab::MAX_HOPS)
+                    .iter()
+                    .filter(|row| matches!(row.target, Target::Document(_)))
+                    .count(),
+                2,
+                "both documents are drawn"
+            );
             let mut tab = pane(graph);
             tab.depth = GraphTab::MAX_HOPS;
             tab.rebuild();
@@ -1854,6 +2156,7 @@ mod tests {
                 edge(&r, LinkKind::Origin, &y),
             ],
             nodes: vec![r, x, y],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         let at = |width| -> Vec<String> {
@@ -1897,6 +2200,7 @@ mod tests {
                 edge(&r, LinkKind::Implements, &i),
             ],
             nodes: vec![r, p, d, i],
+            documents: vec![],
         };
         assert_eq!(kind_width(), 10);
         let drawn: Vec<String> = lines(&rows(&graph, 3), &shell.projects, ROW, &shell.theme)
@@ -1956,12 +2260,12 @@ mod tests {
         let rows = rows(&graph, 2);
         let vulkan = rows
             .iter()
-            .find(|row| row.node.item_id == ids::VULKAN_FEAT_1)
+            .find(|row| row.item().item_id == ids::VULKAN_FEAT_1)
             .expect("vulkan FEAT-1 is one hop from agy FIX-1");
-        assert!(!in_workspace(vulkan.node, &shell.projects));
+        assert!(!in_workspace(vulkan.item().project_id, &shell.projects));
         let drawn = line(
             vulkan,
-            rows[0].node.project_id,
+            rows[0].item().project_id,
             false,
             None,
             ROW,
@@ -2030,7 +2334,7 @@ mod tests {
         tab.cursor = tab
             .visible()
             .iter()
-            .position(|row| row.link.is_some() && row.node.item_id == ids::HTUI_ANA_1)
+            .position(|row| row.link.is_some() && row.item().item_id == ids::HTUI_ANA_1)
             .expect("WS-1 has a row of its own");
         tab.on_key(key(KeyCode::Enter), &mut ctx);
         assert!(
@@ -2146,5 +2450,369 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// MOD-150 M3 D12: a document's row reads its kind, `KEY doc_kind` and the pinned version,
+    /// the latest beside it only when that is newer, then its title.
+    #[tokio::test]
+    async fn a_document_link_reads_kind_owner_and_version() {
+        let shell = Shell::platform().await;
+        let r = node(1, "R", 0);
+        let mut stale = document(
+            10,
+            r.item_id,
+            ArtifactLinkKind::Implements,
+            Some("ANA-1"),
+            "verdict",
+            2,
+            4,
+        );
+        "Verdict: keep Postgres".clone_into(&mut stale.title);
+        let latest = document(
+            11,
+            r.item_id,
+            ArtifactLinkKind::Relates,
+            Some("ANA-2"),
+            "plan",
+            3,
+            3,
+        );
+        let mut graph = LinkGraph {
+            root: r.item_id,
+            nodes: vec![r],
+            edges: vec![],
+            documents: vec![latest, stale],
+        };
+        // As every backend answers it: the tab draws an item's documents in this order.
+        graph.sort_documents();
+        assert_eq!(
+            drawn(&graph, &shell, 80)[1..],
+            [
+                " \u{2192} implements ANA-1 verdict v2 (latest v4) Verdict: keep Postgres",
+                " \u{2192} relates    ANA-2 plan v3 plan title",
+            ]
+        );
+    }
+
+    /// MOD-150 M3 D12: an owner document is labelled by its project's slug, even the root's; an
+    /// item's document of another project carries the slug as an item does.
+    #[tokio::test]
+    async fn an_owner_document_reads_its_slug() {
+        let shell = Shell::platform().await;
+        let r = node(1, "R", 0);
+        let own = document(
+            10,
+            r.item_id,
+            ArtifactLinkKind::Origin,
+            None,
+            "decisions",
+            1,
+            1,
+        );
+        let mut elsewhere = document(
+            11,
+            r.item_id,
+            ArtifactLinkKind::Relates,
+            Some("ANA-1"),
+            "verdict",
+            1,
+            1,
+        );
+        elsewhere.project_id = ProjectId::from_uuid(Uuid::from_u128(101));
+        "lib".clone_into(&mut elsewhere.project_slug);
+        let mut lib = document(
+            12,
+            r.item_id,
+            ArtifactLinkKind::Relates,
+            None,
+            "verdict",
+            1,
+            2,
+        );
+        lib.project_id = ProjectId::from_uuid(Uuid::from_u128(101));
+        "lib".clone_into(&mut lib.project_slug);
+        let mut graph = LinkGraph {
+            root: r.item_id,
+            nodes: vec![r],
+            edges: vec![],
+            documents: vec![lib, elsewhere, own],
+        };
+        graph.sort_documents();
+        assert_eq!(
+            drawn(&graph, &shell, 80)[1..],
+            [
+                " \u{2192} origin     p decisions v1 decisions title",
+                " \u{2192} relates    lib verdict v1 (latest v2) verdict title",
+                " \u{2192} relates    lib:ANA-1 verdict v1 verdict title",
+            ]
+        );
+    }
+
+    /// MOD-150 M3 D12: a document hangs under its item's own row, after its children, and never
+    /// under a `(*)` repeat; a document of a node the walk did not keep is not drawn.
+    #[test]
+    fn a_document_under_a_repeated_node_is_not_drawn_twice() {
+        let r = node(1, "R", 0);
+        let x = node(2, "X", 1);
+        let y = node(3, "Y", 1);
+        let z = node(4, "Z", 2);
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![
+                edge(&r, LinkKind::Relates, &x),
+                edge(&r, LinkKind::Relates, &y),
+                edge(&x, LinkKind::Relates, &y),
+                edge(&x, LinkKind::Relates, &z),
+            ],
+            documents: vec![
+                document(
+                    10,
+                    y.item_id,
+                    ArtifactLinkKind::Implements,
+                    Some("ANA-1"),
+                    "verdict",
+                    1,
+                    1,
+                ),
+                document(
+                    11,
+                    x.item_id,
+                    ArtifactLinkKind::Origin,
+                    Some("ANA-2"),
+                    "prd",
+                    2,
+                    2,
+                ),
+                document(
+                    12,
+                    r.item_id,
+                    ArtifactLinkKind::Relates,
+                    Some("ANA-3"),
+                    "plan",
+                    1,
+                    1,
+                ),
+                document(
+                    13,
+                    ItemId::from_uuid(Uuid::from_u128(99)),
+                    ArtifactLinkKind::Relates,
+                    None,
+                    "verdict",
+                    1,
+                    1,
+                ),
+            ],
+            nodes: vec![r, x, y, z],
+        };
+        assert_eq!(
+            shape(&rows(&graph, 3)),
+            [
+                "R",
+                "\u{2192} relates X",
+                "  \u{2192} relates Y (*)",
+                "  \u{2192} relates Z",
+                "  \u{2192} origin ANA-2 prd v2",
+                "\u{2192} relates Y",
+                "  \u{2192} implements ANA-1 verdict v1",
+                "\u{2192} relates ANA-3 plan v1",
+            ]
+        );
+        // At depth 1 Z is cut, and X's document still follows X's children.
+        assert_eq!(
+            shape(&rows(&graph, 1)),
+            [
+                "R",
+                "\u{2192} relates X",
+                "  \u{2192} relates Y (*)",
+                "  \u{2192} origin ANA-2 prd v2",
+                "\u{2192} relates Y",
+                "  \u{2192} implements ANA-1 verdict v1",
+                "\u{2192} relates ANA-3 plan v1",
+            ]
+        );
+    }
+
+    /// MOD-150 M3 D12: a document's kind is padded with the items' to the same ten cells, and a
+    /// document too long to fit padded unpads every row (L6).
+    #[tokio::test]
+    async fn the_kind_column_keeps_its_width_with_documents() {
+        let shell = Shell::platform().await;
+        let r = node(1, "R", 0);
+        let x = node(2, "X", 1);
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![edge(&r, LinkKind::Origin, &x)],
+            documents: vec![document(
+                10,
+                r.item_id,
+                ArtifactLinkKind::Relates,
+                Some("ANA-1"),
+                "verdict",
+                1,
+                1,
+            )],
+            nodes: vec![r, x],
+        };
+        assert_eq!(kind_width(), 10);
+        assert_eq!(
+            drawn(&graph, &shell, ROW)[1..],
+            [
+                " \u{2192} origin     X \u{25cb} open X title",
+                " \u{2192} relates    ANA-1 verdict v1 verdict ti\u{2026}",
+            ]
+        );
+        // 30 cells hold the padded document row, both titles dropped; 29 only the unpadded one.
+        assert_eq!(
+            drawn(&graph, &shell, 30)[1..],
+            [
+                " \u{2192} origin     X \u{25cb} open",
+                " \u{2192} relates    ANA-1 verdict v1",
+            ]
+        );
+        assert_eq!(
+            drawn(&graph, &shell, 29)[1..],
+            [
+                " \u{2192} origin X \u{25cb} open X title",
+                " \u{2192} relates ANA-1 verdict v1",
+            ]
+        );
+    }
+
+    /// FEAT-1's demo graph with `document` linked from its root, and the row it draws on.
+    async fn feat_1_with(document: LinkedDocument) -> (GraphTab, usize) {
+        let mut graph = demo(ids::HTUI_FEAT_1).await;
+        graph.documents = vec![document];
+        let tab = pane(graph);
+        let at = tab
+            .visible()
+            .iter()
+            .position(|row| matches!(row.target, Target::Document(_)))
+            .expect("the document has a row");
+        (tab, at)
+    }
+
+    /// MOD-150 M3 D12: `Enter` on an item's document reveals the item that owns it, and is
+    /// refused, as an item's row is, when that item is outside the workspace.
+    #[tokio::test]
+    async fn enter_on_an_item_document_reveals_its_owner() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let mut ana_1 = document(
+            10,
+            ids::HTUI_FEAT_1,
+            ArtifactLinkKind::Implements,
+            Some("ANA-1"),
+            "research",
+            2,
+            3,
+        );
+        ana_1.owner_item = Some(ids::HTUI_ANA_1);
+        ana_1.project_id = ids::PROJECT_HTUI;
+        "htui".clone_into(&mut ana_1.project_slug);
+        let (mut tab, at) = feat_1_with(ana_1).await;
+        assert_eq!(at, 8, "after every row the root's children draw");
+        tab.cursor = at;
+        assert_eq!(tab.on_key(key(KeyCode::Enter), &mut ctx), Handled::Consumed);
+        match shell.emit.take().as_slice() {
+            [Action::Reveal(RevealTarget::Item { id, key })] => {
+                assert_eq!((*id, key.as_str()), (ids::HTUI_ANA_1, "ANA-1"));
+            }
+            other => panic!("a reveal: {other:?}"),
+        }
+
+        let mut vulkan = document(
+            11,
+            ids::HTUI_FEAT_1,
+            ArtifactLinkKind::Relates,
+            Some("FEAT-1"),
+            "prd",
+            1,
+            1,
+        );
+        vulkan.owner_item = Some(ids::VULKAN_FEAT_1);
+        vulkan.project_id = ids::PROJECT_VULKAN;
+        "vulkan-tutorials".clone_into(&mut vulkan.project_slug);
+        let (mut tab, at) = feat_1_with(vulkan).await;
+        tab.cursor = at;
+        tab.on_key(key(KeyCode::Enter), &mut ctx);
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Error(text)] if text == "vulkan-tutorials:FEAT-1 is outside this workspace"
+            ),
+            "outside the workspace: refused"
+        );
+        let label = lines(&tab.visible(), &shell.projects, ROW, &shell.theme)[at]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("FEAT-1 prd"))
+            .expect("the label span")
+            .style;
+        assert_eq!(label, shell.theme.dim, "and dim");
+    }
+
+    /// MOD-150 M3 D12: an owner document has no item to reveal; `Enter` says where it opens,
+    /// naming a scope row's owner as its workspace.
+    #[tokio::test]
+    async fn enter_on_an_owner_document_says_where_it_opens() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        for (project, slug, said) in [
+            (
+                ids::PROJECT_HTUI,
+                "htui",
+                "htui verdict is project htui's own document; open it in Settings",
+            ),
+            (
+                ids::PROJECT_SCOPE_PLATFORM,
+                "@platform",
+                "@platform verdict is workspace platform's own document; open it in Settings",
+            ),
+        ] {
+            let mut verdict = document(
+                10,
+                ids::HTUI_FEAT_1,
+                ArtifactLinkKind::Relates,
+                None,
+                "verdict",
+                1,
+                1,
+            );
+            verdict.project_id = project;
+            slug.clone_into(&mut verdict.project_slug);
+            let (mut tab, at) = feat_1_with(verdict).await;
+            tab.cursor = at;
+            assert_eq!(tab.on_key(key(KeyCode::Enter), &mut ctx), Handled::Consumed);
+            let emitted = shell.emit.take();
+            assert!(
+                matches!(emitted.as_slice(), [Action::Error(text)] if text == said),
+                "no reveal: {emitted:?}"
+            );
+        }
+    }
+
+    /// MOD-150 M3 D12: a depth change keeps the cursor on a document whose item stays expanded.
+    #[tokio::test]
+    async fn a_depth_change_keeps_the_cursor_on_its_document() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let (mut tab, at) = feat_1_with(document(
+            10,
+            ids::HTUI_FEAT_1,
+            ArtifactLinkKind::Relates,
+            None,
+            "verdict",
+            1,
+            1,
+        ))
+        .await;
+        tab.cursor = at;
+        tab.on_key(key(KeyCode::Char('+')), &mut ctx);
+        assert!(
+            matches!(tab.visible()[tab.cursor].target, Target::Document(_)),
+            "{:#?}",
+            shape(&tab.visible())
+        );
+        assert_eq!(tab.cursor, tab.visible().len() - 1);
     }
 }

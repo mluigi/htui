@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT d.version\n          FROM item_artifact_link l\n          JOIN document d ON d.id = l.to_document_id\n         WHERE l.from_item_id = $1 AND l.kind = $2 AND l.deleted_at IS NULL\n           AND d.project_id = $3 AND d.item_id IS NOT DISTINCT FROM $4::uuid AND d.kind = $5\n           AND d.id <> $6\n         ORDER BY d.version\n         LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "48177814b3d102905ae280294ee0a2ba9005bc480e4708789a647faa4a00d476"
+}

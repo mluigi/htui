@@ -689,6 +689,7 @@ mod tests {
             root: item().id,
             nodes: vec![node(item().id, project(), "htui", "FEAT-1", 0)],
             edges: Vec::new(),
+            documents: vec![],
         }
     }
 
@@ -744,6 +745,7 @@ mod tests {
                 edge(me, LinkKind::Relates, relates),
                 edge(relates, LinkKind::Supersedes, canonical),
             ],
+            documents: vec![],
         };
         let shown = preview(&item(), Resolution::Duplicate, false, &[], &[], &[], &graph);
         assert_eq!(

@@ -22,7 +22,7 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 54 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 55 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
@@ -31,7 +31,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1),
 /// then the one of `0029_divided_fanout.sql` (MOD-139 plan D1), then the one of
 /// `0031_command_log.sql` (MOD-152 plan D1).
-/// `0032_worker_log.sql` (MOD-122 M2 plan D1).
+/// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
+/// (MOD-150 M3 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -100,6 +101,8 @@ const TABLES: &[&str] = &[
     "command_log",
     // 0032_worker_log.sql (MOD-122)
     "worker_log",
+    // 0034_item_artifact_link.sql (MOD-150 M3)
+    "item_artifact_link",
 ];
 
 #[tokio::test]
@@ -122,7 +125,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -137,8 +140,9 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
-         0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql
-         and MOD-164's 0033_memory_capture.sql, in ordinal order"
+         0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql,
+         MOD-164's 0033_memory_capture.sql and MOD-150 M3's 0034_item_artifact_link.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -156,7 +160,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        54,
+        55,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -166,19 +170,21 @@ async fn migrations_apply_on_a_clean_database() {
          project_type and MOD-163's 0022_memory.sql adds memory_entry and \
          memory_entry_revision and MOD-139's 0029_divided_fanout.sql adds run_plan and MOD-152's \
          0031_command_log.sql adds command_log and MOD-122's \
-         0032_worker_log.sql adds worker_log"
+         0032_worker_log.sql adds worker_log and MOD-150 M3's 0034_item_artifact_link.sql \
+         adds item_artifact_link"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 54 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 55 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
          (memory_entry, memory_entry_revision) and MOD-139's 0029_divided_fanout.sql \
          (run_plan) and MOD-152's 0031_command_log.sql (command_log) and MOD-122's \
-         0032_worker_log.sql (worker_log) and nothing else, \
+         0032_worker_log.sql (worker_log) and MOD-150 M3's 0034_item_artifact_link.sql \
+         (item_artifact_link) and nothing else, \
          got {present:?}"
     );
 
@@ -4253,8 +4259,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(33),
-        "thirty-three embedded migrations, none applied (through MOD-164's 0033_memory_capture.sql)"
+        MigrationState::Pending(34),
+        "thirty-four embedded migrations, none applied (through MOD-150 M3's 0034_item_artifact_link.sql)"
     );
 
     db.drop_db().await;
@@ -4354,8 +4360,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(33),
-        "thirty-three embedded migrations, through MOD-164's 0033_memory_capture.sql"
+        MigrationState::Pending(34),
+        "thirty-four embedded migrations, through MOD-150 M3's 0034_item_artifact_link.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4363,8 +4369,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(33),
-        "every one of the thirty-three, through MOD-164's 0033_memory_capture.sql, is pending"
+        HeadlessError::MigrationsPending(34),
+        "every one of the thirty-four, through MOD-150 M3's 0034_item_artifact_link.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4386,8 +4392,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(33),
-        "every one of the thirty-three, through MOD-164's 0033_memory_capture.sql, is pending"
+        HeadlessError::MigrationsPending(34),
+        "every one of the thirty-four, through MOD-150 M3's 0034_item_artifact_link.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4538,8 +4544,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        33,
-        "the later applies migrate nothing: the thirty-three embedded migrations (through MOD-164's 0033_memory_capture.sql) are applied once"
+        34,
+        "the later applies migrate nothing: the thirty-four embedded migrations (through MOD-150 M3's 0034_item_artifact_link.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -7595,6 +7601,100 @@ async fn cache_0010_applies_over_a_populated_0009_mirror() {
     pool.close().await;
 }
 
+/// MOD-150 M3 T2 (plan D9): cache 0011 applies over a populated 0010 mirror, since
+/// `CACHE_MIGRATOR` runs before the `schema_version` check. An existing `item_link` row survives,
+/// and `item_artifact_link` exists with its columns, keyed on `id`, without `deleted_at` (a
+/// tombstone is a delete in the mirror). Needs no server and therefore never skips.
+#[tokio::test]
+async fn cache_0011_applies_over_a_populated_0010_mirror() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().expect("a temp cache dir");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("cache.sqlite"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open the cache file");
+    htui_store::CACHE_MIGRATOR
+        .run_to(10, &pool)
+        .await
+        .expect("apply cache 0001 through 0010");
+    sqlx::query(
+        "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+         VALUES ('i1', 'i2', 'relates', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a 0010 item_link");
+    htui_store::CACHE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("cache 0011 applies over a populated 0010 file");
+
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM item_link WHERE from_item_id = 'i1'")
+        .fetch_one(&pool)
+        .await
+        .expect("count the kept link");
+    assert_eq!(kept, 1, "the 0010 row is kept");
+
+    sqlx::query(
+        "INSERT INTO item_artifact_link (id, from_item_id, kind, to_document_id, \
+         to_attachment_id, proposed_by_step_id, created_at, updated_at) \
+         VALUES ('l1', 'i1', 'implements', 'd1', NULL, 's1', 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert an item_artifact_link row");
+    let row: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT kind, to_document_id, to_attachment_id, proposed_by_step_id, updated_at \
+           FROM item_artifact_link WHERE id = 'l1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the link back");
+    assert_eq!(
+        row,
+        (
+            "implements".to_owned(),
+            "d1".to_owned(),
+            None,
+            Some("s1".to_owned()),
+            2
+        )
+    );
+    let duplicate = sqlx::query(
+        "INSERT INTO item_artifact_link (id, from_item_id, kind, to_document_id, created_at, \
+         updated_at) VALUES ('l1', 'i2', 'relates', 'd2', 1, 1)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(duplicate.is_err(), "id is the primary key");
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('item_artifact_link') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .expect("list the columns");
+    assert_eq!(
+        columns,
+        [
+            "id",
+            "from_item_id",
+            "kind",
+            "to_document_id",
+            "to_attachment_id",
+            "proposed_by_step_id",
+            "created_at",
+            "updated_at",
+        ],
+        "the Postgres columns less deleted_at"
+    );
+
+    pool.close().await;
+}
+
 /// Inserts `from --kind--> to` straight into `item_link`, live.
 async fn insert_link(
     pool: &sqlx::PgPool,
@@ -7721,6 +7821,184 @@ async fn migration_0030_widens_link_kinds_and_backs_one_parent() {
         .await
         .expect_err("a kind outside the list is refused");
     assert_refused_by(err, "chk_item_link_kind", "item_link.kind = 'blocks'");
+
+    db.drop_db().await;
+}
+
+/// Inserts an `item_artifact_link` row from `from` with the two targets as given.
+async fn insert_artifact_link(
+    pool: &sqlx::PgPool,
+    from: uuid::Uuid,
+    kind: &str,
+    document: Option<uuid::Uuid>,
+    attachment: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO item_artifact_link (from_item_id, kind, to_document_id, to_attachment_id) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(from)
+    .bind(kind)
+    .bind(document)
+    .bind(attachment)
+    .fetch_one(pool)
+    .await
+}
+
+/// MOD-150 M3 (plan D1): 0034 creates `item_artifact_link` as ANA-35 §7.9 writes it, with its
+/// constraints named: the kind CHECK lists `ArtifactLinkKind::ALL`, exactly one target is set,
+/// a link is unique over a NULL attachment, the trigger moves `updated_at`, the two indexes
+/// exist, and a document's delete takes its links. Staged at v33, as on a real box, over an item
+/// and a document written before the migration.
+#[tokio::test]
+async fn migration_0034_creates_item_artifact_link() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(33, &db.pool)
+        .await
+        .expect("apply 0001 through 0033");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod150m3").await;
+    let pk = plant_project_kind(pool, user, "docs").await;
+    let item = plant_item(pool, pk, 1, "open", None, user).await;
+    let owner = plant_item(pool, pk, 2, "open", None, user).await;
+    let document: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO document (project_id, item_id, kind, version, title, body, created_by) \
+         VALUES ($1, $2, 'verdict', 1, 'Verdict', '', $3) RETURNING id",
+    )
+    .bind(pk.0)
+    .bind(owner)
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .expect("plant a v33 document");
+
+    MIGRATOR.run_to(34, pool).await.expect("apply 0034");
+
+    let check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conrelid = 'item_artifact_link'::regclass \
+            AND conname = 'chk_item_artifact_link_kind'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read chk_item_artifact_link_kind");
+    assert_eq!(
+        check, "CHECK ((kind = ANY (ARRAY['origin'::text, 'relates'::text, 'implements'::text])))",
+        "chk_item_artifact_link_kind lists ArtifactLinkKind::ALL in order"
+    );
+    for (index, definition) in [
+        (
+            "idx_item_artifact_link_updated_at",
+            "CREATE INDEX idx_item_artifact_link_updated_at ON public.item_artifact_link \
+             USING btree (updated_at)",
+        ),
+        (
+            "idx_item_artifact_link_document",
+            "CREATE INDEX idx_item_artifact_link_document ON public.item_artifact_link \
+             USING btree (to_document_id)",
+        ),
+        (
+            "idx_item_artifact_link_step",
+            "CREATE INDEX idx_item_artifact_link_step ON public.item_artifact_link \
+             USING btree (proposed_by_step_id)",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {index}: {err}"));
+        assert_eq!(actual, definition, "{index} is as D1 writes it");
+    }
+
+    let err = insert_artifact_link(pool, item, "implements", None, None)
+        .await
+        .expect_err("a link with no target is refused");
+    assert_refused_by(
+        err,
+        "chk_item_artifact_link_target",
+        "a link with no target",
+    );
+    let err = insert_artifact_link(
+        pool,
+        item,
+        "implements",
+        Some(document),
+        Some(uuid::Uuid::now_v7()),
+    )
+    .await
+    .expect_err("a link with two targets is refused");
+    assert_refused_by(
+        err,
+        "chk_item_artifact_link_target",
+        "a link with two targets",
+    );
+    let err = insert_artifact_link(pool, item, "parent", Some(document), None)
+        .await
+        .expect_err("an item-only kind is refused");
+    assert_refused_by(
+        err,
+        "chk_item_artifact_link_kind",
+        "item_artifact_link.kind = 'parent'",
+    );
+
+    let link = insert_artifact_link(pool, item, "implements", Some(document), None)
+        .await
+        .expect("a link to the v33 document");
+    let err = insert_artifact_link(pool, item, "implements", Some(document), None)
+        .await
+        .expect_err("the same link twice is refused");
+    assert_refused_by(
+        err,
+        "uq_item_artifact_link",
+        "the same link twice, the NULL attachments not distinct",
+    );
+    insert_artifact_link(pool, item, "relates", Some(document), None)
+        .await
+        .expect("another kind to the same document is another link");
+
+    sqlx::query("UPDATE item_artifact_link SET updated_at = '2000-01-01T00:00:00Z' WHERE id = $1")
+        .bind(link)
+        .execute(pool)
+        .await
+        .expect("backdate the link");
+    let backdated: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM item_artifact_link WHERE id = $1")
+            .bind(link)
+            .fetch_one(pool)
+            .await
+            .expect("read the backdated stamp");
+    sqlx::query("UPDATE item_artifact_link SET deleted_at = now() WHERE id = $1")
+        .bind(link)
+        .execute(pool)
+        .await
+        .expect("tombstone the link");
+    let moved: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM item_artifact_link WHERE id = $1")
+            .bind(link)
+            .fetch_one(pool)
+            .await
+            .expect("read the moved stamp");
+    assert!(
+        moved > backdated,
+        "trg_item_artifact_link_updated_at moves updated_at on an update ({backdated} -> {moved})"
+    );
+
+    sqlx::query("DELETE FROM document WHERE id = $1")
+        .bind(document)
+        .execute(pool)
+        .await
+        .expect("delete the document");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM item_artifact_link")
+        .fetch_one(pool)
+        .await
+        .expect("count the links");
+    assert_eq!(left, 0, "a document's delete takes its links");
 
     db.drop_db().await;
 }

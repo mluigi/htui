@@ -34,7 +34,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::StoredCommandLog;
-use crate::model::link::{ItemLink, LinkGraph, ProposeLink, WithdrawLink};
+use crate::model::link::{
+    DocumentLink, ItemLink, LinkGraph, ProposeDocumentLink, ProposeLink, WithdrawDocumentLink,
+    WithdrawLink,
+};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus, Document,
@@ -510,6 +513,18 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         fence: StepFence,
         link: WithdrawLink,
     ) -> impl Future<Output = Result<ItemLink>> + Send;
+    /// [`WriteStore::propose_document_link`].
+    fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> impl Future<Output = Result<DocumentLink>> + Send;
+    /// [`WriteStore::withdraw_document_link`].
+    fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> impl Future<Output = Result<DocumentLink>> + Send;
     /// [`WriteStore::item_by_key`].
     fn item_by_key(
         &self,
@@ -1103,6 +1118,20 @@ impl WorkerStore for MemStore {
     }
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
         WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::propose_document_link(self, fence, link).await
+    }
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::withdraw_document_link(self, fence, link).await
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await

@@ -1,0 +1,127 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO item_artifact_link (from_item_id, kind, to_document_id, proposed_by_step_id)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT ON CONSTRAINT uq_item_artifact_link DO UPDATE\n           SET proposed_by_step_id = CASE WHEN item_artifact_link.deleted_at IS NULL\n                                          THEN item_artifact_link.proposed_by_step_id\n                                          ELSE EXCLUDED.proposed_by_step_id END,\n               deleted_at          = NULL\n        RETURNING id                  AS \"id: ArtifactLinkId\",\n                  from_item_id        AS \"from_item_id: ItemId\",\n                  kind                AS \"kind: ArtifactLinkKind\",\n                  to_document_id      AS \"to_document_id: DocumentId\",\n                  to_attachment_id,\n                  proposed_by_step_id AS \"proposed_by_step_id: StepId\",\n                  created_at,\n                  updated_at,\n                  deleted_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ArtifactLinkId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "from_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "from_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: ArtifactLinkKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "to_document_id: DocumentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "to_document_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "to_attachment_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "to_attachment_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "proposed_by_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9d6c0b4e7890d2c054e4bb94023ace4717c1768e6121c3523870b9f5be2ecb9f"
+}

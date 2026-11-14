@@ -1,0 +1,143 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT l.from_item_id AS \"from_item_id: ItemId\",\n                   l.kind         AS \"kind: ArtifactLinkKind\",\n                   d.id           AS \"document_id: DocumentId\",\n                   d.project_id   AS \"project_id: ProjectId\",\n                   p.slug         AS project_slug,\n                   d.item_id      AS \"owner_item: ItemId\",\n                   i.key          AS \"owner_key?\",\n                   d.kind         AS doc_kind,\n                   d.version,\n                   (SELECT MAX(x.version) FROM document x\n                     WHERE x.project_id = d.project_id\n                       AND x.item_id IS NOT DISTINCT FROM d.item_id\n                       AND x.kind = d.kind) AS \"latest_version!\",\n                   d.title\n              FROM item_artifact_link l\n              JOIN document d    ON d.id = l.to_document_id\n              JOIN project p     ON p.id = d.project_id\n              LEFT JOIN item i   ON i.id = d.item_id\n             WHERE l.deleted_at IS NULL AND l.from_item_id = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "from_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "from_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind: ArtifactLinkKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_artifact_link",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "document_id: DocumentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "project_slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "owner_item: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "owner_key?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "doc_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "latest_version!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "title"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "15c7638d4b7b36ccb1ecdd6535670f97d2b93f46163b6fb87c323ece07216a20"
+}

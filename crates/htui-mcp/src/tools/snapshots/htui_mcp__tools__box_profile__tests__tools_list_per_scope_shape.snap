@@ -114,7 +114,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, or to a version of a document (`to_document`). An item is named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -128,8 +128,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -142,12 +177,11 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "duplicates",
               "implements"
             ],
-            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`. A `to_document` link takes only `origin`, `relates` or `implements`."
           }
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"
@@ -254,7 +288,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, or to a version of a document (`to_document`). An item is named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -268,8 +302,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -282,12 +351,11 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "duplicates",
               "implements"
             ],
-            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`. A `to_document` link takes only `origin`, `relates` or `implements`."
           }
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"
@@ -394,7 +462,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
     },
     {
       "name": "item_link",
-      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project or its workspaces, or to a version of a document (`to_document`). An item is named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for workspace shop's own items.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -408,8 +476,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -422,12 +525,11 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "duplicates",
               "implements"
             ],
-            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`."
+            "description": "How this item relates to `to`, read `<this item> <kind> <to>`: `blocked_by`: this item cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s decision. An item has at most one `parent` and one `duplicates`. A `to_document` link takes only `origin`, `relates` or `implements`."
           }
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"

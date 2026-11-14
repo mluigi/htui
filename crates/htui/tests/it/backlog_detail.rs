@@ -16,8 +16,9 @@ use htui::app::Action;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::WorkspaceSummary;
-use htui_core::store::MemStore;
+use htui_core::fixtures::ids;
+use htui_core::model::{ArtifactLinkKind, DocumentRef, ProposeDocumentLink, WorkspaceSummary};
+use htui_core::store::{MemStore, StepFence, WriteStore as _};
 
 /// The workspace of the demo fixture with this slug (`tests/backlog.rs`'s reading).
 async fn workspace(slug: &str) -> WorkspaceSummary {
@@ -240,6 +241,48 @@ async fn the_graph_reads_its_kinds_and_statuses_as_words() {
     assert!(
         !frame.contains("\u{25b8} FEAT-1"),
         "no old cursor:\n{frame}"
+    );
+}
+
+/// MOD-150 M3 D12: a document link planted in the store is a leaf row under the item that links
+/// it, read as its kind, the owner's key and the document kind, then the pinned version beside
+/// the latest. Asserted as text: the fixtures hold no document link, so no snapshot moves (D10).
+#[tokio::test]
+async fn the_graph_draws_a_linked_document() {
+    let store = MemStore::demo();
+    store
+        .propose_document_link(
+            StepFence::Unleased,
+            ProposeDocumentLink {
+                from: ids::HTUI_FEAT_1,
+                kind: ArtifactLinkKind::Origin,
+                to: DocumentRef {
+                    owner: "ANA-1".to_owned(),
+                    kind: "research".to_owned(),
+                    version: Some(2),
+                },
+                step: ids::STEP_PLAN,
+            },
+        )
+        .await
+        .expect("FEAT-1's plan step links ANA-1's research v2");
+    let mut harness = Harness::over(store)
+        .size(100, 30)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, TO_GRAPH);
+    let frame = harness.render();
+    let rows = detail(&frame);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("  \u{2192} origin ANA-1 research v2 (latest v3)")),
+        "the document's row:\n{frame}"
     );
 }
 

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::fixtures::ids;
-use crate::model::link::{ProposeLink, WithdrawLink};
+use crate::model::link::{ArtifactLinkKind, ProposeLink, WithdrawLink};
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
@@ -93,6 +93,7 @@ use crate::store::traits::{
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
+use crate::store::traits::{document_already_pinned, document_outside_reach};
 use crate::store::traits::{invalid_prefix, scope_row_run_workspace, workspace_prefix_taken};
 use crate::store::traits::{
     part_of_another_planner, part_of_another_run, plan_admission_refusal, plan_not_proposed,
@@ -446,6 +447,12 @@ pub const CASES: &[&str] = &[
     "close_out_superseded_needs_or_records_its_supersessor",
     "close_out_names_only_for_duplicate_and_superseded",
     "close_out_link_refusals_follow_the_law",
+    // MOD-150 M3: links to documents (plan D1-D8)
+    "document_link_pins_the_latest_or_the_named_version",
+    "document_link_resolves_an_owner_document",
+    "document_link_refusals",
+    "document_link_withdraw_tombstones_and_revives",
+    "document_links_are_leaves_of_the_walk",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1464,6 +1471,19 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "close_out_link_refusals_follow_the_law" => {
             boxed(close_out_link_refusals_follow_the_law, store).await;
+        }
+        "document_link_pins_the_latest_or_the_named_version" => {
+            boxed(document_link_pins_the_latest_or_the_named_version, store).await;
+        }
+        "document_link_resolves_an_owner_document" => {
+            boxed(document_link_resolves_an_owner_document, store).await;
+        }
+        "document_link_refusals" => boxed(document_link_refusals, store).await,
+        "document_link_withdraw_tombstones_and_revives" => {
+            boxed(document_link_withdraw_tombstones_and_revives, store).await;
+        }
+        "document_links_are_leaves_of_the_walk" => {
+            boxed(document_links_are_leaves_of_the_walk, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4524,6 +4544,29 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
         workspace_id: ids::WORKSPACE_PLATFORM,
         project_ids: vec![ids::PROJECT_AGY],
     };
+    // MOD-150 M3 D8: a document link with each end in the project: one from an htui item to an
+    // agy document, one from an agy item to an htui document.
+    plant_versions(CASE, store, ids::AGY_ANA_1, "verdict", 1).await;
+    let (_run, htui_step) = agent_step(CASE, store, ids::PROJECT_HTUI, ids::HTUI_ANA_2, None).await;
+    propose_document(
+        store,
+        ids::HTUI_ANA_2,
+        ArtifactLinkKind::Relates,
+        doc_ref("agy:ANA-1", "verdict", None),
+        htui_step,
+    )
+    .await
+    .expect(CASE);
+    let (_run, agy_step) = agent_step(CASE, store, ids::PROJECT_AGY, ids::AGY_FEAT_1, None).await;
+    propose_document(
+        store,
+        ids::AGY_FEAT_1,
+        ArtifactLinkKind::Implements,
+        doc_ref("htui:ANA-1", "verdict", None),
+        agy_step,
+    )
+    .await
+    .expect(CASE);
     let agy_before = store
         .items(&agy_scope, &ItemFilter::default())
         .await
@@ -4551,6 +4594,16 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
         "{CASE}: the per-project seed of ANA-9 §5.10 goes whole"
     );
     assert_eq!(report.items, 8, "{CASE}: every item of the project");
+    assert_eq!(
+        report.document_links, 2,
+        "{CASE}: a document link goes with either end (MOD-150 M3 D8)"
+    );
+    assert!(
+        linked_documents(CASE, store, ids::AGY_FEAT_1)
+            .await
+            .is_empty(),
+        "{CASE}: agy:FEAT-1's link to htui:ANA-1's verdict went with the document"
+    );
     assert_eq!(report.workspace_links, 1, "{CASE}: the Platform membership");
     assert_eq!(report.skill_bindings, 3, "{CASE}: R-SKL-2's three bindings");
     assert_eq!(
@@ -4611,6 +4664,18 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
             .collect::<Vec<_>>(),
         vec![ids::AGY_FEAT_1],
         "{CASE}: the cross-project edge to htui:FEAT-2 went with the project it pointed at"
+    );
+    // R1 L3: htui:ANA-2's link to agy:ANA-1's verdict went with its item, leaving no row the
+    // agy document would still count (tombstones included).
+    assert_eq!(
+        store
+            .delete_reach(DeleteTarget::Project(ids::PROJECT_AGY))
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: agy has a reach"))
+            .document_links,
+        0,
+        "{CASE}: no link from a deleted item survives into agy's document links"
     );
 }
 
@@ -34294,6 +34359,699 @@ async fn close_out_link_refusals_follow_the_law<S: WriteStore>(store: &S) {
         matches!(&missing, Err(StoreError::NotFound { entity: "item", id })
             if *id == unknown.to_string()),
         "{CASE}: an unknown item is NotFound before its name is judged, got {missing:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-150 M3: links to documents (plan D1-D8). A link pins the named version or the latest at
+// write, names an item's document by key and an owner document by slug, refuses in D4's order,
+// tombstones and revives like an item link, and leaves the walk's nodes and edges alone.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-150 M3: a [`DocumentRef`](crate::model::DocumentRef).
+fn doc_ref(owner: &str, kind: &str, version: Option<i32>) -> crate::model::DocumentRef {
+    crate::model::DocumentRef {
+        owner: owner.to_owned(),
+        kind: kind.to_owned(),
+        version,
+    }
+}
+
+/// MOD-150 M3 D4: proposes `from --kind--> to` under the unleased fence.
+async fn propose_document<S: WriteStore>(
+    store: &S,
+    from: ItemId,
+    kind: ArtifactLinkKind,
+    to: crate::model::DocumentRef,
+    step: StepId,
+) -> Result<crate::model::DocumentLink, StoreError> {
+    store
+        .propose_document_link(
+            StepFence::Unleased,
+            crate::model::ProposeDocumentLink {
+                from,
+                kind,
+                to,
+                step,
+            },
+        )
+        .await
+}
+
+/// MOD-150 M3 D4: withdraws `from --kind--> to` under the unleased fence.
+async fn withdraw_document<S: WriteStore>(
+    store: &S,
+    from: ItemId,
+    kind: ArtifactLinkKind,
+    to: crate::model::DocumentRef,
+    step: StepId,
+) -> Result<crate::model::DocumentLink, StoreError> {
+    store
+        .withdraw_document_link(
+            StepFence::Unleased,
+            crate::model::WithdrawDocumentLink {
+                from,
+                kind,
+                to,
+                step,
+            },
+        )
+        .await
+}
+
+/// MOD-150 M3 D7: the documents `item`'s zero-hop graph carries.
+async fn linked_documents<S: ReadStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+) -> Vec<crate::model::LinkedDocument> {
+    store.links(item, 0).await.expect(case).documents
+}
+
+/// `NotFound { entity, id }`, or a panic naming the case and what was tried.
+fn not_found_exactly<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    entity: &str,
+    id: &str,
+    what: &str,
+) {
+    match outcome {
+        Err(StoreError::NotFound {
+            entity: got_entity,
+            id: got_id,
+        }) => assert_eq!(
+            (got_entity, got_id.as_str()),
+            (entity, id),
+            "{case}: {what}: NotFound names the entity and the label"
+        ),
+        other => panic!("{case}: {what} is NotFound({entity}, {id:?}), got {other:?}"),
+    }
+}
+
+/// MOD-150 M3 D3: writes `n` versions of `item`'s `kind`.
+async fn plant_versions<S: WriteStore>(case: &str, store: &S, item: ItemId, kind: &str, n: usize) {
+    for _ in 0..n {
+        store
+            .write_document(new_document(item, kind, None))
+            .await
+            .expect(case);
+    }
+}
+
+/// MOD-150 M3 D3: a link with no version pins the latest at write and keeps pinning it when a
+/// newer version lands (`latest_version` moves at read); a named version is pinned as named. The
+/// write answers what the graph reads.
+async fn document_link_pins_the_latest_or_the_named_version<S: WriteStore>(store: &S) {
+    const CASE: &str = "document_link_pins_the_latest_or_the_named_version";
+    plant_versions(CASE, store, ids::HTUI_ANA_2, "verdict", 2).await;
+    let x = feat(CASE, store, "implements the verdict").await;
+    let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+
+    let written = propose_document(
+        store,
+        x,
+        ArtifactLinkKind::Implements,
+        doc_ref("ANA-2", "verdict", None),
+        step,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        (
+            written.link.from_item_id,
+            written.link.kind,
+            written.link.to_document_id,
+            written.link.to_attachment_id,
+            written.link.proposed_by_step_id,
+            written.link.deleted_at,
+        ),
+        (
+            x,
+            ArtifactLinkKind::Implements,
+            Some(written.document.document_id),
+            None,
+            Some(step),
+            None
+        ),
+        "{CASE}: a live row of the step's, to the document"
+    );
+    assert_eq!(
+        (
+            written.document.from_item_id,
+            written.document.project_id,
+            written.document.project_slug.as_str(),
+            written.document.owner_item,
+            written.document.owner_key.as_deref(),
+            written.document.doc_kind.as_str(),
+            written.document.version,
+            written.document.latest_version,
+            written.document.title.clone(),
+        ),
+        (
+            x,
+            ids::PROJECT_HTUI,
+            "htui",
+            Some(ids::HTUI_ANA_2),
+            Some("ANA-2"),
+            "verdict",
+            2,
+            2,
+            format!("verdict of {}", ids::HTUI_ANA_2),
+        ),
+        "{CASE}: no version pins the latest, v2"
+    );
+    assert_eq!(
+        linked_documents(CASE, store, x).await,
+        vec![written.document.clone()],
+        "{CASE}: the graph reads what the write answered"
+    );
+
+    plant_versions(CASE, store, ids::HTUI_ANA_2, "verdict", 1).await;
+    let read = linked_documents(CASE, store, x).await;
+    assert_eq!(
+        read.iter()
+            .map(|doc| (doc.document_id, doc.version, doc.latest_version))
+            .collect::<Vec<_>>(),
+        vec![(written.document.document_id, 2, 3)],
+        "{CASE}: v3 moves the latest, not the pin"
+    );
+
+    let y = feat(CASE, store, "relates to the first verdict").await;
+    let (_run, step_y) = agent_step(CASE, store, ids::PROJECT_HTUI, y, None).await;
+    let first = propose_document(
+        store,
+        y,
+        ArtifactLinkKind::Relates,
+        doc_ref("htui:ANA-2", "verdict", Some(1)),
+        step_y,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        (first.document.version, first.document.latest_version),
+        (1, 3),
+        "{CASE}: a named version is pinned as named, a qualified key resolves like a bare one"
+    );
+    assert_eq!(
+        linked_documents(CASE, store, y).await,
+        vec![first.document],
+        "{CASE}: the other item's link reads back"
+    );
+}
+
+/// MOD-150 M3 D3: an owner that is no item key is a project slug, a project's own document; a
+/// workspace's scope row is named by its `@` slug. Neither has an owner item or key.
+async fn document_link_resolves_an_owner_document<S: WriteStore>(store: &S) {
+    const CASE: &str = "document_link_resolves_an_owner_document";
+    store
+        .write_owner_document(new_owner_document(ids::PROJECT_HTUI, "goals"))
+        .await
+        .expect(CASE);
+    store
+        .write_owner_document(new_owner_document(ids::PROJECT_SCOPE_PLATFORM, "charter"))
+        .await
+        .expect(CASE);
+    let x = feat(CASE, store, "follows the goals").await;
+    let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+
+    let goals = propose_document(
+        store,
+        x,
+        ArtifactLinkKind::Relates,
+        doc_ref("htui", "goals", None),
+        step,
+    )
+    .await
+    .expect(CASE);
+    let charter = propose_document(
+        store,
+        x,
+        ArtifactLinkKind::Origin,
+        doc_ref("@platform", "charter", None),
+        step,
+    )
+    .await
+    .expect(CASE);
+    let shape = |doc: &crate::model::LinkedDocument| {
+        (
+            doc.project_id,
+            doc.project_slug.clone(),
+            doc.owner_item,
+            doc.owner_key.clone(),
+            doc.doc_kind.clone(),
+            doc.version,
+            doc.latest_version,
+        )
+    };
+    assert_eq!(
+        shape(&goals.document),
+        (
+            ids::PROJECT_HTUI,
+            "htui".to_owned(),
+            None,
+            None,
+            "goals".to_owned(),
+            1,
+            1
+        ),
+        "{CASE}: `htui` is the project's own goals"
+    );
+    assert_eq!(
+        shape(&charter.document),
+        (
+            ids::PROJECT_SCOPE_PLATFORM,
+            "@platform".to_owned(),
+            None,
+            None,
+            "charter".to_owned(),
+            1,
+            1
+        ),
+        "{CASE}: `@platform` is the workspace's scope row"
+    );
+    assert_eq!(
+        linked_documents(CASE, store, x).await,
+        vec![charter.document, goals.document],
+        "{CASE}: both read back, `origin` before `relates`"
+    );
+}
+
+/// MOD-150 M3 D4: the refusals in their order (own item, owner and its reach, kind and version,
+/// single pin); the same version again is an upsert that keeps its proposer, and the same document
+/// under another kind is a link of its own. An owner that names nothing reads as one outside the
+/// reach, and a missing kind or version of an owner outside the reach does too, so a refusal never
+/// tells whether a document exists where the step cannot see (R1 M1).
+async fn document_link_refusals<S: WriteStore>(store: &S) {
+    const CASE: &str = "document_link_refusals";
+    const IMPLEMENTS: ArtifactLinkKind = ArtifactLinkKind::Implements;
+    plant_versions(CASE, store, ids::HTUI_ANA_2, "verdict", 2).await;
+    plant_versions(CASE, store, ids::VULKAN_FEAT_1, "spec", 1).await;
+    store
+        .write_owner_document(new_owner_document(ids::PROJECT_VULKAN, "goals"))
+        .await
+        .expect(CASE);
+    let x = feat(CASE, store, "implements the verdict").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+
+    constraint_exactly(
+        CASE,
+        propose_document(
+            store,
+            ids::HTUI_ANA_2,
+            IMPLEMENTS,
+            doc_ref("NOPE-9", "verdict", None),
+            step,
+        )
+        .await,
+        &step_writes_own_item(step, ids::HTUI_ANA_2),
+        "a link from another item, before its document is looked up",
+    );
+    for (to, label, what) in [
+        (
+            doc_ref("ANA-2", "ruling", None),
+            "ANA-2 ruling",
+            "an unknown kind",
+        ),
+        (
+            doc_ref("ANA-2", "verdict", Some(9)),
+            "ANA-2 verdict v9",
+            "version 9 of a two-version document",
+        ),
+        (
+            doc_ref("ANA-2", "verdict", Some(0)),
+            "ANA-2 verdict v0",
+            "a version below 1",
+        ),
+    ] {
+        not_found_exactly(
+            CASE,
+            propose_document(store, x, IMPLEMENTS, to, step).await,
+            "document",
+            label,
+            what,
+        );
+    }
+    for (to, label, what) in [
+        (
+            doc_ref("vulkan-tutorials:FEAT-1", "spec", None),
+            "vulkan-tutorials:FEAT-1 spec",
+            "an item's document of a project outside the run's reach",
+        ),
+        (
+            doc_ref("vulkan-tutorials", "goals", None),
+            "vulkan-tutorials goals",
+            "a project's own document outside the run's reach",
+        ),
+        (
+            doc_ref("vulkan-tutorials:FEAT-1", "ruling", None),
+            "vulkan-tutorials:FEAT-1 ruling",
+            "an unknown kind of an owner outside the run's reach",
+        ),
+        (
+            doc_ref("vulkan-tutorials", "goals", Some(9)),
+            "vulkan-tutorials goals v9",
+            "an unknown version of an owner outside the run's reach",
+        ),
+        (
+            doc_ref("NOPE-9", "verdict", None),
+            "NOPE-9 verdict",
+            "an owner that is neither an item key nor a project slug",
+        ),
+        (
+            doc_ref("no-such-project", "goals", None),
+            "no-such-project goals",
+            "an unknown project slug",
+        ),
+        (
+            doc_ref("vulkan-tutorials:NOPE-9", "spec", None),
+            "vulkan-tutorials:NOPE-9 spec",
+            "an unknown key of a project outside the run's reach",
+        ),
+    ] {
+        constraint_exactly(
+            CASE,
+            propose_document(store, x, IMPLEMENTS, to, step).await,
+            &document_outside_reach(label),
+            what,
+        );
+    }
+
+    let pinned = propose_document(
+        store,
+        x,
+        IMPLEMENTS,
+        doc_ref("ANA-2", "verdict", Some(1)),
+        step,
+    )
+    .await
+    .expect(CASE);
+    constraint_exactly(
+        CASE,
+        propose_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", None),
+            step,
+        )
+        .await,
+        &document_already_pinned(x, IMPLEMENTS, 1),
+        "the latest version beside a pinned v1 under the same kind",
+    );
+
+    let later = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let again = propose_document(
+        store,
+        x,
+        IMPLEMENTS,
+        doc_ref("ANA-2", "verdict", Some(1)),
+        later,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        (
+            again.link.id,
+            again.link.created_at,
+            again.link.proposed_by_step_id,
+            again.link.deleted_at
+        ),
+        (pinned.link.id, pinned.link.created_at, Some(step), None),
+        "{CASE}: the same version again upserts the live row and keeps its proposer"
+    );
+
+    let relates = propose_document(
+        store,
+        x,
+        ArtifactLinkKind::Relates,
+        doc_ref("ANA-2", "verdict", None),
+        step,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        linked_documents(CASE, store, x)
+            .await
+            .iter()
+            .map(|doc| (doc.kind, doc.version))
+            .collect::<Vec<_>>(),
+        vec![(IMPLEMENTS, 1), (ArtifactLinkKind::Relates, 2)],
+        "{CASE}: another kind pins its own version, `implements` before `relates`"
+    );
+    assert_ne!(
+        relates.link.id, pinned.link.id,
+        "{CASE}: another kind is another row"
+    );
+}
+
+/// MOD-150 M3 D4: a withdraw tombstones the live link (to any version, or the named one if it is
+/// the pinned one), only for the run that proposed it; a re-proposal revives the row as the new
+/// step's. A withdraw resolves only the owner (an unknown one reads as outside the reach), never
+/// the version: a version that does not exist is no live link (R1 M1). A tombstone revives only
+/// through the pin check, so a tombstoned v1 beside a live v2 is refused (R1 L3).
+async fn document_link_withdraw_tombstones_and_revives<S: WriteStore>(store: &S) {
+    const CASE: &str = "document_link_withdraw_tombstones_and_revives";
+    const IMPLEMENTS: ArtifactLinkKind = ArtifactLinkKind::Implements;
+    plant_versions(CASE, store, ids::HTUI_ANA_2, "verdict", 2).await;
+    let x = feat(CASE, store, "implements the verdict").await;
+    let (earlier_run, earlier) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+    let proposed = propose_document(
+        store,
+        x,
+        IMPLEMENTS,
+        doc_ref("ANA-2", "verdict", None),
+        earlier,
+    )
+    .await
+    .expect(CASE);
+    // MOD-144: one live graph run per item, so the earlier run ends before the second starts.
+    store
+        .finish_run(earlier_run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    let (_run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+
+    constraint_exactly(
+        CASE,
+        withdraw_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", None),
+            step,
+        )
+        .await,
+        &link_not_proposed_by_run("ANA-2 verdict"),
+        "a live document link another run proposed",
+    );
+    constraint_exactly(
+        CASE,
+        withdraw_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("no-such-project", "verdict", None),
+            earlier,
+        )
+        .await,
+        &document_outside_reach("no-such-project verdict"),
+        "a withdraw naming an owner that resolves to nothing",
+    );
+    for (to, label, what) in [
+        (
+            doc_ref("ANA-2", "verdict", Some(9)),
+            "ANA-2 verdict v9",
+            "a withdraw naming a version that does not exist",
+        ),
+        (
+            doc_ref("ANA-2", "ruling", None),
+            "ANA-2 ruling",
+            "a withdraw naming a kind the owner has no document of",
+        ),
+    ] {
+        not_found_exactly(
+            CASE,
+            withdraw_document(store, x, IMPLEMENTS, to, earlier).await,
+            "item_artifact_link",
+            label,
+            what,
+        );
+    }
+    not_found_exactly(
+        CASE,
+        withdraw_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", Some(1)),
+            earlier,
+        )
+        .await,
+        "item_artifact_link",
+        "ANA-2 verdict v1",
+        "a withdraw naming a version other than the pinned one",
+    );
+
+    let gone = withdraw_document(
+        store,
+        x,
+        IMPLEMENTS,
+        doc_ref("ANA-2", "verdict", Some(2)),
+        earlier,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        (gone.link.id, gone.document.version),
+        (proposed.link.id, 2),
+        "{CASE}: the withdraw answers the pinned row and its document"
+    );
+    assert!(
+        gone.link.deleted_at.is_some(),
+        "{CASE}: the withdraw tombstones the row"
+    );
+    assert!(
+        linked_documents(CASE, store, x).await.is_empty(),
+        "{CASE}: a tombstone is not in the graph"
+    );
+    not_found_exactly(
+        CASE,
+        withdraw_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", None),
+            earlier,
+        )
+        .await,
+        "item_artifact_link",
+        "ANA-2 verdict",
+        "a second withdraw",
+    );
+
+    let revived = propose_document(
+        store,
+        x,
+        IMPLEMENTS,
+        doc_ref("ANA-2", "verdict", Some(2)),
+        step,
+    )
+    .await
+    .expect(CASE);
+    assert_eq!(
+        (
+            revived.link.id,
+            revived.link.created_at,
+            revived.link.proposed_by_step_id,
+            revived.link.deleted_at
+        ),
+        (proposed.link.id, proposed.link.created_at, Some(step), None),
+        "{CASE}: a re-proposal revives the row as the new step's"
+    );
+    assert_eq!(
+        linked_documents(CASE, store, x).await,
+        vec![revived.document.clone()],
+        "{CASE}: the revived link reads back"
+    );
+
+    // A tombstoned v1 beside a live v2: v2 out, v1 in and out, v2 revived, then v1 again.
+    for (op, version) in [
+        ("withdraw", 2),
+        ("propose", 1),
+        ("withdraw", 1),
+        ("propose", 2),
+    ] {
+        let to = doc_ref("ANA-2", "verdict", Some(version));
+        let written = if op == "propose" {
+            propose_document(store, x, IMPLEMENTS, to, step).await
+        } else {
+            withdraw_document(store, x, IMPLEMENTS, to, step).await
+        };
+        written.unwrap_or_else(|err| panic!("{CASE}: {op} v{version}: {err:?}"));
+    }
+    constraint_exactly(
+        CASE,
+        propose_document(
+            store,
+            x,
+            IMPLEMENTS,
+            doc_ref("ANA-2", "verdict", Some(1)),
+            step,
+        )
+        .await,
+        &document_already_pinned(x, IMPLEMENTS, 2),
+        "a tombstoned v1 re-proposed while v2 is live under the same kind",
+    );
+    assert_eq!(
+        linked_documents(CASE, store, x)
+            .await
+            .iter()
+            .map(|doc| (doc.document_id, doc.version))
+            .collect::<Vec<_>>(),
+        vec![(revived.document.document_id, 2)],
+        "{CASE}: the refused revival leaves v2 the one live pin"
+    );
+}
+
+/// MOD-150 M3 D7: documents are leaves. Linking them changes neither the node set nor the edges
+/// (the document's owner item is not reached through it), and the documents of a node at depth
+/// `hops` are in the graph while those of an unreached item are not.
+async fn document_links_are_leaves_of_the_walk<S: WriteStore>(store: &S) {
+    const CASE: &str = "document_links_are_leaves_of_the_walk";
+    plant_versions(CASE, store, ids::HTUI_ANA_2, "verdict", 1).await;
+    store
+        .write_owner_document(new_owner_document(ids::PROJECT_HTUI, "goals"))
+        .await
+        .expect(CASE);
+    let x = feat(CASE, store, "root").await;
+    let y = feat(CASE, store, "one hop out").await;
+    let (_run, step_x) = agent_step(CASE, store, ids::PROJECT_HTUI, x, None).await;
+    let (_run, step_y) = agent_step(CASE, store, ids::PROJECT_HTUI, y, None).await;
+    propose_unleased(store, x, LinkKind::Relates, y, step_x)
+        .await
+        .expect(CASE);
+    let before = store.links(x, 1).await.expect(CASE);
+    assert!(before.documents.is_empty(), "{CASE}: no document link yet");
+
+    let on_x = propose_document(
+        store,
+        x,
+        ArtifactLinkKind::Relates,
+        doc_ref("htui", "goals", None),
+        step_x,
+    )
+    .await
+    .expect(CASE);
+    let on_y = propose_document(
+        store,
+        y,
+        ArtifactLinkKind::Implements,
+        doc_ref("ANA-2", "verdict", None),
+        step_y,
+    )
+    .await
+    .expect(CASE);
+
+    let after = store.links(x, 1).await.expect(CASE);
+    assert_eq!(
+        (&after.nodes, &after.edges),
+        (&before.nodes, &before.edges),
+        "{CASE}: document links add no node and no edge; ANA-2 is not reached through one"
+    );
+    assert_eq!(
+        after.documents,
+        vec![on_x.document.clone(), on_y.document],
+        "{CASE}: the root's document, then the depth-1 node's, in node order"
+    );
+    assert_eq!(
+        store.links(x, 0).await.expect(CASE).documents,
+        vec![on_x.document],
+        "{CASE}: an item outside the hops brings no document"
     );
 }
 

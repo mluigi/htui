@@ -18,14 +18,29 @@
 //! than eight. Those refusals reach the agent unchanged as `refused: <sentence>` through
 //! `store_error`, which names the item's current parent or canonical.
 //!
-//! [`item_by_key`]: htui_core::store::WorkerStore::item_by_key
-//! [`propose_link`]: htui_core::store::WorkerStore::propose_link
-//! [`withdraw_link`]: htui_core::store::WorkerStore::withdraw_link
+//! MOD-150 M3 (plan D11): instead of `to`, a call may name `to_document`, a document by owner (an
+//! item key, else a project slug), kind and optional version (the latest at write when omitted).
+//! Exactly one of the two is named. A document link is `origin`, `relates` or `implements`; it
+//! goes through [`propose_document_link`] and [`withdraw_document_link`], and the answer names
+//! the pinned version and the latest. The owner reads canonically, as `to` does: bare in this
+//! project, `slug:KEY` elsewhere, the project slug for a project's own document.
+//!
+//! [`item_by_key`]: WorkerStore::item_by_key
+//! [`propose_link`]: WorkerStore::propose_link
+//! [`withdraw_link`]: WorkerStore::withdraw_link
+//! [`propose_document_link`]: WorkerStore::propose_document_link
+//! [`withdraw_document_link`]: WorkerStore::withdraw_document_link
 
-use htui_core::model::LinkKind;
 use htui_core::model::link::{ProposeLink, WithdrawLink};
-use htui_core::store::StoreError;
-use htui_core::store::traits::{link_key, link_not_proposed_by_run, link_outside_reach};
+use htui_core::model::{
+    ArtifactLinkKind, DocumentRef, ItemId, LinkKind, LinkedDocument, ProjectId,
+    ProposeDocumentLink, WithdrawDocumentLink, split_qualified,
+};
+use htui_core::store::traits::{
+    document_already_pinned, document_outside_reach, document_ref_label, link_key,
+    link_not_proposed_by_run, link_outside_reach,
+};
+use htui_core::store::{StoreError, WorkerHost, WorkerStore};
 use serde_json::{Value, json};
 
 use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of, store_error};
@@ -42,8 +57,9 @@ enum Op {
 
 // `from` is the scope's item and `to` a key (I-1): `KEY` of the scope's project, `slug:KEY` of
 // another project of its workspaces or `@workspace:KEY` of a workspace's own item (MOD-147 D2); a
-// `run_id`, an `item_id` or a `from` is refused. A plain comment, not a doc: schemars would hand a
-// doc to the agent as the schema's description.
+// `run_id`, an `item_id` or a `from` is refused. MOD-150 M3 D11: `to_document` names a document
+// instead; exactly one of the two is named. A plain comment, not a doc: schemars would hand a doc
+// to the agent as the schema's description.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LinkArgs {
@@ -53,9 +69,18 @@ struct LinkArgs {
     // An attribute, not a doc: a doc wrapped at 100 columns reaches the agent with a line break.
     #[schemars(
         description = "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project \
-                       `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+                       `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use \
+                       `to_document`)."
     )]
-    to: String,
+    #[serde(default)]
+    to: Option<String>,
+    // An attribute, not a doc: a doc wrapped at 100 columns reaches the agent with a line break.
+    #[schemars(
+        description = "Instead of `to`, a document: its owner, its kind and optionally the \
+                       version; `kind` is then `origin`, `relates` or `implements`."
+    )]
+    #[serde(default)]
+    to_document: Option<DocumentArg>,
     // An attribute, not a doc: a doc wrapped at 100 columns reaches the agent with a line break.
     #[schemars(
         description = "How this item relates to `to`, read `<this item> <kind> <to>`: \
@@ -63,10 +88,30 @@ struct LinkArgs {
                        this item was spawned by `to`; `relates`: see also; `supersedes`: this \
                        item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: \
                        this item is the same as `to`; `implements`: this item carries out `to`'s \
-                       decision. An item has at most one `parent` and one `duplicates`."
+                       decision. An item has at most one `parent` and one `duplicates`. A \
+                       `to_document` link takes only `origin`, `relates` or `implements`."
     )]
     #[schemars(schema_with = "kind_schema")]
     kind: LinkKind,
+}
+
+// MOD-150 M3 D11: how the agent names a document, inlined so the schema carries no `$ref`. A
+// plain comment, not a doc: schemars would hand a doc to the agent as the schema's description.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(inline)]
+struct DocumentArg {
+    #[schemars(
+        description = "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, \
+                       `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` \
+                       for workspace `shop`) for a project's own document."
+    )]
+    owner: String,
+    #[schemars(description = "The document's kind, such as `plan` or `verdict`.")]
+    kind: String,
+    #[schemars(description = "The version to link; the latest when omitted.")]
+    #[serde(default)]
+    version: Option<i32>,
 }
 
 /// `{"type": "string", "enum": ["add", "remove"]}`.
@@ -84,8 +129,9 @@ fn kind_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 pub(crate) const DEF: ToolDef = ToolDef {
     name: "item_link",
     description: "Proposes or withdraws a link from this step's item to another item of its \
-                  project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project \
-                  api, @shop:WS-1 for workspace shop's own items.",
+                  project or its workspaces, or to a version of a document (`to_document`). An \
+                  item is named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for \
+                  workspace shop's own items.",
     schema: schema_of::<LinkArgs>,
     advertised: |scope, _| scope.item_id.is_some(),
 };
@@ -98,31 +144,72 @@ fn out_of_scope(to: &str) -> ToolError {
 }
 
 /// `{"from": "<key>", "to": "<key>", "kind": "<kind>", "live": bool}`; `to` is canonical: bare in
-/// this project, `slug:KEY` elsewhere.
-pub(crate) async fn call<H: htui_core::store::WorkerHost>(
-    ctx: Ctx<'_, H>,
-    arguments: Value,
-) -> ToolResult {
-    let LinkArgs { op, to, kind } = args(arguments)?;
-    let session = ctx.session;
-    let scope = &session.scope;
-    let store = &session.store;
-    let Some(from) = scope.item_id else {
+/// this project, `slug:KEY` elsewhere. With `to_document` (MOD-150 M3 D11): `{"from": "<key>",
+/// "to_document": {"owner", "kind", "version", "latest"}, "kind", "live"}`.
+pub(crate) async fn call<H: WorkerHost>(ctx: Ctx<'_, H>, arguments: Value) -> ToolResult {
+    let LinkArgs {
+        op,
+        to,
+        to_document,
+        kind,
+    } = args(arguments)?;
+    let Some(from) = ctx.session.scope.item_id else {
         return Err(ToolError(
             "out of scope: this session has no item".to_owned(),
         ));
     };
-    let target = htui_core::store::WorkerStore::item_by_key(store, scope.project_id, &to)
+    match (to, to_document) {
+        (Some(to), None) => item_call(ctx, from, op, to, kind).await,
+        (None, Some(document)) => {
+            let kind = ArtifactLinkKind::from_link_kind(kind).ok_or_else(|| {
+                ToolError(
+                    "refused: a link to a document is origin, relates or implements".to_owned(),
+                )
+            })?;
+            let to = DocumentRef {
+                owner: document.owner,
+                kind: document.kind,
+                version: document.version,
+            };
+            document_call(ctx, from, op, to, kind).await
+        }
+        _ => Err(ToolError(
+            "invalid arguments: name `to` or `to_document`".to_owned(),
+        )),
+    }
+}
+
+/// `from`'s bare key.
+async fn item_key<S: WorkerStore>(store: &S, from: ItemId) -> Result<String, ToolError> {
+    Ok(WorkerStore::item(store, from)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| ToolError(format!("not found: item {from}")))?
+        .key)
+}
+
+/// The link to the item keyed `to`.
+async fn item_call<H: WorkerHost>(
+    ctx: Ctx<'_, H>,
+    from: ItemId,
+    op: Op,
+    to: String,
+    kind: LinkKind,
+) -> ToolResult {
+    let session = ctx.session;
+    let scope = &session.scope;
+    let store = &session.store;
+    let target = WorkerStore::item_by_key(store, scope.project_id, &to)
         .await
         .map_err(store_error)?
         .ok_or_else(|| out_of_scope(&to))?;
-    let target_item = htui_core::store::WorkerStore::item(store, target)
+    let target_item = WorkerStore::item(store, target)
         .await
         .map_err(store_error)?
         .ok_or_else(|| ToolError(format!("not found: item {target}")))?;
     let elsewhere = target_item.project_id != scope.project_id;
     let canonical = if elsewhere {
-        let project = htui_core::store::WorkerStore::project(store, target_item.project_id)
+        let project = WorkerStore::project(store, target_item.project_id)
             .await
             .map_err(store_error)?
             .ok_or_else(|| ToolError(format!("not found: project {}", target_item.project_id)))?;
@@ -130,11 +217,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     } else {
         target_item.key
     };
-    let from_key = htui_core::store::WorkerStore::item(store, from)
-        .await
-        .map_err(store_error)?
-        .ok_or_else(|| ToolError(format!("not found: item {from}")))?
-        .key;
+    let from_key = item_key(store, from).await?;
     let written = match op {
         Op::Add => {
             let link = ProposeLink {
@@ -143,7 +226,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
                 kind,
                 step: scope.step_id,
             };
-            htui_core::store::WorkerStore::propose_link(store, scope.fence, link).await
+            WorkerStore::propose_link(store, scope.fence, link).await
         }
         Op::Remove => {
             let link = WithdrawLink {
@@ -152,7 +235,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
                 kind,
                 step: scope.step_id,
             };
-            htui_core::store::WorkerStore::withdraw_link(store, scope.fence, link).await
+            WorkerStore::withdraw_link(store, scope.fence, link).await
         }
     };
     let not_yours = || {
@@ -187,5 +270,121 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
         "to": canonical,
         "kind": link.kind,
         "live": link.deleted_at.is_none(),
+    }))
+}
+
+/// The document's owner as the agent reads it (D11): the bare key of an item of `project`,
+/// `slug:KEY` of an item elsewhere, the project slug for a project's own document.
+fn canonical_owner(document: &LinkedDocument, project: ProjectId) -> String {
+    match &document.owner_key {
+        Some(key) if document.project_id == project => key.clone(),
+        Some(key) => format!("{}:{key}", document.project_slug),
+        None => document.project_slug.clone(),
+    }
+}
+
+/// Whether the agent's `owner` text names `document`'s owner, by D3's rules: a bare key in
+/// `project`, a qualified key in its slug's project, else a project slug.
+fn names_owner(owner: &str, document: &LinkedDocument, project: ProjectId) -> bool {
+    let (slug, key) = split_qualified(owner);
+    match (&document.owner_key, slug) {
+        (Some(owner_key), None) => owner_key == key && document.project_id == project,
+        (Some(owner_key), Some(slug)) => owner_key == key && document.project_slug == slug,
+        (None, _) => document.project_slug == owner,
+    }
+}
+
+/// The link to the document `to` (MOD-150 M3 D11).
+async fn document_call<H: WorkerHost>(
+    ctx: Ctx<'_, H>,
+    from: ItemId,
+    op: Op,
+    to: DocumentRef,
+    kind: ArtifactLinkKind,
+) -> ToolResult {
+    let session = ctx.session;
+    let scope = &session.scope;
+    let store = &session.store;
+    let from_key = item_key(store, from).await?;
+    let label = document_ref_label(&to);
+    let written = match op {
+        Op::Add => {
+            let link = ProposeDocumentLink {
+                from,
+                kind,
+                to: to.clone(),
+                step: scope.step_id,
+            };
+            WorkerStore::propose_document_link(store, scope.fence, link).await
+        }
+        Op::Remove => {
+            let link = WithdrawDocumentLink {
+                from,
+                kind,
+                to: to.clone(),
+                step: scope.step_id,
+            };
+            WorkerStore::withdraw_document_link(store, scope.fence, link).await
+        }
+    };
+    let written = match written {
+        Ok(written) => written,
+        Err(StoreError::Constraint(sentence)) if sentence == document_outside_reach(&label) => {
+            return Err(ToolError(format!(
+                "out of scope: document {label} is outside this project and its workspaces"
+            )));
+        }
+        Err(StoreError::Constraint(sentence)) if sentence == link_not_proposed_by_run(&label) => {
+            return Err(ToolError(format!(
+                "not yours: {from_key} {kind} {label} was not proposed by this run"
+            )));
+        }
+        Err(StoreError::NotFound {
+            entity: "document", ..
+        }) => return Err(ToolError(format!("not found: document {label}"))),
+        Err(StoreError::Constraint(sentence)) => {
+            // D4: the pin names the version only; the live link it names is read back for the
+            // owner and kind the agent knows.
+            let pinned = WorkerStore::links(store, from, 0)
+                .await
+                .map_err(store_error)?
+                .documents
+                .into_iter()
+                .find(|doc| {
+                    doc.from_item_id == from
+                        && doc.kind == kind
+                        && doc.doc_kind == to.kind
+                        && names_owner(&to.owner, doc, scope.project_id)
+                        && sentence == document_already_pinned(from, kind, doc.version)
+                });
+            // "an origin", "an implements", "a relates".
+            let article = match kind {
+                ArtifactLinkKind::Origin | ArtifactLinkKind::Implements => "an",
+                ArtifactLinkKind::Relates => "a",
+            };
+            return Err(match pinned {
+                Some(doc) => ToolError(format!(
+                    "refused: {from_key} already has {article} {kind} link to {} {} v{}; remove \
+                     it before linking another version",
+                    canonical_owner(&doc, scope.project_id),
+                    doc.doc_kind,
+                    doc.version
+                )),
+                None => store_error(StoreError::Constraint(sentence)),
+            });
+        }
+        Err(other) => return Err(store_error(other)),
+    };
+    let document = &written.document;
+    Ok(json!({
+        "from": from_key,
+        "to_document": {
+            "owner": canonical_owner(document, scope.project_id),
+            "kind": document.doc_kind,
+            "version": document.version,
+            "latest": document.latest_version,
+        },
+        "kind": written.link.kind,
+        "live": written.link.deleted_at.is_none(),
     }))
 }

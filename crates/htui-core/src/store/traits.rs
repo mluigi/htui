@@ -52,7 +52,10 @@ use uuid::Uuid;
 
 use crate::model::ItemState;
 use crate::model::StoredCommandLog;
-use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
+use crate::model::link::{
+    ArtifactLinkKind, DocumentLink, DocumentRef, ItemLink, LinkKind, ProposeDocumentLink,
+    ProposeLink, WithdrawDocumentLink, WithdrawLink,
+};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
@@ -2583,6 +2586,44 @@ pub trait WriteStore: ReadStore {
     /// `Constraint(link_not_proposed_by_run(..))`.
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink>;
 
+    /// MOD-150 M3 D4: upserts a live `item_artifact_link` from `link.from` to the document
+    /// `link.to` names, pinned at the named version or, without one, the latest at write (D3,
+    /// resolved in the write's transaction). A live row keeps its proposer and only moves
+    /// `updated_at`; a tombstone revives with this step as proposer, after every check below.
+    /// On Postgres the write takes a per-item advisory lock before the pin check (D6).
+    ///
+    /// # Errors
+    /// `NotFound { run_step }`; `Fenced`; `Constraint(step_writes_own_item(..))`;
+    /// `Constraint(document_outside_reach(..))` when the owner (an item key first, then a project
+    /// slug) names nothing or its project is outside the step's reach (MOD-147 D3): one answer
+    /// for both, so a refusal never tells what exists outside the reach;
+    /// `NotFound { entity: "document", id: document_ref_label(..) }` when the owner, in reach, has
+    /// no document of the kind or no such version; `Constraint(document_already_pinned(..))` when
+    /// a live link of the same kind pins another version of the same owner's kind.
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink>;
+
+    /// MOD-150 M3 D4: tombstones the live link of `link.kind` from `link.from` to any version of
+    /// the owner's kind (a named version must be the pinned one) when a step of `link.step`'s run
+    /// proposed it. Answers the tombstoned row and its document.
+    ///
+    /// # Errors
+    /// `NotFound { run_step }`; `Fenced`; `Constraint(step_writes_own_item(..))`;
+    /// `Constraint(document_outside_reach(..))` when the owner names nothing (no reach check, as
+    /// in [`withdraw_link`](Self::withdraw_link)); `NotFound { entity: "item_artifact_link", id:
+    /// document_ref_label(..) }` when no live link of the kind reaches a version of the owner's
+    /// kind, or the named version is not the pinned one (a version or kind that does not exist
+    /// included: neither is resolved); `Constraint(link_not_proposed_by_run(..))` for another
+    /// run's link.
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink>;
+
     /// B-4: the item of `project` whose `key` is `key`; `None` when there is none, a key holding
     /// a NUL included (answered before any read: no key holds one, and Postgres would fail the
     /// parameter, `22021`). MOD-147 D2: a qualified `slug:KEY` (split at the last `:`) is looked
@@ -4106,6 +4147,33 @@ pub fn link_outside_reach(to: ItemId) -> String {
     format!("item {to} is not in this project or its workspaces")
 }
 
+/// MOD-150 M3 D3: how a [`DocumentRef`] is named in a refusal: `"{owner} {kind}"`, plus
+/// `" v{n}"` when a version is named.
+#[must_use]
+pub fn document_ref_label(to: &DocumentRef) -> String {
+    match to.version {
+        Some(version) => format!("{} {} v{version}", to.owner, to.kind),
+        None => format!("{} {}", to.owner, to.kind),
+    }
+}
+
+/// MOD-150 M3 D5: an agent links its item only to documents of projects within the run's reach,
+/// as for items (MOD-147 D3).
+#[must_use]
+pub fn document_outside_reach(label: &str) -> String {
+    format!("document {label} is outside the step's project and its workspaces")
+}
+
+/// MOD-150 M3 D4: one live link of a kind pins one version of an owner's document kind. The
+/// kind is named as a noun: `{kind}s` would read `implementss`.
+#[must_use]
+pub fn document_already_pinned(from: ItemId, kind: ArtifactLinkKind, version: i32) -> String {
+    format!(
+        "item {from} already has a {kind} link to v{version} of that document; withdraw it \
+         before linking another version"
+    )
+}
+
 /// MOD-150 D4 (ANA-35 §7.6): an item has at most one live `parent`; `current` is the live one.
 #[must_use]
 pub fn second_parent(from: ItemId, current: ItemId) -> String {
@@ -4461,6 +4529,9 @@ pub struct DeleteReach {
     pub links: u64,
     /// `document` rows.
     pub documents: u64,
+    /// `item_artifact_link` rows whose from-item **or** document is in the project, tombstones
+    /// included, as `item_requirements` (MOD-150 M3 D8).
+    pub document_links: u64,
     /// `requirement_spec` rows (0 or 1), MOD-38.
     pub requirement_specs: u64,
     /// `requirement_area` rows.
@@ -4511,6 +4582,7 @@ impl std::ops::Add for DeleteReach {
             revisions,
             links,
             documents,
+            document_links,
             requirement_specs,
             requirement_areas,
             requirement_key_counters,
@@ -4544,6 +4616,7 @@ impl std::ops::Add for DeleteReach {
             revisions: revisions + other.revisions,
             links: links + other.links,
             documents: documents + other.documents,
+            document_links: document_links + other.document_links,
             requirement_specs: requirement_specs + other.requirement_specs,
             requirement_areas: requirement_areas + other.requirement_areas,
             requirement_key_counters: requirement_key_counters + other.requirement_key_counters,

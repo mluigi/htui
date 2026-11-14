@@ -1,0 +1,404 @@
+# Plan: MOD-150 M3 — Links to documents
+
+**Source PRD**: `.claude/prds/mod-150-link-kinds.prd.md`
+**Selected Milestone**: 3 — Links to documents
+**Complexity**: Large
+**Routing**: PRD path (resumed at `/plan` for M3), ultracode for implement (C4) (`/handoff-run`, 2026-11-14).
+The plan runs without a confirm gate (handoff-run step 3).
+
+## Summary
+
+`R-ENT-9`: "a link may also target a document … A link to a document names the version it was made
+against"; `R-TUI-5`: "linked documents … as nodes". After M3, an agent's `item_link` can name a
+document by owner and kind, with an optional version:
+
+```json
+{"op":"add","kind":"implements","to_document":{"owner":"ANA-35","kind":"verdict","version":2}}
+```
+
+The store pins that version, or the latest one when no version is named, in a new table
+`item_artifact_link`. The cache mirrors the table, and the Graph tab shows a leaf row for each document
+under the item that links it, as `→ implements ANA-35 verdict v2 (latest v4)`.
+
+## Decisions
+
+- **D1 — Schema, migration `0034_item_artifact_link.sql`.** ANA-35 §7.9's DDL as written:
+  - **Columns:** `id UUID PK DEFAULT gen_random_uuid()`, `from_item_id` (FK `item` CASCADE), `kind`
+    CHECK named `chk_item_artifact_link_kind` IN (`origin`, `relates`, `implements`),
+    `to_document_id` (FK `document` CASCADE), `to_attachment_id UUID` with **no FK** (MOD-114 (3) adds
+    it), `proposed_by_step_id` (FK `run_step` SET NULL), `created_at`, `updated_at`, `deleted_at`.
+  - **Constraints:** `chk_item_artifact_link_target CHECK (num_nonnulls(to_document_id,
+    to_attachment_id) = 1)` and
+    `uq_item_artifact_link UNIQUE NULLS NOT DISTINCT (from_item_id, kind, to_document_id, to_attachment_id)`.
+  - **Also:** a `trg_item_artifact_link_updated_at` trigger (`set_updated_at()`, as
+    `0006_requirements.sql:141`); `idx_item_artifact_link_updated_at` for the cache cursor; a partial
+    `idx_item_artifact_link_document ON (to_document_id) WHERE deleted_at IS NULL`.
+  - **Writers:** nothing writes `to_attachment_id` in M3. No fixture rows (D10).
+- **D2 — Model** (`htui-core/src/model/link.rs`):
+  - **`ArtifactLinkKind`** (`str_enum!`): `Origin`, `Relates`, `Implements`.
+    - `pub const fn as_link_kind(self) -> LinkKind`.
+    - `pub const fn from_link_kind(LinkKind) -> Option<Self>`.
+    - A CHECK-list pin beside `link_kind_matches_check_list` (`model/mod.rs:324`).
+  - **`ArtifactLinkId`**, a new id in `model/ids.rs` ("`item_artifact_link.id` (MOD-150 M3)").
+  - **`ItemArtifactLink`** is one row: `{ id: ArtifactLinkId, from_item_id: ItemId, kind:
+    ArtifactLinkKind, to_document_id: Option<DocumentId>, to_attachment_id: Option<Uuid>,
+    proposed_by_step_id: Option<StepId>, created_at, updated_at, deleted_at: Option<DateTime<Utc>> }`.
+    `to_attachment_id` stays a bare `Uuid` until MOD-114 (3) mints `AttachmentId`; the ids.rs rule
+    "never a bare Uuid" is waived for it in its doc line.
+  - **`DocumentRef { owner: String, kind: String, version: Option<i32> }`**, how a writer names a
+    document:
+    - `owner` is an item key (bare = the step's project, or `slug:KEY`/`@ws:KEY`) for an item's
+      document, or a project slug (a workspace's is its scope row `@ws`) for an owner document.
+    - `version: None` means the latest at write.
+  - **`ProposeDocumentLink { from: ItemId, kind: ArtifactLinkKind, to: DocumentRef, step: StepId }`**
+    and **`WithdrawDocumentLink`**, the same shape.
+  - **`LinkedDocument`** is the read shape, not a table: `{ from_item_id: ItemId, kind:
+    ArtifactLinkKind, document_id: DocumentId, project_id: ProjectId, project_slug: String, owner_item:
+    Option<ItemId>, owner_key: Option<String> (the item's bare key; None for an owner document),
+    doc_kind: String, version: i32, latest_version: i32, title: String }`.
+  - **`DocumentLink { link: ItemArtifactLink, document: LinkedDocument }`** is what a write returns.
+  - **`LinkGraph` gains `#[serde(default)] pub documents: Vec<LinkedDocument>`**: the live document
+    links of every reached item, in the order (`from_item_id` node order, `kind`, `project_slug`,
+    `owner_key`, `doc_kind`, `version`). Every struct literal adds the field (14 sites today, D11).
+- **D3 — Resolution, in the store and inside the write's transaction**, so "latest" is read at write
+  time:
+  1. **`owner` as an item key first:** `item_by_key(step project, owner)`'s rules (bare = the step's
+     project, a qualified key = its slug's project). An item → its documents (`item_id = it`).
+  2. **Otherwise as a project slug:** an exact `project.slug` match (scope rows included). A
+     project → its owner documents (`item_id IS NULL`).
+  3. **`kind` and `version`:** the named version, or `MAX(version)` over that owner and kind.
+  4. **Nothing matches** → `NotFound { entity: "document", id: document_ref_label(&to) }`. The
+     label is `"{owner} {kind}"` plus `" v{n}"` when a version is named. A version below 1 is
+     NotFound too.
+  `LinkedDocument.latest_version` is `MAX(version)` of (project, item_id NOT DISTINCT, kind) at read.
+- **D4 — Store API.**
+  - **On both `WriteStore` and `WorkerStore`**, mirroring `propose_link`/`withdraw_link` and
+    forwarded by every impl: Mem (`mem.rs`, `worker.rs`), Pg (`pg/write.rs`), PgStore/Writer
+    WorkerStore (`htui-store/src/worker.rs`), Writer (`writer.rs`), `UsageSpy`
+    (`htui-agent/src/conformance.rs`), `SpyStore` (`htui-agent/tests/it/recorder.rs`):
+    ```rust
+    async fn propose_document_link(&self, fence: StepFence, link: ProposeDocumentLink) -> Result<DocumentLink>;
+    async fn withdraw_document_link(&self, fence: StepFence, link: WithdrawDocumentLink) -> Result<DocumentLink>;
+    ```
+  - **Propose refusal order:**
+    1. NotFound `run_step` / Fenced (`propose_link`'s step scope, verbatim).
+    2. `step_writes_own_item`.
+    3. D3 resolution: NotFound `document`.
+    4. Reach: the **document's** `project_id` must be reachable from the step's project (D5), else
+       `Constraint(document_outside_reach(&label))`.
+    5. Single pin: a live link from the item, of the same kind, to **another version of the same
+       (owner, doc kind)** → `Constraint(document_already_pinned(from, kind, pinned_version))`.
+    6. Upsert on `uq_item_artifact_link`, with `propose_link`'s rules: a live row keeps its proposer
+       and only bumps `updated_at`; a tombstone revives with this step as proposer. The revival runs
+       every check above.
+  - **Withdraw:**
+    1. The same steps 1–3, except that the version is **not** resolved to the latest.
+    2. The target is the live link from the item, of that kind, to any version of (owner, doc kind)
+       (at most one, by the single pin). A named version that is not the pinned one, or no live link,
+       → `NotFound { entity: "item_artifact_link", id: label }`.
+    3. A link this run did not propose → `Constraint(link_not_proposed_by_run(&label))`, the M1
+       sentence fn reused with the document label.
+    4. It tombstones the row.
+  - **New sentences in `store/traits.rs`** beside `link_outside_reach` (`#[must_use] pub fn … ->
+    String`):
+    - `document_ref_label(&DocumentRef) -> String`
+    - `document_outside_reach(label: &str)` → "document {label} is outside the step's project and its
+      workspaces"
+    - `document_already_pinned(from: ItemId, kind: ArtifactLinkKind, version: i32)` → "item {from}
+      already {kind}s v{version} of that document; withdraw it before linking another version"
+- **D5 — Reach.** The reach is `propose_link`'s, measured on projects:
+  - **Mem:** `link_reaches(step project, document.project_id)`.
+  - **Pg:** a new helper `project_reaches(conn, target_project, from_project)`. Its SQL is
+    `link_reaches`' text with the `item i` join replaced by the target project parameter.
+    `link_reaches` itself stays byte-identical, so its `.sqlx` entry keeps its hash.
+- **D6 — Pg concurrency.** Propose and withdraw both take
+  `pg_advisory_xact_lock(hashtextextended('item_artifact_link:' || from, 0))` before the single-pin
+  check, the same text form as the `duplicates` lock. MemStore is serialised by its state lock.
+  Without the lock, two proposals of different versions could each pass the pin check.
+- **D7 — Links read.** Each `links()` impl fills `LinkGraph.documents` after it has its nodes: the live
+  `item_artifact_link` rows with `to_document_id` set whose `from_item_id` is a reached node, joined to
+  `document`, `project` and `item` (the owner key).
+  - **Pg** (`pg/read.rs:227`): one more `query_as!`, so `cargo sqlx prepare`.
+  - **Mem:** a scan.
+  - **Cache:** a dynamic query in T2. Until T2 lands, the cache's `links` returns `documents: vec![]`
+    (T1 adds that field so the crate compiles).
+  - **Documents are leaves.** The walk never continues through them, so `hops` and the node set are
+    unchanged.
+- **D8 — `DeleteReach.document_links: u64`**, after `documents`. It counts `item_artifact_link` rows,
+  tombstones included, whose from-item **or** document is in the project, as `item_requirements` does.
+  - **Counted on both stores:** Pg `project_reach` and Mem `project_reach`/`scope_row_reach`.
+  - **Labelled** "document link"/"document links" in `htui/src/hierarchy.rs`.
+  - **Positional pin:** `pg_criteria.rs` `every_cascade_table_loses_exactly_what_the_report_names`
+    gets `"item_artifact_link"` at the matching index, after `"document"`, with `[&str; 32]`.
+  - **No snapshot moves:** only non-zero counts are printed, and the fixtures hold no rows.
+- **D9 — Cache mirror** (T2):
+  - **Schema:** `cache_migrations/0011_item_artifact_link.sql` mirrors the table with the `item_link`
+    style: TEXT/INTEGER, no CHECK, no FK, **no `deleted_at`**, PK `id`.
+  - **Table list:** `MIRRORED_TABLES` grows to 23, with `"item_artifact_link"` after `"document"`.
+  - **Refresh:** `refresh_item_artifact_link` takes rows whose from-item **or** document is in the
+    project and `updated_at > cursor`. A tombstone becomes a `DELETE` by `id`; a live row goes
+    through `upsert_sql(…, 1)`. It is registered in `run_pass`'s table list **and** its `match` arm.
+  - **Pins:** the `cache.rs` count pin (22 → 23) and the `it__connection__confirm.snap` text
+    "the 22 mirrored tables" move.
+  - **No backfill:** the Pg schema version bump (0034) rebuilds the mirror.
+- **D10 — Fixtures unchanged.** No document link in `fixtures.rs`, so no prompt digest, Backlog,
+  Graph or delete-confirm snapshot moves from data. Tests plant their own rows.
+- **D11 — MCP `item_link`** (T3):
+  - **Arguments:** `LinkArgs` becomes `{ op, to: Option<String>, to_document: Option<DocumentArg>,
+    kind }`, both targets `#[serde(default)]`. `DocumentArg { owner: String, kind: String, version:
+    Option<i32> }` is `deny_unknown_fields`, with its descriptions as `#[schemars(description)]` (no
+    doc comments, see `link.rs`' note). No property is named `*_id` (the
+    `no_backlog_tool_accepts_…` pin).
+  - **Exactly one target:** both or neither → `"invalid arguments: name `to` or `to_document`"`.
+  - **Kind:** a `to_document` kind outside origin/relates/implements → `"refused: a link to a
+    document is origin, relates or implements"`.
+  - **Calls:** `WorkerStore::propose_document_link`/`withdraw_document_link`.
+  - **Reply:** `{"from": "FEAT-9", "to_document": {"owner": <canonical>, "kind": "verdict",
+    "version": 2, "latest": 4}, "kind": "implements", "live": true}`. The canonical owner is:
+    - the bare key for an item in the step's project;
+    - `slug:KEY` for an item elsewhere;
+    - the project slug for an owner document.
+  - **Error mapping:**
+    - `document_outside_reach` → `out of scope: document {label} …`.
+    - `document_already_pinned` → `refused: {from_key} already {kind} {owner} {doc_kind}
+      v{n}; remove it before linking another version`.
+    - `link_not_proposed_by_run` → `not yours: …`.
+    - NotFound `document` → `not found: document {label}`.
+    - The rest go to `store_error`.
+  - **Descriptions:** the `to` description becomes "an item key, … (or use `to_document`)", and
+    `to_document` gets one line per field.
+- **D12 — Graph tab** (T4):
+  - **Rows:** each item row that is **expanded** in the tree (not a `(*)` repeat) gets one leaf row
+    per `LinkedDocument` whose `from_item_id` is that item. The leaves come after the item's own
+    children, at level + 1, with an out arrow.
+    - `TreeRow` gains a document variant (an index into `graph.documents`).
+    - `GraphRow` carries an enum target: item node or document.
+  - **Line:** arrow, then the kind padded to `kind_width` (via `label::link_kind(kind.as_link_kind())`,
+    so the column stays 10), then the label, then the version text, then the title.
+    - **Label:** `[slug:]KEY doc_kind` for an item's document, or `slug doc_kind` for an owner
+      document. The slug is shown only when `project_id != root project`, as for items.
+    - **Version text:** `v{n}` when `version == latest_version`, else `v{n} (latest v{m})`.
+    - **Fitting:** the title gives way first, as for items.
+    - **Dimming:** follows the item rule on `project_id` (D7 of MOD-147: outside the workspace = dim).
+  - **Enter on a document row:**
+    - With an `owner_item` → `Action::Reveal(RevealTarget::Item)` of the owner, under the same
+      outside-the-workspace refusal as items.
+    - An owner document → `Action::Error("{label} is a {slug} document; open it in Settings")`.
+  - **No legend widget:** the kind words are the legend until MOD-120's toggle.
+  - **No snapshot moves:** the fixtures have no document links (D10); new tests assert text.
+
+## Patterns to Mirror
+
+| Category | Source | Pattern |
+|---|---|---|
+| Sentences | `crates/htui-core/src/store/traits.rs` `link_outside_reach`, `second_parent` | `#[must_use] pub fn … -> String`, one doc line naming the rule |
+| Link write (Pg) | `crates/htui-store/src/pg/write.rs:10349` `PgStore::propose_link`; `:322` `link_reaches`; `:539` `step_scope` | step scope → own item → resolve → reach → advisory lock → pin check → `ON CONFLICT` upsert |
+| Link withdraw (Pg) | `crates/htui-store/src/pg/write.rs:10469` `withdraw_link` | NotFound / not-proposed-by-run, tombstone |
+| Link write (Mem) | `crates/htui-core/src/store/mem.rs:9184` `State::propose_link`, `:9231` `withdraw_link`, `:3941` `link_reaches` | same order, same sentences |
+| Key/slug resolve | `crates/htui-store/src/pg/write.rs:10535` `item_by_key`; `mem.rs:9270` `State::item_by_key`; `model/key.rs` `split_qualified` | qualified key ignores the project argument |
+| Latest version | `pg/write.rs:9086` `write_owner_document` (`MAX(version)` over owner+kind); `mem.rs:2010` `latest_document` | |
+| Links read | `pg/read.rs:227` `PgStore::links`; `mem.rs:1863` `State::link_graph`; `cache/read.rs:541` | reached ids → edge query over `ANY($1)` |
+| Mirror | `cache_migrations/0001_mirror.sql:86`; `cache/refresh.rs:938` `refresh_item_link`, `:200`, `:929`, `:258-310` | either-end filter, tombstone → DELETE, `upsert_sql`, cursor |
+| DeleteReach | `traits.rs:4414`, `pg/write.rs:834` `project_reach`, `mem.rs:5643`, `hierarchy.rs:840` | field per table; positional `TABLES` in `pg_criteria.rs:3345` |
+| Tests (store) | `conformance.rs:33589` `implements_links_like_relates`; helpers `agent_step` :22592, `propose_unleased` :33288, `constraint_exactly` :21459 | `CASE` const, registered in `CASES` (:113) and `run_case_inline` |
+| Tests (migration) | `tests/it/migrations.rs` (0030's test) | `run_to(33)` → plant → `run_to(34)` → catalog asserts |
+| Tests (concurrency) | `pg_criteria.rs` M1's opposite-parent race | two tasks; exactly one outcome |
+| Tests (MCP) | `crates/htui-mcp/tests/it/tools_backlog.rs:616` `item_link_add_resolves_the_key_in_the_project`; `Leased`, `live_link` :203 | `client.call("item_link", json!(…))`, exact JSON reply |
+| Tests (Graph) | `graph.rs` in-file tests `feat_1_draws_the_worked_rows` :1559, `the_new_link_kinds_read_as_words_and_keep_the_column` :1886; hand-built `LinkGraph` :1202 | exact-text `assert_eq!` rows |
+
+## Files to Change
+
+| File | Action | Task |
+|---|---|---|
+| `crates/htui-core/src/model/link.rs`, `model/ids.rs`, `model/mod.rs` | UPDATE | T1 |
+| `crates/htui-core/src/store/traits.rs` (two methods, three sentence fns, `DeleteReach`) | UPDATE | T1 |
+| `crates/htui-core/src/store/worker.rs` (trait + MemStore impl) | UPDATE | T1 |
+| `crates/htui-core/src/store/mem.rs` (state, propose/withdraw, `link_graph`, reach counts) | UPDATE | T1 |
+| `crates/htui-core/src/store/conformance.rs` (new cases, `CASES`, DeleteReach literals) | UPDATE | T1 |
+| `crates/htui-core/tests/it/mem_store.rs` (case count 312 → N) | UPDATE | T1 |
+| `crates/htui-store/migrations/0034_item_artifact_link.sql` | CREATE | T1 |
+| `crates/htui-store/src/pg/write.rs` (propose/withdraw, `project_reaches`, `project_reach` count) | UPDATE | T1 |
+| `crates/htui-store/src/pg/read.rs` (`links` documents query) | UPDATE | T1 |
+| `crates/htui-store/src/pg/demo.rs` (DeleteReach use, if a literal) | UPDATE | T1 |
+| `crates/htui-store/src/worker.rs`, `src/writer.rs` (forwarders) | UPDATE | T1 |
+| `crates/htui-store/src/cache/read.rs` (`documents: vec![]` only) | UPDATE | T1 |
+| `crates/htui-store/.sqlx/*.json` | CREATE/DELETE | T1 |
+| `crates/htui-store/tests/it/migrations.rs` (0034 test, `TABLES`, `Pending(33)`→34 pins, count 33→34, version vector) | UPDATE | T1 |
+| `crates/htui-store/tests/it/connect.rs` (`Pending(33)` pins) | UPDATE | T1 |
+| `crates/htui-store/tests/it/pg_criteria.rs` (cascade `TABLES`; version race) | UPDATE | T1 |
+| `crates/htui-store/tests/it/pg_conformance.rs` (`EXPECTED_CASES`) | UPDATE | T1 |
+| `crates/htui-agent/src/conformance.rs`, `crates/htui-agent/tests/it/recorder.rs` (forwarders) | UPDATE | T1 |
+| `crates/htui-orch/src/closeout.rs` (two test `LinkGraph` literals) | UPDATE | T1 |
+| `crates/htui/src/hierarchy.rs` (destructure, label, test literal) | UPDATE | T1 |
+| `crates/htui/src/ui/tabs/backlog/detail/graph.rs` (five test `LinkGraph` literals: `documents: vec![]` only) | UPDATE | T1 |
+| `crates/htui-store/cache_migrations/0011_item_artifact_link.sql` | CREATE | T2 |
+| `crates/htui-store/src/cache/mod.rs`, `cache/refresh.rs`, `cache/read.rs` | UPDATE | T2 |
+| `crates/htui-store/tests/it/cache.rs`, `tests/it/migrations.rs` (cache 0011 test) | UPDATE | T2 |
+| `crates/htui/tests/it/snapshots/it__connection__confirm.snap` | UPDATE | T2 |
+| `crates/htui-mcp/src/tools/link.rs`, `crates/htui-mcp/tests/it/tools_backlog.rs` | UPDATE | T3 |
+| `crates/htui/src/ui/tabs/backlog/detail/graph.rs` (rows, line, Enter, tests) | UPDATE | T4 |
+| `crates/htui/tests/it/backlog_detail.rs` (an e2e text test of a document row) | UPDATE | T4 |
+
+## Tasks
+
+The lane runs one serial lane, T1 → T2 → T3 → T4. T2 shares `migrations.rs` and `cache/read.rs` with
+T1. T4 shares `graph.rs` with T1's literal edits. T3 and T4 depend on T1's API. T1 is the foundation
+and gets a verifier.
+
+### Task 1: The store writes and reads document links (foundation)
+- **Action** (tests first):
+  - **Conformance cases on both stores**, registered in `CASES` and `run_case_inline`:
+    - `document_link_pins_the_latest_or_the_named_version`:
+      - Plant v1 and v2 of `ANA-2`'s `verdict` (`write_document`).
+      - `implements` with no version → v2, and `LinkGraph.documents` shows v2, latest 2.
+      - Write v3 → the link still reads v2 with latest 3.
+      - On another item, `version: Some(1)` → v1.
+    - `document_link_resolves_an_owner_document`:
+      - A project owner document by slug (`write_owner_document`).
+      - A workspace's by its scope row slug `@…`; `owner_key` is None.
+    - `document_link_refusals`, in D4's order:
+      - an unknown owner;
+      - an unknown kind;
+      - version 9 of a two-version document → NotFound `document`;
+      - a document of an unreachable project → `document_outside_reach`;
+      - a second version under the same link kind → `document_already_pinned`;
+      - the same version again → idempotent, the proposer kept;
+      - the same document under another kind → allowed.
+    - `document_link_withdraw_tombstones_and_revives`:
+      - withdraw → the row is gone from `documents`;
+      - a withdraw from another run → `link_not_proposed_by_run`;
+      - a re-propose revives the row with the new proposer;
+      - a withdraw naming a version other than the pinned one → NotFound `item_artifact_link`.
+    - `document_links_are_leaves_of_the_walk`: node and edge sets are identical with and without
+      document links, and the documents of a depth-`hops` node are included.
+    - Extend the existing project-delete reach case so that `document_links` counts a link on either
+      end.
+  - **Migration test `0034`:**
+    - `run_to(33)` → `run_to(34)`.
+    - The table exists; the CHECK names and lists the three kinds; the `num_nonnulls` CHECK refuses
+      both NULL and both set.
+    - The unique holds over a NULL attachment.
+    - The trigger bumps `updated_at`.
+    - Plus the count pins.
+  - **`pg_criteria` race:** two concurrent proposals of v1 and v2 of one document, same item and kind.
+    Exactly one is live, and the loser gets `document_already_pinned`, never 23505.
+  - **Then implement D1–D8.**
+    - `cargo sqlx prepare` against a migrated scratch database (`docs/hr-sandbox.md` §sqlx, the
+      sandbox Postgres at `localhost:5439`).
+    - Every `LinkGraph` literal adds `documents: vec![]`.
+- **Mirror**: Patterns rows Sentences, Link write/withdraw (Pg/Mem), Key/slug resolve, Latest version,
+  Links read, DeleteReach, Tests (store/migration/concurrency).
+- **Validate**:
+  - `cargo nextest run -p htui-core --all-features`
+  - `cargo nextest run -p htui-store --all-features -E 'binary(it) and test(/^(pg_conformance|pg_criteria|migrations|connect)::/)'`
+  - `cargo sqlx prepare --check -- --all-targets --all-features`
+  - `cargo check --workspace --all-features --tests`
+  - `cargo nextest run -p htui-agent --all-features -E 'binary(it) and test(/^recorder::/)'`
+
+### Task 2: The cache mirrors document links
+- **Action** (tests first):
+  - **`cache.rs`:**
+    - A refresh mirrors a proposed document link, and a withdrawal deletes it.
+    - The offline `links` equals the online one, `documents` included: the existing `canonical`
+      helper sorts `documents` too.
+    - `MIRRORED_TABLES.len() == 23`.
+  - **`migrations.rs`:** a cache `0011` applies over a populated `0010` mirror.
+  - **Then D9:**
+    - the migration, `MIRRORED_TABLES`, the refresh fn, `run_pass` list and arm, and `CacheStore::links`
+      documents query (dynamic SQL, no `.sqlx`);
+    - update `it__connection__confirm.snap` ("23 mirrored tables"), reviewed;
+    - update the `PassReport.tombstones` doc.
+- **Mirror**: Patterns row Mirror.
+- **Validate**:
+  - `cargo nextest run -p htui-store --all-features -E 'binary(it) and test(/^(cache|migrations)::/)'`
+  - `cargo nextest run -p htui --all-features -E 'binary(it) and test(/^connection::/)'`
+
+### Task 3: MCP `item_link` takes `to_document`
+- **Action** (tests first), in `tools_backlog.rs`:
+  - `item_link_to_document_pins_the_latest_version`: the exact reply JSON with `version` and `latest`,
+    and the store's `links().documents` holds it.
+  - `item_link_to_document_names_a_version` and `…_of_a_co_member_reads_qualified` (`htui:FEAT-3`).
+  - `item_link_to_document_by_project_slug`.
+  - `item_link_to_document_second_version_is_one_line`.
+  - `item_link_to_document_with_blocked_by_is_refused`.
+  - `item_link_with_both_targets_is_invalid` and `…_with_neither_…`.
+  - `item_link_remove_to_document_tombstones_it`.
+  - `item_link_to_document_outside_reach_is_out_of_scope`.
+  - The existing `item_link_offers_the_seven_kinds` and
+    `no_backlog_tool_accepts_a_run_project_or_item_id_argument` still pass. Extend the former to pin
+    the `to_document` property's shape.
+  - **Then D11.**
+- **Mirror**: Patterns row Tests (MCP).
+- **Validate**:
+  - `cargo nextest run -p htui-mcp --all-features`
+  - `cargo insta test -p htui-mcp --all-features --check`: no snapshot should move. A moved one is
+    reviewed and named in the report.
+
+### Task 4: The Graph tab shows linked documents
+- **Action** (tests first):
+  - **In-file `graph.rs` tests**, each on a hand-built `LinkGraph` with `documents`:
+    - `a_document_link_reads_kind_owner_and_version`: `" → implements ANA-1 verdict v2 (latest v4) <title>"`,
+      and `v2` alone when it is the latest.
+    - `an_owner_document_reads_its_slug`.
+    - `a_document_under_a_repeated_node_is_not_drawn_twice`.
+    - `the_kind_column_keeps_its_width_with_documents`.
+    - `enter_on_an_item_document_reveals_its_owner`.
+    - `enter_on_an_owner_document_says_where_it_opens`.
+    - `every_width_up_to_the_pane_fits_and_draws` extended with a document row.
+  - **`backlog_detail.rs` e2e:** with a document link planted in the MemStore, the Graph pane draws
+    the row. Assert the text, not a new snapshot.
+  - **Then D12.**
+- **Mirror**: Patterns row Tests (Graph).
+- **Validate**:
+  - `cargo nextest run -p htui --all-features -E 'test(/graph/) or binary(it) and test(/^(backlog_detail|backlog)::/)'`
+  - `cargo insta test -p htui --all-features --check`: expect no moved snapshot (D10).
+
+## Validation
+
+```bash
+bash scripts/gate.sh                                   # main thread, once for the lane
+cargo clippy --workspace -- -D warnings                # featureless clippy (memory: featureless gate)
+cargo sqlx prepare --check -- --all-targets --all-features
+bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
+```
+Live-Qdrant suites and the merged-tree Postgres gate are owed on the host (sandbox).
+
+## Verified claims
+
+| Claim | Verdict | Evidence |
+|---|---|---|
+| Latest Pg migration is `0033`, latest cache migration `0010` | TRUE | directory listings `migrations/0033_memory_capture.sql`, `cache_migrations/0010_divided_fanout.sql` |
+| A document version is its own row; latest = `MAX(version)` per (project, item_id NOT DISTINCT, kind) | TRUE | `0026_workspace_scope.sql:78` `uq_document_owner_kind_version UNIQUE NULLS NOT DISTINCT (project_id, item_id, kind, version)`; `pg/write.rs:9086` `COALESCE(MAX(version),0)+1` |
+| `ON CONFLICT (cols)` infers a `UNIQUE NULLS NOT DISTINCT` constraint, and a second insert with a NULL attachment conflicts | TRUE | probe on the sandbox Postgres 18.7: temp table, second insert took the `DO UPDATE` arm, one row; NULLS NOT DISTINCT is PG ≥ 15, floor 16 |
+| No store method resolves a document by owner+kind or a project by slug | TRUE | explorer read of `traits.rs`/`worker.rs`: only `owner_documents(project)` and `item_by_key` (slug inside a qualified key) |
+| A workspace owner document's project is its scope row, slug `@ws` | TRUE | `0026_workspace_scope.sql:51-58`; `seed.rs:198` `scope_row_slug` |
+| Mem `link_reaches` takes two projects; Pg `link_reaches` takes an item and its SQL is pinned for `.sqlx` | TRUE | `mem.rs:3941`; `pg/write.rs:322-351` and its doc |
+| `WriteStore` impls: Mem, Pg, Writer, UsageSpy, SpyStore; `WorkerStore` impls: Mem, PgStore, Writer | TRUE | `git grep "impl.*WriteStore for\|impl.*WorkerStore for"` |
+| `LinkGraph` has 14 struct literals, in `link.rs`, `mem.rs`, `closeout.rs` (2 test), `cache/read.rs`, `pg/read.rs`, `graph.rs` (5 test) | TRUE | `git grep "LinkGraph {"` (cache.rs's hit is a fn signature) |
+| A new cascading table needs a `DeleteReach` field, a positional `pg_criteria` `TABLES` entry and a `hierarchy.rs` label | TRUE | `traits.rs:4414`; `pg_criteria.rs:3345` doc (positional zip); `hierarchy.rs:840-912` exhaustive destructure |
+| The delete-confirm text prints non-zero counts only, so no snapshot moves with zero rows | TRUE | `hierarchy.rs` doc "One `"{n} {label}"` per **non-zero** count" |
+| `MIRRORED_TABLES` is `[&str; 22]`, and the confirm snapshot holds "22 mirrored tables" | TRUE | `cache/mod.rs:47`; `it__connection__confirm.snap:11` |
+| `set_updated_at()` trigger pattern exists for a new table | TRUE | `0006_requirements.sql:141` |
+| No `item_link` `tools/list` snapshot; the schema is pinned inline | TRUE | explorer: `item_link_offers_the_seven_kinds` asserts the enum; the only tools/list snapshot has no item scope |
+| `item_link` bans `*_id` property names | TRUE | `tools_backlog.rs:1078` `no_backlog_tool_accepts_a_run_project_or_item_id_argument` |
+| The Graph pane is an item-only tree (`GraphRow.node: &LinkNode`, `re_root` emits `RevealTarget::Item`) | TRUE | explorer read of `graph.rs:108-273` |
+| The sqlx prepare recipe exists for the sandbox | TRUE | `docs/hr-sandbox.md:227-236` |
+| Task file sets: T1∩T2 = {`migrations.rs`, `cache/read.rs`}, T1∩T4 = {`graph.rs`}, T2∩T3 = T3∩T4 = ∅, T2∩T4 = ∅ | TRUE | Files table; overlaps force the serial lane |
+
+## Risks
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| Migration `0034` / cache `0011` collide with a parallel branch at collect | Medium | renumber at `scripts/hr collect`; repin `Pending(N)`, the count, `TABLES` (memory: new migration moves count pins) |
+| `.sqlx` drift (links documents query, propose/withdraw, project_reach count) | High | `cargo sqlx prepare` on a migrated scratch DB; `--check` in T1's validation |
+| `LinkGraph` serde change breaks a persisted/IPC payload | Low | `#[serde(default)]` on `documents` |
+| The single-pin race on Pg | Medium | advisory lock per from-item (D6); pg_criteria race test |
+| Graph tree code assumes item rows everywhere | Medium | the `GraphRow` target enum makes every item-only use a compile error, not a silent miss |
+| Sandbox gate flakes (live Qdrant, load) | High | live-Qdrant owed on the host (memory) |
+
+## Acceptance
+
+- [ ] All tasks complete, tests written before code
+- [ ] Validation passes (sandbox), host Postgres/Qdrant gate noted as owed
+- [ ] Patterns mirrored, not reinvented
+- [ ] PRD M3 row → complete; MOD-150 closes (P2) as all three milestones are done

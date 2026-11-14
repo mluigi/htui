@@ -32,6 +32,7 @@ use htui_core::model::{
     StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
     WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
+use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     StepGraphEdge,
@@ -292,7 +293,38 @@ impl ReadStore for PgStore {
         .await
         .map_err(map_sqlx)?;
 
-        Ok(LinkGraph {
+        // MOD-150 M3 D7: the reached items' live document links, leaves of the walk; ordered by
+        // `sort_documents`, not by SQL.
+        let documents = sqlx::query_as!(
+            LinkedDocument,
+            r#"
+            SELECT l.from_item_id AS "from_item_id: ItemId",
+                   l.kind         AS "kind: ArtifactLinkKind",
+                   d.id           AS "document_id: DocumentId",
+                   d.project_id   AS "project_id: ProjectId",
+                   p.slug         AS project_slug,
+                   d.item_id      AS "owner_item: ItemId",
+                   i.key          AS "owner_key?",
+                   d.kind         AS doc_kind,
+                   d.version,
+                   (SELECT MAX(x.version) FROM document x
+                     WHERE x.project_id = d.project_id
+                       AND x.item_id IS NOT DISTINCT FROM d.item_id
+                       AND x.kind = d.kind) AS "latest_version!",
+                   d.title
+              FROM item_artifact_link l
+              JOIN document d    ON d.id = l.to_document_id
+              JOIN project p     ON p.id = d.project_id
+              LEFT JOIN item i   ON i.id = d.item_id
+             WHERE l.deleted_at IS NULL AND l.from_item_id = ANY($1)
+            "#,
+            &reached[..],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut graph = LinkGraph {
             root: id,
             nodes: nodes.into_iter().map(LinkNodeRow::into_node).collect(),
             edges: edges
@@ -303,7 +335,10 @@ impl ReadStore for PgStore {
                     kind: row.kind,
                 })
                 .collect(),
-        })
+            documents,
+        };
+        graph.sort_documents();
+        Ok(graph)
     }
 
     /// Document heads, `(kind, version)` ascending. `body` is deliberately not in the `SELECT`

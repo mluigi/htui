@@ -10,7 +10,10 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use htui_core::model::link::{ItemLink, LinkGraph, ProposeLink, WithdrawLink};
+use htui_core::model::link::{
+    DocumentLink, ItemLink, LinkGraph, ProposeDocumentLink, ProposeLink, WithdrawDocumentLink,
+    WithdrawLink,
+};
 use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
@@ -447,6 +450,20 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
         WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::propose_document_link(self, fence, link).await
+    }
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::withdraw_document_link(self, fence, link).await
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
@@ -974,6 +991,20 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
         WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::propose_document_link(self, fence, link).await
+    }
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        WriteStore::withdraw_document_link(self, fence, link).await
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await

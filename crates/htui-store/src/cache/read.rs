@@ -42,6 +42,7 @@ use htui_core::model::{
     StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
     WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
+use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -612,11 +613,61 @@ impl ReadStore for CacheStore {
             });
         }
 
-        Ok(LinkGraph {
+        // MOD-150 M3 D7: the reached items' document links, leaves of the walk. The mirror holds
+        // live rows only (a tombstone is a delete), so no `deleted_at` filter; `IS` is SQLite's
+        // `IS NOT DISTINCT FROM` for an owner document's NULL `item_id`. Ordered by
+        // `sort_documents`, not by SQL, as on Postgres.
+        let sql = format!(
+            "SELECT l.from_item_id, l.kind, d.id AS document_id, d.project_id, \
+                    p.slug AS project_slug, d.item_id AS owner_item, i.key AS owner_key, \
+                    d.kind AS doc_kind, d.version, \
+                    (SELECT MAX(x.version) FROM document x \
+                      WHERE x.project_id = d.project_id AND x.item_id IS d.item_id \
+                        AND x.kind = d.kind) AS latest_version, \
+                    d.title \
+               FROM item_artifact_link l \
+               JOIN document d  ON d.id = l.to_document_id \
+               JOIN project p   ON p.id = d.project_id \
+               LEFT JOIN item i ON i.id = d.item_id \
+              WHERE l.from_item_id IN ({placeholders})",
+            placeholders = placeholders(reached.len()),
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for item_id in &reached {
+            query = query.bind(item_id.clone());
+        }
+        let document_rows = query.fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        let mut documents = Vec::with_capacity(document_rows.len());
+        for row in &document_rows {
+            documents.push(LinkedDocument {
+                from_item_id: uuid_col(
+                    "item_artifact_link.from_item_id",
+                    &text(row, "from_item_id")?,
+                )?,
+                kind: get::<ArtifactLinkKind>(row, "kind")?,
+                document_id: uuid_col("document.id", &text(row, "document_id")?)?,
+                project_id: uuid_col("document.project_id", &text(row, "project_id")?)?,
+                project_slug: text(row, "project_slug")?,
+                owner_item: opt_uuid_col(
+                    "document.item_id",
+                    opt_text(row, "owner_item")?.as_deref(),
+                )?,
+                owner_key: opt_text(row, "owner_key")?,
+                doc_kind: text(row, "doc_kind")?,
+                version: get(row, "version")?,
+                latest_version: get(row, "latest_version")?,
+                title: text(row, "title")?,
+            });
+        }
+
+        let mut graph = LinkGraph {
             root: id,
             nodes: out,
             edges,
-        })
+            documents,
+        };
+        graph.sort_documents();
+        Ok(graph)
     }
 
     async fn documents(&self, id: ItemId) -> Result<Vec<DocumentHead>> {

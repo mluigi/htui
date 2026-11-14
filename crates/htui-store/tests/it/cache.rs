@@ -18,9 +18,10 @@ use htui_store::testkit as common;
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, ItemState, LinkGraph,
-    MemoryEntryId, NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent,
-    Status, StepId, StepOpening, StepRole, UserId, WorkspaceSummary,
+    ArtifactLinkKind, CitationKind, DocumentId, DocumentRef, EventKind, EventRole, ItemFilter,
+    ItemState, LinkGraph, MemoryEntryId, NewDocument, ProjectId, PromptScope, ProposeDocumentLink,
+    Resolution, RunId, Scope, SessionEvent, Status, StepId, StepOpening, StepRole, UserId,
+    WithdrawDocumentLink, WorkspaceSummary,
 };
 use htui_core::model::{NewRunPlan, PlanScope, PlanStatus, RunPlanId};
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
@@ -91,7 +92,7 @@ async fn mirror_count(pool: &SqlitePool, table: &str) -> i64 {
     row.try_get("n").expect("a count column")
 }
 
-/// `LinkGraph` with its nodes and edges in a canonical order.
+/// `LinkGraph` with its nodes, edges and documents in a canonical order.
 ///
 /// `MemStore` walks its `links` vector, the mirror walks an index, so the two agree on membership
 /// and on depth but not on the order within a depth; the criterion is the graph, not the walk.
@@ -108,6 +109,8 @@ fn canonical(mut graph: LinkGraph) -> LinkGraph {
             .then_with(|| a.to_item_id.cmp(&b.to_item_id))
             .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
     });
+    // MOD-150 M3: `documents` follow the node order just set.
+    graph.sort_documents();
     graph
 }
 
@@ -2995,6 +2998,146 @@ async fn a_tombstoned_link_disappears_from_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-150 M3 T2 (plan D9): a proposed document link reaches the mirror on the next pass, and the
+/// offline `links` answers its `documents` as Postgres does, pinned version and latest included; a
+/// withdrawal is a tombstone on Postgres and a deletion here, as `item_link`'s is.
+///
+/// Both links are written through `PgStore` by `RUN_1`'s implement step (unleased in the fixture,
+/// so `StepFence::Unleased` passes): `FEAT-1` implements `ANA-1` research v1 (latest v3) and
+/// relates to `ANA-1`'s verdict at its latest.
+#[tokio::test]
+async fn a_document_link_is_mirrored_and_a_withdrawal_deletes_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    assert_eq!(
+        mirror_count(cache.pool(), "item_artifact_link").await,
+        0,
+        "the fixture holds no document link (plan D10)"
+    );
+
+    let research = DocumentRef {
+        owner: "ANA-1".to_owned(),
+        kind: "research".to_owned(),
+        version: Some(1),
+    };
+    let pinned = db
+        .store
+        .propose_document_link(
+            StepFence::Unleased,
+            ProposeDocumentLink {
+                from: ids::HTUI_FEAT_1,
+                kind: ArtifactLinkKind::Implements,
+                to: research.clone(),
+                step: ids::STEP_IMPL,
+            },
+        )
+        .await
+        .expect("FEAT-1 implements ANA-1 research v1");
+    let verdict = db
+        .store
+        .propose_document_link(
+            StepFence::Unleased,
+            ProposeDocumentLink {
+                from: ids::HTUI_FEAT_1,
+                kind: ArtifactLinkKind::Relates,
+                to: DocumentRef {
+                    owner: "ANA-1".to_owned(),
+                    kind: "verdict".to_owned(),
+                    version: None,
+                },
+                step: ids::STEP_IMPL,
+            },
+        )
+        .await
+        .expect("FEAT-1 relates to ANA-1's verdict");
+    assert_eq!(
+        (pinned.document.version, pinned.document.latest_version),
+        (1, 3),
+        "an older version is pinned as named"
+    );
+
+    let report = run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the links");
+    assert_eq!(report.rows("item_artifact_link"), 2, "both links upserted");
+    assert_eq!(mirror_count(cache.pool(), "item_artifact_link").await, 2);
+
+    for (root, hops) in [
+        (ids::HTUI_FEAT_1, 0),
+        (ids::HTUI_FEAT_1, 2),
+        (ids::HTUI_FEAT_2, 1),
+    ] {
+        let online = db.store.links(root, hops).await.expect("pg links");
+        assert_eq!(
+            canonical(cache.links(root, hops).await.expect("cache links")),
+            canonical(online.clone()),
+            "links({root}, {hops}), documents included"
+        );
+        assert_eq!(
+            online
+                .documents
+                .iter()
+                .filter(|d| d.from_item_id == ids::HTUI_FEAT_1)
+                .count(),
+            2,
+            "both of FEAT-1's documents are in the graph of {root}"
+        );
+    }
+    let offline = cache.links(ids::HTUI_FEAT_1, 0).await.expect("cache links");
+    assert_eq!(
+        offline.documents,
+        vec![pinned.document.clone(), verdict.document.clone()],
+        "the mirror answers what the writes answered, in sort_documents' order (kind first)"
+    );
+
+    db.store
+        .withdraw_document_link(
+            StepFence::Unleased,
+            WithdrawDocumentLink {
+                from: ids::HTUI_FEAT_1,
+                kind: ArtifactLinkKind::Implements,
+                to: research,
+                step: ids::STEP_IMPL,
+            },
+        )
+        .await
+        .expect("withdraw the research link");
+    let report = run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the tombstone");
+    assert!(report.tombstones >= 1, "the withdrawal is a tombstone");
+
+    let offline = cache.links(ids::HTUI_FEAT_1, 0).await.expect("cache links");
+    assert_eq!(
+        offline.documents,
+        vec![verdict.document.clone()],
+        "the withdrawn link is gone from the mirror's graph"
+    );
+    assert_eq!(
+        offline,
+        db.store.links(ids::HTUI_FEAT_1, 0).await.expect("pg links"),
+        "and the two backends agree after it"
+    );
+    let ids_left: Vec<String> = sqlx::query_scalar("SELECT id FROM item_artifact_link")
+        .fetch_all(cache.pool())
+        .await
+        .expect("list the mirrored rows");
+    assert_eq!(
+        ids_left,
+        vec![verdict.link.id.to_string()],
+        "the row itself is deleted, not flagged"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-38 T5 (blueprint §6.3): `item.resolution` reaches the mirror, and so do the four
 /// requirement tables' names.
 ///
@@ -3005,9 +3148,9 @@ async fn a_tombstoned_link_disappears_from_the_mirror() {
 async fn a_closed_item_mirrors_its_resolution() {
     assert_eq!(
         htui_store::cache::MIRRORED_TABLES.len(),
-        22,
+        23,
         "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement; \
-         MOD-139 adds run_plan",
+         MOD-139 adds run_plan; MOD-150 M3 adds item_artifact_link",
     );
     let Some(db) = common::demo_db().await else {
         return;

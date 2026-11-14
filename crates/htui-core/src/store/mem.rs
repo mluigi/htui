@@ -21,7 +21,11 @@ use serde_json::Value;
 use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
-use crate::model::link::{ProposeLink, WithdrawLink};
+use crate::model::ArtifactLinkId;
+use crate::model::link::{
+    ArtifactLinkKind, DocumentLink, DocumentRef, ItemArtifactLink, LinkedDocument,
+    ProposeDocumentLink, ProposeLink, WithdrawDocumentLink, WithdrawLink,
+};
 use crate::model::split_qualified;
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
@@ -82,13 +86,14 @@ use crate::store::traits::{
     ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     batch_is_closed, branch_refusal, chat_step_status, check_attachment, citation_key,
     close_out_names_no_link, close_out_needs_a_link, close_out_needs_a_summary,
-    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
-    expected_on_row, failure_disagrees_with_status, finish_run_needs_a_terminal_status,
-    graph_not_usable, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
-    item_not_in_project, lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run,
-    link_outside_reach, memory_entry_closed, memory_subject_taken, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    parent_cycle, parent_too_deep, persona_is_bound, persona_patch_refusal, phase_name_refusal,
+    command_finish_status, command_not_claimable, command_not_queued, document_already_pinned,
+    document_needs_a_step, document_outside_reach, document_ref_label, expected_on_row,
+    failure_disagrees_with_status, finish_run_needs_a_terminal_status, graph_not_usable,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run, link_outside_reach,
+    memory_entry_closed, memory_subject_taken, new_persona_refusal, new_skill_refusal,
+    not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step, parent_cycle,
+    parent_too_deep, persona_is_bound, persona_patch_refusal, phase_name_refusal,
     project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
     queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
     requirement_withdrawn, resolution_not_closable, row_names_another_phase,
@@ -323,6 +328,8 @@ struct State {
     /// MOD-147 D2: the `document` rows with `item_id IS NULL`, a project's (or a scope row's)
     /// own, kept apart from `documents` so no item-document reader can meet one.
     owner_documents: Vec<OwnerDocument>,
+    /// MOD-150 M3: `item_artifact_link`; tombstones are kept, as in `links`.
+    artifact_links: Vec<ItemArtifactLink>,
     /// `run`.
     runs: HashMap<RunId, Run>,
     /// `run_step`.
@@ -493,6 +500,7 @@ impl MemStore {
             notes: data.notes,
             documents: data.documents,
             owner_documents: Vec::new(),
+            artifact_links: Vec::new(),
             runs: data.runs.into_iter().map(|row| (row.id, row)).collect(),
             steps: data.steps.into_iter().map(|row| (row.id, row)).collect(),
             step_trees: BTreeMap::new(),
@@ -1912,7 +1920,130 @@ impl State {
             })
             .collect();
 
-        Ok(LinkGraph { root, nodes, edges })
+        // MOD-150 M3 D7: the reached items' live document links, leaves of the walk.
+        let documents = self
+            .artifact_links
+            .iter()
+            .filter(|row| row.deleted_at.is_none() && seen.contains(&row.from_item_id))
+            .filter_map(|row| self.linked_document(row.from_item_id, row.kind, row.to_document_id?))
+            .collect();
+        let mut graph = LinkGraph {
+            root,
+            nodes,
+            edges,
+            documents,
+        };
+        graph.sort_documents();
+        Ok(graph)
+    }
+
+    /// MOD-150 M3 D2: the read shape of `from --kind--> document`, with the latest version of
+    /// the document's owner and kind; `None` when the document is gone.
+    fn linked_document(
+        &self,
+        from: ItemId,
+        kind: ArtifactLinkKind,
+        id: DocumentId,
+    ) -> Option<LinkedDocument> {
+        let (owner, doc_kind, version, title) =
+            if let Some(row) = self.documents.iter().find(|row| row.id == id) {
+                let project = self.items.get(&row.item_id)?.project_id;
+                (
+                    DocOwner {
+                        project,
+                        item: Some(row.item_id),
+                    },
+                    &row.kind,
+                    row.version,
+                    &row.title,
+                )
+            } else {
+                let row = self.owner_documents.iter().find(|row| row.id == id)?;
+                (
+                    DocOwner {
+                        project: row.project_id,
+                        item: None,
+                    },
+                    &row.kind,
+                    row.version,
+                    &row.title,
+                )
+            };
+        let latest_version = self
+            .owner_versions(owner, doc_kind)
+            .into_iter()
+            .map(|(_, version)| version)
+            .max()
+            .unwrap_or(version);
+        Some(LinkedDocument {
+            from_item_id: from,
+            kind,
+            document_id: id,
+            project_id: owner.project,
+            project_slug: self.projects.get(&owner.project)?.slug.clone(),
+            owner_item: owner.item,
+            owner_key: owner
+                .item
+                .and_then(|item| self.items.get(&item))
+                .map(|item| item.key.clone()),
+            doc_kind: doc_kind.clone(),
+            version,
+            latest_version,
+            title: title.clone(),
+        })
+    }
+
+    /// MOD-150 M3 D3: `(id, version)` of every version of `owner`'s documents of `kind`.
+    fn owner_versions(&self, owner: DocOwner, kind: &str) -> Vec<(DocumentId, i32)> {
+        match owner.item {
+            Some(item) => self
+                .documents
+                .iter()
+                .filter(|row| row.item_id == item && row.kind == kind)
+                .map(|row| (row.id, row.version))
+                .collect(),
+            None => self
+                .owner_documents
+                .iter()
+                .filter(|row| row.project_id == owner.project && row.kind == kind)
+                .map(|row| (row.id, row.version))
+                .collect(),
+        }
+    }
+
+    /// MOD-150 M3 D3: whose documents `owner` names from a step of `project`: an item key first
+    /// (`item_by_key`'s rules), else an exact project slug. `None` when it names neither; the
+    /// callers answer that as [`document_outside_reach`], so it reads as an owner outside the
+    /// reach (R1 M1).
+    fn document_owner(&self, project: ProjectId, owner: &str) -> Option<DocOwner> {
+        match self.item_by_key(project, owner) {
+            Some(item) => Some(DocOwner {
+                project: self.items.get(&item)?.project_id,
+                item: Some(item),
+            }),
+            None => self
+                .projects
+                .values()
+                .find(|row| row.slug == owner)
+                .map(|row| DocOwner {
+                    project: row.id,
+                    item: None,
+                }),
+        }
+    }
+
+    /// MOD-150 M3 D3: `owner`'s document of `to.kind`, the named version or the latest.
+    /// `NotFound { entity: "document" }` when it has none; asked only once the owner is in reach.
+    fn resolve_document(&self, owner: DocOwner, to: &DocumentRef) -> Result<DocumentId> {
+        let versions = self.owner_versions(owner, &to.kind);
+        let pick = match to.version {
+            Some(named) => versions.into_iter().find(|(_, version)| *version == named),
+            None => versions.into_iter().max_by_key(|(_, version)| *version),
+        };
+        pick.map(|(id, _)| id).ok_or_else(|| StoreError::NotFound {
+            entity: "document",
+            id: document_ref_label(to),
+        })
     }
 
     /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, walked in memory.
@@ -5808,6 +5939,8 @@ impl State {
                         .filter(|row| row.project_id == id)
                         .count(),
             ),
+            // MOD-150 M3 D8: either end, tombstones included, as `item_requirements` below.
+            document_links: rows(self.project_document_links(id, &items)),
             requirement_specs: rows(usize::from(self.requirement_specs.contains_key(&id))),
             requirement_areas: rows(requirement_areas.len()),
             requirement_key_counters: rows(
@@ -6033,6 +6166,25 @@ impl State {
         let run_commands = &self.run_commands;
         self.follow_up_payloads
             .retain(|id, _| run_commands.contains_key(id));
+        // MOD-150 M3 D8: a document link goes with either end (`ON DELETE CASCADE` on both), and
+        // one that survives loses a proposing step that did not (`SET NULL`, the trigger moving
+        // `updated_at`).
+        let documents = self.project_documents(id, &gone.items);
+        self.artifact_links.retain(|row| {
+            !gone.items.contains(&row.from_item_id)
+                && row
+                    .to_document_id
+                    .is_none_or(|doc| !documents.contains(&doc))
+        });
+        for row in &mut self.artifact_links {
+            if row
+                .proposed_by_step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                row.proposed_by_step_id = None;
+                row.updated_at = now;
+            }
+        }
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.owner_documents.retain(|row| row.project_id != id);
@@ -9265,6 +9417,177 @@ impl State {
         Ok(row.clone())
     }
 
+    /// MOD-150 M3 D4: the upsert of a document link. Refusals run step, fence, own item, the
+    /// owner and its reach (D5, [`Self::link_reaches`]: an owner that names nothing reads as one
+    /// outside it, R1 M1), the kind and version (D3, the latest when none is named) and the
+    /// single pin, before the upsert, so a tombstone's revival is checked like an insert; a live
+    /// row keeps its proposer, a tombstone revives as the step's. The state lock serialises the
+    /// pin check (D6).
+    fn propose_document_link(
+        &mut self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+        now: DateTime<Utc>,
+    ) -> Result<DocumentLink> {
+        let (_, item, project) = self.step_scope(link.step, fence)?;
+        if item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let label = document_ref_label(&link.to);
+        let Some(owner) = self
+            .document_owner(project, &link.to.owner)
+            .filter(|owner| self.link_reaches(project, owner.project))
+        else {
+            return Err(StoreError::Constraint(document_outside_reach(&label)));
+        };
+        let document = self.resolve_document(owner, &link.to)?;
+        let versions = self.owner_versions(owner, &link.to.kind);
+        let pinned = self
+            .artifact_links
+            .iter()
+            .filter(|row| {
+                row.deleted_at.is_none() && row.from_item_id == link.from && row.kind == link.kind
+            })
+            .filter_map(|row| row.to_document_id)
+            .filter(|id| *id != document)
+            .filter_map(|id| versions.iter().find(|(version_id, _)| *version_id == id))
+            .map(|(_, version)| *version)
+            .min();
+        if let Some(pinned) = pinned {
+            return Err(StoreError::Constraint(document_already_pinned(
+                link.from, link.kind, pinned,
+            )));
+        }
+        let at = self.artifact_links.iter().position(|row| {
+            row.from_item_id == link.from
+                && row.kind == link.kind
+                && row.to_document_id == Some(document)
+                && row.to_attachment_id.is_none()
+        });
+        let row = if let Some(at) = at {
+            let row = &mut self.artifact_links[at];
+            if row.deleted_at.is_some() {
+                row.proposed_by_step_id = Some(link.step);
+                row.deleted_at = None;
+            }
+            row.updated_at = now;
+            row.clone()
+        } else {
+            let row = ItemArtifactLink {
+                id: ArtifactLinkId::new(),
+                from_item_id: link.from,
+                kind: link.kind,
+                to_document_id: Some(document),
+                to_attachment_id: None,
+                proposed_by_step_id: Some(link.step),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            self.artifact_links.push(row.clone());
+            row
+        };
+        self.document_link(row)
+    }
+
+    /// MOD-150 M3 D4: tombstones the live document link of `link.kind` from `link.from` to any
+    /// version of the owner's kind (a named version must be the pinned one) when a step of
+    /// `link.step`'s run proposed it. Refusals run step, fence, own item, the owner (one that
+    /// names nothing is [`document_outside_reach`]; no reach check, as in `withdraw_link`), then
+    /// `NotFound` for no matching live row (a version that does not exist included: it is never
+    /// resolved, R1 M1) and [`link_not_proposed_by_run`] for a live row of anyone else's.
+    fn withdraw_document_link(
+        &mut self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+        now: DateTime<Utc>,
+    ) -> Result<DocumentLink> {
+        let (run, item, project) = self.step_scope(link.step, fence)?;
+        if item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let label = document_ref_label(&link.to);
+        let Some(owner) = self.document_owner(project, &link.to.owner) else {
+            return Err(StoreError::Constraint(document_outside_reach(&label)));
+        };
+        let versions = self.owner_versions(owner, &link.to.kind);
+        let steps = &self.steps;
+        let Some(row) = self.artifact_links.iter_mut().find(|row| {
+            row.deleted_at.is_none()
+                && row.from_item_id == link.from
+                && row.kind == link.kind
+                && row
+                    .to_document_id
+                    .and_then(|id| versions.iter().find(|(version_id, _)| *version_id == id))
+                    .is_some_and(|(_, version)| link.to.version.is_none_or(|v| v == *version))
+        }) else {
+            return Err(StoreError::NotFound {
+                entity: "item_artifact_link",
+                id: label,
+            });
+        };
+        let ours = row
+            .proposed_by_step_id
+            .and_then(|proposer| steps.get(&proposer))
+            .is_some_and(|proposer| proposer.run_id == run);
+        if !ours {
+            return Err(StoreError::Constraint(link_not_proposed_by_run(&label)));
+        }
+        row.deleted_at = Some(now);
+        row.updated_at = now;
+        let row = row.clone();
+        self.document_link(row)
+    }
+
+    /// MOD-150 M3 D8: the ids of project `id`'s documents: those of its `items`, and its own.
+    fn project_documents(&self, id: ProjectId, items: &HashSet<ItemId>) -> HashSet<DocumentId> {
+        self.documents
+            .iter()
+            .filter(|row| items.contains(&row.item_id))
+            .map(|row| row.id)
+            .chain(
+                self.owner_documents
+                    .iter()
+                    .filter(|row| row.project_id == id)
+                    .map(|row| row.id),
+            )
+            .collect()
+    }
+
+    /// MOD-150 M3 D8: the `item_artifact_link` rows a delete of project `id` (holding `items`)
+    /// takes: from one of its items or to one of its documents, tombstones included.
+    fn project_document_links(&self, id: ProjectId, items: &HashSet<ItemId>) -> usize {
+        let documents = self.project_documents(id, items);
+        self.artifact_links
+            .iter()
+            .filter(|row| {
+                items.contains(&row.from_item_id)
+                    || row
+                        .to_document_id
+                        .is_some_and(|doc| documents.contains(&doc))
+            })
+            .count()
+    }
+
+    /// MOD-150 M3 D2: a written row and the document it pins.
+    fn document_link(&self, link: ItemArtifactLink) -> Result<DocumentLink> {
+        let id = link.to_document_id.ok_or_else(|| StoreError::NotFound {
+            entity: "document",
+            id: link.id.to_string(),
+        })?;
+        let document = self
+            .linked_document(link.from_item_id, link.kind, id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "document",
+                id: id.to_string(),
+            })?;
+        Ok(DocumentLink { link, document })
+    }
+
     /// MOD-11 B-4: the item of `project` keyed `key`. MOD-147 D2: a qualified `slug:KEY` names
     /// its project by slug, and `project` is ignored; an unknown slug is `None`.
     fn item_by_key(&self, project: ProjectId, key: &str) -> Option<ItemId> {
@@ -9312,6 +9635,16 @@ impl State {
         row.updated_at = now;
         Ok(row.clone())
     }
+}
+
+/// MOD-150 M3 D3: whose documents a [`DocumentRef`] names: an item's (`item` set), or a
+/// project's own (`item` `None`). `project` is the document rows' `project_id` either way.
+#[derive(Debug, Clone, Copy)]
+struct DocOwner {
+    /// `document.project_id`.
+    project: ProjectId,
+    /// `document.item_id`.
+    item: Option<ItemId>,
 }
 
 /// The rows a project delete takes, identified once by [`State::project_reach`] so the report and
@@ -11545,6 +11878,24 @@ impl WriteStore for MemStore {
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
         let now = self.now();
         self.write(|state| state.withdraw_link(fence, link, now))
+    }
+
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        let now = self.now();
+        self.write(|state| state.propose_document_link(fence, link, now))
+    }
+
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        let now = self.now();
+        self.write(|state| state.withdraw_document_link(fence, link, now))
     }
 
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
