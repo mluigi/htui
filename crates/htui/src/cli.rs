@@ -183,6 +183,16 @@ pub enum Command {
     /// runs and permission requests, in the overlay's order (project in scope order, then item key,
     /// run, step and reason), with their age. Reads only, as `status`.
     Waiting(StateArgs),
+    /// Stop every run in a workspace (`R-ORCH-16`), after a confirmation: each agent step stops at
+    /// its turn boundary and keeps its session, checks and htui's own steps stop at once; with
+    /// `--force` every step is killed mid-turn (a graceful stop already in force is escalated).
+    /// Nothing new starts in the workspace until `htui resume`. Waits up to 20 s for the runs to
+    /// stop, then prints each run and how it will resume.
+    Stop(StopArgs),
+    /// Resume a stopped workspace, after a confirmation: each stopped run resumes on the box that
+    /// ran it, at that box's next command poll; queued runs can start again. Prints each run and
+    /// how it will resume.
+    Resume(ResumeArgs),
     /// Write htui's Claude Code plugin (MOD-93). `htui claude emit` writes a directory marketplace
     /// and prints the two `claude plugin` commands. It runs neither, and never edits `~/.claude`.
     Claude(ClaudeArgs),
@@ -190,6 +200,31 @@ pub enum Command {
     /// never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits
     /// when the agent closes stdin.
     Mcp,
+}
+
+/// `htui stop`'s arguments (MOD-125 M4 D1). None reads the environment.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct StopArgs {
+    /// The workspace's slug.
+    #[arg(value_name = "WORKSPACE")]
+    pub workspace: String,
+    /// Kill every step mid-turn instead of stopping at turn boundaries.
+    #[arg(long)]
+    pub force: bool,
+    /// Answer the confirmation yes; without a terminal it is required.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// `htui resume`'s arguments (MOD-125 M4 D1). None reads the environment.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ResumeArgs {
+    /// The workspace's slug.
+    #[arg(value_name = "WORKSPACE")]
+    pub workspace: String,
+    /// Answer the confirmation yes; without a terminal it is required.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `htui provision`'s arguments. None reads the environment (MOD-45 D291).
@@ -269,7 +304,8 @@ pub struct StateArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, ClaudeArgs, ClaudeCommand, Command, EmitArgs, ProvisionArgs, StateArgs, WorkerArgs,
+        Args, ClaudeArgs, ClaudeCommand, Command, EmitArgs, ProvisionArgs, ResumeArgs, StateArgs,
+        StopArgs, WorkerArgs,
     };
     use clap::{CommandFactory as _, Parser as _};
 
@@ -822,6 +858,99 @@ mod tests {
         let mut command = Args::command();
         command.build();
         for name in ["status", "waiting"] {
+            let verb = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`{name}` is a subcommand"));
+            let mut saw_log = false;
+            for arg in verb.get_arguments() {
+                if arg.get_id() == "log" {
+                    saw_log = true;
+                    assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("HTUI_LOG")));
+                } else {
+                    assert_eq!(
+                        arg.get_env(),
+                        None,
+                        "`htui {name} --{}` must not read the environment",
+                        arg.get_id()
+                    );
+                }
+            }
+            assert!(saw_log, "`--log` is propagated to `{name}`");
+        }
+    }
+
+    /// `htui stop` over `workspace` with these flags.
+    fn stop(workspace: &str, force: bool, yes: bool) -> Option<Command> {
+        Some(Command::Stop(StopArgs {
+            workspace: workspace.to_owned(),
+            force,
+            yes,
+        }))
+    }
+
+    /// MOD-125 M4 D1: `htui stop [--force] [--yes|-y] <WORKSPACE>`, `htui resume [--yes|-y]
+    /// <WORKSPACE>`.
+    #[test]
+    fn stop_and_resume_parse_their_flags() {
+        let args = Args::try_parse_from(["htui", "stop", "x"]).expect("parse");
+        assert_eq!(args.command, stop("x", false, false));
+        let args = Args::try_parse_from(["htui", "stop", "--force", "-y", "x"]).expect("parse");
+        assert_eq!(args.command, stop("x", true, true));
+        let args = Args::try_parse_from(["htui", "stop", "x", "--yes"]).expect("parse");
+        assert_eq!(args.command, stop("x", false, true));
+        let args = Args::try_parse_from(["htui", "resume", "--yes", "x"]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Resume(ResumeArgs {
+                workspace: "x".to_owned(),
+                yes: true,
+            }))
+        );
+        let args = Args::try_parse_from(["htui", "resume", "x"]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Resume(ResumeArgs {
+                workspace: "x".to_owned(),
+                yes: false,
+            }))
+        );
+    }
+
+    /// MOD-125 M4 D1: the workspace is required, `--force` is `stop`'s alone, and no TUI flag
+    /// stands beside either verb.
+    #[test]
+    fn stop_and_resume_need_a_workspace_and_refuse_tui_flags() {
+        for bad in [
+            &["htui", "stop"][..],
+            &["htui", "resume"],
+            &["htui", "--demo", "stop", "x"],
+            &["htui", "--offline", "resume", "x"],
+            &["htui", "stop", "--decisions", "x"],
+            &["htui", "resume", "--force", "x"],
+            &["htui", "stop", "x", "y"],
+        ] {
+            assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    /// MOD-125 M4 D1: the global `--log` goes after `stop` and `resume`, as after every
+    /// subcommand.
+    #[test]
+    fn log_goes_after_stop() {
+        let args = Args::try_parse_from(["htui", "stop", "x", "--log", "l"]).expect("parse");
+        assert_eq!(args.log.as_deref(), Some(std::path::Path::new("l")));
+        assert_eq!(args.command, stop("x", false, false));
+        let args = Args::try_parse_from(["htui", "resume", "--log", "l", "x"]).expect("parse");
+        assert_eq!(args.log.as_deref(), Some(std::path::Path::new("l")));
+    }
+
+    /// `R-STO-1`, MOD-125 M4 D1: no argument of `htui stop` or `htui resume` reads the
+    /// environment, except the propagated global `--log`.
+    #[test]
+    fn no_stop_or_resume_argument_reads_the_environment() {
+        let mut command = Args::command();
+        command.build();
+        for name in ["stop", "resume"] {
             let verb = command
                 .find_subcommand(name)
                 .unwrap_or_else(|| panic!("`{name}` is a subcommand"));
