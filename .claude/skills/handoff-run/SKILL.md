@@ -186,7 +186,8 @@ catches the defect. Review authority sits in one place, the review gate.
    - **Agents never run the workspace gate.** An implementer runs its task's check, clippy and rustfmt on the crates
      it touched. A workflow agent's prompt cache lasts five minutes, so a long build inside an agent reloads its
      whole context at full price.
-4. **Gate, once per lane.** After a lane finishes, the main thread runs the gate itself (`bash scripts/gate.sh`, or
+4. **Gate, once per lane.** After a lane finishes, the main thread runs the gate itself (`bash scripts/gate.sh`; in a
+   sandbox `env -u HTUI_TEST_QDRANT_URL bash scripts/gate.sh`, see Sandbox mode; or
    the item's narrower gate when the plan names one) and reads the result. A red gate goes back to one implementer
    with the failing output and that task's brief.
 5. **Review gate.** The repo's configured reviewer agent always runs over the full change set; it is the final
@@ -239,9 +240,21 @@ review gate included — is unchanged.
   under two IDs: when a listed title looks like the same issue, ask the maintainer before filing; on
   reuse, cite the sibling's ID in this run's phase note instead of creating the item.
 - **Database** — `psql -h localhost -p 5439 -U postgres` (trust auth, no password).
-  `HTUI_TEST_DATABASE_URL` and `HTUI_TEST_QDRANT_URL` are already set. There is no `docker` here: a
+  `HTUI_TEST_DATABASE_URL` and `HTUI_TEST_QDRANT_URL` are already set (the second is never used for a test run:
+  see the next bullet). There is no `docker` here: a
   recipe that says `docker exec htui-postgres psql …` becomes the same `psql` command against
   `localhost:5439` (the `sqlx prepare` variant is in `docs/hr-sandbox.md`).
+- **No live Qdrant tests.** The sandbox's Qdrant times out creating collections, so every live case
+  (`qdrant_live`, `qdrant_worker`, a test named `live_qdrant_*`) fails after about 50 s, and nextest retries it
+  once, one at a time in the `live-qdrant` group: about half an hour of known failures per gate (MOD-147 M4,
+  2026-11-14). So:
+  - the main thread gates with `env -u HTUI_TEST_QDRANT_URL bash scripts/gate.sh`. The `qdrant` step then reports
+    `skipped` and the live suites return early, so "PASSED (1 skipped: qdrant)" is a green sandbox gate;
+  - every agent prompt (implementer, verifier, repair, reviewer) says never to run a live Qdrant test, and to
+    prefix every `cargo` command with `env -u HTUI_TEST_QDRANT_URL`, so a crate filter that happens to match a live
+    case returns early instead of timing out. A new live test is compiled (`--no-run`), never run;
+  - the phase note, the write-up and the done-report list the live-Qdrant suites, new live tests named, as owed
+    on the host.
 - **Durable notes** — this run's Gortex daemon and store, and every Gortex memory it writes, are private to
   the run and are deleted when it is purged. Anything that must outlive the run goes in the repo (plan,
   write-up) or the Claude auto-memory under `~/.claude`, which is shared with the host.
@@ -267,4 +280,6 @@ review gate included — is unchanged.
   its behalf** (see the References note). Never `bash …/*.sh` on this platform.
 - No done-report over a red validator.
 - In a sandbox (`HR_SANDBOX=1`) the item is `$HR_ITEM` and nothing is pushed — see Sandbox mode.
+- In a sandbox no live Qdrant test runs: the gate and every agent's `cargo` run with `HTUI_TEST_QDRANT_URL`
+  unset, and the live suites are owed on the host — see Sandbox mode.
 - This skill orchestrates; it does not duplicate the law — `workflow-docs.md` wins on any bookkeeping conflict.
