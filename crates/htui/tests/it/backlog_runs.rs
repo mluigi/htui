@@ -10,7 +10,9 @@ use htui::agent_worker::AgentRuntime;
 use htui::app::Action;
 use htui::run_worker::RunRuntime;
 use htui::testkit::Harness;
-use htui::ui::tabs::backlog::BacklogTab;
+use htui::ui::shell::{Preset, TabLayout};
+use htui::ui::state_file::{UiState, UiStore};
+use htui::ui::tabs::backlog::{BACKLOG_LAYOUT, BacklogTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{LinkKind, Status, WorkspaceSummary};
@@ -53,6 +55,29 @@ async fn driving() -> Harness {
 
 /// [`driving`] on a `width` x `height` terminal.
 async fn driving_at(width: u16, height: u16) -> Harness {
+    driving_laid(width, height, None).await
+}
+
+/// [`driving_at`] laid out `ide` (the list beside the detail, no activity pane): for a frame whose
+/// subject the default `ide_activity` layout's shorter detail pane cuts off (MOD-122 M3 review).
+async fn driving_ide_at(width: u16, height: u16) -> Harness {
+    driving_laid(width, height, Some(Preset::Ide)).await
+}
+
+/// [`driving_at`] with the Backlog's saved layout set to `preset`, or the default when `None`.
+async fn driving_laid(width: u16, height: u16, preset: Option<Preset>) -> Harness {
+    let store = UiStore::memory();
+    if let Some(preset) = preset {
+        let mut state = UiState::default();
+        state.layouts.insert(
+            BacklogTab::ID.0.to_owned(),
+            TabLayout {
+                preset,
+                ..BACKLOG_LAYOUT
+            },
+        );
+        store.save(&state).expect("a memory store saves");
+    }
     let runtime = RunRuntime::with_parts(
         Arc::new(FakeIsolator::new()),
         Arc::new(FakeVerifier::new()),
@@ -62,7 +87,8 @@ async fn driving_at(width: u16, height: u16) -> Harness {
         .size(width, height)
         .with_tab(Box::new(BacklogTab::new()))
         .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
-        .with_run_runtime(runtime);
+        .with_run_runtime(runtime)
+        .with_ui_store(store);
     harness.drive_to_end().await;
     harness.app().update(Action::SetScope {
         workspace: workspace("platform").await,
@@ -168,7 +194,9 @@ async fn the_close_out_asks_inside_the_detail_pane() {
 /// field a few cells beside it.
 #[tokio::test]
 async fn the_typed_close_out_shows_the_key_typed_at_80_columns() {
-    let mut harness = driving_at(80, 24).await;
+    // Laid out `ide`: the default layout's shorter detail pane lets the question cover the run it
+    // counts (MOD-122 M3 review, R1-tui verifier).
+    let mut harness = driving_ide_at(80, 24).await;
     on_runs(&mut harness, 0).await;
     for key in ["C", "y"] {
         harness.key(key);
