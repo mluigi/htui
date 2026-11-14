@@ -55,8 +55,8 @@ use htui_core::model::{
 };
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{
-    AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
-    locator_refusal, target_name_refusal,
+    AttachedBox, BoxKind, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, Target,
+    TargetEdit, TargetId, TargetKind, locator_refusal, target_name_refusal,
 };
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
@@ -76,9 +76,11 @@ use htui_core::store::traits::{
     step_document_refusal, step_note_refusal, step_writes_own_item, workspace_prefix_taken,
 };
 use htui_core::store::traits::{
-    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
-    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_name_taken,
-    target_retired, target_takes_no_container,
+    DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN, TARGET_USER_DEFAULT, box_bound_to_other_target,
+    box_hostname_is_blank, box_not_a_child_of, child_box_needs_a_machine, has_nul,
+    target_bound_elsewhere, target_built_in, target_has_runs, target_in_use, target_name_taken,
+    target_retired, target_takes_no_container, target_user_graph, target_user_item,
+    target_user_project,
 };
 use htui_core::store::traits::{
     document_already_pinned, document_outside_reach, document_ref_label,
@@ -2078,6 +2080,107 @@ async fn lock_box_row(conn: &mut PgConnection, id: BoxId) -> Result<Option<BoxRo
     .map_err(map_sqlx)
 }
 
+/// MOD-130 M1 T4 (blueprint B3, B7): a target named as a level's value, read `FOR SHARE` for the
+/// rest of `conn`'s transaction, so a concurrent retire or delete waits for the level's write and
+/// then sees it; a setter that waited behind a retire sees `retired_at`, and one behind a delete
+/// sees no row. No row is `references_no_row(column)`, a retired one [`target_retired`].
+async fn share_level_target(
+    conn: &mut PgConnection,
+    column: &str,
+    target: Option<TargetId>,
+) -> Result<()> {
+    let Some(id) = target else {
+        return Ok(());
+    };
+    let row = sqlx::query!(
+        "SELECT name, retired_at FROM target WHERE id = $1 FOR SHARE",
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?;
+    match row {
+        None => Err(StoreError::Constraint(references_no_row(
+            column, id, "target",
+        ))),
+        Some(row) if row.retired_at.is_some() => {
+            Err(StoreError::Constraint(target_retired(&row.name)))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// MOD-130 M1 T4 (blueprint B11): the Settings default row, parsed, on any executor. The
+/// statement is `box_probe_spec`'s byte for byte, so it reuses that offline entry.
+async fn default_target_on<'e, E: PgExecutor<'e>>(executor: E) -> Result<Option<DefaultTarget>> {
+    let row = sqlx::query!(
+        "SELECT value, updated_at FROM app_setting WHERE key = $1",
+        DEFAULT_TARGET_KEY,
+    )
+    .fetch_optional(executor)
+    .await
+    .map_err(map_sqlx)?;
+    row.map(|row| DefaultTarget::parse(&row.value, row.updated_at))
+        .transpose()
+}
+
+/// MOD-130 M1 T4 (D14, blueprint B5): the P9 labels of every level and the Settings default
+/// naming `id`, read in `conn`'s transaction after the target row's lock.
+async fn target_users(conn: &mut PgConnection, id: TargetId) -> Result<Vec<String>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT 'project' AS "kind!", p.slug AS "name!", NULL::text AS "project?",
+               NULL::text AS "workspace?"
+          FROM project p WHERE p.target_id = $1
+        UNION ALL
+        SELECT 'workflow', g.name, gp.slug, w.slug
+          FROM step_graph g
+          LEFT JOIN project gp ON gp.id = g.project_id
+          LEFT JOIN workspace w ON w.id = g.workspace_id
+         WHERE g.target_id = $1
+        UNION ALL
+        SELECT 'item', i.key, ip.slug, NULL
+          FROM item i JOIN project ip ON ip.id = i.project_id
+         WHERE i.target_id = $1
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let mut users: Vec<String> = rows
+        .into_iter()
+        .map(|row| match row.kind.as_str() {
+            "project" => target_user_project(&row.name),
+            "workflow" => {
+                target_user_graph(&row.name, row.project.as_deref(), row.workspace.as_deref())
+            }
+            _ => target_user_item(&row.name, row.project.as_deref().unwrap_or_default()),
+        })
+        .collect();
+    if default_target_on(&mut *conn)
+        .await?
+        .is_some_and(|default| default.target == id)
+    {
+        users.push(TARGET_USER_DEFAULT.to_owned());
+    }
+    Ok(users)
+}
+
+/// MOD-130 M1 T4: the refusals `retire_target` and `delete_target` share, with the target row
+/// locked `FOR UPDATE` first (blueprint B7): unknown, local, in use.
+async fn lock_free_target(conn: &mut PgConnection, id: TargetId) -> Result<Target> {
+    let current = lock_target(&mut *conn, id).await?;
+    if current.kind == TargetKind::Local {
+        return Err(StoreError::Constraint(target_built_in()));
+    }
+    let users = target_users(&mut *conn, id).await?;
+    if !users.is_empty() {
+        return Err(StoreError::Constraint(target_in_use(&current.name, &users)));
+    }
+    Ok(current)
+}
+
 /// MOD-130 M1 T2: whether a target other than `except` holds `name`.
 async fn target_name_held(
     conn: &mut PgConnection,
@@ -3990,6 +4093,242 @@ impl WriteStore for PgStore {
         Ok(CasOutcome::Applied(updated))
     }
 
+    /// MOD-130 M1 T4 (D5, P6, blueprint B7): the project read first (`NotFound`), then in one
+    /// transaction the target `FOR SHARE` and the compare-and-set; a miss re-reads, as
+    /// `update_project` does.
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<Project>> {
+        if self.project(project).await?.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: project.to_string(),
+            });
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        share_level_target(&mut tx, "project.target_id", target).await?;
+        let updated = sqlx::query_as!(
+            Project,
+            r#"
+            UPDATE project SET target_id = $3
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id              AS "id: ProjectId",
+                      slug,
+                      name,
+                      description,
+                      type            AS project_type,
+                      owner_workspace_id AS "owner_workspace_id: WorkspaceId",
+                      secret_provider,
+                      secret_scope,
+                      settings,
+                      target_id       AS "target_id: TargetId",
+                      created_by      AS "created_by: htui_core::model::UserId",
+                      created_at,
+                      updated_at
+            "#,
+            project.as_uuid(),
+            expected,
+            target.map(TargetId::as_uuid),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.project(project).await?, "project", project),
+        }
+    }
+
+    /// MOD-130 M1 T4 (D11, P6, blueprint B7): `set_project_target`'s shape on `step_graph`; the
+    /// bump rides in the compare-and-set statement, as in `update_step_graph`, so a miss bumps
+    /// nothing.
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        if self.step_graph_row(graph).await?.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "step_graph",
+                id: graph.to_string(),
+            });
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        share_level_target(&mut tx, "step_graph.target_id", target).await?;
+        let updated = sqlx::query_as!(
+            StepGraphRow,
+            r#"
+            UPDATE step_graph SET
+                target_id = $3,
+                revision  = revision + 1
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id           AS "id: StepGraphId",
+                      project_id   AS "project_id: ProjectId",
+                      workspace_id AS "workspace_id: WorkspaceId",
+                      name,
+                      description,
+                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
+                      is_override,
+                      revision,
+                      target_id    AS "target_id: TargetId",
+                      created_at,
+                      updated_at
+            "#,
+            graph.as_uuid(),
+            expected,
+            target.map(TargetId::as_uuid),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(StepGraph::try_from(row)?)),
+            None => cas_miss(self.step_graph_row(graph).await?, "step_graph", graph),
+        }
+    }
+
+    async fn default_target(&self) -> Result<Option<DefaultTarget>> {
+        default_target_on(&self.pool).await
+    }
+
+    /// MOD-130 M1 T4 (D3, P6, blueprint B7, B11): the clear refusal before any SQL, then in one
+    /// transaction the target `FOR SHARE` and `set_box_probe_spec`'s three statements byte for
+    /// byte (their offline entries); a miss re-reads and answers `Stale`, `None` included.
+    async fn set_default_target(
+        &self,
+        target: Option<TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<DefaultTarget>>> {
+        if target.is_none() && expected.is_none() {
+            return Err(StoreError::Constraint(
+                DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN.to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        share_level_target(&mut tx, "app_setting.default_target", target).await?;
+        let name = DEFAULT_TARGET_KEY;
+        let value = target.map(DefaultTarget::value);
+        let landed: Option<DateTime<Utc>> = match (&value, expected) {
+            (None, None) => unreachable!("refused before the transaction"),
+            (Some(value), None) => sqlx::query_scalar!(
+                r#"
+                        INSERT INTO app_setting (key, value) VALUES ($1, $2)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                name,
+                value,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+            (Some(value), Some(token)) => sqlx::query_scalar!(
+                r#"
+                        UPDATE app_setting SET value = $2
+                         WHERE key = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                name,
+                value,
+                token,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+            (None, Some(token)) => sqlx::query_scalar!(
+                r#"
+                    DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                name,
+                token,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        tx.commit().await.map_err(map_sqlx)?;
+        match landed {
+            Some(updated_at) => Ok(CasOutcome::Applied(
+                target.map(|target| DefaultTarget { target, updated_at }),
+            )),
+            None => Ok(CasOutcome::Stale(self.default_target().await?)),
+        }
+    }
+
+    /// MOD-130 M1 T4 (D14, blueprint B7): one transaction, the target locked `FOR UPDATE` before
+    /// the in-use read, so a level setter waiting on its `FOR SHARE` sees the retire.
+    async fn retire_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let current = lock_free_target(&mut tx, id).await?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if current.retired_at.is_some() {
+            return Ok(CasOutcome::Applied(current));
+        }
+        let retired = sqlx::query_as!(
+            Target,
+            r#"
+            UPDATE target SET retired_at = now()
+             WHERE id = $1
+            RETURNING id          AS "id: TargetId",
+                      name,
+                      kind        AS "kind: TargetKind",
+                      locator,
+                      box_id      AS "box_id: BoxId",
+                      probed_at,
+                      probe_error,
+                      retired_at,
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(CasOutcome::Applied(retired))
+    }
+
+    /// MOD-130 M1 T4 (D14, P8, blueprint B7): `retire_target`'s lock and refusals, then run
+    /// history ([`target_has_runs`]), then the delete, all in one transaction; no `23503` or
+    /// `23001` ever reaches the caller.
+    async fn delete_target(&self, id: TargetId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let current = lock_free_target(&mut tx, id).await?;
+        let runs = sqlx::query_scalar!(
+            r#"SELECT count(*) AS "runs!" FROM run WHERE target_id = $1"#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if runs > 0 {
+            return Err(StoreError::Constraint(target_has_runs(
+                &current.name,
+                u64::try_from(runs).unwrap_or_default(),
+            )));
+        }
+        sqlx::query!("DELETE FROM target WHERE id = $1", id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(())
+    }
+
     /// MOD-130 M1 T2 (P4, P5, blueprint B7, B10): one transaction. The target row is locked
     /// `FOR UPDATE` and the parent `FOR KEY SHARE` before their refusals; the child is inserted
     /// `ON CONFLICT DO NOTHING` and then locked `FOR UPDATE`, so two attaches of one child are
@@ -4590,6 +4929,7 @@ impl WriteStore for PgStore {
                       secret_provider,
                       secret_scope,
                       settings,
+                      target_id       AS "target_id: TargetId",
                       created_by      AS "created_by: htui_core::model::UserId",
                       created_at,
                       updated_at
@@ -4674,6 +5014,7 @@ impl WriteStore for PgStore {
                       secret_provider,
                       secret_scope,
                       settings,
+                      target_id       AS "target_id: TargetId",
                       created_by      AS "created_by: htui_core::model::UserId",
                       created_at,
                       updated_at
@@ -5236,6 +5577,7 @@ impl WriteStore for PgStore {
                       -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
                       is_override,
                       revision,
+                      target_id    AS "target_id: TargetId",
                       created_at,
                       updated_at
             "#,
@@ -5283,6 +5625,7 @@ impl WriteStore for PgStore {
                       -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
                       is_override,
                       revision,
+                      target_id    AS "target_id: TargetId",
                       created_at,
                       updated_at
             "#,

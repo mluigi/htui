@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id              AS \"id: ProjectId\",\n                   slug,\n                   name,\n                   description,\n                   type            AS project_type,\n                   owner_workspace_id AS \"owner_workspace_id: WorkspaceId\",\n                   secret_provider,\n                   secret_scope,\n                   settings,\n                   created_by      AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at\n              FROM project WHERE id = $1\n            ",
+  "query": "\n            UPDATE project SET target_id = $3\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      type            AS project_type,\n                      owner_workspace_id AS \"owner_workspace_id: WorkspaceId\",\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      target_id       AS \"target_id: TargetId\",\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,17 @@
       },
       {
         "ordinal": 9,
+        "name": "target_id: TargetId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
         "name": "created_by: htui_core::model::UserId",
         "type_info": "Uuid",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -138,6 +149,8 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Timestamptz",
         "Uuid"
       ]
     },
@@ -151,10 +164,11 @@
       true,
       true,
       false,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "26eaa22304589adca74cf5bdabcf5fa6cf1a38a49b7737d8b8c322bdffb3fad0"
+  "hash": "1be33a45189cd97fe12099c995bb9f3ef84792f5dd07f5d9dd02732a128c7c05"
 }

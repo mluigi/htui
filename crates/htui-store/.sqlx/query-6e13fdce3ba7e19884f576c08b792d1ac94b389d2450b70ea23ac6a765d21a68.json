@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 'project' AS \"kind!\", p.slug AS \"name!\", NULL::text AS \"project?\",\n               NULL::text AS \"workspace?\"\n          FROM project p WHERE p.target_id = $1\n        UNION ALL\n        SELECT 'workflow', g.name, gp.slug, w.slug\n          FROM step_graph g\n          LEFT JOIN project gp ON gp.id = g.project_id\n          LEFT JOIN workspace w ON w.id = g.workspace_id\n         WHERE g.target_id = $1\n        UNION ALL\n        SELECT 'item', i.key, ip.slug, NULL\n          FROM item i JOIN project ip ON ip.id = i.project_id\n         WHERE i.target_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "project?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "6e13fdce3ba7e19884f576c08b792d1ac94b389d2450b70ea23ac6a765d21a68"
+}

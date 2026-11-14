@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use htui_core::model::OwnerDocument;
 use htui_core::model::StepRole;
+use htui_core::model::TargetId;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -738,6 +739,7 @@ impl ReadStore for PgStore {
                    secret_provider,
                    secret_scope,
                    settings,
+                   target_id       AS "target_id: TargetId",
                    created_by      AS "created_by: htui_core::model::UserId",
                    created_at,
                    updated_at
@@ -1314,7 +1316,7 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+    async fn target(&self, id: TargetId) -> Result<htui_core::model::Target> {
         sqlx::query_as!(
             htui_core::model::Target,
             r#"
@@ -3361,6 +3363,7 @@ impl PgStore {
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
                    revision,
+                   target_id    AS "target_id: TargetId",
                    created_at,
                    updated_at
               FROM step_graph
@@ -3397,6 +3400,7 @@ impl PgStore {
                    -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).
                    g.is_override,
                    g.revision,
+                   g.target_id    AS "target_id: TargetId",
                    g.created_at,
                    g.updated_at
               FROM step_graph g
@@ -3734,6 +3738,7 @@ pub(crate) async fn step_graph_row_on<'e, E: PgExecutor<'e>>(
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
                    revision,
+                   target_id    AS "target_id: TargetId",
                    created_at,
                    updated_at
               FROM step_graph WHERE id = $1
@@ -4110,6 +4115,7 @@ pub(crate) struct StepGraphRow {
     pub(crate) description: String,
     pub(crate) is_override: bool,
     pub(crate) revision: i64,
+    pub(crate) target_id: Option<TargetId>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -4132,6 +4138,7 @@ impl TryFrom<StepGraphRow> for StepGraph {
             description: row.description,
             is_override: row.is_override,
             revision: row.revision,
+            target_id: row.target_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

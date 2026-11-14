@@ -2979,6 +2979,7 @@ pub(super) mod tests {
                 description: String::new(),
                 is_override: false,
                 revision: 1,
+                target_id: None,
                 created_at: now(),
                 updated_at: now(),
             },

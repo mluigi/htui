@@ -31,10 +31,12 @@ use htui_core::model::{
     SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
     Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
+use htui_core::model::{NewTarget, TargetId, TargetKind};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
+use htui_core::store::traits::{target_has_runs, target_retired};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
@@ -15342,5 +15344,129 @@ async fn workspace_rename_restores_a_missing_scope_row() {
         "with its `WS` seed"
     );
 
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 T4 (D14, P8): a target a run references is never deleted. The run is planted with
+/// `target_id` and `target_source = 'item'` through SQL (M2 writes them); `delete_target` answers
+/// `target_has_runs` before the statement, so no `23503`/`23001` reaches the caller, and the row
+/// stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_target_refuses_one_with_run_history() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "history docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+    let run = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("queue a graph run");
+    sqlx::query("UPDATE run SET target_id = $1, target_source = 'item' WHERE id = $2")
+        .bind(target.id.as_uuid())
+        .bind(run.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant the run's target");
+
+    match db.store.delete_target(target.id).await {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_has_runs("history docker", 1));
+        }
+        other => panic!("a target with run history is refused, got {other:?}"),
+    }
+    assert_eq!(
+        db.store.target(target.id).await.expect("the row stays"),
+        target,
+        "the refusal deleted nothing"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 T4 (blueprint B7): a level setter that waits behind a retire holding the target's
+/// row lock sees the retire, and answers `target_retired` rather than naming a retired target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_set_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "racing docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+    let project = db
+        .store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect("project")
+        .expect("the fixture holds htui");
+
+    // The retire's transaction, held open with the row locked as `retire_target` locks it.
+    let mut retire = PgConnection::connect(&db.url)
+        .await
+        .expect("the retiring connection");
+    sqlx::query("BEGIN")
+        .execute(&mut retire)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+        .bind(target.id.as_uuid())
+        .execute(&mut retire)
+        .await
+        .expect("lock the target");
+    sqlx::query("UPDATE target SET retired_at = now() WHERE id = $1")
+        .bind(target.id.as_uuid())
+        .execute(&mut retire)
+        .await
+        .expect("retire it");
+
+    let setter = {
+        let store = db.store.clone();
+        tokio::spawn(async move {
+            store
+                .set_project_target(project.id, project.updated_at, Some(target.id))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !setter.is_finished(),
+        "the setter waits on the retire's row lock"
+    );
+    sqlx::query("COMMIT")
+        .execute(&mut retire)
+        .await
+        .expect("commit the retire");
+
+    match setter.await.expect("the setter task") {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_retired("racing docker"));
+        }
+        other => panic!("a set behind a retire is refused, got {other:?}"),
+    }
+    assert_eq!(
+        db.store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("project")
+            .expect("htui"),
+        project,
+        "the refused set wrote nothing"
+    );
     db.drop_db().await;
 }

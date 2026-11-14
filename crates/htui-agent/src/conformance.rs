@@ -882,6 +882,44 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<htui_core::model::AttachedBox> {
         self.inner.attach_child_box(new).await
     }
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> StoreResult<CasOutcome<Project>> {
+        self.inner
+            .set_project_target(project, expected, target)
+            .await
+    }
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> StoreResult<CasOutcome<StepGraph>> {
+        self.inner.set_graph_target(graph, expected, target).await
+    }
+    async fn default_target(&self) -> StoreResult<Option<htui_core::model::DefaultTarget>> {
+        self.inner.default_target().await
+    }
+    async fn set_default_target(
+        &self,
+        target: Option<htui_core::model::TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<Option<htui_core::model::DefaultTarget>>> {
+        self.inner.set_default_target(target, expected).await
+    }
+    async fn retire_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<CasOutcome<htui_core::model::Target>> {
+        self.inner.retire_target(id, expected).await
+    }
+    async fn delete_target(&self, id: htui_core::model::TargetId) -> StoreResult<()> {
+        self.inner.delete_target(id).await
+    }
     async fn set_agent_box_quota(
         &self,
         agent_id: AgentId,

@@ -1061,6 +1061,7 @@ impl ReadStore for CacheStore {
             secret_provider: opt_text(&row, "secret_provider")?,
             secret_scope: opt_text(&row, "secret_scope")?,
             settings: json_col("project.settings", &text(&row, "settings")?)?,
+            target_id: None, // MOD-130 M1 T5
             created_by: uuid_col::<UserId>("project.created_by", &text(&row, "created_by")?)?,
             created_at: ts_col("project.created_at", get(&row, "created_at")?)?,
             updated_at: ts_col("project.updated_at", get(&row, "updated_at")?)?,

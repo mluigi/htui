@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO step_graph (id, project_id, workspace_id, name, description, is_override)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            RETURNING id           AS \"id: StepGraphId\",\n                      project_id   AS \"project_id: ProjectId\",\n                      workspace_id AS \"workspace_id: WorkspaceId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      revision,\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            UPDATE step_graph SET\n                target_id = $3,\n                revision  = revision + 1\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id           AS \"id: StepGraphId\",\n                      project_id   AS \"project_id: ProjectId\",\n                      workspace_id AS \"workspace_id: WorkspaceId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      revision,\n                      target_id    AS \"target_id: TargetId\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,17 @@
       },
       {
         "ordinal": 7,
+        "name": "target_id: TargetId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -106,11 +117,8 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Uuid",
-        "Text",
-        "Text",
-        "Bool"
+        "Timestamptz",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -121,9 +129,10 @@
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "4c3a6d2a6370fa760de34c9e1405d00bba042ed6cc0f2aceae20a38546571b01"
+  "hash": "f6dd1fc1fb395e905c4e9e6ba5d44792438ba715058acc7c04d957c453968431"
 }

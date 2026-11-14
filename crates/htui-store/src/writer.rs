@@ -579,6 +579,66 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> Result<CasOutcome<Project>> {
+        match self {
+            Self::Memory(store) => store.set_project_target(project, expected, target).await,
+            Self::Online(pg) => pg.set_project_target(project, expected, target).await,
+        }
+    }
+
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        match self {
+            Self::Memory(store) => store.set_graph_target(graph, expected, target).await,
+            Self::Online(pg) => pg.set_graph_target(graph, expected, target).await,
+        }
+    }
+
+    async fn default_target(&self) -> Result<Option<htui_core::model::DefaultTarget>> {
+        match self {
+            Self::Memory(store) => store.default_target().await,
+            Self::Online(pg) => pg.default_target().await,
+        }
+    }
+
+    async fn set_default_target(
+        &self,
+        target: Option<htui_core::model::TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<htui_core::model::DefaultTarget>>> {
+        match self {
+            Self::Memory(store) => store.set_default_target(target, expected).await,
+            Self::Online(pg) => pg.set_default_target(target, expected).await,
+        }
+    }
+
+    async fn retire_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.retire_target(id, expected).await,
+            Self::Online(pg) => pg.retire_target(id, expected).await,
+        }
+    }
+
+    async fn delete_target(&self, id: htui_core::model::TargetId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_target(id).await,
+            Self::Online(pg) => pg.delete_target(id).await,
+        }
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         match self {
             Self::Memory(store) => store.start_chat_run(chat).await,
