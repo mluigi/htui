@@ -3723,7 +3723,8 @@ fn row_of(frame: &str, needle: &str) -> Option<usize> {
 }
 
 /// MOD-115 M2 §7 (T7): `Tab` focuses the detail, where `j` scrolls the Body and the list cursor
-/// stays on its item; focused again, the list takes `j` as before.
+/// stays on its item; focused again, the list takes `j` as before. Under the Backlog's
+/// `ide_activity` default (MOD-122 M3 D11) the cycle passes the activity pane on its way back.
 #[tokio::test]
 async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     let mut harness = backlog().await;
@@ -3750,7 +3751,9 @@ async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     );
     assert_eq!(row_of(&after, second), Some(at - 1), "a row:\n{after}");
 
-    // Detail -> list: the panes cycle, and `j` is the list's again.
+    // Detail -> activity -> list: the panes cycle, and `j` is the list's again.
+    harness.key("tab");
+    harness.drive_to_end().await;
     harness.key("tab");
     harness.drive_to_end().await;
     harness.key("j");
@@ -3872,7 +3875,7 @@ async fn click_activity(harness: &mut Harness) {
 #[tokio::test]
 async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "f"]).await;
+    press(&mut harness, &["f"]).await;
     let open = harness.render();
     assert!(
         open.contains("\u{256d}\u{2500} Filter "),
@@ -3905,7 +3908,7 @@ async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
 #[tokio::test]
 async fn the_list_is_drawn_above_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "f"]).await;
+    press(&mut harness, &["f"]).await;
     click_activity(&mut harness).await;
     let frame = harness.render();
     let lines: Vec<&str> = frame.lines().collect();
@@ -3930,7 +3933,9 @@ async fn the_list_is_drawn_above_the_filter_while_the_activity_pane_has_the_focu
 #[tokio::test]
 async fn f_in_the_focused_activity_pane_cycles_its_filter_not_the_backlogs() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "tab", "tab"]).await;
+    // The pane key moves the focus among the panes the last frame drew.
+    harness.render();
+    press(&mut harness, &["tab", "tab"]).await;
     let focused = harness.render();
     assert!(
         focused.contains("Enter open \u{b7} f filter"),

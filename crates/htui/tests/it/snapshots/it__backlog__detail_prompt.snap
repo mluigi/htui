@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: harness.render()
 ---
 Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
@@ -22,13 +22,13 @@ Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                     ││skills                        88      88  …│
 │                                                     ││                                           │
 │                                                     ││skills    tests v1 · project · always → ac…│
-│                                                     ││          rust-style v2 · project · always…│
-│                                                     ││                                           │
-│                                                     ││notes     preview: the template is chosen …│
-│                                                     ││          preview: documents are latest-pe…│
-│                                                     ││          preview: the `summary` kind is e…│
-│                                                     ││          preview: phase-level skills come…│
-│                                                     ││          preview: output_kind defaults to…│
-│                                                     ││          preview: command_queue exposure …│
-│                                                     ││          preview: attempt 1, so verify_fa…│
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/waiting.rs
+source: crates/htui/tests/it/waiting.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   0 waiting · memory ·  ?  keys
@@ -14,21 +14,21 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
+│                                                     ││          No body for this item.           │
 │                ╭ Waiting on you ────────────────────────────────────────────────╮                │
 │                │                   nothing is waiting on you                    │                │
 │                │a gate, a permission request or a blocked item will appear here │                │
-│                ╰ j/k move · Enter open · Esc close ─────────────────────────────╯item.           │
-│                                                     ││               e writes one                │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                ╰ j/k move · Enter open · Esc close ─────────────────────────────╯                │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

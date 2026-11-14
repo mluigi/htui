@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/concepts_search.rs
+source: crates/htui/tests/it/concepts_search.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           2 waiting ·  F1  keys
@@ -22,13 +22,13 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │type a query; Enter searches                                                                  │ │
+╰─│                                                                                              │─╯
+╭─│type a query; Enter searches                                                                  │─╮
 │ │                                                                                              │ │
 │ ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close ───╯ │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

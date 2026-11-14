@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/shell.rs
+source: crates/htui/tests/it/shell.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   0 waiting · online ·  ?  keys
@@ -14,21 +14,21 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                                                     ││          No body for this item.           │
+│                                                     ││               e writes one                │
 │                        ╭ Schema ─────────────────────────────────────────╮                       │
 │                        │3 schema migrations are pending. Apply them now? │                       │
-│                        ╰ y apply · n/Esc stay offline ───────────────────╯r this item.           │
-│                                                     ││               e writes one                │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                        ╰ y apply · n/Esc stay offline ───────────────────╯                       │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

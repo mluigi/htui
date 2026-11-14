@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/prompt_preview.rs
+source: crates/htui/tests/it/prompt_preview.rs
 expression: frame
 ---
 Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
@@ -22,13 +22,13 @@ Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                     ││          rust-style v2 · project · always…│
 │                                                     ││                                           │
 │                                                     ││notes     preview: the template is chosen …│
-│                                                     ││          preview: documents are latest-pe…│
-│                                                     ││          preview: the `summary` kind is e…│
-│                                                     ││          preview: phase-level skills come…│
-│                                                     ││          preview: output_kind defaults to…│
-│                                                     ││          preview: command_queue exposure …│
-│                                                     ││          preview: attempt 1, so verify_fa…│
-│                                                     ││          preview: no run exists, so no ru…│
-│                                                     ││          preview: memory is selected now …│
-│                                                     ││          preview: no phase of this item's…│
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -145,13 +145,13 @@ async fn the_empty_docs_and_notes_name_the_key_that_writes_one() {
 ///
 /// MOD-122 M3 D10: the focused activity pane holds the keys, so `a` there is never the Docs
 /// pane's; the compose area is opened from the detail first and the click moves the focus to the
-/// activity pane after it.
+/// activity pane after it. The pane is the Backlog's default (`ide_activity`, MOD-122 M3 D11).
 #[tokio::test]
 async fn the_compose_rule_follows_the_detail_pane_while_the_activity_pane_has_the_focus() {
     use crossterm::event::{MouseButton, MouseEventKind};
 
     let mut harness = on(100, 30, TO_FEAT_1, TO_DOCS).await;
-    keys(&mut harness, &["f3", "a"]).await;
+    keys(&mut harness, &["a"]).await;
     let opened = harness.render();
     assert!(opened.contains(" New document "), "the rule:\n{opened}");
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 50, 25);

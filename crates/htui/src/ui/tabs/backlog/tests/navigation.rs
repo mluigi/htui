@@ -396,24 +396,32 @@ async fn a_fold_survives_a_filter_that_hides_its_project() {
 
 // ---- MOD-115 M2 T7: the panes, motion by focus, the location ---------------------------
 
-/// MOD-115 M2 D2: the Backlog is a list + detail tab, its default today's 55/45 split, and
-/// its render claims exactly the rects the tab drew before the shell kept layouts.
+/// MOD-115 M2 D2, MOD-122 M3 D11: the Backlog is a list + detail tab, its default the 55/45
+/// split with the activity pane below both (`ide_activity`), and its render claims exactly the
+/// rects the tab drew before the shell kept layouts, above the activity pane's full-width rows.
 #[tokio::test]
 async fn the_backlog_claims_a_list_and_a_detail_at_today_s_split() {
     assert_eq!(BacklogTab::new().panes(), Panes::ListDetail(BACKLOG_LAYOUT));
     assert_eq!(BACKLOG_LAYOUT.list, ListSize::Percent(55));
-    assert_eq!(BACKLOG_LAYOUT.preset, Preset::Ide);
+    assert_eq!(BACKLOG_LAYOUT.preset, Preset::IdeActivity);
 
     let bench = Bench::new().await;
     let claim = Cell::new(None);
     let ctx = bench.ctx().with_pane_claim(&claim);
     let _ = drawn_through(&bench.tab(), &ctx);
     let (region, areas) = claim.get().expect("the render claims its panes");
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(region);
     assert_eq!(region, Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1));
+    let activity = areas.activity.expect("the default shows the activity pane");
+    assert_eq!(
+        (activity.x, activity.width, activity.bottom()),
+        (region.x, region.width, region.bottom()),
+        "the activity pane spans the body's bottom rows"
+    );
+    assert!(!activity.is_empty());
+    let above = Rect::new(region.x, region.y, region.width, activity.y - region.y);
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(above);
     assert_eq!((areas.list, areas.detail), (Some(left), right));
-    assert_eq!(areas.activity, None);
 }
 
 /// MOD-115 M2 D2: a layout that hides the list gives the detail the whole body; the

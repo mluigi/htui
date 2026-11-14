@@ -449,11 +449,20 @@ async fn the_status_line_and_help_box_over_the_switcher() {
 }
 
 /// The hints of a 100x30 frame (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border,
-/// the last row, so this is that row with the rule and the corners trimmed off.
+/// the last row, so this is that row with the rule and the corners trimmed off. Under the
+/// Backlog's `ide_activity` default (MOD-122 M3 D11) the tab's border is the row above the
+/// activity pane.
 fn hint_row(frame: &str) -> &str {
-    frame.lines().last().unwrap_or_default().trim_matches([
-        '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
-    ])
+    let lines: Vec<&str> = frame.lines().collect();
+    lines
+        .iter()
+        .position(|line| line.starts_with("\u{256d}\u{2500} Activity"))
+        .and_then(|at| at.checked_sub(1))
+        .map_or_else(|| lines.last().copied(), |at| Some(lines[at]))
+        .unwrap_or_default()
+        .trim_matches([
+            '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+        ])
 }
 
 /// The demo shell, every tab registered, settled on the Backlog.

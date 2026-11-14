@@ -2388,9 +2388,43 @@ mod tests {
         );
     }
 
-    /// The notice's rows drawn at `size`, joined back into one sentence.
-    fn flowed_at(form: &ItemForm, size: (u16, u16)) -> (String, String) {
-        let rows = drawn_at(form, size);
+    /// The notice's rows drawn at `size` under the `ide` preset, joined back into one sentence.
+    ///
+    /// Pinned to `ide` (list beside detail, no activity pane): under the Backlog's
+    /// `ide_activity` default (MOD-122 M3 D11) an 80x24 terminal leaves the detail too few rows
+    /// for the hedge, so these tests pin D11's rule at the height it was written for.
+    fn flowed_at(form: &ItemForm, (width, height): (u16, u16)) -> (String, String) {
+        use crate::ui::shell::{PaneId, Preset, TabLayout, layout::areas};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let ide = TabLayout {
+            preset: Preset::Ide,
+            ..BACKLOG_LAYOUT
+        };
+        let right = areas(
+            chrome(Rect::new(0, 0, width, height)).body,
+            &ide,
+            PaneId::List,
+        )
+        .detail;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            right.width,
+            right.height,
+        ))
+        .expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                framed(frame, frame.area(), form);
+            })
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
         let flowed = rows
             .iter()
             .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))

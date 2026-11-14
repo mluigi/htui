@@ -407,6 +407,31 @@ async fn the_list_over_graphics_says_nothing_is_waiting() {
     insta::assert_snapshot!("graphics_empty", frame);
 }
 
+/// `frame` with every `HH:MM` written `hh:mm`: the activity pane below the Backlog (its
+/// `ide_activity` default, MOD-122 M3 D11) stamps each event with the machine's local clock.
+fn clockless(frame: &str) -> String {
+    let chars: Vec<char> = frame.chars().collect();
+    let mut out = String::with_capacity(frame.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let clock = chars.len() >= i + 5
+            && chars[i].is_ascii_digit()
+            && chars[i + 1].is_ascii_digit()
+            && chars[i + 2] == ':'
+            && chars[i + 3].is_ascii_digit()
+            && chars[i + 4].is_ascii_digit()
+            && (i == 0 || !chars[i - 1].is_ascii_digit());
+        if clock {
+            out.push_str("hh:mm");
+            i += 5;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Plan D9: the rows in project, key, run and step order, a run's gate before its permission and
 /// the item's Reopen row last of all.
 #[tokio::test]
@@ -432,7 +457,7 @@ async fn the_list_over_platform_holds_a_gate_a_permission_and_a_reopen() {
         "htui:FEAT-2  \u{2014}         unblock     blocked, no active run: u reopens it",
     );
     assert!(gate < permission && permission < reopen, "{frame}");
-    insta::assert_snapshot!("platform_mixed", frame);
+    insta::assert_snapshot!("platform_mixed", clockless(&frame));
 }
 
 /// MOD-147 D10: a workspace's own item parked at its gate waits on a person too, listed first and

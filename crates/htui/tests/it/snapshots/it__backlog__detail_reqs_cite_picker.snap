@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: picker
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
@@ -20,15 +20,15 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
 │                                                     ││  R-ENT-1 must Every item has a stable key…│
 │                                                     ││▌ R-ENT-2 later An item may carry a free-f…│
 ╰─────────────────────────────────────────────────────╯╰─j/k move · Enter pick · Esc back──────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

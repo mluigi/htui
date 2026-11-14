@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: frame
 ---
 Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
@@ -12,23 +12,23 @@ Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │  FEAT-1   ◐ running    TUI scaffold                 ││                                           │
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
-│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││          No links for this item.          │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││ a run step proposes the links shown here  │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
-│  FIX-1    ○ open       Session leak on cancel       ││          No links for this item.          │
-│                                                     ││ a run step proposes the links shown here  │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

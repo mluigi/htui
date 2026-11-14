@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog_runs.rs
+source: crates/htui/tests/it/backlog_runs.rs
 expression: frame
 ---
 Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  keys
@@ -7,22 +7,22 @@ Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  
 │ ▾ Platform (0)                           ││kind   status      box          st│
 │ ▾ htui (8)                               ││mode                            fi│
 │▌ ANA-1    ● done       Data model, box r…││graph  ● done      DESKTOP-HTUI 09│
-│  ANA-2    ○ open       Orchestrator step…││manual                          09│
-│  CLEAN-1  ✗ failed     Drop the legacy m…││▸ research        ● done          │
-│  FEAT-1   ◐ running    TUI scaffold      ││    candidate 1 approved✓  claude/│
-│  FEAT-2   ⊘ blocked    Agent driver and …││  research        ↷ superseded    │
-│  FEAT-3   ◌ queued     Postgres store an…││  ╭ Close out ─────────────────╮ef│
-│  FIX-1    ✓ closed     Terminal left raw…││  │close ANA-1 as done · 1 run │  │
-│  TOOL-1   ⚠ needs you  CI matrix for the…││  │· 0 commit rows · summary   │  │
-│ ▾ agy (3)                                ││  │v2                          │  │
-│  ANA-1    ● done       Prompt assembly s…││  │type ANA-1 to close it:     │  │
-│  FEAT-1   ○ open       ACP transport upg…││  │                            │  │
-│  FIX-1    ○ open       Session leak on c…││  │ANA-1                       │  │
-│                                          ││  ╰ Enter close · Esc cancel ──╯  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
+│  ANA-2    ○ open       Orchestrator step…││ma╭ Close out ─────────────────╮09│
+│  CLEAN-1  ✗ failed     Drop the legacy m…││▸ │close ANA-1 as done · 1 run │  │
+│  FEAT-1   ◐ running    TUI scaffold      ││  │· 0 commit rows · summary   │e/│
+│  FEAT-2   ⊘ blocked    Agent driver and …││  │v2                          │  │
+│  FEAT-3   ◌ queued     Postgres store an…││  │type ANA-1 to close it:     │ef│
+│  FIX-1    ✓ closed     Terminal left raw…││  │                            │  │
+│  TOOL-1   ⚠ needs you  CI matrix for the…││  │ANA-1                       │  │
+│ ▾ agy (3)                                ││  ╰ Enter close · Esc cancel ──╯  │
+│  ANA-1    ● done       Prompt assembly s…││                                  │
+│  FEAT-1   ○ open       ACP transport upg…││                                  │
+│  FIX-1    ○ open       Session leak on c…││                                  │
 ╰──────────────────────────────────────────╯╰──────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────╮
+│                                                                              │
+│                                                                              │
+│                               No activity yet.                               │
+│                  events appear as runs start, wait and fail                  │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

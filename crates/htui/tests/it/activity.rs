@@ -459,3 +459,47 @@ async fn an_open_form_keeps_the_keys_over_the_focused_activity_pane() {
         "the click had focused the activity pane, which has the keys once the form closes:\n{closed}"
     );
 }
+
+/// D11: the Backlog's default is `ide_activity`, so a machine with no saved layout opens it with
+/// the activity pane below the list and the detail; a layout already saved in `ui-state.toml`
+/// (here `ide`) wins over the default and keeps the pane away.
+#[tokio::test]
+async fn the_backlog_opens_with_the_activity_pane_unless_a_saved_layout_says_otherwise() {
+    let mut fresh = Harness::over(MemStore::demo())
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_ui_store(UiStore::memory());
+    register_all(fresh.app());
+    fresh.drive_to_end().await;
+    assert_eq!(fresh.app().tabs.active_id(), Some(BacklogTab::ID));
+    let shown = frame(&mut fresh);
+    assert!(
+        activity_title(&shown).contains("all workspaces"),
+        "a fresh UI state shows the activity pane:\n{shown}"
+    );
+    assert!(
+        fresh.ui_store().load().state.layouts.is_empty(),
+        "the default is not written back"
+    );
+
+    let saved = UiStore::memory();
+    let mut state = UiState::default();
+    state.layouts.insert(
+        BacklogTab::ID.0.to_owned(),
+        TabLayout {
+            preset: Preset::Ide,
+            ..BACKLOG_LAYOUT
+        },
+    );
+    saved.save(&state).expect("a memory store saves");
+    let mut kept = Harness::over(MemStore::demo())
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_ui_store(saved);
+    register_all(kept.app());
+    kept.drive_to_end().await;
+    assert_eq!(kept.app().tabs.active_id(), Some(BacklogTab::ID));
+    let shown = frame(&mut kept);
+    assert!(
+        !shown.contains("\u{2500} Activity"),
+        "a saved `ide` layout keeps the activity pane away:\n{shown}"
+    );
+}

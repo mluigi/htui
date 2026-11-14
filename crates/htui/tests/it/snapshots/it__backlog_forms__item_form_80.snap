@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog_forms.rs
+source: crates/htui/tests/it/backlog_forms.rs
 expression: frame
 ---
 Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  keys
@@ -18,11 +18,11 @@ Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  
 │  ANA-1    ● done       Prompt assembly s…││                                  │
 │  FEAT-1   ○ open       ACP transport upg…││                                  │
 │  FIX-1    ○ open       Session leak on c…││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
 ╰──────────────────────────────────────────╯╰─Tab field · Ctrl+s save …────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────╮
+│                                                                              │
+│                                                                              │
+│                               No activity yet.                               │
+│                  events appear as runs start, wait and fail                  │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: frame
 ---
 Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is outside this workspace
@@ -21,14 +21,14 @@ Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is o
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
 │                                                     ││depth 2/3                                  │
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
