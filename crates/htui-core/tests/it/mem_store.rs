@@ -31,6 +31,13 @@ async fn mem_store_worker_log_conformance() {
     conformance::run_all_worker_logs(|| async { MemStore::demo() }).await;
 }
 
+/// The activity half of the suite (MOD-122 M3, blueprint F1), bound to the same fixture: a
+/// fourth binding, because `run_all_activity` is generic over `WriteStore + ActivityStore`.
+#[tokio::test]
+async fn mem_store_activity_conformance() {
+    conformance::run_all_activity(|| async { MemStore::demo() }).await;
+}
+
 #[tokio::test]
 async fn demo_store_loads_the_fixture() {
     let store = MemStore::demo();
@@ -110,5 +117,10 @@ async fn demo_store_loads_the_fixture() {
         conformance::WORKER_LOG_CASES.len(),
         5,
         "MOD-122 M2's five worker log cases (plan D1, D4, D7; blueprint F1, F2)"
+    );
+    assert_eq!(
+        conformance::ACTIVITY_CASES.len(),
+        12,
+        "MOD-122 M3's twelve activity cases (plan D1-D4, D7; blueprint F1)"
     );
 }
