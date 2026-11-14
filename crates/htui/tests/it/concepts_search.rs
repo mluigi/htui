@@ -19,15 +19,16 @@ use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::ConceptsSearch;
 use htui::ui::overlay::concepts_search::{
-    INDEXING, LOADING, changed, hit_row, idle, index_report, unavailable_status,
+    INDEXING, LOADING, OWNER_DOCUMENT, changed, hit_row, idle, index_report, unavailable_status,
 };
 use htui::ui::tabs::{BacklogTab, ChatTab, RequirementsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
-use htui_core::model::Scope;
-use htui_core::store::MemStore;
+use htui_core::model::document::GOALS_KIND;
+use htui_core::model::{DocumentId, NewOwnerDocument, Scope};
+use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::Backend;
-use htui_store::vector::{Hit, PointType};
+use htui_store::vector::{Hit, Owner, PointType};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -635,4 +636,68 @@ async fn a_rebound_reindex_key_is_named_with_no_matches() {
         frame.contains("no matches \u{2014} Ctrl+o indexes this scope if the index is empty"),
         "{frame}"
     );
+}
+
+/// MOD-147 M4 D8-D10, end to end: a Platform goals document, indexed by `Ctrl+R` with every
+/// project in scope, is found by a search of its text and lists under the workspace's slug,
+/// `@platform`; `Enter` on it keeps the box open with the owner-document notice.
+#[tokio::test]
+async fn a_workspace_goals_document_is_indexed_found_and_opened_from_settings() {
+    let store = MemStore::demo();
+    let goals = store
+        .write_owner_document(NewOwnerDocument {
+            id: DocumentId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind: GOALS_KIND.into(),
+            title: "Goals".into(),
+            body: "## Aim\none zircon search for the platform".into(),
+            created_by: ids::USER,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("the memory store writes it");
+    let index = Arc::new(MemIndex::new());
+    let mut harness = in_platform(
+        Harness::over(store)
+            .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+            .with_concepts_runtime(ConceptsRuntime::new(index.clone())),
+    )
+    .await;
+    harness.key("ctrl-f");
+    harness.key("ctrl-r");
+    harness.drive_to_end().await;
+    assert!(
+        index
+            .store()
+            .points()
+            .iter()
+            .any(|p| p.subject.owner() == Owner::Document(goals.id)),
+        "Ctrl+R indexed the workspace's goals document"
+    );
+
+    type_text(&mut harness, "zircon");
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let mut projects = vec![ids::PROJECT_SCOPE_PLATFORM];
+    projects.extend(platform_scope().await.1.project_ids);
+    let hits = expected(&index, "zircon", projects, false).await;
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = &hits[0];
+    assert_eq!(
+        (hit.owner, hit.key.as_str()),
+        (Owner::Document(goals.id), "@platform")
+    );
+    let frame = harness.render();
+    assert!(
+        frame.contains(&clip(&hit_row(hit, best(&hits)), HIT_CELLS)),
+        "{frame}"
+    );
+    assert!(frame.contains("@platform"), "{frame}");
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert!(search_is_open(&mut harness), "nothing is revealed");
+    let frame = harness.render();
+    assert!(frame.contains(OWNER_DOCUMENT), "{frame}");
+    assert_eq!(harness.app().status, None);
 }
