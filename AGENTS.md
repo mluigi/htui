@@ -69,6 +69,14 @@ Overview: `.claude/skills/handoff-docs.md`.
   `isolation_live` take their module's `ONE_AT_A_TIME` lock, which serialises them under
   `cargo test`; under nextest the `live-agent` group in `.config/nextest.toml` does, and a new
   `*_live` module with such a lock joins that group's filter.
+- Slow sweeps: an exhaustive test too slow for every run is `#[ignore]`d inside a `slow_sweep`
+  module. The gate's test step runs `test(/::slow_sweep::/)` when a path in its
+  `SLOW_SWEEP_PATHS` differs from `main`, and always under `--slow` (`-Slow` in the `.ps1`). A new
+  sweep adds the paths it reads to that list in both twins.
+- Test Postgres: `htui-postgres-test` in `compose.yaml` (Postgres 18, port 5440, data on a tmpfs,
+  durability off), apart from the dev `htui` database on `htui-postgres` (16, the ANA-9 floor).
+  The hr sandbox runs 18 the same way. A test that pins a SQLSTATE pins what both 16 and 18 send:
+  `ON DELETE RESTRICT` is `23503` on 16 and `23001` on 18.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.

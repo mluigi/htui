@@ -833,127 +833,137 @@ mod tests {
         );
     }
 
-    /// MOD-115 M2 RV1 H1 (MD4): the `[field]`, `[choice]` and `[answer]` rows and the
-    /// Requirements priority keys are the keys a view kept before M2 (the `FIXED` register and
-    /// the text widgets' own literals). No entry a file from before M2 could hold takes one of
-    /// their chords: a version-1 file with one such entry loads with every one of those rows at
-    /// its compiled chords, or is refused for a reason that names none of them.
-    #[test]
-    fn a_version_1_entry_never_takes_a_key_a_view_kept_before_m2() {
-        let compiled = Keys::compiled();
-        let kept = kept_by_a_view;
-        let mut chords: Vec<KeyChord> = Vec::new();
-        for row in compiled.rows.iter().filter(|row| kept(row.act)) {
-            for &chord in &row.chords {
-                if chord != ESC && !chords.contains(&chord) {
-                    chords.push(chord);
+    /// The opt-in sweeps: `#[ignore]`d, and run by `scripts/gate.sh` when `crates/htui/src/keys/`
+    /// differs from `main` or under `--slow` (its filter is `test(/::slow_sweep::/)`).
+    mod slow_sweep {
+        use super::*;
+
+        /// MOD-115 M2 RV1 H1 (MD4): the `[field]`, `[choice]` and `[answer]` rows and the
+        /// Requirements priority keys are the keys a view kept before M2 (the `FIXED` register and
+        /// the text widgets' own literals). No entry a file from before M2 could hold takes one of
+        /// their chords: a version-1 file with one such entry loads with every one of those rows at
+        /// its compiled chords, or is refused for a reason that names none of them.
+        ///
+        /// About a minute in a debug build. By hand:
+        /// `cargo nextest run -p htui --all-features --run-ignored only -E 'test(/::slow_sweep::/)'`.
+        #[test]
+        #[ignore = "slow sweep: scripts/gate.sh runs it when crates/htui/src/keys/ changes, or with --slow"]
+        fn a_version_1_entry_never_takes_a_key_a_view_kept_before_m2() {
+            let compiled = Keys::compiled();
+            let kept = kept_by_a_view;
+            let mut chords: Vec<KeyChord> = Vec::new();
+            for row in compiled.rows.iter().filter(|row| kept(row.act)) {
+                for &chord in &row.chords {
+                    if chord != ESC && !chords.contains(&chord) {
+                        chords.push(chord);
+                    }
                 }
             }
-        }
-        // Where an entry could meet a kept row: a stack offering both, the row's own context, or
-        // anywhere for `editor.focus` (E9 (d)). The other pairs never meet, and would only slow
-        // the sweep down.
-        let offers = |stack: Stack<'_>, row: &Row| {
-            stack.layers().iter().enumerate().any(|(index, layer)| {
-                layer.context() == row.context && stack.admits(index, row.act)
-            })
-        };
-        let kept_in: Vec<(Stack<'_>, Vec<KeyChord>)> = DECLARED
-            .iter()
-            .map(|&(_, stack)| {
-                let held = compiled
-                    .rows
-                    .iter()
-                    .filter(|row| kept(row.act) && offers(stack, row))
-                    .flat_map(|row| row.chords.iter().copied())
-                    .collect();
-                (stack, held)
-            })
-            .collect();
-        let (mut loaded, mut refused) = (0, 0);
-        for row in compiled
-            .rows
-            .iter()
-            .filter(|row| before_m2(row.act) && !kept(row.act))
-        {
-            let name = row.act.spec().map_or("", |spec| spec.name);
-            for chord in chords.iter().filter(|&&chord| {
-                row.act == Act::EditorFocus
-                    || compiled.rows.iter().any(|other| {
-                        kept(other.act)
-                            && other.context == row.context
-                            && other.chords.contains(&chord)
-                    })
-                    || kept_in
+            // Where an entry could meet a kept row: a stack offering both, the row's own context, or
+            // anywhere for `editor.focus` (E9 (d)). The other pairs never meet, and would only slow
+            // the sweep down.
+            let offers = |stack: Stack<'_>, row: &Row| {
+                stack.layers().iter().enumerate().any(|(index, layer)| {
+                    layer.context() == row.context && stack.admits(index, row.act)
+                })
+            };
+            let kept_in: Vec<(Stack<'_>, Vec<KeyChord>)> = DECLARED
+                .iter()
+                .map(|&(_, stack)| {
+                    let held = compiled
+                        .rows
                         .iter()
-                        .any(|(stack, held)| held.contains(&chord) && offers(*stack, row))
-            }) {
-                let src = format!(
-                    "version = 1\n[{}]\n{name} = [{:?}]\n",
-                    row.context.table(),
-                    chord.spec()
-                );
-                match load_str(&src) {
-                    Ok(keys) => {
-                        loaded += 1;
-                        for fixed in compiled.rows.iter().filter(|row| kept(row.act)) {
-                            assert_eq!(
-                                keys.chords(fixed.context, fixed.act),
-                                fixed.chords,
-                                "{src}: {:?} lost a chord",
-                                fixed.act
-                            );
-                        }
-                        // RV1 repair 1: where the entry acts, the screen does what it did before
-                        // M2: the view's key where the view kept it, the entry's elsewhere.
-                        for &(phrase, stack) in DECLARED {
-                            let candidates = keys.actions(stack, *chord);
-                            if !candidates.contains(&row.act) {
-                                continue;
-                            }
-                            if fixed_before_m2(stack, *chord).is_some() {
-                                assert!(
-                                    candidates.first().is_some_and(|&act| kept(act)),
-                                    "{src} {phrase}: {candidates:?}"
+                        .filter(|row| kept(row.act) && offers(stack, row))
+                        .flat_map(|row| row.chords.iter().copied())
+                        .collect();
+                    (stack, held)
+                })
+                .collect();
+            let (mut loaded, mut refused) = (0, 0);
+            for row in compiled
+                .rows
+                .iter()
+                .filter(|row| before_m2(row.act) && !kept(row.act))
+            {
+                let name = row.act.spec().map_or("", |spec| spec.name);
+                for chord in chords.iter().filter(|&&chord| {
+                    row.act == Act::EditorFocus
+                        || compiled.rows.iter().any(|other| {
+                            kept(other.act)
+                                && other.context == row.context
+                                && other.chords.contains(&chord)
+                        })
+                        || kept_in
+                            .iter()
+                            .any(|(stack, held)| held.contains(&chord) && offers(*stack, row))
+                }) {
+                    let src = format!(
+                        "version = 1\n[{}]\n{name} = [{:?}]\n",
+                        row.context.table(),
+                        chord.spec()
+                    );
+                    match load_str(&src) {
+                        Ok(keys) => {
+                            loaded += 1;
+                            for fixed in compiled.rows.iter().filter(|row| kept(row.act)) {
+                                assert_eq!(
+                                    keys.chords(fixed.context, fixed.act),
+                                    fixed.chords,
+                                    "{src}: {:?} lost a chord",
+                                    fixed.act
                                 );
-                            } else {
-                                assert!(
-                                    !candidates.iter().any(|&act| steps_aside(act)),
-                                    "{src} {phrase}: {candidates:?}"
-                                );
+                            }
+                            // RV1 repair 1: where the entry acts, the screen does what it did before
+                            // M2: the view's key where the view kept it, the entry's elsewhere.
+                            for &(phrase, stack) in DECLARED {
+                                let candidates = keys.actions(stack, *chord);
+                                if !candidates.contains(&row.act) {
+                                    continue;
+                                }
+                                if fixed_before_m2(stack, *chord).is_some() {
+                                    assert!(
+                                        candidates.first().is_some_and(|&act| kept(act)),
+                                        "{src} {phrase}: {candidates:?}"
+                                    );
+                                } else {
+                                    assert!(
+                                        !candidates.iter().any(|&act| steps_aside(act)),
+                                        "{src} {phrase}: {candidates:?}"
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(errors) => {
-                        refused += 1;
-                        for error in &errors {
-                            // Only where the view kept the key before M2, which refused it then.
-                            let fixed = DECLARED.iter().any(|&(phrase, stack)| {
-                                error.message.ends_with(phrase)
-                                    && fixed_before_m2(stack, *chord).is_some()
-                            });
-                            assert!(
-                                fixed
-                                    || ![
-                                        "is already field.",
-                                        "is already choice.",
-                                        "is already answer.",
-                                        "is already requirements.priority_",
-                                    ]
-                                    .iter()
-                                    .any(|named| error.message.contains(named)),
-                                "{src}: {}",
-                                error.message
-                            );
+                        Err(errors) => {
+                            refused += 1;
+                            for error in &errors {
+                                // Only where the view kept the key before M2, which refused it then.
+                                let fixed = DECLARED.iter().any(|&(phrase, stack)| {
+                                    error.message.ends_with(phrase)
+                                        && fixed_before_m2(stack, *chord).is_some()
+                                });
+                                assert!(
+                                    fixed
+                                        || ![
+                                            "is already field.",
+                                            "is already choice.",
+                                            "is already answer.",
+                                            "is already requirements.priority_",
+                                        ]
+                                        .iter()
+                                        .any(|named| error.message.contains(named)),
+                                    "{src}: {}",
+                                    error.message
+                                );
+                            }
                         }
                     }
                 }
             }
+            assert!(
+                loaded > 500 && refused > 0,
+                "{loaded} loaded, {refused} refused"
+            );
         }
-        assert!(
-            loaded > 500 && refused > 0,
-            "{loaded} loaded, {refused} refused"
-        );
     }
 
     /// MOD-115 M2 RV1 repair 1 (MD4): a version-1 entry on a key a view kept ahead of the
@@ -1040,8 +1050,8 @@ mod tests {
 
     // MOD-57 M2 E9: the editor's keys.
 
-    /// E9 (b): `editor.focus` never gives way, so an `[editor]` entry on its chord collides in
-    /// `[editor]`, and focus keeps it.
+    /// E9 (b), MOD-67 M4 D8.1: `editor.focus` never gives way, so an `[editor]` entry on its chord
+    /// collides in `[editor]` instead of silently unbinding the focus toggle, and focus keeps it.
     #[test]
     fn the_abort_cannot_take_the_focus_chord() {
         assert_eq!(
@@ -1474,19 +1484,6 @@ mod tests {
                         .to_owned()
                 ),
             ]
-        );
-    }
-
-    /// MOD-67 M4 D8.1: `editor.focus` never gives its chord way to an `[editor]` entry, so the
-    /// entry collides instead of silently unbinding the focus toggle.
-    #[test]
-    fn editor_focus_never_gives_way() {
-        assert_eq!(
-            errors("[editor]\nabort = \"ctrl-4\"\n"),
-            one(
-                2,
-                r#"[editor] abort = "ctrl-4": "ctrl-4" is already editor.focus (default) in [editor]"#
-            )
         );
     }
 

@@ -3,10 +3,11 @@
 # The doc step runs cargo doc under the workspace's deny-level rustdoc lints.
 #
 # Usage:
-#   pwsh -NoProfile -File scripts/gate.ps1 [-Only <step>] [-Detach] [-Status] [-SelfTest]
+#   pwsh -NoProfile -File scripts/gate.ps1 [-Only <step>] [-Slow] [-Detach] [-Status] [-SelfTest]
 #
 #   -Only <step>  run one step (fmt, clippy-all, clippy-bare, doc, postgres, qdrant, test,
 #                 abort-grep, migrations, workflow-docs, plugin)
+#   -Slow         run the opt-in slow sweeps even when nothing they cover differs from main
 #   -Detach       relaunch in a hidden process, log to target/gate/run.log, print the PID
 #   -Status       print target/gate/last.json and exit
 #
@@ -24,6 +25,7 @@
 param(
     [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'doc', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
     [string]$Only,
+    [switch]$Slow,
     [switch]$Detach,
     [switch]$Status,
     [switch]$SelfTest
@@ -42,6 +44,14 @@ $MinClaude = [version]'2.1.287'
 $Steps = @('fmt', 'clippy-all', 'clippy-bare', 'doc', 'postgres', 'qdrant', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
 # The pinned cargo-nextest (TOOL-17 D3): the test step prints its install line when none is on PATH.
 $NextestVersion = '0.9.151'
+# The opt-in slow sweeps: `#[ignore]`d tests in a `slow_sweep` module, too slow for every run. The
+# test step runs them when a path below differs from main (committed, staged, unstaged or
+# untracked), or under -Slow. A path joins the list with the sweep that reads it.
+$SlowSweepFilter = 'test(/::slow_sweep::/)'
+$SlowSweepPaths = @('crates/htui/src/keys/')
+$script:SlowSweepBase = if ($env:GATE_SLOW_SWEEP_BASE) { $env:GATE_SLOW_SWEEP_BASE } else { 'main' }
+$script:SlowSweepRoot = $RepoRoot
+$script:RunSlow = [bool]$Slow
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Started = ''
@@ -143,6 +153,24 @@ function Step-Qdrant {
     return $Pass
 }
 
+function Test-SlowSweepsDue {
+    # $true = run them. -Slow, or a covered path that differs from the merge base with main. No
+    # merge base (main absent, a shallow clone) runs them too: a sweep skipped by accident is the
+    # failure this guards against. Returns the sentence it prints, then the verdict.
+    if ($script:RunSlow) { return 'test: slow sweeps run (-Slow)', $true }
+    $base = & git -C $script:SlowSweepRoot merge-base HEAD $script:SlowSweepBase 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $base) {
+        return "test: slow sweeps run (no merge base with $($script:SlowSweepBase))", $true
+    }
+    $changed = @(& git -C $script:SlowSweepRoot diff --name-only $base -- @SlowSweepPaths) +
+        @(& git -C $script:SlowSweepRoot ls-files --others --exclude-standard -- @SlowSweepPaths) |
+        Where-Object { $_ }
+    if (@($changed).Count -gt 0) {
+        return "test: slow sweeps run ($(@($changed).Count) changed under $($SlowSweepPaths -join ' '))", $true
+    }
+    return "test: slow sweeps skipped (nothing under $($SlowSweepPaths -join ' ') differs from $($script:SlowSweepBase); -Slow runs them)", $false
+}
+
 function Step-Test {
     # TOOL-17 (D6): cargo-nextest runs each test in its own process, so tests no longer share one
     # per binary; the live Qdrant cases take turns through the live-qdrant test group in
@@ -169,9 +197,19 @@ function Step-Test {
     & cargo nextest run --workspace --all-features --no-fail-fast --profile gate 2>&1 | Tee-Object -FilePath $script:TestLog
     # $LASTEXITCODE is cargo's: Tee-Object is a cmdlet and does not touch it.
     $nextestCode = $LASTEXITCODE
+    # The default profile, not `gate`: a sweep is deterministic, so no retry, and the gate's
+    # junit.xml stays the main run's.
+    $slowCode = 0
+    $sentence, $due = Test-SlowSweepsDue
+    $sentence | Tee-Object -FilePath $script:TestLog -Append | Write-Host
+    if ($due) {
+        & cargo nextest run --workspace --all-features --no-fail-fast --run-ignored only -E $SlowSweepFilter 2>&1 |
+            Tee-Object -FilePath $script:TestLog -Append
+        $slowCode = $LASTEXITCODE
+    }
     & cargo test --workspace --all-features --doc 2>&1 | Tee-Object -FilePath $script:TestLog -Append
     $docCode = $LASTEXITCODE
-    if ($nextestCode -eq 0 -and $docCode -eq 0) { return $Pass } else { return $Fail }
+    if ($nextestCode -eq 0 -and $slowCode -eq 0 -and $docCode -eq 0) { return $Pass } else { return $Fail }
 }
 
 function Step-AbortGrep {
@@ -353,6 +391,36 @@ function Invoke-GateSelfTest {
         if ("$rs" -like '*get.nexte.st*') { $failures += 'test: a sandbox without cargo-nextest printed an install line' }
         if (Test-Path -LiteralPath $mark) { $failures += 'test: a missing cargo-nextest still ran cargo' }
 
+        # The slow sweeps run on a covered path that differs from main, under -Slow, and without a
+        # merge base; nothing else runs them.
+        $sweep = Join-Path $tmp 'sweep'
+        $g = { & git -C $sweep -c user.name=gate -c user.email=gate@localhost @args }
+        New-Item -ItemType Directory -Force (Join-Path $sweep 'crates/htui/src/keys'), (Join-Path $sweep 'crates/other') | Out-Null
+        Set-Content -LiteralPath (Join-Path $sweep 'crates/htui/src/keys/a.rs') ''
+        Set-Content -LiteralPath (Join-Path $sweep 'crates/other/b.rs') ''
+        & $g init -q -b main; & $g add -A; & $g commit -qm base; & $g switch -qc feature
+        $savedRoot = $script:SlowSweepRoot; $savedSlow = $script:RunSlow; $savedBase = $script:SlowSweepBase
+        function Test-Due { param([bool]$SlowFlag = $false, [string]$Base = 'main')
+            $script:SlowSweepRoot = $sweep; $script:RunSlow = $SlowFlag; $script:SlowSweepBase = $Base
+            (Test-SlowSweepsDue)[-1]
+        }
+        try {
+            if (Test-Due) { $failures += 'slow sweeps: ran with nothing changed' }
+            Set-Content -LiteralPath (Join-Path $sweep 'crates/other/b.rs') 'x'
+            if (Test-Due) { $failures += 'slow sweeps: ran for a change outside their paths' }
+            if (-not (Test-Due -SlowFlag $true)) { $failures += 'slow sweeps: -Slow did not run them' }
+            if (-not (Test-Due -Base 'no-such-branch')) { $failures += 'slow sweeps: no merge base did not run them' }
+            Set-Content -LiteralPath (Join-Path $sweep 'crates/htui/src/keys/new.rs') ''
+            if (-not (Test-Due)) { $failures += 'slow sweeps: an untracked file under their paths did not run them' }
+            Remove-Item -LiteralPath (Join-Path $sweep 'crates/htui/src/keys/new.rs')
+            Set-Content -LiteralPath (Join-Path $sweep 'crates/htui/src/keys/a.rs') 'x'
+            if (-not (Test-Due)) { $failures += 'slow sweeps: an unstaged edit under their paths did not run them' }
+            & $g commit -qam edit
+            if (-not (Test-Due)) { $failures += 'slow sweeps: a commit under their paths since main did not run them' }
+        } finally {
+            $script:SlowSweepRoot = $savedRoot; $script:RunSlow = $savedSlow; $script:SlowSweepBase = $savedBase
+        }
+
         $savedDsn = $env:HTUI_TEST_DATABASE_URL
         try {
             $env:HTUI_TEST_DATABASE_URL = $null
@@ -441,12 +509,13 @@ if ($Detach) {
         # wait on the gate's copy of that pipe until the gate ends. Without it the child starts
         # through ShellExecute, inherits nothing, and writes its own log.
         $q = { param([string]$s) "'" + $s.Replace("'", "''") + "'" }
-        $cmd = "& $(& $q $PSCommandPath)$(if ($Only) { " -Only $Only" }) *> $(& $q $runLog)"
+        $cmd = "& $(& $q $PSCommandPath)$(if ($Only) { " -Only $Only" })$(if ($Slow) { ' -Slow' }) *> $(& $q $runLog)"
         $p = Start-Process pwsh -ArgumentList @('-NoProfile', '-Command', $cmd) -WindowStyle Hidden -PassThru
     } else {
         # Elsewhere .NET hands the child only its three redirected streams.
         $argList = @('-NoProfile', '-File', $PSCommandPath)
         if ($Only) { $argList += @('-Only', $Only) }
+        if ($Slow) { $argList += '-Slow' }
         $p = Start-Process pwsh -ArgumentList $argList -PassThru `
             -RedirectStandardOutput $runLog `
             -RedirectStandardError (Join-Path $script:GateDir 'run.err.log')

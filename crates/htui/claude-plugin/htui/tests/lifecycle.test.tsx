@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { BAND, engineBottom, htui, ok, start, STATUS, waitingCalls, WAITING, WAITING_NONE, type Answer, type Call } from './fixtures'
+import { BAND, engineBottom, htui, ok, registered, start, STATUS, waitingCalls, WAITING, WAITING_NONE, type Answer, type Call } from './fixtures'
 
 test('auto polls at start and every poll_seconds', async ($, on) => {
   const clock = mock.clock(on)
@@ -144,9 +144,9 @@ test('an htui-driven session stands down', async ($, on) => {
   htui(on, { waiting: ok(WAITING), status: ok(STATUS) }, calls)
   engineBottom(on, 'AbovePrompt')
   let registers = 0
-  on('command.register', async () => {
+  on('command.register', async (_$, e) => {
     registers += 1
-    return { value: undefined }
+    return registered(e.name)
   })
   let opens = 0
   on('ui.open', async () => {

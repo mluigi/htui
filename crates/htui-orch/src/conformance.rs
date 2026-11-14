@@ -19113,7 +19113,7 @@ async fn a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict<H: CaseHarnes
 
 #[cfg(test)]
 mod tests {
-    use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
+    use super::{CASES, CaseHarness, FakeOrchestrator, run_all};
 
     /// The suite's own binding, and the one `tests/fake_conformance.rs` mirrors out of crate (T5).
     struct Demo;
@@ -19247,16 +19247,9 @@ mod tests {
     /// `run_case` panics on a name it does not know, which is the whole point of its `match`:
     /// running the list through it is what keeps [`CASES`] and the dispatcher in step. It is also
     /// what makes T5's work mechanical — replacing a stub body cannot silently orphan its name.
+    /// Through [`run_all`], the loop a binding actually calls, which is that same walk.
     #[tokio::test]
     async fn every_case_name_dispatches() {
-        for name in CASES {
-            run_case(name, &Demo).await;
-        }
-    }
-
-    /// And the loop a binding actually calls.
-    #[tokio::test]
-    async fn run_all_walks_the_list() {
         run_all(&Demo).await;
     }
 }

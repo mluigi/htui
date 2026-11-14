@@ -78,7 +78,8 @@ async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: n
       line: `htui: answer version ${doc.version} is newer than this plugin: run htui claude emit --force, then /reload-plugins`,
     }
   }
-  if (typeof doc.error?.message === 'string') return { ok: false, line: `htui: ${clean(doc.error.message)}` }
+  const error = doc.error
+  if (isObject(error) && typeof error.message === 'string') return { ok: false, line: `htui: ${clean(error.message)}` }
   if (r.exitCode !== 0) return { ok: false, line: `htui: exit ${r.exitCode}` }
   return { ok: true, doc, exitCode: r.exitCode }
 }

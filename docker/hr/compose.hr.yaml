@@ -19,13 +19,16 @@ services:
       - {type: volume, source: cargo-src, target: "${HR_HOME:?}/.cargo/registry/src"}
 
   postgres:
-    image: postgres:16
+    # The test server's version, as the host's htui-postgres-test (compose.yaml). The 18 image keeps
+    # its cluster under /var/lib/postgresql/18/docker, so the volume is mounted one level up; it is
+    # pgdata18, not pgdata, so a run created under 16 never offers its old cluster to an 18 server.
+    image: postgres:18
     command: ["postgres", "-p", "5439", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
     shm_size: 1gb
     volumes:
-      - {type: volume, source: pgdata, target: /var/lib/postgresql/data}
+      - {type: volume, source: pgdata18, target: /var/lib/postgresql}
     healthcheck:   # -h localhost: the entrypoint's init-time temp server is socket-only, so this goes green only on the real server
       test: ["CMD-SHELL", "pg_isready -h localhost -p 5439 -U postgres"]
       interval: 2s
@@ -183,7 +186,7 @@ services:
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/credentials.toml", read_only: true, bind: {create_host_path: false}}
 
 volumes:
-  pgdata:
+  pgdata18:
   gortex:
   cargo-src:       # per run, so `down -v` removes it
   cargo:

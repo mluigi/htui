@@ -7,10 +7,11 @@
 # keep the two in lockstep (same step names, same last.json shape).
 #
 # Usage:
-#   bash scripts/gate.sh [--only <step>] [--detach] [--status] [--self-test]
+#   bash scripts/gate.sh [--only <step>] [--slow] [--detach] [--status] [--self-test]
 #
 #   --only <step>  run one step (fmt, clippy-all, clippy-bare, doc, postgres, qdrant, test,
 #                  abort-grep, migrations, workflow-docs, plugin)
+#   --slow         run the opt-in slow sweeps even when nothing they cover differs from main
 #   --detach       relaunch under setsid, log to target/gate/run.log, print the PID and return
 #   --status       print target/gate/last.json and exit
 #
@@ -49,6 +50,13 @@ MIN_CLAUDE="2.1.287"
 STEPS=(fmt clippy-all clippy-bare doc postgres qdrant test abort-grep migrations workflow-docs plugin)
 # The pinned cargo-nextest (TOOL-17 D3): the test step prints its install line when none is on PATH.
 NEXTEST_VERSION="0.9.151"
+# The opt-in slow sweeps: `#[ignore]`d tests in a `slow_sweep` module, too slow for every run. The
+# test step runs them when a path below differs from main (committed, staged, unstaged or
+# untracked), or under --slow. A path joins the list with the sweep that reads it.
+SLOW_SWEEP_FILTER='test(/::slow_sweep::/)'
+SLOW_SWEEP_PATHS=(crates/htui/src/keys/)
+SLOW_SWEEP_BASE="${GATE_SLOW_SWEEP_BASE:-main}"
+SLOW=0
 
 STEP_NAMES=(); STEP_STATUS=(); STEP_SECONDS=()
 STARTED=""
@@ -141,6 +149,26 @@ step_qdrant() {
     echo "qdrant: $host:$port reachable; the Qdrant suites run live"
 }
 
+slow_sweeps_due() {
+    # 0 = run them. --slow, or a covered path that differs from the merge base with main. No merge
+    # base (main absent, a shallow clone) runs them too: a sweep skipped by accident is the failure
+    # this guards against.
+    local base changed
+    [[ $SLOW -eq 1 ]] && { echo "test: slow sweeps run (--slow)"; return 0; }
+    if ! base="$(git -C "$REPO_ROOT" merge-base HEAD "$SLOW_SWEEP_BASE" 2>/dev/null)"; then
+        echo "test: slow sweeps run (no merge base with $SLOW_SWEEP_BASE)"
+        return 0
+    fi
+    changed="$(git -C "$REPO_ROOT" diff --name-only "$base" -- "${SLOW_SWEEP_PATHS[@]}"
+        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "${SLOW_SWEEP_PATHS[@]}")"
+    if [[ -n "$changed" ]]; then
+        echo "test: slow sweeps run ($(wc -l <<< "$changed" | tr -d ' ') changed under ${SLOW_SWEEP_PATHS[*]})"
+        return 0
+    fi
+    echo "test: slow sweeps skipped (nothing under ${SLOW_SWEEP_PATHS[*]} differs from $SLOW_SWEEP_BASE; --slow runs them)"
+    return 1
+}
+
 step_test() {
     # TOOL-17 (D6): cargo-nextest runs each test in its own process, so tests no longer share one
     # per binary; the live Qdrant cases take turns through the live-qdrant test group in
@@ -149,7 +177,7 @@ step_test() {
     # No cargo-nextest: fail before running anything, with the install line. Not in an hr sandbox:
     # there ~/.cargo/bin is an empty read-only tmpfs off PATH (docker/hr/compose.hr.yaml), and the
     # image carries nextest, so a sandbox without it runs an image built before TOOL-17.
-    local rc_nextest rc_doc
+    local rc_nextest rc_slow=0 rc_doc
     if ! command -v cargo-nextest >/dev/null 2>&1; then
         if [[ "${HR_SANDBOX:-}" == 1 ]]; then
             echo "test: cargo-nextest not installed - this hr image predates TOOL-17; rebuild it on the host with scripts/hr build"
@@ -162,9 +190,16 @@ step_test() {
     # PIPESTATUS, not $?: tee would otherwise report success for a failed cargo.
     cargo nextest run --workspace --all-features --no-fail-fast --profile gate 2>&1 | tee "$TEST_LOG"
     rc_nextest="${PIPESTATUS[0]}"
+    # The default profile, not `gate`: a sweep is deterministic, so no retry, and the gate's
+    # junit.xml stays the main run's.
+    if slow_sweeps_due | tee -a "$TEST_LOG"; [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+        cargo nextest run --workspace --all-features --no-fail-fast --run-ignored only \
+            -E "$SLOW_SWEEP_FILTER" 2>&1 | tee -a "$TEST_LOG"
+        rc_slow="${PIPESTATUS[0]}"
+    fi
     cargo test --workspace --all-features --doc 2>&1 | tee -a "$TEST_LOG"
     rc_doc="${PIPESTATUS[0]}"
-    [[ $rc_nextest -eq 0 && $rc_doc -eq 0 ]]
+    [[ $rc_nextest -eq 0 && $rc_slow -eq 0 && $rc_doc -eq 0 ]]
 }
 
 step_abort_grep() {
@@ -336,6 +371,25 @@ run_self_test() {
     [[ "$out" != *get.nexte.st* ]] || failures+=('test: a sandbox without cargo-nextest printed an install line')
     [[ ! -e "$tmp/cargo-ran" ]] || failures+=('test: a sandbox without cargo-nextest still ran cargo')
 
+    # The slow sweeps run on a covered path that differs from main, under --slow, and without a
+    # merge base; nothing else runs them.
+    local sweep="$tmp/sweep" g=(git -C "$tmp/sweep" -c user.name=gate -c user.email=gate@localhost)
+    mkdir -p "$sweep/crates/htui/src/keys" "$sweep/crates/other"
+    "${g[@]}" init -q -b main && : > "$sweep/crates/htui/src/keys/a.rs" && : > "$sweep/crates/other/b.rs" \
+        && "${g[@]}" add -A && "${g[@]}" commit -qm base && "${g[@]}" switch -qc feature
+    due() { ( REPO_ROOT="$sweep"; SLOW="${1:-0}"; SLOW_SWEEP_BASE="${2:-main}"; slow_sweeps_due >/dev/null ); }
+    due && failures+=('slow sweeps: ran with nothing changed')
+    echo x > "$sweep/crates/other/b.rs"
+    due && failures+=('slow sweeps: ran for a change outside their paths')
+    due 1 || failures+=('slow sweeps: --slow did not run them')
+    due 0 no-such-branch || failures+=('slow sweeps: no merge base did not run them')
+    : > "$sweep/crates/htui/src/keys/new.rs"
+    due || failures+=('slow sweeps: an untracked file under their paths did not run them')
+    rm "$sweep/crates/htui/src/keys/new.rs"; echo x > "$sweep/crates/htui/src/keys/a.rs"
+    due || failures+=('slow sweeps: an unstaged edit under their paths did not run them')
+    "${g[@]}" commit -qam edit
+    due || failures+=('slow sweeps: a commit under their paths since main did not run them')
+
     ( unset HTUI_TEST_DATABASE_URL; step_postgres >/dev/null; [[ $? -eq 3 ]] ) \
         || failures+=('postgres: an unset DSN was not skipped')
     ( HTUI_TEST_DATABASE_URL='postgres://u@127.0.0.1:1/db' step_postgres >/dev/null; [[ $? -eq 1 ]] ) \
@@ -401,12 +455,13 @@ run_self_test() {
 
 # ---- main ----
 
-usage() { echo "Usage: $0 [--only <step>] [--detach] [--status] [--self-test]"; }
+usage() { echo "Usage: $0 [--only <step>] [--slow] [--detach] [--status] [--self-test]"; }
 
 ONLY=""; DETACH=0; STATUS=0; SELF_TEST=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --only) ONLY="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+        --slow) SLOW=1; shift ;;
         --detach) DETACH=1; shift ;;
         --status) STATUS=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
@@ -432,7 +487,7 @@ fi
 
 if [[ $DETACH -eq 1 ]]; then
     mkdir -p "$GATE_DIR"
-    args=(); [[ -n "$ONLY" ]] && args=(--only "$ONLY")
+    args=(); [[ -n "$ONLY" ]] && args=(--only "$ONLY"); [[ $SLOW -eq 1 ]] && args+=(--slow)
     # `env --default-signal` (TOOL-16): a non-interactive shell starts a background job with SIGINT
     # and SIGQUIT ignored, every process under it inherits that, and a shell that starts with a
     # signal ignored cannot trap it. Two tests interrupt a `trap ... INT` child and failed in every
