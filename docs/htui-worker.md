@@ -44,7 +44,13 @@ What it does:
 - Every 5 seconds, when the box's executor is `worker`: claims the box's queued runs in the order
   they were queued, adopts the box's `running` runs that nobody holds (a lease given back or
   lapsed), and walks them. It refreshes each walk's lease and fences itself before its lease can
-  lapse, exactly as the TUI does.
+  lapse, exactly as the TUI does. It also lands the finished work of the box's runs on repos set to
+  `push`: it takes each pending integration record under a lease, checks the run's commits are on
+  the target branch, and fast-forwards the remote's target branch with the box's own git
+  credentials (never forced, never prompting). A remote that moved, or a push git refuses, parks
+  the record as refused with its reason and an item note; the item's dependents wait until its
+  records have landed. The walk lands a run itself as soon as it finishes; the sweep is the
+  recovery path after a crash or a lapsed lease.
 - Picks up a repo or checkout change (a repo added, a checkout path set or moved) at the next
   sweep when no run is walking, with no restart; `copy_max_total_bytes` is read again at that
   point. While a run is walking, the worker keeps adopting but its sweep claims no queued run
