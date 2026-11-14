@@ -26,7 +26,7 @@ use htui_store::secret::{KeyHost, QdrantEnv, QdrantKeyError};
 use htui_store::vector::{
     self, COLLECTION, ExistingCollection, Hit, Probe, QdrantStore, SearchQuery, VectorStore as _,
 };
-use htui_store::vector_sync::{Indexer, SyncReport};
+use htui_store::vector_sync::{Indexer, SyncReport, workspace_search_scope};
 use htui_store::{Backend, PgStore, secret};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -1232,9 +1232,13 @@ impl ConceptsRuntime {
         let index = Arc::clone(&self.index);
         let replies = replies.clone();
         let task = match &envelope.request {
-            StoreRequest::SearchConcepts(query) => {
-                // D233: no projects is no search; the index would say `[]` too.
-                if query.projects.is_empty() || query.limit == 0 {
+            StoreRequest::SearchConcepts {
+                query,
+                scope_row_of,
+            } => {
+                // D233: no projects is no search; the index would say `[]` too. MOD-147 M4 D8: a
+                // workspace's scope row still is something to search.
+                if (query.projects.is_empty() && scope_row_of.is_none()) || query.limit == 0 {
                     return ConceptsServed::Reply(StoreReply::Concepts(Box::new(
                         ConceptsReply::Hits {
                             query: query.clone(),
@@ -1242,9 +1246,27 @@ impl ConceptsRuntime {
                         },
                     )));
                 }
-                let query = query.clone();
+                let (backend, query, scope_row_of) =
+                    (backend.clone(), query.clone(), *scope_row_of);
                 tokio::spawn(async move {
-                    let outcome = index.search(query.clone()).await;
+                    // MOD-147 M4 D8: widened here, off the loop; the reply keeps the request's
+                    // own query, so the overlay's match on it is unchanged.
+                    let searched = match scope_row_of {
+                        Some(workspace_id) => {
+                            let members = Scope {
+                                workspace_id,
+                                project_ids: query.projects.clone(),
+                            };
+                            SearchQuery {
+                                projects: workspace_search_scope(&backend, &members)
+                                    .await
+                                    .project_ids,
+                                ..query.clone()
+                            }
+                        }
+                        None => query.clone(),
+                    };
+                    let outcome = index.search(searched).await;
                     let reply = ConceptsReply::Hits { query, outcome };
                     let _ = replies.send(ReplyEnvelope {
                         seq,
@@ -1253,14 +1275,29 @@ impl ConceptsRuntime {
                     });
                 })
             }
-            StoreRequest::IndexConcepts { scope } => {
-                if scope.project_ids.is_empty() {
+            StoreRequest::IndexConcepts {
+                scope,
+                scope_row_of,
+            } => {
+                if scope.project_ids.is_empty() && scope_row_of.is_none() {
                     return ConceptsServed::Reply(StoreReply::Concepts(Box::new(
                         ConceptsReply::Indexed(Ok(SyncReport::default())),
                     )));
                 }
-                let (backend, scope) = (backend.clone(), scope.clone());
+                let (backend, scope, scope_row_of) =
+                    (backend.clone(), scope.clone(), *scope_row_of);
                 tokio::spawn(async move {
+                    // MOD-147 M4 D8: the scope row joins off the loop, as a search's does.
+                    let scope = match scope_row_of {
+                        Some(workspace_id) => {
+                            let asked = Scope {
+                                workspace_id,
+                                ..scope
+                            };
+                            workspace_search_scope(&backend, &asked).await
+                        }
+                        None => scope,
+                    };
                     let outcome = index.sync(backend, scope).await;
                     let _ = replies.send(ReplyEnvelope {
                         seq,
@@ -1326,8 +1363,10 @@ mod tests {
     use crate::store_worker;
     use crate::ui::overlay::OverlayId;
     use htui_core::fixtures::ids;
-    use htui_core::store::{MemStore, ReadStore as _};
-    use htui_store::vector::PointType;
+    use htui_core::model::document::GOALS_KIND;
+    use htui_core::model::{DocumentId, NewOwnerDocument, OwnerDocument};
+    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_store::vector::{Owner, PointType};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PROBE: Origin = Origin::Overlay(OverlayId("probe"));
@@ -1431,7 +1470,13 @@ mod tests {
         let served = runtime.serve(
             &backend,
             &tx,
-            &envelope(7, StoreRequest::SearchConcepts(query.clone())),
+            &envelope(
+                7,
+                StoreRequest::SearchConcepts {
+                    query: query.clone(),
+                    scope_row_of: None,
+                },
+            ),
         );
         assert!(matches!(served, ConceptsServed::Deferred), "{served:?}");
         assert_eq!(runtime.settle(Duration::from_secs(10)).await, 0);
@@ -1467,7 +1512,13 @@ mod tests {
         let replies = serve_one(
             &mut runtime,
             &backend,
-            &envelope(1, StoreRequest::SearchConcepts(all)),
+            &envelope(
+                1,
+                StoreRequest::SearchConcepts {
+                    query: all,
+                    scope_row_of: None,
+                },
+            ),
         )
         .await;
         let everything = hits(&replies[0].reply).1.clone().expect("no failure");
@@ -1480,7 +1531,13 @@ mod tests {
         let replies = serve_one(
             &mut runtime,
             &backend,
-            &envelope(2, StoreRequest::SearchConcepts(decisions)),
+            &envelope(
+                2,
+                StoreRequest::SearchConcepts {
+                    query: decisions,
+                    scope_row_of: None,
+                },
+            ),
         )
         .await;
         let narrowed = hits(&replies[0].reply).1.clone().expect("no failure");
@@ -1505,7 +1562,13 @@ mod tests {
         let served = runtime.serve(
             &backend,
             &tx,
-            &envelope(1, StoreRequest::SearchConcepts(query.clone())),
+            &envelope(
+                1,
+                StoreRequest::SearchConcepts {
+                    query: query.clone(),
+                    scope_row_of: None,
+                },
+            ),
         );
         let ConceptsServed::Reply(reply) = served else {
             panic!("answered at once, got {served:?}")
@@ -1537,7 +1600,13 @@ mod tests {
             let served = runtime.serve(
                 &backend,
                 &tx,
-                &envelope(seq, StoreRequest::SearchConcepts(query.clone())),
+                &envelope(
+                    seq,
+                    StoreRequest::SearchConcepts {
+                        query: query.clone(),
+                        scope_row_of: None,
+                    },
+                ),
             );
             assert!(matches!(served, ConceptsServed::Deferred), "{served:?}");
         }
@@ -1566,13 +1635,20 @@ mod tests {
                 1,
                 StoreRequest::IndexConcepts {
                     scope: scope.clone(),
+                    scope_row_of: None,
                 },
             ),
         );
         let second = runtime.serve(
             &backend,
             &tx,
-            &envelope(2, StoreRequest::SearchConcepts(query)),
+            &envelope(
+                2,
+                StoreRequest::SearchConcepts {
+                    query: query,
+                    scope_row_of: None,
+                },
+            ),
         );
         assert!(matches!(first, ConceptsServed::Deferred), "{first:?}");
         assert!(matches!(second, ConceptsServed::Deferred), "{second:?}");
@@ -1592,6 +1668,7 @@ mod tests {
         let mut runtime = ConceptsRuntime::new(index.clone());
         let request = StoreRequest::IndexConcepts {
             scope: scope.clone(),
+            scope_row_of: None,
         };
 
         let replies = serve_one(&mut runtime, &backend, &envelope(1, request.clone())).await;
@@ -1605,6 +1682,130 @@ mod tests {
         assert_eq!(again.items_rebuilt, 0, "nothing changed since: {again:?}");
     }
 
+    /// The demo store with a `platform` goals document that says `zircon`, the members-only
+    /// `platform` scope, and the document.
+    async fn platform_with_goals() -> (Backend, Scope, OwnerDocument) {
+        let mem = MemStore::demo();
+        let goals = mem
+            .write_owner_document(NewOwnerDocument {
+                id: DocumentId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                kind: GOALS_KIND.into(),
+                title: "Goals".into(),
+                body: "## Aim\none zircon search for the platform".into(),
+                created_by: ids::USER,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("the memory store writes it");
+        let backend = Backend::memory(mem);
+        let StoreReply::Workspaces(workspaces) =
+            store_worker::serve(&backend, &StoreRequest::Workspaces).await
+        else {
+            panic!("workspaces answered with the wrong variant")
+        };
+        let platform = workspaces
+            .iter()
+            .find(|w| w.slug == "platform")
+            .expect("the demo fixture holds the `platform` workspace");
+        (backend, Scope::from_workspace(platform), goals)
+    }
+
+    /// MOD-147 M4 D8: `scope_row_of` widens a search to the workspace's scope row off the loop,
+    /// so its goals document is found; without it the members alone are searched. The reply
+    /// carries the request's own query either way, and no projects with a scope row still search.
+    #[tokio::test]
+    async fn a_search_with_the_scope_row_finds_the_workspaces_own_document() {
+        let (backend, scope, goals) = platform_with_goals().await;
+        let wide = scope.with_scope_row(ids::PROJECT_SCOPE_PLATFORM);
+        let index = seeded(&backend, &wide, MemIndex::new()).await;
+        let mut runtime = ConceptsRuntime::new(index);
+        let finds_goals = |reply: &StoreReply| {
+            hits(reply)
+                .1
+                .as_ref()
+                .expect("no failure")
+                .iter()
+                .any(|hit| hit.owner == Owner::Document(goals.id))
+        };
+
+        for (seq, projects) in [(1, scope.project_ids.clone()), (2, Vec::new())] {
+            let query = concepts::query("zircon", projects, false, 10);
+            let replies = serve_one(
+                &mut runtime,
+                &backend,
+                &envelope(
+                    seq,
+                    StoreRequest::SearchConcepts {
+                        query: query.clone(),
+                        scope_row_of: Some(scope.workspace_id),
+                    },
+                ),
+            )
+            .await;
+            assert_eq!(replies.len(), 1);
+            assert_eq!(hits(&replies[0].reply).0, &query, "the request's own query");
+            assert!(finds_goals(&replies[0].reply), "{:?}", replies[0].reply);
+        }
+
+        let query = concepts::query("zircon", scope.project_ids.clone(), false, 10);
+        let replies = serve_one(
+            &mut runtime,
+            &backend,
+            &envelope(
+                3,
+                StoreRequest::SearchConcepts {
+                    query: query.clone(),
+                    scope_row_of: None,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(hits(&replies[0].reply).0, &query);
+        assert!(!finds_goals(&replies[0].reply), "{:?}", replies[0].reply);
+    }
+
+    /// MOD-147 M4 D8: an index run with `scope_row_of` indexes the scope row's points too, and one
+    /// without it the members alone.
+    #[tokio::test]
+    async fn an_index_run_with_the_scope_row_reports_its_points() {
+        let (backend, scope, goals) = platform_with_goals().await;
+        let of_the_row = |index: &MemIndex| {
+            index
+                .store()
+                .points()
+                .into_iter()
+                .filter(|p| p.project_id == ids::PROJECT_SCOPE_PLATFORM)
+                .collect::<Vec<_>>()
+        };
+
+        let index = Arc::new(MemIndex::new());
+        let mut runtime = ConceptsRuntime::new(index.clone());
+        let request = StoreRequest::IndexConcepts {
+            scope: scope.clone(),
+            scope_row_of: Some(scope.workspace_id),
+        };
+        let replies = serve_one(&mut runtime, &backend, &envelope(1, request)).await;
+        let report = *indexed(&replies[0].reply).as_ref().expect("no failure");
+        assert_eq!(report.points_upserted, index.store().points().len());
+        let row = of_the_row(&index);
+        assert!(
+            row.iter()
+                .any(|p| p.subject.owner() == Owner::Document(goals.id)),
+            "{row:?}"
+        );
+
+        let members = Arc::new(MemIndex::new());
+        let mut runtime = ConceptsRuntime::new(members.clone());
+        let request = StoreRequest::IndexConcepts {
+            scope,
+            scope_row_of: None,
+        };
+        serve_one(&mut runtime, &backend, &envelope(1, request)).await;
+        assert!(!members.store().points().is_empty());
+        assert!(of_the_row(&members).is_empty());
+    }
+
     #[tokio::test]
     async fn index_and_search_errors_are_concepts_replies_never_failed() {
         let (backend, scope) = platform().await;
@@ -1615,7 +1816,13 @@ mod tests {
         let replies = serve_one(
             &mut runtime,
             &backend,
-            &envelope(1, StoreRequest::SearchConcepts(query)),
+            &envelope(
+                1,
+                StoreRequest::SearchConcepts {
+                    query: query,
+                    scope_row_of: None,
+                },
+            ),
         )
         .await;
         assert_eq!(hits(&replies[0].reply).1, &Err(message.to_owned()));
@@ -1623,7 +1830,13 @@ mod tests {
         let replies = serve_one(
             &mut runtime,
             &backend,
-            &envelope(2, StoreRequest::IndexConcepts { scope }),
+            &envelope(
+                2,
+                StoreRequest::IndexConcepts {
+                    scope,
+                    scope_row_of: None,
+                },
+            ),
         )
         .await;
         assert_eq!(indexed(&replies[0].reply), &Err(message.to_owned()));
@@ -1638,24 +1851,44 @@ mod tests {
         let (backend, scope) = platform().await;
         let query = concepts::query("anything", scope.project_ids.clone(), false, 10);
 
-        let reply =
-            store_worker::serve(&backend, &StoreRequest::SearchConcepts(query.clone())).await;
+        let reply = store_worker::serve(
+            &backend,
+            &StoreRequest::SearchConcepts {
+                query: query.clone(),
+                scope_row_of: None,
+            },
+        )
+        .await;
         let (echoed, outcome) = hits(&reply);
         assert_eq!(echoed, &query);
         assert_eq!(outcome, &Err(NOT_AVAILABLE.to_owned()));
 
-        let reply = store_worker::serve(&backend, &StoreRequest::IndexConcepts { scope }).await;
+        let reply = store_worker::serve(
+            &backend,
+            &StoreRequest::IndexConcepts {
+                scope,
+                scope_row_of: None,
+            },
+        )
+        .await;
         assert_eq!(indexed(&reply), &Err(NOT_AVAILABLE.to_owned()));
     }
 
     #[tokio::test]
     async fn request_names_match_the_name_arms() {
         let (_, scope) = platform().await;
-        let search = StoreRequest::SearchConcepts(concepts::query("x", Vec::new(), false, 1));
+        let search = StoreRequest::SearchConcepts {
+            query: concepts::query("x", Vec::new(), false, 1),
+            scope_row_of: None,
+        };
         assert_eq!(REQUEST_NAMES[0], search.name());
         assert_eq!(
             REQUEST_NAMES[1],
-            StoreRequest::IndexConcepts { scope }.name()
+            StoreRequest::IndexConcepts {
+                scope,
+                scope_row_of: None,
+            }
+            .name()
         );
         assert_eq!(REQUEST_NAMES[2], StoreRequest::ProbeQdrant.name());
         assert!(
@@ -2887,12 +3120,24 @@ mod tests {
         runtime.serve(
             &backend,
             &tx,
-            &envelope(1, StoreRequest::SearchConcepts(query)),
+            &envelope(
+                1,
+                StoreRequest::SearchConcepts {
+                    query: query,
+                    scope_row_of: None,
+                },
+            ),
         );
         runtime.serve(
             &backend,
             &tx,
-            &envelope(2, StoreRequest::IndexConcepts { scope }),
+            &envelope(
+                2,
+                StoreRequest::IndexConcepts {
+                    scope,
+                    scope_row_of: None,
+                },
+            ),
         );
         runtime.shutdown();
         assert_eq!(

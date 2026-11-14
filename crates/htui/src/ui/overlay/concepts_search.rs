@@ -3,7 +3,9 @@
 //! A query field, a project scope (`Ctrl+P`: every project of the workspace, then each one), a
 //! decisions toggle (`Ctrl+D`) and the last hits. `Enter` searches when the query or a toggle
 //! changed since the last search, and otherwise opens the highlighted hit through
-//! `Action::Reveal` (D234, D235). `Ctrl+R` re-indexes the current scope (D237).
+//! `Action::Reveal` (D234, D235). `Ctrl+R` re-indexes the current scope (D237). With every
+//! project in scope, a search and a `Ctrl+R` run also cover the workspace's own scope row, its `WS`
+//! items and documents (MOD-147 M4 D9); a project cycled to is that project alone.
 //!
 //! Drawn on the MOD-115 kit (M4 E6): [`Modal`] is the frame, `kit::list` the hits (the `▌` gutter
 //! and the selection band mark the cursor, MOD-85), and the keys sit on the modal's bottom
@@ -19,7 +21,7 @@
 //! in this box and nothing else.
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope};
+use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope, WorkspaceId};
 use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_store::vector::{Hit, Owner, PointType, QUERY_EMBED_FAILED, SearchQuery};
 use htui_store::vector_sync::SyncReport;
@@ -80,7 +82,7 @@ pub fn idle(submit: Option<&str>) -> String {
     }
 }
 
-/// A workspace with no project: nothing is sent (D233).
+/// No project and no workspace (the nil startup one): nothing is sent (D233, MOD-147 M4 D9).
 pub const NO_PROJECTS: &str = "this workspace has no projects";
 
 /// `Enter` on an empty query.
@@ -247,10 +249,19 @@ impl ConceptsSearch {
         };
     }
 
+    /// MOD-147 M4 D9: the workspace whose scope row a search or an index run also covers: the
+    /// workspace's in "all projects" mode, none with a project cycled to or in the nil startup
+    /// workspace. The worker resolves the row off the loop (D8).
+    fn scope_row_of(&self, scope: &Scope) -> Option<WorkspaceId> {
+        (self.project.is_none() && !scope.workspace_id.as_uuid().is_nil())
+            .then_some(scope.workspace_id)
+    }
+
     /// `Ctrl+R`: re-index the current scope (D237). The reply prints the CLI's report line.
     fn reindex(&mut self, ctx: &Ctx<'_>) {
         let project_ids = self.projects(ctx.scope);
-        if project_ids.is_empty() {
+        let scope_row_of = self.scope_row_of(ctx.scope);
+        if project_ids.is_empty() && scope_row_of.is_none() {
             self.notice = Some(NO_PROJECTS);
             return;
         }
@@ -260,6 +271,7 @@ impl ConceptsSearch {
                 workspace_id: ctx.scope.workspace_id,
                 project_ids,
             },
+            scope_row_of,
         });
     }
 
@@ -268,7 +280,8 @@ impl ConceptsSearch {
     fn enter(&mut self, ctx: &Ctx<'_>) {
         let query = self.current(ctx.scope);
         if self.sent.as_ref() != Some(&query) {
-            if query.projects.is_empty() {
+            let scope_row_of = self.scope_row_of(ctx.scope);
+            if query.projects.is_empty() && scope_row_of.is_none() {
                 self.notice = Some(NO_PROJECTS);
             } else if query.text.is_empty() {
                 self.notice = Some(EMPTY_QUERY);
@@ -280,7 +293,10 @@ impl ConceptsSearch {
                 self.error = None;
                 self.why = false;
                 self.notice = None;
-                ctx.request(StoreRequest::SearchConcepts(query));
+                ctx.request(StoreRequest::SearchConcepts {
+                    query,
+                    scope_row_of,
+                });
             }
             return;
         }
@@ -749,6 +765,12 @@ mod tests {
             Self::over(Vec::new())
         }
 
+        /// This bench inside the `platform` workspace rather than the nil startup one.
+        fn in_platform(mut self) -> Self {
+            self.scope.workspace_id = ids::WORKSPACE_PLATFORM;
+            self
+        }
+
         fn over(projects: Vec<ProjectRef>) -> Self {
             Self {
                 scope: Scope {
@@ -863,7 +885,28 @@ mod tests {
             .take()
             .into_iter()
             .filter_map(|action| match action {
-                Action::Store(StoreRequest::SearchConcepts(query)) => Some(query),
+                Action::Store(StoreRequest::SearchConcepts { query, .. }) => Some(query),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `scope_row_of` of every search and index run the overlay emitted since the last call
+    /// (MOD-147 M4 D8), each with its projects.
+    fn scope_rows(bench: &Bench) -> Vec<(Vec<ProjectId>, Option<WorkspaceId>)> {
+        bench
+            .emit
+            .take()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::SearchConcepts {
+                    query,
+                    scope_row_of,
+                }) => Some((query.projects, scope_row_of)),
+                Action::Store(StoreRequest::IndexConcepts {
+                    scope,
+                    scope_row_of,
+                }) => Some((scope.project_ids, scope_row_of)),
                 _ => None,
             })
             .collect()
@@ -919,6 +962,57 @@ mod tests {
             .expect("a rounded box")
     }
 
+    /// MOD-147 M4 D9: in "all projects" mode a search and a `Ctrl+R` run also cover the
+    /// workspace's scope row; a project cycled to sends its own project alone.
+    #[test]
+    fn all_projects_send_the_workspaces_scope_row_and_a_cycled_project_does_not() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        let members = vec![ids::PROJECT_HTUI, ids::PROJECT_AGY];
+        bench.typed(&mut search, "tui");
+        bench.code(&mut search, KeyCode::Enter);
+        bench.ctrl(&mut search, 'r');
+        assert_eq!(
+            scope_rows(&bench),
+            [
+                (members.clone(), Some(ids::WORKSPACE_PLATFORM)),
+                (members, Some(ids::WORKSPACE_PLATFORM)),
+            ]
+        );
+
+        bench.ctrl(&mut search, 'p');
+        bench.code(&mut search, KeyCode::Enter);
+        bench.ctrl(&mut search, 'r');
+        assert_eq!(
+            scope_rows(&bench),
+            [
+                (vec![ids::PROJECT_HTUI], None),
+                (vec![ids::PROJECT_HTUI], None),
+            ]
+        );
+    }
+
+    /// MOD-147 M4 D9: a workspace with no member projects still has its scope row to search and
+    /// index, so nothing is refused.
+    #[test]
+    fn a_workspace_with_no_projects_still_sends_its_scope_row() {
+        let bench = Bench::empty().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "goals");
+        bench.code(&mut search, KeyCode::Enter);
+        bench.ctrl(&mut search, 'r');
+        assert_eq!(
+            scope_rows(&bench),
+            [
+                (Vec::new(), Some(ids::WORKSPACE_PLATFORM)),
+                (Vec::new(), Some(ids::WORKSPACE_PLATFORM)),
+            ]
+        );
+        assert!(!bench.render(&search).contains(NO_PROJECTS));
+    }
+
+    /// The nil startup workspace with no project: nothing to search, and the overlay says so
+    /// (MOD-147 M4 D9 keeps the refusal there).
     #[test]
     fn an_empty_scope_sends_nothing_and_says_so() {
         let bench = Bench::empty();
@@ -1422,7 +1516,7 @@ mod tests {
         assert!(
             matches!(
                 &emitted[..],
-                [Action::Store(StoreRequest::IndexConcepts { scope })]
+                [Action::Store(StoreRequest::IndexConcepts { scope, scope_row_of: None })]
                     if scope.project_ids == vec![ids::PROJECT_HTUI]
                         && scope.workspace_id == bench.scope.workspace_id
             ),

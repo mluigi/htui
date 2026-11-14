@@ -1019,12 +1019,21 @@ pub enum StoreRequest {
     SecretsTree(WorkspaceId),
     /// MOD-64 D231: a concepts search, served by `concepts_worker::ConceptsRuntime` on a task of its
     /// own (`R-NF-3`). Answered with [`StoreReply::Concepts`], never `Failed` (D232).
-    SearchConcepts(SearchQuery),
+    SearchConcepts {
+        /// What to search. The reply carries it back as it was sent.
+        query: SearchQuery,
+        /// MOD-147 M4 D8: `Some(ws)` also searches that workspace's scope row, resolved off the
+        /// loop (`vector_sync::workspace_search_scope`); `None` searches `query.projects` alone.
+        scope_row_of: Option<WorkspaceId>,
+    },
     /// MOD-64 D237: `Indexer::sync` over `scope`'s projects, on the runtime's task. Answered with
     /// [`StoreReply::Concepts`].
     IndexConcepts {
         /// The workspace and the projects to index.
         scope: Scope,
+        /// MOD-147 M4 D8: `Some(ws)` also indexes that workspace's scope row, resolved off the
+        /// loop; `None` indexes `scope` alone.
+        scope_row_of: Option<WorkspaceId>,
     },
     /// MOD-160 D9: a model-free look at this process's Qdrant, served by
     /// `concepts_worker::ConceptsRuntime` on a task of its own (`R-NF-3`), never on the loop.
@@ -1503,7 +1512,7 @@ impl StoreRequest {
             Self::SecretsTree(..) => "secrets_tree",
             // The three of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241,
             // MOD-160 D9).
-            Self::SearchConcepts(_) => "search_concepts",
+            Self::SearchConcepts { .. } => "search_concepts",
             Self::IndexConcepts { .. } => "index_concepts",
             Self::ProbeQdrant => "probe_qdrant",
             // Blueprint D209: one name per verb, `run_worker::ORCH_NAMES`.
@@ -2733,7 +2742,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
         // belongs to a caller with none (the harness default), and is answered in the overlay's
         // own reply (D232).
-        StoreRequest::SearchConcepts(query) => {
+        StoreRequest::SearchConcepts { query, .. } => {
             StoreReply::Concepts(Box::new(ConceptsReply::Hits {
                 query: query.clone(),
                 outcome: Err(concepts_worker::NOT_AVAILABLE.to_owned()),
@@ -3706,7 +3715,7 @@ pub(crate) fn spawn_with_concepts(
                         // every item: both are tasks of the concepts runtime, and
                         // `Deferred => continue` is the whole of `R-NF-3`. A Qdrant probe
                         // (MOD-160 D9) may wait the probe's 3 s bound on a dead Qdrant: the same.
-                        StoreRequest::SearchConcepts(_)
+                        StoreRequest::SearchConcepts { .. }
                         | StoreRequest::IndexConcepts { .. }
                         | StoreRequest::ProbeQdrant => {
                             match concepts.serve(&backend, &tx, &envelope) {
@@ -4190,7 +4199,13 @@ mod tests {
         );
         let query = crate::concepts::query("anything", scope.project_ids, false, 10);
         for (seq, request) in [
-            (1, StoreRequest::SearchConcepts(query.clone())),
+            (
+                1,
+                StoreRequest::SearchConcepts {
+                    query: query.clone(),
+                    scope_row_of: None,
+                },
+            ),
             (2, StoreRequest::BoxInfo),
         ] {
             tx.send(RequestEnvelope {

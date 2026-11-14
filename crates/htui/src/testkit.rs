@@ -400,7 +400,7 @@ impl Harness {
                     // one `store_worker::serve` answers them `NOT_AVAILABLE` (D244), and a Qdrant
                     // probe "nothing probed" (MOD-160 D9).
                     (
-                        StoreRequest::SearchConcepts(_)
+                        StoreRequest::SearchConcepts { .. }
                         | StoreRequest::IndexConcepts { .. }
                         | StoreRequest::ProbeQdrant,
                         _,
