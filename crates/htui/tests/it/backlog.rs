@@ -16,7 +16,9 @@ use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
-use htui::ui::tabs::backlog::BacklogTab;
+use htui::ui::shell::{Preset, TabLayout};
+use htui::ui::state_file::{UiState, UiStore};
+use htui::ui::tabs::backlog::{BACKLOG_LAYOUT, BacklogTab};
 use htui::ui::tabs::registry::Tab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
@@ -64,6 +66,31 @@ async fn backlog() -> Harness {
         // and `store_worker::spawn` always has. Without one here every selection would answer
         // `Failed` and take the status line, which is a harness artefact and not a shell state.
         .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    harness
+}
+
+/// [`backlog`] laid out `ide` (the list beside the detail, no activity pane): for a frame whose
+/// subject the default `ide_activity` layout's shorter detail pane cuts off (MOD-122 M3 review).
+async fn backlog_ide() -> Harness {
+    let store = UiStore::memory();
+    let mut state = UiState::default();
+    state.layouts.insert(
+        BacklogTab::ID.0.to_owned(),
+        TabLayout {
+            preset: Preset::Ide,
+            ..BACKLOG_LAYOUT
+        },
+    );
+    store.save(&state).expect("a memory store saves");
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_ui_store(store);
     harness.drive_to_end().await;
     harness.app().update(Action::SetScope {
         workspace: workspace("platform").await,
@@ -343,6 +370,8 @@ async fn j_k_g_and_shift_g_move_the_selection() {
     );
 }
 
+/// Laid out `ide` ([`backlog_ide`]): the default layout's detail pane is too short for the body
+/// and the prompt's table, the frames' subject.
 #[tokio::test]
 async fn the_six_sub_tabs_render_the_selected_item() {
     for (steps, name) in [
@@ -356,7 +385,7 @@ async fn the_six_sub_tabs_render_the_selected_item() {
         // enough to read and asserts its bytes.
         (5, "detail_prompt"),
     ] {
-        let mut harness = backlog().await;
+        let mut harness = backlog_ide().await;
         down(&mut harness, TO_FEAT_1).await;
         sub_tab(&mut harness, steps);
         insta::assert_snapshot!(name, harness.render());
@@ -870,6 +899,35 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     );
     insta::assert_snapshot!("runs_closeout_typed", typed);
     assert_eq!(harness.app().status, None);
+    for frame in [&warn, &typed] {
+        assert_dialog_rows_are_clear(frame);
+    }
+}
+
+/// Review L7: every row the close-out dialog spans holds the box alone across the detail pane:
+/// no run row shows through beside it.
+fn assert_dialog_rows_are_clear(frame: &str) {
+    let lines: Vec<&str> = frame.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains("\u{256d} Close out"))
+        .unwrap_or_else(|| panic!("the dialog is drawn:\n{frame}"));
+    let bottom = top
+        + lines[top..]
+            .iter()
+            .position(|line| line.contains("\u{2570} "))
+            .unwrap_or_else(|| panic!("the dialog's bottom border:\n{frame}"));
+    for line in &lines[top..=bottom] {
+        let (_, detail) = line
+            .split_once("\u{2502}\u{2502}")
+            .unwrap_or_else(|| panic!("the detail pane on {line:?}:\n{frame}"));
+        let inside = detail.strip_suffix('\u{2502}').unwrap_or(detail).trim();
+        let edges = ['\u{256d}', '\u{2570}', '\u{2502}', '\u{256e}', '\u{256f}'];
+        assert!(
+            inside.starts_with(edges) && inside.ends_with(edges),
+            "the box alone on {line:?}:\n{frame}"
+        );
+    }
 }
 
 /// MOD-39 plan P13 through the whole tab: the engine's preview starts an `open` item's picker on
@@ -1233,10 +1291,11 @@ async fn an_action_key_in_flow_answers_as_in_the_list() {
 }
 
 /// MOD-72 D1, D5, D6: `FEAT-1`'s plan step recorded the fixture's one tool call, a `read`, so its
-/// node's third line is `⚒ read×1`; no other node draws a chip.
+/// node's third line is `⚒ read×1`; no other node draws a chip. Laid out `ide` ([`backlog_ide`]):
+/// the default layout's detail pane is too short for the flow's `implement` node.
 #[tokio::test]
 async fn the_flow_draws_the_plan_step_s_tool_call_as_a_chip() {
-    let mut harness = backlog().await;
+    let mut harness = backlog_ide().await;
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
     past_the_rework_run(&mut harness);

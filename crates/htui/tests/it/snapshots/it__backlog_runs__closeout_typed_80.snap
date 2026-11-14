@@ -7,11 +7,11 @@ Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  
 │ ▾ Platform (0)                           ││kind   status      box          st│
 │ ▾ htui (8)                               ││mode                            fi│
 │▌ ANA-1    ● done       Data model, box r…││graph  ● done      DESKTOP-HTUI 09│
-│  ANA-2    ○ open       Orchestrator step…││ma╭ Close out ─────────────────╮09│
-│  CLEAN-1  ✗ failed     Drop the legacy m…││▸ │close ANA-1 as done · 1 run │  │
-│  FEAT-1   ◐ running    TUI scaffold      ││  │· 0 commit rows · summary   │e/│
+│  ANA-2    ○ open       Orchestrator step…││  ╭ Close out ─────────────────╮  │
+│  CLEAN-1  ✗ failed     Drop the legacy m…││  │close ANA-1 as done · 1 run │  │
+│  FEAT-1   ◐ running    TUI scaffold      ││  │· 0 commit rows · summary   │  │
 │  FEAT-2   ⊘ blocked    Agent driver and …││  │v2                          │  │
-│  FEAT-3   ◌ queued     Postgres store an…││  │type ANA-1 to close it:     │ef│
+│  FEAT-3   ◌ queued     Postgres store an…││  │type ANA-1 to close it:     │  │
 │  FIX-1    ✓ closed     Terminal left raw…││  │                            │  │
 │  TOOL-1   ⚠ needs you  CI matrix for the…││  │ANA-1                       │  │
 │ ▾ agy (3)                                ││  ╰ Enter close · Esc cancel ──╯  │

@@ -10,7 +10,7 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │  ANA-2    ○ open       Orchestrator step graphs and…││manual                          09-02 17:00│
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▸ research        ● done            —  1h00│
 │  FEAT-1   ◐ running    TUI scaffold                 ││  ╭ Close out ──────────────────────────╮  │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  │close ANA-1 as duplicate · 1 run · 0 │00│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  │close ANA-1 as duplicate · 1 run · 0 │  │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││  │commit rows · summary v2             │  │
 │  FIX-1    ✓ closed     Terminal left raw after panic││  │duplicate of which item? type its    │  │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││  │key:                                 │  │
