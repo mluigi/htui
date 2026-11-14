@@ -13,8 +13,8 @@ use crate::embed::{DenseEmbedder, EmbedderIdentity};
 use crate::qdrant_settings::QdrantSettings;
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentId, ItemId, ItemKindId, Priority, ProjectId, RequirementId, RequirementState,
-    Resolution, Status,
+    DocumentId, IndexedCollection, ItemId, ItemKindId, Priority, ProjectId, RequirementId,
+    RequirementState, Resolution, Status,
 };
 use htui_core::store::StoreError;
 use qdrant_client::qdrant::{
@@ -34,12 +34,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// The collection name. Not versioned by name (MOD-159): a payload change bumps
+/// The one shared collection every htui wrote before MOD-159 gave each workspace its own
+/// ([`IndexedCollection`]). Named only to drop it (the `Global` lease's holder does, plan D10)
+/// and by tests and the bench. Collections are not versioned by name: a payload change bumps
 /// [`PAYLOAD_SCHEMA`], and `connect` drops and recreates a collection stamped with an older one
 /// (and refuses one a newer htui stamped); the next sync refills it, since the whole index can be
-/// rebuilt from Postgres. `v2` is a historical
-/// suffix (MOD-50 D222 added `resolution` and requirement points under a new name).
-pub const COLLECTION: &str = "htui_concepts_v2";
+/// rebuilt from Postgres.
+pub const LEGACY_COLLECTION: &str = "htui_concepts_v2";
 /// Name of the dense vector.
 pub const DENSE: &str = "dense";
 /// Name of the sparse (BM25) vector.
@@ -880,7 +881,8 @@ impl<E> std::fmt::Debug for QdrantStore<E> {
 }
 
 impl<E: DenseEmbedder> QdrantStore<E> {
-    /// Connects to [`COLLECTION`], creating it and its payload indexes on first use.
+    /// Connects to `collection` ([`IndexedCollection::name`]), creating it and its payload indexes
+    /// on first use.
     ///
     /// # Errors
     /// [`StoreError::Backend`] when Qdrant cannot be reached, and `embedder mismatch` when the
@@ -889,11 +891,18 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     /// recording this embedder under an older payload stamp (or none) is dropped and recreated
     /// empty (MOD-144 Decision B); the next `Indexer::sync` refills it. A newer payload stamp is
     /// `embedder mismatch` too (R1): a newer htui wrote it, and it is never dropped.
-    pub async fn connect(settings: &QdrantSettings, embedder: E) -> Result<Self, StoreError> {
-        Self::connect_to(settings, embedder, COLLECTION).await
+    pub async fn connect(
+        settings: &QdrantSettings,
+        embedder: E,
+        collection: &IndexedCollection,
+    ) -> Result<Self, StoreError> {
+        Self::connect_to(settings, embedder, &collection.name()).await
     }
 
-    /// As [`connect`](Self::connect), to a named collection (tests use a throwaway one).
+    /// As [`connect`](Self::connect), to a collection by name (tests use a throwaway one).
+    ///
+    /// # Errors
+    /// As [`connect`](Self::connect).
     pub async fn connect_to(
         settings: &QdrantSettings,
         embedder: E,
@@ -904,7 +913,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         Ok(store)
     }
 
-    /// Opens [`COLLECTION`] for reading only (MOD-92 G8): `Ok(None)` when it does not exist.
+    /// Opens `collection` for reading only (MOD-92 G8): `Ok(None)` when it does not exist.
     /// Creates no collection, no payload index, and stamps nothing: an unstamped collection of the
     /// right width is searched as it is (what `connect` would have stamped). The width and embedder
     /// check is `connect`'s own.
@@ -915,11 +924,12 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     pub async fn open_existing(
         settings: &QdrantSettings,
         embedder: E,
+        collection: &IndexedCollection,
     ) -> Result<Option<Self>, StoreError> {
-        Self::open_existing_to(settings, embedder, COLLECTION).await
+        Self::open_existing_to(settings, embedder, &collection.name()).await
     }
 
-    /// As [`open_existing`](Self::open_existing), on a named collection (tests use a throwaway one).
+    /// As [`open_existing`](Self::open_existing), on a collection by name (tests use a throwaway one).
     ///
     /// # Errors
     /// As [`open_existing`](Self::open_existing).
@@ -1256,16 +1266,19 @@ impl std::fmt::Debug for ExistingCollection {
 }
 
 impl ExistingCollection {
-    /// [`COLLECTION`], when it exists; `Ok(None)` when it does not. Creates nothing.
+    /// `collection`, when it exists; `Ok(None)` when it does not. Creates nothing.
     ///
     /// # Errors
     /// [`StoreError::Backend`] when Qdrant cannot be reached, and [`QDRANT_REFUSED`]
     /// ([`is_qdrant_refused`]) when it refuses the API key.
-    pub async fn find(settings: &QdrantSettings) -> Result<Option<Self>, StoreError> {
-        Self::find_in(settings, COLLECTION).await
+    pub async fn find(
+        settings: &QdrantSettings,
+        collection: &IndexedCollection,
+    ) -> Result<Option<Self>, StoreError> {
+        Self::find_in(settings, &collection.name()).await
     }
 
-    /// As [`find`](Self::find), for a named collection (tests use a throwaway one).
+    /// As [`find`](Self::find), for a collection by name (tests use a throwaway one).
     ///
     /// # Errors
     /// As [`find`](Self::find).
@@ -1315,6 +1328,63 @@ impl ExistingCollection {
             .await
             .map(drop)
     }
+}
+
+/// Every workspace collection Qdrant holds (MOD-159 D1, D9): the `htui_ws_<uuid>` names it lists,
+/// parsed by [`IndexedCollection::parse`], in name order. `htui_global`, the legacy collection
+/// and any other name are left out. Loads no model and creates nothing.
+///
+/// # Errors
+/// [`StoreError::Backend`] when Qdrant cannot be reached, and [`QDRANT_REFUSED`]
+/// ([`is_qdrant_refused`]) when it refuses the API key.
+pub async fn workspace_collections(
+    settings: &QdrantSettings,
+) -> Result<Vec<IndexedCollection>, StoreError> {
+    let listed = client(settings)?
+        .list_collections()
+        .await
+        .map_err(|e| qdrant("list collections", e))?;
+    Ok(workspace_collections_among(
+        listed.collections.iter().map(|c| c.name.as_str()),
+    ))
+}
+
+/// The workspace collections among `names`, sorted by name ([`workspace_collections`]).
+fn workspace_collections_among<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<IndexedCollection> {
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter_map(IndexedCollection::parse)
+        .filter(|collection| matches!(collection, IndexedCollection::Workspace(_)))
+        .collect()
+}
+
+/// Drops the collection `name` (MOD-159 D10: the legacy one): `true` when it existed and this
+/// call dropped it, `false` when there was none.
+///
+/// # Errors
+/// [`StoreError::Backend`] when Qdrant cannot be reached or refuses the drop, and
+/// [`QDRANT_REFUSED`] ([`is_qdrant_refused`]) when it refuses the API key.
+pub async fn drop_collection_named(
+    settings: &QdrantSettings,
+    name: &str,
+) -> Result<bool, StoreError> {
+    let client = client(settings)?;
+    let exists = client
+        .collection_exists(name)
+        .await
+        .map_err(|e| qdrant("collection exists", e))?;
+    if !exists {
+        return Ok(false);
+    }
+    let dropped = client
+        .delete_collection(name)
+        .await
+        .map_err(|e| qdrant("delete collection", e))?;
+    Ok(dropped.result)
 }
 
 /// MOD-160 D9: what a model-free look at Qdrant found ([`probe`]). Every sentence is a
@@ -1621,6 +1691,28 @@ mod tests {
             document,
             text: "MOD-34 Qdrant related concepts search".into(),
         }
+    }
+
+    /// MOD-159 D1: only `htui_ws_<uuid>` names are workspace collections, sorted by name.
+    #[test]
+    fn workspace_collections_are_the_parsed_workspace_names_in_name_order() {
+        let a = IndexedCollection::Workspace(htui_core::model::WorkspaceId::from_uuid(
+            Uuid::from_u128(1),
+        ));
+        let b = IndexedCollection::Workspace(htui_core::model::WorkspaceId::from_uuid(
+            Uuid::from_u128(2),
+        ));
+        let (a_name, b_name) = (a.name(), b.name());
+        let names = [
+            b_name.as_str(),
+            "htui_global",
+            LEGACY_COLLECTION,
+            "htui_test_0192f3a45b6c7d8e9f0123456789abcd",
+            "htui_ws_0192F3A45B6C7D8E9F0123456789ABCD",
+            a_name.as_str(),
+        ];
+        assert_eq!(workspace_collections_among(names), [a, b]);
+        assert_eq!(workspace_collections_among([]), []);
     }
 
     fn requirement(state: RequirementState) -> ConceptPoint {
