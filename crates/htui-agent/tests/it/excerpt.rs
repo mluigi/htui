@@ -1066,6 +1066,7 @@ fn repo_row(name: &str, is_primary: bool) -> Repo {
         is_primary,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        integrate: None,
     }
 }
 

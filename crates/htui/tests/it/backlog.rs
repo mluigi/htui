@@ -1227,6 +1227,7 @@ fn bare_snapshot() -> GraphSnapshot {
         capture: None,
         source: None,
         edges: Vec::new(),
+        integrate: std::collections::BTreeMap::new(),
     }
 }
 

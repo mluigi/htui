@@ -408,6 +408,7 @@ mod tests {
             is_primary: false,
             created_at: at,
             updated_at: at,
+            integrate: None,
         }
     }
 

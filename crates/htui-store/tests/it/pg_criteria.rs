@@ -1284,6 +1284,7 @@ fn race_run(item: ItemId) -> NewRun {
             capture: None,
             source: None,
             edges: Vec::new(),
+            integrate: std::collections::BTreeMap::new(),
         },
         repo_scope: Vec::new(),
         queued_at: Utc::now(),

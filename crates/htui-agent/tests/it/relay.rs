@@ -123,6 +123,7 @@ fn snapshot() -> GraphSnapshot {
         capture: None,
         source: None,
         edges: Vec::new(),
+        integrate: BTreeMap::new(),
     }
 }
 

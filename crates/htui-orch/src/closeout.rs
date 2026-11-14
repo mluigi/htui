@@ -373,6 +373,7 @@ mod tests {
             is_primary: n == 1,
             created_at: at(1, 9),
             updated_at: at(1, 9),
+            integrate: None,
         }
     }
 

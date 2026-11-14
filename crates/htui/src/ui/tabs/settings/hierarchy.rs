@@ -1436,6 +1436,8 @@ impl HierarchySection {
                         default_branch: Some(editor.text(2)),
                         // Never the flag: `p` is its only writer (D12).
                         is_primary: None,
+                        // MOD-133: the repo form does not edit the mode yet (M2's).
+                        integrate: None,
                     },
                 }
             }
