@@ -20,7 +20,7 @@ threshold PRD verdict (the design doc already filled the PRD's role).
 - **`scripts/hr`** (bash + gum, every verb also plain-argument): `build`, `up`, `attach`, `ls`,
   `collect [--merge]`, `down [--purge]`, `gc`. Work leaves a sandbox only when the maintainer runs
   `collect` on the host (fetch into a temporary ref, fast-forward check, then `update-ref`; `--merge`
-  shows the diffstat of `.claude`/`scripts`/`docker`/`CLAUDE.md`/… and validates with the pre-merge
+  shows the diffstat of `.claude`/`scripts`/`docker`/`AGENTS.md`/… and validates with the pre-merge
   validator). Host-side git never reads a clone's worktree outside a throwaway `--network none`
   container. The run registry is host-only (`HR_RUNS`) and validated field by field.
 - **`scripts/hr-mint`** — cross-run ID leases under `flock`: the minted ID is the max of the run's
