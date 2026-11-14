@@ -130,10 +130,10 @@ pub use hierarchy::{
     WorkspaceProject, WorkspaceSummary, workspace_folder,
 };
 pub use ids::{
-    AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, MemoryEntryId,
-    NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
-    RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId, SkillBindingId, SkillId,
-    StepGraphId, StepId, UserId, WorkspaceId,
+    AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,
+    MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId,
+    RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
+    SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
@@ -147,7 +147,10 @@ pub use kind::{
     PhasePatch, PlanScope, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, Split,
     StepGraph, StepGraphEdge, StepGraphPatch, StepGraphPhase,
 };
-pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
+pub use link::{
+    ArtifactLinkKind, DocumentLink, DocumentRef, ItemArtifactLink, ItemLink, LinkEdge, LinkGraph,
+    LinkKind, LinkNode, LinkedDocument, ProposeDocumentLink, UpstreamEntry, WithdrawDocumentLink,
+};
 pub use memory::{
     MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,
     MemoryEntry, MemoryEvidence, MemoryKind, MemoryPatch, MemoryRevision, MemorySource,
@@ -333,6 +336,34 @@ mod tests {
                 "duplicates",
                 "implements",
             ],
+        );
+    }
+
+    /// `0034_item_artifact_link.sql`'s `chk_item_artifact_link_kind` (MOD-150 M3 D1), and each
+    /// kind maps to the `LinkKind` of its name and back.
+    #[test]
+    fn artifact_link_kind_matches_check_list() {
+        check_enum(ArtifactLinkKind::ALL, &["origin", "relates", "implements"]);
+        for kind in ArtifactLinkKind::ALL {
+            assert_eq!(kind.as_link_kind().as_str(), kind.as_str());
+            assert_eq!(
+                ArtifactLinkKind::from_link_kind(kind.as_link_kind()),
+                Some(*kind)
+            );
+        }
+        let refused: Vec<LinkKind> = LinkKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| ArtifactLinkKind::from_link_kind(*kind).is_none())
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                LinkKind::BlockedBy,
+                LinkKind::Supersedes,
+                LinkKind::Parent,
+                LinkKind::Duplicates
+            ]
         );
     }
 

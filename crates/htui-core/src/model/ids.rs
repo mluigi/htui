@@ -133,4 +133,6 @@ id_newtype!(
     MemoryEntryId,
     /// `run_plan.id` (MOD-139 plan D1, P-1): one revision of a run's plan.
     RunPlanId,
+    /// `item_artifact_link.id` (MOD-150 M3).
+    ArtifactLinkId,
 );

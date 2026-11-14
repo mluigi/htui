@@ -4,7 +4,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::ids::{ItemId, ProjectId, StepId};
+use uuid::Uuid;
+
+use crate::model::ids::{ArtifactLinkId, DocumentId, ItemId, ProjectId, StepId};
 use crate::model::item::{ItemState, Status};
 use crate::model::run::RunStatus;
 
@@ -88,6 +90,145 @@ pub struct WithdrawLink {
     pub step: StepId,
 }
 
+str_enum!(
+    /// `item_artifact_link.kind` (MOD-150 M3, ANA-35 §7.9): the kinds a link to a document (or,
+    /// from MOD-114 (3), an attachment) may take, a subset of [`LinkKind`]'s.
+    ArtifactLinkKind {
+        /// `from` was spawned by the document.
+        Origin => "origin",
+        /// Untyped relation.
+        Relates => "relates",
+        /// `from` carries out the document's decision or specification.
+        Implements => "implements",
+    }
+);
+
+impl ArtifactLinkKind {
+    /// The [`LinkKind`] of the same name.
+    #[must_use]
+    pub const fn as_link_kind(self) -> LinkKind {
+        match self {
+            Self::Origin => LinkKind::Origin,
+            Self::Relates => LinkKind::Relates,
+            Self::Implements => LinkKind::Implements,
+        }
+    }
+
+    /// The artifact kind of the same name; `None` for a kind a link to a document cannot take.
+    #[must_use]
+    pub const fn from_link_kind(kind: LinkKind) -> Option<Self> {
+        match kind {
+            LinkKind::Origin => Some(Self::Origin),
+            LinkKind::Relates => Some(Self::Relates),
+            LinkKind::Implements => Some(Self::Implements),
+            LinkKind::BlockedBy
+            | LinkKind::Supersedes
+            | LinkKind::Parent
+            | LinkKind::Duplicates => None,
+        }
+    }
+}
+
+/// A row of `item_artifact_link` (MOD-150 M3 D1): a link from an item to one version of a
+/// document (or, from MOD-114 (3), an attachment). Removal is a tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemArtifactLink {
+    /// `item_artifact_link.id`.
+    pub id: ArtifactLinkId,
+    /// `item_artifact_link.from_item_id`.
+    pub from_item_id: ItemId,
+    /// `item_artifact_link.kind`.
+    pub kind: ArtifactLinkKind,
+    /// `item_artifact_link.to_document_id`: the pinned version's row.
+    pub to_document_id: Option<DocumentId>,
+    /// `item_artifact_link.to_attachment_id`. A bare `Uuid`, waiving the ids rule, until
+    /// MOD-114 (3) mints `AttachmentId`; nothing writes it in M3.
+    pub to_attachment_id: Option<Uuid>,
+    /// `item_artifact_link.proposed_by_step_id`; `None` once the step is gone (`SET NULL`).
+    pub proposed_by_step_id: Option<StepId>,
+    /// `item_artifact_link.created_at`.
+    pub created_at: DateTime<Utc>,
+    /// `item_artifact_link.updated_at`.
+    pub updated_at: DateTime<Utc>,
+    /// `item_artifact_link.deleted_at`: the tombstone.
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// How a writer names a document (MOD-150 M3 D2): its owner, its kind and, optionally, its
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentRef {
+    /// An item key (bare: the step's project; or `slug:KEY`, `@ws:KEY`) for an item's document,
+    /// else a project slug (a workspace's scope row is `@ws`) for an owner document.
+    pub owner: String,
+    /// `document.kind`.
+    pub kind: String,
+    /// `document.version`; `None` is the latest at write.
+    pub version: Option<i32>,
+}
+
+/// Arguments of `WriteStore::propose_document_link` (MOD-150 M3 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeDocumentLink {
+    /// `item_artifact_link.from_item_id`: the proposing step's own item.
+    pub from: ItemId,
+    /// `item_artifact_link.kind`.
+    pub kind: ArtifactLinkKind,
+    /// The document, resolved in the write's transaction (D3).
+    pub to: DocumentRef,
+    /// The proposing step, written to `item_artifact_link.proposed_by_step_id`.
+    pub step: StepId,
+}
+
+/// Arguments of `WriteStore::withdraw_document_link` (MOD-150 M3 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawDocumentLink {
+    /// `item_artifact_link.from_item_id`: the withdrawing step's own item.
+    pub from: ItemId,
+    /// `item_artifact_link.kind`.
+    pub kind: ArtifactLinkKind,
+    /// The document; without a version, whichever version the live link pins.
+    pub to: DocumentRef,
+    /// The withdrawing step; the link must have been proposed by a step of its run.
+    pub step: StepId,
+}
+
+/// One document an item links to, as the graph reads it (MOD-150 M3 D2). Not a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedDocument {
+    /// `item_artifact_link.from_item_id`.
+    pub from_item_id: ItemId,
+    /// `item_artifact_link.kind`.
+    pub kind: ArtifactLinkKind,
+    /// `document.id`, the pinned version's row.
+    pub document_id: DocumentId,
+    /// `document.project_id`.
+    pub project_id: ProjectId,
+    /// `project.slug` of that project.
+    pub project_slug: String,
+    /// `document.item_id`; `None` for an owner document.
+    pub owner_item: Option<ItemId>,
+    /// The owner item's bare `item.key`; `None` for an owner document.
+    pub owner_key: Option<String>,
+    /// `document.kind`.
+    pub doc_kind: String,
+    /// The pinned `document.version`.
+    pub version: i32,
+    /// The latest version of the same owner and kind, at read.
+    pub latest_version: i32,
+    /// `document.title` of the pinned version.
+    pub title: String,
+}
+
+/// What a document link write answers (MOD-150 M3 D2): the row and the document it pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentLink {
+    /// The `item_artifact_link` row as written.
+    pub link: ItemArtifactLink,
+    /// The document the row pins.
+    pub document: LinkedDocument,
+}
+
 /// One item reached by a traversal, with the hop distance from the root. Not a table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkNode {
@@ -140,6 +281,11 @@ pub struct LinkGraph {
     pub nodes: Vec<LinkNode>,
     /// Edges between the reached items.
     pub edges: Vec<LinkEdge>,
+    /// MOD-150 M3 D2: the live document links of every reached item, in
+    /// [`sort_documents`](Self::sort_documents)' order. Documents are leaves: the walk never
+    /// continues through one.
+    #[serde(default)]
+    pub documents: Vec<LinkedDocument>,
 }
 
 impl LinkGraph {
@@ -147,6 +293,28 @@ impl LinkGraph {
     #[must_use]
     pub fn node(&self, id: ItemId) -> Option<&LinkNode> {
         self.nodes.iter().find(|node| node.item_id == id)
+    }
+
+    /// MOD-150 M3 D2: orders `documents` by `(from_item_id` in node order, `kind`,
+    /// `project_slug`, `owner_key`, `doc_kind`, `version)`, the texts by bytes. Every backend
+    /// runs this after its own query, so the order never depends on a collation.
+    pub fn sort_documents(&mut self) {
+        let nodes = &self.nodes;
+        let at = |id: ItemId| nodes.iter().position(|node| node.item_id == id);
+        self.documents.sort_by(|a, b| {
+            at(a.from_item_id)
+                .cmp(&at(b.from_item_id))
+                .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
+                .then_with(|| a.project_slug.as_bytes().cmp(b.project_slug.as_bytes()))
+                .then_with(|| {
+                    a.owner_key
+                        .as_deref()
+                        .map(str::as_bytes)
+                        .cmp(&b.owner_key.as_deref().map(str::as_bytes))
+                })
+                .then_with(|| a.doc_kind.as_bytes().cmp(b.doc_kind.as_bytes()))
+                .then_with(|| a.version.cmp(&b.version))
+        });
     }
 }
 
