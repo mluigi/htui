@@ -1479,8 +1479,10 @@ async fn item_link_to_document_outside_reach_is_out_of_scope() {
     assert!(fx.linked_documents().await.is_empty());
 }
 
-/// R1 M1: whether an owner outside the reach exists, or has the kind or version named, never
-/// shows: each refusal is the same sentence, the agent's label aside, on `add` and `remove`.
+/// R1 M1: on `add`, whether an owner outside the reach exists, or has the kind or version named,
+/// never shows: each refusal is the same sentence, the agent's label aside. On `remove` only an
+/// owner that resolves to nothing reads out of scope; an existing owner with no live link reads
+/// `not found: item_artifact_link`, as a withdraw checks no reach (`withdraw_link`, MOD-147 edge 9).
 #[tokio::test]
 async fn item_link_to_document_outside_reach_never_says_what_exists() {
     let fx = Leased::ana_2().await;
