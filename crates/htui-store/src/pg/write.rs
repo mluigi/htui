@@ -2891,7 +2891,8 @@ impl WriteStore for PgStore {
                 INSERT INTO item_key_counter (project_id, prefix, last_value)
                 SELECT $2, k.prefix, 1 FROM item_kind k WHERE k.id = $3 AND k.project_id = $2
                    AND ($12::uuid IS NULL OR EXISTS (
-                           SELECT 1 FROM target t WHERE t.id = $12 AND t.retired_at IS NULL))
+                           SELECT 1 FROM target t WHERE t.id = $12 AND t.retired_at IS NULL
+                            FOR SHARE))
                 ON CONFLICT (project_id, prefix)
                 DO UPDATE SET last_value = item_key_counter.last_value + 1
                 RETURNING prefix, last_value
@@ -2955,15 +2956,23 @@ impl WriteStore for PgStore {
             .item_kind(new.kind_id)
             .await?
             .is_some_and(|kind| kind.project_id == new.project_id);
-        if kind_held
-            && let Some(target) = new.target_id
+        if !kind_held {
+            return Err(StoreError::Constraint(kind_not_in_project(
+                new.kind_id,
+                new.project_id,
+            )));
+        }
+        if let Some(target) = new.target_id
             && let Some(refusal) = self.item_target_refusal(target).await?
         {
             return Err(StoreError::Constraint(refusal));
         }
-        Err(StoreError::Constraint(kind_not_in_project(
-            new.kind_id,
-            new.project_id,
+        // The kind and the target both read clean, so no guard of the `INSERT … SELECT` explains
+        // the zero rows: a backend fault, not a rule.
+        Err(StoreError::Backend(format!(
+            "item `{}` refused a mint whose kind and target read clean: no rule of §4.2 can \
+             produce this",
+            new.id
         )))
     }
 
@@ -3016,7 +3025,8 @@ impl WriteStore for PgStore {
                            SELECT 1 FROM item_kind k
                             WHERE k.id = $5 AND k.project_id = item.project_id))
                    AND ($15::uuid IS NULL OR EXISTS (
-                           SELECT 1 FROM target t WHERE t.id = $15 AND t.retired_at IS NULL))
+                           SELECT 1 FROM target t WHERE t.id = $15 AND t.retired_at IS NULL
+                            FOR SHARE))
                 RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,
                           priority, required_tags, touched_paths, step_graph_id, target_id,
                           version, created_by, created_at, updated_at, closed_at, resolution
@@ -4215,7 +4225,6 @@ impl WriteStore for PgStore {
         let name = DEFAULT_TARGET_KEY;
         let value = target.map(DefaultTarget::value);
         let landed: Option<DateTime<Utc>> = match (&value, expected) {
-            (None, None) => unreachable!("refused before the transaction"),
             (Some(value), None) => sqlx::query_scalar!(
                 r#"
                         INSERT INTO app_setting (key, value) VALUES ($1, $2)
@@ -4241,17 +4250,26 @@ impl WriteStore for PgStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(map_sqlx)?,
-            (None, Some(token)) => sqlx::query_scalar!(
-                r#"
+            (None, expected) => {
+                // Refused before the transaction too; answered here as well, so no store path
+                // can panic on it.
+                let Some(token) = expected else {
+                    return Err(StoreError::Constraint(
+                        DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN.to_owned(),
+                    ));
+                };
+                sqlx::query_scalar!(
+                    r#"
                     DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
                     RETURNING updated_at AS "updated_at!"
                     "#,
-                name,
-                token,
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?,
+                    name,
+                    token,
+                )
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?
+            }
         };
         tx.commit().await.map_err(map_sqlx)?;
         match landed {

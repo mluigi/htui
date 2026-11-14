@@ -15470,3 +15470,121 @@ async fn a_level_set_behind_a_retire_is_refused() {
     );
     db.drop_db().await;
 }
+
+/// MOD-130 M1 R1 (blueprint B7): an item writer naming a target reads it `FOR SHARE`, so an
+/// `update_item` or a `mint_item` that waits behind a retire holding the target's row lock sees
+/// the retire and answers `target_retired`, never storing a retired target.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_write_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let kind = race_kind(&db.pool).await;
+    let before = db
+        .store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("read must not fail")
+        .expect("the fixture item exists");
+    let (edited, version) = (before.id, before.version);
+
+    for writer in ["update_item", "mint_item"] {
+        let name = format!("racing {writer}");
+        let target = db
+            .store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: name.clone(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("create a target");
+
+        // The retire's transaction, held open with the row locked as `retire_target` locks it.
+        let mut retire = PgConnection::connect(&db.url)
+            .await
+            .expect("the retiring connection");
+        sqlx::query("BEGIN")
+            .execute(&mut retire)
+            .await
+            .expect("begin");
+        sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+            .bind(target.id.as_uuid())
+            .execute(&mut retire)
+            .await
+            .expect("lock the target");
+        sqlx::query("UPDATE target SET retired_at = now() WHERE id = $1")
+            .bind(target.id.as_uuid())
+            .execute(&mut retire)
+            .await
+            .expect("retire it");
+
+        let store = db.store.clone();
+        let item = ItemId::new();
+        let write = tokio::spawn(async move {
+            if writer == "update_item" {
+                store
+                    .update_item(
+                        edited,
+                        version,
+                        ItemPatch {
+                            target_id: Some(Some(target.id)),
+                            author_id: ids::USER,
+                            box_id: Some(ids::BOX),
+                            reason: "pinned".to_owned(),
+                            ..ItemPatch::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                store
+                    .mint_item(NewItem {
+                        id: item,
+                        target_id: Some(target.id),
+                        ..race_item(kind, "racing mint")
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !write.is_finished(),
+            "the {writer} waits on the retire's row lock"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut retire)
+            .await
+            .expect("commit the retire");
+
+        match write.await.expect("the writer task") {
+            Err(htui_core::store::StoreError::Constraint(sentence)) => {
+                assert_eq!(sentence, target_retired(&name), "{writer}");
+            }
+            other => panic!("an {writer} behind a retire is refused, got {other:?}"),
+        }
+        let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM item WHERE target_id = $1")
+            .bind(target.id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the target's items");
+        assert_eq!(pinned, 0, "the refused {writer} stored no retired target");
+    }
+    assert_eq!(
+        db.store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("read must not fail")
+            .expect("the fixture item exists"),
+        before,
+        "the refused edit wrote nothing"
+    );
+    assert_eq!(
+        counter(&db.pool, ids::PROJECT_HTUI, RACE_PREFIX).await,
+        None,
+        "the refused mint spent no key number"
+    );
+    db.drop_db().await;
+}
