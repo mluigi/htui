@@ -1,7 +1,6 @@
 ---
 source: crates/htui/tests/it/activity.rs
-assertion_line: 327
-expression: frame(&mut harness)
+expression: harness.render()
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            3 waiting ·  ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
@@ -26,9 +25,9 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
 ╭─ Activity · ⚠ 1 needs you · all workspaces ──────────────────────────────────────────────────────╮
 │ needs you ───────────────────────────────────────────────────────────────────────────────────────│
-│▌⚠ needs you hh:mm ANA-2 plan gate                                                                │
+│▌⚠ needs you 11-02 09:41 ANA-2 plan gate                                                          │
 │ recent ──────────────────────────────────────────────────────────────────────────────────────────│
-│ ◐ started hh:mm ANA-2                                                                            │
+│ ◐ started 11-02 09:41 ANA-2                                                                      │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

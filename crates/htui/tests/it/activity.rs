@@ -11,7 +11,7 @@
 //! gate event the store's activity writer records.
 #![cfg(feature = "testkit")]
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use crossterm::event::{MouseButton, MouseEventKind};
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
@@ -77,29 +77,18 @@ async fn refresh(harness: &mut Harness) {
     harness.drive_to_end().await;
 }
 
-/// The frame with every `HH:MM` written `hh:mm`: a row's time is the machine's local clock.
-fn frame(harness: &mut Harness) -> String {
-    let text = harness.render();
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let clock = chars.len() >= i + 5
-            && chars[i].is_ascii_digit()
-            && chars[i + 1].is_ascii_digit()
-            && chars[i + 2] == ':'
-            && chars[i + 3].is_ascii_digit()
-            && chars[i + 4].is_ascii_digit()
-            && (i == 0 || !chars[i - 1].is_ascii_digit());
-        if clock {
-            out.push_str("hh:mm");
-            i += 5;
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
+/// The instant every seeded event is stamped with (review L5): the harness prints the panel's
+/// times in UTC, and a day before any run of these tests, so a row reads `11-02 09:41`.
+fn seeded_at() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 2, 9, 41, 0)
+        .single()
+        .expect("a valid instant")
+}
+
+/// A handle on `store`'s rows whose clock is frozen at [`seeded_at`]: what it writes, the events
+/// the store's activity writer records included, is stamped then.
+fn seeding(store: &MemStore) -> MemStore {
+    store.handle_at(seeded_at())
 }
 
 /// The activity pane's title line.
@@ -119,12 +108,12 @@ fn activity_focused(frame: &str) -> bool {
 /// Presses `tab` until the activity pane is focused.
 fn focus_activity(harness: &mut Harness) {
     for _ in 0..3 {
-        if activity_focused(&frame(harness)) {
+        if activity_focused(&harness.render()) {
             return;
         }
         harness.key("tab");
     }
-    let frame = frame(harness);
+    let frame = harness.render();
     assert!(activity_focused(&frame), "the activity pane:\n{frame}");
 }
 
@@ -154,7 +143,7 @@ fn cursor_line(frame: &str) -> String {
 fn event(kind: ActivityKind, key: &str, item: htui_core::model::ItemId) -> ActivityEvent {
     ActivityEvent {
         id: 0,
-        at: Utc::now(),
+        at: seeded_at(),
         kind,
         workspace: Some(ids::WORKSPACE_PLATFORM),
         project: Some(ids::PROJECT_HTUI),
@@ -258,13 +247,13 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId) {
 async fn an_event_shows_within_one_refresh_newest_first() {
     let store = MemStore::demo();
     let mut harness = platform(&store).await;
-    let before = frame(&mut harness);
+    let before = harness.render();
     assert!(before.contains("No activity yet."), "{before}");
 
-    store.push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
-    store.push_activity(event(ActivityKind::StepFailed, "ANA-2", ids::HTUI_ANA_2));
+    seeding(&store).push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
+    seeding(&store).push_activity(event(ActivityKind::StepFailed, "ANA-2", ids::HTUI_ANA_2));
     refresh(&mut harness).await;
-    let after = frame(&mut harness);
+    let after = harness.render();
     let row = |key: &str| {
         after
             .lines()
@@ -281,10 +270,10 @@ async fn an_event_shows_within_one_refresh_newest_first() {
 async fn a_park_is_pinned_and_counted_and_answering_it_unpins_it() {
     let store = MemStore::demo();
     let mut harness = platform(&store).await;
-    store.push_activity(event(ActivityKind::RunFinished, "ANA-1", ids::HTUI_ANA_1));
-    let (_, step) = park_ana_2(&store).await;
+    seeding(&store).push_activity(event(ActivityKind::RunFinished, "ANA-1", ids::HTUI_ANA_1));
+    let (_, step) = park_ana_2(&seeding(&store)).await;
     refresh(&mut harness).await;
-    let pinned = frame(&mut harness);
+    let pinned = harness.render();
     let title = activity_title(&pinned);
     assert!(
         title.contains("Activity \u{b7} \u{26a0} 1 needs you \u{b7} all workspaces"),
@@ -309,7 +298,7 @@ async fn a_park_is_pinned_and_counted_and_answering_it_unpins_it() {
         "the gate is answered"
     );
     refresh(&mut harness).await;
-    let answered = frame(&mut harness);
+    let answered = harness.render();
     let title = activity_title(&answered);
     assert!(!title.contains("needs you"), "unpinned: {title}");
     assert!(title.contains("Activity \u{b7} all workspaces"), "{title}");
@@ -322,16 +311,16 @@ async fn a_park_is_pinned_and_counted_and_answering_it_unpins_it() {
 async fn enter_opens_the_rows_step_and_back_returns_to_the_activity_pane() {
     let store = MemStore::demo();
     let mut harness = platform(&store).await;
-    park_ana_2(&store).await;
+    park_ana_2(&seeding(&store)).await;
     refresh(&mut harness).await;
     focus_activity(&mut harness);
-    insta::assert_snapshot!("focused", frame(&mut harness));
+    insta::assert_snapshot!("focused", harness.render());
 
     harness.key("enter");
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     assert_eq!(harness.app().top_bar.workspace, "Platform");
-    let opened = frame(&mut harness);
+    let opened = harness.render();
     assert!(on_item(&opened, "ANA-2"), "{opened}");
     assert!(
         !activity_focused(&opened),
@@ -343,7 +332,7 @@ async fn enter_opens_the_rows_step_and_back_returns_to_the_activity_pane() {
 
     harness.key("backspace");
     harness.drive_to_end().await;
-    let back = frame(&mut harness);
+    let back = harness.render();
     assert!(
         activity_focused(&back),
         "back on the activity pane:\n{back}"
@@ -356,9 +345,9 @@ async fn enter_opens_the_rows_step_and_back_returns_to_the_activity_pane() {
 async fn enter_on_another_workspaces_row_enters_it_and_reveals() {
     let store = MemStore::demo();
     let mut harness = graphics(&store).await;
-    park_ana_2(&store).await;
+    park_ana_2(&seeding(&store)).await;
     refresh(&mut harness).await;
-    let listed = frame(&mut harness);
+    let listed = harness.render();
     assert!(listed.contains("@platform ANA-2"), "{listed}");
     focus_activity(&mut harness);
 
@@ -370,7 +359,7 @@ async fn enter_on_another_workspaces_row_enters_it_and_reveals() {
         harness.app().status.as_deref(),
         Some("opened workspace Platform for ANA-2")
     );
-    let opened = frame(&mut harness);
+    let opened = harness.render();
     assert!(on_item(&opened, "ANA-2"), "{opened}");
     let line = cursor_line(&opened);
     assert!(line.contains("plan"), "the parked step: {line}\n{opened}");
@@ -382,12 +371,12 @@ async fn enter_on_another_workspaces_row_enters_it_and_reveals() {
 async fn f_cycles_the_filter_and_the_title_says_which() {
     let store = MemStore::demo();
     let mut harness = graphics(&store).await;
-    store.push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
+    seeding(&store).push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
     refresh(&mut harness).await;
     focus_activity(&mut harness);
     for filter in ["needs you", "failures", "this workspace", "all workspaces"] {
         harness.key("f");
-        let frame = frame(&mut harness);
+        let frame = harness.render();
         let title = activity_title(&frame);
         assert!(
             title.contains(&format!("Activity \u{b7} {filter} ")),
@@ -405,7 +394,7 @@ async fn f_cycles_the_filter_and_the_title_says_which() {
 async fn enter_on_a_chat_row_opens_the_replay() {
     let store = MemStore::demo();
     let mut harness = graphics(&store).await;
-    store.push_activity(ActivityEvent {
+    seeding(&store).push_activity(ActivityEvent {
         chat: true,
         item: None,
         item_key: None,
@@ -414,7 +403,7 @@ async fn enter_on_a_chat_row_opens_the_replay() {
     });
     refresh(&mut harness).await;
     focus_activity(&mut harness);
-    let listed = frame(&mut harness);
+    let listed = harness.render();
     assert!(listed.contains(" chat plan"), "{listed}");
 
     harness.key("enter");
@@ -428,11 +417,11 @@ async fn enter_on_a_chat_row_opens_the_replay() {
 async fn an_open_form_keeps_the_keys_over_the_focused_activity_pane() {
     let store = MemStore::demo();
     let mut harness = platform(&store).await;
-    store.push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
+    seeding(&store).push_activity(event(ActivityKind::RunStarted, "ANA-1", ids::HTUI_ANA_1));
     refresh(&mut harness).await;
     harness.key("e");
     harness.drive_to_end().await;
-    let open = frame(&mut harness);
+    let open = harness.render();
     let row = open
         .lines()
         .position(|line| line.contains("\u{2500} Activity \u{b7}"))
@@ -444,7 +433,7 @@ async fn an_open_form_keeps_the_keys_over_the_focused_activity_pane() {
     for key in ["Q", "x", "f"] {
         harness.key(key);
     }
-    let typed = frame(&mut harness);
+    let typed = harness.render();
     assert!(typed.contains("Qxf"), "the form took the keys:\n{typed}");
     let title = activity_title(&typed);
     assert!(
@@ -453,7 +442,7 @@ async fn an_open_form_keeps_the_keys_over_the_focused_activity_pane() {
     );
     harness.key("esc");
     harness.drive_to_end().await;
-    let closed = frame(&mut harness);
+    let closed = harness.render();
     assert!(
         activity_focused(&closed),
         "the click had focused the activity pane, which has the keys once the form closes:\n{closed}"
@@ -471,7 +460,7 @@ async fn the_backlog_opens_with_the_activity_pane_unless_a_saved_layout_says_oth
     register_all(fresh.app());
     fresh.drive_to_end().await;
     assert_eq!(fresh.app().tabs.active_id(), Some(BacklogTab::ID));
-    let shown = frame(&mut fresh);
+    let shown = fresh.render();
     assert!(
         activity_title(&shown).contains("all workspaces"),
         "a fresh UI state shows the activity pane:\n{shown}"
@@ -497,7 +486,7 @@ async fn the_backlog_opens_with_the_activity_pane_unless_a_saved_layout_says_oth
     register_all(kept.app());
     kept.drive_to_end().await;
     assert_eq!(kept.app().tabs.active_id(), Some(BacklogTab::ID));
-    let shown = frame(&mut kept);
+    let shown = kept.render();
     assert!(
         !shown.contains("\u{2500} Activity"),
         "a saved `ide` layout keeps the activity pane away:\n{shown}"

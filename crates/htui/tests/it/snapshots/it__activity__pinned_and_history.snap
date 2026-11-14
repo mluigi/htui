@@ -1,6 +1,5 @@
 ---
 source: crates/htui/tests/it/activity.rs
-assertion_line: 297
 expression: pinned
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            3 waiting ·  ?  keys
@@ -26,10 +25,10 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
 ╭─ Activity · ⚠ 1 needs you · all workspaces ──────────────────────────────────────────────────────╮
 │ needs you ───────────────────────────────────────────────────────────────────────────────────────│
-│▌⚠ needs you hh:mm ANA-2 plan gate                                                                │
+│▌⚠ needs you 11-02 09:41 ANA-2 plan gate                                                          │
 │ recent ──────────────────────────────────────────────────────────────────────────────────────────│
-│ ◐ started hh:mm ANA-2                                                                            │
-│ ● finished hh:mm ANA-1 plan                                                                      │
+│ ◐ started 11-02 09:41 ANA-2                                                                      │
+│ ● finished 11-02 09:41 ANA-1 plan                                                                │
 │                                                                                                  │
 │                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

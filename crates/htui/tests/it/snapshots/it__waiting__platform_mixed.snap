@@ -1,7 +1,6 @@
 ---
 source: crates/htui/tests/it/waiting.rs
-assertion_line: 460
-expression: clockless(&frame)
+expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   4 waiting · memory ·  ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
@@ -26,10 +25,10 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
 ╭─ Activity · ⚠ 2 needs you · all workspaces ──────────────────────────────────────────────────────╮
 │ needs you ───────────────────────────────────────────────────────────────────────────────────────│
-│▌⚠ needs you hh:mm ANA-2 plan permission: edit: src/lib.rs                                        │
-│ ⚠ needs you hh:mm ANA-2 plan gate                                                                │
+│▌⚠ needs you 11-02 09:41 ANA-2 plan permission: edit: src/lib.rs                                  │
+│ ⚠ needs you 11-02 09:41 ANA-2 plan gate                                                          │
 │ recent ──────────────────────────────────────────────────────────────────────────────────────────│
-│ ◐ started hh:mm ANA-2                                                                            │
+│ ◐ started 11-02 09:41 ANA-2                                                                      │
 │                                                                                                  │
 │                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

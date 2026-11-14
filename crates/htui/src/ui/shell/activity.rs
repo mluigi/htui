@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use htui_core::model::activity::{
     ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind, ActivityPage,
 };
@@ -28,6 +28,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::window;
+use crate::ui::kit::text::STAMP;
 
 /// D8 (blueprint F7): the panel holds at most this many events, one store page.
 pub const CAPACITY: usize = ACTIVITY_PAGE as usize;
@@ -119,16 +120,16 @@ pub struct ActivityPanel {
     zone: Zone,
 }
 
-/// How a row's `HH:MM` is printed: in the machine's zone; in UTC under test, so no snapshot
-/// moves with the machine's.
+/// How a row's time is printed: in the machine's zone; in UTC under test and in the `testkit`
+/// harness (review L5), so no snapshot moves with the machine's.
 #[derive(Debug, Clone, Copy, Default)]
 enum Zone {
     /// The local zone.
     #[default]
     Local,
-    /// UTC.
-    #[cfg(test)]
-    Utc,
+    /// UTC, "today" being `today`'s date or, with none, the wall clock's.
+    #[cfg(any(test, feature = "testkit"))]
+    Utc { today: Option<NaiveDate> },
 }
 
 impl ActivityPanel {
@@ -136,6 +137,13 @@ impl ActivityPanel {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Review L5: the panel prints its rows' times in UTC, so a harness frame reads the same on
+    /// every machine.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn print_in_utc(&mut self) {
+        self.zone = Zone::Utc { today: None };
     }
 
     /// `None` until the first reply; then `max_id − OVERLAP`.
@@ -230,26 +238,37 @@ impl ActivityPanel {
             format!("Activity \u{b7} {}", self.filter.label())
         };
         let inner = Pane::inner(area);
-        let mut list_rows: Vec<Row<'static>> = Vec::with_capacity(rows.len() + 2);
-        let mut selected = None;
+        // The list: the events, under a `needs you` divider when pinned rows lead and a `recent`
+        // one after them when more follow. Review L1: the window is placed from the selection
+        // and the dividers first, and only the rows in it are built (the panel holds hundreds).
+        let lead = usize::from(pinned > 0);
+        let recent = pinned > 0 && rows.len() > pinned;
+        let total = rows.len() + lead + usize::from(recent);
+        let slot = |index: usize| index + lead + usize::from(recent && index >= pinned);
         let at = self.at(&rows.iter().map(|event| event.id).collect::<Vec<_>>());
+        let height = usize::from(inner.height);
+        let offset = window(at.map_or(0, slot), total, height);
+        let shown = offset..offset.saturating_add(height).min(total);
+        let selected = at.map(slot).and_then(|at| at.checked_sub(offset));
+        let mut list_rows: Vec<Row<'static>> = Vec::with_capacity(shown.len());
         for (index, event) in rows.iter().enumerate() {
-            if pinned > 0 && index == 0 {
+            let at = slot(index);
+            if lead == 1 && index == 0 && shown.contains(&0) {
                 list_rows.push(divider(NEEDS_YOU_DIVIDER, inner.width, theme));
             }
-            if pinned > 0 && index == pinned {
+            if recent && index == pinned && shown.contains(&(at - 1)) {
                 list_rows.push(divider(RECENT_DIVIDER, inner.width, theme));
             }
-            if at == Some(index) {
-                selected = Some(list_rows.len());
+            if at >= shown.end {
+                break;
             }
-            list_rows.push(Row {
-                line: self.line(event, scope, theme),
-                kind: RowKind::Item,
-            });
+            if shown.contains(&at) {
+                list_rows.push(Row {
+                    line: self.line(event, scope, theme),
+                    kind: RowKind::Item,
+                });
+            }
         }
-        let height = usize::from(inner.height);
-        let offset = window(selected.unwrap_or(0), list_rows.len(), height);
         let focus = if focused {
             Focus::Focused
         } else {
@@ -258,24 +277,16 @@ impl ActivityPanel {
         let mut pane = Pane::new(&title)
             .focus(focus)
             .accent(ctx.accent())
-            .scrollbar(list_rows.len(), offset);
+            .scrollbar(total, offset);
         if focused && let Some(hints) = self.key_hint(ctx.keys(), theme) {
             pane = pane.hints(hints);
         }
         let inner = pane.render(frame, area, theme);
-        if list_rows.is_empty() {
+        if total == 0 {
             let (what, next) = self.empty_state(ctx.keys());
             empty::render(frame, inner, &what, NextStep(&next), theme);
         } else {
-            list::render(
-                frame,
-                inner,
-                &list_rows,
-                selected,
-                offset,
-                ctx.accent(),
-                theme,
-            );
+            list::render(frame, inner, &list_rows, selected, 0, ctx.accent(), theme);
         }
     }
 
@@ -421,12 +432,19 @@ impl ActivityPanel {
         Line::from(spans)
     }
 
-    /// `at` as `HH:MM` in the panel's zone.
+    /// `at` in the panel's zone: `HH:MM` today, `MM-DD HH:MM` on any other day (review L4, the
+    /// Runs table's [`STAMP`]).
     fn clock(&self, at: DateTime<Utc>) -> String {
         match self.zone {
-            Zone::Local => at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
-            #[cfg(test)]
-            Zone::Utc => at.format("%H:%M").to_string(),
+            Zone::Local => stamp(
+                at.with_timezone(&chrono::Local).naive_local(),
+                chrono::Local::now().date_naive(),
+            ),
+            #[cfg(any(test, feature = "testkit"))]
+            Zone::Utc { today } => stamp(
+                at.naive_utc(),
+                today.unwrap_or_else(|| Utc::now().date_naive()),
+            ),
         }
     }
 
@@ -472,6 +490,15 @@ const NO_EVENTS_NEXT: &str = "events appear as runs start, wait and fail";
 
 /// The next step under a filter that hides everything while `activity.filter` has no key.
 const UNBOUND_FILTER: &str = "bind activity.filter to show";
+
+/// A row's time (D8, review L4): `HH:MM` on `today`, else `MM-DD HH:MM`.
+fn stamp(at: NaiveDateTime, today: NaiveDate) -> String {
+    if at.date() == today {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format(STAMP).to_string()
+    }
+}
 
 /// D5: whether `event` is the current workspace's: it names the workspace (a run started there,
 /// or the workspace's own scope row), or its project is in the scope.
@@ -612,10 +639,13 @@ mod tests {
         ActivityPage { events, pinned }
     }
 
-    /// A panel that prints times in UTC, so no snapshot moves with the machine's zone.
+    /// A panel that prints times in UTC, so no snapshot moves with the machine's zone, on the
+    /// day of [`at`]'s events.
     fn fresh() -> ActivityPanel {
         ActivityPanel {
-            zone: Zone::Utc,
+            zone: Zone::Utc {
+                today: Some(at(0).date_naive()),
+            },
             ..ActivityPanel::new()
         }
     }
@@ -1097,6 +1127,72 @@ mod tests {
         assert!(!unfocused.contains("open"), "{unfocused}");
         insta::assert_snapshot!("focused", focused);
         insta::assert_snapshot!("unfocused", unfocused);
+    }
+
+    /// Review L4: a row from before today carries its date, as the Runs table's do; today's
+    /// keep the bare time.
+    #[test]
+    fn a_row_from_before_today_carries_its_date() {
+        let mut panel = fresh();
+        let mut yesterday = event(2, ActivityKind::RunStarted);
+        yesterday.at = at(0) - chrono::TimeDelta::minutes(9 * 60 + 1);
+        panel.merge(
+            page(
+                vec![event(1, ActivityKind::RunStarted), yesterday],
+                Vec::new(),
+            ),
+            workspaces(),
+        );
+        let frame = frame(&panel, 60, 6);
+        assert!(frame.contains("started 11-13 23:59 MOD-2"), "{frame}");
+        assert!(frame.contains("started 09:01 MOD-1"), "{frame}");
+    }
+
+    /// Review L1: only the rows in view are built, the window placed from the selection and the
+    /// dividers: at the bottom of a full ring the oldest row is selected and the dividers are
+    /// off screen; at the top both lead, with the scrollbar's length the whole list.
+    #[test]
+    fn a_long_list_draws_the_window_around_the_selection() {
+        let mut panel = fresh();
+        panel.merge(
+            page(
+                plain(1..=CAPACITY as i64),
+                vec![
+                    event(900, ActivityKind::Gate),
+                    event(901, ActivityKind::Gate),
+                ],
+            ),
+            workspaces(),
+        );
+        panel.on_act(Act::ListBottom, &scope());
+        let bottom = frame(&panel, 60, 8);
+        let rows: Vec<&str> = bottom.lines().collect();
+        assert!(rows[6].contains("MOD-1 research"), "{bottom}");
+        assert!(
+            rows[6].starts_with("\u{2502}\u{258c}"),
+            "selected:\n{bottom}"
+        );
+        assert!(rows[5].contains("MOD-2 research"), "{bottom}");
+        assert!(!bottom.contains("needs you \u{2500}"), "{bottom}");
+        assert!(!bottom.contains("recent \u{2500}"), "{bottom}");
+
+        panel.on_act(Act::ListTop, &scope());
+        let top = frame(&panel, 60, 8);
+        let rows: Vec<&str> = top.lines().collect();
+        assert!(rows[1].contains("needs you \u{2500}"), "{top}");
+        assert!(rows[2].contains("MOD-901"), "{top}");
+        assert!(rows[2].starts_with("\u{2502}\u{258c}"), "selected:\n{top}");
+        assert!(rows[3].contains("MOD-900"), "{top}");
+        assert!(rows[4].contains("recent \u{2500}"), "{top}");
+        assert!(rows[5].contains(&format!("MOD-{CAPACITY} ")), "{top}");
+
+        // The `recent` divider on the window's last row, the event after it off screen.
+        panel.on_act(Act::ListDown, &scope());
+        let edge = frame(&panel, 60, 5);
+        let rows: Vec<&str> = edge.lines().collect();
+        assert!(rows[1].contains("MOD-901"), "{edge}");
+        assert!(rows[2].contains("MOD-900"), "{edge}");
+        assert!(rows[3].contains("recent \u{2500}"), "{edge}");
     }
 
     #[test]
