@@ -85,6 +85,7 @@ pub mod frontmatter;
 pub mod hand_written;
 pub mod hierarchy;
 pub mod ids;
+pub mod indexer;
 pub mod item;
 pub mod item_merge;
 pub mod item_spec;
@@ -135,6 +136,7 @@ pub use ids::{
     RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
     SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
+pub use indexer::{IndexedCollection, IndexerLease, LeaseTake};
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
 };

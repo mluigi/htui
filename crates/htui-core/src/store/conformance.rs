@@ -51,6 +51,7 @@ use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
+use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
 use crate::model::{ItemState, latest_graph_run};
 use crate::model::{
     LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
@@ -63,6 +64,7 @@ use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::error::StoreError;
+use crate::store::indexer_lease::IndexerLeaseStore;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
@@ -1986,6 +1988,598 @@ async fn worker_log_set_box_log_level_keeps_the_rest_of_the_blob<S: WriteStore +
         );
         assert_eq!(cleared.edit_version, before.edit_version, "{CASE}");
     }
+}
+
+/// The indexer lease half of the suite (MOD-159 M1 plan D3), in run order. A name never changes.
+///
+/// A fourth list beside [`CASES`], [`READ_CASES`] and [`WORKER_LOG_CASES`], for the reason the
+/// worker log list is one: these cases need [`IndexerLeaseStore`], a narrow trait only `MemStore`
+/// and `PgStore` implement. Each case writes, so [`run_all_indexer_leases`] builds a fresh store per
+/// case. Expiry is the store's clock, so a lapsed lease is a zero TTL, as the run-lease cases make
+/// one (MOD-40 plan D10), and expiries are compared with each other, never with the test's clock.
+pub const INDEXER_LEASE_CASES: &[&str] = &[
+    "indexer_lease_is_taken_when_no_row_exists",
+    "indexer_lease_held_by_another_owner_is_refused_with_its_holder",
+    "indexer_lease_taken_again_by_its_owner_is_ours_and_renewed",
+    "an_expired_indexer_lease_is_taken_by_another_owner",
+    "renewing_an_indexer_lease_another_owner_took_answers_false",
+    "releasing_frees_every_lease_of_the_owner_and_only_those",
+    "indexer_leases_of_two_collections_are_independent",
+    "an_out_of_range_indexer_lease_ttl_is_refused",
+];
+
+/// Runs one [`INDEXER_LEASE_CASES`] case by name against an already-loaded store. Every arm is
+/// boxed, as [`run_case`]'s are (MOD-137).
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_indexer_lease_case<S: WriteStore + IndexerLeaseStore>(name: &str, store: &S) {
+    Box::pin(run_indexer_lease_case_inline(name, store)).await;
+}
+
+async fn run_indexer_lease_case_inline<S: WriteStore + IndexerLeaseStore>(name: &str, store: &S) {
+    match name {
+        "indexer_lease_is_taken_when_no_row_exists" => {
+            Box::pin(indexer_lease_is_taken_when_no_row_exists(store)).await;
+        }
+        "indexer_lease_held_by_another_owner_is_refused_with_its_holder" => {
+            Box::pin(indexer_lease_held_by_another_owner_is_refused_with_its_holder(store)).await;
+        }
+        "indexer_lease_taken_again_by_its_owner_is_ours_and_renewed" => {
+            Box::pin(indexer_lease_taken_again_by_its_owner_is_ours_and_renewed(
+                store,
+            ))
+            .await;
+        }
+        "an_expired_indexer_lease_is_taken_by_another_owner" => {
+            Box::pin(an_expired_indexer_lease_is_taken_by_another_owner(store)).await;
+        }
+        "renewing_an_indexer_lease_another_owner_took_answers_false" => {
+            Box::pin(renewing_an_indexer_lease_another_owner_took_answers_false(
+                store,
+            ))
+            .await;
+        }
+        "releasing_frees_every_lease_of_the_owner_and_only_those" => {
+            Box::pin(releasing_frees_every_lease_of_the_owner_and_only_those(
+                store,
+            ))
+            .await;
+        }
+        "indexer_leases_of_two_collections_are_independent" => {
+            Box::pin(indexer_leases_of_two_collections_are_independent(store)).await;
+        }
+        "an_out_of_range_indexer_lease_ttl_is_refused" => {
+            Box::pin(an_out_of_range_indexer_lease_ttl_is_refused(store)).await;
+        }
+        other => panic!(
+            "unknown indexer lease case `{other}`; INDEXER_LEASE_CASES and run_indexer_lease_case \
+             disagree"
+        ),
+    }
+}
+
+/// Runs every case in [`INDEXER_LEASE_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_indexer_leases<S, F, Fut>(make: F)
+where
+    S: WriteStore + IndexerLeaseStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in INDEXER_LEASE_CASES {
+        run_indexer_lease_case(name, &make().await).await;
+    }
+}
+
+/// The collection most indexer lease cases contend for: the `Platform` workspace's.
+const PLATFORM_COLLECTION: IndexedCollection =
+    IndexedCollection::Workspace(ids::WORKSPACE_PLATFORM);
+
+/// `collection`'s lease as people see it; panics, naming the case, when it was never taken.
+async fn indexer_lease_row<S: IndexerLeaseStore>(
+    case: &str,
+    store: &S,
+    collection: &IndexedCollection,
+) -> IndexerLease {
+    store
+        .indexer_lease(collection)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: {collection} has a lease row"))
+}
+
+/// MOD-159 M1 plan D2, D3: the first take of a collection creates its row and holds it; the row
+/// names the taker's box, that box's hostname, and is live until the store's now plus the TTL.
+async fn indexer_lease_is_taken_when_no_row_exists<S: WriteStore + IndexerLeaseStore>(store: &S) {
+    const CASE: &str = "indexer_lease_is_taken_when_no_row_exists";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    assert_eq!(
+        store.indexer_lease(&PLATFORM_COLLECTION).await.expect(CASE),
+        None,
+        "{CASE}: the fixture holds no indexer lease"
+    );
+
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, Uuid::now_v7(), LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: a collection with no row is free"
+    );
+    let lease = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert_eq!(lease.collection, PLATFORM_COLLECTION.name(), "{CASE}");
+    assert_eq!(lease.box_id, Some(ids::BOX), "{CASE}: the taker's box");
+    assert_eq!(
+        lease.box_name,
+        Some(hostname),
+        "{CASE}: the box's hostname, for display"
+    );
+    assert!(lease.expires_at.is_some(), "{CASE}: a held lease expires");
+    assert!(lease.live, "{CASE}: held for the TTL, so live: {lease:?}");
+    assert_eq!(
+        store
+            .indexer_lease(&IndexedCollection::Global)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: only the collection taken has a row"
+    );
+}
+
+/// MOD-159 M1 plan D3: a live lease of another owner is not taken; the take answers its holder,
+/// the box that `indexing runs on`, and writes nothing.
+async fn indexer_lease_held_by_another_owner_is_refused_with_its_holder<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "indexer_lease_held_by_another_owner_is_refused_with_its_holder";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    let (holder, other) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    let before = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+
+    let stranger_box = BoxId::new();
+    let answer = store
+        .take_indexer_lease(&PLATFORM_COLLECTION, stranger_box, other, LEASE)
+        .await
+        .expect(CASE);
+    let LeaseTake::Held(held) = answer else {
+        panic!("{CASE}: a live lease of another owner is Held, got {answer:?}");
+    };
+    assert_eq!(held.collection, PLATFORM_COLLECTION.name(), "{CASE}");
+    assert_eq!(
+        held.box_id,
+        Some(ids::BOX),
+        "{CASE}: names the holder's box"
+    );
+    assert_eq!(held.box_name, Some(hostname), "{CASE}: and its hostname");
+    assert!(held.live, "{CASE}: the holder's lease is live");
+    assert_eq!(
+        held, before,
+        "{CASE}: Held is the row as `indexer_lease` reads it"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        before,
+        "{CASE}: a refused take writes nothing"
+    );
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, holder, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the holder still holds it"
+    );
+}
+
+/// MOD-159 M1 plan D3: a take by the owner that holds the lease is `Ours` and moves its expiry.
+async fn indexer_lease_taken_again_by_its_owner_is_ours_and_renewed<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "indexer_lease_taken_again_by_its_owner_is_ours_and_renewed";
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, owner, TimeDelta::minutes(1))
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    let first = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+
+    assert_eq!(
+        store
+            .take_indexer_lease(
+                &PLATFORM_COLLECTION,
+                ids::BOX,
+                owner,
+                TimeDelta::minutes(10)
+            )
+            .await
+            .expect(CASE),
+        LeaseTake::Ours,
+        "{CASE}: the owner takes its own live lease again"
+    );
+    let second = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(second.live, "{CASE}: still live: {second:?}");
+    assert!(
+        second.expires_at > first.expires_at,
+        "{CASE}: the take renewed the expiry: {first:?} then {second:?}"
+    );
+    assert_eq!(second.box_id, Some(ids::BOX), "{CASE}");
+}
+
+/// MOD-159 M1 plan D3: a lapsed lease (a zero TTL, MOD-40 plan D10) is free to another owner, and
+/// the take is `Taken`, not `Ours`; the old owner's renewal then answers `false`.
+async fn an_expired_indexer_lease_is_taken_by_another_owner<S: WriteStore + IndexerLeaseStore>(
+    store: &S,
+) {
+    const CASE: &str = "an_expired_indexer_lease_is_taken_by_another_owner";
+    let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, first, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: the first owner takes it for no time at all"
+    );
+    let lapsed = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(
+        !lapsed.live,
+        "{CASE}: a zero TTL is lapsed at once: {lapsed:?}"
+    );
+
+    let second_box = BoxId::new();
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, second_box, second, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: an expired lease is taken by another owner"
+    );
+    let taken = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(taken.live, "{CASE}: {taken:?}");
+    assert_eq!(
+        taken.box_id,
+        Some(second_box),
+        "{CASE}: the row names the new holder's box"
+    );
+    assert_eq!(
+        taken.box_name, None,
+        "{CASE}: a box with no row has no name (no foreign key)"
+    );
+    assert!(
+        !store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the old owner no longer holds it"
+    );
+}
+
+/// MOD-159 M1 plan D3, D6: a renewal is a compare-and-set on the owner. Once another owner took
+/// the lease, the old owner's renewal touches nothing and answers `false` (abandon); a renewal of a
+/// collection never taken is `false` too.
+async fn renewing_an_indexer_lease_another_owner_took_answers_false<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "renewing_an_indexer_lease_another_owner_took_answers_false";
+    let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+    assert!(
+        !store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: no row, nothing to renew"
+    );
+    assert_eq!(
+        store.indexer_lease(&PLATFORM_COLLECTION).await.expect(CASE),
+        None,
+        "{CASE}: a renewal creates no row"
+    );
+
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, first, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    let held = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, TimeDelta::minutes(10))
+            .await
+            .expect(CASE),
+        "{CASE}: the owner renews its own lease"
+    );
+    let renewed = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(
+        renewed.expires_at > held.expires_at,
+        "{CASE}: the renewal moved the expiry: {held:?} then {renewed:?}"
+    );
+
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: the owner lets it lapse (a zero TTL)"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, second, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: another owner takes the lapsed lease"
+    );
+    let taken = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(
+        !store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: the old owner's renewal touches nothing"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        taken,
+        "{CASE}: a refused renewal writes nothing"
+    );
+}
+
+/// MOD-159 M1 plan D3, D7: a release frees every lease its owner holds, across collections, and
+/// answers how many; another owner's lease is untouched. A freed lease is not live, keeps its box
+/// for display, and is free to the next take.
+async fn releasing_frees_every_lease_of_the_owner_and_only_those<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "releasing_frees_every_lease_of_the_owner_and_only_those";
+    let (leaving, staying, next) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let graphics = IndexedCollection::Workspace(ids::WORKSPACE_GRAPHICS);
+    for collection in [PLATFORM_COLLECTION, IndexedCollection::Global] {
+        assert_eq!(
+            store
+                .take_indexer_lease(&collection, ids::BOX, leaving, LEASE)
+                .await
+                .expect(CASE),
+            LeaseTake::Taken,
+            "{CASE}: {collection}"
+        );
+    }
+    assert_eq!(
+        store
+            .take_indexer_lease(&graphics, ids::BOX, staying, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: {graphics}"
+    );
+    let kept = indexer_lease_row(CASE, store, &graphics).await;
+
+    assert_eq!(
+        store.release_indexer_leases(leaving).await.expect(CASE),
+        2,
+        "{CASE}: both of the leaving owner's leases"
+    );
+    for collection in [PLATFORM_COLLECTION, IndexedCollection::Global] {
+        let freed = indexer_lease_row(CASE, store, &collection).await;
+        assert!(!freed.live, "{CASE}: {collection} is free: {freed:?}");
+        assert_eq!(
+            freed.box_id,
+            Some(ids::BOX),
+            "{CASE}: {collection} keeps its last box for display"
+        );
+        assert!(
+            !store
+                .renew_indexer_lease(&collection, leaving, LEASE)
+                .await
+                .expect(CASE),
+            "{CASE}: {collection} is no longer the leaving owner's"
+        );
+    }
+    assert_eq!(
+        indexer_lease_row(CASE, store, &graphics).await,
+        kept,
+        "{CASE}: another owner's lease is untouched"
+    );
+    assert_eq!(
+        store.release_indexer_leases(leaving).await.expect(CASE),
+        0,
+        "{CASE}: a second release frees nothing"
+    );
+    assert_eq!(
+        store
+            .release_indexer_leases(Uuid::now_v7())
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: an owner holding nothing frees nothing"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, next, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: a released lease is free to the next take"
+    );
+}
+
+/// MOD-159 M1 plan D1, D3: each collection has its own row. One owner holding one collection
+/// does not hold or block another, and a renewal of one moves only that one.
+async fn indexer_leases_of_two_collections_are_independent<S: WriteStore + IndexerLeaseStore>(
+    store: &S,
+) {
+    const CASE: &str = "indexer_leases_of_two_collections_are_independent";
+    let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+    let graphics = IndexedCollection::Workspace(ids::WORKSPACE_GRAPHICS);
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, first, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&graphics, ids::BOX, second, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: another collection is free while the first is held"
+    );
+    assert!(
+        !store
+            .renew_indexer_lease(&graphics, first, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: holding one collection is not holding another"
+    );
+    let graphics_before = indexer_lease_row(CASE, store, &graphics).await;
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, first, TimeDelta::minutes(10))
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &graphics).await,
+        graphics_before,
+        "{CASE}: a renewal of one collection moves only that one"
+    );
+    assert!(
+        matches!(
+            store
+                .take_indexer_lease(&graphics, ids::BOX, first, LEASE)
+                .await
+                .expect(CASE),
+            LeaseTake::Held(_)
+        ),
+        "{CASE}: the first owner cannot take the second's collection"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&IndexedCollection::Global, ids::BOX, first, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: one owner may hold several collections"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION)
+            .await
+            .collection,
+        PLATFORM_COLLECTION.name(),
+        "{CASE}"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &IndexedCollection::Global)
+            .await
+            .collection,
+        "htui_global",
+        "{CASE}"
+    );
+}
+
+/// MOD-159 M1 plan D3 (MOD-40 blueprint B27): a TTL below zero or past [`MAX_LEASE_TTL`] is
+/// `Constraint` from a take and a renewal, before anything is read, and writes nothing. Both
+/// bounds are accepted.
+async fn an_out_of_range_indexer_lease_ttl_is_refused<S: WriteStore + IndexerLeaseStore>(
+    store: &S,
+) {
+    const CASE: &str = "an_out_of_range_indexer_lease_ttl_is_refused";
+    let owner = Uuid::now_v7();
+    let out_of_range = [
+        TimeDelta::microseconds(-1),
+        MAX_LEASE_TTL + TimeDelta::microseconds(1),
+    ];
+    for ttl in out_of_range {
+        let take = store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, owner, ttl)
+            .await;
+        assert!(
+            matches!(take, Err(StoreError::Constraint(_))),
+            "{CASE}: a take for {ttl} is Constraint, got {take:?}"
+        );
+        let renew = store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, owner, ttl)
+            .await;
+        assert!(
+            matches!(renew, Err(StoreError::Constraint(_))),
+            "{CASE}: a renewal for {ttl} of a collection never taken is Constraint, got {renew:?}"
+        );
+    }
+    assert_eq!(
+        store.indexer_lease(&PLATFORM_COLLECTION).await.expect(CASE),
+        None,
+        "{CASE}: a refused take creates no row"
+    );
+
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, owner, MAX_LEASE_TTL)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: the longest TTL is accepted"
+    );
+    let held = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    for ttl in out_of_range {
+        let renew = store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, owner, ttl)
+            .await;
+        assert!(
+            matches!(renew, Err(StoreError::Constraint(_))),
+            "{CASE}: a renewal for {ttl} is Constraint, got {renew:?}"
+        );
+        let take = store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, owner, ttl)
+            .await;
+        assert!(
+            matches!(take, Err(StoreError::Constraint(_))),
+            "{CASE}: the owner's take for {ttl} is Constraint, got {take:?}"
+        );
+    }
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        held,
+        "{CASE}: a refused renewal or take writes nothing"
+    );
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: a zero TTL is accepted"
+    );
 }
 
 /// The `Platform` workspace of the fixture: projects `htui` (position 0) then `agy` (position 1).
@@ -35786,7 +36380,8 @@ async fn document_links_are_leaves_of_the_walk<S: WriteStore>(store: &S) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CASES, READ_CASES, WORKER_LOG_CASES, run_case, run_read_case, run_worker_log_case,
+        CASES, INDEXER_LEASE_CASES, READ_CASES, WORKER_LOG_CASES, run_case, run_indexer_lease_case,
+        run_read_case, run_worker_log_case,
     };
     use crate::store::MemStore;
 
@@ -35797,20 +36392,21 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
 
-        // The three lists are reported separately by MOD-6's binding, so a name may not be in two
+        // The four lists are reported separately by MOD-6's binding, so a name may not be in two
         // either: a duplicate across them would be run twice and reported once.
         let mut all: Vec<&str> = CASES
             .iter()
             .chain(READ_CASES)
             .chain(WORKER_LOG_CASES)
+            .chain(INDEXER_LEASE_CASES)
             .copied()
             .collect();
         all.sort_unstable();
         all.dedup();
         assert_eq!(
             all.len(),
-            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len(),
-            "a case name is unique across the three lists"
+            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len() + INDEXER_LEASE_CASES.len(),
+            "a case name is unique across the four lists"
         );
     }
 
@@ -35972,6 +36568,15 @@ mod tests {
     async fn run_worker_log_case_accepts_every_name() {
         for name in WORKER_LOG_CASES {
             run_worker_log_case(name, &MemStore::demo()).await;
+        }
+    }
+
+    /// The same guard for the indexer lease half (MOD-159 M1 plan D3): each case writes, so each
+    /// gets a fresh store.
+    #[tokio::test]
+    async fn run_indexer_lease_case_accepts_every_name() {
+        for name in INDEXER_LEASE_CASES {
+            run_indexer_lease_case(name, &MemStore::demo()).await;
         }
     }
 }
