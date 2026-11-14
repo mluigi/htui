@@ -1,0 +1,10 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: focused
+---
+╭─ Activity · all workspaces ──────────────────────────────╮
+│▌◐ started 09:02 MOD-2 research                           │
+│ ◐ started 09:01 MOD-1 research                           │
+│                                                          │
+│                                                          │
+╰─Enter open · f filter · j/k move─────────────────────────╯

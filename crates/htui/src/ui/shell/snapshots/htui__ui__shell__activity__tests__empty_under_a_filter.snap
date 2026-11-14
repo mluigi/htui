@@ -1,0 +1,12 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: frame
+---
+╭─ Activity · needs you ───────────────────────────────────╮
+│                                                          │
+│                                                          │
+│                No events under needs you.                │
+│                     f shows failures                     │
+│                                                          │
+│                                                          │
+╰─Enter open · f filter · j/k move─────────────────────────╯

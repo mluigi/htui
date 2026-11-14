@@ -357,6 +357,10 @@ level  = ["v"]  # minimum level
 follow = ["F"]  # follow
 bottom = ["G"]  # newest
 
+[activity]
+open   = ["enter"]  # open the item or chat
+filter = ["f"]      # all workspaces · needs you · failures · this workspace
+
 [queue]
 move_down = ["J"]      # move down
 move_up   = ["K"]      # move up

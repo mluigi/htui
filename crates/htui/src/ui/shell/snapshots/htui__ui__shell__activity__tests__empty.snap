@@ -1,0 +1,12 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: frame
+---
+╭─ Activity · all workspaces ──────────────────────────────╮
+│                                                          │
+│                                                          │
+│                     No activity yet.                     │
+│        events appear as runs start, wait and fail        │
+│                                                          │
+│                                                          │
+╰─Enter open · f filter · j/k move─────────────────────────╯
