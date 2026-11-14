@@ -441,7 +441,13 @@ fn human_text(answer: &Answer) -> (String, Vec<String>) {
             };
             let mut notes: Vec<String> = note.map(str::to_owned).into_iter().collect();
             if !search.unavailable.is_empty() {
-                notes.push(unavailable_note(&search.unavailable));
+                notes.push(unavailable_note(
+                    &search.unavailable,
+                    search.cause.as_deref(),
+                ));
+            } else if let Some(cause) = &search.cause {
+                // The global collection failed while workspaces answered: its sentence alone.
+                notes.push(cause.chars().filter(|c| !c.is_control()).collect());
             }
             (text, notes)
         }
@@ -449,16 +455,31 @@ fn human_text(answer: &Answer) -> (String, Vec<String>) {
     }
 }
 
-/// D9's stderr note: the workspaces whose collection a search could not read, by slug.
-fn unavailable_note(slugs: &[String]) -> String {
+/// D9's stderr note: the workspaces whose collection a search could not read, by slug, and
+/// (MOD-159 M1 R2) why the first failed one failed, its sentence's own "knowledge search
+/// unavailable: " left out.
+fn unavailable_note(slugs: &[String], cause: Option<&str>) -> String {
     let slugs: Vec<String> = slugs
         .iter()
         .map(|slug| slug.chars().filter(|c| !c.is_control()).collect())
         .collect();
-    format!(
+    let note = format!(
         "knowledge search unavailable for workspace(s): {}",
         slugs.join(", ")
-    )
+    );
+    match cause {
+        Some(cause) => {
+            let prefix = format!("{}: ", htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE);
+            let cause: String = cause
+                .strip_prefix(&prefix)
+                .unwrap_or(cause)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            format!("{note} ({cause})")
+        }
+        None => note,
+    }
 }
 
 /// A verb's answer: the document kind and what happened.
@@ -606,6 +627,9 @@ pub struct SearchAnswer {
     /// MOD-159 M1 plan D9: the slugs of the workspaces whose collection is missing or refused,
     /// when the others answered; empty otherwise.
     pub unavailable: Vec<String>,
+    /// MOD-159 M1 R2: the first failed collection's sentence when the others answered, for the
+    /// stderr note only (the document names the workspaces, not why).
+    pub cause: Option<String>,
 }
 
 /// The index's answer to a search whose Postgres answered (A-2).
@@ -1428,6 +1452,7 @@ mod tests {
                 decisions: false,
                 index,
                 unavailable: Vec::new(),
+                cause: None,
             }),
         }
     }
@@ -1761,6 +1786,33 @@ mod tests {
                 "knowledge search unavailable for workspace(s): platform",
             ]
         );
+    }
+
+    /// MOD-159 M1 R2: a workspace that failed while others answered is named with why, its
+    /// sentence's lead-in left out; the document keeps the slugs alone.
+    #[test]
+    fn the_unavailable_note_says_why_the_first_failure_failed() {
+        let mut answer = search_missing(IndexAnswer::Hits(two_hits()), &["lone"]);
+        if let Outcome::Search(search) = &mut answer.outcome {
+            search.cause = Some(htui_core::qdrant::unavailable(
+                "embedder mismatch: collection `htui_ws_1` holds vectors from hash/384",
+            ));
+        }
+        let (_, notes) = human_text(&answer);
+        assert_eq!(
+            notes,
+            [
+                "knowledge search unavailable for workspace(s): lone (embedder mismatch: collection \
+              `htui_ws_1` holds vectors from hash/384)"
+            ]
+        );
+        let doc = document(&answer);
+        assert_eq!(doc["unavailable"], serde_json::json!(["lone"]));
+        assert!(
+            !doc.to_string().contains("embedder mismatch"),
+            "the document keeps the slugs alone: {doc}"
+        );
+        assert_eq!(answer.exit_code(), 0);
     }
 
     #[test]

@@ -114,6 +114,8 @@ impl JobIndex for Prefixed {
 
     fn forget(&self, _: Option<&Arc<Self::Store>>) {}
 
+    fn forget_synced(&self) {}
+
     async fn drop_legacy(&self, settings: &QdrantSettings) -> Result<bool, String> {
         vector::drop_collection_named(settings, &self.legacy())
             .await

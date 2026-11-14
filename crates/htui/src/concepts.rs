@@ -22,9 +22,9 @@
 //!
 //! The background sync (MOD-41 plan D19, MOD-158 D7, MOD-159 M1 plan D7) lives here too:
 //! [`IndexJob`] runs [`index_job`] in `htui worker` and in the TUI while it is online. Every beat
-//! (the run lease's refresh) it resolves the Qdrant settings, takes or renews the lease of every
+//! (the run lease's refresh) it resolves the Qdrant URL, takes or renews the lease of every
 //! collection, and reconciles each one it holds at start and then every [`sync_interval`].
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +167,8 @@ impl JobIndex for CliIndex {
     }
 
     fn forget(&self, _: Option<&Arc<Self::Store>>) {}
+
+    fn forget_synced(&self) {}
 
     async fn drop_legacy(&self, settings: &QdrantSettings) -> Result<bool, String> {
         drop_legacy(settings).await
@@ -328,6 +330,10 @@ pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What an index run whose lease another box took over mid-sync says (plan D6): it stopped there,
+/// nothing deleted. `--index-items` names the workspace before it; the overlay says it alone.
+pub(crate) const TAKEN_OVER: &str = "another box took the indexing over; stopped here";
+
 /// Who takes a lease, and for how long: the box, the process's token (plan D5), the TTL.
 #[derive(Debug, Clone, Copy)]
 pub struct Holder {
@@ -348,8 +354,9 @@ fn held_note(slug: &str, lease: &IndexerLease) -> String {
 }
 
 /// The box a lease names, as a person reads it: its hostname, or the last eight hex digits of its
-/// id when its row is gone (the overlay's `held_line` rule), stripped of control characters.
-fn holder_name(lease: &IndexerLease) -> String {
+/// id when its row is gone, stripped of control characters. The CLI's note and the overlay's
+/// `held_line` both say it (MOD-159 M1 R2: one rule, written once).
+pub(crate) fn holder_name(lease: &IndexerLease) -> String {
     let name = lease.box_name.clone().unwrap_or_else(|| {
         lease.box_id.map_or_else(
             || "another box".to_owned(),
@@ -404,9 +411,7 @@ where
         };
         let one = Indexer::sync(store, scope, &*vectors, &guard).await?;
         if one.abandoned {
-            note(format!(
-                "workspace {slug}: another box took the indexing over; stopped here"
-            ));
+            note(format!("workspace {slug}: {TAKEN_OVER}"));
         }
         report += one;
     }
@@ -542,6 +547,10 @@ pub trait JobIndex {
     /// settings stopped resolving, so no connection, and no key it was made with, outlives them
     /// (MOD-158 R1, B-L1).
     fn forget(&self, store: Option<&Arc<Self::Store>>);
+    /// The key stopped resolving while the URL still does (MOD-159 M1 R2): the connections a sync
+    /// made, and the key they hold, go; a search's read-only ones stay, since each search resolves
+    /// its settings, key included, itself.
+    fn forget_synced(&self);
     /// Drops the legacy collection (plan D10); `true` when it existed.
     ///
     /// # Errors
@@ -565,6 +574,10 @@ impl JobIndex for QdrantIndex {
         Self::forget(self, store);
     }
 
+    fn forget_synced(&self) {
+        Self::forget_synced(self);
+    }
+
     async fn drop_legacy(&self, settings: &QdrantSettings) -> Result<bool, String> {
         drop_legacy(settings).await
     }
@@ -577,12 +590,15 @@ pub struct JobState {
     /// another owner holds the lease, when a sync was abandoned, and when the settings stop
     /// resolving, so the next take reconciles at once.
     held: HashMap<IndexedCollection, tokio::time::Instant>,
-    /// An embedder mismatch was logged at `error` (review L3).
-    mismatch: bool,
+    /// The collections whose embedder mismatch was logged at `error` (review L3), each once
+    /// until it opens again (MOD-159 M1 R2).
+    mismatch: HashSet<IndexedCollection>,
     /// The legacy collection was dropped, or found absent, by this process (plan D10).
     legacy_checked: bool,
     /// "No Qdrant URL" was logged since the URL was last set.
     no_url_said: bool,
+    /// The sentence of the last key failure logged, until the key reads again (MOD-159 M1 R2).
+    key_said: Option<String>,
 }
 
 impl JobState {
@@ -598,12 +614,14 @@ impl JobState {
 /// One beat of the index job (MOD-159 M1 plan D7); answers how long to sleep before the next: the
 /// lease times' refresh, read now (D4).
 ///
-/// The settings first: none resolve, and nothing is taken, opened or loaded (no URL is one `info`
+/// The URL first: none resolves, and nothing is taken, opened or loaded (no URL is one `info`
 /// line until a URL is set). Then, for every workspace of [`IndexSource::index_scopes`] and the
 /// global collection, in that order: its lease is taken (or renewed) for `owner`; one another
 /// owner holds is forgotten. A held collection whose last reconcile is older than
 /// [`sync_interval`], or that this job never reconciled, is opened and synced over its workspace's
 /// scope, the lease renewed before each delete batch; an abandoned sync forgets the collection.
+/// The key is read at the first due collection only (MOD-159 M1 R2), and while one collection
+/// reconciles every lease the job holds is renewed each refresh.
 /// The global collection has nothing to sync yet: it is opened (created), and its holder drops the
 /// legacy collection once per process (D10). Failures are log lines; the next beat or interval is
 /// the retry.
@@ -627,10 +645,11 @@ where
     };
     let times = LeaseTimes::from_app(&app);
     let every = sync_interval(&app);
-    let resolved = match settings.settings().await {
-        Ok(resolved) => {
+    // MOD-159 M1 R2: the URL alone; the key is read only when a collection is due (below).
+    let url = match settings.url().await {
+        Ok(url) => {
             state.no_url_said = false;
-            resolved
+            url
         }
         Err(why) => {
             index.forget(None);
@@ -677,6 +696,9 @@ where
         owner,
         ttl: times.ttl,
     };
+    // The settings with the key, read at the first due collection and kept for this beat; `None`
+    // inside when the key could not be read.
+    let mut keyed: Option<Option<QdrantSettings>> = None;
     for (collection, scope) in collections {
         match source
             .take_indexer_lease(&collection, box_id, owner, times.ttl)
@@ -696,12 +718,99 @@ where
             .held
             .get(&collection)
             .is_none_or(|last| last.elapsed() >= every);
-        if due {
-            state.held.insert(collection, tokio::time::Instant::now());
-            reconcile(source, index, &resolved, collection, scope, holder, state).await;
+        if !due {
+            continue;
+        }
+        // Marked first: a key that cannot be read is tried again next interval, not next beat.
+        state.held.insert(collection, tokio::time::Instant::now());
+        if keyed.is_none() {
+            keyed = Some(with_key(settings, index, &url, state).await);
+        }
+        let Some(Some(resolved)) = &keyed else {
+            continue;
+        };
+        // MOD-159 M1 R2: a reconcile may outlast the TTL (a first build), so every lease this
+        // job holds, this collection's included, is renewed every refresh while it runs.
+        let leases: Vec<IndexedCollection> = state.held.keys().copied().collect();
+        let work = reconcile(source, index, resolved, collection, scope, holder, state);
+        let lost = while_renewing(source, &leases, holder, times.refresh, work).await;
+        for collection in lost {
+            state.held.remove(&collection);
         }
     }
     times.refresh
+}
+
+/// `url` with the key [`concepts_worker::QdrantSource::api_key`] reads now (MOD-159 M1 R2: only
+/// when a collection is due, since an interactive key may prompt a locked keyring). A key that
+/// cannot be read is `None`, said at `warn` once until its sentence changes, and drops only the
+/// connections a sync made ([`JobIndex::forget_synced`]).
+async fn with_key<I: JobIndex>(
+    settings: &concepts_worker::QdrantSource,
+    index: &I,
+    url: &htui_core::qdrant::QdrantUrl,
+    state: &mut JobState,
+) -> Option<QdrantSettings> {
+    match settings.api_key().await {
+        Ok(api_key) => {
+            state.key_said = None;
+            Some(QdrantSettings {
+                url: url.clone(),
+                api_key,
+            })
+        }
+        Err(why) => {
+            index.forget_synced();
+            let sentence = why.sentence();
+            if state.key_said.as_deref() != Some(sentence.as_str()) {
+                tracing::warn!(err = %sentence, "concepts index not synced: no key; next interval");
+                state.key_said = Some(sentence);
+            }
+            None
+        }
+    }
+}
+
+/// `work`, with `collections`' leases renewed for `holder` every `every` while it runs (MOD-159
+/// M1 R2). Answers the collections whose renewal touched nothing (another owner took the lease):
+/// the caller stops holding them. A renewal that fails is a log line; the next beat retries.
+async fn while_renewing<L: IndexerLeaseStore>(
+    leases: &L,
+    collections: &[IndexedCollection],
+    holder: Holder,
+    every: Duration,
+    work: impl Future<Output = ()>,
+) -> Vec<IndexedCollection> {
+    let every = every.max(Duration::from_secs(1));
+    let mut work = std::pin::pin!(work);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut lost = Vec::new();
+    loop {
+        tokio::select! {
+            () = &mut work => return lost,
+            _ = ticker.tick() => {
+                for collection in collections {
+                    if lost.contains(collection) {
+                        continue;
+                    }
+                    match leases
+                        .renew_indexer_lease(collection, holder.owner, holder.ttl)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(%collection, "concepts index lease taken over; let go");
+                            lost.push(*collection);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, %collection, "concepts index lease not renewed");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// [`index_beat`]'s work on one held, due collection.
@@ -719,11 +828,11 @@ async fn reconcile<S, I>(
 {
     let store = match index.open(resolved.clone(), &collection).await {
         Ok(store) => {
-            state.mismatch = false;
+            state.mismatch.remove(&collection);
             store
         }
         Err(err) => {
-            match open_failure_level(names_a_mismatch(&err), &mut state.mismatch) {
+            match open_failure_level(names_a_mismatch(&err), &mut state.mismatch, collection) {
                 tracing::Level::ERROR => tracing::error!(
                     %err,
                     %collection,
@@ -802,9 +911,10 @@ where
     }
 }
 
-/// How long [`IndexJob::stop`] waits for its leases to be let go before it gives up on them
-/// (they lapse on their own after the TTL).
-const RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// How long `htui worker`'s [`IndexJob::stop`] waits for its leases to be let go before it gives
+/// up on them (they lapse on their own after the TTL). The TUI waits less (MOD-159 M1 R2): its
+/// whole store-loop shutdown has `crate::SHUTDOWN`.
+pub const WORKER_RELEASE_WAIT: Duration = Duration::from_secs(5);
 
 /// A running [`index_job`] (MOD-159 M1 plan D7, D8): `htui worker`'s, and the TUI's while it is
 /// online. [`Self::stop`] ends it and lets go of every lease it holds.
@@ -821,24 +931,25 @@ pub struct IndexJob<S: IndexerLeaseStore> {
 impl IndexJob<PgStore> {
     /// The job over `pg` and the process's shared index (MOD-11 H-26: the worker's index job and
     /// `search_concepts` load one model), with a token of its own (plan D5). Always spawned,
-    /// whatever the setting says: each beat resolves the URL and key again (MOD-158 D7).
+    /// whatever the setting says: each beat resolves the URL again, and the key when a collection
+    /// is due (MOD-158 D7, MOD-159 M1 R2).
     #[must_use]
     pub fn spawn(pg: PgStore) -> Self {
         Self::spawn_over(pg, concepts_worker::shared_qdrant(), Uuid::now_v7(), None)
     }
 
     /// The job over `pg` and `index`, taking leases as `owner`; its first beat waits for `after`
-    /// (the previous job's [`Self::stop`], so its release cannot free what this one takes).
+    /// (the previous jobs' [`Self::stop`]s, so their release cannot free what this one takes).
     pub(crate) fn spawn_over(
         pg: PgStore,
         index: Arc<QdrantIndex>,
         owner: Uuid,
-        after: Option<tokio::task::JoinHandle<()>>,
+        after: Option<futures::future::BoxFuture<'static, ()>>,
     ) -> Self {
         let leases = pg.clone();
         let task = tokio::spawn(async move {
             if let Some(after) = after {
-                let _ = after.await;
+                after.await;
             }
             let settings = Arc::clone(index.source());
             match index_job(&pg, &settings, &*index, owner).await {}
@@ -859,14 +970,17 @@ impl<S: IndexerLeaseStore> IndexJob<S> {
     }
 
     /// Ends the job, then lets go of every lease its token holds (best effort, logged, waited for
-    /// at most five seconds): another process takes them over on its next beat rather than after
-    /// the TTL. A sync stopped half-way is safe: the next holder's reconcile finishes it.
-    pub async fn stop(self) {
+    /// at most `wait`: [`WORKER_RELEASE_WAIT`] in `htui worker`, less in the TUI): another process
+    /// takes them over on its next beat rather than after the TTL. A sync stopped half-way is
+    /// safe: the next holder's reconcile finishes it. A job that had panicked is said at `error`.
+    pub async fn stop(self, wait: Duration) {
         self.task.abort();
-        let _ = self.task.await;
-        match tokio::time::timeout(RELEASE_WAIT, self.leases.release_indexer_leases(self.owner))
-            .await
+        if let Err(err) = self.task.await
+            && err.is_panic()
         {
+            tracing::error!(%err, "the concepts index job had panicked; it indexed nothing since");
+        }
+        match tokio::time::timeout(wait, self.leases.release_indexer_leases(self.owner)).await {
             Ok(Ok(freed)) => tracing::debug!(freed, "concepts index leases let go"),
             Ok(Err(err)) => tracing::warn!(%err, "concepts index leases not let go; they lapse"),
             Err(_) => tracing::warn!("concepts index leases not let go in time; they lapse"),
@@ -877,13 +991,19 @@ impl<S: IndexerLeaseStore> IndexJob<S> {
 /// The level [`reconcile`] logs one failed open at: an embedder mismatch is `ERROR` the first time
 /// and `DEBUG` after, since it says the same until someone rebuilds the collection; anything else
 /// is `WARN` every time (review L3).
-fn open_failure_level(mismatch: bool, reported: &mut bool) -> tracing::Level {
+/// The once is per collection (MOD-159 M1 R2): `reported` holds the collections whose mismatch
+/// was said.
+fn open_failure_level(
+    mismatch: bool,
+    reported: &mut HashSet<IndexedCollection>,
+    collection: IndexedCollection,
+) -> tracing::Level {
     if !mismatch {
         tracing::Level::WARN
-    } else if std::mem::replace(reported, true) {
-        tracing::Level::DEBUG
-    } else {
+    } else if reported.insert(collection) {
         tracing::Level::ERROR
+    } else {
+        tracing::Level::DEBUG
     }
 }
 
@@ -1067,12 +1187,14 @@ where
     };
     let targets = search_projects(&pg, options, ctx.identity).await;
     pg.close().await;
-    let (index, unavailable) = search_index(&settings, ctx.prefix, &targets?, options, load).await;
+    let (index, unavailable, cause) =
+        search_index(&settings, ctx.prefix, &targets?, options, load).await;
     Ok(SearchAnswer {
         query: options.query.clone(),
         decisions: options.decisions,
         index,
         unavailable,
+        cause,
     })
 }
 
@@ -1134,17 +1256,25 @@ enum Part {
     Failed(IndexAnswer),
 }
 
-/// D9: the collections' parts as one answer, and the workspaces whose collection is missing or
-/// failed (the global one, `None`, is never named). Any hits: `Hits`, merged ([`merge_hits`]),
-/// and the workspaces named. No hits and a failure: the first failure, as a search of one
-/// collection answered. Every collection missing: `Empty`.
-fn combine(parts: Vec<(Option<String>, Part)>, limit: u64) -> (IndexAnswer, Vec<String>) {
+/// D9: the collections' parts as one answer, the workspaces whose collection is missing or
+/// failed (the global one, `None`, is never named), and the first failure's sentence when the
+/// answer is hits anyway (MOD-159 M1 R2: the stderr note says it). A failure and no workspace
+/// collection that answered: the first failure, as a search of one collection answered; the
+/// global collection, empty on most boxes, never stands in for a workspace (R2). Otherwise any
+/// collection that answered: `Hits`, merged ([`merge_hits`]), and the workspaces named. Every
+/// collection missing: `Empty`.
+fn combine(
+    parts: Vec<(Option<String>, Part)>,
+    limit: u64,
+) -> (IndexAnswer, Vec<String>, Option<String>) {
     let mut lists = Vec::new();
     let mut unavailable = Vec::new();
     let mut failure = None;
+    let mut a_workspace_answered = false;
     for (slug, part) in parts {
         match part {
             Part::Hits(hits) => {
+                a_workspace_answered |= slug.is_some();
                 lists.push(hits);
                 continue;
             }
@@ -1159,10 +1289,26 @@ fn combine(parts: Vec<(Option<String>, Part)>, limit: u64) -> (IndexAnswer, Vec<
             unavailable.push(slug);
         }
     }
-    if !lists.is_empty() {
-        return (IndexAnswer::Hits(merge_hits(lists, limit)), unavailable);
+    match failure {
+        Some(failure) if !a_workspace_answered => (failure, Vec::new(), None),
+        failure if !lists.is_empty() => (
+            IndexAnswer::Hits(merge_hits(lists, limit)),
+            unavailable,
+            failure.as_ref().and_then(failure_sentence),
+        ),
+        _ => (IndexAnswer::Empty, Vec::new(), None),
     }
-    (failure.unwrap_or(IndexAnswer::Empty), Vec::new())
+}
+
+/// A failed answer's sentence; `None` for hits and the empty index.
+fn failure_sentence(answer: &IndexAnswer) -> Option<String> {
+    match answer {
+        IndexAnswer::Offline(sentence)
+        | IndexAnswer::Refused(sentence)
+        | IndexAnswer::AccessRefused(sentence)
+        | IndexAnswer::Failed(sentence) => Some(sentence.clone()),
+        IndexAnswer::Hits(_) | IndexAnswer::Empty => None,
+    }
 }
 
 /// The collections, then the model, then the searches (MOD-92 G8, review R1 M3, MOD-159 M1 plan
@@ -1177,7 +1323,7 @@ async fn search_index<E, F, Fut>(
     targets: &[SearchTarget],
     options: &SearchOptions,
     load: F,
-) -> (IndexAnswer, Vec<String>)
+) -> (IndexAnswer, Vec<String>, Option<String>)
 where
     E: DenseEmbedder + Clone,
     F: FnOnce() -> Fut,
@@ -1212,7 +1358,7 @@ where
                 parts.push((slug, Part::Hits(Vec::new())));
             }
             Ok(None) => parts.push((slug, Part::Missing)),
-            Err(err) => return (index_refusal(err), Vec::new()),
+            Err(err) => return (index_refusal(err), Vec::new(), None),
         }
     }
     found.retain(|(_, _, query)| !query.projects.is_empty() && query.limit > 0);
@@ -1395,12 +1541,13 @@ mod tests {
     #[test]
     fn a_mismatch_is_an_error_once_then_debug_and_anything_else_a_warning() {
         use tracing::Level;
-        let mut reported = false;
-        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
-        assert_eq!(open_failure_level(true, &mut reported), Level::ERROR);
-        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
-        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
-        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
+        let c = IndexedCollection::Global;
+        let mut reported = HashSet::new();
+        assert_eq!(open_failure_level(false, &mut reported, c), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported, c), Level::ERROR);
+        assert_eq!(open_failure_level(true, &mut reported, c), Level::DEBUG);
+        assert_eq!(open_failure_level(false, &mut reported, c), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported, c), Level::DEBUG);
     }
 
     #[test]
@@ -1719,7 +1866,7 @@ mod tests {
     /// workspaces whose collection is missing or refused are named, the global one never is.
     #[test]
     fn a_search_names_the_workspaces_whose_collection_it_could_not_read() {
-        let (answer, unavailable) = combine(
+        let (answer, unavailable, _) = combine(
             vec![
                 (Some("htui".into()), Part::Hits(vec![scored("A-1", 0.4)])),
                 (Some("platform".into()), Part::Missing),
@@ -1739,7 +1886,7 @@ mod tests {
             ["GLOBAL-22", "A-1"]
         );
         assert_eq!(unavailable, ["platform", "lone"]);
-        let (answer, unavailable) = combine(
+        let (answer, unavailable, _) = combine(
             vec![
                 (Some("htui".into()), Part::Hits(vec![scored("A-1", 0.4)])),
                 (None, Part::Missing),
@@ -1750,17 +1897,67 @@ mod tests {
         assert!(unavailable.is_empty(), "the global one is never named");
     }
 
+    /// MOD-159 M1 R2: the global collection, empty on most boxes, always answers, so it never
+    /// counts as a workspace that answered: a failed workspace beside it is the failure, its exit
+    /// as before. One workspace answering beside a failed one is hits, the failed one named.
+    #[test]
+    fn the_global_collection_never_hides_a_failed_workspace() {
+        let mismatch = IndexAnswer::Refused(htui_core::qdrant::unavailable(
+            "embedder mismatch: collection `htui_ws_1` holds vectors from hash/384",
+        ));
+        let (answer, unavailable, _) = combine(
+            vec![
+                (Some("lone".into()), Part::Failed(mismatch.clone())),
+                (None, Part::Hits(Vec::new())),
+            ],
+            10,
+        );
+        assert_eq!(answer, mismatch);
+        assert!(unavailable.is_empty(), "{unavailable:?}");
+        let (answer, unavailable, _) = combine(
+            vec![
+                (Some("lone".into()), Part::Failed(mismatch.clone())),
+                (None, Part::Hits(vec![scored("GLOBAL-1", 0.9)])),
+            ],
+            10,
+        );
+        assert_eq!(
+            answer, mismatch,
+            "global hits do not answer for a workspace"
+        );
+        assert!(unavailable.is_empty(), "{unavailable:?}");
+        let (answer, unavailable, cause) = combine(
+            vec![
+                (Some("htui".into()), Part::Hits(vec![scored("A-1", 0.4)])),
+                (Some("lone".into()), Part::Failed(mismatch.clone())),
+                (None, Part::Hits(Vec::new())),
+            ],
+            10,
+        );
+        assert!(matches!(answer, IndexAnswer::Hits(_)), "{answer:?}");
+        assert_eq!(unavailable, ["lone"]);
+        assert_eq!(
+            cause.as_deref(),
+            failure_sentence(&mismatch).as_deref(),
+            "the stderr note carries why"
+        );
+        assert!(
+            cause.is_some_and(|cause| cause.contains("embedder mismatch")),
+            "the failure's own sentence"
+        );
+    }
+
     /// D9: every collection missing is the empty index, as one missing collection was; no hits and
     /// a failure is that failure, its exit unchanged.
     #[test]
     fn a_search_with_no_collection_is_empty_and_one_with_only_failures_fails() {
-        let (answer, unavailable) = combine(
+        let (answer, unavailable, _) = combine(
             vec![(Some("htui".into()), Part::Missing), (None, Part::Missing)],
             10,
         );
         assert_eq!(answer, IndexAnswer::Empty);
         assert!(unavailable.is_empty(), "{unavailable:?}");
-        let (answer, unavailable) = combine(
+        let (answer, unavailable, _) = combine(
             vec![
                 (Some("htui".into()), Part::Missing),
                 (
@@ -1952,7 +2149,7 @@ mod tests {
         let load = || -> std::future::Ready<anyhow::Result<HashEmbedder>> {
             panic!("no model for a Qdrant that does not answer")
         };
-        let (answer, unavailable) = search_index(&settings, "c", &targets, &options, load).await;
+        let (answer, unavailable, _) = search_index(&settings, "c", &targets, &options, load).await;
         assert!(
             unavailable.is_empty(),
             "a failure names nobody: {unavailable:?}"
@@ -2072,6 +2269,8 @@ mod tests {
             reads: AtomicUsize,
             fail: AtomicUsize,
             takeover: Mutex<Option<Takeover>>,
+            /// How long its next read of the htui project sleeps (a sync longer than the TTL).
+            pause: Mutex<Option<Duration>>,
         }
 
         impl Counting {
@@ -2106,6 +2305,10 @@ mod tests {
                 self.reads.fetch_add(1, Ordering::SeqCst);
                 if project == ids::PROJECT_HTUI {
                     self.syncs.fetch_add(1, Ordering::SeqCst);
+                    let pause = self.pause.lock().expect("not poisoned").take();
+                    if let Some(pause) = pause {
+                        tokio::time::sleep(pause).await;
+                    }
                 }
                 let armed = self.takeover.lock().expect("not poisoned").take();
                 if let Some(t) = armed {
@@ -2140,6 +2343,7 @@ mod tests {
             fail_opens: AtomicUsize,
             fail_upserts: usize,
             forgotten: Mutex<Vec<bool>>,
+            synced: AtomicUsize,
             legacy: AtomicUsize,
         }
 
@@ -2188,6 +2392,11 @@ mod tests {
             fn legacy_drops(&self) -> usize {
                 self.legacy.load(Ordering::SeqCst)
             }
+
+            /// How often the job's own connections were dropped (an unreadable key).
+            fn synced_forgets(&self) -> usize {
+                self.synced.load(Ordering::SeqCst)
+            }
         }
 
         impl JobIndex for Fakes {
@@ -2217,6 +2426,10 @@ mod tests {
                     .lock()
                     .expect("not poisoned")
                     .push(store.is_some());
+            }
+
+            fn forget_synced(&self) {
+                self.synced.fetch_add(1, Ordering::SeqCst);
             }
 
             async fn drop_legacy(&self, _: &QdrantSettings) -> Result<bool, String> {
@@ -2320,7 +2533,7 @@ mod tests {
                 );
             }
 
-            first_job.stop().await;
+            first_job.stop(WORKER_RELEASE_WAIT).await;
             for collection in every_collection() {
                 assert!(
                     !lease(&read, &collection).await.is_some_and(|l| l.live),
@@ -2335,7 +2548,7 @@ mod tests {
             );
             assert!(!second.store(PLATFORM).inner.points().is_empty());
             assert!(!second_job.is_finished(), "it runs until it is stopped");
-            second_job.stop().await;
+            second_job.stop(WORKER_RELEASE_WAIT).await;
         }
 
         /// D6, D7: a holder whose lease another box takes during its sync deletes nothing (the
@@ -2443,7 +2656,7 @@ mod tests {
                 3,
                 "the new minute applies from the next beat"
             );
-            job.stop().await;
+            job.stop(WORKER_RELEASE_WAIT).await;
         }
 
         /// D10: the holder of the global collection creates it and drops the legacy collection,
@@ -2469,7 +2682,7 @@ mod tests {
                 1,
                 "the legacy collection is dropped once"
             );
-            job.stop().await;
+            job.stop(WORKER_RELEASE_WAIT).await;
         }
 
         /// MOD-158 R1 (B-L1): a sync that fails forgets the connection it used, so the next
@@ -2525,7 +2738,7 @@ mod tests {
                 "{:?}",
                 index.urls()
             );
-            job.stop().await;
+            job.stop(WORKER_RELEASE_WAIT).await;
         }
 
         /// MOD-158 D7: a failed open is a log line; the collection is opened again at the next
@@ -2547,6 +2760,133 @@ mod tests {
             index_beat(&read, &settings, &index, owner, &mut state).await;
             assert_eq!(index.opened().len(), 6, "opened again");
             assert_eq!(index.store(PLATFORM).syncs(), 1);
+        }
+
+        /// MOD-159 M1 R2: a reconcile longer than the TTL (a first build) does not let the job's
+        /// other leases lapse, nor the one it syncs under: they are renewed every refresh while it
+        /// runs, so another owner's take finds each one held.
+        #[tokio::test(start_paused = true)]
+        async fn a_long_reconcile_keeps_every_held_lease_live() {
+            let read = indexable().await;
+            read.set_app_setting(SYNC_MINUTES_KEY, json!(1));
+            let settings = settings_over(&read);
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            tokio::time::advance(BEAT).await;
+            // Every collection is due again; Platform's sync now takes five minutes.
+            *index.store(PLATFORM).pause.lock().expect("not poisoned") = Some(5 * MINUTE);
+            let other = Uuid::now_v7();
+            let probe = async {
+                tokio::time::sleep(4 * MINUTE).await;
+                assert_eq!(index.store(PLATFORM).syncs(), 2, "still in the long sync");
+                for collection in every_collection() {
+                    let take = read
+                        .take_indexer_lease(&collection, ids::BOX, other, TimeDelta::seconds(120))
+                        .await
+                        .expect("the memory store never fails");
+                    assert!(
+                        matches!(take, LeaseTake::Held(_)),
+                        "{collection} is still held by the job: {take:?}"
+                    );
+                }
+            };
+            tokio::join!(
+                index_beat(&read, &settings, &index, owner, &mut state),
+                probe
+            );
+            assert_eq!(state.held(), every_collection());
+        }
+
+        /// MOD-159 M1 R2: a beat resolves the URL alone; the key (which may prompt a locked
+        /// keyring) is read only when a held collection is due, once for that beat.
+        #[tokio::test(start_paused = true)]
+        async fn beats_with_nothing_due_read_no_key() {
+            static READS: AtomicUsize = AtomicUsize::new(0);
+            fn ring() -> htui_core::store::Result<Option<String>> {
+                READS.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            let read = indexable().await;
+            let settings =
+                concepts_worker::QdrantSource::new(QdrantEnv::default(), KeySource::Interactive)
+                    .with_keyring(ring);
+            settings.publish(Some(Arc::new(read.clone())));
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(
+                READS.load(Ordering::SeqCst),
+                1,
+                "one read for the first beat"
+            );
+            assert_eq!(index.opened_once(), every_collection());
+            for _ in 0..5 {
+                tokio::time::advance(BEAT).await;
+                index_beat(&read, &settings, &index, owner, &mut state).await;
+            }
+            assert_eq!(
+                READS.load(Ordering::SeqCst),
+                1,
+                "nothing due, no key read; the leases were still renewed"
+            );
+            assert_eq!(state.held(), every_collection());
+            tokio::time::advance(15 * MINUTE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(READS.load(Ordering::SeqCst), 2, "due again, read again");
+        }
+
+        /// MOD-159 M1 R2: a key that cannot be read opens nothing and keeps the leases; it drops
+        /// the job's own connections only (never the search's), and waits for the interval.
+        #[tokio::test(start_paused = true)]
+        async fn an_unreadable_key_keeps_the_leases_and_drops_only_the_jobs_connections() {
+            fn locked() -> htui_core::store::Result<Option<String>> {
+                Err(StoreError::Backend("the Secret Service is locked".into()))
+            }
+            let read = indexable().await;
+            let settings =
+                concepts_worker::QdrantSource::new(QdrantEnv::default(), KeySource::Interactive)
+                    .with_keyring(locked);
+            settings.publish(Some(Arc::new(read.clone())));
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(index.opened().is_empty(), "nothing opened without the key");
+            assert_eq!(state.held(), every_collection(), "the leases are kept");
+            assert_eq!(index.forgotten(), Vec::<bool>::new(), "no forget-all");
+            assert_eq!(index.synced_forgets(), 1, "the job's connections, once");
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(index.synced_forgets(), 1, "nothing due, no key read");
+        }
+
+        /// MOD-159 M1 R2: each collection's embedder mismatch is an error once, on its own.
+        #[test]
+        fn each_collections_mismatch_is_an_error_once() {
+            use tracing::Level;
+            let mut reported = HashSet::new();
+            assert_eq!(
+                open_failure_level(true, &mut reported, PLATFORM),
+                Level::ERROR
+            );
+            assert_eq!(
+                open_failure_level(true, &mut reported, GRAPHICS),
+                Level::ERROR,
+                "another collection's mismatch is said too"
+            );
+            assert_eq!(
+                open_failure_level(true, &mut reported, PLATFORM),
+                Level::DEBUG
+            );
+            assert_eq!(
+                open_failure_level(false, &mut reported, GRAPHICS),
+                Level::WARN
+            );
         }
 
         /// The interval's rule: positive whole minutes, else 15.
@@ -2701,7 +3041,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert!(!job.is_finished(), "the job runs until it is stopped");
-            job.stop().await;
+            job.stop(WORKER_RELEASE_WAIT).await;
         }
 
         /// MOD-11 H-26: the index job and every search take the model from one load slot on the

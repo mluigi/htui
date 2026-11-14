@@ -484,6 +484,11 @@ impl Overlay for ConceptsSearch {
                     }
                 }
             }
+            // MOD-159 M1 R2: another box took the lease over mid-sync, so the run stopped there:
+            // said dim, in the CLI's words, never as a finished report.
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))) if report.abandoned => {
+                self.index = IndexLine::Done(concepts::TAKEN_OVER.to_owned());
+            }
             ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))) => {
                 self.index = IndexLine::Done(index_report(report));
             }
@@ -680,17 +685,8 @@ pub fn index_report(report: &SyncReport) -> String {
 /// digits of its id when its row is gone; the expiry in UTC, as the queue overlay's times are.
 #[must_use]
 pub fn held_line(lease: &IndexerLease) -> String {
-    let holder = lease.box_name.clone().unwrap_or_else(|| {
-        lease.box_id.map_or_else(
-            || "another box".to_owned(),
-            |id| {
-                let text = id.as_uuid().simple().to_string();
-                text[text.len().saturating_sub(8)..].to_owned()
-            },
-        )
-    });
     // The hostname is stored text: stripped of control characters like a hit's key.
-    let holder: String = holder.chars().filter(|c| !c.is_control()).collect();
+    let holder = concepts::holder_name(lease);
     match lease.expires_at {
         Some(at) => format!(
             "indexing runs on {holder} (lease until {})",
@@ -1741,6 +1737,32 @@ mod tests {
             ConceptsReply::Indexed(Err("qdrant: upsert: refused".to_owned())),
         );
         assert!(bench.render(&search).contains("qdrant: upsert: refused"));
+    }
+
+    /// MOD-159 M1 R2: a press whose lease another box took over mid-sync stopped there; the row
+    /// says so, in the CLI's words, dim, and never as a report.
+    #[test]
+    fn a_ctrl_r_another_box_took_over_says_it_stopped() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        let _ = bench.emit.take();
+        let report = SyncReport {
+            items_rebuilt: 2,
+            abandoned: true,
+            ..Default::default()
+        };
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))),
+        );
+        let frame = bench.render(&search);
+        assert!(!frame.contains(INDEXING), "{frame}");
+        assert!(
+            frame.contains("another box took the indexing over; stopped here"),
+            "{frame}"
+        );
+        assert!(!frame.contains("indexed:"), "no report: {frame}");
     }
 
     /// MOD-159 M1 D12: a lease another box holds is said on the index row, in the dim style (it

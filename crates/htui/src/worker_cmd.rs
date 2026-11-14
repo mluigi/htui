@@ -154,7 +154,7 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     // MOD-159 M1 plan D7: the job ends and lets go of its leases, so another process indexes on
     // its next beat rather than after the TTL.
-    index_job.stop().await;
+    index_job.stop(concepts::WORKER_RELEASE_WAIT).await;
     start_check_task.abort();
     // R1 M2: the last lines ship, waiting at most `worker_log::FINAL_FLUSH_MAX`.
     log_flusher.shutdown().await;

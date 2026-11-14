@@ -3,7 +3,7 @@
 //!
 //! The loop is generic over [`ShipSource`] so a fake store can drive it (blueprint F7f, the shape
 //! of `concepts::IndexSource`); [`spawn_flusher`] is concrete over [`PgStore`], as
-//! `concepts::spawn_index_job` is.
+//! `concepts::IndexJob::spawn` is.
 
 use std::collections::BTreeMap;
 use std::future::Future;

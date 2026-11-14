@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use futures::FutureExt as _;
+use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use htui_core::model::{BoxId, IndexedCollection, IndexerLease, LeaseTake, Scope, WorkspaceId};
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
@@ -107,6 +107,39 @@ pub fn merge_hits(lists: Vec<Vec<Hit>>, limit: u64) -> Vec<Hit> {
     });
     hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     hits
+}
+
+/// D9, MOD-159 M1 R2: each searched collection's answer (a missing one has none) as one. A
+/// collection that failed (a stale one, another embedder's) is logged and skipped while another
+/// answers, so one bad `htui_ws_*` does not fail every search. A failure is the answer only when
+/// no workspace collection answered: the global one, empty on most boxes, never stands in for a
+/// workspace (`concepts::combine`'s rule for the CLI).
+fn partial_answer(
+    answers: Vec<(String, Result<Vec<Hit>, String>)>,
+    limit: u64,
+) -> Result<Vec<Hit>, String> {
+    let mut lists = Vec::with_capacity(answers.len());
+    let mut failed = Vec::new();
+    let mut a_workspace_answered = false;
+    for (collection, answer) in answers {
+        match answer {
+            Ok(hits) => {
+                a_workspace_answered |= matches!(
+                    IndexedCollection::parse(&collection),
+                    Some(IndexedCollection::Workspace(_))
+                );
+                lists.push(hits);
+            }
+            Err(err) => failed.push((collection, err)),
+        }
+    }
+    if !a_workspace_answered && let Some((_, first)) = failed.first() {
+        return Err(first.clone());
+    }
+    for (collection, err) in failed {
+        tracing::warn!(collection, %err, "concepts search skipped a collection that failed");
+    }
+    Ok(merge_hits(lists, limit))
 }
 
 /// [`DeleteGuard`] made object-safe for [`ConceptIndex::sync`] (MOD-159 M1 plan D6): asked
@@ -626,14 +659,24 @@ impl QdrantSource {
     /// MOD-160 D5: the URL's verdict is recorded as soon as it is known, before the key: a URL
     /// that resolves is configured even when the key cannot be read.
     pub async fn settings(&self) -> Result<QdrantSettings, Unresolved> {
+        let url = self.url().await?;
+        let api_key = self.api_key().await?;
+        Ok(QdrantSettings { url, api_key })
+    }
+
+    /// D4 alone, read now: the key, `None` when no source holds one. The index job reads it only
+    /// when a collection is due (MOD-159 M1 R2), since an interactive key may prompt a locked
+    /// keyring.
+    ///
+    /// # Errors
+    /// [`Unresolved::Key`].
+    pub async fn api_key(&self) -> Result<Option<Zeroizing<String>>, Unresolved> {
         let key = self
             .key
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let url = self.url().await?;
-        let api_key = resolve_key(&self.env, &key, self.keyring).await?;
-        Ok(QdrantSettings { url, api_key })
+        resolve_key(&self.env, &key, self.keyring).await
     }
 }
 
@@ -758,6 +801,14 @@ impl<T> Connections<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+    }
+
+    /// Every connection made as `made`, in any collection, goes; the others stay.
+    fn clear_made(&self, made: Made) {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, cached| cached.made != made);
     }
 
     /// [`QdrantSource::settings`]' answer, the cache cleared when it is not settings.
@@ -910,31 +961,35 @@ impl QdrantIndex {
         Ok(Some(store))
     }
 
-    /// D9: `query` over each collection of `names` in turn (each read-only, as one search was
-    /// before MOD-159), merged by [`merge_hits`]. A missing collection adds nothing; the first
-    /// failure is the answer and drops the connection it used.
+    /// D9: `query` over each of `collections` in turn (each read-only, as one search was before
+    /// MOD-159), answered by [`partial_answer`]. A missing collection adds nothing; a failure
+    /// drops the connection it used.
     async fn search_collections(
         &self,
         settings: &QdrantSettings,
         names: &[String],
         query: &SearchQuery,
     ) -> Result<Vec<Hit>, String> {
-        let mut lists = Vec::with_capacity(names.len());
+        let mut answers = Vec::with_capacity(names.len());
         for name in names {
             let store = match self.connections.get(name, settings, Made::ReadOnly) {
                 Some(store) => store,
-                None => match self.open_read_only(settings.clone(), name).await? {
-                    Some(store) => store,
-                    None => continue,
+                None => match self.open_read_only(settings.clone(), name).await {
+                    Ok(Some(store)) => store,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        answers.push((name.clone(), Err(err)));
+                        continue;
+                    }
                 },
             };
             let hits = store.search(query).await.map_err(|e| {
                 self.connections.forget(&store);
                 e.to_string()
-            })?;
-            lists.push(hits);
+            });
+            answers.push((name.clone(), hits));
         }
-        Ok(merge_hits(lists, query.limit))
+        partial_answer(answers, query.limit)
     }
 
     /// The worker's index job's `forget` (MOD-158 R1, B-L1): `Some(store)` after a failed sync on
@@ -944,6 +999,12 @@ impl QdrantIndex {
             Some(store) => self.connections.forget(store),
             None => self.connections.clear(),
         }
+    }
+
+    /// The index job's key stopped resolving (MOD-159 M1 R2): the ensured connections a sync made
+    /// go, the read-only ones a search made stay.
+    pub(crate) fn forget_synced(&self) {
+        self.connections.clear_made(Made::Ensured);
     }
 
     /// The settings, read now; a cached connection is dropped when they do not resolve.
@@ -1164,6 +1225,8 @@ pub struct MemIndex {
     stores: Mutex<HashMap<String, Arc<vector::MemVectorStore>>>,
     /// What every call answers instead, when set.
     failure: Option<String>,
+    /// The collections, by name, whose search fails (a stale or mismatched collection).
+    failing_in: HashSet<String>,
     /// How long every call sleeps first, when set.
     delay: Option<Duration>,
     /// What a probe answers (MOD-160 D9); `None`: nothing probed.
@@ -1185,6 +1248,13 @@ impl MemIndex {
             failure: Some(message.into()),
             ..self
         }
+    }
+
+    /// A search of `collection` fails, with a message naming it; the other collections answer.
+    #[must_use]
+    pub fn failing_in(mut self, collection: &IndexedCollection) -> Self {
+        self.failing_in.insert(collection.name());
+        self
     }
 
     /// Every call sleeps `by` first (`tokio::time::sleep`, so a paused clock advances it).
@@ -1286,13 +1356,18 @@ impl ConceptIndex for MemIndex {
                 SearchIn::Everywhere => self.workspace_names(),
             };
             names.push(IndexedCollection::Global.name());
-            let mut lists = Vec::with_capacity(names.len());
+            let mut answers = Vec::with_capacity(names.len());
             for name in names {
                 if let Some(store) = self.existing(&name) {
-                    lists.push(store.search(&query).await.map_err(|e| e.to_string())?);
+                    let answer = if self.failing_in.contains(&name) {
+                        Err(format!("qdrant: {name}: planted failure"))
+                    } else {
+                        store.search(&query).await.map_err(|e| e.to_string())
+                    };
+                    answers.push((name, answer));
                 }
             }
-            Ok(merge_hits(lists, query.limit))
+            partial_answer(answers, query.limit)
         })
     }
 
@@ -1335,29 +1410,41 @@ async fn this_box(backend: &Backend) -> Option<BoxId> {
         .map(|info| info.box_id)
 }
 
-/// `Ctrl+R` under `scope`'s workspace collection lease (MOD-159 M1 plan D12). A lease another
-/// owner holds live is [`IndexOutcome::HeldBy`] and nothing is synced. A free one is taken for
-/// this run alone and let go after it; one `owner` already holds (this process's index job's) is
-/// used and kept. The sync renews the lease before each delete batch ([`LeaseRenewal`]).
+/// `Ctrl+R` under `scope`'s workspace collection lease (MOD-159 M1 plan D12, R2). A lease the
+/// runtime's token (`job_owner`) holds, its index job's, renews: the sync runs under it and it is
+/// kept. Otherwise the press takes the lease under a token of its own, so the job, beating
+/// meanwhile, finds it held instead of sharing it, and lets go of that one lease after the sync; a
+/// press aborted half-way (superseded, or the TUI quit) leaves it to lapse within the TTL. A lease
+/// another owner holds live is [`IndexOutcome::HeldBy`] and nothing is synced. The sync renews
+/// the lease before each delete batch ([`LeaseRenewal`]).
 async fn index_under_lease(
     index: &dyn ConceptIndex,
     backend: Backend,
     scope: Scope,
-    owner: Uuid,
+    job_owner: Uuid,
 ) -> Result<IndexOutcome, String> {
     let collection = IndexedCollection::Workspace(scope.workspace_id);
     let Some(box_id) = this_box(&backend).await else {
         return Err(NO_BOX_IDENTITY.to_owned());
     };
     let ttl = LeaseTimes::from_app(&backend.app_settings().await.unwrap_or_default()).ttl;
-    let taken = match backend
-        .take_indexer_lease(&collection, box_id, owner, ttl)
+    let the_jobs = backend
+        .renew_indexer_lease(&collection, job_owner, ttl)
         .await
-        .map_err(|e| e.to_string())?
-    {
-        LeaseTake::Held(lease) => return Ok(IndexOutcome::HeldBy(lease)),
-        LeaseTake::Taken => true,
-        LeaseTake::Ours => false,
+        .map_err(|e| e.to_string())?;
+    let owner = if the_jobs {
+        job_owner
+    } else {
+        let press = Uuid::now_v7();
+        match backend
+            .take_indexer_lease(&collection, box_id, press, ttl)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            LeaseTake::Held(lease) => return Ok(IndexOutcome::HeldBy(lease)),
+            // A fresh token is never `Ours`; both mean the press holds it now.
+            LeaseTake::Taken | LeaseTake::Ours => press,
+        }
     };
     let guard = LeaseRenewal {
         backend: backend.clone(),
@@ -1368,13 +1455,9 @@ async fn index_under_lease(
     let synced = index
         .sync(backend.clone(), collection, scope, Box::new(guard))
         .await;
-    if taken {
-        // Let go of this one lease: renewed to lapse now. `release_indexer_leases` would free
-        // every lease of `owner`, the index job's included.
-        if let Err(err) = backend
-            .renew_indexer_lease(&collection, owner, TimeDelta::zero())
-            .await
-        {
+    if !the_jobs {
+        // This one lease, compare-and-set on the press's token: nothing of the job's.
+        if let Err(err) = backend.release_indexer_lease(&collection, owner).await {
             tracing::warn!(%err, %collection, "the Ctrl+R lease was not let go; it lapses");
         }
     }
@@ -1402,21 +1485,34 @@ pub struct ConceptsRuntime {
     tasks: HashMap<(Origin, Discriminant<StoreRequest>), JoinHandle<()>>,
     /// What [`Self::publish`] last handed the index (MOD-158 R1, B-L2).
     published: Published,
-    /// This process's indexer-lease token (MOD-159 M1 plan D5): `Ctrl+R` takes a workspace's
-    /// lease with it, so a lease this process's own index job holds is `Ours`.
+    /// This process's indexer-lease token (MOD-159 M1 plan D5), its index job's: `Ctrl+R` renews
+    /// a lease the job holds under it, and takes a free one under a token of its own (R2).
     owner: Uuid,
     /// The TUI's index job ([`Self::with_index_job`]), `None` when this runtime runs none.
     job: Option<JobSlot>,
 }
 
-/// The TUI's index job (MOD-159 M1 plan D8): the index it runs over, and the job over the
-/// writable store last published, if any.
+/// The TUI's index job (MOD-159 M1 plan D8): the index it runs over, the job over the writable
+/// store last published, if any, and the stops of the jobs before it.
 struct JobSlot {
     /// The process's shared index, so the job and the overlay's search load one model.
     index: Arc<QdrantIndex>,
     /// The job running now.
     running: Option<crate::concepts::IndexJob<PgStore>>,
+    /// Every earlier job's stop, chained, until it is done (MOD-159 M1 R2): kept across a `None`
+    /// publish, so a job started after going offline and back still waits for the release of the
+    /// one before, which lets go of every lease of the same token.
+    stopping: Option<Stopping>,
 }
+
+/// Earlier jobs' stops, awaited by the next job's first beat and by
+/// [`ConceptsRuntime::stop_index_job`].
+type Stopping = Shared<BoxFuture<'static, ()>>;
+
+/// How long the TUI's [`crate::concepts::IndexJob::stop`] waits for its leases to be let go
+/// (MOD-159 M1 R2): the store loop's whole shutdown has `crate::SHUTDOWN` (5 s), so less than
+/// `htui worker`'s [`crate::concepts::WORKER_RELEASE_WAIT`]; leases not let go lapse in the TTL.
+pub const TUI_RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 /// What [`ConceptsRuntime::publish`] last handed the index, so an unchanged backend is not handed
 /// over again on every iteration of the store loop.
@@ -1478,16 +1574,24 @@ impl ConceptsRuntime {
 
     /// The same runtime, also running the TUI's index job (MOD-159 M1 plan D8) over the process's
     /// shared index: [`Self::publish`] starts it over each writable store it is handed, with this
-    /// runtime's token (so `Ctrl+R` finds its leases `Ours`), and stops it, letting go of its
+    /// runtime's token (so `Ctrl+R` renews a lease the job holds), and stops it, letting go of its
     /// leases, when the store goes; [`Self::stop_index_job`] stops it at exit. Only
     /// `store_worker::spawn_hosted` asks for it: `--demo` and the memory backend have no writable
     /// store, so no job runs there, and the test harness builds runtimes without one.
     #[must_use]
     pub fn with_index_job(self) -> Self {
+        self.with_index_job_over(shared_qdrant())
+    }
+
+    /// [`Self::with_index_job`] over `index`: a test's, whose settings come from a `QdrantEnv`
+    /// literal (blueprint P-13).
+    #[must_use]
+    pub(crate) fn with_index_job_over(self, index: Arc<QdrantIndex>) -> Self {
         Self {
             job: Some(JobSlot {
-                index: shared_qdrant(),
+                index,
                 running: None,
+                stopping: None,
             }),
             ..self
         }
@@ -1525,26 +1629,49 @@ impl ConceptsRuntime {
         self.index
             .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
         // MOD-159 M1 plan D8: the job follows the writable store. The old one stops on a task of
-        // its own (this awaits nothing); the new one's first beat waits for that stop, so the old
-        // release cannot free a lease the new job has just taken under the same token.
+        // its own (this awaits nothing), after every stop before it; the next job's first beat
+        // waits for them all, so no release under the same token can free a lease it has just
+        // taken. The chain outlives a `None` publish (R2), for the job after going back online.
         if let Some(job) = &mut self.job {
-            let stopping = job.running.take().map(|old| tokio::spawn(old.stop()));
+            if let Some(old) = job.running.take() {
+                let before = job.stopping.take();
+                let stop = tokio::spawn(async move {
+                    if let Some(before) = before {
+                        before.await;
+                    }
+                    old.stop(TUI_RELEASE_WAIT).await;
+                });
+                job.stopping = Some(
+                    async move {
+                        let _ = stop.await;
+                    }
+                    .boxed()
+                    .shared(),
+                );
+            }
             job.running = store.map(|pg| {
                 crate::concepts::IndexJob::spawn_over(
                     pg.clone(),
                     Arc::clone(&job.index),
                     self.owner,
-                    stopping,
+                    job.stopping.clone().map(FutureExt::boxed),
                 )
             });
         }
     }
 
     /// MOD-159 M1 plan D8: stops the TUI's index job, if one runs, and lets go of its leases
-    /// (waited for at most a few seconds). The store loop calls it once, when the UI is gone.
+    /// (waited for at most [`TUI_RELEASE_WAIT`]), then waits as long again at most for an earlier
+    /// job's stop still in flight. The store loop calls it once, when the UI is gone.
     pub async fn stop_index_job(&mut self) {
-        if let Some(running) = self.job.as_mut().and_then(|job| job.running.take()) {
-            running.stop().await;
+        let Some(job) = self.job.as_mut() else {
+            return;
+        };
+        if let Some(running) = job.running.take() {
+            running.stop(TUI_RELEASE_WAIT).await;
+        }
+        if let Some(stopping) = job.stopping.take() {
+            let _ = tokio::time::timeout(TUI_RELEASE_WAIT, stopping).await;
         }
     }
 
@@ -3964,6 +4091,204 @@ mod tests {
             .expect("held");
         assert!(lease.live, "still held: {lease:?}");
         assert_eq!(lease.box_id, Some(box_id));
+        // MOD-159 M1 R2: still the job's: its next renewal finds it.
+        assert!(
+            backend
+                .renew_indexer_lease(&collection, runtime.owner(), TimeDelta::seconds(120))
+                .await
+                .expect("the memory store renews it"),
+            "the job's lease is renewable by the runtime's token after the press"
+        );
+    }
+
+    /// MOD-159 M1 R2: a press on a free lease takes it under a token of its own, never the
+    /// runtime's: the runtime's index job, beating meanwhile, finds it held and leaves it, and the
+    /// press's release afterwards cannot free anything of the job's.
+    #[tokio::test(start_paused = true)]
+    async fn a_ctrl_r_on_a_free_lease_holds_it_under_a_token_of_its_own() {
+        let (backend, scope) = platform().await;
+        let collection = IndexedCollection::Workspace(scope.workspace_id);
+        let index = Arc::new(MemIndex::new().delayed(Duration::from_secs(10)));
+        let mut runtime = ConceptsRuntime::new(index.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let served = runtime.serve(
+            &backend,
+            &tx,
+            &envelope(
+                1,
+                StoreRequest::IndexConcepts {
+                    scope,
+                    scope_row_of: None,
+                },
+            ),
+        );
+        assert!(matches!(served, ConceptsServed::Deferred), "{served:?}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("the press took it");
+        assert!(lease.live, "{lease:?}");
+        assert!(
+            !backend
+                .renew_indexer_lease(&collection, runtime.owner(), TimeDelta::seconds(120))
+                .await
+                .expect("the memory store answers"),
+            "the runtime's token does not hold the press's lease"
+        );
+        assert_eq!(runtime.settle(Duration::from_secs(60)).await, 0);
+        let reply = rx.try_recv().expect("the press answered");
+        assert!(
+            matches!(outcome(&reply.reply), Ok(IndexOutcome::Synced(_))),
+            "{:?}",
+            reply.reply
+        );
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("taken once");
+        assert!(!lease.live, "the press let it go: {lease:?}");
+    }
+
+    /// MOD-159 M1 R2: one failing collection (stale, or another embedder's) is skipped and the
+    /// others answer, for MCP's `Everywhere` and the TUI's named workspaces alike. A failure is
+    /// the answer only when no workspace collection answered: the global one, empty on most
+    /// boxes, never stands in for one.
+    #[tokio::test]
+    async fn a_failing_collection_is_skipped_while_the_others_answer() {
+        use htui_core::model::ProjectId;
+        const WORDS: &str = "lighthouse beacon";
+        let (ws_a, ws_b) = (WorkspaceId::new(), WorkspaceId::new());
+        let (pa, pb) = (ProjectId::new(), ProjectId::new());
+        let seed = |index: MemIndex| async move {
+            for (collection, project, key) in [
+                (IndexedCollection::Workspace(ws_a), pa, "A-1"),
+                (IndexedCollection::Workspace(ws_b), pb, "B-1"),
+                (IndexedCollection::Global, pa, "G-1"),
+            ] {
+                index
+                    .store(&collection)
+                    .upsert(vec![point(project, key, WORDS)])
+                    .await
+                    .expect("the fake upserts");
+            }
+            index
+        };
+        let query = concepts::query(WORDS, vec![pa, pb], false, 10);
+        let keys = |hits: Result<Vec<Hit>, String>| {
+            let mut keys: Vec<String> = hits
+                .expect("the others answer")
+                .into_iter()
+                .map(|h| h.key)
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        let a_fails = seed(MemIndex::new().failing_in(&IndexedCollection::Workspace(ws_a))).await;
+        assert_eq!(
+            keys(a_fails.search(SearchIn::Everywhere, query.clone()).await),
+            ["B-1", "G-1"]
+        );
+        assert_eq!(
+            keys(
+                a_fails
+                    .search(SearchIn::Workspaces(vec![ws_a, ws_b]), query.clone())
+                    .await
+            ),
+            ["B-1", "G-1"]
+        );
+        let alone = a_fails
+            .search(SearchIn::Workspaces(vec![ws_a]), query.clone())
+            .await
+            .expect_err("its only workspace failed; the global one does not hide it");
+        assert!(alone.contains("planted failure"), "{alone}");
+
+        let global_fails = seed(MemIndex::new().failing_in(&IndexedCollection::Global)).await;
+        assert_eq!(
+            keys(
+                global_fails
+                    .search(SearchIn::Everywhere, query.clone())
+                    .await
+            ),
+            ["A-1", "B-1"]
+        );
+        let every = seed(
+            MemIndex::new()
+                .failing_in(&IndexedCollection::Workspace(ws_a))
+                .failing_in(&IndexedCollection::Workspace(ws_b)),
+        )
+        .await;
+        assert!(
+            every.search(SearchIn::Everywhere, query).await.is_err(),
+            "every workspace collection failed"
+        );
+    }
+
+    /// MOD-159 M1 R2 (plan D8): the TUI's index job starts when a writable store is published,
+    /// takes leases under the runtime's token, and `stop_index_job` lets go of them. Its model
+    /// never loads, so the job holds its first due collection while it waits.
+    #[tokio::test]
+    async fn the_runtimes_index_job_runs_under_its_token_and_lets_go_at_the_stop() {
+        use crate::concepts::IndexSource as _;
+        let Some(db) = htui_store::testkit::fresh_db().await else {
+            return;
+        };
+        let index = Arc::new(
+            QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+                .with_source(Arc::new(source(Some("http://127.0.0.1:1"), None, no_key))),
+        );
+        let mut runtime =
+            ConceptsRuntime::new(Arc::new(Recording::default())).with_index_job_over(index);
+        let first = db
+            .store
+            .index_scopes()
+            .await
+            .expect("the scopes")
+            .first()
+            .map_or(IndexedCollection::Global, |scope| {
+                IndexedCollection::Workspace(scope.workspace_id)
+            });
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "concepts-index-job", 1)
+            .await
+            .expect("open a throwaway mirror");
+        runtime.publish(&Backend::Online {
+            pg: db.store.clone(),
+            cache: cache.clone(),
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !db
+            .store
+            .indexer_lease(&first)
+            .await
+            .expect("the lease reads")
+            .is_some_and(|lease| lease.live)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the job never took {first}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            db.store
+                .renew_indexer_lease(&first, runtime.owner(), TimeDelta::seconds(120))
+                .await
+                .expect("the lease renews"),
+            "taken under the runtime's token"
+        );
+        runtime.stop_index_job().await;
+        let lease = db
+            .store
+            .indexer_lease(&first)
+            .await
+            .expect("the lease reads")
+            .expect("taken once");
+        assert!(!lease.live, "let go at the stop: {lease:?}");
+        cache.close().await;
+        db.drop_db().await;
     }
 
     /// D12: a backend with no box of its own cannot take a lease: the run says so.
