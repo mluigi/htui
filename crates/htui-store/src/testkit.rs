@@ -491,8 +491,10 @@ pub async fn qdrant_turn() -> QdrantTurn {
 /// qdrant-client's default 5 s deadline while the parallel gate saturates the box ("create
 /// collection: … Timeout expired"), which a [`qdrant_turn`] cannot help: the load is every other
 /// test, not another Qdrant case. `connect_to` is idempotent (an existing collection is checked
-/// and its indexes re-asserted), so a retry after a create the server did finish is safe. Any
-/// other error, an embedder mismatch included, is returned at once.
+/// and its indexes re-asserted), so a retry after a create the server did finish is safe: a retry
+/// that checks before that create lands and then loses the create to it gets `ALREADY_EXISTS`,
+/// which `ensure_collection` takes for an existing collection. Any other error, an embedder
+/// mismatch included, is returned at once.
 ///
 /// # Errors
 /// What the last attempt answered.

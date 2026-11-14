@@ -453,6 +453,30 @@ async fn an_unrecorded_collection_is_stamped_once() {
     );
 }
 
+/// Connects that race to create one new collection all open it: the ones that lose the create
+/// find it there and check it as an existing one. Two htui processes starting on a fresh Qdrant
+/// meet this, and so does `testkit::qdrant_connect_to`'s retry after a create the client gave up
+/// on but the server finished.
+#[tokio::test]
+async fn connects_racing_to_create_one_collection_all_open_it() {
+    let Some((_turn, url)) = qdrant_url().await else {
+        return;
+    };
+    let name = fresh_name();
+    let (a, b, c, d) = tokio::join!(
+        connect(&url, HashEmbedder::new(DENSE_DIM), &name),
+        connect(&url, HashEmbedder::new(DENSE_DIM), &name),
+        connect(&url, HashEmbedder::new(DENSE_DIM), &name),
+        connect(&url, HashEmbedder::new(DENSE_DIM), &name),
+    );
+    let stamped = stored_identity(&raw(&url), &name).await;
+    raw(&url).delete_collection(&name).await.expect("drop");
+    for (at, connected) in [a, b, c, d].into_iter().enumerate() {
+        connected.unwrap_or_else(|e| panic!("connect {at}: {e}"));
+    }
+    assert_eq!(stamped, Some(EmbedderIdentity::hash(DENSE_DIM)));
+}
+
 /// Qdrant merges an update's metadata into the collection's (observed on 1.19.1, over gRPC here
 /// and over REST): the stamp adds its key and leaves the others.
 #[tokio::test]
