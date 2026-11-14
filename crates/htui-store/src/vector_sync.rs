@@ -14,9 +14,9 @@
 //!
 //! Owner documents follow (MOD-147 M4 D5): a project's or a workspace's scope row's own documents
 //! (`item_id IS NULL`), the newest version of each kind indexed under its owner's slug. Such a
-//! row is never updated (a new version is a new row), so a newest document whose points exist is
-//! in step, one without points is built, and the points of a document no longer the newest of its
-//! kind are deleted. A workspace-scoped search reaches the scope row through
+//! row is never updated (a new version is a new row), so a newest document with a point for each
+//! of its sections is in step, one missing any is built (in one upsert), and the points of a
+//! document no longer the newest of its kind are deleted. A workspace-scoped search reaches the scope row through
 //! [`workspace_search_scope`].
 use crate::vector::{
     ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
@@ -33,7 +33,7 @@ use uuid::Uuid;
 /// tokens; 2000 characters of English prose stays under that.
 pub const MAX_CHUNK_CHARS: usize = 2000;
 
-/// Most requirement or owner-document points written in one upsert.
+/// Most requirement points written in one upsert.
 const UPSERT_BATCH: usize = 256;
 
 /// What one [`Indexer::sync`] did.
@@ -184,9 +184,10 @@ async fn sync_requirements(
 }
 
 /// The owner-document half of one project's sync (MOD-147 M4 D5): one listing, the newest version
-/// of each kind built when it has no points yet, and the points of every other document deleted.
-/// An owner document is never updated, so points under a newest document's ID are in step. When
-/// a document is to be built and the owner row is gone, nothing is written for the project.
+/// of each kind built when it lacks any of its points, and the points of every other document
+/// deleted. An owner document is never updated, so a newest document with a point for each of
+/// its sections is in step (MOD-147 M4 R1 L1). When a document is to be built and the owner row
+/// is gone, nothing is written for the project.
 async fn sync_owner_documents(
     read: &impl ReadStore,
     project: ProjectId,
@@ -203,27 +204,41 @@ async fn sync_owner_documents(
             }
         }
     }
+    // MOD-147 M4 R1 L1: in step only with a point for every section, so a document an earlier
+    // sync left half-written is built again. Its points are taken out of `indexed` either way:
+    // a rebuild rewrites them under the same IDs, so none of them is stale.
     let build: Vec<OwnerDocument> = latest
         .into_values()
-        .filter(|doc| indexed.remove(&doc.id).is_none())
+        .filter(|doc| {
+            let held = indexed.remove(&doc.id).map_or(0, |points| points.len());
+            held != section_count(&doc.body)
+        })
         .collect();
-    let mut points = Vec::new();
+    let mut documents = Vec::new();
     if !build.is_empty() {
         let Some(owner) = read.project(project).await? else {
             return Ok(report); // gone since the listing; the next sync drops its points
         };
         for doc in &build {
-            points.extend(owner_document_points(&owner, doc));
+            documents.push(owner_document_points(&owner, doc));
         }
     }
     let stale: Vec<Uuid> = indexed.into_values().flatten().map(|p| p.id).collect();
-    report.points_upserted += points.len();
+    report.points_upserted += documents.iter().map(Vec::len).sum::<usize>();
     report.points_deleted += stale.len();
-    for batch in points.chunks(UPSERT_BATCH) {
-        store.upsert(batch.to_vec()).await?;
+    // MOD-147 M4 R1 L1: one upsert per document, as the item pass writes one per item, so a
+    // failed call never leaves part of a document behind.
+    for points in documents {
+        store.upsert(points).await?;
     }
     store.delete(stale).await?;
     Ok(report)
+}
+
+/// The points a document of `body` is indexed as: one per section, one for an empty body
+/// ([`owner_document_points`], [`document_points`]).
+fn section_count(body: &str) -> usize {
+    chunk_markdown(body, MAX_CHUNK_CHARS).len().max(1)
 }
 
 /// MOD-147 M4 D6: the scope a workspace-scoped search and index cover: `scope` with the
@@ -887,6 +902,44 @@ mod tests {
         let points = owner_document_points(&store);
         assert_eq!(indexed_documents(&points), BTreeSet::from([new.id]));
         assert!(!indexed_documents(&points).contains(&old.id));
+    }
+
+    /// MOD-147 M4 R1 L1: a newest owner document missing one of its sections' points (a failed
+    /// upsert on an earlier sync) is not in step: the next sync writes all of its sections again
+    /// and deletes none of them.
+    #[tokio::test]
+    async fn a_half_indexed_owner_document_is_rebuilt_whole() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        let goals = write_owner_document(
+            &read,
+            ids::PROJECT_HTUI,
+            GOALS_KIND,
+            "Goals",
+            "## A\none\n## B\ntwo",
+        )
+        .await;
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(owner_document_points(&store).len(), 2);
+        store
+            .delete(vec![crate::vector::document_point_id(goals.id, 1)])
+            .await
+            .unwrap();
+        assert_eq!(owner_document_points(&store).len(), 1);
+
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(
+            report.points_upserted, 2,
+            "both sections, rewritten together"
+        );
+        assert_eq!(report.points_deleted, 0);
+        let points = owner_document_points(&store);
+        assert_eq!(points.len(), 2);
+        assert_eq!(indexed_documents(&points), BTreeSet::from([goals.id]));
+
+        let again = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(again.points_upserted, 0, "whole again, so in step");
     }
 
     /// MOD-147 M4 D5: the item pass never takes an owner-document point for an item orphan.
