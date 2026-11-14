@@ -458,7 +458,9 @@ for now).
   renews the lease of every collection. A collection whose lease another process holds is left
   to it. A beat reads the Qdrant URL only; the API key is read when a collection is due for a
   reconcile, so a beat with nothing to reconcile never touches the keyring. A key that cannot be
-  read is one `warn` line until its error changes, and that reconcile waits for the next interval.
+  read is one `warn` line until its error changes; the worker then lets go of every lease it holds,
+  so a process with a key takes the indexing over, and takes none, nor reads the key, until the
+  interval below has passed.
 - **A collection it holds is reconciled once when it is taken, then every
   `concepts_sync_minutes` minutes.** That is an `app_setting` key holding a positive whole number,
   read again every beat; without it, or with any other value, the interval is 15 minutes. The

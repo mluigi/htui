@@ -587,8 +587,8 @@ impl JobIndex for QdrantIndex {
 #[derive(Debug, Default)]
 pub struct JobState {
     /// Each collection this job holds, and when its last full reconcile started. Forgotten when
-    /// another owner holds the lease, when a sync was abandoned, and when the settings stop
-    /// resolving, so the next take reconciles at once.
+    /// another owner holds the lease, when a sync was abandoned, when the settings stop
+    /// resolving, and when the key cannot be read, so the next take reconciles at once.
     held: HashMap<IndexedCollection, tokio::time::Instant>,
     /// The collections whose embedder mismatch was logged at `error` (review L3), each once
     /// until it opens again (MOD-159 M1 R2).
@@ -599,6 +599,9 @@ pub struct JobState {
     no_url_said: bool,
     /// The sentence of the last key failure logged, until the key reads again (MOD-159 M1 R2).
     key_said: Option<String>,
+    /// When the key last could not be read, until it reads again: the job then holds no lease,
+    /// and takes none until [`sync_interval`] has passed since (MOD-159 M1 R2 review).
+    key_failed_at: Option<tokio::time::Instant>,
 }
 
 impl JobState {
@@ -621,7 +624,9 @@ impl JobState {
 /// [`sync_interval`], or that this job never reconciled, is opened and synced over its workspace's
 /// scope, the lease renewed before each delete batch; an abandoned sync forgets the collection.
 /// The key is read at the first due collection only (MOD-159 M1 R2), and while one collection
-/// reconciles every lease the job holds is renewed each refresh.
+/// reconciles every lease the job holds is renewed each refresh. A key that cannot be read lets
+/// every lease the job holds go, so a box with a key takes the indexing over, and the job takes
+/// no lease, and reads no key, until [`sync_interval`] has passed since.
 /// The global collection has nothing to sync yet: it is opened (created), and its holder drops the
 /// legacy collection once per process (D10). Failures are log lines; the next beat or interval is
 /// the retry.
@@ -667,6 +672,14 @@ where
             return times.refresh;
         }
     };
+    // MOD-159 M1 R2 review: a box that cannot read the key leaves the indexing to one that can,
+    // and does not ask the keyring again before the interval.
+    if state
+        .key_failed_at
+        .is_some_and(|failed| failed.elapsed() < every)
+    {
+        return times.refresh;
+    }
     let Some(box_id) = source.index_box().await else {
         tracing::warn!("concepts index not synced: this box has no identity; next beat");
         return times.refresh;
@@ -696,9 +709,8 @@ where
         owner,
         ttl: times.ttl,
     };
-    // The settings with the key, read at the first due collection and kept for this beat; `None`
-    // inside when the key could not be read.
-    let mut keyed: Option<Option<QdrantSettings>> = None;
+    // The settings with the key, read at the first due collection and kept for this beat.
+    let mut keyed: Option<QdrantSettings> = None;
     for (collection, scope) in collections {
         match source
             .take_indexer_lease(&collection, box_id, owner, times.ttl)
@@ -721,13 +733,16 @@ where
         if !due {
             continue;
         }
-        // Marked first: a key that cannot be read is tried again next interval, not next beat.
         state.held.insert(collection, tokio::time::Instant::now());
         if keyed.is_none() {
-            keyed = Some(with_key(settings, index, &url, state).await);
+            keyed = with_key(settings, index, &url, state).await;
         }
-        let Some(Some(resolved)) = &keyed else {
-            continue;
+        let Some(resolved) = &keyed else {
+            // MOD-159 M1 R2 review: a held lease this box cannot sync under would keep a box
+            // with a key from taking it over for as long as this one stays online.
+            release_held(source, owner, state).await;
+            state.key_failed_at = Some(tokio::time::Instant::now());
+            break;
         };
         // MOD-159 M1 R2: a reconcile may outlast the TTL (a first build), so every lease this
         // job holds, this collection's included, is renewed every refresh while it runs.
@@ -754,6 +769,7 @@ async fn with_key<I: JobIndex>(
     match settings.api_key().await {
         Ok(api_key) => {
             state.key_said = None;
+            state.key_failed_at = None;
             Some(QdrantSettings {
                 url: url.clone(),
                 api_key,
@@ -767,6 +783,17 @@ async fn with_key<I: JobIndex>(
                 state.key_said = Some(sentence);
             }
             None
+        }
+    }
+}
+
+/// Lets go of every lease `state` holds for `owner` (MOD-159 M1 R2 review: the key cannot be
+/// read), each on its own, so a lease `owner` lost meanwhile stays its new holder's. A release
+/// that fails is a log line: that lease lapses within its TTL.
+async fn release_held<L: IndexerLeaseStore>(leases: &L, owner: Uuid, state: &mut JobState) {
+    for collection in std::mem::take(&mut state.held).into_keys() {
+        if let Err(err) = leases.release_indexer_lease(&collection, owner).await {
+            tracing::warn!(%err, %collection, "concepts index lease not released; it lapses");
         }
     }
 }
@@ -2840,10 +2867,11 @@ mod tests {
             assert_eq!(READS.load(Ordering::SeqCst), 2, "due again, read again");
         }
 
-        /// MOD-159 M1 R2: a key that cannot be read opens nothing and keeps the leases; it drops
-        /// the job's own connections only (never the search's), and waits for the interval.
+        /// MOD-159 M1 R2: a key that cannot be read opens nothing and lets every lease go, so a box
+        /// with a key takes the indexing over; it drops the job's own connections only (never the
+        /// search's), and the job takes nothing, and reads no key, until the interval has passed.
         #[tokio::test(start_paused = true)]
-        async fn an_unreadable_key_keeps_the_leases_and_drops_only_the_jobs_connections() {
+        async fn an_unreadable_key_lets_the_leases_go_and_drops_only_the_jobs_connections() {
             fn locked() -> htui_core::store::Result<Option<String>> {
                 Err(StoreError::Backend("the Secret Service is locked".into()))
             }
@@ -2855,14 +2883,54 @@ mod tests {
             let index = Fakes::default();
             let owner = Uuid::now_v7();
             let mut state = JobState::default();
+            let other = Uuid::now_v7();
+            let every_take_is = |want: fn(&LeaseTake) -> bool, why: &'static str| {
+                let read = read.clone();
+                async move {
+                    for collection in every_collection() {
+                        let take = read
+                            .take_indexer_lease(
+                                &collection,
+                                ids::BOX,
+                                other,
+                                TimeDelta::seconds(120),
+                            )
+                            .await
+                            .expect("the memory store never fails");
+                        assert!(want(&take), "{collection}: {why}: {take:?}");
+                    }
+                }
+            };
             index_beat(&read, &settings, &index, owner, &mut state).await;
             assert!(index.opened().is_empty(), "nothing opened without the key");
-            assert_eq!(state.held(), every_collection(), "the leases are kept");
+            assert_eq!(state.held(), Vec::new(), "the leases are let go");
             assert_eq!(index.forgotten(), Vec::<bool>::new(), "no forget-all");
             assert_eq!(index.synced_forgets(), 1, "the job's connections, once");
             tokio::time::advance(BEAT).await;
             index_beat(&read, &settings, &index, owner, &mut state).await;
-            assert_eq!(index.synced_forgets(), 1, "nothing due, no key read");
+            assert_eq!(
+                index.synced_forgets(),
+                1,
+                "within the interval, no key read"
+            );
+            assert_eq!(state.held(), Vec::new(), "nor any lease taken");
+            every_take_is(
+                |take| matches!(take, LeaseTake::Taken),
+                "another box takes the indexing over",
+            )
+            .await;
+            read.release_indexer_leases(other)
+                .await
+                .expect("the memory store never fails");
+            tokio::time::advance(15 * MINUTE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(
+                index.synced_forgets(),
+                2,
+                "the interval passed: the key is read again"
+            );
+            assert_eq!(state.held(), Vec::new(), "still unreadable: let go again");
+            every_take_is(|take| matches!(take, LeaseTake::Taken), "let go again").await;
         }
 
         /// MOD-159 M1 R2: each collection's embedder mismatch is an error once, on its own.
