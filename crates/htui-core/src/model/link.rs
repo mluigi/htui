@@ -1,6 +1,8 @@
 //! Links between items and the traversal projection the graph view renders (`docs/ANA-9.md`
 //! §5.5, §7.3).
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -297,10 +299,14 @@ impl LinkGraph {
 
     /// MOD-150 M3 D2: orders `documents` by `(from_item_id` in node order, `kind`,
     /// `project_slug`, `owner_key`, `doc_kind`, `version)`, the texts by bytes. Every backend
-    /// runs this after its own query, so the order never depends on a collation.
+    /// runs this after its own query, so the order never depends on a collation. A document of
+    /// an item that is no node sorts first; an item listed twice ranks by its first node.
     pub fn sort_documents(&mut self) {
-        let nodes = &self.nodes;
-        let at = |id: ItemId| nodes.iter().position(|node| node.item_id == id);
+        let mut ranks: HashMap<ItemId, usize> = HashMap::with_capacity(self.nodes.len());
+        for (rank, node) in self.nodes.iter().enumerate() {
+            ranks.entry(node.item_id).or_insert(rank);
+        }
+        let at = |id: ItemId| ranks.get(&id).copied();
         self.documents.sort_by(|a, b| {
             at(a.from_item_id)
                 .cmp(&at(b.from_item_id))

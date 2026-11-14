@@ -315,10 +315,13 @@ impl GraphTab {
                 // MOD-150 M3 D12: an item's document reveals its owner; an owner document has
                 // no item to reveal.
                 let (Some(id), Some(key)) = (document.owner_item, &document.owner_key) else {
+                    let owner = match document.project_slug.strip_prefix('@') {
+                        Some(workspace) => format!("workspace {workspace}"),
+                        None => format!("project {}", document.project_slug),
+                    };
                     ctx.emit(Action::Error(format!(
-                        "{} is a {} document; open it in Settings",
+                        "{} is {owner}'s own document; open it in Settings",
                         document_key(document),
-                        document.project_slug
                     )));
                     return;
                 };
@@ -404,29 +407,14 @@ fn tree(graph: &LinkGraph, depth: u8) -> Vec<TreeRow> {
     out
 }
 
-/// Each item's documents, as indices into `LinkGraph::documents`, in the order they are drawn:
-/// `(kind, project slug, owner key, doc kind, version)`, the texts by bytes, so the backend's
-/// order never shows (as [`node_order`]).
+/// Each item's documents, as indices into `LinkGraph::documents`, in the order they are drawn.
+/// That is the reply's order: every backend answers it sorted by
+/// [`LinkGraph::sort_documents`], whose order within one item, `(kind, project slug, owner key,
+/// doc kind, version)` by bytes, is the one drawn, so no re-sort here.
 fn documents_by_item(graph: &LinkGraph) -> HashMap<ItemId, Vec<usize>> {
     let mut by_item: HashMap<ItemId, Vec<usize>> = HashMap::new();
     for (at, document) in graph.documents.iter().enumerate() {
         by_item.entry(document.from_item_id).or_default().push(at);
-    }
-    for documents in by_item.values_mut() {
-        documents.sort_by(|&a, &b| {
-            let (a, b) = (&graph.documents[a], &graph.documents[b]);
-            a.kind
-                .as_str()
-                .cmp(b.kind.as_str())
-                .then_with(|| a.project_slug.as_bytes().cmp(b.project_slug.as_bytes()))
-                .then_with(|| {
-                    let (a, b) = (a.owner_key.as_deref(), b.owner_key.as_deref());
-                    a.map(str::as_bytes).cmp(&b.map(str::as_bytes))
-                })
-                .then_with(|| a.doc_kind.as_bytes().cmp(b.doc_kind.as_bytes()))
-                .then(a.version.cmp(&b.version))
-                .then_with(|| a.document_id.cmp(&b.document_id))
-        });
     }
     by_item
 }
@@ -2489,12 +2477,14 @@ mod tests {
             3,
             3,
         );
-        let graph = LinkGraph {
+        let mut graph = LinkGraph {
             root: r.item_id,
             nodes: vec![r],
             edges: vec![],
             documents: vec![latest, stale],
         };
+        // As every backend answers it: the tab draws an item's documents in this order.
+        graph.sort_documents();
         assert_eq!(
             drawn(&graph, &shell, 80)[1..],
             [
@@ -2541,12 +2531,13 @@ mod tests {
         );
         lib.project_id = ProjectId::from_uuid(Uuid::from_u128(101));
         "lib".clone_into(&mut lib.project_slug);
-        let graph = LinkGraph {
+        let mut graph = LinkGraph {
             root: r.item_id,
             nodes: vec![r],
             edges: vec![],
             documents: vec![lib, elsewhere, own],
         };
+        graph.sort_documents();
         assert_eq!(
             drawn(&graph, &shell, 80)[1..],
             [
@@ -2760,32 +2751,44 @@ mod tests {
         assert_eq!(label, shell.theme.dim, "and dim");
     }
 
-    /// MOD-150 M3 D12: an owner document has no item to reveal; `Enter` says where it opens.
+    /// MOD-150 M3 D12: an owner document has no item to reveal; `Enter` says where it opens,
+    /// naming a scope row's owner as its workspace.
     #[tokio::test]
     async fn enter_on_an_owner_document_says_where_it_opens() {
         let shell = Shell::platform().await;
         let mut ctx = shell.ctx();
-        let mut verdict = document(
-            10,
-            ids::HTUI_FEAT_1,
-            ArtifactLinkKind::Relates,
-            None,
-            "verdict",
-            1,
-            1,
-        );
-        verdict.project_id = ids::PROJECT_HTUI;
-        "htui".clone_into(&mut verdict.project_slug);
-        let (mut tab, at) = feat_1_with(verdict).await;
-        tab.cursor = at;
-        assert_eq!(tab.on_key(key(KeyCode::Enter), &mut ctx), Handled::Consumed);
-        assert!(
-            matches!(
-                shell.emit.take().as_slice(),
-                [Action::Error(text)] if text == "htui verdict is a htui document; open it in Settings"
+        for (project, slug, said) in [
+            (
+                ids::PROJECT_HTUI,
+                "htui",
+                "htui verdict is project htui's own document; open it in Settings",
             ),
-            "no reveal"
-        );
+            (
+                ids::PROJECT_SCOPE_PLATFORM,
+                "@platform",
+                "@platform verdict is workspace platform's own document; open it in Settings",
+            ),
+        ] {
+            let mut verdict = document(
+                10,
+                ids::HTUI_FEAT_1,
+                ArtifactLinkKind::Relates,
+                None,
+                "verdict",
+                1,
+                1,
+            );
+            verdict.project_id = project;
+            slug.clone_into(&mut verdict.project_slug);
+            let (mut tab, at) = feat_1_with(verdict).await;
+            tab.cursor = at;
+            assert_eq!(tab.on_key(key(KeyCode::Enter), &mut ctx), Handled::Consumed);
+            let emitted = shell.emit.take();
+            assert!(
+                matches!(emitted.as_slice(), [Action::Error(text)] if text == said),
+                "no reveal: {emitted:?}"
+            );
+        }
     }
 
     /// MOD-150 M3 D12: a depth change keeps the cursor on a document whose item stays expanded.
