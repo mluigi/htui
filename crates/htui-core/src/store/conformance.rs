@@ -2245,7 +2245,7 @@ async fn gate_is_pinned_until_answered<S: WriteStore + ActivityStore>(store: &S)
     );
     assert_eq!(
         feed(CASE, store).await.pinned,
-        [gate.clone()],
+        std::slice::from_ref(&gate),
         "{CASE}: the waiting gate is pinned"
     );
 
@@ -2393,7 +2393,11 @@ async fn blocked_item_is_unblock<S: WriteStore + ActivityStore>(store: &S) {
         ),
         "{CASE}: an item with no active run"
     );
-    assert_eq!(feed(CASE, store).await.pinned, [unblock.clone()], "{CASE}");
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        std::slice::from_ref(&unblock),
+        "{CASE}"
+    );
 
     assert!(
         store
@@ -2455,7 +2459,7 @@ async fn permission_pending_is_pinned<S: WriteStore + ActivityStore>(store: &S) 
     );
     assert_eq!(
         feed(CASE, store).await.pinned,
-        [permission.clone()],
+        std::slice::from_ref(&permission),
         "{CASE}"
     );
 
