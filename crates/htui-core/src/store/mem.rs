@@ -12432,6 +12432,24 @@ impl IndexerLeaseStore for MemStore {
         }))
     }
 
+    async fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        let now = self.now();
+        Ok(self.write(
+            |state| match state.indexer_leases.get_mut(&collection.name()) {
+                Some(row) if row.owner == Some(owner) => {
+                    row.owner = None;
+                    row.expires_at = Some(now);
+                    true
+                }
+                _ => false,
+            },
+        ))
+    }
+
     async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
         let now = self.now();
         Ok(self.read(|state| state.indexer_lease_view(&collection.name(), now)))

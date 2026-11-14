@@ -2,7 +2,8 @@
 //!
 //! The `IndexerLeaseStore` impl lives here, a child of `pg`, as `worker_log.rs`'s does, so it
 //! reads the pool directly. The SQL is the run lease's (`write.rs`'s `take_lease`,
-//! `refresh_lease`, `release_lease`): every expiry is `clock_timestamp()` plus the TTL in
+//! `refresh_lease`, `release_lease`; a release of one collection is the release of all narrowed
+//! to its row): every expiry is `clock_timestamp()` plus the TTL in
 //! microseconds, judged by the same clock, and a compare-and-set that touches no row means "not
 //! ours". The owner token is written and compared, never selected.
 
@@ -124,6 +125,24 @@ impl IndexerLeaseStore for PgStore {
         .map_err(map_sqlx)?
         .rows_affected();
         Ok(freed)
+    }
+
+    async fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        let freed = sqlx::query!(
+            "UPDATE indexer_lease SET lease_owner = NULL, lease_expires_at = clock_timestamp() \
+              WHERE collection = $1 AND lease_owner = $2",
+            collection.name(),
+            owner,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(freed == 1)
     }
 
     async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {

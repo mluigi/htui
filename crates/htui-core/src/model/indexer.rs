@@ -89,9 +89,10 @@ pub struct IndexerLease {
 /// What a take of an indexer lease answers (plan D3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseTake {
-    /// The lease was free or expired and is now the taker's.
+    /// The lease was free, released, or lapsed under another owner, and is now the taker's.
     Taken,
-    /// The taker already held it; the expiry moved.
+    /// The taker holds it, or held it last and no one has taken it since, even if it lapsed; the
+    /// expiry moved.
     Ours,
     /// Another owner holds it live; nothing was written.
     Held(IndexerLease),

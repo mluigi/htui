@@ -1041,6 +1041,18 @@ impl IndexerLeaseStore for Backend {
         }
     }
 
+    async fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.release_indexer_lease(collection, owner).await,
+            Self::Online { pg, .. } => pg.release_indexer_lease(collection, owner).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
         match self {
             Self::Memory(store) => store.indexer_lease(collection).await,
@@ -1516,6 +1528,27 @@ mod tests {
             .expect("the take wrote a row");
         assert_eq!(lease.box_id, Some(box_id));
         assert!(lease.live);
+        assert!(
+            memory
+                .release_indexer_lease(&global, owner)
+                .await
+                .expect("release one in memory")
+        );
+        assert!(
+            !memory
+                .indexer_lease(&global)
+                .await
+                .expect("read in memory")
+                .expect("a release keeps the row")
+                .live
+        );
+        assert_eq!(
+            memory
+                .take_indexer_lease(&global, box_id, owner, ttl)
+                .await
+                .expect("take after the release"),
+            LeaseTake::Taken
+        );
         assert_eq!(
             memory
                 .release_indexer_leases(owner)
@@ -1542,6 +1575,10 @@ mod tests {
         ));
         assert!(matches!(
             offline.release_indexer_leases(owner).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.release_indexer_lease(&global, owner).await,
             Err(StoreError::Unreachable(_))
         ));
         assert!(matches!(

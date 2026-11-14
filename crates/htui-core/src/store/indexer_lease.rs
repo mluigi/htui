@@ -27,10 +27,11 @@ use crate::store::error::Result;
 /// `indexer_lease` rows (MOD-159 M1 plan D2, D3).
 pub trait IndexerLeaseStore: Send + Sync {
     /// Takes `collection`'s lease for `owner` on `box_id` until the store's now plus `ttl` when it
-    /// is free (no row, no owner), expired, or already `owner`'s; the first take of a collection
-    /// creates its row. [`LeaseTake::Taken`] for a free or expired lease, [`LeaseTake::Ours`] when
-    /// `owner` held it (its expiry moves), and [`LeaseTake::Held`] naming the holder when another
-    /// owner holds it live, in which case nothing is written.
+    /// is free (no row, no owner), lapsed, or already `owner`'s; the first take of a collection
+    /// creates its row. [`LeaseTake::Taken`] for a lease that was free, released, or lapsed under
+    /// another owner; [`LeaseTake::Ours`] when `owner` holds it, or held it last and no one has
+    /// taken it since, even if it lapsed (its expiry moves); and [`LeaseTake::Held`] naming the
+    /// holder when another owner holds it live, in which case nothing is written.
     ///
     /// # Errors
     ///
@@ -44,9 +45,9 @@ pub trait IndexerLeaseStore: Send + Sync {
         ttl: TimeDelta,
     ) -> impl Future<Output = Result<LeaseTake>> + Send;
 
-    /// Moves `collection`'s expiry to the store's now plus `ttl` when `owner` still holds it, even
-    /// a lapsed lease no one has taken since. `false` (zero rows: another owner took it, or it was
-    /// released, or never taken) means abandon.
+    /// Moves `collection`'s expiry to the store's now plus `ttl` when `owner` holds it, or held it
+    /// last and no one has taken it since, even if it lapsed (so the lease is live again). `false`
+    /// (zero rows: another owner took it, or it was released, or never taken) means abandon.
     ///
     /// # Errors
     ///
@@ -66,6 +67,20 @@ pub trait IndexerLeaseStore: Send + Sync {
     ///
     /// Whatever the backend reports.
     fn release_indexer_leases(&self, owner: Uuid) -> impl Future<Output = Result<u64>> + Send;
+
+    /// Frees `collection`'s lease when `owner` holds it, or held it last and no one has taken it
+    /// since: it loses its owner, expires now, and keeps its box for display, as
+    /// [`release_indexer_leases`](Self::release_indexer_leases) frees each. Answers whether a row
+    /// changed; `owner`'s other leases and another owner's are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend reports.
+    fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     /// `collection`'s lease as people see it, `None` when it was never taken.
     ///
