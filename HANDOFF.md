@@ -93,12 +93,43 @@ MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_s
 ## Parallel runs (2026-11-14)
 
 The next ten items by `next-item.sh` ranking, then what each wave unlocks, by dependencies only (file and
-migration overlap is not checked; trigger-gated and "wanted later" items are left out). IDs only; a later wave
-starts once the items it follows are done.
+migration overlap is not checked; trigger-gated and "wanted later" items are left out). One item per line:
+`ID: suggested implementer model`, as the value for `--model implementer=<model>` (`opus` is the inherited
+default; `sonnet` for the bounded, mostly-UI items, to measure its quality). A later wave starts once the
+items it follows are done.
 
-- **Wave 1 (together):** MOD-147, MOD-150, MOD-122, MOD-125, MOD-159, MOD-130, MOD-133, MOD-116, MOD-127, ANA-39
-- **Wave 2:** MOD-149, MOD-132, MOD-135, MOD-143, MOD-117, MOD-128, MOD-161, MOD-167, MOD-8
-- **Wave 3:** MOD-118, MOD-136, MOD-154, MOD-155, MOD-129
+**Wave 1 (together)**
+
+- MOD-147: opus
+- MOD-150: opus
+- MOD-122: sonnet
+- MOD-125: opus
+- MOD-159: opus
+- MOD-130: opus
+- MOD-133: opus
+- MOD-116: sonnet
+- MOD-127: sonnet
+- ANA-39: none (analysis)
+
+**Wave 2**
+
+- MOD-149: sonnet
+- MOD-132: opus
+- MOD-135: sonnet
+- MOD-143: opus
+- MOD-117: sonnet
+- MOD-128: sonnet
+- MOD-161: sonnet
+- MOD-167: opus
+- MOD-8: sonnet
+
+**Wave 3**
+
+- MOD-118: sonnet
+- MOD-136: opus
+- MOD-154: sonnet
+- MOD-155: opus
+- MOD-129: opus
 
 ---
 

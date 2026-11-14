@@ -89,7 +89,7 @@ Ordered; do not interleave:
    **Parallel runs**: remove the closed ID from HANDOFF's "Parallel runs" section, and
    move every item whose blockers are now all done up to the earliest wave it fits; when
    wave 1 holds fewer than ten, refill it from `scripts/next-item.sh`'s ranking
-   (dependencies only, IDs only).
+   (dependencies only, one `ID: model` line per item; a refilled item gets a suggested implementer model).
 6. **Cross-links**: any other item (this repo or another repo's HANDOFF) that pointed at
    this item as a blocker → update it to point at the item's write-up file / new owning
    item.
