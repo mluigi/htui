@@ -1207,6 +1207,7 @@ mod tests {
                 edge(&r, LinkKind::BlockedBy, &x),
             ],
             nodes: vec![x, r],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         assert_eq!(
@@ -1263,6 +1264,7 @@ mod tests {
                 edge(&r, LinkKind::Relates, &y),
             ],
             nodes: vec![x_again, y, r, x],
+            documents: vec![],
         };
         assert_eq!(rank_nodes(&graph, 3), [2, 3, 1], "R, X at depth 1, Y");
         assert_eq!(shape(&rows(&graph, 3)), ["R", "→ relates X", "→ relates Y"]);
@@ -1769,6 +1771,7 @@ mod tests {
             root: r.item_id,
             edges: vec![edge(&r, LinkKind::Relates, &x)],
             nodes: vec![r, x],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         for width in 0..=ROW {
@@ -1854,6 +1857,7 @@ mod tests {
                 edge(&r, LinkKind::Origin, &y),
             ],
             nodes: vec![r, x, y],
+            documents: vec![],
         };
         let rows = rows(&graph, 3);
         let at = |width| -> Vec<String> {
@@ -1897,6 +1901,7 @@ mod tests {
                 edge(&r, LinkKind::Implements, &i),
             ],
             nodes: vec![r, p, d, i],
+            documents: vec![],
         };
         assert_eq!(kind_width(), 10);
         let drawn: Vec<String> = lines(&rows(&graph, 3), &shell.projects, ROW, &shell.theme)

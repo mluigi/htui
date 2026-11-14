@@ -834,7 +834,7 @@ pub const REQUEST_NAMES: [&str; 13] = [
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 32] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -858,6 +858,7 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
         revisions,
         links,
         documents,
+        document_links,
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
@@ -891,6 +892,7 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 31] {
         (revisions, "revision", "revisions"),
         (links, "link", "links"),
         (documents, "document", "documents"),
+        (document_links, "document link", "document links"),
         (requirement_specs, "requirement spec", "requirement specs"),
         (requirement_areas, "requirement area", "requirement areas"),
         (

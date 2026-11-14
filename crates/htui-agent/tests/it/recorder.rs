@@ -1192,6 +1192,20 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<htui_core::model::ItemLink> {
         self.inner.withdraw_link(fence, link).await
     }
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: htui_core::model::ProposeDocumentLink,
+    ) -> StoreResult<htui_core::model::DocumentLink> {
+        self.inner.propose_document_link(fence, link).await
+    }
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: htui_core::model::WithdrawDocumentLink,
+    ) -> StoreResult<htui_core::model::DocumentLink> {
+        self.inner.withdraw_document_link(fence, link).await
+    }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> StoreResult<Option<ItemId>> {
         self.inner.item_by_key(project, key).await
     }
