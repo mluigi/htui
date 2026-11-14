@@ -205,25 +205,32 @@ async fn sync_owner_documents(
         }
     }
     // MOD-147 M4 R1 L1: in step only with a point for every section, so a document an earlier
-    // sync left half-written is built again. Its points are taken out of `indexed` either way:
-    // a rebuild rewrites them under the same IDs, so none of them is stale.
-    let build: Vec<OwnerDocument> = latest
-        .into_values()
-        .filter(|doc| {
-            let held = indexed.remove(&doc.id).map_or(0, |points| points.len());
-            held != section_count(&doc.body)
-        })
-        .collect();
+    // sync left half-written is built again. Its points are taken out of `indexed` either way;
+    // a rebuild rewrites the ones it builds again under the same IDs and deletes the rest, so a
+    // document holding more points than it has sections settles too (fix-round verifier, low).
+    let mut build: Vec<(OwnerDocument, Vec<Uuid>)> = Vec::new();
+    for doc in latest.into_values() {
+        let held: Vec<Uuid> = indexed.remove(&doc.id).map_or_else(Vec::new, |points| {
+            points.into_iter().map(|p| p.id).collect()
+        });
+        if held.len() != section_count(&doc.body) {
+            build.push((doc, held));
+        }
+    }
     let mut documents = Vec::new();
+    let mut stale: Vec<Uuid> = Vec::new();
     if !build.is_empty() {
         let Some(owner) = read.project(project).await? else {
             return Ok(report); // gone since the listing; the next sync drops its points
         };
-        for doc in &build {
-            documents.push(owner_document_points(&owner, doc));
+        for (doc, held) in &build {
+            let points = owner_document_points(&owner, doc);
+            let keep: BTreeSet<Uuid> = points.iter().map(ConceptPoint::id).collect();
+            stale.extend(held.iter().copied().filter(|id| !keep.contains(id)));
+            documents.push(points);
         }
     }
-    let stale: Vec<Uuid> = indexed.into_values().flatten().map(|p| p.id).collect();
+    stale.extend(indexed.into_values().flatten().map(|p| p.id));
     report.points_upserted += documents.iter().map(Vec::len).sum::<usize>();
     report.points_deleted += stale.len();
     // MOD-147 M4 R1 L1: one upsert per document, as the item pass writes one per item, so a
@@ -940,6 +947,45 @@ mod tests {
 
         let again = Indexer::sync(&read, &s, &store).await.unwrap();
         assert_eq!(again.points_upserted, 0, "whole again, so in step");
+    }
+
+    /// MOD-147 M4 R1 (fix-round verifier, low): a newest owner document holding more points than
+    /// it has sections (a chunking change without a payload stamp bump) is rebuilt once and loses
+    /// the extra points, rather than being rewritten on every sync with the extras kept.
+    #[tokio::test]
+    async fn an_owner_document_with_extra_points_loses_them_and_settles() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        let goals = write_owner_document(
+            &read,
+            ids::PROJECT_HTUI,
+            GOALS_KIND,
+            "Goals",
+            "## A\none\n## B\ntwo",
+        )
+        .await;
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let mut extra = owner_document_points(&store)
+            .into_iter()
+            .next()
+            .expect("an owner-document point");
+        if let Some(doc) = extra.document.as_mut() {
+            doc.chunk = 5;
+        }
+        store.upsert(vec![extra]).await.unwrap();
+        assert_eq!(owner_document_points(&store).len(), 3);
+
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.points_upserted, 2, "its two sections, rewritten");
+        assert_eq!(report.points_deleted, 1, "the extra point");
+        let points = owner_document_points(&store);
+        assert_eq!(points.len(), 2);
+        assert_eq!(indexed_documents(&points), BTreeSet::from([goals.id]));
+
+        let again = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(again.points_upserted, 0, "in step from now on");
+        assert_eq!(again.points_deleted, 0);
     }
 
     /// MOD-147 M4 D5: the item pass never takes an owner-document point for an item orphan.
