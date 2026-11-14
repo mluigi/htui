@@ -19,6 +19,9 @@ use htui_orch::isolate::{Clock as _, IsolateError};
 /// The remote every `push` repo of this file names, with a credential in it.
 const REMOTE: &str = "https://bot:secret@forge.example/o/htui.git";
 
+/// A second remote, for a case that needs two.
+const OTHER_REMOTE: &str = "https://forge.example/o/other.git";
+
 /// The demo fixture with `FEAT-3` free to start, every phase of its graph ungated (`gate` on
 /// `gated` phases only) and `review` approving.
 async fn harness(gated: &[&str]) -> FakeOrchestrator {
@@ -295,6 +298,89 @@ async fn an_isolator_error_leaves_the_record_pending() {
         .await
         .expect("MemStore never fails a read");
     assert_eq!(records[0].state, IntegrationState::Landed);
+}
+
+/// F2 M1: an isolator error for a remote skips the pass's later records for that remote (they
+/// stay `pending`, untried); a record for another remote is still tried. Two errors are scripted:
+/// whichever record comes first, the pass asks the isolator twice, once per remote, and both
+/// answers are errors. The next pass lands all three.
+#[tokio::test]
+async fn an_isolator_error_skips_the_passs_other_records_for_that_remote() {
+    let orch = harness(&[]).await;
+    let first = repo(&orch, Some(REMOTE), Some(IntegrateMode::Push)).await;
+    let mut scope = vec![first];
+    for (name, remote) in [("twin", REMOTE), ("other", OTHER_REMOTE)] {
+        let id = RepoId::new();
+        orch.store
+            .create_repo(NewRepo {
+                id,
+                project_id: ids::PROJECT_HTUI,
+                name: name.to_owned(),
+                remote_url: Some(remote.to_owned()),
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the repo is fresh");
+        set_mode(&orch, id, Some(IntegrateMode::Push)).await;
+        scope.push(id);
+    }
+    for _ in 0..2 {
+        orch.isolator.fail_land(IsolateError::Git(
+            "git ls-remote timed out after 30s".to_owned(),
+        ));
+    }
+
+    let started = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: Some(scope),
+            workspace: None,
+        })
+        .await
+        .expect("the run starts");
+    let CommandOutcome::Started { run, rest } = started else {
+        panic!("`StartRun` answers `Started`, not {started:?}");
+    };
+    assert_eq!(rest.run, RunStatus::Done);
+    let records = orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(
+        records
+            .iter()
+            .all(|record| record.state == IntegrationState::Pending),
+        "{records:?}"
+    );
+    let requests = orch.isolator.land_requests();
+    let mut asked: Vec<&str> = requests
+        .iter()
+        .map(|request| request.remote.as_str())
+        .collect();
+    asked.sort_unstable();
+    assert_eq!(
+        asked,
+        [REMOTE, OTHER_REMOTE],
+        "one try per remote: {requests:?}"
+    );
+
+    // The same owner takes its own leases again at once; nothing more is scripted.
+    assert_eq!(orch.land(Some(run)).await.expect("the pass runs"), 3);
+    let records = orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(
+        records
+            .iter()
+            .all(|record| record.state == IntegrationState::Landed),
+        "{records:?}"
+    );
 }
 
 /// D3: a `local` run (the repo's default, the project's default) writes no record and lands

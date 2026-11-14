@@ -2154,8 +2154,11 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// MOD-133 D8: the trait's contract over this box's checkout ([`GixIsolator::landing_tip`],
-    /// then the two network verbs with no lock held).
+    /// MOD-133 D8: the trait's contract over this box's checkout (`GixIsolator::landing_tip`,
+    /// then the two network verbs with no lock held). A remote that already holds the tip, at it
+    /// or past it (F2 L3: a crash between the push and the settle, then someone else's push), has
+    /// it landed with nothing pushed; a push that never reached the remote (F2 L1) is an `Err`,
+    /// so the record stays `pending` and is retried.
     fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
         Box::pin(async move {
             let Some(checkout) = self.config.repos.get(&request.repo) else {
@@ -2169,16 +2172,24 @@ impl Isolator for GixIsolator {
             let cwd = &checkout.local_path;
             let remote = request.remote.as_str();
             let target = request.target_branch.as_str();
-            if git.ls_remote(cwd, remote, target).await?.as_deref() == Some(tip.as_str()) {
+            if let Some(remote_tip) = git.ls_remote(cwd, remote, target).await?
+                && (remote_tip == tip
+                    || self
+                        .holds_past(request.repo, checkout, &tip, remote_tip)
+                        .await?)
+            {
                 return Ok(LandOutcome::Landed { hash: tip });
             }
-            Ok(match git.push(cwd, remote, &tip, target).await? {
-                git::Pushed::Done => LandOutcome::Landed { hash: tip },
-                git::Pushed::NonFastForward => refused(land::non_fast_forward(target)),
+            match git.push(cwd, remote, &tip, target).await? {
+                git::Pushed::Done => Ok(LandOutcome::Landed { hash: tip }),
+                git::Pushed::NonFastForward => Ok(refused(land::non_fast_forward(target))),
                 git::Pushed::Failed(line) => {
-                    refused(land::push_failed(&scrub_remote(&line, remote)))
+                    Ok(refused(land::push_failed(&scrub_remote(&line, remote))))
                 }
-            })
+                git::Pushed::Unreachable(line) => Err(IsolateError::Git(unreachable_remote(
+                    &scrub_remote(&line, remote),
+                ))),
+            }
         })
     }
 }
@@ -2186,6 +2197,11 @@ impl Isolator for GixIsolator {
 /// A [`LandOutcome::Refused`] with `reason`.
 fn refused(reason: String) -> LandOutcome {
     LandOutcome::Refused { reason }
+}
+
+/// MOD-133 F2 L1: the `Err` of a push that never reached its remote, with git's scrubbed line.
+fn unreachable_remote(line: &str) -> String {
+    format!("git push could not reach the remote: {line}")
 }
 
 /// MOD-133 D8: a `git` line shown in a reason, with `remote` and every other URL in it carrying
@@ -2222,6 +2238,26 @@ impl GixIsolator {
                 }
             }
             Ok(Ok(tip))
+        })
+        .await
+    }
+
+    /// MOD-133 F2 L3: whether the remote's `remote_tip` is a commit this checkout holds and
+    /// `tip` is its ancestor, so the remote already holds the run's work and moved past it. Read
+    /// under the repo's admin lock, as [`GixIsolator::landing_tip`]; a commit this checkout lacks
+    /// answers `false`, and the push then decides.
+    async fn holds_past(
+        &self,
+        repo: RepoId,
+        checkout: &RepoCheckout,
+        tip: &str,
+        remote_tip: String,
+    ) -> Result<bool, IsolateError> {
+        let _admin = self.admin_guard(repo).await;
+        let path = checkout.local_path.clone();
+        let tip = tip.to_owned();
+        blocking(move || {
+            Ok(git::has_commit(&path, &remote_tip)? && git::is_ancestor(&path, &tip, &remote_tip)?)
         })
         .await
     }

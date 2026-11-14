@@ -4768,13 +4768,24 @@ async fn landing_refuses_what_is_not_on_the_target() {
 
 /// MOD-133 D8 (PRD Q2): read off a wrapper `git`: landing runs `ls-remote`, then one
 /// `push --porcelain --` of a plain `<tip>:refs/heads/main` refspec (never `--force`, never `+`),
-/// both under a `GIT_SSH_COMMAND` in batch mode; a second landing only asks `ls-remote`.
+/// both under a `GIT_SSH_COMMAND` in batch mode; a second landing only asks `ls-remote`. F2 M1:
+/// both carry ssh's connect timeout and http's low-speed abort, and `ls-remote` has its own 30 s
+/// budget under the 120 s one. F2 L4: with no inherited `GIT_SSH_COMMAND` or `GIT_SSH`, the
+/// repository's `core.sshCommand` is the command the options are appended to.
 #[cfg(unix)]
 #[tokio::test]
 async fn landing_pushes_without_force_in_batch_mode() {
     let Some(git) = skip_without_git!() else {
         return;
     };
+    assert_eq!(
+        htui_orch::isolate::git::LS_REMOTE_TIMEOUT,
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        htui_orch::isolate::git::VERB_TIMEOUT,
+        std::time::Duration::from_secs(120)
+    );
     let fix = Fixture::new(Isolation::Worktree, None).await;
     let remote_dir = tempfile::tempdir().expect("a temporary directory");
     let remote = remote_dir.path().join("fresh.git");
@@ -4784,13 +4795,21 @@ async fn landing_pushes_without_force_in_batch_mode() {
         &["init", "--quiet", "--bare", &remote.to_string_lossy()],
     )
     .await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &["config", "core.sshCommand", "ssh -i /k/id"],
+    )
+    .await;
 
     let log = remote_dir.path().join("argv.log");
     let wrapper = remote_dir.path().join("bin").join("git");
     crate::write_executable::write_executable(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf 'ARGS %s\\nSSH %s\\n' \"$*\" \"${{GIT_SSH_COMMAND-}}\" >> '{}'\n\
+            "#!/bin/sh\nprintf 'CALL %s\\tSSH=%s\\tLIMIT=%s\\tTIME=%s\\n' \"$*\" \
+             \"${{GIT_SSH_COMMAND-unset}}\" \"${{GIT_HTTP_LOW_SPEED_LIMIT-unset}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_TIME-unset}}\" >> '{}'\n\
              exec '{}' \"$@\"\n",
             log.display(),
             git.binary().display()
@@ -4813,11 +4832,21 @@ async fn landing_pushes_without_force_in_batch_mode() {
     assert_eq!(remote_main(&git, &remote).await, fix.core.head);
 
     let logged = std::fs::read_to_string(&log).expect("the wrapper logged");
-    let calls: Vec<&str> = logged
+    // `(args, GIT_SSH_COMMAND, low-speed limit, low-speed time)` of every network verb.
+    let network: Vec<(&str, &str, &str, &str)> = logged
         .lines()
-        .filter_map(|line| line.strip_prefix("ARGS "))
-        .filter(|args| *args != "--version")
+        .filter_map(|line| line.strip_prefix("CALL "))
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let args = fields.next()?;
+            let ssh = fields.next()?.strip_prefix("SSH=")?;
+            let limit = fields.next()?.strip_prefix("LIMIT=")?;
+            let time = fields.next()?.strip_prefix("TIME=")?;
+            Some((args, ssh, limit, time))
+        })
+        .filter(|(args, ..)| args.starts_with("ls-remote ") || args.starts_with("push "))
         .collect();
+    let calls: Vec<&str> = network.iter().map(|(args, ..)| *args).collect();
     let remote_text = remote.to_string_lossy();
     assert_eq!(
         calls,
@@ -4837,15 +4866,75 @@ async fn landing_pushes_without_force_in_batch_mode() {
             .any(|args| args.contains("--force") || args.contains(" +") || args.contains(" -f")),
         "{logged}"
     );
-    let ssh: Vec<&str> = logged
-        .lines()
-        .filter_map(|line| line.strip_prefix("SSH "))
-        .collect();
-    assert!(
-        ssh.iter()
-            .skip(1)
-            .all(|command| command.ends_with(" -o BatchMode=yes")),
-        "every network verb runs in batch mode: {logged}"
+    for (_, ssh, limit, time) in &network {
+        assert_eq!(
+            (*limit, *time),
+            ("1000", "30"),
+            "the low-speed abort: {logged}"
+        );
+        if std::env::var_os("GIT_SSH").is_none() {
+            assert!(
+                ssh.ends_with(" -o BatchMode=yes -o ConnectTimeout=20"),
+                "every network verb runs in batch mode with a connect timeout: {logged}"
+            );
+        }
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            assert_eq!(
+                *ssh, "ssh -i /k/id -o BatchMode=yes -o ConnectTimeout=20",
+                "the repository's core.sshCommand is kept: {logged}"
+            );
+        }
+    }
+}
+
+/// MOD-133 F2 L3: a remote that holds the run's tip and moved past it (a crash between the push
+/// and the settle, then someone else's push) has the work landed: nothing is pushed or refused.
+/// A remote past a commit this checkout lacks is still the push's to judge
+/// (`a_moved_remote_is_refused_and_left_alone`).
+#[tokio::test]
+async fn a_remote_past_the_tip_has_it_landed() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    assert_eq!(remote_main(&git, &remote).await, fix.core.head);
+    // Someone moved the remote's `main` past the tip, from a commit this checkout holds.
+    git_out(
+        &git,
+        &fix.core.path,
+        &["checkout", "--quiet", "-b", "later"],
+    )
+    .await;
+    let later = commit_file(&fix.core.path, "later.txt", "later\n", "after the tip");
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", "main"]).await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &[
+            "push",
+            "--quiet",
+            &remote.to_string_lossy(),
+            "later:refs/heads/main",
+        ],
+    )
+    .await;
+    assert_eq!(remote_main(&git, &remote).await, later);
+
+    assert_eq!(
+        fix.isolator
+            .land(&fix.core_request(&remote, "main", vec![fix.core.head.clone()]))
+            .await
+            .expect("the landing runs"),
+        LandOutcome::Landed {
+            hash: fix.core.head.clone()
+        }
+    );
+    assert_eq!(
+        remote_main(&git, &remote).await,
+        later,
+        "nothing was pushed"
     );
 }
 

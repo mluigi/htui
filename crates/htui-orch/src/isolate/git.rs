@@ -39,6 +39,23 @@ pub const MIN_GIT: (u32, u32, u32) = (2, 33, 0);
 /// One verb's wall-clock budget; on expiry the process group is killed and nothing is retried.
 pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// MOD-133 F2 M1: [`Cli::ls_remote`]'s own budget, under [`VERB_TIMEOUT`]: a remote that stops
+/// answering costs the land pass this much per record, not two minutes. The push keeps
+/// [`VERB_TIMEOUT`].
+pub const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// MOD-133 F2 M1: the ssh options both network verbs append: never prompt, and give up on a host
+/// that does not answer the connect within 20 s (ssh has no connect timeout of its own).
+pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
+
+/// MOD-133 F2 M1: the environment both network verbs run under besides `GIT_SSH_COMMAND`: an
+/// http transfer slower than 1000 bytes a second for 30 s is aborted rather than left to the
+/// verb's budget.
+pub const NETWORK_ENV: [(&str, &str); 2] = [
+    ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+    ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+];
+
 /// The bound on `git --version` inside [`Cli::probe`], which runs synchronously inside
 /// `GixIsolator::new`, on a blocking thread when the run runtime builds its isolator (MOD-4 plan
 /// D213).
@@ -1006,22 +1023,58 @@ fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
 // MOD-133 D8: landing's two network verbs, `ls-remote` and `push`.
 // ---------------------------------------------------------------------------------------------
 
-/// MOD-133 D8 (PRD Q2): the `GIT_SSH_COMMAND` both network verbs run under: `inherited` (the
-/// process's own, which [`SCRUBBED_ENV`] keeps, as it keeps `SSH_AUTH_SOCK`), else `ssh`, with
-/// ` -o BatchMode=yes` appended. An ssh remote then authenticates with the box's own agent and
-/// keys and fails rather than prompting; `GIT_TERMINAL_PROMPT=0` does the same for https.
-#[must_use]
-pub fn ssh_command(inherited: Option<&str>) -> String {
-    let base = inherited
-        .map(str::trim)
-        .filter(|command| !command.is_empty())
-        .unwrap_or("ssh");
-    format!("{base} -o BatchMode=yes")
+/// MOD-133 F2 L4: where [`ssh_command`] reads git's own choice of ssh command from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SshSources<'a> {
+    /// This process's `GIT_SSH_COMMAND`, which [`SCRUBBED_ENV`] keeps (as it keeps
+    /// `SSH_AUTH_SOCK`).
+    pub inherited: Option<&'a str>,
+    /// This process's `GIT_SSH` (a plink, say).
+    pub git_ssh: Option<&'a str>,
+    /// The repository's `core.sshCommand`.
+    pub configured: Option<&'a str>,
 }
 
-/// [`ssh_command`] over this process's `GIT_SSH_COMMAND`.
-fn batch_ssh() -> String {
-    ssh_command(std::env::var("GIT_SSH_COMMAND").ok().as_deref())
+/// MOD-133 D8 (PRD Q2), F2 L4: the `GIT_SSH_COMMAND` both network verbs run under, `None` for
+/// none. Git ranks `GIT_SSH_COMMAND` over `core.sshCommand` over `GIT_SSH` over `ssh`
+/// (`connect.c`), and setting `GIT_SSH_COMMAND` would replace the other two, so the command is
+/// git's own choice with [`SSH_OPTIONS`] appended: the inherited `GIT_SSH_COMMAND`, else
+/// `core.sshCommand`, else `ssh`. A `GIT_SSH` with neither above it is left to git and no command
+/// is set: plink takes no `-o`. An ssh remote then authenticates with the box's own agent and
+/// keys and fails rather than prompting; `GIT_TERMINAL_PROMPT=0` does the same for https.
+///
+/// ssh keeps the **first** value it is given for an option, so a command that already carries
+/// `-o BatchMode=no` (or its own `ConnectTimeout`) keeps it: the box's owner asked for it.
+#[must_use]
+pub fn ssh_command(sources: SshSources<'_>) -> Option<String> {
+    let set = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_owned)
+    };
+    let base = match (set(sources.inherited), set(sources.configured)) {
+        (Some(command), _) | (None, Some(command)) => command,
+        (None, None) if set(sources.git_ssh).is_some() => return None,
+        (None, None) => "ssh".to_owned(),
+    };
+    Some(format!("{base} {SSH_OPTIONS}"))
+}
+
+/// MOD-133 F2 M1: the environment of a network verb: [`NETWORK_ENV`], and `GIT_SSH_COMMAND` when
+/// [`ssh_command`] answered one.
+#[must_use]
+pub fn network_env(ssh: Option<&str>) -> Vec<(&'static str, &str)> {
+    let mut env = NETWORK_ENV.to_vec();
+    if let Some(ssh) = ssh {
+        env.push(("GIT_SSH_COMMAND", ssh));
+    }
+    env
+}
+
+/// This process's environment variable `key`, when it is valid UTF-8.
+fn inherited_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 /// MOD-133 D8: `git push`'s argv: `push --porcelain -- <remote> <tip>:refs/heads/<target>`.
@@ -1047,14 +1100,27 @@ pub enum Pushed {
     NonFastForward,
     /// Any other non-zero exit, with the line a human should read (not yet redacted).
     Failed(String),
+    /// MOD-133 F2 L1: the remote could not be reached (`transport_failure`): retried, never a
+    /// refusal. The line a human should read (not yet redacted).
+    Unreachable(String),
 }
 
-/// The line of a failed network verb a human should read: its first `fatal:` line, else its
-/// first `error:` line, else [`Exited::message`]'s, else the exit status.
+/// The line of a failed network verb a human should read (F2 L2: a server's own reason first):
+/// the reason of its first porcelain `!` line (`[remote rejected] (<reason>)`), else its first
+/// `remote: error:` line, else its first `fatal:` line, else its first `error:` line, else
+/// [`Exited::message`]'s, else the exit status.
 fn network_failure(exited: &Exited) -> String {
     let lines = || exited.stderr.lines().map(str::trim_end);
-    lines()
-        .find(|line| line.starts_with("fatal:"))
+    let rejected = exited.stdout.lines().find_map(|line| {
+        let mut fields = line.trim_end().splitn(3, '\t');
+        (fields.next() == Some("!"))
+            .then(|| fields.nth(1))
+            .flatten()
+            .filter(|summary| !summary.is_empty())
+    });
+    rejected
+        .or_else(|| lines().find(|line| line.starts_with("remote: error:")))
+        .or_else(|| lines().find(|line| line.starts_with("fatal:")))
         .or_else(|| lines().find(|line| line.starts_with("error:")))
         .or_else(|| exited.message())
         .map_or_else(
@@ -1064,6 +1130,67 @@ fn network_failure(exited: &Exited) -> String {
             },
             str::to_owned,
         )
+}
+
+/// MOD-133 F2 L1: the markers of a `fatal:` line that could not reach the remote at all.
+const TRANSPORT_MARKERS: [&str; 6] = [
+    "Could not resolve host",
+    "Connection refused",
+    "Connection timed out",
+    "Operation timed out",
+    "Failed to connect to",
+    "Couldn't connect to server",
+];
+
+/// MOD-133 F2 L1: the markers of an authentication failure, which stays a refusal.
+const AUTH_MARKERS: [&str; 5] = [
+    "Permission denied",
+    "Authentication failed",
+    "could not read Username",
+    "could not read Password",
+    "Access denied",
+];
+
+/// MOD-133 F2 L1: whether a failed network verb's stderr says the remote could not be reached (a
+/// DNS failure, a refused or timed-out connection, an HTTP 5xx), so landing retries it rather than
+/// refusing for good. A `fatal:` line with a [`TRANSPORT_MARKERS`] marker or `The requested URL
+/// returned error: 5NN` is one; so is git's bare `Could not read from remote repository` (what
+/// ssh's own connect failure leaves) when nothing before it is the remote's answer: no `remote:`
+/// or `ERROR:` line, no `does not appear to be a git repository`. An authentication failure
+/// ([`AUTH_MARKERS`], HTTP 401 or 403) never is.
+fn transport_failure(stderr: &str) -> bool {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let auth = lines.iter().any(|line| {
+        AUTH_MARKERS.iter().any(|marker| line.contains(marker))
+            || line.contains("The requested URL returned error: 401")
+            || line.contains("The requested URL returned error: 403")
+    });
+    if auth {
+        return false;
+    }
+    let fatal = |line: &str| line.starts_with("fatal:");
+    let server_error = |line: &str| {
+        line.split("The requested URL returned error: ")
+            .nth(1)
+            .is_some_and(|code| code.starts_with('5'))
+    };
+    if lines.iter().any(|line| {
+        fatal(line)
+            && (TRANSPORT_MARKERS.iter().any(|marker| line.contains(marker)) || server_error(line))
+    }) {
+        return true;
+    }
+    let Some(unread) = lines
+        .iter()
+        .position(|line| fatal(line) && line.contains("Could not read from remote repository"))
+    else {
+        return false;
+    };
+    !lines[..unread].iter().any(|line| {
+        line.starts_with("remote:")
+            || line.starts_with("ERROR:")
+            || line.contains("does not appear to be a git repository")
+    })
 }
 
 /// Whether a `git push` exit carries a rejection for a moved remote: `[rejected]` with
@@ -1088,10 +1215,50 @@ fn parse_ls_remote(stdout: &str, reference: &str) -> Option<String> {
 }
 
 impl Cli {
+    /// MOD-133 F2 M1: [`LS_REMOTE_TIMEOUT`], or this `git`'s own budget when that is shorter (a
+    /// test's).
+    fn ls_remote_budget(&self) -> Duration {
+        self.budget.min(LS_REMOTE_TIMEOUT)
+    }
+
+    /// MOD-133 F2 L4: [`ssh_command`] over this process's `GIT_SSH_COMMAND` and `GIT_SSH` and, when
+    /// neither is set, `cwd`'s `core.sshCommand` (`git config --get`, so includes and the global
+    /// file count as git counts them; a failed read is an unset one).
+    async fn network_ssh(&self, cwd: &Path) -> Option<String> {
+        let inherited = inherited_env("GIT_SSH_COMMAND");
+        let git_ssh = inherited_env("GIT_SSH");
+        let configured = if inherited
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            None
+        } else {
+            self.run(
+                "config",
+                cwd,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("--get"),
+                    OsStr::new("core.sshCommand"),
+                ],
+                &[],
+            )
+            .await
+            .ok()
+            .filter(Exited::ok)
+            .map(|exited| exited.stdout.trim().to_owned())
+        };
+        ssh_command(SshSources {
+            inherited: inherited.as_deref(),
+            git_ssh: git_ssh.as_deref(),
+            configured: configured.as_deref(),
+        })
+    }
+
     /// MOD-133 D8: `git ls-remote -- <remote> refs/heads/<target>` in `cwd`, under
-    /// [`ssh_command`]: the remote's target tip. `None` when the remote has no such branch **and**
-    /// when the verb failed (an unreachable remote, a refused credential): landing then pushes,
-    /// and the push's own failure is the one reported.
+    /// [`network_env`] and [`LS_REMOTE_TIMEOUT`] (F2 M1): the remote's target tip. `None` when the
+    /// remote has no such branch **and** when the verb failed (an unreachable remote, a refused
+    /// credential): landing then pushes, and the push's own failure is the one reported.
     ///
     /// # Errors
     /// [`IsolateError::Git`] when the verb cannot be spawned or outlives its budget.
@@ -1102,8 +1269,12 @@ impl Cli {
         target: &str,
     ) -> Result<Option<String>, IsolateError> {
         let reference = format!("refs/heads/{target}");
-        let ssh = batch_ssh();
-        let exited = self
+        let ssh = self.network_ssh(cwd).await;
+        let bounded = Self {
+            budget: self.ls_remote_budget(),
+            ..self.clone()
+        };
+        let exited = bounded
             .run(
                 "ls-remote",
                 cwd,
@@ -1113,7 +1284,7 @@ impl Cli {
                     OsStr::new(remote),
                     OsStr::new(&reference),
                 ],
-                &[("GIT_SSH_COMMAND", &ssh)],
+                &network_env(ssh.as_deref()),
             )
             .await?;
         if !exited.ok() {
@@ -1122,8 +1293,9 @@ impl Cli {
         Ok(parse_ls_remote(&exited.stdout, &reference))
     }
 
-    /// MOD-133 D8: [`push_args`] in `cwd`, under [`ssh_command`]: the fast-forward of the
-    /// remote's `target` to `tip`, classified.
+    /// MOD-133 D8: [`push_args`] in `cwd`, under [`network_env`] and [`VERB_TIMEOUT`]: the
+    /// fast-forward of the remote's `target` to `tip`, classified. A failure that never reached
+    /// the remote (`transport_failure`) is [`Pushed::Unreachable`] (F2 L1).
     ///
     /// # Errors
     /// [`IsolateError::Git`] when the verb cannot be spawned or outlives its budget.
@@ -1136,14 +1308,16 @@ impl Cli {
     ) -> Result<Pushed, IsolateError> {
         let args = push_args(remote, tip, target);
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        let ssh = batch_ssh();
+        let ssh = self.network_ssh(cwd).await;
         let exited = self
-            .run("push", cwd, &args, &[("GIT_SSH_COMMAND", &ssh)])
+            .run("push", cwd, &args, &network_env(ssh.as_deref()))
             .await?;
         Ok(if exited.ok() {
             Pushed::Done
         } else if rejected_as_moved(&exited) {
             Pushed::NonFastForward
+        } else if transport_failure(&exited.stderr) {
+            Pushed::Unreachable(network_failure(&exited))
         } else {
             Pushed::Failed(network_failure(&exited))
         })
@@ -4664,15 +4838,153 @@ mod tests {
         );
     }
 
-    /// MOD-133 D8 (PRD Q2): the network verbs' ssh command is the inherited one, else `ssh`,
-    /// always in batch mode.
+    /// MOD-133 D8 (PRD Q2), F2 L4: the network verbs' ssh command is git's own choice (the
+    /// inherited `GIT_SSH_COMMAND`, else `core.sshCommand`, else `ssh`), always in batch mode with
+    /// a connect timeout; a `GIT_SSH` (plink takes no `-o`) is left to git, with no command set.
     #[test]
-    fn the_ssh_command_is_batch_mode_over_the_inherited_one() {
-        assert_eq!(super::ssh_command(None), "ssh -o BatchMode=yes");
-        assert_eq!(super::ssh_command(Some("  ")), "ssh -o BatchMode=yes");
+    fn the_ssh_command_is_batch_mode_over_gits_own_choice() {
+        const OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
+        let ssh = |inherited, git_ssh, configured| {
+            super::ssh_command(super::SshSources {
+                inherited,
+                git_ssh,
+                configured,
+            })
+        };
+        assert_eq!(ssh(None, None, None), Some(format!("ssh {OPTIONS}")));
         assert_eq!(
-            super::ssh_command(Some("ssh -i /k/id")),
-            "ssh -i /k/id -o BatchMode=yes"
+            ssh(Some("  "), None, Some("")),
+            Some(format!("ssh {OPTIONS}"))
+        );
+        assert_eq!(
+            ssh(Some("ssh -i /k/id"), Some("plink"), Some("ssh -i /c/id")),
+            Some(format!("ssh -i /k/id {OPTIONS}")),
+            "GIT_SSH_COMMAND outranks everything"
+        );
+        assert_eq!(
+            ssh(None, Some("plink"), Some("ssh -i /c/id")),
+            Some(format!("ssh -i /c/id {OPTIONS}")),
+            "core.sshCommand outranks GIT_SSH, as in git's own `connect.c`"
+        );
+        assert_eq!(
+            ssh(None, Some("C:\\plink.exe"), None),
+            None,
+            "GIT_SSH alone is left to git"
+        );
+        assert_eq!(
+            ssh(Some("ssh -o BatchMode=no"), None, None),
+            Some(format!("ssh -o BatchMode=no {OPTIONS}")),
+            "ssh takes an option's first value, so the inherited one wins"
+        );
+    }
+
+    /// MOD-133 F2 M1: `ls-remote` runs under its own 30 s bound, the push under the verb budget,
+    /// and both verbs carry the low-speed abort.
+    #[test]
+    fn the_network_verbs_are_bounded() {
+        let cli = Cli {
+            binary: PathBuf::from("git"),
+            version: MIN_GIT,
+            budget: super::VERB_TIMEOUT,
+        };
+        assert_eq!(super::LS_REMOTE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(cli.ls_remote_budget(), Duration::from_secs(30));
+        assert_eq!(super::VERB_TIMEOUT, Duration::from_secs(120));
+        let short = cli.with_budget(Duration::from_millis(200));
+        assert_eq!(
+            short.ls_remote_budget(),
+            Duration::from_millis(200),
+            "a shorter verb budget still wins"
+        );
+        assert_eq!(
+            super::network_env(Some("ssh -o BatchMode=yes")),
+            [
+                ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+                ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+                ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
+            ]
+        );
+        assert_eq!(
+            super::network_env(None),
+            [
+                ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+                ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+            ]
+        );
+    }
+
+    /// MOD-133 F2 L1: a failure to reach the remote is a transport failure (retried), an auth
+    /// failure or a remote's own answer is not (refused).
+    #[test]
+    fn a_transport_failure_is_told_from_a_refusal() {
+        let transport = [
+            "fatal: unable to access 'https://forge.example/o/r.git/': Could not resolve host: forge.example\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': Failed to connect to forge.example port 443: Connection refused\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': Connection timed out after 30001 milliseconds\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': Operation timed out after 30000 milliseconds with 0 bytes received\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 503\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 502 Bad Gateway\n",
+            "ssh: connect to host forge.example port 22: Connection refused\r\n\
+             fatal: Could not read from remote repository.\n\n\
+             Please make sure you have the correct access rights\nand the repository exists.\n",
+            "ssh: Could not resolve hostname forge.example: Name or service not known\r\n\
+             fatal: Could not read from remote repository.\n",
+            "kex_exchange_identification: Connection closed by remote host\r\n\
+             fatal: Could not read from remote repository.\n",
+        ];
+        for stderr in transport {
+            assert!(super::transport_failure(stderr), "transport: {stderr}");
+        }
+        let refusals = [
+            "git@forge.example: Permission denied (publickey).\r\n\
+             fatal: Could not read from remote repository.\n",
+            "remote: HTTP Basic: Access denied\n\
+             fatal: Authentication failed for 'https://forge.example/o/r.git/'\n",
+            "fatal: could not read Username for 'https://forge.example': terminal prompts disabled\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 403\n",
+            "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 401\n",
+            "remote: Repository not found.\nfatal: Could not read from remote repository.\n",
+            "ERROR: Repository not found.\nfatal: Could not read from remote repository.\n",
+            "fatal: '../nonexist.git' does not appear to be a git repository\n\
+             fatal: Could not read from remote repository.\n",
+            "error: failed to push some refs to 'https://forge.example/o/r.git'\n",
+            "",
+        ];
+        for stderr in refusals {
+            assert!(!super::transport_failure(stderr), "refusal: {stderr}");
+        }
+    }
+
+    /// MOD-133 F2 L2: a server's decline is the reason kept: the porcelain `[remote rejected]`
+    /// line's, else the first `remote: error:` line, else the `fatal:`/`error:` choice.
+    #[test]
+    fn a_remote_rejection_keeps_the_servers_reason() {
+        let declined = Exited {
+            code: Some(1),
+            stdout: "To https://forge.example/o/r.git\n\
+                     !\tabc:refs/heads/main\t[remote rejected] (protected branch hook declined)\n\
+                     Done\n"
+                .to_owned(),
+            stderr: "remote: error: GH006: Protected branch update failed for refs/heads/main.\n\
+                     error: failed to push some refs to 'https://forge.example/o/r.git'\n"
+                .to_owned(),
+        };
+        assert!(!super::rejected_as_moved(&declined));
+        assert_eq!(
+            super::network_failure(&declined),
+            "[remote rejected] (protected branch hook declined)"
+        );
+        let hook = Exited {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "remote: some banner\n\
+                     remote: error: pre-receive hook says no\n\
+                     error: failed to push some refs to 'https://forge.example/o/r.git'\n"
+                .to_owned(),
+        };
+        assert_eq!(
+            super::network_failure(&hook),
+            "remote: error: pre-receive hook says no"
         );
     }
 

@@ -1412,6 +1412,23 @@ where
         .await
     }
 
+    /// MOD-133 F2 L5: the queue runner could not start a run of `item` for `reason` (an
+    /// `IntegrateRefused` sentence, which writes nothing itself and leaves the item `open` and
+    /// queued): one note on the item, ``the queue cannot start a run: <reason>``, by this engine's
+    /// user on this box. The runner calls it once per batch and reason.
+    ///
+    /// # Errors
+    /// The store's own.
+    pub async fn note_queue_refusal(&self, item: ItemId, reason: &str) -> Result<(), EngineError> {
+        self.note(
+            item,
+            format!("the queue cannot start a run: {reason}"),
+            None,
+            self.now(),
+        )
+        .await
+    }
+
     /// The body `enqueue` had, with `batch_id` threaded into `NewRun` (MOD-12 D7).
     async fn enqueue_with(
         &self,
@@ -3690,11 +3707,14 @@ where
     /// MOD-133 D9: lands records already taken under this engine's owner, one at a time. Per
     /// record: the run's steps and commit rows are read, its landed commits in the record's repo
     /// computed ([`land::landed_commits`]), [`Isolator::land`] called, and the answer settled
-    /// under this owner. When the settle wrote (`true`), the item is noted: `integration landed:
-    /// repo `<repo>` <target> at <short hash>`, or `integration refused for repo `<repo>`
-    /// (<mode> to <target>): <reason>; the run's work has not landed`. An `Err` from the isolator
-    /// leaves the record `pending` (its lease lapses and the next sweep retries it), is logged,
-    /// and the loop goes on. Answers how many records were settled.
+    /// under this owner. When the settle wrote (`true`), the item is noted:
+    /// ``integration landed: repo `<repo>` <target> at <short hash>``, or
+    /// ``integration refused for repo `<repo>` (<mode> to <target>): <reason>; the run's work has
+    /// not landed``. An `Err` from the isolator leaves the record `pending` (its lease lapses and
+    /// the next sweep retries it), is logged, and the loop goes on; F2 M1: the pass's later
+    /// records for the same remote are skipped (they stay `pending`, and this owner takes them
+    /// again next pass), so a remote that does not answer costs one verb budget a pass, not one
+    /// per record. Answers how many records were settled.
     ///
     /// # Errors
     /// The store's own.
@@ -3702,7 +3722,12 @@ where
         let mut settled = 0;
         let mut read: Option<LandReads> = None;
         let mut repos: BTreeMap<ProjectId, Vec<Repo>> = BTreeMap::new();
+        let mut unreachable: BTreeSet<String> = BTreeSet::new();
         for record in records {
+            if unreachable.contains(&record.remote) {
+                tracing::debug!(run = %record.run_id, repo = %record.repo_id, "the record's remote failed earlier in this pass; it stays pending");
+                continue;
+            }
             if !matches!(&read, Some(reads) if reads.run == record.run_id) {
                 read = Some(self.land_reads(record.run_id).await?);
             }
@@ -3718,7 +3743,8 @@ where
             let outcome = match self.parts.isolator.land(&request).await {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    tracing::warn!(run = %record.run_id, repo = %record.repo_id, %err, "landing failed; the integration record stays pending for the next sweep");
+                    tracing::warn!(run = %record.run_id, repo = %record.repo_id, %err, "landing failed; the integration record, and this pass's later ones for the same remote, stay pending for the next sweep");
+                    unreachable.insert(record.remote.clone());
                     continue;
                 }
             };
