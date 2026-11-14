@@ -6,8 +6,9 @@
 //! and run a core generic over the store, so the unit tests run it on `MemStore::demo()` and
 //! `tests/it/stop_cli_pg.rs` on Postgres. The confirmation (D2) is a preview on stdout, the
 //! question on stderr and one line of stdin; `--yes` answers it, and without a terminal it is
-//! required. A request that writes nothing (a repeat stop, a resume of a workspace that is not
-//! stopped) asks nothing. Every ending is a [`StateExit`]: 0 done, 2 refused, 3 Postgres did not
+//! required. The stop row is read again once the question is answered, and a request whose stop
+//! changed meanwhile writes nothing (refused). A request that writes nothing (a repeat stop, a
+//! resume of a workspace that is not stopped) asks nothing. Every ending is a [`StateExit`]: 0 done, 2 refused, 3 Postgres did not
 //! answer, 1 any other store failure.
 
 use std::collections::HashMap;
@@ -64,8 +65,9 @@ impl core::fmt::Debug for Ask<'_> {
 pub struct Context<'a> {
     /// The user a stop is recorded as requested by (`PgStore::this_user`).
     pub user: UserId,
-    /// The stop's `requested_at`.
-    pub now: DateTime<Utc>,
+    /// The clock the stop's `requested_at` is read from, once the question is answered
+    /// (`Utc::now`): a prompt left open does not date the stop to when it was asked.
+    pub now: fn() -> DateTime<Utc>,
     /// Each agent's caps (`registry::caps_for` over the store's agents, [`caps_map`]): what a
     /// stopped step's resume is forecast from.
     pub caps: &'a HashMap<AgentId, DriverCaps>,
@@ -271,8 +273,8 @@ fn resume_question(slug: &str) -> String {
 ///
 /// # Errors
 /// [`StateExit`]: 2 refused (no DSN, keyring, `box.toml`, schema, unknown slug, not confirmed,
-/// no terminal without `--yes`, a workspace deleted meanwhile), 3 Postgres did not answer, 1 any
-/// other store failure.
+/// no terminal without `--yes`, a stop changed while asking, a workspace deleted meanwhile), 3
+/// Postgres did not answer, 1 any other store failure.
 pub async fn run_stop(args: cli::StopArgs) -> Result<(), StateExit> {
     let mode = if args.force {
         StopMode::Forced
@@ -353,7 +355,7 @@ fn process_context<'a>(
 ) -> Context<'a> {
     Context {
         user: pg.this_user(),
-        now: Utc::now(),
+        now: Utc::now,
         caps,
         workspaces,
         wait: STOP_WAIT,
@@ -363,9 +365,9 @@ fn process_context<'a>(
 
 /// `htui stop`'s core (D5): reads the stop row; a request that would write nothing (graceful over
 /// graceful, anything over forced) prints the report after `workspace <slug> is already stopped
-/// (<mode>)` and asks nothing; otherwise it asks (D2), writes `stop_workspace(ws, mode,
-/// ctx.user, ctx.now)`, waits up to `ctx.wait` for the state to read `stopped` (D7), and prints
-/// the report.
+/// (<mode>)` and asks nothing; otherwise it asks (D2), re-reads the row and refuses when it changed
+/// meanwhile, writes `stop_workspace(ws, mode, ctx.user, (ctx.now)())`, waits up to `ctx.wait` for
+/// the state to read `stopped` (D7), and prints the report.
 ///
 /// # Errors
 /// [`StateExit`], as [`run_stop`].
@@ -398,8 +400,14 @@ pub async fn stop_on<S: ReadStore + WriteStore>(
         }
     };
     confirm(store, ctx, workspace, ask, out, &question, "stopped").await?;
+    let again = if mode == StopMode::Forced {
+        format!("htui stop {slug} --force")
+    } else {
+        format!("htui stop {slug}")
+    };
+    unchanged(store, workspace, stored.as_ref(), "stopped", &again).await?;
     store
-        .stop_workspace(workspace.workspace_id, mode, ctx.user, ctx.now)
+        .stop_workspace(workspace.workspace_id, mode, ctx.user, (ctx.now)())
         .await
         .map_err(|err| store_exit(&err, slug, "stopped"))?;
     settle(store, ctx, workspace, ask).await?;
@@ -412,9 +420,10 @@ pub async fn stop_on<S: ReadStore + WriteStore>(
     emit(out, &text)
 }
 
-/// `htui resume`'s core (D6): with a stop row it asks (D2), deletes it (`Ok(false)`, someone
-/// resumed it first, is no error) and prints the report under `resume requested: …`; without one
-/// it asks nothing and prints the report under `workspace <slug> is not stopped`. No wait.
+/// `htui resume`'s core (D6): with a stop row it asks (D2), re-reads it and refuses when it changed
+/// meanwhile, deletes it (`Ok(false)`, someone resumed it in between, is no error) and prints the
+/// report under `resume requested: …`; without one it asks nothing and prints the report under
+/// `workspace <slug> is not stopped`. No wait.
 ///
 /// # Errors
 /// [`StateExit`], as [`run_resume`].
@@ -443,6 +452,8 @@ pub async fn resume_on<S: ReadStore + WriteStore>(
             "resumed",
         )
         .await?;
+        let again = format!("htui resume {slug}");
+        unchanged(store, workspace, stored.as_ref(), "resumed", &again).await?;
         store
             .resume_workspace(workspace.workspace_id)
             .await
@@ -628,6 +639,33 @@ async fn confirm<S: ReadStore + WriteStore>(
     }
 }
 
+/// The stop row read again after [`confirm`]: gone, or with another mode or request instant than
+/// the one the request was decided on, means someone stopped or resumed the workspace while the
+/// question was open, so nothing is written and the request is refused (2) with the command to run
+/// `again`.
+async fn unchanged<S: ReadStore + WriteStore>(
+    store: &S,
+    workspace: &WorkspaceSummary,
+    decided_on: Option<&WorkspaceStop>,
+    nothing_was: &str,
+    again: &str,
+) -> Result<(), StateExit> {
+    let stored = store
+        .workspace_stop(workspace.workspace_id)
+        .await
+        .map_err(|err| store_exit(&err, &workspace.slug, "read"))?;
+    let key = |row: &WorkspaceStop| (row.mode, row.requested_at);
+    if stored.as_ref().map(key) == decided_on.map(key) {
+        Ok(())
+    } else {
+        Err(StateExit::Refused(format!(
+            "the stop of workspace {} changed while asking; nothing was {nothing_was}; run {again} \
+             again",
+            workspace.slug
+        )))
+    }
+}
+
 /// The workspace whose slug is `slug`, exactly; refused naming the slugs there are.
 fn resolve<'w>(
     workspaces: &'w [WorkspaceSummary],
@@ -699,6 +737,7 @@ mod tests {
     use htui_orch::promote::StepResume;
     use serde_json::{Value, json};
     use std::collections::HashMap;
+    use std::io::BufRead;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -714,7 +753,7 @@ mod tests {
         store: MemStore,
         caps: HashMap<AgentId, DriverCaps>,
         workspaces: Vec<WorkspaceSummary>,
-        now: DateTime<Utc>,
+        now: fn() -> DateTime<Utc>,
     }
 
     /// What one verb printed and how it ended.
@@ -753,7 +792,7 @@ mod tests {
                 store,
                 caps,
                 workspaces,
-                now: now(),
+                now,
             }
         }
 
@@ -816,6 +855,42 @@ mod tests {
                 yes,
                 interactive,
                 input: &mut input,
+                question: &mut err,
+            };
+            let ended = resume_on(&self.store, &self.ctx(), slug, &mut ask, &mut out).await;
+            Ran {
+                ended,
+                out: String::from_utf8(out).expect("utf-8"),
+                err: String::from_utf8(err).expect("utf-8"),
+            }
+        }
+
+        /// No `--yes`, on a terminal whose answer is read from `input`.
+        async fn stop_asking(&self, slug: &str, mode: StopMode, input: &mut dyn BufRead) -> Ran {
+            let mut err = Vec::new();
+            let mut out = Vec::new();
+            let mut ask = Ask {
+                yes: false,
+                interactive: true,
+                input,
+                question: &mut err,
+            };
+            let ended = stop_on(&self.store, &self.ctx(), slug, mode, &mut ask, &mut out).await;
+            Ran {
+                ended,
+                out: String::from_utf8(out).expect("utf-8"),
+                err: String::from_utf8(err).expect("utf-8"),
+            }
+        }
+
+        /// [`Self::stop_asking`] for `htui resume`.
+        async fn resume_asking(&self, slug: &str, input: &mut dyn BufRead) -> Ran {
+            let mut err = Vec::new();
+            let mut out = Vec::new();
+            let mut ask = Ask {
+                yes: false,
+                interactive: true,
+                input,
                 question: &mut err,
             };
             let ended = resume_on(&self.store, &self.ctx(), slug, &mut ask, &mut out).await;
@@ -972,6 +1047,52 @@ mod tests {
         ]
     }
 
+    /// A terminal that answers `typed` once `meanwhile` ran: what someone else did while the
+    /// question was open.
+    struct Meanwhile<F: FnOnce()> {
+        meanwhile: Option<F>,
+        typed: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl<F: FnOnce()> Meanwhile<F> {
+        fn new(typed: &str, meanwhile: F) -> Self {
+            Self {
+                meanwhile: Some(meanwhile),
+                typed: std::io::Cursor::new(typed.as_bytes().to_vec()),
+            }
+        }
+
+        fn before(&mut self) {
+            if let Some(meanwhile) = self.meanwhile.take() {
+                meanwhile();
+            }
+        }
+    }
+
+    impl<F: FnOnce()> std::io::Read for Meanwhile<F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.before();
+            self.typed.read(buf)
+        }
+    }
+
+    impl<F: FnOnce()> BufRead for Meanwhile<F> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.before();
+            self.typed.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.typed.consume(amount);
+        }
+    }
+
+    /// Another user's write, made while a question is open: `MemStore` never pends, so a
+    /// blocking poll of its future is the write itself.
+    fn meanwhile<T>(write: impl Future<Output = Result<T, StoreError>>) -> T {
+        futures::executor::block_on(write).expect("the other user's write")
+    }
+
     const GRACEFUL_Q: &str = "Stop workspace `graphics` gracefully? Each agent step stops at its \
                               turn boundary, checks stop at once; nothing new starts until `htui \
                               resume graphics`. [y/N] ";
@@ -1013,6 +1134,35 @@ mod tests {
             ran.out
         );
         assert!(!ran.out.contains("still stopping"), "{}", ran.out);
+    }
+
+    thread_local! {
+        /// [`clock`]'s instant: a `tokio::test` runs on its own thread.
+        static CLOCK: core::cell::Cell<DateTime<Utc>> = core::cell::Cell::new(now());
+    }
+
+    /// A clock a test moves by hand.
+    fn clock() -> DateTime<Utc> {
+        CLOCK.with(core::cell::Cell::get)
+    }
+
+    /// D5: the stop's `requested_at` is read when it is written, after the answer, not when the
+    /// question was asked: a prompt left open an hour records the hour it was answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_stamped_when_answered_not_when_asked() {
+        let mut fx = Fixture::demo().await;
+        fx.now = clock;
+        let mut input = Meanwhile::new("y\n", || CLOCK.with(|at| at.set(demo_at(30, 1))));
+        let ran = fx
+            .stop_asking("graphics", StopMode::Graceful, &mut input)
+            .await;
+        ran.ended.as_ref().expect("stopped");
+        assert_eq!(
+            fx.row(ids::WORKSPACE_GRAPHICS)
+                .await
+                .map(|row| row.requested_at),
+            Some(demo_at(30, 1))
+        );
     }
 
     /// D5: `--force` asks the forced question and writes `forced`; over a graceful row it asks the
@@ -1068,7 +1218,7 @@ mod tests {
         .await
         .ended
         .expect("stopped");
-        fx.now = demo_at(31, 0);
+        fx.now = || demo_at(31, 0);
         let ran = fx
             .stop("graphics", StopMode::Graceful, Answer::NoTerminal)
             .await;
@@ -1099,7 +1249,7 @@ mod tests {
         .ended
         .expect("escalated");
         let stored = fx.row(ids::WORKSPACE_GRAPHICS).await;
-        fx.now = demo_at(32, 0);
+        fx.now = || demo_at(32, 0);
         for mode in [StopMode::Graceful, StopMode::Forced] {
             let ran = fx.stop("graphics", mode, Answer::NoTerminal).await;
             ran.ended.as_ref().expect("a repeat is answered");
@@ -1400,6 +1550,132 @@ mod tests {
                  {run8}  stopped, no box  cannot be resumed: cancel it from the Runs pane\n"
             )
         );
+    }
+
+    /// D6: a resume deletes only the stop it previewed. Someone else resumed, then forced a new
+    /// stop, while the question was open: the forced stop stands and the resume is refused (2);
+    /// the stop gone meanwhile is refused the same way.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_refuses_a_stop_that_changed_while_asking() {
+        let fx = Fixture::demo().await;
+        let ws = ids::WORKSPACE_GRAPHICS;
+        let resume_again = "the stop of workspace graphics changed while asking; nothing was \
+                            resumed; run htui resume graphics again";
+        fx.stop(
+            "graphics",
+            StopMode::Graceful,
+            Answer::Yes { interactive: true },
+        )
+        .await
+        .ended
+        .expect("stopped");
+        let store = fx.store.clone();
+        let mut input = Meanwhile::new("y\n", move || {
+            assert!(meanwhile(store.resume_workspace(ws)));
+            meanwhile(store.stop_workspace(ws, StopMode::Forced, ids::USER, demo_at(30, 1)));
+        });
+        let ran = fx.resume_asking("graphics", &mut input).await;
+        assert_eq!(ran.refusal(), resume_again);
+        assert_eq!(ran.ended.as_ref().err().map(StateExit::code), Some(2));
+        let row = fx.row(ws).await.expect("the forced stop stands");
+        assert_eq!(
+            (row.mode, row.requested_at),
+            (StopMode::Forced, demo_at(30, 1))
+        );
+
+        let store = fx.store.clone();
+        let mut input = Meanwhile::new("y\n", move || {
+            assert!(meanwhile(store.resume_workspace(ws)));
+        });
+        let ran = fx.resume_asking("graphics", &mut input).await;
+        assert_eq!(ran.refusal(), resume_again);
+        assert_eq!(fx.row(ws).await, None);
+    }
+
+    /// D5: `--force` over a graceful stop that someone resumed while the question was open writes
+    /// no fresh forced stop; a stop over a workspace someone stopped meanwhile is refused alike.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_refuses_a_stop_that_changed_while_asking() {
+        let fx = Fixture::demo().await;
+        let ws = ids::WORKSPACE_GRAPHICS;
+        fx.stop(
+            "graphics",
+            StopMode::Graceful,
+            Answer::Yes { interactive: true },
+        )
+        .await
+        .ended
+        .expect("stopped");
+        let store = fx.store.clone();
+        let mut input = Meanwhile::new("y\n", move || {
+            assert!(meanwhile(store.resume_workspace(ws)));
+        });
+        let ran = fx
+            .stop_asking("graphics", StopMode::Forced, &mut input)
+            .await;
+        assert_eq!(ran.err, ESCALATE_Q);
+        assert_eq!(
+            ran.refusal(),
+            "the stop of workspace graphics changed while asking; nothing was stopped; run htui \
+             stop graphics --force again"
+        );
+        assert_eq!(fx.row(ws).await, None, "no fresh forced stop");
+
+        let store = fx.store.clone();
+        let mut input = Meanwhile::new("y\n", move || {
+            meanwhile(store.stop_workspace(ws, StopMode::Graceful, ids::USER, demo_at(30, 1)));
+        });
+        let ran = fx
+            .stop_asking("graphics", StopMode::Graceful, &mut input)
+            .await;
+        assert_eq!(
+            ran.refusal(),
+            "the stop of workspace graphics changed while asking; nothing was stopped; run htui \
+             stop graphics again"
+        );
+        assert_eq!(
+            fx.row(ws).await.map(|row| row.requested_at),
+            Some(demo_at(30, 1)),
+            "the other user's stop stands"
+        );
+    }
+
+    /// D7: the wait ends at the first poll after the running run settles, well before
+    /// `ctx.wait`: the header reads `stopped` and nothing says `still stopping`.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_once_the_runs_settle() {
+        let fx = Fixture::demo().await;
+        let owner = Uuid::now_v7();
+        let run = fx.claimed(ids::WORKSPACE_GRAPHICS, 1, owner).await;
+        let settles = Duration::from_secs(3);
+        let started = tokio::time::Instant::now();
+        let (ran, ()) = tokio::join!(
+            fx.stop(
+                "graphics",
+                StopMode::Graceful,
+                Answer::Yes { interactive: false },
+            ),
+            async {
+                tokio::time::sleep(settles).await;
+                fx.stop_run(run, owner).await;
+            },
+        );
+        ran.ended.as_ref().expect("stopped");
+        let waited = started.elapsed();
+        assert!(waited >= settles, "{waited:?}");
+        assert!(waited <= settles + STOP_POLL, "{waited:?}");
+        assert!(
+            STOP_WAIT >= settles + STOP_POLL * 10,
+            "well under the bound"
+        );
+        assert_eq!(ran.err, "waiting for 1 running run to stop…\n");
+        assert!(
+            ran.out
+                .starts_with("workspace graphics: stopped (graceful, "),
+            "{}",
+            ran.out
+        );
+        assert!(!ran.out.contains("still stopping"), "{}", ran.out);
     }
 
     /// D3: `Unreachable` is offline (3), a vanished workspace refused (2), anything else failed

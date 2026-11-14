@@ -3,8 +3,9 @@
 //!
 //! What only this file can prove: the verbs write and delete the `workspace_stop` row with the
 //! connected user, and their report reads through `PgStore`'s `workspace_live_runs`, `boxes`,
-//! `item` and `agents` (the caps). Every case runs over `testkit::demo_db()` and returns early,
-//! printing `testkit::SKIP`, with `HTUI_TEST_DATABASE_URL` unset.
+//! `item`, `agents` (the caps), `run_steps` and `step_events` (a stopped step's forecast). Every
+//! case runs over `testkit::demo_db()` and returns early, printing `testkit::SKIP`, with
+//! `HTUI_TEST_DATABASE_URL` unset.
 #![cfg(feature = "testkit")]
 
 use std::collections::HashMap;
@@ -13,13 +14,15 @@ use chrono::{TimeDelta, Utc};
 use htui::state_cmd::StateExit;
 use htui::stop_cmd::{self, Ask, Context, STOP_POLL, STOP_WAIT};
 use htui_agent::driver::DriverCaps;
+use htui_agent::event::SESSION_STARTED;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentId, Claim, ItemId, NewItem, NewRun, RunId, RunMode, StopMode, WorkspaceStopState,
-    WorkspaceSummary,
+    AgentId, Claim, EventKind, EventRole, ItemId, NewItem, NewRun, NewRunStep, RunId, RunMode,
+    SessionEvent, StepId, StepRole, StepStatus, StopMode, WorkspaceStopState, WorkspaceSummary,
 };
-use htui_core::store::{ReadStore as _, WriteStore as _};
+use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 use htui_store::testkit;
+use serde_json::json;
 use uuid::Uuid;
 
 /// What `run_*` would read from the store before the core.
@@ -39,7 +42,7 @@ impl Inputs {
     fn ctx(&self, db: &testkit::TestDb) -> Context<'_> {
         Context {
             user: db.store.this_user(),
-            now: Utc::now(),
+            now: Utc::now,
             caps: &self.caps,
             workspaces: &self.workspaces,
             wait: STOP_WAIT,
@@ -76,8 +79,9 @@ async fn stop(
     (ended, String::from_utf8(out).expect("utf-8"))
 }
 
-/// A graph run of a fresh `htui` item in `graphics`, claimed on the fixture box and stopped by
-/// its executor (`stop_run`), as M2 stops one.
+/// A graph run of a fresh `htui` item in `graphics`, claimed on the fixture box, with one running
+/// `implement` step on an agent that resumes sessions, whose log holds a `session_started` banner,
+/// and stopped by its executor (`stop_run`), as M2 stops one.
 async fn stopped_on_the_box(db: &testkit::TestDb) -> RunId {
     let item = db
         .store
@@ -129,6 +133,55 @@ async fn stopped_on_the_box(db: &testkit::TestDb) -> RunId {
             .expect("claim"),
         Claim::Admitted
     );
+    let step = db
+        .store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE_CLI),
+            model: None,
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
+        })
+        .await
+        .expect("create step")
+        .id;
+    assert!(
+        db.store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, Utc::now())
+            .await
+            .expect("start")
+    );
+    let rows: Vec<SessionEvent> = [
+        (EventKind::Prompt, json!({ "text": "go" })),
+        (
+            EventKind::Other,
+            json!({ "update": SESSION_STARTED, "body": { "session_id": "sess_1" } }),
+        ),
+    ]
+    .into_iter()
+    .zip(0..)
+    .map(|((kind, payload), seq)| SessionEvent {
+        run_step_id: step,
+        seq,
+        turn: 0,
+        kind,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload,
+        raw: None,
+        at: Utc::now(),
+    })
+    .collect();
+    db.store
+        .append_events(StepFence::Lease(owner), &rows)
+        .await
+        .expect("append");
     assert!(db.store.stop_run(run, owner).await.expect("stop_run"));
     run
 }
@@ -167,7 +220,7 @@ async fn a_stop_and_a_resume_round_trip_on_postgres() {
     );
     assert!(
         out.contains(&format!(
-            "{ours}  stopped on DESKTOP-HTUI  resumes: continues from where it stopped"
+            "{ours}  stopped on DESKTOP-HTUI  resumes: implement reopens its agent session"
         )),
         "{out}"
     );
