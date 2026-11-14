@@ -554,6 +554,7 @@ mod tests {
             description: String::new(),
             is_override,
             revision: 0,
+            target_id: None,
             created_at: EPOCH,
             updated_at: EPOCH,
         }

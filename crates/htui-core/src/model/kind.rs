@@ -460,6 +460,11 @@ pub struct StepGraph {
     /// CAS token of `replace_graph`. 0 on a fresh graph.
     #[serde(default)]
     pub revision: i64,
+    /// `step_graph.target_id` (MOD-130 M1, D3, D11): the workflow's execution target, `None` to
+    /// inherit. Its one writer is
+    /// [`set_graph_target`](crate::store::WriteStore::set_graph_target), which bumps `revision`.
+    #[serde(default)]
+    pub target_id: Option<crate::model::TargetId>,
     /// `step_graph.created_at`.
     pub created_at: DateTime<Utc>,
     /// `step_graph.updated_at`.

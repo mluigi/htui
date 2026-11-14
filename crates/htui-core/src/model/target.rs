@@ -49,6 +49,47 @@ pub const RUNNABLE_KINDS: &[TargetKind] = &[TargetKind::Local];
 /// id; an absent row means the local target.
 pub const DEFAULT_TARGET_KEY: &str = "default_target";
 
+/// The Settings default target (MOD-130 M1, D3, blueprint B11): the `app_setting` row
+/// [`DEFAULT_TARGET_KEY`] parsed, with its compare-and-set token. An absent row means the local
+/// target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultTarget {
+    /// The target the row names.
+    pub target: TargetId,
+    /// `app_setting.updated_at`: the token of
+    /// [`set_default_target`](crate::store::WriteStore::set_default_target) (P6).
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DefaultTarget {
+    /// The `app_setting.value` that names `target` (MOD-130 M1, D3): a JSON string of the id.
+    #[must_use]
+    pub fn value(target: TargetId) -> Value {
+        Value::String(target.to_string())
+    }
+
+    /// Parses a stored [`DEFAULT_TARGET_KEY`] row (MOD-130 M1, blueprint B11). A value that is
+    /// not a JSON string holding a target id is a backend error naming the key: only
+    /// [`set_default_target`](crate::store::WriteStore::set_default_target) writes the row.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`](crate::store::StoreError::Backend) for a malformed value.
+    pub fn parse(
+        value: &Value,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, crate::store::StoreError> {
+        value
+            .as_str()
+            .and_then(|text| text.parse::<TargetId>().ok())
+            .map(|target| Self { target, updated_at })
+            .ok_or_else(|| {
+                crate::store::StoreError::Backend(format!(
+                    "app_setting `{DEFAULT_TARGET_KEY}` holds {value}, not a target id"
+                ))
+            })
+    }
+}
+
 /// The longest target name, in chars (MOD-130 M1, P9).
 const TARGET_NAME_MAX: usize = 64;
 

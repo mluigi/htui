@@ -50,7 +50,8 @@ use crate::model::{
     executor_scrub_refusal, missing_tags_failure,
 };
 use crate::model::{
-    BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind, TargetStatus,
+    BoxKind, NewChildBox, NewTarget, StepGraph, Target, TargetEdit, TargetId, TargetKind,
+    TargetStatus,
 };
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
@@ -87,17 +88,18 @@ use crate::store::traits::{
     withdrawn_requirement_cited,
 };
 use crate::store::traits::{
+    DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN, box_bound_to_other_target, box_hostname_is_blank,
+    box_not_a_child_of, child_box_needs_a_machine, target_bound_elsewhere, target_built_in,
+    target_in_use, target_locator_refused, target_name_refused, target_name_taken, target_retired,
+    target_takes_no_container,
+};
+use crate::store::traits::{
     MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
 };
 use crate::store::traits::{
     back_asks_you_beside_another_asks_you, branch_is_not_an_object_of_booleans,
     forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
     loop_edge_runs_forward, workspace_graph_is_held,
-};
-use crate::store::traits::{
-    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
-    child_box_needs_a_machine, target_bound_elsewhere, target_built_in, target_locator_refused,
-    target_name_refused, target_name_taken, target_takes_no_container,
 };
 use crate::store::traits::{close_out_names_no_link, close_out_needs_a_link};
 use crate::store::traits::{deadline_below_one, judge_model_without_agent};
@@ -484,6 +486,12 @@ pub const CASES: &[&str] = &[
     "attach_child_box_creates_reuses_and_refuses",
     // MOD-130 M1 T3: the item's target is a spec field (D11, blueprint B3)
     "item_target_is_a_spec_field",
+    // MOD-130 M1 T4: the levels, the Settings default, retire and delete (D3, D5, D11, D14)
+    "project_and_scope_row_targets_are_cas",
+    "graph_target_bumps_revision",
+    "default_target_is_cas_on_updated_at",
+    "retire_and_delete_refuse_a_target_in_use",
+    "a_retired_target_is_refused_everywhere",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1549,6 +1557,19 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             boxed(attach_child_box_creates_reuses_and_refuses, store).await;
         }
         "item_target_is_a_spec_field" => boxed(item_target_is_a_spec_field, store).await,
+        "project_and_scope_row_targets_are_cas" => {
+            boxed(project_and_scope_row_targets_are_cas, store).await;
+        }
+        "graph_target_bumps_revision" => boxed(graph_target_bumps_revision, store).await,
+        "default_target_is_cas_on_updated_at" => {
+            boxed(default_target_is_cas_on_updated_at, store).await;
+        }
+        "retire_and_delete_refuse_a_target_in_use" => {
+            boxed(retire_and_delete_refuse_a_target_in_use, store).await;
+        }
+        "a_retired_target_is_refused_everywhere" => {
+            boxed(a_retired_target_is_refused_everywhere, store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -28641,6 +28662,22 @@ async fn every_graph_write_bumps_revision<S: WriteStore>(store: &S) {
     expect(9, "delete_phase_agents").await;
     Box::pin(store.delete_phase(build_id)).await.expect(CASE);
     expect(10, "delete_phase").await;
+    // MOD-130 M1 T4 (D11): the workflow's target is graph content too.
+    let token = body_now(CASE, store, graph.id).await.graph.updated_at;
+    applied(
+        CASE,
+        Box::pin(store.set_graph_target(graph.id, token, Some(seed::LOCAL_TARGET_ID)))
+            .await
+            .expect(CASE),
+    );
+    expect(11, "set_graph_target").await;
+    stale(
+        CASE,
+        Box::pin(store.set_graph_target(graph.id, token, None))
+            .await
+            .expect(CASE),
+    );
+    expect(11, "a stale set_graph_target").await;
 }
 
 /// MOD-137 D3: a name is unique per scope: the library, a workspace and a project may each hold
@@ -37723,6 +37760,790 @@ async fn item_target_is_a_spec_field<S: WriteStore>(store: &S) {
         "{CASE}: a refused mint consumes no key number"
     );
     assert_eq!(next.target_id, None, "{CASE}: a plain mint inherits");
+}
+
+/// `project(id)`, which the fixture holds (MOD-130 M1 T4).
+async fn project_now<S: WriteStore>(case: &str, store: &S, id: ProjectId) -> Project {
+    store
+        .project(id)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: project {id} is stored"))
+}
+
+/// Each project graph's `(id, revision)` (MOD-130 M1 T4).
+async fn graph_revisions<S: WriteStore>(
+    case: &str,
+    store: &S,
+    project: ProjectId,
+) -> Vec<(StepGraphId, i64)> {
+    store
+        .step_graphs(project)
+        .await
+        .expect(case)
+        .into_iter()
+        .map(|graph| (graph.id, graph.revision))
+        .collect()
+}
+
+/// MOD-130 M1 T4 (D3, D5, P6): a project's target and a workspace's scope row's target (the
+/// workspace level) are each a compare-and-set on `updated_at`: set, cleared to inherit, and a
+/// spent token is `Stale` with the row as it is now. The scope row's value reads back on
+/// `project(scope_id)`, and no graph's `revision` moves. An unknown project is `NotFound`, and a
+/// target that names no row is `references_no_row`.
+async fn project_and_scope_row_targets_are_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_and_scope_row_targets_are_cas";
+    let docker = store
+        .create_target(new_target("level docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let revisions = graph_revisions(CASE, store, ids::PROJECT_HTUI).await;
+
+    for id in [ids::PROJECT_HTUI, ids::PROJECT_SCOPE_PLATFORM] {
+        let row = project_now(CASE, store, id).await;
+        assert_eq!(
+            row.target_id, None,
+            "{CASE}: {} inherits at first",
+            row.slug
+        );
+        let set = applied(
+            CASE,
+            store
+                .set_project_target(id, row.updated_at, Some(docker.id))
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(set.target_id, Some(docker.id), "{CASE}: {} set", row.slug);
+        assert!(
+            set.updated_at > row.updated_at,
+            "{CASE}: {} updated_at moves",
+            row.slug
+        );
+        assert_eq!(
+            Project {
+                target_id: None,
+                updated_at: row.updated_at,
+                ..set.clone()
+            },
+            row,
+            "{CASE}: {} moves target_id and updated_at only",
+            row.slug
+        );
+        assert_eq!(
+            project_now(CASE, store, id).await,
+            set,
+            "{CASE}: {} reads back on project()",
+            row.slug
+        );
+
+        let current = stale(
+            CASE,
+            store
+                .set_project_target(id, row.updated_at, None)
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(current, set, "{CASE}: a spent token is Stale with the row");
+        assert_eq!(
+            project_now(CASE, store, id).await,
+            set,
+            "{CASE}: a stale set writes nothing"
+        );
+
+        let local = applied(
+            CASE,
+            store
+                .set_project_target(id, set.updated_at, Some(seed::LOCAL_TARGET_ID))
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            local.target_id,
+            Some(seed::LOCAL_TARGET_ID),
+            "{CASE}: the local target is a level's value like any other"
+        );
+        let cleared = applied(
+            CASE,
+            store
+                .set_project_target(id, local.updated_at, None)
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(cleared.target_id, None, "{CASE}: back to inherit (D3)");
+        assert_eq!(
+            project_now(CASE, store, id).await,
+            cleared,
+            "{CASE}: the clear reads back"
+        );
+
+        let unknown = TargetId::new();
+        constraint_exactly(
+            CASE,
+            store
+                .set_project_target(id, cleared.updated_at, Some(unknown))
+                .await,
+            &references_no_row("project.target_id", unknown, "target"),
+            "a target that names no row",
+        );
+        constraint_exactly(
+            CASE,
+            store
+                .set_project_target(id, DateTime::UNIX_EPOCH, Some(unknown))
+                .await,
+            &references_no_row("project.target_id", unknown, "target"),
+            "a target that names no row wins over a spent token",
+        );
+        assert_eq!(
+            project_now(CASE, store, id).await,
+            cleared,
+            "{CASE}: a refusal writes nothing"
+        );
+    }
+
+    let nowhere = ProjectId::new();
+    match store
+        .set_project_target(nowhere, DateTime::UNIX_EPOCH, Some(docker.id))
+        .await
+    {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!((entity, id), ("project", nowhere.to_string()), "{CASE}");
+        }
+        other => panic!("{CASE}: an unknown project is NotFound, got {other:?}"),
+    }
+    assert_eq!(
+        graph_revisions(CASE, store, ids::PROJECT_HTUI).await,
+        revisions,
+        "{CASE}: a project's target moves no graph's revision"
+    );
+}
+
+/// MOD-130 M1 T4 (D11, P6, blueprint B9): `set_graph_target` is a compare-and-set on
+/// `updated_at` that bumps `revision` by exactly one and moves `updated_at`; a spent token is
+/// `Stale` with the revision unchanged; `replace_graph` never writes `target_id`.
+async fn graph_target_bumps_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "graph_target_bumps_revision";
+    let docker = store
+        .create_target(new_target("graph docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let other = store
+        .create_target(new_target("graph ssh", TargetKind::Ssh, json!({})))
+        .await
+        .expect(CASE);
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "targeted",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(graph.target_id, None, "{CASE}: a fresh graph inherits");
+
+    let set = applied(
+        CASE,
+        store
+            .set_graph_target(graph.id, graph.updated_at, Some(docker.id))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(set.target_id, Some(docker.id), "{CASE}: set");
+    assert_eq!(set.revision, graph.revision + 1, "{CASE}: revision + 1");
+    assert!(
+        set.updated_at > graph.updated_at,
+        "{CASE}: updated_at moves"
+    );
+    assert_eq!(
+        StepGraph {
+            target_id: None,
+            revision: graph.revision,
+            updated_at: graph.updated_at,
+            ..set.clone()
+        },
+        graph,
+        "{CASE}: target_id, revision and updated_at move, nothing else"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph.id).await.graph,
+        set,
+        "{CASE}: graph_body reads the set"
+    );
+
+    let current = stale(
+        CASE,
+        store
+            .set_graph_target(graph.id, graph.updated_at, None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(current, set, "{CASE}: a spent token is Stale with the row");
+    assert_eq!(
+        body_now(CASE, store, graph.id).await.graph.revision,
+        set.revision,
+        "{CASE}: a stale set bumps nothing"
+    );
+
+    // Blueprint B9: `replace_graph` writes name and description, never `target_id`.
+    let mut body = body_now(CASE, store, graph.id).await;
+    body.graph.target_id = Some(other.id);
+    let replaced = applied(
+        CASE,
+        Box::pin(store.replace_graph(graph.id, body.graph.revision, body))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        replaced.graph.target_id,
+        Some(docker.id),
+        "{CASE}: replace_graph keeps the stored target"
+    );
+    let replaced = body_now(CASE, store, graph.id).await.graph;
+    assert_eq!(
+        (replaced.target_id, replaced.revision),
+        (Some(docker.id), set.revision + 1),
+        "{CASE}: replace_graph bumps and keeps the target"
+    );
+
+    let cleared = applied(
+        CASE,
+        store
+            .set_graph_target(graph.id, replaced.updated_at, None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (cleared.target_id, cleared.revision),
+        (None, replaced.revision + 1),
+        "{CASE}: a clear bumps too"
+    );
+
+    let unknown = TargetId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .set_graph_target(graph.id, cleared.updated_at, Some(unknown))
+            .await,
+        &references_no_row("step_graph.target_id", unknown, "target"),
+        "a target that names no row",
+    );
+    let nowhere = StepGraphId::new();
+    match store
+        .set_graph_target(nowhere, DateTime::UNIX_EPOCH, None)
+        .await
+    {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!((entity, id), ("step_graph", nowhere.to_string()), "{CASE}");
+        }
+        other => panic!("{CASE}: an unknown graph is NotFound, got {other:?}"),
+    }
+    assert_eq!(
+        body_now(CASE, store, graph.id).await.graph,
+        cleared,
+        "{CASE}: the refusals wrote and bumped nothing"
+    );
+}
+
+/// MOD-130 M1 T4 (D3, P6, blueprint B11): the Settings default target is a compare-and-set on
+/// its row's `updated_at` with `set_box_probe_spec`'s token rules: absent at first; "expect no
+/// row" inserts once and is `Stale` over a row; a spent token is `Stale`; a clear with the
+/// row's token deletes it; a clear with no token is refused before any read.
+async fn default_target_is_cas_on_updated_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "default_target_is_cas_on_updated_at";
+    let docker = store
+        .create_target(new_target("default docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.default_target().await.expect(CASE),
+        None,
+        "{CASE}: no row at first, so the local target (D3)"
+    );
+    constraint_exactly(
+        CASE,
+        store.set_default_target(None, None).await,
+        DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN,
+        "a clear with no token",
+    );
+
+    let first = applied(
+        CASE,
+        store
+            .set_default_target(Some(docker.id), None)
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied insert carries the row");
+    assert_eq!(first.target, docker.id, "{CASE}: the row names the target");
+    assert_eq!(
+        store.default_target().await.expect(CASE),
+        Some(first),
+        "{CASE}: the read-back is the row the insert returned"
+    );
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_default_target(Some(seed::LOCAL_TARGET_ID), None)
+                .await
+                .expect(CASE)
+        ),
+        Some(first),
+        "{CASE}: a second \"expect no row\" is Stale carrying the row"
+    );
+
+    let unknown = TargetId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .set_default_target(Some(unknown), Some(first.updated_at))
+            .await,
+        &references_no_row("app_setting.default_target", unknown, "target"),
+        "a target that names no row",
+    );
+
+    let second = applied(
+        CASE,
+        store
+            .set_default_target(Some(seed::LOCAL_TARGET_ID), Some(first.updated_at))
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied replace carries the row");
+    assert_eq!(
+        second.target,
+        seed::LOCAL_TARGET_ID,
+        "{CASE}: the local target can be named"
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "{CASE}: the token moves"
+    );
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_default_target(Some(docker.id), Some(first.updated_at))
+                .await
+                .expect(CASE)
+        ),
+        Some(second),
+        "{CASE}: a spent token is Stale carrying the row"
+    );
+
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_default_target(None, Some(second.updated_at))
+                .await
+                .expect(CASE)
+        ),
+        None,
+        "{CASE}: a clear answers Applied(None)"
+    );
+    assert_eq!(
+        store.default_target().await.expect(CASE),
+        None,
+        "{CASE}: the row is gone"
+    );
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_default_target(None, Some(second.updated_at))
+                .await
+                .expect(CASE)
+        ),
+        None,
+        "{CASE}: a clear of a gone row is Stale(None)"
+    );
+}
+
+/// MOD-130 M1 T4 (D14, P9, blueprint B5): retire and delete refuse a target a project, a
+/// workspace's scope row, a workflow, an item or the Settings default names, listing them
+/// deduplicated and sorted by bytes. Once every level is cleared, retire sets `retired_at` and
+/// `targets()` still lists the row; a target nothing names is deleted; the local target is
+/// built in for both.
+async fn retire_and_delete_refuse_a_target_in_use<S: WriteStore>(store: &S) {
+    const CASE: &str = "retire_and_delete_refuse_a_target_in_use";
+    let busy = store
+        .create_target(new_target("busy docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let project = project_now(CASE, store, ids::PROJECT_HTUI).await;
+    let project = applied(
+        CASE,
+        store
+            .set_project_target(project.id, project.updated_at, Some(busy.id))
+            .await
+            .expect(CASE),
+    );
+    let scope = project_now(CASE, store, ids::PROJECT_SCOPE_PLATFORM).await;
+    let scope = applied(
+        CASE,
+        store
+            .set_project_target(scope.id, scope.updated_at, Some(busy.id))
+            .await
+            .expect(CASE),
+    );
+    let mut graphs = Vec::new();
+    for (scope, name) in [
+        (GraphScope::Project(ids::PROJECT_HTUI), "busy flow"),
+        (GraphScope::Workspace(ids::WORKSPACE_PLATFORM), "busy flow"),
+        (GraphScope::Library, "busy flow"),
+    ] {
+        let graph = store
+            .create_step_graph(scoped_graph(scope, name, false))
+            .await
+            .expect(CASE);
+        graphs.push(applied(
+            CASE,
+            store
+                .set_graph_target(graph.id, graph.updated_at, Some(busy.id))
+                .await
+                .expect(CASE),
+        ));
+    }
+    let item = store
+        .mint_item(NewItem {
+            target_id: Some(busy.id),
+            ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "busy")
+        })
+        .await
+        .expect(CASE);
+    let ws_item = store
+        .mint_item(NewItem {
+            target_id: Some(busy.id),
+            ..new_item(
+                ids::PROJECT_SCOPE_PLATFORM,
+                ids::KIND_SCOPE_PLATFORM_WS,
+                "busy too",
+            )
+        })
+        .await
+        .expect(CASE);
+    let default = applied(
+        CASE,
+        store
+            .set_default_target(Some(busy.id), None)
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied insert carries the row");
+
+    let sentence = format!(
+        "target busy docker is used by Settings default, item {} of project htui, item {} of \
+         project platform, project htui, workflow busy flow in the library, workflow busy flow \
+         of project htui, workflow busy flow of workspace platform, workspace platform; set them \
+         to inherit or another target first",
+        item.key, ws_item.key
+    );
+    assert_eq!(
+        target_in_use(
+            "busy docker",
+            &[
+                "workspace platform".to_owned(),
+                "Settings default".to_owned(),
+                "workspace platform".to_owned(),
+            ]
+        ),
+        "target busy docker is used by Settings default, workspace platform; set them to \
+         inherit or another target first",
+        "{CASE}: labels are deduplicated and sorted by bytes"
+    );
+    constraint_exactly(
+        CASE,
+        store.retire_target(busy.id, busy.updated_at).await,
+        &sentence,
+        "a retire of a target in use",
+    );
+    constraint_exactly(
+        CASE,
+        store.retire_target(busy.id, DateTime::UNIX_EPOCH).await,
+        &sentence,
+        "in use wins over a spent token",
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_target(busy.id).await,
+        &sentence,
+        "a delete of a target in use",
+    );
+    assert_eq!(
+        store.target(busy.id).await.expect(CASE),
+        busy,
+        "{CASE}: a refusal writes nothing"
+    );
+
+    // Clear every level, then the retire lands.
+    applied(
+        CASE,
+        store
+            .set_project_target(project.id, project.updated_at, None)
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .set_project_target(scope.id, scope.updated_at, None)
+            .await
+            .expect(CASE),
+    );
+    for graph in &graphs {
+        applied(
+            CASE,
+            store
+                .set_graph_target(graph.id, graph.updated_at, None)
+                .await
+                .expect(CASE),
+        );
+    }
+    for minted in [&item, &ws_item] {
+        let UpdateOutcome::Updated(_) = store
+            .update_item(
+                minted.id,
+                minted.version,
+                ItemPatch {
+                    target_id: Some(None),
+                    author_id: ids::USER,
+                    box_id: Some(ids::BOX),
+                    reason: EditReason::Edited.as_str().to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect(CASE)
+        else {
+            panic!("{CASE}: an item's clear lands")
+        };
+    }
+    constraint_exactly(
+        CASE,
+        store.retire_target(busy.id, busy.updated_at).await,
+        "target busy docker is used by Settings default; set them to inherit or another target \
+         first",
+        "the default alone still holds it",
+    );
+    applied(
+        CASE,
+        store
+            .set_default_target(None, Some(default.updated_at))
+            .await
+            .expect(CASE),
+    );
+
+    let stale_row = stale(
+        CASE,
+        store
+            .retire_target(busy.id, DateTime::UNIX_EPOCH)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stale_row, busy,
+        "{CASE}: a spent token is Stale with the row"
+    );
+    let retired = applied(
+        CASE,
+        store
+            .retire_target(busy.id, busy.updated_at)
+            .await
+            .expect(CASE),
+    );
+    assert!(retired.retired_at.is_some(), "{CASE}: retired_at is set");
+    assert!(
+        retired.updated_at > busy.updated_at,
+        "{CASE}: updated_at moves"
+    );
+    assert_eq!(
+        Target {
+            retired_at: None,
+            updated_at: busy.updated_at,
+            ..retired.clone()
+        },
+        busy,
+        "{CASE}: retire moves retired_at and updated_at only"
+    );
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .retire_target(busy.id, retired.updated_at)
+                .await
+                .expect(CASE),
+        ),
+        retired,
+        "{CASE}: a second retire is Applied, unchanged"
+    );
+    let listed = store.targets().await.expect(CASE);
+    assert!(
+        listed.contains(&retired),
+        "{CASE}: targets() still lists a retired target (P10)"
+    );
+
+    let spare = store
+        .create_target(new_target("spare docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    store.delete_target(spare.id).await.expect(CASE);
+    match store.target(spare.id).await {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!((entity, id), ("target", spare.id.to_string()), "{CASE}");
+        }
+        other => panic!("{CASE}: a deleted target is gone, got {other:?}"),
+    }
+    match store.delete_target(spare.id).await {
+        Err(StoreError::NotFound { entity, .. }) => assert_eq!(entity, "target", "{CASE}"),
+        other => panic!("{CASE}: a second delete is NotFound, got {other:?}"),
+    }
+    match store.retire_target(spare.id, spare.updated_at).await {
+        Err(StoreError::NotFound { entity, .. }) => assert_eq!(entity, "target", "{CASE}"),
+        other => panic!("{CASE}: a retire of a gone target is NotFound, got {other:?}"),
+    }
+
+    let local = store.target(seed::LOCAL_TARGET_ID).await.expect(CASE);
+    constraint_exactly(
+        CASE,
+        store
+            .retire_target(seed::LOCAL_TARGET_ID, local.updated_at)
+            .await,
+        &target_built_in(),
+        "a retire of the local target",
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_target(seed::LOCAL_TARGET_ID).await,
+        &target_built_in(),
+        "a delete of the local target",
+    );
+    assert_eq!(
+        store.targets().await.expect(CASE),
+        listed,
+        "{CASE}: the local target's refusals write nothing"
+    );
+}
+
+/// MOD-130 M1 T4 (D14, P9): after a retire, every writer that names a target as a value refuses
+/// it with `target_retired` and writes nothing: both level setters, the Settings default, an
+/// item edit and `attach_child_box`.
+async fn a_retired_target_is_refused_everywhere<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_retired_target_is_refused_everywhere";
+    let machine = fixture_box_row(store, CASE).await;
+    let created = store
+        .create_target(new_target("old docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let retired = applied(
+        CASE,
+        store
+            .retire_target(created.id, created.updated_at)
+            .await
+            .expect(CASE),
+    );
+    let refusal = target_retired("old docker");
+
+    let project = project_now(CASE, store, ids::PROJECT_HTUI).await;
+    constraint_exactly(
+        CASE,
+        store
+            .set_project_target(project.id, project.updated_at, Some(retired.id))
+            .await,
+        &refusal,
+        "set_project_target",
+    );
+    assert_eq!(
+        project_now(CASE, store, ids::PROJECT_HTUI).await,
+        project,
+        "{CASE}: set_project_target wrote nothing"
+    );
+
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "retired flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        store
+            .set_graph_target(graph.id, graph.updated_at, Some(retired.id))
+            .await,
+        &refusal,
+        "set_graph_target",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph.id).await.graph,
+        graph,
+        "{CASE}: set_graph_target wrote and bumped nothing"
+    );
+
+    constraint_exactly(
+        CASE,
+        store.set_default_target(Some(retired.id), None).await,
+        &refusal,
+        "set_default_target",
+    );
+    assert_eq!(
+        store.default_target().await.expect(CASE),
+        None,
+        "{CASE}: set_default_target wrote nothing"
+    );
+
+    let item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "stays"))
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        store
+            .update_item(
+                item.id,
+                item.version,
+                ItemPatch {
+                    target_id: Some(Some(retired.id)),
+                    author_id: ids::USER,
+                    box_id: Some(ids::BOX),
+                    reason: EditReason::Edited.as_str().to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await,
+        &refusal,
+        "update_item",
+    );
+    assert_eq!(
+        store.item(item.id).await.expect(CASE),
+        Some(item),
+        "{CASE}: update_item wrote nothing"
+    );
+
+    let before = store.boxes().await.expect(CASE);
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(NewChildBox {
+                id: BoxId::new(),
+                parent: machine.id,
+                hostname: "old-dev".to_owned(),
+                target: retired.id,
+            })
+            .await,
+        &refusal,
+        "attach_child_box",
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: attach_child_box wrote nothing"
+    );
+    assert_eq!(
+        store.target(retired.id).await.expect(CASE),
+        retired,
+        "{CASE}: the target is untouched"
+    );
 }
 
 #[cfg(test)]

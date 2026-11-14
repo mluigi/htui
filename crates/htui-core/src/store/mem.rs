@@ -71,6 +71,7 @@ use crate::model::{
     RunProvenance,
 };
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
+use crate::model::{DEFAULT_TARGET_KEY, DefaultTarget};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
@@ -110,6 +111,10 @@ use crate::store::traits::{
     skill_body_refusal, skill_patch_refusal, skill_version_key, startable, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN, TARGET_USER_DEFAULT, target_in_use, target_user_graph,
+    target_user_item, target_user_project,
 };
 use crate::store::traits::{
     MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
@@ -3282,6 +3287,7 @@ impl State {
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
+            target_id: None,
             created_by: new.created_by,
             created_at: now,
             updated_at: now,
@@ -3521,6 +3527,7 @@ impl State {
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
+            target_id: None,
             created_by,
             created_at: now,
             updated_at: now,
@@ -4045,6 +4052,7 @@ impl State {
             description: new.description,
             is_override: new.is_override,
             revision: 0,
+            target_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -11306,6 +11314,224 @@ impl State {
         };
         Ok(AttachedBox { child, target })
     }
+
+    /// MOD-130 M1 T4 (D14, blueprint B3): a target named as a level's value is the local one,
+    /// or a stored one that is not retired; one naming no row is `references_no_row(column)`.
+    fn level_target_refusal(&self, column: &str, target: Option<TargetId>) -> Result<()> {
+        let Some(id) = target else {
+            return Ok(());
+        };
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(());
+        }
+        match self.targets.get(&id) {
+            None => Err(StoreError::Constraint(references_no_row(
+                column, id, "target",
+            ))),
+            Some(row) if row.retired_at.is_some() => {
+                Err(StoreError::Constraint(target_retired(&row.name)))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// [`WriteStore::set_project_target`]'s order: unknown project, the target, `Stale`.
+    fn set_project_target(
+        &mut self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Project>> {
+        let current = self
+            .projects
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "project",
+                id: id.to_string(),
+            })?;
+        self.level_target_refusal("project.target_id", target)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        let row = self
+            .projects
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        row.target_id = target;
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::set_graph_target`]'s order, then the write and one bump (D11).
+    fn set_graph_target(
+        &mut self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let current = self
+            .graphs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph",
+                id: id.to_string(),
+            })?;
+        self.level_target_refusal("step_graph.target_id", target)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        self.graphs
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock")
+            .target_id = target;
+        self.bump_graph(id, now);
+        Ok(CasOutcome::Applied(self.graphs[&id].clone()))
+    }
+
+    /// The Settings default row, parsed (blueprint B11).
+    fn default_target(&self) -> Result<Option<DefaultTarget>> {
+        self.app_settings
+            .get(DEFAULT_TARGET_KEY)
+            .map(|(value, updated_at)| DefaultTarget::parse(value, *updated_at))
+            .transpose()
+    }
+
+    /// [`WriteStore::set_default_target`]: the clear refusal, the target, then
+    /// [`set_box_probe_spec`](State::set_box_probe_spec)'s token rule.
+    fn set_default_target(
+        &mut self,
+        target: Option<TargetId>,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<DefaultTarget>>> {
+        if target.is_none() && expected.is_none() {
+            return Err(StoreError::Constraint(
+                DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN.to_owned(),
+            ));
+        }
+        self.level_target_refusal("app_setting.default_target", target)?;
+        let stored = self.default_target()?;
+        let current = match (&stored, expected) {
+            (None, None) => true,
+            (Some(row), Some(want)) => row.updated_at == want,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !current {
+            return Ok(CasOutcome::Stale(stored));
+        }
+        Ok(CasOutcome::Applied(match target {
+            Some(target) => {
+                self.app_settings.insert(
+                    DEFAULT_TARGET_KEY.to_owned(),
+                    (DefaultTarget::value(target), now),
+                );
+                Some(DefaultTarget {
+                    target,
+                    updated_at: now,
+                })
+            }
+            None => {
+                self.app_settings.remove(DEFAULT_TARGET_KEY);
+                None
+            }
+        }))
+    }
+
+    /// The P9 labels (blueprint B5) of every level and the Settings default naming `id`.
+    fn target_users(&self, id: TargetId) -> Result<Vec<String>> {
+        let slug = |project: ProjectId| {
+            self.projects
+                .get(&project)
+                .map_or_else(|| project.to_string(), |row| row.slug.clone())
+        };
+        let mut users: Vec<String> = self
+            .projects
+            .values()
+            .filter(|row| row.target_id == Some(id))
+            .map(|row| target_user_project(&row.slug))
+            .collect();
+        users.extend(
+            self.graphs
+                .values()
+                .filter(|row| row.target_id == Some(id))
+                .map(|row| match row.scope {
+                    GraphScope::Project(project) => {
+                        target_user_graph(&row.name, Some(&slug(project)), None)
+                    }
+                    GraphScope::Workspace(workspace) => {
+                        let owner = self
+                            .workspaces
+                            .get(&workspace)
+                            .map_or_else(|| workspace.to_string(), |row| row.slug.clone());
+                        target_user_graph(&row.name, None, Some(&owner))
+                    }
+                    GraphScope::Library => target_user_graph(&row.name, None, None),
+                }),
+        );
+        users.extend(
+            self.items
+                .values()
+                .filter(|row| row.target_id == Some(id))
+                .map(|row| target_user_item(&row.key, &slug(row.project_id))),
+        );
+        if self
+            .default_target()?
+            .is_some_and(|default| default.target == id)
+        {
+            users.push(TARGET_USER_DEFAULT.to_owned());
+        }
+        Ok(users)
+    }
+
+    /// The refusals [`WriteStore::retire_target`] and [`WriteStore::delete_target`] share:
+    /// unknown, local, in use.
+    fn target_free(&self, id: TargetId) -> Result<Target> {
+        let current = self.target_row(id)?;
+        if current.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        let users = self.target_users(id)?;
+        if !users.is_empty() {
+            return Err(StoreError::Constraint(target_in_use(&current.name, &users)));
+        }
+        Ok(current)
+    }
+
+    /// [`WriteStore::retire_target`]: the shared refusals, `Stale`, then `retired_at` unless it
+    /// is set already.
+    fn retire_target(
+        &mut self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let current = self.target_free(id)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if current.retired_at.is_some() {
+            return Ok(CasOutcome::Applied(current));
+        }
+        let row = self
+            .targets
+            .get_mut(&id)
+            .expect("a target that is not local is a stored one, read under the same lock");
+        row.retired_at = Some(now);
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::delete_target`]: the shared refusals, then the delete. Run history waits
+    /// for M2's `Run.target_id` here (P8).
+    fn delete_target(&mut self, id: TargetId) -> Result<()> {
+        self.target_free(id)?;
+        self.targets.remove(&id);
+        Ok(())
+    }
 }
 
 impl ReadStore for MemStore {
@@ -12719,6 +12945,52 @@ impl WriteStore for MemStore {
     async fn attach_child_box(&self, new: NewChildBox) -> Result<AttachedBox> {
         let now = self.now();
         self.write(|state| state.attach_child_box(new, now))
+    }
+
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<Project>> {
+        let now = self.now();
+        self.write(|state| state.set_project_target(project, expected, target, now))
+    }
+
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let now = self.now();
+        self.write(|state| state.set_graph_target(graph, expected, target, now))
+    }
+
+    async fn default_target(&self) -> Result<Option<DefaultTarget>> {
+        self.read(State::default_target)
+    }
+
+    async fn set_default_target(
+        &self,
+        target: Option<TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<DefaultTarget>>> {
+        let now = self.now();
+        self.write(|state| state.set_default_target(target, expected, now))
+    }
+
+    async fn retire_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let now = self.now();
+        self.write(|state| state.retire_target(id, expected, now))
+    }
+
+    async fn delete_target(&self, id: TargetId) -> Result<()> {
+        self.write(|state| state.delete_target(id))
     }
 }
 

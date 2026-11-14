@@ -79,6 +79,11 @@ pub struct Project {
     pub secret_scope: Option<String>,
     /// `project.settings` (`JSONB`): token budget, retention, cached transcript steps, ...
     pub settings: Value,
+    /// `project.target_id` (MOD-130 M1, D3, D5): the project's execution target, `None` to
+    /// inherit. On a workspace's scope row it is the workspace level. Its one writer is
+    /// [`set_project_target`](crate::store::WriteStore::set_project_target) (P6).
+    #[serde(default)]
+    pub target_id: Option<crate::model::TargetId>,
     /// `project.created_by`.
     pub created_by: UserId,
     /// `project.created_at`.

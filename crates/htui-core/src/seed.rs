@@ -239,6 +239,7 @@ pub fn graph_row(
         description: graph_description(kind.name),
         is_override: false,
         revision: 0,
+        target_id: None,
         created_at: now,
         updated_at: now,
     }

@@ -1414,6 +1414,7 @@ mod tests {
             secret_provider: provider.map(str::to_owned),
             secret_scope: scope.map(str::to_owned),
             settings: serde_json::json!({}),
+            target_id: None,
             created_by: UserId::new(),
             created_at: now,
             updated_at: now,
